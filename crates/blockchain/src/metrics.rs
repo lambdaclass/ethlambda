@@ -745,10 +745,11 @@ static LEAN_NODE_SYNC_STATUS: std::sync::LazyLock<IntGaugeVec> = std::sync::Lazy
 
 /// Cross-client label set for `lean_aggregator_skipped_total` (leanMetrics).
 ///
-/// `not_synced`, `missing_state` and `spawn_failed` never fire in ethlambda
-/// today: aggregation is not gated on sync status, needs no per-target
-/// pre-state resolution, and the worker thread is spawned once at startup.
-/// They are seeded at zero so fleet-wide dashboards see the full series.
+/// `missing_state` and `spawn_failed` never fire in ethlambda today:
+/// aggregation needs no per-target pre-state resolution, and a worker thread
+/// that fails to spawn takes the actor's `started()` hook down with it rather
+/// than reaching this counter. They are seeded at zero so fleet-wide
+/// dashboards see the full series.
 const AGGREGATOR_SKIP_REASONS: &[&str] = &[
     "not_aggregator",
     "not_synced",
@@ -1015,6 +1016,16 @@ pub fn observe_committee_signatures_aggregation(elapsed: std::time::Duration) {
 pub fn inc_aggregator_skipped_not_aggregator() {
     LEAN_AGGREGATOR_SKIPPED_TOTAL
         .with_label_values(&["not_aggregator"])
+        .inc();
+}
+
+/// One vote-aggregation interval passed with this node holding the
+/// aggregation duty but the sync gate parking the worker, so nothing was
+/// proved. Counted per interval, like `not_aggregator`, rather than per
+/// polling round.
+pub fn inc_aggregator_skipped_not_synced() {
+    LEAN_AGGREGATOR_SKIPPED_TOTAL
+        .with_label_values(&["not_synced"])
         .inc();
 }
 

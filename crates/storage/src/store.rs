@@ -269,6 +269,24 @@ impl PayloadBuffer {
         self.data.get(data_root).map_or(0, |e| e.proofs.len())
     }
 
+    /// The proof for `data_root` binding the most validators, cloned, paired
+    /// with its participant count. `None` when the buffer holds no proof for
+    /// that root.
+    ///
+    /// Clones one proof where [`Self::proofs_for_root`] clones them all: a
+    /// proof is up to 512 KiB, and a caller that only wants to put one on the
+    /// wire should not pay for the rest. Ties keep an arbitrary winner, since
+    /// two proofs binding the same number of validators are equally good here.
+    fn widest_proof_for_root(&self, data_root: &H256) -> Option<(usize, SingleMessageAggregate)> {
+        self.data
+            .get(data_root)?
+            .proofs
+            .iter()
+            .map(|proof| (validator_indices(&proof.participants).count(), proof))
+            .max_by_key(|(participants, _)| *participants)
+            .map(|(participants, proof)| (participants, proof.clone()))
+    }
+
     /// Return cloned proofs for a given data_root, or empty vec if none.
     fn proofs_for_root(&self, data_root: &H256) -> Vec<SingleMessageAggregate> {
         self.data
@@ -1586,6 +1604,39 @@ impl Store {
         (new, known)
     }
 
+    /// The widest proof held for `data_root` across the new and known buffers:
+    /// the one binding the most validators. `None` when neither buffer holds a
+    /// proof for that data, i.e. none was ever inserted or it has since been
+    /// evicted or pruned.
+    ///
+    /// The aggregate publication path reads its proof back through this rather
+    /// than carrying its own copy of what the aggregation worker produced, so
+    /// what reaches the wire is the best proof we hold for that attestation
+    /// data at publication time. Clones at most one proof per buffer, where
+    /// [`Self::existing_proofs_for_data`] clones every one.
+    pub fn widest_proof_for_data(&self, data_root: &H256) -> Option<SingleMessageAggregate> {
+        let new = self
+            .new_payloads
+            .lock()
+            .unwrap()
+            .widest_proof_for_root(data_root);
+        let known = self
+            .known_payloads
+            .lock()
+            .unwrap()
+            .widest_proof_for_root(data_root);
+        match (new, known) {
+            (Some((new_participants, new_proof)), Some((known_participants, known_proof))) => {
+                Some(if known_participants > new_participants {
+                    known_proof
+                } else {
+                    new_proof
+                })
+            }
+            (found, None) | (None, found) => found.map(|(_, proof)| proof),
+        }
+    }
+
     /// Return attestation data entries from the new (pending) payload buffer.
     ///
     /// Used to iterate over data that has pending proofs but may lack gossip
@@ -2377,6 +2428,82 @@ mod tests {
         // Should be 1 distinct data entry with 3 proofs
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.data[&data_root].proofs.len(), 3);
+    }
+
+    #[test]
+    fn widest_proof_for_root_picks_the_one_binding_most_validators() {
+        let mut buf = PayloadBuffer::new(10);
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        // Disjoint participant sets, so `push`'s subsumption rule keeps both.
+        buf.push(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[0, 1, 2]),
+        );
+        buf.push(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[7]),
+        );
+
+        let (participants, proof) = buf
+            .widest_proof_for_root(&data_root)
+            .expect("root is in the buffer");
+        assert_eq!(participants, 3);
+        assert_eq!(
+            validator_indices(&proof.participants).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+
+        assert!(
+            buf.widest_proof_for_root(&make_att_data(99).hash_tree_root())
+                .is_none()
+        );
+    }
+
+    /// Publication reads its proof back out of the pool, so the lookup has to
+    /// see both buffers: a proposer's interval-0 promote can move our own
+    /// aggregate into `known` before the vote-aggregation interval publishes
+    /// it, and a peer's wider proof for the same data can land in either.
+    #[test]
+    fn widest_proof_for_data_spans_new_and_known_buffers() {
+        let mut store = Store::test_store();
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+
+        assert!(store.widest_proof_for_data(&data_root).is_none());
+
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validators(&[3]),
+        );
+        assert_eq!(
+            validator_indices(
+                &store
+                    .widest_proof_for_data(&data_root)
+                    .expect("new buffer holds it")
+                    .participants
+            )
+            .collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        // A wider proof in the known buffer wins over the narrower new one.
+        let entries = vec![(
+            HashedAttestationData::new(data),
+            make_proof_for_validators(&[3, 4, 5]),
+        )];
+        store.insert_known_aggregated_payloads_batch(entries);
+        assert_eq!(
+            validator_indices(
+                &store
+                    .widest_proof_for_data(&data_root)
+                    .expect("known buffer holds the wider one")
+                    .participants
+            )
+            .collect::<Vec<_>>(),
+            vec![3, 4, 5]
+        );
     }
 
     #[test]

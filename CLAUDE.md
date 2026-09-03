@@ -82,13 +82,29 @@ Fork choice head update
 - The actor **applies** each aggregate on arrival (the pool the worker re-reads must
   account for it, or the same group gets proved twice) but **buffers** the gossip
   publication in `pending_aggregates` until interval 2
-- `JobPolicy` gates what the worker may take, by wall-clock position in the slot: backlog
+- `pending_aggregates` buffers the `AttestationData` keyed by data root, never the proof:
+  the proof is already in the store's `new_payloads`, where `PayloadBuffer` dedups and
+  caps it. Publication reads it back with `Store::widest_proof_for_data`, so re-proving a
+  group after a straggler signature replaces the entry instead of queueing a second
+  near-identical 512 KiB aggregate, and what goes on the wire is the widest proof held
+  for that data
+- `JobPolicy` gates what the worker may take, by position in the slot: backlog
   work early, a current-slot group once it holds `min_current_slot_group_sigs`, and inside
   `EARLY_AGGREGATION_WINDOW` before interval 2 nothing but that group (a backlog job is a
   recursive merge that would occupy the single prover across the boundary)
+- *Which* slot comes from `store.current_slot()`, the same clock `on_tick`'s idempotency
+  guard keys on; only the sub-interval position inside it comes from the wall clock
+  (`ms_into_slot`, clamped to that slot). Two independent clocks would let the worker and
+  the actor disagree about the current slot, and `select_best_job` buckets on exactly that
 - The actor raises a pause flag (`AggregationWorker::pause`, RAII guard) around its own
   `propose_block`, since both compete for the same single-threaded leanVM prover. A proof
-  already in flight is not interrupted — `aggregate_mixed` cannot be
+  already in flight is not interrupted — `aggregate_mixed` cannot be. The flag is a plain
+  bool, not a depth counter, so `propose_block` must stay its only caller
+- The worker also parks itself while the sync gate suppresses duties: it reads the shared
+  `SyncStatusController` plus its own copy of the startup-fixed `gate_duties` flag. A node
+  that is behind would otherwise prove its backlog against the same prover block import
+  needs. Read in `next_job` rather than taken as a `pause` guard, since that flag admits
+  one holder
 - `EmittedCoverage` remembers per-slot what the worker emitted, closing the window between
   `send` and the actor's apply. Recorded on *attempt*, so a failed proof is not retried at
   full prover cost

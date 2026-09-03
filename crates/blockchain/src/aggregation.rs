@@ -35,7 +35,10 @@
 //!
 //! The actor can also park the worker outright: it raises the pause flag
 //! around its own block build, so the prover is not shared with it (see
-//! [`AggregationWorker::pause`]).
+//! [`AggregationWorker::pause`]). The worker parks itself as well while the
+//! sync gate is suppressing duties, so a node that is behind spends the prover
+//! on the block import that closes the gap rather than on a backlog the
+//! network has stopped waiting for.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -61,6 +64,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
+use crate::metrics::SyncStatus;
+use crate::sync_status::SyncStatusController;
 use crate::{SlotInterval, metrics};
 
 /// How long the worker waits before re-reading the pool when it found nothing
@@ -90,6 +95,22 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 fn vote_aggregation_offset_ms(config: &ChainConfig) -> u64 {
     // Slot 0 reduces `to_ms_since_genesis` to the offset within a slot.
     SlotInterval::Aggregation.to_ms_since_genesis(0, config)
+}
+
+/// How far into `slot` the wall clock is, in milliseconds.
+///
+/// The store clock decides which slot the worker is in, but it counts whole
+/// intervals and [`EARLY_AGGREGATION_WINDOW`] is finer than one, so the
+/// position *inside* the slot still comes from the wall clock. It is measured
+/// from `slot`'s own start and clamped to that slot, so when the two clocks
+/// disagree the answer degrades to an edge of the slot the store says we are
+/// in: short of it the permissive [`JobPolicy::Backlog`] end, past it
+/// [`JobPolicy::Open`]. It never describes a position inside some other slot.
+fn ms_into_slot(now_ms: u64, slot: u64, config: &ChainConfig) -> u64 {
+    let slot_start_ms = config.genesis_time_ms() + slot * config.milliseconds_per_slot;
+    now_ms
+        .saturating_sub(slot_start_ms)
+        .min(config.milliseconds_per_slot)
 }
 
 /// How long before the vote-aggregation boundary the worker stops taking
@@ -176,6 +197,17 @@ impl AggregationWorker {
     /// Stop handing the worker new jobs for as long as the returned guard
     /// lives. A proof already in flight is not interrupted (`aggregate_mixed`
     /// cannot be), so this bounds contention rather than eliminating it.
+    ///
+    /// **At most one live guard.** The flag is a plain boolean, not a depth
+    /// counter, so two overlapping guards would unpause the worker the moment
+    /// the first one drops, while the second still believes it has the prover
+    /// to itself. The block build is the only caller, and that is what keeps
+    /// the plain boolean correct.
+    ///
+    /// A further reason to hold the worker back belongs in [`next_job`], as a
+    /// condition the worker reads for itself the way it reads the aggregator
+    /// role and the sync gate. Turn this into an `AtomicUsize` depth counter
+    /// before adding a second guard here.
     pub(crate) fn pause(&self) -> PauseGuard {
         self.paused.store(true, Ordering::Release);
         PauseGuard(self.paused.clone())
@@ -211,7 +243,8 @@ impl AggregationWorker {
 }
 
 /// Lowers the worker's pause flag on drop, so an early return on the paused
-/// code path cannot leave the worker parked forever.
+/// code path cannot leave the worker parked forever. Correct for exactly one
+/// live guard; see [`AggregationWorker::pause`].
 pub(crate) struct PauseGuard(Arc<AtomicBool>);
 
 impl Drop for PauseGuard {
@@ -220,15 +253,21 @@ impl Drop for PauseGuard {
     }
 }
 
-/// Startup-fixed inputs the worker's vote-propagation gate needs. Both come
-/// from the CLI and never change at runtime, so the worker owns a copy instead
-/// of reaching back into the actor.
+/// Startup-fixed inputs the worker's gates need. All come from the CLI and
+/// never change at runtime, so the worker owns a copy instead of reaching back
+/// into the actor.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     /// Number of attestation committees (= subnet count).
     pub(crate) attestation_committee_count: u64,
     /// Attestation subnets this node subscribes to.
     pub(crate) subscribed_subnets: HashSet<u64>,
+    /// Whether a syncing node suppresses duties; cleared by the CLI
+    /// `--disable-duty-sync-gate`. Mirrors `SyncStatusTracker`'s own copy: the
+    /// tracker publishes its sync verdict through [`SyncStatusController`],
+    /// but not whether that verdict gates anything, so the worker carries the
+    /// flag itself.
+    pub(crate) gate_duties: bool,
 }
 
 /// One successful aggregate streamed back from the worker.
@@ -769,7 +808,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
 
 /// Apply a worker-produced aggregate to the store. Called per message on the
 /// actor thread; gauge metrics that depend on total counts are batched into
-/// `finalize_aggregation_session` so we pay one lock per session instead of
+/// [`refresh_pool_gauges`] instead, so we pay one lock per slot rather than
 /// one per aggregate. Idempotent wrt the gossip delete.
 pub fn apply_aggregated_group(store: &mut Store, output: &AggregatedGroupOutput) {
     store.insert_new_aggregated_payload(output.hashed.clone(), output.proof.clone());
@@ -872,12 +911,14 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 ///
 /// The worker owns a [`Store`] clone — same backend, same in-memory buffers —
 /// the shared aggregator-role flag (so a runtime toggle reaches it without a
-/// restart), and the startup-fixed gate inputs. It runs until the returned
-/// handle's [`AggregationWorker::shutdown`] cancels it.
+/// restart), the shared sync status (so the sync gate reaches it the same way),
+/// and the startup-fixed gate inputs. It runs until the returned handle's
+/// [`AggregationWorker::shutdown`] cancels it.
 pub(crate) fn spawn_aggregation_worker(
     store: Store,
     actor: ActorRef<crate::BlockChainServer>,
     aggregator: AggregatorController,
+    sync_status: SyncStatusController,
     config: WorkerConfig,
 ) -> AggregationWorker {
     let cancel = CancellationToken::new();
@@ -887,7 +928,17 @@ pub(crate) fn spawn_aggregation_worker(
         let paused = paused.clone();
         std::thread::Builder::new()
             .name("aggregation-worker".to_owned())
-            .spawn(move || run_aggregation_worker(store, actor, aggregator, config, cancel, paused))
+            .spawn(move || {
+                run_aggregation_worker(
+                    store,
+                    actor,
+                    aggregator,
+                    sync_status,
+                    config,
+                    cancel,
+                    paused,
+                )
+            })
             .expect("spawning the aggregation worker thread")
     };
 
@@ -903,15 +954,16 @@ pub(crate) fn spawn_aggregation_worker(
 /// Each round re-reads the pool through the store handle, picks the best job
 /// ([`select_best_job`]), proves it, and hands the result to the actor as an
 /// [`AggregateProduced`] message. With nothing to do — nothing eligible,
-/// paused for a block build, or no aggregation duty — it sleeps
+/// paused for a block build, syncing, or no aggregation duty — it sleeps
 /// [`WORKER_IDLE_POLL`] and looks again.
 ///
-/// `aggregate_mixed` cannot be interrupted, so both cancellation and the pause
-/// flag are only observed between jobs.
+/// `aggregate_mixed` cannot be interrupted, so cancellation, the pause flag
+/// and the sync gate are all only observed between jobs.
 fn run_aggregation_worker(
     store: Store,
     actor: ActorRef<crate::BlockChainServer>,
     aggregator: AggregatorController,
+    sync_status: SyncStatusController,
     config: WorkerConfig,
     cancel: CancellationToken,
     paused: Arc<AtomicBool>,
@@ -928,6 +980,7 @@ fn run_aggregation_worker(
             &store,
             &time_config,
             &aggregator,
+            &sync_status,
             &paused,
             &config,
             &mut emitted,
@@ -980,15 +1033,16 @@ fn run_aggregation_worker(
     info!("Aggregation worker stopped");
 }
 
-/// One round of job selection: honor the role flag and the pause flag, derive
-/// the slot and the [`JobPolicy`] from the wall clock, then ask
-/// [`select_best_job`] for the winner. `None` means "nothing to do right now",
-/// which inside the early window is a deliberate answer rather than an idle
-/// one.
+/// One round of job selection: honor the role flag, the pause flag and the
+/// sync gate, take the slot from the store clock and the [`JobPolicy`] from
+/// where the wall clock sits inside it, then ask [`select_best_job`] for the
+/// winner. `None` means "nothing to do right now", which inside the early
+/// window is a deliberate answer rather than an idle one.
 fn next_job(
     store: &Store,
     time_config: &ChainConfig,
     aggregator: &AggregatorController,
+    sync_status: &SyncStatusController,
     paused: &AtomicBool,
     config: &WorkerConfig,
     emitted: &mut EmittedCoverage,
@@ -997,13 +1051,42 @@ fn next_job(
         return None;
     }
 
-    // Before genesis there is no slot to aggregate for.
-    let ms_since_genesis = crate::unix_now_ms().checked_sub(time_config.genesis_time_ms())?;
-    let slot = ms_since_genesis / time_config.milliseconds_per_slot;
-    let ms_into_slot = ms_since_genesis % time_config.milliseconds_per_slot;
+    // A node that is behind has both a large backlog and a prover the import
+    // path needs for `verify_aggregated_signature`. Proving that backlog would
+    // compete with the work that closes the gap, to produce aggregates for
+    // slots the network has moved past, so the gate that already suppresses
+    // this node's attestations and proposals suppresses its aggregation too.
+    //
+    // Read here rather than taken as a `pause` guard: that flag admits a single
+    // holder (see [`AggregationWorker::pause`]) and the block build owns it.
+    if config.gate_duties && sync_status.get() == SyncStatus::Syncing {
+        return None;
+    }
+
+    let now_ms = crate::unix_now_ms();
+    // Before genesis there is no slot to aggregate for. A "has the chain
+    // started" test only; which slot we are in comes from the store clock.
+    if now_ms < time_config.genesis_time_ms() {
+        return None;
+    }
+
+    // The slot comes from the store clock, the one authority the actor drives
+    // the interval grid off (`on_tick`'s idempotency guard keys on it).
+    // Derived independently from the wall clock the two could disagree — the
+    // wall clock drifts behind the monotonic tick cadence inside VMs, and a
+    // long block build leaves the store clock ahead of it — and
+    // `select_best_job` would then bucket the slot's real group as stale,
+    // proving it thin below `min_sigs`, or bucket a stale group as current and
+    // hold it back to a boundary that has already passed.
+    let slot = store.current_slot();
 
     emitted.roll_to(slot);
-    let policy = job_policy(ms_into_slot, time_config, store, config);
+    let policy = job_policy(
+        ms_into_slot(now_ms, slot, time_config),
+        time_config,
+        store,
+        config,
+    );
 
     select_best_job(store, slot, policy, emitted)
 }
@@ -1767,6 +1850,7 @@ mod tests {
         let config = WorkerConfig {
             attestation_committee_count: 4,
             subscribed_subnets: HashSet::from([0, 1]),
+            gate_duties: true,
         };
         // 10 validators over 4 committees: subnets 0 and 1 hold 3 each, so a
         // group gathering both needs 4 of those 6.
@@ -1803,5 +1887,44 @@ mod tests {
                 JobPolicy::Open
             );
         }
+    }
+
+    /// The store clock owns which slot the worker is in, so the wall-clock
+    /// offset is always measured against *that* slot and clamped to it. A wall
+    /// clock lagging the store reads as the start of the store's slot, one
+    /// running ahead as its end; neither can describe a position inside a
+    /// different slot, which is what would mis-bucket the slot's own group.
+    #[test]
+    fn ms_into_slot_is_measured_against_the_store_slot() {
+        let time_config = ChainConfig::new(1_000, DEFAULT_MILLISECONDS_PER_SLOT);
+        let genesis_ms = time_config.genesis_time_ms();
+        let slot = 7;
+        let slot_start_ms = genesis_ms + slot * DEFAULT_MILLISECONDS_PER_SLOT;
+
+        assert_eq!(ms_into_slot(slot_start_ms, slot, &time_config), 0);
+        assert_eq!(
+            ms_into_slot(slot_start_ms + 1_234, slot, &time_config),
+            1_234
+        );
+
+        // Wall clock a slot and a half behind the store: clamped to the start
+        // of the store's slot, the permissive `Backlog` end.
+        let behind = slot_start_ms - DEFAULT_MILLISECONDS_PER_SLOT / 2;
+        assert_eq!(ms_into_slot(behind, slot, &time_config), 0);
+        assert_eq!(ms_into_slot(genesis_ms, slot, &time_config), 0);
+
+        // Wall clock past the end of the store's slot: clamped to the slot's
+        // width, which is at or past the vote-aggregation boundary, so `Open`.
+        let ahead = slot_start_ms + 3 * DEFAULT_MILLISECONDS_PER_SLOT;
+        assert_eq!(
+            ms_into_slot(ahead, slot, &time_config),
+            DEFAULT_MILLISECONDS_PER_SLOT
+        );
+        assert!(
+            ms_into_slot(ahead, slot, &time_config) >= vote_aggregation_offset_ms(&time_config)
+        );
+
+        // Before genesis at all: still the start of slot 0, no underflow.
+        assert_eq!(ms_into_slot(0, 0, &time_config), 0);
     }
 }

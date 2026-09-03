@@ -126,6 +126,14 @@ impl SyncStatusTracker {
         // Gate disabled: the syncing state is observe-only, never suppresses duties.
         !self.gate_duties || !self.syncing
     }
+
+    /// Whether the syncing state gates duties at all. Fixed at startup, so the
+    /// aggregation worker takes a copy instead of reading the tracker: the
+    /// [`SyncStatusController`] it shares with the actor carries the sync
+    /// verdict but not whether that verdict suppresses anything.
+    pub(crate) fn gate_duties(&self) -> bool {
+        self.gate_duties
+    }
 }
 
 #[cfg(test)]

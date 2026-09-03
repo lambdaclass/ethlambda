@@ -8,7 +8,7 @@ use ethlambda_storage::{ALL_TABLES, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
-    attestation::{SignedAggregatedAttestation, SignedAttestation},
+    attestation::{AttestationData, SignedAggregatedAttestation, SignedAttestation},
     block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
     chain_config::ChainConfig,
     primitives::{H256, HashTreeRoot as _},
@@ -187,7 +187,7 @@ impl BlockChain {
             aggregator,
             pending_block_parents: HashMap::new(),
             aggregation_worker: None,
-            pending_aggregates: Vec::new(),
+            pending_aggregates: HashMap::new(),
             last_tick_instant: None,
             attestation_committee_count,
             subscribed_subnets,
@@ -247,12 +247,21 @@ pub struct BlockChainServer {
     /// treat `None` as "not up yet".
     aggregation_worker: Option<AggregationWorker>,
 
-    /// Aggregates produced by the worker and not yet gossiped. They are
-    /// applied to the store the moment they arrive (so the pool and the
-    /// worker's next selection round see them) but published only at the
-    /// vote-aggregation interval, which keeps proving off the interval grid
-    /// without moving publication off it.
-    pending_aggregates: Vec<SignedAggregatedAttestation>,
+    /// Attestation data the worker has produced an aggregate for and that has
+    /// not been gossiped yet, keyed by data root. Applied to the store the
+    /// moment they arrive (so the pool and the worker's next selection round
+    /// see them) but published only at the vote-aggregation interval, which
+    /// keeps proving off the interval grid without moving publication off it.
+    ///
+    /// Only the data is buffered, never the proof. The proof already went into
+    /// the store's `new_payloads` on arrival, where `PayloadBuffer` dedups
+    /// proofs subsumed by a wider one and caps the total; a second copy here
+    /// would be an unbounded queue of up-to-512 KiB clones with neither
+    /// bound, and a straggler signature that re-proves the same group would
+    /// add a near-duplicate to it rather than replacing what it supersedes.
+    /// Keying by data root collapses those to one entry, and
+    /// `Store::widest_proof_for_data` picks what actually goes on the wire.
+    pending_aggregates: HashMap<H256, AttestationData>,
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
@@ -417,21 +426,34 @@ impl BlockChainServer {
 
             // ==== interval 2 ====
             SlotInterval::Aggregation => {
-                // Sampled at the interval boundary, as before. It now sees any
-                // aggregate the worker already produced this slot, which is
-                // the point of proving off the grid.
-                coverage::emit_agg_start_new_coverage(
-                    &self.store,
-                    self.attestation_committee_count,
-                );
+                if is_aggregator {
+                    // Sampled at the interval boundary, as before. It now sees
+                    // any aggregate the worker already produced this slot,
+                    // which is the point of proving off the grid.
+                    //
+                    // Aggregator-only, as it was when the session started
+                    // here: the series measures what our own aggregation
+                    // covered by the boundary. On a non-aggregator the same
+                    // call reads `new_payloads` filled by gossip instead, so
+                    // emitting it everywhere would put two different
+                    // populations in one series.
+                    coverage::emit_agg_start_new_coverage(
+                        &self.store,
+                        self.attestation_committee_count,
+                    );
+                    if !self.sync_status.duties_allowed() {
+                        // We hold the duty but the sync gate is parking the
+                        // worker, so no aggregate was produced this slot.
+                        metrics::inc_aggregator_skipped_not_synced();
+                    }
+                } else {
+                    metrics::inc_aggregator_skipped_not_aggregator();
+                }
 
                 // Proving runs continuously on the worker; this interval is
                 // only where what it produced reaches the network.
                 self.publish_pending_aggregates(slot, is_aggregator);
                 aggregation::refresh_pool_gauges(&self.store);
-                if !is_aggregator {
-                    metrics::inc_aggregator_skipped_not_aggregator();
-                }
             }
 
             // ==== interval 3 ====
@@ -477,8 +499,13 @@ impl BlockChainServer {
         self.key_manager.advance_keys_to((slot + 1) as u32);
     }
 
-    /// Gossip every aggregate the worker produced since the last
-    /// vote-aggregation interval, then clear the buffer.
+    /// Gossip an aggregate for every attestation data the worker produced one
+    /// for since the last vote-aggregation interval, then clear the buffer.
+    ///
+    /// The proof comes back out of the payload pool rather than from a copy
+    /// held here, so what goes on the wire is the widest proof we hold for
+    /// that data: ours, or a peer's when theirs binds more validators. See
+    /// `pending_aggregates` for why the proof is not buffered.
     ///
     /// The buffer is drained even when this node has since dropped the
     /// aggregator role: those aggregates are already in our own pool, and
@@ -488,17 +515,21 @@ impl BlockChainServer {
         if pending.is_empty() {
             return;
         }
-        let count = pending.len();
 
         let Some(p2p) = self.p2p.as_ref().filter(|_| is_aggregator) else {
             debug!(
                 %slot,
-                count,
+                count = pending.len(),
                 is_aggregator,
                 "Dropping buffered aggregates: nowhere to publish them"
             );
             return;
         };
+
+        // Oldest data first, and deterministically: the buffer is a map, whose
+        // own iteration order is RandomState-seeded.
+        let mut pending: Vec<(H256, AttestationData)> = pending.into_iter().collect();
+        pending.sort_unstable_by_key(|(data_root, data)| (data.slot, *data_root));
 
         // Count our own aggregates in the same series as gossip-received ones,
         // so an aggregator does not report an empty aggregate arrival profile.
@@ -507,9 +538,24 @@ impl BlockChainServer {
         // would time us on.
         let time_config = *self.store.config();
         let publish_ms = unix_now_ms();
+        let mut count = 0usize;
 
-        for aggregate in pending {
+        for (data_root, data) in pending {
+            // `None` means every proof for this data was evicted or pruned out
+            // of both buffers between the worker producing it and this tick.
+            // The caps make that unlikely within one slot, but it is reachable,
+            // and there is nothing left to publish when it happens.
+            let Some(proof) = self.store.widest_proof_for_data(&data_root) else {
+                debug!(
+                    %slot,
+                    data_root = %ShortRoot(&data_root.0),
+                    "Buffered aggregate left the payload pool before publication"
+                );
+                continue;
+            };
             metrics::observe_gossip_aggregation_arrival(publish_ms, &time_config);
+            count += 1;
+            let aggregate = SignedAggregatedAttestation { data, proof };
             let _ = p2p
                 .publish_aggregated_attestation(aggregate)
                 .inspect_err(|err| error!(%err, "Failed to publish aggregated attestation"));
@@ -1231,17 +1277,20 @@ impl BlockChainServer {
     /// Actor lifecycle hook: bring up the always-on aggregation worker.
     ///
     /// It gets its own `Store` clone (same backend, same in-memory buffers),
-    /// the shared aggregator-role flag so a runtime toggle reaches it, and the
-    /// startup-fixed inputs its vote-propagation gate needs.
+    /// the shared aggregator-role flag and the shared sync status so runtime
+    /// changes to either reach it without a restart, and the startup-fixed
+    /// inputs its gates need.
     #[started]
     async fn on_started(&mut self, ctx: &Context<Self>) {
         self.aggregation_worker = Some(aggregation::spawn_aggregation_worker(
             self.store.clone(),
             ctx.actor_ref(),
             self.aggregator.clone(),
+            self.sync_status_controller.clone(),
             WorkerConfig {
                 attestation_committee_count: self.attestation_committee_count,
                 subscribed_subnets: self.subscribed_subnets.clone(),
+                gate_duties: self.sync_status.gate_duties(),
             },
         ));
     }
@@ -1339,10 +1388,11 @@ impl Handler<AggregateProduced> for BlockChainServer {
             data: msg.output.hashed.data().clone(),
         });
 
-        self.pending_aggregates.push(SignedAggregatedAttestation {
-            data: msg.output.hashed.data().clone(),
-            proof: msg.output.proof,
-        });
+        // Data root only: the proof is already in the pool, and re-proving the
+        // same group after a straggler signature replaces this entry instead of
+        // queueing a second near-identical aggregate behind it.
+        self.pending_aggregates
+            .insert(msg.output.hashed.root(), msg.output.hashed.data().clone());
     }
 }
 
