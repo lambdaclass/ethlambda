@@ -36,7 +36,6 @@ libssz-types.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
-
 tracing.workspace = true
 tracing-subscriber = "0.3"
 
@@ -50,6 +49,10 @@ reqwest.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
 
+# For `resolve_node_key`'s ephemeral-key generation when `--node-key` is omitted.
+secp256k1.workspace = true
+
+
 tikv-jemallocator = { workspace = true, optional = true }
 
 libc.workspace = true
@@ -60,6 +63,10 @@ libc.workspace = true
 # feature never reaches the shipped binary.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+
+# Pins the SHA-256 of the built-in mainnet genesis state, so swapping that
+# asset has to be deliberate. Tests only: nothing in the binary hashes it.
+sha2.workspace = true
 
 [build-dependencies]
 vergen-git2.workspace = true

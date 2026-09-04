@@ -1492,7 +1492,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1932,9 +1932,11 @@ dependencies = [
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "rayon",
  "reqwest",
+ "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -2022,6 +2024,7 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
+ "libp2p-mplex",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
@@ -4127,6 +4130,24 @@ dependencies = [
  "pin-project",
  "prometheus-client",
  "web-time",
+]
+
+[[package]]
+name = "libp2p-mplex"
+version = "0.44.0"
+source = "git+https://github.com/lambdaclass/rust-libp2p.git?rev=2f14d0ec9665a01cfb6a02326c90628c4bba521c#2f14d0ec9665a01cfb6a02326c90628c4bba521c"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "nohash-hasher",
+ "parking_lot",
+ "rand 0.8.6",
+ "smallvec",
+ "tracing",
+ "unsigned-varint",
 ]
 
 [[package]]
@@ -7821,6 +7842,10 @@ name = "unsigned-varint"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+]
 
 [[package]]
 name = "untrusted"

@@ -28,8 +28,17 @@ use crate::Bootnode;
 use admission::LeanFilter;
 use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 
-/// How often the dial loop looks for a new peer.
+/// How often the dial loop looks for a new peer once the node has some.
 pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How often it looks while it has none.
+///
+/// A node with zero peers is not idling, it is failing. Mainnet beacon nodes
+/// sit at their inbound cap and answer `Goodbye(129)`, "too many peers", within
+/// a millisecond of the handshake, so landing one with room takes many
+/// attempts. Five seconds between rounds is a reasonable heartbeat for a
+/// connected node and far too slow for a starving one.
+pub const DISCOVERY_STARVED_DIAL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default connected-peer count above which the dial loop stops dialing.
 /// Overridable per node via [`DiscoverySpawnConfig::target_peers`].
@@ -95,6 +104,10 @@ pub struct DiscoverySpawnConfig {
     /// instead, because it counts only peers registered over RLPx and so can
     /// never see ours; see `PEER_TABLE_TARGET_PEERS`.
     pub target_peers: usize,
+    /// The `eth2` entry to publish and to compare discovered peers against.
+    pub fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    pub custody_group_count: Option<u64>,
 }
 
 /// What the P2P actor needs from a running discovery server.
@@ -149,6 +162,8 @@ pub async fn spawn_discovery(
         p2p_port: config.p2p_port,
         subscription_subnets: config.subscription_subnets,
         attestation_committee_count: config.attestation_committee_count,
+        fork_id: config.fork_id,
+        custody_group_count: config.custody_group_count,
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
@@ -162,7 +177,7 @@ pub async fn spawn_discovery(
     // The peer table owns the filter it runs, so the dial loop keeps a clone
     // rather than sharing one: the two carry the same fork id and committee
     // count, which is what makes their judgments agree.
-    let filter = LeanFilter::new(EnrForkId::local(), config.attestation_committee_count);
+    let filter = LeanFilter::new(config.fork_id, config.attestation_committee_count);
     let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
         PEER_TABLE_TARGET_PEERS,
@@ -241,6 +256,8 @@ mod tests {
             bootnodes: Vec::new(),
             advertise_ip,
             target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         }
     }
 

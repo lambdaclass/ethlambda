@@ -128,8 +128,8 @@ The metrics below are not part of the [leanMetrics specification](https://github
 
 ### Peer Discovery
 
-Only emitted when discv5 discovery is enabled (`--discovery.enable`); see
-[Peer discovery](./discovery.md). Counts dials discovery initiated, as opposed to
+See [Peer discovery](./discovery.md), which is always on. Counts dials
+discovery initiated, as opposed to
 the static bootnode dials every node makes. Connection outcomes are not repeated
 here: a discovery dial that succeeds or fails shows up in
 `lean_peer_connection_events_total` like any other.

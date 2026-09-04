@@ -1,3 +1,13 @@
+//! What `P2PServer` does with a request/response message, whichever chain it
+//! came from.
+//!
+//! One dispatch and one set of handlers: `handle_req_resp_message` matches the
+//! flat `Request` and `ResponsePayload`, so the enum variant is the only place
+//! the two chains are told apart. Handler names follow the same convention the
+//! variants do, lean prefixed and beacon bare. What is chain-specific below the
+//! dispatch is the *body* of a handler, never the path to it; encoding lives
+//! further down still, in `crate::lean::encoding` and `crate::beacon::encoding`.
+
 use std::collections::HashSet;
 
 use ethlambda_network_api::BlockSource;
@@ -13,15 +23,24 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
 use super::{
-    BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
-    BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, Response, ResponsePayload, Status,
+    Request, Response, ResponsePayload,
     messages::{ResponseCode, error_message},
+};
+use crate::beacon::BeaconWire;
+use crate::beacon::handler::{self as beacon_handler, StatusVersion};
+use crate::beacon::messages::{BeaconStatus, Goodbye, Ping};
+use crate::lean::messages::{
+    BlocksByRangeRequest, BlocksByRootRequest, RequestedBlockRoots, Status,
+};
+use crate::lean::protocols::{
+    BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
+    BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, PendingRequestKind, RangeSyncState, p2p_protocol,
-    req_resp::RequestedBlockRoots,
+    PendingRequest, PendingRequestKind, RangeSyncState, metrics, p2p_protocol,
 };
+use libp2p::request_response::ResponseChannel;
 
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
@@ -35,23 +54,52 @@ pub async fn handle_req_resp_message(
             } => {
                 let peer_count = server.connected_peers.len();
                 match request {
-                    Request::Status(status) => {
+                    Request::LeanStatus(status) => {
                         trace!(kind = "status_request", peer_count, "P2P message received");
-                        handle_status_request(server, status, channel, peer).await;
+                        handle_lean_status_request(server, status, channel, peer).await;
                     }
-                    Request::BlocksByRoot(request) => {
+                    Request::LeanBlocksByRoot(request) => {
                         trace!(
                             kind = "blocks_by_root_request",
                             peer_count, "P2P message received"
                         );
-                        handle_blocks_by_root_request(server, request, channel, peer).await;
+                        handle_lean_blocks_by_root_request(server, request, channel, peer).await;
                     }
-                    Request::BlocksByRange(request) => {
+                    Request::LeanBlocksByRange(request) => {
                         trace!(
                             kind = "blocks_by_range_request",
                             peer_count, "P2P message received"
                         );
-                        handle_blocks_by_range_request(server, request, channel, peer).await;
+                        handle_lean_blocks_by_range_request(server, request, channel, peer).await;
+                    }
+                    // The beacon protocols. One arm each rather than a grouping
+                    // variant that the beacon handler would have to
+                    // re-discriminate: the protocol id already decided which
+                    // this is, in the codec.
+                    Request::Status(peer_status) => {
+                        trace!(
+                            kind = "beacon_status_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_status_request(server, peer, peer_status, channel).await;
+                    }
+                    Request::Ping(ping) => {
+                        trace!(kind = "beacon_ping", peer_count, "P2P message received");
+                        handle_ping(server, peer, ping, channel).await;
+                    }
+                    Request::MetaData(protocol) => {
+                        trace!(
+                            kind = "beacon_metadata_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_metadata_request(server, peer, protocol, channel).await;
+                    }
+                    Request::Goodbye(goodbye) => {
+                        trace!(kind = "beacon_goodbye", peer_count, "P2P message received");
+                        // No response: goodbye is one-way, and dropping
+                        // `channel` closes the stream, which is what the peer
+                        // is waiting for.
+                        handle_goodbye(peer, goodbye);
                     }
                 }
             }
@@ -62,11 +110,29 @@ pub async fn handle_req_resp_message(
                 let peer_count = server.connected_peers.len();
                 match response {
                     Response::Success { payload } => match payload {
-                        ResponsePayload::Status(status) => {
+                        ResponsePayload::LeanStatus(status) => {
                             trace!(kind = "status_response", peer_count, "P2P message received");
-                            handle_status_response(server, status, peer).await;
+                            handle_lean_status_response(server, status, peer).await;
                         }
-                        ResponsePayload::Blocks(blocks) => {
+                        ResponsePayload::Status(status) => {
+                            trace!(
+                                kind = "beacon_status_response",
+                                peer_count, "P2P message received"
+                            );
+                            handle_status_response(server, peer, status);
+                        }
+                        ResponsePayload::Pong(ping) => {
+                            trace!(kind = "beacon_pong", peer_count, "P2P message received");
+                            handle_pong(peer, ping);
+                        }
+                        ResponsePayload::MetaData(_) => {
+                            trace!(
+                                kind = "beacon_metadata_response",
+                                peer_count, "P2P message received"
+                            );
+                            handle_metadata_response(peer);
+                        }
+                        ResponsePayload::LeanBlocks(blocks) => {
                             trace!(kind = "blocks_response", peer_count, "P2P message received");
 
                             match server.outbound_requests.remove(&request_id) {
@@ -74,14 +140,16 @@ pub async fn handle_req_resp_message(
                                     start_slot,
                                     end_slot,
                                 }) => {
-                                    handle_blocks_by_range_response(
+                                    handle_lean_blocks_by_range_response(
                                         server, blocks, peer, start_slot, end_slot,
                                     )
                                     .await;
                                 }
                                 Some(PendingRequestKind::Root(root)) => {
-                                    handle_blocks_by_root_response(server, blocks, peer, root, ctx)
-                                        .await;
+                                    handle_lean_blocks_by_root_response(
+                                        server, blocks, peer, root, ctx,
+                                    )
+                                    .await;
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -135,7 +203,18 @@ pub async fn handle_req_resp_message(
                         "BlocksByRange request failed; retry is disabled"
                     );
                 }
-                None => {}
+                // Only the handshake is untracked, and only one failure of it
+                // is worth acting on: a peer that has dropped `status/1`
+                // refuses the stream outright, and without a handshake it never
+                // enters the sync peer set at all.
+                None => {
+                    if matches!(
+                        error,
+                        request_response::OutboundFailure::UnsupportedProtocols
+                    ) {
+                        crate::beacon::handler::retry_status_on_other_version(server, peer).await;
+                    }
+                }
             }
         }
         request_response::Event::InboundFailure {
@@ -154,7 +233,29 @@ pub async fn handle_req_resp_message(
     }
 }
 
-async fn handle_status_request(
+/// Answer a request with a success payload.
+///
+/// Every request handler on either chain ends here, which is most of what the
+/// two have in common above encoding.
+fn respond(server: &mut P2PServer, channel: ResponseChannel<Response>, payload: ResponsePayload) {
+    server
+        .swarm_handle
+        .send_response(channel, Response::success(payload));
+}
+
+/// Answer a request with an error code and a reason.
+fn refuse(
+    server: &mut P2PServer,
+    channel: ResponseChannel<Response>,
+    code: ResponseCode,
+    reason: &str,
+) {
+    server
+        .swarm_handle
+        .send_response(channel, Response::error(code, error_message(reason)));
+}
+
+async fn handle_lean_status_request(
     server: &mut P2PServer,
     request: Status,
     channel: request_response::ResponseChannel<Response>,
@@ -162,11 +263,10 @@ async fn handle_status_request(
 ) {
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
     let our_status = build_status(&server.store);
-    let response = Response::success(ResponsePayload::Status(our_status));
-    server.swarm_handle.send_response(channel, response);
+    respond(server, channel, ResponsePayload::LeanStatus(our_status));
 }
 
-async fn handle_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
+async fn handle_lean_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
 
     let our_head_slot = server.store.head_slot();
@@ -200,7 +300,7 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
     trace!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
 }
 
-async fn handle_blocks_by_root_request(
+async fn handle_lean_blocks_by_root_request(
     server: &mut P2PServer,
     request: BlocksByRootRequest,
     channel: request_response::ResponseChannel<Response>,
@@ -220,11 +320,10 @@ async fn handle_blocks_by_root_request(
     let found = blocks.len();
     trace!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
-    let response = Response::success(ResponsePayload::Blocks(blocks));
-    server.swarm_handle.send_response(channel, response);
+    respond(server, channel, ResponsePayload::LeanBlocks(blocks));
 }
 
-async fn handle_blocks_by_range_request(
+async fn handle_lean_blocks_by_range_request(
     server: &mut P2PServer,
     request: BlocksByRangeRequest,
     channel: request_response::ResponseChannel<Response>,
@@ -238,11 +337,12 @@ async fn handle_blocks_by_range_request(
     );
 
     if request.count == 0 || request.count > MAX_REQUEST_BLOCKS {
-        let response = Response::error(
+        refuse(
+            server,
+            channel,
             ResponseCode::INVALID_REQUEST,
-            error_message("invalid BlocksByRange request"),
+            "invalid BlocksByRange request",
         );
-        server.swarm_handle.send_response(channel, response);
         return;
     }
 
@@ -256,8 +356,7 @@ async fn handle_blocks_by_range_request(
         "Responding to BlocksByRange request"
     );
 
-    let response = Response::success(ResponsePayload::Blocks(blocks));
-    server.swarm_handle.send_response(channel, response);
+    respond(server, channel, ResponsePayload::LeanBlocks(blocks));
 }
 
 fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<SignedBlock> {
@@ -285,7 +384,7 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         .unwrap_or_default()
 }
 
-async fn handle_blocks_by_root_response(
+async fn handle_lean_blocks_by_root_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
     peer: PeerId,
@@ -321,7 +420,7 @@ async fn handle_blocks_by_root_response(
     }
 }
 
-async fn handle_blocks_by_range_response(
+async fn handle_lean_blocks_by_range_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
     peer: PeerId,
@@ -449,7 +548,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         .swarm_handle
         .send_request(
             peer,
-            Request::BlocksByRoot(request),
+            Request::LeanBlocksByRoot(request),
             libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
         )
         .await
@@ -506,7 +605,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
         .swarm_handle
         .send_request(
             peer,
-            Request::BlocksByRange(request),
+            Request::LeanBlocksByRange(request),
             libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
         )
         .await
@@ -583,6 +682,138 @@ async fn handle_fetch_failure(
     pending.attempts += 1;
 
     send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+}
+
+/// The beacon wire, or a refusal sent on `channel`.
+///
+/// A beacon request reaching a lean node means a peer negotiated a protocol
+/// this process does not serve, which is the peer's error to hear about rather
+/// than a stream to drop silently. Every request handler below opens with this,
+/// which is what the beacon module's single request entry point did once at
+/// the top of its match, before the dispatch grew an arm per protocol.
+fn beacon_wire_or_refuse(
+    server: &mut P2PServer,
+    peer: PeerId,
+    channel: ResponseChannel<Response>,
+) -> Option<(&BeaconWire, ResponseChannel<Response>)> {
+    if server.wire.beacon().is_none() {
+        warn!(%peer, "Beacon request arrived on a lean node; refusing");
+        refuse(
+            server,
+            channel,
+            ResponseCode::INVALID_REQUEST,
+            "this node does not speak the beacon protocols",
+        );
+        return None;
+    }
+    // Re-taken as a shared borrow now that the `send_response` above, which
+    // needs `&mut server`, is behind us.
+    server.wire.beacon().map(|wire| (wire, channel))
+}
+
+/// Answer `status/N` with our own, and record what the peer told us.
+async fn handle_status_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    peer_status: BeaconStatus,
+    channel: ResponseChannel<Response>,
+) {
+    let Some((wire, channel)) = beacon_wire_or_refuse(server, peer, channel) else {
+        return;
+    };
+    if peer_status.fork_digest() != wire.fork_digest {
+        // Not grounds for closing the stream: the peer told us who it is and we
+        // answer honestly. Counting it is how a digest that has moved under us
+        // becomes visible.
+        warn!(
+            %peer,
+            peer_digest = %hex::encode(peer_status.fork_digest()),
+            our_digest = %hex::encode(wire.fork_digest),
+            "Peer is on another fork digest"
+        );
+        metrics::inc_beacon_status_digest_mismatch();
+    } else {
+        trace!(
+            %peer,
+            peer_head_slot = peer_status.head_slot(),
+            peer_finalized_epoch = peer_status.finalized_epoch(),
+            "Beacon status received"
+        );
+    }
+    let our_status = beacon_handler::build_status(wire, StatusVersion::of(&peer_status));
+    respond(server, channel, ResponsePayload::Status(our_status));
+}
+
+/// Answer `ping/1` with our metadata sequence number.
+async fn handle_ping(
+    server: &mut P2PServer,
+    peer: PeerId,
+    ping: Ping,
+    channel: ResponseChannel<Response>,
+) {
+    let Some((wire, channel)) = beacon_wire_or_refuse(server, peer, channel) else {
+        return;
+    };
+    debug!(%peer, peer_seq_number = ping.seq_number, "Ping received");
+    let pong = Ping {
+        seq_number: wire.metadata_seq_number,
+    };
+    respond(server, channel, ResponsePayload::Pong(pong));
+}
+
+/// Answer `metadata/N` in the version the peer negotiated.
+async fn handle_metadata_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    protocol: &'static str,
+    channel: ResponseChannel<Response>,
+) {
+    let Some((wire, channel)) = beacon_wire_or_refuse(server, peer, channel) else {
+        return;
+    };
+    let Some(metadata) = beacon_handler::build_metadata(wire, protocol) else {
+        warn!(%peer, protocol, "No metadata shape for this protocol");
+        return;
+    };
+    respond(server, channel, ResponsePayload::MetaData(metadata));
+}
+
+/// Record a `goodbye/1`. One-way, so the caller drops the channel.
+fn handle_goodbye(peer: PeerId, Goodbye { reason }: Goodbye) {
+    trace!(%peer, reason, "Peer said goodbye");
+}
+
+/// Record the peer's answer to our handshake. Nothing is driven off one yet.
+fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: BeaconStatus) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    if status.fork_digest() != wire.fork_digest {
+        warn!(
+            %peer,
+            peer_digest = %hex::encode(status.fork_digest()),
+            our_digest = %hex::encode(wire.fork_digest),
+            "Handshake answered from another fork digest"
+        );
+        metrics::inc_beacon_status_digest_mismatch();
+        return;
+    }
+    trace!(
+        %peer,
+        peer_head_slot = status.head_slot(),
+        peer_finalized_epoch = status.finalized_epoch(),
+        "Beacon handshake complete"
+    );
+}
+
+/// Record a pong. Nothing is driven off one yet.
+fn handle_pong(peer: PeerId, ping: Ping) {
+    debug!(%peer, peer_seq_number = ping.seq_number, "Pong received");
+}
+
+/// Record a peer's metadata. Nothing is driven off one yet.
+fn handle_metadata_response(peer: PeerId) {
+    debug!(%peer, "Peer metadata received");
 }
 
 #[cfg(test)]

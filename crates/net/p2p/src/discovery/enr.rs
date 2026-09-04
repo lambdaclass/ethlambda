@@ -22,11 +22,9 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use ethlambda_types::constants::FORK_DIGEST;
 use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
 use ethrex_p2p::utils::public_key_from_signing_key;
 use libssz::SszEncode;
-use libssz_derive::{SszDecode, SszEncode};
 use secp256k1::SecretKey;
 
 use super::DiscoveryError;
@@ -34,41 +32,14 @@ use super::DiscoveryError;
 pub(crate) const QUIC_ENR_KEY: &[u8] = b"quic";
 pub(crate) const ETH2_ENR_KEY: &[u8] = b"eth2";
 pub(crate) const ATTNETS_ENR_KEY: &[u8] = b"attnets";
+pub(crate) const CGC_ENR_KEY: &[u8] = b"cgc";
 
-/// Fork version of the next planned hard fork. The spec says to set this to the
-/// current fork version when no fork is planned; lean has neither.
-pub(crate) const NEXT_FORK_VERSION: [u8; 4] = [0; 4];
-
-/// Sentinel for "no fork is scheduled", per the beacon spec.
-pub(crate) const FAR_FUTURE_EPOCH: u64 = u64::MAX;
-
-/// The `eth2` ENR entry: SSZ, 16 bytes, byte-identical to the beacon-chain
-/// `ENRForkID` container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
-pub(crate) struct EnrForkId {
-    pub(crate) fork_digest: [u8; 4],
-    pub(crate) next_fork_version: [u8; 4],
-    pub(crate) next_fork_epoch: u64,
-}
-
-impl EnrForkId {
-    /// This node's fork id. Constant for the lifetime of the process.
-    pub(crate) fn local() -> Self {
-        Self {
-            fork_digest: fork_digest(),
-            next_fork_version: NEXT_FORK_VERSION,
-            next_fork_epoch: FAR_FUTURE_EPOCH,
-        }
-    }
-}
-
-/// [`FORK_DIGEST`] as raw bytes. The constant is the same hex string embedded in
-/// every gossipsub topic name, so the ENR and the topics cannot disagree.
-pub(crate) fn fork_digest() -> [u8; 4] {
-    u32::from_str_radix(FORK_DIGEST, 16)
-        .expect("FORK_DIGEST must be 8 hex digits")
-        .to_be_bytes()
-}
+// The `eth2` entry's container, its two "no fork is planned" constants, and the
+// lean fork digest. They live in `ethlambda-types` rather than here because the
+// binary has to name the type to hand one in, and because the beacon wire
+// computes its digest at startup from the fork schedule; re-exported at this
+// module's old paths so every use site inside the crate is unchanged.
+pub use ethlambda_types::enr::{EnrForkId, FAR_FUTURE_EPOCH, NEXT_FORK_VERSION, fork_digest};
 
 /// Encode subscribed attestation subnets as the `attnets` bitfield: bit `i` set
 /// means subnet `i` is subscribed.
@@ -123,6 +94,18 @@ pub(crate) struct LocalEnrParams {
     pub(crate) p2p_port: u16,
     pub(crate) subscription_subnets: HashSet<u64>,
     pub(crate) attestation_committee_count: u64,
+    /// The `eth2` entry to publish.
+    ///
+    /// Lean's is a compile-time constant, but the beacon wire computes its
+    /// digest from the fork schedule and the anchor's genesis validators root
+    /// at startup, so this cannot be reached for internally.
+    pub(crate) fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    ///
+    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire, even though nothing is
+    /// custodied yet: peers may reject a lower value outright, which would
+    /// defeat the mode. `None` on lean, which has no data-availability domain.
+    pub(crate) custody_group_count: Option<u64>,
 }
 
 impl LocalEnrParams {
@@ -164,9 +147,12 @@ impl LocalEnrParams {
         // in the built record, so the answers are not checked here.
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
-        pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
+        pairs.set_extra(ETH2_ENR_KEY, self.fork_id.to_ssz());
         if let Some(quic_port) = dialable_port(self.p2p_port) {
             pairs.set_extra_int(QUIC_ENR_KEY, quic_port.into());
+        }
+        if let Some(count) = self.custody_group_count {
+            pairs.set_extra_int(CGC_ENR_KEY, count);
         }
         pairs
     }
@@ -258,29 +244,83 @@ mod tests {
             p2p_port: 9001,
             subscription_subnets: HashSet::from([1u64, 4]),
             attestation_committee_count: 8,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .expect("ENR builds")
     }
 
     #[test]
-    fn fork_digest_parses_the_constant() {
-        assert_eq!(fork_digest(), [0x12, 0x34, 0x56, 0x78]);
+    fn the_published_fork_id_is_the_one_supplied() {
+        // Lean's is a compile-time constant, but the beacon wire computes its
+        // digest from the fork schedule at startup, so the ENR builder must not
+        // reach for EnrForkId::local() behind the caller's back.
+        let supplied = EnrForkId {
+            fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+            next_fork_version: [0x06, 0x00, 0x00, 0x00],
+            next_fork_epoch: FAR_FUTURE_EPOCH,
+        };
+        let record = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: supplied,
+            custody_group_count: None,
+        })
+        .expect("ENR builds");
+
+        let raw = record
+            .pairs()
+            .extra(ETH2_ENR_KEY)
+            .expect("eth2 entry present");
+        assert_eq!(EnrForkId::from_ssz_bytes(&raw).unwrap(), supplied);
     }
 
     #[test]
-    fn enr_fork_id_is_sixteen_bytes_and_round_trips() {
-        let id = EnrForkId::local();
-        let bytes = id.to_ssz();
-        assert_eq!(bytes.len(), 16, "ENRForkID is 4 + 4 + 8 bytes");
-        assert_eq!(EnrForkId::from_ssz_bytes(&bytes).unwrap(), id);
+    fn the_custody_group_count_is_published_only_when_asked_for() {
+        // Lean has no data-availability domain, so publishing a cgc there would
+        // advertise a claim with no meaning behind it.
+        let record = build();
+        assert_eq!(record.pairs().extra(CGC_ENR_KEY), None);
+
+        let with_cgc = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(with_cgc.pairs().extra_int::<u64>(CGC_ENR_KEY), Some(4));
     }
 
     #[test]
-    fn local_fork_id_has_no_planned_fork() {
-        let id = EnrForkId::local();
-        assert_eq!(id.fork_digest, fork_digest());
-        assert_eq!(id.next_fork_version, NEXT_FORK_VERSION);
-        assert_eq!(id.next_fork_epoch, FAR_FUTURE_EPOCH);
+    fn a_sixty_four_wide_attnets_is_eight_bytes_of_zeroes() {
+        // What a node subscribing to no attestation subnet actually serves.
+        // Publishing a shorter bitfield would be a different claim: readers
+        // treat bits past the end as unset, but the beacon spec's attnets is a
+        // fixed-width Bitvector and a short one is malformed to a strict reader.
+        let record = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(
+            record.pairs().extra(ATTNETS_ENR_KEY).as_deref(),
+            Some(&[0u8; 8][..])
+        );
     }
 
     #[test]
@@ -353,6 +393,8 @@ mod tests {
             p2p_port: 0,
             subscription_subnets: HashSet::from([1u64]),
             attestation_committee_count: 8,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .expect("ENR builds");
 

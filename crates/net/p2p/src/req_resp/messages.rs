@@ -1,17 +1,34 @@
-use ethlambda_types::{ShortRoot, block::SignedBlock, checkpoint::Checkpoint, primitives::H256};
-use libssz_derive::{SszDecode, SszEncode};
+use ethlambda_types::{ShortRoot, block::SignedBlock};
 use libssz_types::SszList;
 
-pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
-pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
-pub const BLOCKS_BY_RANGE_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
-pub const MAX_REQUEST_BLOCKS: u64 = 1024; // Maximum number of blocks in a single request (1024).
+use crate::beacon::messages::{BeaconMetaData, BeaconStatus, Goodbye, Ping};
+use crate::lean::messages::{BlocksByRangeRequest, BlocksByRootRequest, Status};
 
+/// Every request either chain can send, on one flat enum.
+///
+/// One variant per protocol. Flat rather than a `Lean(..)`/`Beacon(..)` pair of
+/// sub-enums, because a request is dispatched once, on its protocol: grouping
+/// them meant the codec built two enums to encode one request, and every
+/// dispatch re-discriminated what the protocol id had already settled.
+///
+/// Only lean's variants are prefixed. `Status` exists on both wires and means
+/// different things, so one of the two has to say which it is; the beacon
+/// variants keep the name their protocol has in the beacon-chain spec, which is
+/// what a reader comparing this against that spec is looking for.
 #[derive(Debug, Clone)]
 pub enum Request {
-    Status(Status),
-    BlocksByRoot(BlocksByRootRequest),
-    BlocksByRange(BlocksByRangeRequest),
+    LeanStatus(Status),
+    LeanBlocksByRoot(BlocksByRootRequest),
+    LeanBlocksByRange(BlocksByRangeRequest),
+    Status(BeaconStatus),
+    Ping(Ping),
+    /// The negotiated `metadata/N` protocol id.
+    ///
+    /// The request is empty on the wire, but the responder has to answer in the
+    /// version the peer asked for, and `request_response::Event::Message` does
+    /// not carry the protocol id. The codec does, so it records it here.
+    MetaData(&'static str),
+    Goodbye(Goodbye),
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +58,7 @@ impl Response {
 /// Bounded summary for logs.
 ///
 /// Prefer this over `Debug` anywhere a `Response` reaches a log line. The derived
-/// `Debug` on a `Blocks` payload expands every block header and every attestation
+/// `Debug` on a `LeanBlocks` payload expands every block header and every attestation
 /// bitlist byte-by-byte, so a full `BlocksByRange` answer renders as hundreds of
 /// kilobytes on a single line — enough to be rejected outright by a log backend.
 /// `SignedBlock`'s own `Debug` already truncates the opaque proof bytes for the
@@ -50,19 +67,19 @@ impl std::fmt::Display for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Success {
-                payload: ResponsePayload::Status(status),
+                payload: ResponsePayload::LeanStatus(status),
             } => write!(
                 f,
-                "Success(Status head={}/{} finalized={}/{})",
+                "Success(LeanStatus head={}/{} finalized={}/{})",
                 status.head.slot,
                 ShortRoot(&status.head.root.0),
                 status.finalized.slot,
                 ShortRoot(&status.finalized.root.0),
             ),
             Self::Success {
-                payload: ResponsePayload::Blocks(blocks),
+                payload: ResponsePayload::LeanBlocks(blocks),
             } => {
-                write!(f, "Success(Blocks count={}", blocks.len())?;
+                write!(f, "Success(LeanBlocks count={}", blocks.len())?;
                 // Reported as first/last rather than a range: a BlocksByRoot
                 // response follows the requested root order, so the slots are
                 // not necessarily contiguous or ascending.
@@ -72,6 +89,30 @@ impl std::fmt::Display for Response {
                     write!(f, " first_slot={first_slot} last_slot={last_slot}")?;
                 }
                 write!(f, ")")
+            }
+            Self::Success {
+                payload: ResponsePayload::Status(status),
+            } => write!(
+                f,
+                "Success(Status head_slot={} finalized_epoch={} fork_digest={})",
+                status.head_slot(),
+                status.finalized_epoch(),
+                hex::encode(status.fork_digest()),
+            ),
+            Self::Success {
+                payload: ResponsePayload::Pong(ping),
+            } => write!(f, "Success(Pong seq_number={})", ping.seq_number),
+            Self::Success {
+                payload: ResponsePayload::MetaData(metadata),
+            } => {
+                // The version is what a mismatch here would be about; the
+                // bitfields behind it are not worth a log line.
+                let (version, seq_number) = match metadata {
+                    BeaconMetaData::V1(metadata) => (1, metadata.seq_number),
+                    BeaconMetaData::V2(metadata) => (2, metadata.seq_number),
+                    BeaconMetaData::V3(metadata) => (3, metadata.seq_number),
+                };
+                write!(f, "Success(MetaData v{version} seq_number={seq_number})")
             }
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
@@ -130,20 +171,20 @@ impl std::fmt::Debug for ResponseCode {
     }
 }
 
+/// Every success payload either chain can send, on one flat enum.
+///
+/// Mirrors [`Request`]: one variant per protocol, lean's prefixed. Not one
+/// variant per request variant, because [`Request::Goodbye`] is answered by
+/// closing the stream rather than by a payload.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
-    Status(Status),
-    Blocks(Vec<SignedBlock>),
+    LeanStatus(Status),
+    LeanBlocks(Vec<SignedBlock>),
+    Status(BeaconStatus),
+    Pong(Ping),
+    MetaData(BeaconMetaData),
 }
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct Status {
-    pub finalized: Checkpoint,
-    pub head: Checkpoint,
-}
-
-pub type RequestedBlockRoots = SszList<H256, 1024>;
 
 /// Error message type for non-success responses.
 /// SSZ-encoded as List[byte, 256] per spec.
@@ -168,15 +209,4 @@ pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     };
 
     ErrorMessage::try_from(truncated.to_vec()).expect("error message fits in 256 bytes")
-}
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct BlocksByRootRequest {
-    pub roots: RequestedBlockRoots,
-}
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct BlocksByRangeRequest {
-    pub start_slot: u64,
-    pub count: u64,
 }

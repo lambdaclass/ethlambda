@@ -15,9 +15,11 @@
 # Beacon Chain
 
 - [Beacon Chain State Transition](./beacon_stf.md)
+- [The mainnet wire](./beacon_wire.md)
 
 # Operations
 
+- [Command line](./cli.md)
 - [HTTP API](./rpc.md)
 - [Metrics](./metrics.md)
 - [Checkpoint Sync](./checkpoint_sync.md)

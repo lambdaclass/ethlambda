@@ -5,6 +5,14 @@ use snap::read::FrameEncoder;
 
 pub const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
+/// An `InvalidData` error, which is what every decode failure on this path is.
+///
+/// Shared with `lean::encoding` and `beacon::encoding`, which produce the same
+/// error for the same reason.
+pub fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
 // https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md#max_message_size
 pub const MAX_COMPRESSED_PAYLOAD_SIZE: usize = 32 + MAX_PAYLOAD_SIZE + MAX_PAYLOAD_SIZE / 6 + 1024; // ~12 MB
 

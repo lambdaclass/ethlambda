@@ -1,5 +1,14 @@
 pub use ethlambda_types::constants::FORK_DIGEST;
 
+/// The kind segment of a gossip topic name.
+///
+/// Both wires name a topic `/{chain}/{fork_digest}/{kind}/{encoding}`, so this
+/// reads either. It is what lets one dispatch classify a message without first
+/// asking which chain this node follows.
+pub fn topic_kind(topic: &str) -> Option<&str> {
+    topic.split('/').nth(3)
+}
+
 /// Topic kind for block gossip
 pub const BLOCK_TOPIC_KIND: &str = "block";
 /// Topic kind prefix for per-committee attestation subnets.

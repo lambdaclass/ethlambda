@@ -1,3 +1,24 @@
+//! Checkpoint sync for `ethlambda node`, against a lean peer's `/lean/v0/…`
+//! API.
+//!
+//! The URL cleaning, the base-URL trim and the "try each URL, first success
+//! wins" fan-out below were a `checkpoint_common` module while `crate::beacon`
+//! read mainnet's genesis metadata as JSON off the same `--checkpoint-sync-url`
+//! list. It reads that from the genesis state built into the binary now, so
+//! this is the only caller left and they have folded back in here.
+//!
+//! The HTTP client is built here for a reason that outlived that split: a
+//! finalized `State` is large enough to need a connect timeout plus an
+//! inactivity read timeout, where a plain total timeout would kill a healthy
+//! slow transfer.
+//!
+//! This path also fetches state and block *concurrently*, from endpoints that
+//! each mean "whatever is finalized right now", so the peer can advance
+//! finalization between the two requests. That is what
+//! [`fetch_finalized_anchor`]'s retry loop (via [`try_checkpoint_url`]) is
+//! for.
+
+use std::future::Future;
 use std::time::Duration;
 
 use ethlambda_types::block::SignedBlock;
@@ -35,6 +56,58 @@ const CHECKPOINT_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// slow-to-boot peer time to become reachable. Attempts stay within Hive's
 /// client-startup budget when each one fails fast.
 const MAX_CHECKPOINT_ATTEMPTS: u32 = 5;
+
+/// Strip one trailing slash, so `{base}{path}` never doubles one.
+fn trim_trailing_slash(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+/// Trim whitespace from each URL and drop any that become empty.
+///
+/// A shell expanding an unset variable into `--checkpoint-sync-url ""` is an
+/// easy way to end up with an empty string in the list; treating it as a URL
+/// worth dialing is never useful.
+pub(crate) fn clean_urls<I>(urls: I) -> Vec<String>
+where
+    I: IntoIterator,
+    I::Item: AsRef<str>,
+{
+    urls.into_iter()
+        .map(|url| url.as_ref().trim().to_string())
+        .filter(|url| !url.is_empty())
+        .collect()
+}
+
+/// Try each URL in turn, stopping at the first success.
+///
+/// `attempt` receives the URL (owned, not borrowed: a closure returning a
+/// future can't hand back one that borrows its own argument, since `Fut` is a
+/// single associated type rather than one per call; cloning a handful of
+/// short strings is a cheap way around that) and whether another one remains
+/// after it, so the caller can word a "trying next" vs. "no more URLs" log
+/// without this function knowing what logging looks like on either side.
+/// `on_exhausted` turns whatever `attempt` left behind into the error to
+/// return: it is called with `None` only when `urls` was empty to begin with,
+/// and with `Some(the last error)` once every URL has been tried and failed.
+async fn try_urls_in_order<T, E, Fut>(
+    urls: &[String],
+    mut attempt: impl FnMut(String, bool) -> Fut,
+    on_exhausted: impl FnOnce(Option<E>) -> E,
+) -> Result<T, E>
+where
+    Fut: Future<Output = Result<T, E>>,
+{
+    let mut iter = urls.iter().peekable();
+    let mut last_err = None;
+    while let Some(url) = iter.next() {
+        let has_more = iter.peek().is_some();
+        match attempt(url.clone(), has_more).await {
+            Ok(value) => return Ok(value),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    Err(on_exhausted(last_err))
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointSyncError {
@@ -112,13 +185,14 @@ async fn fetch_ssz<T: SszDecode>(client: &Client, url: &str) -> Result<T, Checkp
 /// `http://peer:5052/lean/v0/states/finalized`) via `--checkpoint-sync-url`.
 /// The new contract is a base URL (`http://peer:5052`) so we can derive both
 /// the state and block endpoints. To avoid breaking existing devnet scripts,
-/// strip a trailing legacy path if present and also trim any trailing slash.
+/// strip a trailing legacy path if present, on top of the trailing-slash trim
+/// [`trim_trailing_slash`] applies.
 // TODO: remove this and use the full URL
 fn normalize_base_url(url: &str) -> &str {
     // Trim trailing slashes FIRST so that the legacy-suffix strip succeeds on
     // inputs like `…/lean/v0/states/finalized/`; otherwise we'd leave the
     // state path embedded in the "base URL" and double-prefix every request.
-    let trimmed = url.trim_end_matches('/');
+    let trimmed = trim_trailing_slash(url);
     trimmed
         .strip_suffix(FINALIZED_STATE_PATH)
         .unwrap_or(trimmed)
@@ -284,33 +358,33 @@ pub async fn fetch_anchor_block_and_state(
     genesis_time: u64,
     validators: &[Validator],
 ) -> Result<(State, SignedBlock), CheckpointSyncError> {
-    let mut iter = checkpoint_urls.iter().peekable();
-    let mut last_err: Option<CheckpointSyncError> = None;
-    loop {
-        let Some(url) = iter.next() else {
-            return Err(match last_err {
-                Some(err) => {
-                    error!(%err, "All checkpoint sync attempts failed");
-                    err
+    try_urls_in_order(
+        checkpoint_urls,
+        |url, has_more| async move {
+            match try_checkpoint_url(&url, genesis_time, validators).await {
+                Ok(pair) => {
+                    info!(%url, "Checkpoint sync successful with this peer");
+                    Ok(pair)
                 }
-                None => CheckpointSyncError::NoCheckpointUrls,
-            });
-        };
-        match try_checkpoint_url(url, genesis_time, validators).await {
-            Ok(pair) => {
-                info!(%url, "Checkpoint sync successful with this peer");
-                return Ok(pair);
-            }
-            Err(err) => {
-                if iter.peek().is_some() {
-                    warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
-                } else {
-                    warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+                Err(err) => {
+                    if has_more {
+                        warn!(%url, %err, "Checkpoint sync failed for this peer; trying next URL");
+                    } else {
+                        warn!(%url, %err, "Checkpoint sync failed for this peer; no more URLs to try");
+                    }
+                    Err(err)
                 }
-                last_err = Some(err);
             }
-        }
-    }
+        },
+        |last_err| match last_err {
+            Some(err) => {
+                error!(%err, "All checkpoint sync attempts failed");
+                err
+            }
+            None => CheckpointSyncError::NoCheckpointUrls,
+        },
+    )
+    .await
 }
 
 /// Fetch the finalized anchor, retrying any failure (e.g. the peer not yet
@@ -338,6 +412,95 @@ pub async fn fetch_anchor_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The URL helpers first, then the checkpoint-sync path that uses them.
+
+    #[test]
+    fn trim_trailing_slash_strips_exactly_one() {
+        assert_eq!(trim_trailing_slash("http://peer:5052/"), "http://peer:5052");
+        assert_eq!(trim_trailing_slash("http://peer:5052"), "http://peer:5052");
+    }
+
+    #[test]
+    fn clean_urls_trims_and_drops_empties() {
+        let urls = vec![
+            " http://a ".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "http://b".to_string(),
+        ];
+        assert_eq!(clean_urls(urls), vec!["http://a", "http://b"]);
+    }
+
+    #[test]
+    fn clean_urls_accepts_a_borrowed_slice_too() {
+        // `run_node` cleans a borrowed URL list rather than consuming it;
+        // this pins that the generic bound covers that.
+        let urls = vec![" http://a ".to_string()];
+        assert_eq!(clean_urls(&urls), vec!["http://a"]);
+    }
+
+    #[tokio::test]
+    async fn try_urls_in_order_returns_the_first_success() {
+        let urls = vec!["a".to_string(), "b".to_string()];
+        let result: Result<&str, &str> = try_urls_in_order(
+            &urls,
+            |url, _has_more| async move { if url == "a" { Err("nope") } else { Ok("yes") } },
+            |_last_err| "exhausted",
+        )
+        .await;
+        assert_eq!(result, Ok("yes"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_list_is_distinguished_from_an_exhausted_one() {
+        let empty: Vec<String> = vec![];
+        let empty_result: Result<&str, &str> = try_urls_in_order(
+            &empty,
+            |_url, _has_more| async { Err("unreachable") },
+            |last_err| {
+                assert!(last_err.is_none(), "an empty list never attempts anything");
+                "no urls configured"
+            },
+        )
+        .await;
+        assert_eq!(empty_result, Err("no urls configured"));
+
+        let urls = vec!["a".to_string()];
+        let exhausted_result: Result<&str, &str> = try_urls_in_order(
+            &urls,
+            |_url, _has_more| async { Err("boom") },
+            |last_err| {
+                assert_eq!(last_err, Some("boom"));
+                "exhausted"
+            },
+        )
+        .await;
+        assert_eq!(exhausted_result, Err("exhausted"));
+    }
+
+    #[tokio::test]
+    async fn has_more_is_false_only_on_the_last_url() {
+        let urls = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let mut seen = Vec::new();
+        let _: Result<(), &str> = try_urls_in_order(
+            &urls,
+            |url, has_more| {
+                seen.push((url, has_more));
+                async { Err("keep going") }
+            },
+            |_| "exhausted",
+        )
+        .await;
+        assert_eq!(
+            seen,
+            vec![
+                ("a".to_string(), true),
+                ("b".to_string(), true),
+                ("c".to_string(), false),
+            ]
+        );
+    }
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::primitives::H256;

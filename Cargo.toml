@@ -81,6 +81,11 @@ prometheus = "0.14"
 
 clap = { version = "4.3", features = ["derive", "env"] }
 
+# Version pinned to ethrex's workspace: `SecretKey` crosses that API boundary.
+# `rand` is re-exported as `secp256k1::rand`, so nothing needs a direct dep on it
+# to seed a key.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }
+
 # Merkleizing a beacon state is almost entirely SHA-256 compressions, so which
 # implementation `sha2` picks matters. What `asm` actually buys is aarch64: on
 # x86/x86_64, sha2 0.10.9 compiles its `x86` backend and dispatches to the SHA-NI

@@ -1,3 +1,4 @@
+mod beacon;
 mod benchmark;
 mod checkpoint_sync;
 mod cli;
@@ -25,7 +26,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,7 +34,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-use cli::NodeOptions;
+use cli::{Network, Options};
 use command::Command;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
@@ -41,9 +42,10 @@ use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
-    Bootnode, P2P, PeerId, SwarmConfig, attestation_subscription_subnets, build_swarm,
-    discovery::DiscoverySpawnConfig, parse_enrs,
+    LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
+    build_swarm, discovery::DiscoverySpawnConfig, parse_enrs,
 };
+use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
@@ -71,9 +73,16 @@ const ASCII_ART: &str = r#"
 
 fn main() -> eyre::Result<()> {
     match command::parse() {
+        // Both node sub-commands are one startup path with a different
+        // `Network`. The sub-command is only how the choice is spelled on the
+        // command line.
         Command::Node(options) => {
             init_node_logging()?;
-            run_node(options)
+            run_node(options.into())
+        }
+        Command::Beacon(options) => {
+            init_node_logging()?;
+            run_node(options.into())
         }
         // The benchmark is synchronous, CPU-bound work, so it runs on this
         // thread and the tokio runtime is never started — rather than parking
@@ -110,17 +119,96 @@ fn init_benchmark_logging() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")
 }
 
+/// A node that has started, whichever chain it follows.
+///
+/// What [`wait_for_shutdown`] needs to stop, and all [`run_node`] has left to
+/// assemble once the chain-specific half is done.
+struct RunningNode {
+    p2p: P2P,
+    /// `None` on mainnet: that follower decodes gossip and imports nothing, so
+    /// there is no chain actor to drive, stop or join.
+    blockchain: Option<BlockChain>,
+    /// The HTTP server task. Returns once `shutdown` is cancelled.
+    http: tokio::task::JoinHandle<()>,
+    /// Cancelled by [`wait_for_shutdown`] to stop `http`.
+    shutdown: CancellationToken,
+}
+
+/// What one chain claims to serve, in the entries its ENR publishes and its
+/// discv5 admission filter judges peers by.
+///
+/// Split out of [`DiscoverySpawnConfig`] because the other eight fields there
+/// are the node key, the ports, the bootnodes and the peer target: operator
+/// input, identical on either chain. Writing the whole config in each arm meant
+/// typing those eight out twice, where the compiler could not tell if the two
+/// copies drifted.
+struct DiscoveryWireEntries {
+    subscription_subnets: HashSet<u64>,
+    attestation_committee_count: u64,
+    fork_id: ethlambda_types::enr::EnrForkId,
+    custody_group_count: Option<u64>,
+}
+
+/// What one chain's own setup produces, and everything [`run_node`] needs from
+/// it to put a node on the wire.
+///
+/// A data bag, not an abstraction: the `match` that fills it stays inline in
+/// `run_node`, because moving it into a method of its own would relocate the
+/// branch rather than remove it. The fields are exactly the values the two
+/// chains cannot share, in the order the code below consumes them.
+struct ChainSetup {
+    /// The wire-specific half of the swarm configuration: topics, protocol set,
+    /// `seen_ttl`, identify version, connection limits.
+    wire: WireConfig,
+    /// The ENR entries that describe the wire above: the only part of the discv5
+    /// configuration the two chains disagree about. Everything else in
+    /// [`DiscoverySpawnConfig`] is operator-supplied and identical either way,
+    /// so it is filled in once, below the match.
+    discovery: DiscoveryWireEntries,
+    /// Backs the lean req/resp handlers. Mainnet's is an empty in-memory store
+    /// that nothing on that path reads; a DB-backed one arrives with the anchor.
+    store: Store,
+    /// PeerId to node name, for logs. Empty on mainnet, which has no roster.
+    node_names: HashMap<PeerId, String>,
+    /// The validator keys and actor configuration, or `None` on mainnet, which
+    /// imports nothing and so has no chain actor.
+    chain: Option<(HashMap<u64, ValidatorKeyPair>, BlockChainConfig)>,
+}
+
+/// Boot the node, on whichever chain [`Options::network`] names.
+///
+/// One startup path, in the order it has to happen: validate the port, register
+/// the metrics, say what is running, raise the file-descriptor limit, resolve
+/// the node key, then the one `match` where the two chains differ, then the
+/// swarm, the discv5 server and the HTTP server, which are the same either way.
+/// Mainnet stops there. Lean carries on into the chain actor.
+///
+/// `Network::Lean` runs the full consensus node: a `BlockChain` actor with
+/// validator duties, a RocksDB store, checkpoint sync and the `/lean/v0` API.
+/// `Network::Mainnet` is the wire and nothing above it: it derives mainnet's
+/// fork digest, joins discv5, subscribes to the global gossip topics and logs
+/// what it decodes. It keeps no chain, so it has no fork choice and no state to
+/// answer from; the `/lean/v0` API is served there too, off an empty store, so
+/// that one HTTP call site serves both. Those endpoints answer for a chain that
+/// is not running, and fixing that is its own change.
+//
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
 // parallelism. Use a single-threaded runtime under Shadow. This is an
 // optimization, not a correctness requirement.
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
-async fn run_node(options: NodeOptions) -> eyre::Result<()> {
-    options.validate_ports()?;
+async fn run_node(options: Options) -> eyre::Result<()> {
+    let Options { common, network } = options;
+
+    // Before any side effect, so a port collision aborts ahead of the metrics
+    // registry, the fd limit and the data directory.
+    common.validate_ports()?;
 
     #[cfg(feature = "shadow-integration")]
-    init_shadow_cost(&options.shadow);
+    if let Network::Lean(lean) = &network {
+        init_shadow_cost(&lean.shadow);
+    }
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -128,9 +216,9 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     ethlambda_blockchain::metrics::set_node_start_time();
 
     let rpc_config = RpcConfig {
-        http_address: options.http_address,
-        api_port: options.api_port,
-        metrics_port: options.metrics_port,
+        http_address: common.http_address,
+        api_port: common.api_port,
+        metrics_port: common.metrics_port,
         version: version::CLIENT_VERSION,
     };
 
@@ -151,121 +239,43 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     // simulator. Detected here before any config / key / genesis loading
     // so the driver run doesn't touch --node-key, --custom-network-config-dir,
     // or any other consensus prerequisite the hive shim doesn't bother to
-    // provision.
-    if ethlambda_rpc::test_driver::test_driver_enabled() {
+    // provision. Lean-only: the endpoints it serves are lean's, and it must
+    // still precede the key resolution below.
+    if matches!(network, Network::Lean(_)) && ethlambda_rpc::test_driver::test_driver_enabled() {
         info!("HIVE_LEAN_TEST_DRIVER detected; booting in test-driver mode");
         return run_test_driver(rpc_config).await;
     }
 
-    let node_p2p_key = read_hex_file_bytes(&options.node_key).wrap_err_with(|| {
-        format!(
-            "failed to load node key from {}",
-            options.node_key.display()
-        )
-    })?;
-    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), options.gossipsub_port);
+    let node_p2p_key = resolve_node_key(common.node_key.as_deref())?;
 
     #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
     info!("Using jemalloc allocator with heap profiling enabled");
     #[cfg(any(target_env = "msvc", not(feature = "jemalloc")))]
     info!("Using system allocator");
 
-    info!(node_key=?options.node_key, "got node key");
+    info!(node_key=?common.node_key, "got node key");
 
-    let config_path = options.genesis;
-    let bootnodes_path = options.bootnodes;
-    let validators_path = options.validators;
-    let validator_config = options.validator_config;
-    let validator_keys_dir = options.hash_sig_keys_dir;
+    let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
 
-    let config_yaml = std::fs::read_to_string(&config_path).wrap_err_with(|| {
-        format!(
-            "failed to read genesis config from {}",
-            config_path.display()
-        )
-    })?;
-    let genesis_config: GenesisConfig =
-        serde_yaml_ng::from_str(&config_yaml).wrap_err_with(|| {
-            format!(
-                "failed to parse genesis config from {}",
-                config_path.display()
-            )
-        })?;
-
-    info!(
-        genesis_time = genesis_config.genesis_time,
-        milliseconds_per_slot = genesis_config.milliseconds_per_slot,
-        validator_count = genesis_config.genesis_validators.len(),
-        "Loaded genesis configuration"
+    // The `--bootnodes` file, read and parsed once. An absent flag is not an
+    // empty list: `default_bootnodes` is what each chain falls back to.
+    let bootnodes = parse_enrs(
+        common
+            .bootnodes
+            .as_deref()
+            .map(read_bootnode_strings)
+            .transpose()?
+            .unwrap_or_else(|| default_bootnodes(&network)),
     );
 
-    let validator_config_file = read_validator_config_file(&validator_config)?;
-    let node_names = load_node_names(&validator_config_file);
-
-    // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
-    // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
-    // bound here so a YAML value of 0 cannot bypass it.
-    let attestation_committee_count = options
-        .attestation_committee_count
-        .or(validator_config_file.config.attestation_committee_count)
-        .unwrap_or(1);
-    eyre::ensure!(
-        attestation_committee_count >= 1,
-        "attestation_committee_count must be >= 1 (got {attestation_committee_count})"
-    );
-    info!(
-        attestation_committee_count,
-        "Loaded attestation committee count"
-    );
-    ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
-
-    let bootnodes = read_bootnodes(&bootnodes_path)?;
-
-    let validator_keys =
-        read_validator_keys(&validators_path, &validator_keys_dir, &options.node_id)
-            .wrap_err("failed to load validator keys")?;
-
-    let data_dir =
-        std::path::absolute(&options.data_dir).unwrap_or_else(|_| options.data_dir.clone());
-    info!(data_dir = %data_dir.display(), "Initializing DB");
-    std::fs::create_dir_all(&data_dir)
-        .wrap_err_with(|| format!("failed to create data directory {}", data_dir.display()))?;
-    let backend = Arc::new(
-        RocksDBBackend::open(&data_dir)
-            .map_err(|err| eyre::eyre!("{err}"))
-            .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
-    );
-
-    let clean_checkpoint_urls: Vec<String> = options
-        .checkpoint_sync_url
-        .into_iter()
-        .map(|url| url.trim().to_string())
-        .filter(|url| !url.is_empty())
-        .collect();
-
-    let store = fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
-        .await
-        .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
-
-    let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
-
-    // Shared, runtime-mutable aggregator flag. Seeded from the CLI and
-    // threaded into both the blockchain actor (which reads on every tick)
-    // and the API server (which exposes GET/POST admin endpoints).
-    let aggregator = AggregatorController::new(options.is_aggregator);
-
-    // Attestation subnets this node subscribes to, computed once and shared by
-    // the P2P swarm (to open gossip subscriptions) and the blockchain actor
-    // (to size the early-aggregation threshold), so both agree on which subnets
-    // feed this node's gossip groups. Subscriptions are fixed at startup and
-    // are not re-evaluated when the aggregator role is toggled at runtime; see
-    // the hot-standby note on SwarmConfig.
-    let subscribed_subnets = attestation_subscription_subnets(
-        &validator_ids,
-        attestation_committee_count,
-        options.is_aggregator,
-        options.aggregate_subnet_ids.as_deref(),
-    );
+    // Shared, runtime-mutable aggregator flag, seeded from the CLI flag only
+    // `node` takes: mainnet has no aggregation duty. Threaded into both the
+    // blockchain actor, which reads it on every tick, and the API server, whose
+    // admin endpoints can flip it at runtime.
+    let aggregator = AggregatorController::new(match &network {
+        Network::Lean(lean) => lean.is_aggregator,
+        Network::Mainnet => false,
+    });
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
     // tick (alongside the `lean_node_sync_status` metric); the RPC
@@ -279,90 +289,285 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
-    let blockchain_config = BlockChainConfig {
-        aggregator: aggregator.clone(),
-        sync_status_controller: sync_status.clone(),
-        attestation_committee_count,
-        gate_duties: !options.disable_duty_sync_gate,
-        subscribed_subnets: subscribed_subnets.clone(),
-        proposer_config: ProposerConfig {
-            enable_proposer_aggregation: options.enable_proposer_aggregation,
-            max_attestations_per_block: options.max_attestations_per_block,
-        },
+    // The one place the two chains diverge. Everything above is shared setup;
+    // everything below is shared startup and, in `wait_for_shutdown`, shared
+    // teardown.
+    let setup = match network {
+        // The full lean consensus node: a chain actor with validator duties, a
+        // RocksDB store, checkpoint sync and the `/lean/v0` API.
+        Network::Lean(lean) => {
+            let config_path = lean.genesis;
+            let validators_path = lean.validators;
+            let validator_config = lean.validator_config;
+            let validator_keys_dir = lean.hash_sig_keys_dir;
+
+            let config_yaml = std::fs::read_to_string(&config_path).wrap_err_with(|| {
+                format!(
+                    "failed to read genesis config from {}",
+                    config_path.display()
+                )
+            })?;
+            let genesis_config: GenesisConfig = serde_yaml_ng::from_str(&config_yaml)
+                .wrap_err_with(|| {
+                    format!(
+                        "failed to parse genesis config from {}",
+                        config_path.display()
+                    )
+                })?;
+
+            info!(
+                genesis_time = genesis_config.genesis_time,
+                milliseconds_per_slot = genesis_config.milliseconds_per_slot,
+                validator_count = genesis_config.genesis_validators.len(),
+                "Loaded genesis configuration"
+            );
+
+            let validator_config_file = read_validator_config_file(&validator_config)?;
+            let node_names = load_node_names(&validator_config_file);
+
+            // Resolve attestation_committee_count: CLI flag > validator-config.yaml > 1.
+            // The CLI path is bounded by clap's `range(1..)`; enforce the same lower
+            // bound here so a YAML value of 0 cannot bypass it.
+            let attestation_committee_count = lean
+                .attestation_committee_count
+                .or(validator_config_file.config.attestation_committee_count)
+                .unwrap_or(1);
+            eyre::ensure!(
+                attestation_committee_count >= 1,
+                "attestation_committee_count must be >= 1 (got {attestation_committee_count})"
+            );
+            info!(
+                attestation_committee_count,
+                "Loaded attestation committee count"
+            );
+            ethlambda_blockchain::metrics::set_attestation_committee_count(
+                attestation_committee_count,
+            );
+
+            let validator_keys =
+                read_validator_keys(&validators_path, &validator_keys_dir, &lean.node_id)
+                    .wrap_err("failed to load validator keys")?;
+
+            let data_dir =
+                std::path::absolute(&common.data_dir).unwrap_or_else(|_| common.data_dir.clone());
+            info!(data_dir = %data_dir.display(), "Initializing DB");
+            std::fs::create_dir_all(&data_dir).wrap_err_with(|| {
+                format!("failed to create data directory {}", data_dir.display())
+            })?;
+            let backend = Arc::new(
+                RocksDBBackend::open(&data_dir)
+                    .map_err(|err| eyre::eyre!("{err}"))
+                    .wrap_err_with(|| {
+                        format!("failed to open RocksDB at {}", data_dir.display())
+                    })?,
+            );
+
+            let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
+
+            let store =
+                fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
+                    .await
+                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+
+            let validator_ids: Vec<u64> = validator_keys.keys().copied().collect();
+
+            // Attestation subnets this node subscribes to, computed once and shared by
+            // the P2P swarm (to open gossip subscriptions) and the blockchain actor
+            // (to size the early-aggregation threshold), so both agree on which subnets
+            // feed this node's gossip groups. Subscriptions are fixed at startup and
+            // are not re-evaluated when the aggregator role is toggled at runtime; see
+            // the hot-standby note on SwarmConfig.
+            let subscribed_subnets = attestation_subscription_subnets(
+                &validator_ids,
+                attestation_committee_count,
+                lean.is_aggregator,
+                lean.aggregate_subnet_ids.as_deref(),
+            );
+
+            let blockchain_config = BlockChainConfig {
+                aggregator: aggregator.clone(),
+                sync_status_controller: sync_status.clone(),
+                attestation_committee_count,
+                gate_duties: !lean.disable_duty_sync_gate,
+                subscribed_subnets: subscribed_subnets.clone(),
+                proposer_config: ProposerConfig {
+                    enable_proposer_aggregation: lean.enable_proposer_aggregation,
+                    max_attestations_per_block: lean.max_attestations_per_block,
+                },
+            };
+
+            ChainSetup {
+                wire: WireConfig::Lean(LeanWireConfig {
+                    validator_ids,
+                    attestation_committee_count,
+                    subscription_subnets: subscribed_subnets.clone(),
+                    milliseconds_per_slot: genesis_config.milliseconds_per_slot,
+                }),
+                discovery: DiscoveryWireEntries {
+                    subscription_subnets: subscribed_subnets,
+                    attestation_committee_count,
+                    fork_id: ethlambda_types::enr::EnrForkId::local(),
+                    custody_group_count: None,
+                },
+                store,
+                node_names,
+                chain: Some((validator_keys, blockchain_config)),
+            }
+        }
+        // The Ethereum Beacon Chain follower: the wire and nothing above it.
+        // Every network parameter is derived rather than configured, from the
+        // genesis state built into the binary: the fork digest depends on the
+        // epoch, which depends on genesis time. See `crate::beacon`.
+        Network::Mainnet => {
+            info!(
+                bootnodes = ?common.bootnodes,
+                gossipsub_port = common.gossipsub_port,
+                http_address = %common.http_address,
+                metrics_port = common.metrics_port,
+                discovery_port = common.discovery.port,
+                advertise_ip = ?common.discovery.advertise_ip,
+                "Resolved mainnet configuration"
+            );
+
+            let params = beacon::wire_params()?;
+
+            // An empty lean store. `P2PServer` holds one for the lean handlers;
+            // no beacon path reads it, because this node decodes gossip and
+            // imports nothing. A DB-backed beacon store arrives with the anchor.
+            let store = Store::from_anchor_state(
+                Arc::new(ethlambda_storage::backend::InMemoryBackend::default()),
+                State::from_genesis(params.wire.genesis_time, Vec::new()),
+                // The lean cadence, for a lean store no beacon path reads: the
+                // beacon chain's own slot duration lives in `params.wire`.
+                DEFAULT_MILLISECONDS_PER_SLOT,
+            );
+
+            ChainSetup {
+                wire: WireConfig::Beacon(Box::new(params.wire)),
+                discovery: DiscoveryWireEntries {
+                    // No attestation subnet is subscribed, so the bitfield is
+                    // 64 bits all unset: exactly what this node serves.
+                    subscription_subnets: Default::default(),
+                    attestation_committee_count:
+                        ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
+                    fork_id: params.fork_id,
+                    custody_group_count: Some(
+                        ethlambda_p2p::beacon::constants::CUSTODY_REQUIREMENT,
+                    ),
+                },
+                store,
+                node_names: HashMap::new(),
+                // Nothing is imported, so there is no chain actor.
+                chain: None,
+            }
+        }
     };
 
-    let blockchain = BlockChain::spawn(
-        store.clone(),
-        validator_keys,
-        blockchain_config,
-        events.clone(),
-    );
+    // The operator-supplied half of the discv5 configuration, which neither
+    // chain varies. Built before `build_swarm` because that moves the node key
+    // and the bootnode list.
+    let discovery = DiscoverySpawnConfig {
+        node_key: node_p2p_key.clone(),
+        bind_ip: p2p_socket.ip(),
+        discovery_port: common.discovery.port,
+        // Advertised as both the `quic` and `tcp` entries: TCP and UDP are
+        // separate namespaces, so `build_swarm` binds both from this one number.
+        p2p_port: p2p_socket.port(),
+        bootnodes: bootnodes.clone(),
+        advertise_ip: common.discovery.advertise_ip,
+        target_peers: common.discovery.target_peers,
+        subscription_subnets: setup.discovery.subscription_subnets,
+        attestation_committee_count: setup.discovery.attestation_committee_count,
+        fork_id: setup.discovery.fork_id,
+        custody_group_count: setup.discovery.custody_group_count,
+    };
 
     let built = build_swarm(SwarmConfig {
-        node_key: node_p2p_key.clone(),
-        bootnodes: bootnodes.clone(),
+        node_key: node_p2p_key,
+        bootnodes,
         listening_socket: p2p_socket,
-        validator_ids,
-        attestation_committee_count,
-        subscription_subnets: subscribed_subnets.clone(),
-        milliseconds_per_slot: genesis_config.milliseconds_per_slot,
+        wire: setup.wire,
     })
     .wrap_err("failed to build swarm")?;
 
-    // Capture the local peer ID before `built` is moved into the P2P actor; the
-    // RPC `/lean/v0/node/identity` endpoint reports it.
+    // Captured before `built` is moved into the P2P actor; the RPC
+    // `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
-    // `None` when discovery is disabled; `P2P::spawn` starts the discv5 server
-    // from it and owns the resulting handle.
-    let discovery = options.discovery.enable.then(|| DiscoverySpawnConfig {
-        node_key: node_p2p_key,
-        bind_ip: p2p_socket.ip(),
-        discovery_port: options.discovery.port,
-        p2p_port: p2p_socket.port(),
-        subscription_subnets: subscribed_subnets,
-        attestation_committee_count,
-        bootnodes,
-        advertise_ip: options.discovery.advertise_ip,
-        target_peers: options.discovery.target_peers,
-    });
-
-    let p2p = P2P::spawn(built, store.clone(), node_names, discovery)
+    // `P2P::spawn` starts the discv5 server from this and owns the resulting
+    // handle.
+    let p2p = P2P::spawn(built, setup.store.clone(), setup.node_names, discovery)
         .await
         .wrap_err("failed to start discv5 discovery")?;
 
-    // Wire actors together via protocol refs
-    blockchain
-        .actor_ref()
-        .recipient::<InitP2P>()
-        .send(InitP2P {
-            p2p: p2p.actor_ref().to_block_chain_to_p2p_ref(),
-        })
-        .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
-    p2p.actor_ref()
-        .recipient::<InitBlockChain>()
-        .send(InitBlockChain {
-            blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
-        })
-        .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
+    let shutdown = CancellationToken::new();
+    let rpc_shutdown = shutdown.clone();
+    let rpc_store = setup.store.clone();
+    let rpc_aggregator = aggregator.clone();
+    let rpc_sync_status = sync_status.clone();
+    let rpc_events = events.clone();
 
-    let shutdown_token = CancellationToken::new();
-    let rpc_shutdown = shutdown_token.clone();
-
-    let rpc_handle = tokio::spawn(async move {
+    let http = tokio::spawn(async move {
         let _ = ethlambda_rpc::start_rpc_server(
             rpc_config,
-            store,
-            aggregator,
-            sync_status,
+            rpc_store,
+            rpc_aggregator,
+            rpc_sync_status,
             local_peer_id,
-            events,
+            rpc_events,
             rpc_shutdown,
         )
         .await
         .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
+    let mut running_node = RunningNode {
+        p2p,
+        blockchain: None,
+        http,
+        shutdown,
+    };
+
+    let Some((validator_keys, blockchain_config)) = setup.chain else {
+        // Mainnet is the wire and nothing above it: no chain actor to spawn,
+        // wire up, stop or join.
+        wait_for_shutdown(running_node).await;
+        return Ok(());
+    };
+
+    let blockchain = BlockChain::spawn(setup.store, validator_keys, blockchain_config, events);
+
+    let p2p_ref = running_node.p2p.actor_ref();
+    let p2p = p2p_ref.to_block_chain_to_p2p_ref();
+
+    // Wire actors together via protocol refs
+    blockchain
+        .actor_ref()
+        .recipient::<InitP2P>()
+        .send(InitP2P { p2p })
+        .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
+
+    p2p_ref
+        .recipient::<InitBlockChain>()
+        .send(InitBlockChain {
+            blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
+        })
+        .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
+
+    running_node.blockchain = Some(blockchain);
+    wait_for_shutdown(running_node).await;
+    Ok(())
+}
+
+/// Wait for ctrl-c, then stop and join whatever is running.
+///
+/// A 2nd, 3rd and 4th ctrl-c escalate to `std::process::exit(1)` rather than
+/// leaving shutdown stuck on an actor that hangs in `stop()`/`join()`.
+///
+/// Shared by both chains. Mainnet used to park on `pending()` here, so a
+/// follower killed mid-write left recovery to do; it now tears down the same
+/// way the lean node does.
+async fn wait_for_shutdown(node: RunningNode) {
     info!("Node initialized");
 
     // 1st ctrl+c: start graceful shutdown
@@ -385,19 +590,82 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         std::process::exit(1);
     });
 
-    let blockchain_ref = blockchain.actor_ref().clone();
-    let p2p_ref = p2p.actor_ref().clone();
-    blockchain_ref.context().stop();
-    p2p_ref.context().stop();
-    shutdown_token.cancel();
+    let blockchain_ref = node
+        .blockchain
+        .as_ref()
+        .map(|blockchain| blockchain.actor_ref().clone());
+    let p2p_ref = node.p2p.actor_ref().clone();
 
-    blockchain_ref.join().await;
+    if let Some(blockchain_ref) = &blockchain_ref {
+        blockchain_ref.context().stop();
+    }
+    p2p_ref.context().stop();
+    node.shutdown.cancel();
+
+    if let Some(blockchain_ref) = blockchain_ref {
+        blockchain_ref.join().await;
+    }
     p2p_ref.join().await;
-    let _ = rpc_handle.await;
+    let _ = node.http.await;
 
     info!("Shutdown complete");
+}
 
-    Ok(())
+/// The ENRs to start from when `--bootnodes` was not given.
+///
+/// Mainnet publishes a bootnode list, so an absent flag means "use it". A lean
+/// network's ENRs are per-deployment, so there is nothing to default to and an
+/// absent flag means this node reaches peers only through discv5. That case
+/// warns, because a node that then finds nobody is islanded and otherwise looks
+/// healthy.
+fn default_bootnodes(network: &Network) -> Vec<String> {
+    match network {
+        Network::Lean(_) => {
+            warn!(
+                "No --bootnodes file supplied: starting with no bootnodes. This node can \
+                 only find peers via discv5."
+            );
+            Vec::new()
+        }
+        Network::Mainnet => beacon::MAINNET_BOOTNODES
+            .iter()
+            .map(|enr| enr.to_string())
+            .collect(),
+    }
+}
+
+/// Read a bootnode file into one ENR string per entry.
+///
+/// Shared by both chains: [`run_node`] reads the file once and hands the result
+/// to [`parse_enrs`], which skips an unusable record with a warning rather than
+/// failing startup, and warns again if that leaves the list empty.
+///
+/// YAML first, then a line-oriented fallback. The two sub-commands arrived
+/// with different readers: `node` required a strict YAML sequence, `beacon`
+/// used a tolerant line parser so that a list pasted from a chat message or a
+/// comment left in the file would still work. Trying YAML first makes the
+/// merged reader a true superset of both, which a line parser alone is not: a
+/// quoted (`"enr:..."`) or flow-style (`["enr:...", ...]`) sequence is valid
+/// YAML that `node` accepted before, and a line parser would hand its quotes
+/// and brackets on to `parse_enrs`.
+///
+/// The fallback is not an error path. Anything YAML rejects, a bare list with
+/// no `- ` markers or a stray `#` comment in a file that is otherwise a flow
+/// sequence, is exactly what the tolerant reader exists for.
+fn read_bootnode_strings(path: &Path) -> eyre::Result<Vec<String>> {
+    let contents = std::fs::read_to_string(path)
+        .wrap_err_with(|| format!("failed to read bootnodes from {}", path.display()))?;
+
+    if let Ok(entries) = serde_yaml_ng::from_str::<Vec<String>>(&contents) {
+        return Ok(entries);
+    }
+
+    Ok(contents
+        .lines()
+        .map(|line| line.trim().trim_start_matches("- ").trim())
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| line.to_string())
+        .collect())
 }
 
 /// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
@@ -506,23 +774,6 @@ fn load_node_names(file: &ValidatorConfigFile) -> HashMap<PeerId, String> {
         .collect();
 
     ethlambda_p2p::derive_peer_ids(names_and_privkeys)
-}
-
-fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> eyre::Result<Vec<Bootnode>> {
-    let bootnodes_path = bootnodes_path.as_ref();
-    let bootnodes_yaml = std::fs::read_to_string(bootnodes_path).wrap_err_with(|| {
-        format!(
-            "failed to read bootnodes file from {}",
-            bootnodes_path.display()
-        )
-    })?;
-    let enrs: Vec<String> = serde_yaml_ng::from_str(&bootnodes_yaml).wrap_err_with(|| {
-        format!(
-            "failed to parse bootnodes file from {}",
-            bootnodes_path.display()
-        )
-    })?;
-    Ok(parse_enrs(enrs))
 }
 
 /// One entry in `annotated_validators.yaml` as emitted by `lean-quickstart`'s
@@ -694,6 +945,35 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
         .wrap_err_with(|| format!("failed to decode hex file from {}", path.display()))
 }
 
+/// Resolve a sub-command's node key: read `--node-key` if given, otherwise
+/// generate a fresh secp256k1 key in memory.
+///
+/// Shared by both sub-commands, since `--node-key` is optional on both. There
+/// is no precedent elsewhere in this binary for writing generated key material
+/// to `--data-dir`, and doing so would need file permissions this repo does
+/// not otherwise establish; keeping it in memory only is the conservative
+/// choice, so a generated identity does not survive a restart.
+///
+/// The warning matters more on `node` than on `beacon`. `beacon` is a
+/// read-only follower with no validator identity to protect, but a lean node
+/// that silently changes PeerId every restart loses its place in every peer's
+/// scoring and in any ENR its neighbours cached.
+fn resolve_node_key(node_key_path: Option<&Path>) -> eyre::Result<Vec<u8>> {
+    match node_key_path {
+        Some(path) => read_hex_file_bytes(path)
+            .wrap_err_with(|| format!("failed to load node key from {}", path.display())),
+        None => {
+            let generated = secp256k1::SecretKey::new(&mut secp256k1::rand::rngs::OsRng);
+            warn!(
+                "No --node-key supplied: generated an ephemeral secp256k1 key in memory for \
+                 this run only. This node's PeerId and ENR will be different on the next \
+                 start; pass --node-key with a persisted key file for a stable identity."
+            );
+            Ok(generated.secret_bytes().to_vec())
+        }
+    }
+}
+
 /// Fetch the initial state for the node.
 ///
 /// State already on disk wins: a previous run's DB is resumed from whenever it
@@ -821,8 +1101,8 @@ async fn fetch_initial_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{Command, try_parse_from};
     use ethlambda_storage::backend::InMemoryBackend;
-    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
@@ -1088,6 +1368,154 @@ validators:
         assert!(
             matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A unique path under the OS temp dir, so parallel test runs cannot
+    /// collide on the same file.
+    fn temp_key_path(label: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("ethlambda-test-node-key-{label}-{nanos}.key"))
+    }
+
+    #[test]
+    fn a_supplied_node_key_is_read_verbatim_and_stable_across_calls() {
+        // A `PeerId` is a pure function of the key bytes (see
+        // `ethlambda_p2p::derive_peer_ids`), so two calls returning the same
+        // bytes for the same file is exactly what "the same PeerId across two
+        // runs" comes down to, without pulling libp2p's key derivation into
+        // this crate's tests.
+        let path = temp_key_path("supplied");
+        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
+
+        let first = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let second = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_missing_node_key_generates_a_valid_key_that_differs_from_a_supplied_one() {
+        let path = temp_key_path("baseline");
+        std::fs::write(&path, "01".repeat(32)).expect("temp key file writes");
+        let supplied = resolve_node_key(Some(path.as_path())).expect("reads the supplied key");
+        let _ = std::fs::remove_file(&path);
+
+        let generated_a = resolve_node_key(None).expect("generates a key");
+        let generated_b = resolve_node_key(None).expect("generates a key");
+
+        // "Accepted": the bytes are a valid secp256k1 secret key, the same
+        // check `build_swarm` performs before deriving the swarm identity.
+        secp256k1::SecretKey::from_slice(&generated_a)
+            .expect("generated key is a valid secp256k1 secret key");
+
+        assert_ne!(generated_a, supplied);
+        assert_ne!(generated_a, generated_b, "two generations must not collide");
+    }
+
+    /// Write `contents` to a scratch file and read it back as a bootnode list.
+    fn read_bootnodes_from(label: &str, contents: &str) -> Vec<String> {
+        let nanos = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("ethlambda-test-enrs-{label}-{nanos}.yaml"));
+        std::fs::write(&path, contents).expect("temp bootnode file writes");
+        let entries = read_bootnode_strings(&path).expect("bootnode file reads");
+        let _ = std::fs::remove_file(&path);
+        entries
+    }
+
+    /// The shapes `node` accepted before the two readers merged. A line parser
+    /// alone would hand the quotes and brackets on to `parse_enrs`, which is
+    /// why YAML is tried first.
+    #[test]
+    fn the_bootnode_reader_still_accepts_every_yaml_shape() {
+        assert_eq!(
+            read_bootnodes_from("block", "- enr:aaa\n- enr:bbb\n"),
+            ["enr:aaa", "enr:bbb"]
+        );
+        assert_eq!(
+            read_bootnodes_from("quoted", "- \"enr:aaa\"\n- 'enr:bbb'\n"),
+            ["enr:aaa", "enr:bbb"]
+        );
+        assert_eq!(
+            read_bootnodes_from("flow", "[\"enr:aaa\", \"enr:bbb\"]\n"),
+            ["enr:aaa", "enr:bbb"]
+        );
+    }
+
+    /// The shapes only `beacon`'s tolerant reader accepted. These are not YAML
+    /// sequences, so they reach the line-oriented fallback.
+    #[test]
+    fn the_bootnode_reader_still_accepts_a_bare_or_commented_list() {
+        assert_eq!(
+            read_bootnodes_from("bare", "enr:aaa\nenr:bbb\n"),
+            ["enr:aaa", "enr:bbb"]
+        );
+        assert_eq!(
+            read_bootnodes_from("comments", "# peers\n- enr:aaa\n\n  # aside\nenr:bbb\n"),
+            ["enr:aaa", "enr:bbb"]
+        );
+    }
+
+    #[test]
+    fn an_empty_bootnode_file_yields_no_entries() {
+        assert!(read_bootnodes_from("empty", "").is_empty());
+        assert!(read_bootnodes_from("blank", "\n\n  \n").is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_bootnode_file_is_an_error_but_an_absent_one_is_not() {
+        // The flag is optional on both chains, so no flag is not an error;
+        // what an absent list *means* is each chain's own decision, made in
+        // `default_bootnodes`. A path that was supplied and cannot be read is
+        // still a hard failure: the operator named a file, so a typo must not
+        // look like "no peers".
+        let absent: Option<&Path> = None;
+        assert!(
+            absent
+                .map(read_bootnode_strings)
+                .transpose()
+                .expect("no flag is not an error")
+                .is_none()
+        );
+        let missing = std::env::temp_dir().join("ethlambda-test-enrs-does-not-exist.yaml");
+        assert!(read_bootnode_strings(&missing).is_err());
+    }
+
+    /// The two chains read the same absent flag in opposite directions, so an
+    /// arm that starts answering like the other one is a silent peering change:
+    /// mainnet with no seeds cannot bootstrap, and a lean node handed mainnet's
+    /// ENRs dials peers that will reject it.
+    #[test]
+    fn an_absent_bootnode_flag_falls_back_per_chain() {
+        let argv = [
+            "ethlambda",
+            "node",
+            "--genesis",
+            "config.yaml",
+            "--validators",
+            "validators.yaml",
+            "--validator-config",
+            "validator-config.yaml",
+            "--hash-sig-keys-dir",
+            "keys",
+            "--node-id",
+            "ethlambda_0",
+        ];
+        let Command::Node(node) = try_parse_from(argv).expect("`node` parses") else {
+            panic!("`node` must resolve to the node sub-command");
+        };
+        assert!(default_bootnodes(&Options::from(node).network).is_empty());
+
+        assert_eq!(
+            default_bootnodes(&Network::Mainnet).len(),
+            beacon::MAINNET_BOOTNODES.len()
         );
     }
 }

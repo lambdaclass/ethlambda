@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServerProtocol as _};
 use libp2p::PeerId;
 use libp2p::swarm::dial_opts::DialOpts;
-use tracing::info;
+use tracing::trace;
 
 use super::admission::{DiscoveredPeer, LeanFilter, rank_by_uncovered_subnets};
 use super::{DISCOVERY_CANDIDATE_BATCH, DiscoveryHandle};
@@ -50,89 +50,95 @@ impl DiscoveryState {
 ///
 /// Called from both teardown paths — a connection that closed and a dial that
 /// never established — so the map cannot outlive the peers in it and
-/// [`covered_subnets`] cannot credit a subnet to someone who left. A no-op when
-/// discovery is off.
+/// [`covered_subnets`] cannot credit a subnet to someone who left.
 pub(crate) fn forget_discovered_peer(server: &mut P2PServer, peer_id: &PeerId) {
-    if let Some(discovery) = server.discovery.as_mut() {
-        discovery.peer_attnets.remove(peer_id);
-    }
+    server.discovery.peer_attnets.remove(peer_id);
 }
 
-/// One tick of the dial loop. A no-op when discovery is disabled.
+/// One tick of the dial loop.
 pub(crate) async fn dial_tick(server: &mut P2PServer) {
-    // Snapshot what the refill needs before any `.await`, so no borrow of
-    // `server.discovery` has to live across the async boundary. Both are handle
-    // clones: an actor ref and two `Copy` fields, taken only when a refill is
-    // actually due rather than on every tick that just drains the queue.
-    let Some(discovery) = server.discovery.as_ref() else {
-        return;
-    };
-    if server.connected_peers.len() >= discovery.target_peers {
+    if server.connected_peers.len() >= server.discovery.target_peers {
         return;
     }
-    let refill = discovery
-        .candidates
-        .is_empty()
-        .then(|| (discovery.peer_table.clone(), discovery.filter.clone()));
+    // Snapshot what the refill needs before the `.await`, so no borrow of
+    // `server` has to live across it. Both are handle clones: an actor ref and
+    // a filter, taken only when a refill is actually due rather than on every
+    // tick that just drains the queue.
+    let refill = server.discovery.candidates.is_empty().then(|| {
+        (
+            server.discovery.peer_table.clone(),
+            server.discovery.filter.clone(),
+        )
+    });
     let mut admitted = match refill {
         Some((peer_table, filter)) => draw_candidates(&peer_table, &filter).await,
         None => Vec::new(),
     };
 
-    let Some(discovery) = server.discovery.as_mut() else {
-        return;
-    };
     if !admitted.is_empty() {
-        let covered = covered_subnets(&discovery.peer_attnets, &server.connected_peers);
+        let covered = covered_subnets(&server.discovery.peer_attnets, &server.connected_peers);
         rank_by_uncovered_subnets(&mut admitted, &covered);
-        discovery.candidates.extend(admitted);
+        server.discovery.candidates.extend(admitted);
     }
 
-    let mut next = None;
-    while let Some(candidate) = discovery.candidates.pop_front() {
-        if candidate.peer_id == discovery.local_peer_id
-            || server.connected_peers.contains(&candidate.peer_id)
+    // Dial the whole shortfall rather than one candidate per interval. Measured
+    // on mainnet: a well-connected beacon node is at its inbound cap, so it
+    // completes the handshake and answers `Goodbye(129)`, "too many peers",
+    // within the same millisecond. Finding one with room is a numbers game, and
+    // one dial per interval loses it: the node spent minutes at zero peers while
+    // candidates queued up behind a `break`.
+    let budget = server
+        .discovery
+        .target_peers
+        .saturating_sub(server.connected_peers.len())
+        .min(DISCOVERY_CANDIDATE_BATCH);
+    let local_peer_id = server.discovery.local_peer_id;
+
+    let mut to_dial = Vec::with_capacity(budget);
+    while to_dial.len() < budget {
+        let Some(candidate) = server.discovery.candidates.pop_front() else {
+            break;
+        };
+        if candidate.peer_id == local_peer_id || server.connected_peers.contains(&candidate.peer_id)
         {
             continue;
         }
-        next = Some(candidate);
-        break;
+        to_dial.push(candidate);
     }
-    let Some(candidate) = next else {
-        return;
-    };
 
-    info!(
-        peer_id = %candidate.peer_id,
-        subnets = ?candidate.subnets,
-        "Dialing discovered peer"
-    );
-    // One `DialOpts` carrying every address, not one dial per address: libp2p
-    // races them within the attempt, which is what lets a live TCP address
-    // rescue a peer whose advertised QUIC port does not answer.
-    let opts = DialOpts::peer_id(candidate.peer_id)
-        .addresses(candidate.addrs)
-        .build();
-    // The candidate has already been popped and marked tried in the peer table,
-    // so this is the only chance to record its subnets: whatever happens here,
-    // it will not be offered again. Which makes the refusal the swarm gives back
-    // decide whether recording them is right.
-    match server.swarm_handle.dial_outcome(opts).await {
-        // Nothing in flight and nothing coming, so `forget_discovered_peer`
-        // would never run: recording the subnets here would leave
-        // `covered_subnets` counting a peer we never reach.
-        DialOutcome::Unreachable => return,
-        // A dial to this peer is already in flight, from an earlier tick or from
-        // the static bootnode path in `build_swarm`. Recording is still right:
-        // that attempt has a terminal event coming, which tears the entry down.
-        // Skipping it is what would drift, and permanently — the peer connects,
-        // covers subnets, and `covered_subnets` never counts them, so the dial
-        // loop keeps hunting for coverage it already has.
-        DialOutcome::AlreadyInProgress => {}
-        DialOutcome::Queued => metrics::inc_discovered_peers_dialed(),
-    }
-    if let Some(discovery) = server.discovery.as_mut() {
-        discovery
+    for candidate in to_dial {
+        trace!(
+            peer_id = %candidate.peer_id,
+            subnets = ?candidate.subnets,
+            "Dialing discovered peer"
+        );
+        // One `DialOpts` carrying every address, not one dial per address:
+        // libp2p races them within the attempt, which is what lets a live TCP
+        // address rescue a peer whose advertised QUIC port does not answer.
+        let opts = DialOpts::peer_id(candidate.peer_id)
+            .addresses(candidate.addrs)
+            .build();
+        // The candidate has already been popped and marked tried in the peer
+        // table, so this is the only chance to record its subnets: whatever
+        // happens here, it will not be offered again. Which makes the refusal
+        // the swarm gives back decide whether recording them is right.
+        match server.swarm_handle.dial_outcome(opts).await {
+            // Nothing in flight and nothing coming, so `forget_discovered_peer`
+            // would never run: recording the subnets here would leave
+            // `covered_subnets` counting a peer we never reach.
+            DialOutcome::Unreachable => continue,
+            // A dial to this peer is already in flight, from an earlier tick or
+            // from the static bootnode path in `build_swarm`. Recording is
+            // still right: that attempt has a terminal event coming, which
+            // tears the entry down. Skipping it is what would drift, and
+            // permanently — the peer connects, covers subnets, and
+            // `covered_subnets` never counts them, so the dial loop keeps
+            // hunting for coverage it already has.
+            DialOutcome::AlreadyInProgress => {}
+            DialOutcome::Queued => metrics::inc_discovered_peers_dialed(),
+        }
+        server
+            .discovery
             .peer_attnets
             .insert(candidate.peer_id, candidate.subnets);
     }

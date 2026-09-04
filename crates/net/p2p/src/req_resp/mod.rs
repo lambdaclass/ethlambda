@@ -1,13 +1,9 @@
-mod codec;
-mod encoding;
+pub(crate) mod codec;
+pub(crate) mod encoding;
 pub mod handlers;
-mod messages;
+pub(crate) mod messages;
 
 pub use codec::Codec;
 pub use encoding::{MAX_COMPRESSED_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE};
 pub use handlers::{build_status, fetch_block_from_peer, handle_req_resp_message};
-pub use messages::{
-    BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, BlocksByRangeRequest,
-    BlocksByRootRequest, MAX_REQUEST_BLOCKS, Request, RequestedBlockRoots, Response,
-    ResponsePayload, STATUS_PROTOCOL_V1, Status,
-};
+pub use messages::{Request, Response, ResponsePayload};

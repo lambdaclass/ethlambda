@@ -5,6 +5,7 @@ pub mod block;
 pub mod chain_config;
 pub mod checkpoint;
 pub mod constants;
+pub mod enr;
 pub mod genesis;
 pub mod primitives;
 pub mod state;

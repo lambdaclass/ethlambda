@@ -1,3 +1,31 @@
+pub mod muxers {
+    //! Why the TCP transport offers mplex as well as yamux.
+    //!
+    //! Measured against live mainnet peers on 2026-08-13, dialing with a
+    //! throwaway probe binary carrying nothing but `identify`, so that none of
+    //! this crate's own protocols can be the cause:
+    //!
+    //! ```text
+    //! yamux only      Proposed /yamux/1.0.0  ->  NotAvailable
+    //!                 connection dies ~250ms in, no Goodbye, yamux frame
+    //!                 decode error: multistream-select negotiates the muxer
+    //!                 optimistically, so we are already writing yamux frames
+    //!                 when the refusal arrives and we parse their reply as one
+    //!
+    //! yamux + mplex   Proposed /yamux/1.0.0, then /mplex/6.7.0
+    //!                 Negotiated /mplex/6.7.0, identify completes both ways
+    //! ```
+    //!
+    //! The same probe against a non-Ethereum libp2p node (an IPFS bootstrapper)
+    //! completes identify with yamux alone, which is what rules out this crate's
+    //! transport setup and points at the beacon network's own convention.
+    //!
+    //! mplex is deprecated in libp2p and the facade crate has already dropped
+    //! its re-export, so `libp2p-mplex` is depended on directly. When mainnet
+    //! peers accept yamux, this goes away; until then a yamux-only beacon node
+    //! peers with nothing over TCP.
+}
+
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     net::{IpAddr, SocketAddr},
@@ -15,7 +43,7 @@ use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
-use futures::{StreamExt, future::OptionFuture};
+use futures::StreamExt;
 use libp2p::{
     Multiaddr, StreamProtocol,
     gossipsub::{MessageAuthenticity, ValidationMode},
@@ -36,7 +64,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
+        DISCOVERY_DIAL_INTERVAL, DISCOVERY_STARVED_DIAL_INTERVAL, DiscoveryError,
+        DiscoverySpawnConfig,
         dial::{DiscoveryState, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
@@ -45,16 +74,19 @@ use crate::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_block,
     },
-    req_resp::{
-        BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
-        MAX_COMPRESSED_PAYLOAD_SIZE, MAX_REQUEST_BLOCKS, Request, STATUS_PROTOCOL_V1, build_status,
-        fetch_block_from_peer,
+    lean::protocols::{
+        BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
+        BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
+        STATUS_V1 as STATUS_PROTOCOL_V1,
     },
+    req_resp::{Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request, build_status, fetch_block_from_peer},
     swarm_adapter::SwarmHandle,
 };
 
+pub mod beacon;
 pub mod discovery;
 mod gossipsub;
+pub mod lean;
 pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
@@ -156,9 +188,47 @@ pub(crate) struct Behaviour {
     identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
     req_resp: request_response::Behaviour<Codec>,
+    /// Refuses connections past the configured ceiling. A deny from any member
+    /// behaviour denies the connection, so registering this is the whole
+    /// mechanism; see [`beacon::swarm::connection_limits`] for the numbers and why the
+    /// beacon network needs them while lean does not.
+    connection_limits: libp2p::connection_limits::Behaviour,
+}
+
+/// No connection limits, which is what the lean network has always run with: a
+/// devnet's peer count is bounded by the size of the devnet itself, so a cap
+/// there would only ever cap the operator.
+pub(crate) fn unlimited_connections() -> libp2p::connection_limits::Behaviour {
+    libp2p::connection_limits::Behaviour::new(Default::default())
 }
 
 /// Configuration for building the libp2p swarm.
+///
+/// These are the parameters both networks take; [`WireConfig`] carries what only
+/// one of them does. One config and one [`build_swarm`] rather than a pair per
+/// network, because the transport, the two listeners and the static bootnode
+/// dialing are identical and were duplicated line for line while there were two
+/// builders.
+pub struct SwarmConfig {
+    pub node_key: Vec<u8>,
+    pub bootnodes: Vec<Bootnode>,
+    pub listening_socket: SocketAddr,
+    /// Which network's wire to build. Decides the gossip topics, the req/resp
+    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version and
+    /// the connection limits, and so decides the [`Wire`] the built swarm
+    /// carries.
+    pub wire: WireConfig,
+}
+
+/// The half of [`SwarmConfig`] the two networks disagree about.
+pub enum WireConfig {
+    Lean(LeanWireConfig),
+    /// Boxed for the reason [`Wire::Beacon`] is: it carries a whole `Config`,
+    /// and every lean node would otherwise pay for it in each config it moves.
+    Beacon(Box<beacon::swarm::BeaconWireConfig>),
+}
+
+/// The lean network's swarm parameters.
 ///
 /// INVARIANT: `subscription_subnets` is the fixed set of attestation subnets
 /// this node subscribes to. It is computed once by the caller via
@@ -170,10 +240,7 @@ pub(crate) struct Behaviour {
 /// resubscribe gossip subnets; this is the leanSpec PR #636 "hot-standby model"
 /// scope limitation. A node that may aggregate at runtime must include those
 /// subnets here at startup.
-pub struct SwarmConfig {
-    pub node_key: Vec<u8>,
-    pub bootnodes: Vec<Bootnode>,
-    pub listening_socket: SocketAddr,
+pub struct LeanWireConfig {
     pub validator_ids: Vec<u64>,
     pub attestation_committee_count: u64,
     /// Attestation subnets to subscribe to, precomputed via
@@ -216,16 +283,53 @@ pub fn attestation_subscription_subnets(
     subnets
 }
 
+/// Which network's wire this node speaks.
+///
+/// One `P2PServer` serves both, dispatching on this once at the top of each
+/// handler, exactly as `BlockChainServer` dispatches on the state variant.
+/// Nothing is shared below the match: the topic names, the req/resp protocol
+/// ids, the handshake and the decode are all different, and the parts that
+/// genuinely coincide (the discv5 stack, the `ssz_snappy` framing,
+/// `compute_message_id`) sit one layer down and are the beacon spec's anyway.
+pub enum Wire {
+    Lean(LeanWire),
+    /// Boxed because a `BeaconWire` carries a whole `Config` and so is four
+    /// times the size of a `LeanWire`; unboxed, every lean node would pay for
+    /// it in each `Wire` it moves.
+    Beacon(Box<beacon::BeaconWire>),
+}
+
+/// The lean network's gossip topics.
+pub struct LeanWire {
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+}
+
+impl Wire {
+    pub(crate) fn lean(&self) -> Option<&LeanWire> {
+        match self {
+            Wire::Lean(lean) => Some(lean),
+            Wire::Beacon(_) => None,
+        }
+    }
+
+    pub(crate) fn beacon(&self) -> Option<&beacon::BeaconWire> {
+        match self {
+            Wire::Beacon(beacon) => Some(beacon),
+            Wire::Lean(_) => None,
+        }
+    }
+}
+
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
     /// This node's libp2p peer ID, derived from the node key. Exposed so the
     /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
     pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
     /// Every dial target per bootnode; see [`dial_addrs`]. Empty entries are never
     /// inserted; see [`bootnode_dial_addrs`].
     pub(crate) bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
@@ -251,9 +355,14 @@ pub enum SwarmBuildError {
     Subscription(#[from] libp2p::gossipsub::SubscriptionError),
 }
 
-/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
-pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
-    let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
+/// The gossipsub parameters both wires share.
+///
+/// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
+/// match the beacon spec, so `seen_ttl` is the only value that differs between
+/// the two networks: lean's is its slot duration times a 3-slot justification
+/// lookback times two, mainnet's epoch is 32 slots of 12s.
+pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config {
+    libp2p::gossipsub::ConfigBuilder::default()
         // d
         .mesh_n(8)
         // d_low
@@ -266,9 +375,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
-        .duplicate_cache_time(Duration::from_millis(
-            config.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS,
-        ))
+        .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
         // Taken from ream
@@ -277,45 +384,85 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .allow_self_origin(true)
         .idontwant_message_size_threshold(1000)
         .build()
-        .expect("invalid gossipsub config");
+        .expect("invalid gossipsub config")
+}
 
-    let gossipsub =
-        libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
-            .expect("failed to initiate behaviour");
+impl Behaviour {
+    pub(crate) fn new(
+        identify: libp2p::identify::Behaviour,
+        gossipsub: libp2p::gossipsub::Behaviour,
+        req_resp: request_response::Behaviour<Codec>,
+        connection_limits: libp2p::connection_limits::Behaviour,
+    ) -> Self {
+        Self {
+            identify,
+            gossipsub,
+            req_resp,
+            connection_limits,
+        }
+    }
+}
 
-    let req_resp = request_response::Behaviour::new(
-        vec![
-            (
-                StreamProtocol::new(STATUS_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-            (
-                StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-            (
-                StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-        ],
-        Default::default(),
-    );
+/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
+///
+/// One builder for both networks. Four things differ at the behaviour level and
+/// are resolved in the first match below; the topic set differs and is resolved
+/// in the last one. Everything in between, the transport, the QUIC and TCP
+/// listeners and the static bootnode dialing, is the same on either wire.
+pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
+    let SwarmConfig {
+        node_key,
+        bootnodes,
+        listening_socket,
+        wire,
+    } = config;
 
-    let secret_key =
-        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
+    let (seen_ttl, protocols, identify_version, connection_limits) = match &wire {
+        WireConfig::Lean(lean) => (
+            Duration::from_millis(lean.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS),
+            vec![
+                (
+                    StreamProtocol::new(STATUS_PROTOCOL_V1),
+                    request_response::ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+                    request_response::ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
+                    request_response::ProtocolSupport::Full,
+                ),
+            ],
+            // Use the same `protocol_version` string as zeam
+            "/ipfs/0.1.0",
+            unlimited_connections(),
+        ),
+        WireConfig::Beacon(beacon) => (
+            beacon::swarm::seen_ttl(&beacon.config),
+            beacon::protocols::registrations(),
+            beacon::swarm::IDENTIFY_PROTOCOL_VERSION,
+            beacon::swarm::connection_limits(),
+        ),
+    };
+
+    let gossipsub = libp2p::gossipsub::Behaviour::new(
+        MessageAuthenticity::Anonymous,
+        gossipsub_config(seen_ttl),
+    )
+    .expect("failed to initiate behaviour");
+
+    let req_resp = request_response::Behaviour::new(protocols, Default::default());
+
+    let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    // Use the same `protocol_version` string as zeam
     let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
-        "/ipfs/0.1.0".to_owned(),
+        identify_version.to_owned(),
         identity.public(),
     ));
 
-    let behavior = Behaviour {
-        identify,
-        gossipsub,
-        req_resp,
-    };
+    let behavior = Behaviour::new(identify, gossipsub, req_resp, connection_limits);
 
     // TODO: set peer scoring params
 
@@ -324,7 +471,15 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .with_tcp(
             libp2p::tcp::Config::default().nodelay(true),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            // mplex is not decoration: mainnet beacon peers answer `na` to a
+            // yamux-only proposal. See [`muxers`] for the measurement. Lean
+            // peers all speak yamux, so offering both costs that wire nothing
+            // and keeps one transport stack rather than two.
+            #[allow(deprecated)]
+            (
+                libp2p::yamux::Config::default,
+                libp2p_mplex::MplexConfig::default,
+            ),
         )
         .expect("failed to add TCP transport to swarm")
         .with_quic()
@@ -337,7 +492,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let (bootnode_addrs, undialable_bootnodes) =
-        merge_bootnode_dial_addrs(config.bootnodes, local_peer_id);
+        merge_bootnode_dial_addrs(bootnodes, local_peer_id);
     // The merged map is the dial input, so every address a duplicate entry
     // contributed is in the one attempt this peer gets. A refused dial is not
     // fatal: the entry stays in `bootnode_addrs`, so the redial path picks the
@@ -360,8 +515,8 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         );
     }
     let quic_addr = Multiaddr::empty()
-        .with(config.listening_socket.ip().into())
-        .with(Protocol::Udp(config.listening_socket.port()))
+        .with(listening_socket.ip().into())
+        .with(Protocol::Udp(listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
         .listen_on(quic_addr.clone())
@@ -373,8 +528,8 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     // Same port number as the QUIC listener above: TCP and UDP are separate
     // namespaces, so this cannot collide with it.
     let tcp_addr = Multiaddr::empty()
-        .with(config.listening_socket.ip().into())
-        .with(Protocol::Tcp(config.listening_socket.port()));
+        .with(listening_socket.ip().into())
+        .with(Protocol::Tcp(listening_socket.port()));
     swarm
         .listen_on(tcp_addr.clone())
         .map_err(|source| SwarmBuildError::Listen {
@@ -383,49 +538,80 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             source,
         })?;
 
-    // Subscribe to block topic (all nodes)
-    let block_topic = block_topic();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&block_topic)
-        .unwrap();
+    let wire = match wire {
+        WireConfig::Lean(lean) => {
+            // Subscribe to block topic (all nodes)
+            let block_topic = block_topic();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&block_topic)
+                .unwrap();
 
-    // Subscribe to aggregation topic (all validators)
-    let aggregation_topic = aggregation_topic();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&aggregation_topic)
-        .unwrap();
+            // Subscribe to aggregation topic (all validators)
+            let aggregation_topic = aggregation_topic();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&aggregation_topic)
+                .unwrap();
 
-    // The committee metric should reflect validator membership only, not
-    // aggregator-only subscriptions.
-    let metric_subnet = config
-        .validator_ids
-        .iter()
-        .map(|vid| vid % config.attestation_committee_count)
-        .min()
-        .unwrap_or(0);
-    metrics::set_attestation_committee_subnet(metric_subnet);
+            // The committee metric should reflect validator membership only, not
+            // aggregator-only subscriptions.
+            let metric_subnet = lean
+                .validator_ids
+                .iter()
+                .map(|vid| vid % lean.attestation_committee_count)
+                .min()
+                .unwrap_or(0);
+            metrics::set_attestation_committee_subnet(metric_subnet);
 
-    let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
-    for &subnet_id in &config.subscription_subnets {
-        let topic = attestation_subnet_topic(subnet_id);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-        info!(subnet_id, "Subscribed to attestation subnet");
-        attestation_topics.insert(subnet_id, topic);
-    }
+            let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> =
+                HashMap::new();
+            for &subnet_id in &lean.subscription_subnets {
+                let topic = attestation_subnet_topic(subnet_id);
+                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                info!(subnet_id, "Subscribed to attestation subnet");
+                attestation_topics.insert(subnet_id, topic);
+            }
 
-    info!(socket=%config.listening_socket, "P2P node started");
+            info!(socket=%listening_socket, "P2P node started");
+
+            Wire::Lean(LeanWire {
+                attestation_topics,
+                attestation_committee_count: lean.attestation_committee_count,
+                block_topic,
+                aggregation_topic,
+            })
+        }
+        WireConfig::Beacon(beacon) => {
+            let topics = beacon::topics::BeaconTopics::new(beacon.fork_digest);
+            for topic in &topics.topics {
+                swarm.behaviour_mut().gossipsub.subscribe(topic)?;
+                info!(topic = %topic, "Subscribed to beacon topic");
+            }
+
+            info!(
+                socket = %listening_socket,
+                fork_digest = %hex::encode(beacon.fork_digest),
+                topics = topics.topics.len(),
+                "Beacon P2P node started"
+            );
+
+            Wire::Beacon(Box::new(beacon::BeaconWire {
+                fork_digest: beacon.fork_digest,
+                topics,
+                config: beacon.config,
+                genesis_time: beacon.genesis_time,
+                metadata_seq_number: 0,
+            }))
+        }
+    };
 
     Ok(BuiltSwarm {
         local_peer_id,
         swarm,
-        attestation_topics,
-        attestation_committee_count: config.attestation_committee_count,
-        block_topic,
-        aggregation_topic,
+        wire,
         bootnode_addrs,
     })
 }
@@ -441,56 +627,44 @@ impl P2P {
     /// Start discovery, start the I/O adapter, spawn the actor, and wire the
     /// swarm event stream.
     ///
-    /// `discovery` is `Some` when discv5 discovery is enabled: the discv5
-    /// server is started here, and its handle seeds the dial loop's state and
-    /// schedules its first tick. `None` leaves the dial loop permanently
-    /// dormant, so peering relies solely on the static bootnode list dialed by
-    /// `build_swarm`.
+    /// The discv5 server is started here, and its handle seeds the dial loop's
+    /// state and schedules its first tick. It is started before the swarm
+    /// adapter so a fatal discovery failure (a busy UDP port, say) surfaces
+    /// before any actor is running.
     ///
-    /// Discovery is started before the swarm adapter so a fatal discovery
-    /// failure (a busy UDP port, say) surfaces before any actor is running.
+    /// Discovery is not optional. It used to be, behind `--discovery.enable`,
+    /// but neither chain has another way to reach a peer it was not handed
+    /// statically, and mainnet never had the choice at all: published bootnode
+    /// ENRs carry no `quic` entry, so none of them is statically dialable.
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: Option<DiscoverySpawnConfig>,
+        discovery: DiscoverySpawnConfig,
     ) -> Result<P2P, DiscoveryError> {
-        if discovery.is_none() {
-            info!("discv5 discovery disabled; peering from the static bootnode list only");
-        }
-        // `OptionFuture` awaits the spawn only when there is one to await, so the
-        // disabled case stays a plain `None` without a branch of its own.
-        let discovery = OptionFuture::from(discovery.map(spawn_discovery))
-            .await
-            .transpose()?;
+        let discovery = spawn_discovery(discovery).await?;
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
-        let discovery_enabled = discovery.is_some();
         let server = P2PServer {
             swarm_handle,
             store,
             blockchain: None,
-            attestation_topics: built.attestation_topics,
-            attestation_committee_count: built.attestation_committee_count,
-            block_topic: built.block_topic,
-            aggregation_topic: built.aggregation_topic,
+            wire: built.wire,
             connected_peers: HashSet::new(),
             pending_root_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
-            discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
+            discovery: DiscoveryState::new(discovery, built.local_peer_id),
         };
         let handle = server.start();
-        if discovery_enabled {
-            send_after(
-                DISCOVERY_DIAL_INTERVAL,
-                handle.context(),
-                p2p_protocol::DiscoverPeers,
-            );
-        }
+        send_after(
+            DISCOVERY_DIAL_INTERVAL,
+            handle.context(),
+            p2p_protocol::DiscoverPeers,
+        );
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
     }
@@ -515,10 +689,7 @@ pub struct P2PServer {
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
 
     pub(crate) connected_peers: HashSet<PeerId>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
@@ -527,8 +698,7 @@ pub struct P2PServer {
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
-    /// Set when discovery is enabled. `None` disables the dial loop entirely.
-    pub(crate) discovery: Option<DiscoveryState>,
+    pub(crate) discovery: DiscoveryState,
 }
 
 impl P2PServer {
@@ -602,12 +772,16 @@ impl P2PServer {
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        // Reschedule first, so an early return never stops the loop.
-        send_after(
-            DISCOVERY_DIAL_INTERVAL,
-            ctx.clone(),
-            p2p_protocol::DiscoverPeers,
-        );
+        // Reschedule first, so an early return never stops the loop. A node
+        // with no peers retries on the shorter interval: see
+        // `DISCOVERY_STARVED_DIAL_INTERVAL` for why zero peers is a failure to
+        // work through rather than a state to wait out.
+        let interval = if self.connected_peers.is_empty() {
+            DISCOVERY_STARVED_DIAL_INTERVAL
+        } else {
+            DISCOVERY_DIAL_INTERVAL
+        };
+        send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
         dial_tick(self).await;
     }
 }
@@ -668,10 +842,11 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
             req_resp::handle_req_resp_message(server, req_resp_event, ctx).await;
         }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-            message @ libp2p::gossipsub::Event::Message { .. },
-        )) => {
-            gossipsub::handle_gossipsub_message(server, message).await;
+        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
+            message,
+            ..
+        })) => {
+            gossipsub::handle_gossip_message(server, message).await;
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -695,27 +870,49 @@ async fn handle_swarm_event(
                     direction,
                     "success",
                 );
-                // Send status request on first connection to this peer
-                let our_status = build_status(&server.store);
-                let our_finalized_slot = our_status.finalized.slot;
-                let our_head_slot = our_status.head.slot;
-                trace!(
-                    %peer_id,
-                    %direction,
-                    %transport,
-                    peer_count,
-                    our_finalized_slot,
-                    our_head_slot,
-                    "Peer connected"
-                );
-                server
-                    .swarm_handle
-                    .send_request(
-                        peer_id,
-                        Request::Status(our_status),
-                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                // Compute the beacon status and its log fields first, so no
+                // borrow of `server.wire` is alive across the send.
+                let beacon_status = server.wire.beacon().map(|wire| {
+                    (
+                        beacon::handler::build_status(wire, beacon::handler::StatusVersion::V1),
+                        hex::encode(wire.fork_digest),
                     )
-                    .await;
+                });
+                match beacon_status {
+                    Some((status, digest)) => {
+                        trace!(
+                            %peer_id,
+                            %direction,
+                            %transport,
+                            peer_count,
+                            fork_digest = %digest,
+                            "Peer connected"
+                        );
+                        beacon::handler::send_status(server, peer_id, status).await;
+                    }
+                    None => {
+                        let our_status = build_status(&server.store);
+                        let our_finalized_slot = our_status.finalized.slot;
+                        let our_head_slot = our_status.head.slot;
+                        trace!(
+                            %peer_id,
+                            %direction,
+                            %transport,
+                            peer_count,
+                            our_finalized_slot,
+                            our_head_slot,
+                            "Peer connected"
+                        );
+                        server
+                            .swarm_handle
+                            .send_request(
+                                peer_id,
+                                Request::LeanStatus(our_status),
+                                libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                            )
+                            .await;
+                    }
+                }
             } else {
                 trace!(%peer_id, %direction, %transport, "Added peer connection");
             }
@@ -815,12 +1012,34 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-            metrics::notify_peer_connected(
-                server.resolve_node_name(peer_id.as_ref()),
-                "inbound",
-                "error",
+            // A connection our own limit refused is policy working, not a
+            // fault. Once the cap is reached every further dial arrives here,
+            // so counting these as errors would bury the real ones under the
+            // steady rate of peers we are deliberately turning away, and warn
+            // once per rejection while doing it. See `beacon::swarm::connection_limits`.
+            let refused_at_capacity = matches!(
+                &error,
+                libp2p::swarm::ListenError::Denied { cause }
+                    if cause
+                        .downcast_ref::<libp2p::connection_limits::Exceeded>()
+                        .is_some()
             );
-            debug!(%error, "Incoming connection error");
+            if refused_at_capacity {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "refused_at_capacity",
+                );
+                let peer_count = server.connected_peers.len();
+                debug!(peer_count, "Refused an inbound connection at capacity");
+            } else {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "error",
+                );
+                debug!(%error, "Incoming connection error");
+            }
         }
         _ => {
             trace!(?event, "Ignored swarm event");
@@ -1164,23 +1383,26 @@ mod tests {
 
     /// Proves the TCP transport `build_swarm` now adds actually completes a
     /// connection end to end, rather than only compiling. Builds two real
-    /// swarms via the production entry point (port `0`, so this cannot collide
-    /// with a running node or a sibling test), learns the first swarm's TCP
-    /// listen address off its own `NewListenAddr` event, dials it from the
-    /// second swarm, and polls both until each reports `ConnectionEstablished`.
-    /// A regression to QUIC-only, or a misconfigured TCP transport, hangs here
-    /// until the timeout rather than racing to a false positive.
+    /// swarms via the production entry point (port `0`, so this cannot
+    /// collide with a running node or a sibling test), learns the first
+    /// swarm's TCP listen address off its own `NewListenAddr` event, dials it
+    /// from the second swarm, and polls both until each reports
+    /// `ConnectionEstablished`. A regression to QUIC-only, or a
+    /// misconfigured TCP transport, hangs here until the timeout rather than
+    /// racing to a false positive.
     #[tokio::test]
-    async fn two_swarms_connect_over_tcp() {
+    async fn two_lean_swarms_connect_over_tcp() {
         fn build(node_key_byte: u8) -> BuiltSwarm {
             build_swarm(SwarmConfig {
                 node_key: vec![node_key_byte; 32],
                 bootnodes: Vec::new(),
                 listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
-                validator_ids: Vec::new(),
-                attestation_committee_count: 1,
-                subscription_subnets: HashSet::new(),
-                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                wire: WireConfig::Lean(LeanWireConfig {
+                    validator_ids: Vec::new(),
+                    attestation_committee_count: 1,
+                    subscription_subnets: HashSet::new(),
+                    milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                }),
             })
             .expect("swarm builds")
         }
@@ -1188,8 +1410,8 @@ mod tests {
         let mut dialer = build(1);
         let mut listener = build(2);
 
-        // Both a QUIC and a TCP `NewListenAddr` arrive for `listener`; only the
-        // TCP one is wanted here.
+        // Both a QUIC and a TCP `NewListenAddr` arrive for `listener`; only
+        // the TCP one is wanted here.
         let listener_tcp_addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } =
                 listener.swarm.select_next_some().await
@@ -1228,6 +1450,24 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    #[test]
+    fn a_lean_wire_reports_its_topics_and_no_beacon_wire() {
+        // The enum is what makes "subscribed to lean topics and beacon topics
+        // at once" unrepresentable. `P2PServer` dispatches on it once per
+        // handler, the same way `BlockChainServer` dispatches on the state
+        // variant.
+        let wire = Wire::Lean(LeanWire {
+            attestation_topics: HashMap::new(),
+            attestation_committee_count: 4,
+            block_topic: block_topic(),
+            aggregation_topic: aggregation_topic(),
+        });
+        assert!(wire.beacon().is_none());
+        let lean = wire.lean().expect("a lean wire");
+        assert_eq!(lean.attestation_committee_count, 4);
+        assert!(lean.block_topic.to_string().starts_with("/leanconsensus/"));
     }
 
     /// A bootnode file naming one peer twice must not abort the node.
@@ -1277,10 +1517,12 @@ mod tests {
             node_key: vec![7u8; 32],
             bootnodes,
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
-            validator_ids: Vec::new(),
-            attestation_committee_count: 1,
-            subscription_subnets: HashSet::new(),
-            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+            wire: WireConfig::Lean(LeanWireConfig {
+                validator_ids: Vec::new(),
+                attestation_committee_count: 1,
+                subscription_subnets: HashSet::new(),
+                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+            }),
         })
         .expect("a duplicated bootnode entry must not fail the build");
 

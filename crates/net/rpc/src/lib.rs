@@ -72,39 +72,76 @@ pub async fn start_rpc_server(
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
         .layer(Extension(events));
-    let metrics_router = metrics::start_prometheus_metrics_api();
-    let debug_router = build_debug_router();
+    start_http_servers(config, Some(api_router), shutdown).await
+}
+
+/// Bind and serve this process's HTTP surface, and return when it stops.
+///
+/// The metrics and debug routers are always served: they need no state, and a
+/// process that records Prometheus series without serving them leaves the
+/// question of whether it is healthy unanswerable. `api_router` is what the
+/// caller has to supply, and is what differs between the two sub-commands.
+///
+/// `Some(router)` serves it alongside them: merged onto one listener when
+/// `api_port == metrics_port`, otherwise on two independent servers, so
+/// pointing both flags at one port is supported rather than a
+/// misconfiguration. `None` serves only metrics and debug, on `metrics_port`;
+/// `api_port` is then unused. That is `ethlambda beacon`, which has no lean
+/// `Store`, `AggregatorController`, `SyncStatusController` or `EventBus` to
+/// build the lean API from, and would be serving lean answers for a beacon
+/// chain if it invented empty ones.
+pub async fn start_http_servers(
+    config: RpcConfig,
+    api_router: Option<Router>,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let metrics_app = Router::new()
+        .merge(metrics::start_prometheus_metrics_api())
+        .merge(build_debug_router());
+
+    let Some(api_router) = api_router else {
+        return serve(
+            config.http_address,
+            config.metrics_port,
+            metrics_app,
+            shutdown,
+        )
+        .await;
+    };
 
     if config.api_port == config.metrics_port {
-        let app = Router::new()
-            .merge(api_router)
-            .merge(metrics_router)
-            .merge(debug_router);
-        let addr = SocketAddr::new(config.http_address, config.api_port);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-            })
-            .await?;
-    } else {
-        let api_addr = SocketAddr::new(config.http_address, config.api_port);
-        let metrics_addr = SocketAddr::new(config.http_address, config.metrics_port);
-        let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
-        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-        let metrics_app = Router::new().merge(metrics_router).merge(debug_router);
-        let metrics_shutdown = shutdown.clone();
-        tokio::try_join!(
-            axum::serve(api_listener, api_router).with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-            }),
-            axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(async move {
-                metrics_shutdown.cancelled().await;
-            }),
-        )?;
+        let app = Router::new().merge(api_router).merge(metrics_app);
+        return serve(config.http_address, config.api_port, app, shutdown).await;
     }
 
+    let metrics_shutdown = shutdown.clone();
+    tokio::try_join!(
+        serve(config.http_address, config.api_port, api_router, shutdown),
+        serve(
+            config.http_address,
+            config.metrics_port,
+            metrics_app,
+            metrics_shutdown
+        ),
+    )?;
     Ok(())
+}
+
+/// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+async fn serve(
+    address: IpAddr,
+    port: u16,
+    app: Router,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let addr = SocketAddr::new(address, port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "HTTP server listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await
 }
 
 /// Build the API router with the given store, client version, and peer ID.

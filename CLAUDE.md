@@ -13,6 +13,12 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
+  ├─ src/main.rs            # run_node: one entry point for both chains (see below)
+  ├─ src/cli.rs             # Options { common, network: Lean | Mainnet }
+  ├─ src/command.rs         # Sub-command dispatch + default-subcommand injection
+  ├─ src/beacon.rs          # Mainnet wire params: built-in genesis, fork digest
+  ├─ src/checkpoint_sync.rs # Lean checkpoint sync (`/lean/v0/...`)
+  ├─ assets/mainnet/genesis.ssz  # Mainnet genesis BeaconState (eth-clients/mainnet's file)
   └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
   blockchain/               # State machine actor (GenServer pattern)
@@ -276,15 +282,15 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial (list order confers no preference; the default `dial_concurrency_factor` starts both handshakes)
-  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `NodeOptions::validate_ports` rejects every clash before anything binds
+  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `CommonOptions::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
 
-### Peer Discovery (discv5, opt-in)
-- Off by default; `--discovery.enable` plus `--discovery.port` (own UDP socket, must differ from `--gossipsub-port`)
+### Peer Discovery (discv5)
+- Always on, on both chains, on `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `CommonOptions::validate_ports`). There is no `--discovery.enable`: mainnet bootnode ENRs are not statically dialable so a crawl is its only way to find a peer, and a lean node with no `--bootnodes` is in the same position. Co-located nodes on one host must each pass `--discovery.port`
 - Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
@@ -297,12 +303,104 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Message IDs
 - 20-byte truncated SHA256 of: domain (valid/invalid snappy) + topic + data
 
+## One startup path for both chains (`bin/ethlambda/src/main.rs`)
+
+`ethlambda node` and `ethlambda beacon` are the same entry point. Each parses
+into one `cli::Options { common, network }`, where `network` is
+`Network::Lean(LeanOptions)` or `Network::Mainnet`. The lean variant carries
+that chain's own flags, so a lean-only flag is unreachable on the mainnet path
+by construction rather than by an `Option` nobody unwraps; `Mainnet` is a unit
+variant, since every flag `beacon` takes is a common one.
+
+`run_node` owns everything that is not chain-specific, in order: the discv5
+port check, metrics registration, the banner and version log, the
+`RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
+it must still precede key loading), `--node-key` resolution, reading
+`--bootnodes`, and building the aggregator, sync-status and event handles.
+
+It then branches **once**, on `network`, both arms inline, each evaluating to a
+`ChainSetup`: the wire configuration, the ENR entries that describe it, the
+`Store` the req/resp handlers answer from, the node-name roster, and an `Option`
+holding the validator keys and `BlockChainConfig`. The rest of the discv5
+configuration is the node key, the ports, the bootnodes and the peer target,
+which are operator input and identical either way, so `run_node` fills those in
+once below the match rather than having each arm repeat them.
+Everything after that match is shared again: one `build_swarm`, one
+`P2P::spawn`, one `start_rpc_server`. `ChainSetup.chain` being `None` is what
+ends the mainnet path, through a `let ... else` that returns into the shared
+`wait_for_shutdown`; lean falls through it into `BlockChain::spawn` and the
+`InitP2P`/`InitBlockChain` wiring.
+
+`ChainSetup` is a data bag, not an abstraction. The match that fills it stays
+inline, because moving it into a method would relocate the branch rather than
+remove it.
+
+Two consequences of "one call site" worth knowing. `P2P::spawn` now runs
+*before* `BlockChain::spawn`, so gossip arriving in between hits a `P2PServer`
+whose `blockchain` is still `None` and is dropped; every access is an `if let
+Some`, and the window is a handful of statements. And `beacon` now binds
+`--api-port` and serves the `/lean/v0` routes off an empty in-memory store,
+which answers for a chain that is not running; that is an accepted placeholder,
+not a design.
+
+`RunningNode.blockchain` is an `Option` for the same reason: the mainnet
+follower decodes gossip and imports nothing, so it has no chain actor to stop or
+join. It is why mainnet gets the graceful shutdown, metrics bootstrap and
+fd-limit raise it previously lacked (it used to park on
+`std::future::pending()`).
+
+`docs/cli.md` has the step-by-step table.
+
+### Mainnet's genesis is built into the binary
+
+`beacon`'s `genesis_time` and `genesis_validators_root`, which the fork digest
+keying every gossip topic, the ENR `eth2` entry and discv5 admission are
+computed from, come from `bin/ethlambda/assets/mainnet/genesis.ssz`. That is
+`metadata/genesis.ssz` from `eth-clients/mainnet` byte for byte, the same repo
+`beacon::MAINNET_BOOTNODES` is copied from, so both of this chain's hardcoded
+values have one upstream; `beacon::tests::the_shipped_state_is_eth_clients_file`
+pins its SHA-256 so replacing it has to be deliberate.
+`beacon::mainnet_genesis_state` decodes it as a **phase0** `BeaconState`, whole
+rather than reading the prefix those two fields sit in, so a corrupt asset fails
+loudly at startup rather than yielding two plausible numbers. 5.4 MB stored
+uncompressed and about 4 ms to decode: a deflated copy is under a third the
+size, but paying for it means a zip or gzip decoder in the dependency graph to
+read one build-time constant.
+
+Two consequences. `beacon` now takes **no** network configuration: a bare
+`ethlambda beacon` boots, and `--checkpoint-sync-url` is accepted there but
+unused (it is declared once for both sub-commands, and the anchor work will want
+it back). And a build with `ethlambda-types/preset-minimal` on cannot decode
+this asset, because the minimal preset shortens the state's fixed-size vectors;
+nothing enables that feature for this binary, and failing is the right answer if
+anything does.
+
+These values used to come from a Beacon API's `/eth/v1/beacon/genesis`, which
+made a `beacon` run depend on a checkpoint provider being reachable. They are
+properties of the chain, not of a provider. Lean's checkpoint sync is untouched:
+it fetches a *finalized* anchor, which genuinely has no local source.
+The URL cleaning, base-URL trim and first-success fan-out that the two paths
+once shared through a `checkpoint_common` module now live in
+`checkpoint_sync.rs`, its only remaining caller.
+
 ## HTTP Servers (API + Metrics)
 
 The RPC crate serves the API router (`--api-port`, default 5052) and the metrics/debug routers
 (`--metrics-port`, default 5054). When the two ports differ it binds two independent Axum servers;
 when they are equal it merges all three routers onto a single listener, so pointing both flags at
-one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
+one port is supported and not a misconfiguration.
+
+Both sub-commands bind through one call to `start_rpc_server`, from one site in `run_node`, so
+both serve all three routers. `beacon` reaches it with placeholders: the empty in-memory `Store`
+its `P2PServer` already holds, an `AggregatorController` seeded `false`, and a default
+`SyncStatusController` and `EventBus`. Those endpoints therefore answer for a chain that is not
+running. That is deliberate for now, to keep one HTTP call site rather than two; giving the beacon
+follower its own surface belongs with the anchor work. `start_http_servers(config, api_router,
+shutdown)` still takes `api_router` as an `Option` and `crates/net/rpc/tests/http_servers.rs`
+still covers the `None` arm, because that is the shape the beacon follower returns to once it has
+a surface of its own.
+
+See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 

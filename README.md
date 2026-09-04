@@ -30,6 +30,78 @@ make docker-build DOCKER_TAG=local
 
 Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
 
+### Running the node
+
+The binary follows one of two chains, chosen by a sub-command:
+
+```sh
+cargo build --release
+./target/release/ethlambda <node|beacon> [flags]
+```
+
+[`docs/cli.md`](./docs/cli.md) is the full flag reference for both.
+
+#### `ethlambda node` — the Lean consensus chain
+
+This is what the rest of this README is about, and it is the default: a bare
+flag list with no sub-command still runs the node, so existing scripts and
+Docker entrypoints keep working unchanged.
+
+It needs a genesis config, a validator registry, a bootnode list and this
+node's own keys, all of which a devnet generates for you:
+
+```sh
+./target/release/ethlambda node \
+  --genesis            config/config.yaml \
+  --validators         config/annotated_validators.yaml \
+  --bootnodes          config/nodes.yaml \
+  --validator-config   config/validator-config.yaml \
+  --hash-sig-keys-dir  config/hash-sig-keys \
+  --node-key           config/ethlambda_0.key \
+  --node-id            ethlambda_0 \
+  --data-dir           ./data \
+  --is-aggregator
+```
+
+`--node-id` picks this node's entry out of `annotated_validators.yaml`, so it
+is what decides which validators this process runs.
+
+The easiest way to get those files is `make run-devnet`, which generates them
+under `lean-quickstart/local-devnet/genesis/`. See
+[Running in a devnet](#running-in-a-devnet) below.
+
+> **Important:** at least one node on the network must run with
+> `--is-aggregator`, or attestations are never aggregated into blocks and the
+> chain produces blocks but never finalizes.
+
+#### `ethlambda beacon` — the Ethereum Beacon Chain
+
+Follows mainnet's gossip. It derives the fork digest from the chain's genesis,
+joins discv5, subscribes to the seven global gossip topics, and logs every
+block and aggregate attestation it decodes:
+
+```sh
+./target/release/ethlambda beacon
+```
+
+No flag is required. The `genesis_time` and `genesis_validators_root` the fork
+digest is computed from come from mainnet's genesis `BeaconState`, which is
+built into the binary (`eth-clients/mainnet`'s `genesis.ssz`, byte for byte), so
+startup touches no network and depends on no checkpoint provider. `--node-key`
+is worth passing anyway: without one a fresh identity is generated in memory
+for that run, so the PeerId and ENR change on every restart.
+
+Within about half a minute you should see:
+
+```
+Beacon block decoded  slot=15115256 proposer=2241096 fork="fulu" block_root=455f66bc bytes=158301
+Beacon aggregate attestation decoded  slot=15115256 aggregator=111250 attesters=442 …
+```
+
+This is a follower and nothing more: it keeps no chain, imports nothing, and
+publishes nothing. See [`docs/beacon_wire.md`](./docs/beacon_wire.md) for what
+goes on the wire and how to tell a healthy run from a broken one.
+
 ### Running in a devnet
 
 To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):
@@ -48,8 +120,6 @@ Press `Ctrl+C` to stop all nodes.
 > sudo sysctl -w net.core.wmem_max=7340032
 > ```
 > To persist across reboots, add to `/etc/sysctl.conf`. For Docker, pass `--sysctl net.core.rmem_max=7340032 --sysctl net.core.wmem_max=7340032`.
-
-> **Important:** When running nodes manually (outside `make run-devnet`), at least one node must be started with `--is-aggregator` for attestations to be aggregated and included in blocks. Without this flag, the network will produce blocks but never finalize.
 
 For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
 
