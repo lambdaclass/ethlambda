@@ -85,11 +85,10 @@ jobs:
             | jq -e '.schema_version == 1 and (.samples | length == 3)'
 
   # Stable cargo ignores the publish-age cooldown in .cargo/config.toml, so the
-  # lockfile can pin too-young crates (or deliberately via the
-  # CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow escape hatch). Fail the build
-  # when either lockfile does. Infrastructure failures (toolchain download, a
-  # resolution that fails for reasons unrelated to age, e.g. a yanked upstream
-  # crate) only warn: they are outside the PR's control and would block every PR.
+  # lockfile can pin too-young crates. Fail the build when either lockfile does.
+  # Infrastructure failures (toolchain download, a resolution that fails for
+  # reasons unrelated to age, e.g. a yanked upstream crate) only warn: they are
+  # outside the PR's control and would block every PR.
   cooldown:
     name: Dependency cooldown
     runs-on: ubuntu-latest

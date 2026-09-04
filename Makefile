@@ -23,9 +23,7 @@ RESOLVER_TOOLCHAIN := nightly-2026-06-21
 # Resolution done on stable (`cargo add`, plain `cargo update`) is NOT covered;
 # this target is the intended path for routine updates. Git dependencies have
 # no publish age and are refreshed WITHOUT any cooldown: review their lockfile
-# rev changes manually. Escape hatch for an urgent bump to a version younger
-# than the cooldown, applied to the WHOLE resolution of that invocation:
-#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow make update UPDATE_ARGS="-p h2 --precise 0.4.16"
+# rev changes manually.
 update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS="-p foo")
 	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
 	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age $(UPDATE_ARGS)
