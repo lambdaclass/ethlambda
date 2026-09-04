@@ -354,10 +354,12 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
         let should_signal_proposal = has_proposal && is_final_tick;
 
         // NOTE: here we assume on_tick never skips intervals.
-        // Interval 2 (committee-signature aggregation) is no longer handled here:
-        // the blockchain actor orchestrates the aggregation worker directly so
-        // the actor's message loop stays unblocked during the expensive XMSS
-        // proofs. See `BlockChainServer::start_aggregation_session` in `lib.rs`.
+        // Interval 2 (committee-signature aggregation) is not handled here:
+        // proving runs continuously on the blockchain actor's off-thread
+        // aggregation worker, so the actor's message loop stays unblocked
+        // during the expensive XMSS work, and the interval only carries the
+        // publication of what the worker produced. See
+        // `BlockChainServer::publish_pending_aggregates` in `lib.rs`.
         match interval {
             SlotInterval::BlockPublication => {
                 // Start of slot - process attestations if proposal exists
@@ -369,7 +371,8 @@ pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
                 // Vote propagation — no action
             }
             SlotInterval::Aggregation => {
-                // Aggregation is driven by the actor (off-thread); nothing to do here.
+                // Aggregation runs on the actor's off-thread worker; nothing to
+                // do here.
             }
             SlotInterval::SafeTargetUpdate => {
                 // Update safe target for validators
