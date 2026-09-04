@@ -48,7 +48,7 @@ use crate::{
     req_resp::{
         BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
         MAX_COMPRESSED_PAYLOAD_SIZE, MAX_REQUEST_BLOCKS, Request, STATUS_PROTOCOL_V1, build_status,
-        fetch_block_from_peer,
+        fetch_block_from_peer, handle_fetch_failure,
     },
     swarm_adapter::SwarmHandle,
 };
@@ -67,6 +67,19 @@ const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
+
+/// Timeout libp2p applies to an in-flight req/resp exchange.
+const REQ_RESP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Backstop for a `BlocksByRoot` request that libp2p never reports an outcome
+/// for. libp2p drops a request whose dial it rejects with
+/// `DialError::DialPeerConditionFalse` without emitting `OutboundFailure`, and
+/// a root left in `pending_root_requests` is deduplicated out of every later
+/// fetch, so the block can never be recovered for the life of the process.
+///
+/// Kept above `REQ_RESP_TIMEOUT` so a request that did reach a connection
+/// fails through libp2p's own path first.
+const ROOT_FETCH_WATCHDOG: Duration = Duration::from_secs(15);
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
@@ -298,7 +311,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 request_response::ProtocolSupport::Full,
             ),
         ],
-        Default::default(),
+        request_response::Config::default().with_request_timeout(REQ_RESP_TIMEOUT),
     );
 
     let secret_key =
@@ -547,6 +560,14 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn block_fetch_timeout(
+        &self,
+        root: H256,
+        peer: PeerId,
+        request_id: OutboundRequestId,
+        attempt: u32,
+    ) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
@@ -558,7 +579,7 @@ impl P2PServer {
     async fn handle_retry_block_fetch(
         &mut self,
         msg: p2p_protocol::RetryBlockFetch,
-        _ctx: &Context<Self>,
+        ctx: &Context<Self>,
     ) {
         let root = msg.root;
         // Check if still pending (might have succeeded during backoff)
@@ -569,10 +590,42 @@ impl P2PServer {
 
         trace!(%root, "Retrying block fetch after backoff");
 
-        if !fetch_block_from_peer(self, root).await {
+        if !fetch_block_from_peer(self, root, ctx).await {
             tracing::error!(%root, "Failed to retry block fetch, giving up");
             self.pending_root_requests.remove(&root);
         }
+    }
+
+    /// Fail an attempt that libp2p never reported an outcome for.
+    ///
+    /// Without this the root stays in `pending_root_requests` forever and the
+    /// deduplication in the `FetchBlock` handler swallows every later attempt
+    /// to fetch that block.
+    #[send_handler]
+    async fn handle_block_fetch_timeout(
+        &mut self,
+        msg: p2p_protocol::BlockFetchTimeout,
+        ctx: &Context<Self>,
+    ) {
+        // Any outcome for this attempt either cleared the entry or moved it on
+        // to a later attempt, which arms a watchdog of its own.
+        let outstanding = self
+            .pending_root_requests
+            .get(&msg.root)
+            .is_some_and(|pending| pending.attempts == msg.attempt);
+        if !outstanding {
+            trace!(root = %msg.root, "Block fetch settled before the watchdog fired");
+            return;
+        }
+
+        warn!(
+            root = %msg.root,
+            peer = %msg.peer,
+            attempt = msg.attempt,
+            "BlocksByRoot request produced no libp2p outcome, failing it"
+        );
+        self.outbound_requests.remove(&msg.request_id);
+        handle_fetch_failure(self, msg.root, msg.peer, ctx).await;
     }
 
     #[send_handler]
@@ -640,14 +693,14 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
 }
 
 impl Handler<FetchBlock> for P2PServer {
-    async fn handle(&mut self, msg: FetchBlock, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: FetchBlock, ctx: &Context<Self>) {
         let root = msg.root;
         // Deduplicate - if already pending, ignore
         if self.pending_root_requests.contains_key(&root) {
             trace!(%root, "Block fetch already in progress, ignoring duplicate");
             return;
         }
-        fetch_block_from_peer(self, root).await;
+        fetch_block_from_peer(self, root, ctx).await;
     }
 }
 

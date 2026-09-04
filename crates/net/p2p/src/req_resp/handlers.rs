@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, PendingRequestKind, RangeSyncState, p2p_protocol,
+    PendingRequest, PendingRequestKind, ROOT_FETCH_WATCHDOG, RangeSyncState, p2p_protocol,
     req_resp::RequestedBlockRoots,
 };
 
@@ -80,10 +80,8 @@ pub async fn handle_req_resp_message(
                                     .await;
                                 }
                                 Some(PendingRequestKind::Root(root)) => {
-                                    handle_blocks_by_root_response(
-                                        server, blocks, peer, request_id, root, ctx,
-                                    )
-                                    .await;
+                                    handle_blocks_by_root_response(server, blocks, peer, root, ctx)
+                                        .await;
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -99,8 +97,12 @@ pub async fn handle_req_resp_message(
                             Some(PendingRequestKind::Range { .. }) => {
                                 fail_range_request(server, &peer);
                             }
-                            Some(request @ PendingRequestKind::Root(_)) => {
-                                server.outbound_requests.insert(request_id, request);
+                            Some(PendingRequestKind::Root(root)) => {
+                                // An error response completes the exchange, so
+                                // no `OutboundFailure` follows to retire the
+                                // root. Fail it here or it stays pending
+                                // forever and deduplicates every later fetch.
+                                handle_fetch_failure(server, root, peer, ctx).await;
                             }
                             None => {}
                         }
@@ -283,48 +285,48 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         .unwrap_or_default()
 }
 
+/// Pick the block that answers a `BlocksByRoot` request out of the response.
+///
+/// Requests carry a single root, so at most one block can answer one. Anything
+/// else the peer sent is unsolicited and dropped.
+fn matching_block(blocks: Vec<SignedBlock>, requested_root: H256) -> Option<SignedBlock> {
+    blocks
+        .into_iter()
+        .find(|block| block.message.hash_tree_root() == requested_root)
+}
+
 async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
     peer: PeerId,
-    request_id: request_response::OutboundRequestId,
     requested_root: H256,
     ctx: &Context<P2PServer>,
 ) {
-    trace!(%peer, count = blocks.len(), "Received BlocksByRoot response");
+    let received = blocks.len();
+    trace!(%peer, count = received, "Received BlocksByRoot response");
 
-    if blocks.is_empty() {
-        // Re-insert so failure handling can find it
-        server
-            .outbound_requests
-            .insert(request_id, PendingRequestKind::Root(requested_root));
-        debug!(%peer, "Received empty BlocksByRoot response");
+    // A response that answers nothing is a failed attempt, whether it was empty
+    // or carried only blocks we never asked for. Treating the latter as a
+    // no-op would leave the root pending forever, and the deduplication in the
+    // `FetchBlock` handler would swallow every later attempt to fetch it.
+    let Some(block) = matching_block(blocks, requested_root) else {
+        debug!(
+            %peer,
+            received,
+            expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
+            "BlocksByRoot response carried no matching block"
+        );
         handle_fetch_failure(server, requested_root, peer, ctx).await;
         return;
-    }
+    };
 
-    for block in blocks {
-        let root = block.message.hash_tree_root();
+    // Clean up tracking for this root
+    server.pending_root_requests.remove(&requested_root);
 
-        // Validate that this block matches what we requested
-        if root != requested_root {
-            debug!(
-                %peer,
-                received_root = %ethlambda_types::ShortRoot(&root.0),
-                expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
-                "Received block with mismatched root, ignoring"
-            );
-            continue;
-        }
-
-        // Clean up tracking for this root
-        server.pending_root_requests.remove(&root);
-
-        if let Some(ref blockchain) = server.blockchain {
-            let _ = blockchain
-                .new_block(block, BlockSource::Sync)
-                .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
-        }
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_block(block, BlockSource::Sync)
+            .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
     }
 }
 
@@ -398,7 +400,11 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 /// Handles tracking in both pending_requests and request_id_map.
-pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
+pub async fn fetch_block_from_peer(
+    server: &mut P2PServer,
+    root: H256,
+    ctx: &Context<P2PServer>,
+) -> bool {
     if server.connected_peers.is_empty() {
         debug!(%root, "Cannot fetch block: no connected peers");
         return false;
@@ -466,18 +472,33 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     };
 
     // Track the request if not already tracked (new request)
-    server
+    let attempt = server
         .pending_root_requests
         .entry(root)
         .or_insert(PendingRequest {
             attempts: 1,
             failed_peers: HashSet::new(),
-        });
+        })
+        .attempts;
 
     // Map request_id to root for failure handling
     server
         .outbound_requests
         .insert(request_id, PendingRequestKind::Root(root));
+
+    // Every other exit from this attempt runs off a libp2p event, and libp2p
+    // does not always emit one, so arm a backstop that fails the attempt if
+    // nothing else does.
+    send_after(
+        ROOT_FETCH_WATCHDOG,
+        ctx.clone(),
+        p2p_protocol::BlockFetchTimeout {
+            root,
+            peer,
+            request_id,
+            attempt,
+        },
+    );
 
     true
 }
@@ -556,33 +577,68 @@ fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
-async fn handle_fetch_failure(
+/// What follows a failed attempt to fetch a block by root.
+#[derive(Debug, PartialEq, Eq)]
+enum FetchFailure {
+    /// Wait `backoff`, then try another peer.
+    Retry { attempts: u32, backoff: Duration },
+    /// Out of attempts. The root is no longer pending.
+    GaveUp { attempts: u32 },
+    /// Nothing was pending for this root, so the failure is late or duplicate.
+    NotPending,
+}
+
+/// Charge a failed attempt to the pending table and decide what follows.
+///
+/// Split out of [`handle_fetch_failure`] so the retry accounting is testable
+/// without a live actor.
+fn record_fetch_failure(
+    pending_root_requests: &mut HashMap<H256, PendingRequest>,
+    root: H256,
+    peer: PeerId,
+) -> FetchFailure {
+    let Some(pending) = pending_root_requests.get_mut(&root) else {
+        return FetchFailure::NotPending;
+    };
+
+    pending.failed_peers.insert(peer);
+    let attempts = pending.attempts;
+
+    if attempts >= MAX_FETCH_RETRIES {
+        pending_root_requests.remove(&root);
+        return FetchFailure::GaveUp { attempts };
+    }
+
+    pending.attempts += 1;
+    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(attempts - 1);
+
+    FetchFailure::Retry {
+        attempts,
+        backoff: Duration::from_millis(backoff_ms),
+    }
+}
+
+/// Retire one failed attempt at fetching `root`.
+///
+/// Every path that ends an attempt must come through here: a root left in
+/// `pending_root_requests` is deduplicated out of every later fetch, so a
+/// silent exit loses that block for the life of the process.
+pub(crate) async fn handle_fetch_failure(
     server: &mut P2PServer,
     root: H256,
     peer: PeerId,
     ctx: &Context<P2PServer>,
 ) {
-    let Some(pending) = server.pending_root_requests.get_mut(&root) else {
-        return;
-    };
-
-    pending.failed_peers.insert(peer);
-
-    if pending.attempts >= MAX_FETCH_RETRIES {
-        error!(%root, %peer, attempts=%pending.attempts,
-               "Block fetch failed after max retries, giving up");
-        server.pending_root_requests.remove(&root);
-        return;
+    match record_fetch_failure(&mut server.pending_root_requests, root, peer) {
+        FetchFailure::NotPending => {}
+        FetchFailure::GaveUp { attempts } => {
+            error!(%root, %peer, attempts, "Block fetch failed after max retries, giving up");
+        }
+        FetchFailure::Retry { attempts, backoff } => {
+            debug!(%root, %peer, attempts, ?backoff, "Block fetch failed, scheduling retry");
+            send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+        }
     }
-
-    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
-    let backoff = Duration::from_millis(backoff_ms);
-
-    debug!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");
-
-    pending.attempts += 1;
-
-    send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
 }
 
 #[cfg(test)]
@@ -655,5 +711,99 @@ mod tests {
         assert_eq!(slots, vec![1, 2, 4]);
         assert_eq!(roots, vec![root_1, root_2, root_4]);
         assert!(!roots.contains(&side_root_3));
+    }
+
+    fn pending_root(root: H256, attempts: u32) -> HashMap<H256, PendingRequest> {
+        HashMap::from([(
+            root,
+            PendingRequest {
+                attempts,
+                failed_peers: HashSet::new(),
+            },
+        )])
+    }
+
+    /// A response that answers nothing must not look like a success. Returning
+    /// `Some` for an unrequested block would leave the requested root pending
+    /// forever, and the `FetchBlock` deduplication would then swallow every
+    /// later attempt to fetch it.
+    #[test]
+    fn matching_block_rejects_a_response_that_answers_a_different_root() {
+        let wanted = signed_block(1, H256::ZERO);
+        let wanted_root = wanted.message.hash_tree_root();
+        let other = signed_block(2, H256::ZERO);
+
+        assert!(matching_block(vec![other.clone()], wanted_root).is_none());
+        assert!(matching_block(Vec::new(), wanted_root).is_none());
+
+        let found = matching_block(vec![other, wanted], wanted_root)
+            .expect("the requested block answers the request");
+        assert_eq!(found.message.hash_tree_root(), wanted_root);
+    }
+
+    /// A failure for a root nobody is waiting on must stay a no-op, so a late
+    /// or duplicate event cannot resurrect a root that already succeeded.
+    #[test]
+    fn record_fetch_failure_ignores_an_untracked_root() {
+        let mut pending = HashMap::new();
+        let outcome = record_fetch_failure(&mut pending, H256::ZERO, PeerId::random());
+
+        assert_eq!(outcome, FetchFailure::NotPending);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn record_fetch_failure_backs_off_and_excludes_the_failing_peer() {
+        let root = H256::ZERO;
+        let peer = PeerId::random();
+        let mut pending = pending_root(root, 1);
+
+        let first = record_fetch_failure(&mut pending, root, peer);
+        assert_eq!(
+            first,
+            FetchFailure::Retry {
+                attempts: 1,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+            }
+        );
+
+        let second = record_fetch_failure(&mut pending, root, PeerId::random());
+        assert_eq!(
+            second,
+            FetchFailure::Retry {
+                attempts: 2,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER),
+            }
+        );
+
+        let entry = pending.get(&root).expect("root is still pending");
+        assert_eq!(entry.attempts, 3);
+        assert!(entry.failed_peers.contains(&peer));
+    }
+
+    /// Giving up has to clear the entry: leaving it behind is the same
+    /// permanent lock as never failing the attempt at all.
+    #[test]
+    fn record_fetch_failure_clears_the_root_when_it_gives_up() {
+        let root = H256::ZERO;
+        let mut pending = pending_root(root, MAX_FETCH_RETRIES);
+
+        let outcome = record_fetch_failure(&mut pending, root, PeerId::random());
+
+        assert_eq!(
+            outcome,
+            FetchFailure::GaveUp {
+                attempts: MAX_FETCH_RETRIES
+            }
+        );
+        assert!(!pending.contains_key(&root));
+    }
+
+    /// The watchdog is a backstop for requests libp2p never reports on, so it
+    /// must outlast libp2p's own timeout. Inverting these makes it fire on
+    /// healthy-but-slow requests and hides the real failure path.
+    #[test]
+    fn the_fetch_watchdog_outlasts_the_libp2p_request_timeout() {
+        assert!(ROOT_FETCH_WATCHDOG > crate::REQ_RESP_TIMEOUT);
     }
 }
