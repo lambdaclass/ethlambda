@@ -91,8 +91,8 @@ make test                                    # All tests + forkchoice spec tests
 ```bash
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
 make update UPDATE_ARGS="-p <crate>"                     # Bump deps under the 14-day publish-age cooldown (nightly resolver)
-make update-allow PACKAGE=<crate> VERSION=<ver>          # Escape hatch for a version younger than the cooldown
-make cooldown-check                                      # Warn about lockfile entries younger than the cooldown
+CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow make update UPDATE_ARGS="-p <crate> --precise <ver>"  # Escape hatch; CI stays red until it ages
+make cooldown-check                                      # Fail if a lockfile pins crates younger than the cooldown (same as CI)
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
 ```

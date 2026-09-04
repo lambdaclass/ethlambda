@@ -101,8 +101,10 @@ All commits must have a verified signature.
   freshly published crate versions as a supply-chain precaution. A plain `cargo update` or
   `cargo add` on stable bypasses the cooldown; `make lint`/`make test` and CI build
   `--locked` so an unresolved manifest change fails loudly instead of silently re-resolving.
-  For an urgent fix younger than the cooldown use `make update-allow PACKAGE=<crate> VERSION=<version>`
-  and review the whole lockfile diff. Git dependencies have no publish age and are not covered.
+  For an urgent fix younger than the cooldown, prefix the same command with
+  `CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow` and review the whole lockfile diff; CI's
+  `Dependency cooldown` job will stay red until that version ages past the window.
+  Git dependencies have no publish age and are not covered.
 
 ### Review Process
 

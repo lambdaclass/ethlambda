@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update update-allow cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -6,9 +6,6 @@ help: ## 📚 Show help for each of the Makefile recipes
 fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
-# `--locked` so the committed Cargo.lock is actually enforced: without it cargo
-# silently resolves and rewrites the lockfile, bypassing the publish-age cooldown
-# (see `update` below).
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -26,30 +23,28 @@ RESOLVER_TOOLCHAIN := nightly-2026-06-21
 # Resolution done on stable (`cargo add`, plain `cargo update`) is NOT covered;
 # this target is the intended path for routine updates. Git dependencies have
 # no publish age and are refreshed WITHOUT any cooldown: review their lockfile
-# rev changes manually.
+# rev changes manually. Escape hatch for an urgent bump to a version younger
+# than the cooldown, applied to the WHOLE resolution of that invocation:
+#   CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow make update UPDATE_ARGS="-p h2 --precise 0.4.16"
 update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS="-p foo")
-	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
+	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
 	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age $(UPDATE_ARGS)
 
-# Escape hatch for an urgent update to a version younger than the cooldown,
-# e.g. `make update-allow PACKAGE=h2 VERSION=0.4.16`. The bypass applies to the
-# WHOLE resolution of this invocation (transitive picks included), so review the
-# resulting lockfile diff.
-update-allow: ## 🚨 Update one crate to a version younger than the cooldown (PACKAGE=... VERSION=...)
-	@test -n "$(PACKAGE)" -a -n "$(VERSION)" || { echo "usage: make update-allow PACKAGE=<crate> VERSION=<version>" >&2; exit 1; }
-	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
-	CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow \
-	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age -p $(PACKAGE) --precise $(VERSION)
-
-# Stable cargo ignores the cooldown, so the lockfile can pin too-young crates
-# (or deliberately via `update-allow`); surface them without touching the file.
-cooldown-check: ## 🔎 Warn about lockfile entries younger than the publish-age cooldown
-	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
-	if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age 2>&1); then \
-		echo "WARNING: publish-age cooldown probe failed:"; echo "$$out" | grep -v "^ *Updating " | head -20; exit 0; \
-	fi; \
-	hits=$$(echo "$$out" | grep -E "Downgrading|is too new" || true); \
-	if [ -n "$$hits" ]; then echo "WARNING: lockfile pins crates younger than the publish-age cooldown:"; echo "$$hits"; fi
+# Stable cargo ignores the cooldown, so a lockfile can pin too-young crates;
+# same check as the CI `cooldown` job, without touching the files. A cooldown
+# downgrade is annotated with the too-young version's publish date; downgrades
+# for other reasons carry no such note and are not flagged.
+cooldown-check: ## 🔎 Fail if a lockfile pins crates younger than the publish-age cooldown
+	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
+	status=0; \
+	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do \
+		if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age --manifest-path $$manifest 2>&1); then \
+			echo "WARNING: publish-age cooldown probe failed for $$manifest:"; echo "$$out" | grep -v "^ *Updating " | head -20; continue; \
+		fi; \
+		hits=$$(echo "$$out" | grep -E "^ *Downgrading .*published" || true); \
+		if [ -n "$$hits" ]; then echo "ERROR: $$manifest pins crates younger than the publish-age cooldown:"; echo "$$hits"; status=1; fi; \
+	done; \
+	exit $$status
 
 BENCH_ARGS ?= synthetic --mock-crypto
 
