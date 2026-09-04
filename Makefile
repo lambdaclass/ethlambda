@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench update update-allow cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -6,13 +6,50 @@ help: ## 📚 Show help for each of the Makefile recipes
 fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
+# `--locked` so the committed Cargo.lock is actually enforced: without it cargo
+# silently resolves and rewrites the lockfile, bypassing the publish-age cooldown
+# (see `update` below).
 lint: ## 🔍 Run clippy on all workspace crates
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during
 	# signature verification/aggregation, without paying for LTO on every rebuild
-	cargo test --workspace --profile release-fast
+	cargo test --locked --workspace --profile release-fast
+
+# Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
+# is nightly-only, everything else runs on the stable toolchain pinned in
+# rust-toolchain.toml.
+RESOLVER_TOOLCHAIN := nightly-2026-06-21
+
+# Versions published less than 14 days ago are excluded from resolution.
+# Resolution done on stable (`cargo add`, plain `cargo update`) is NOT covered;
+# this target is the intended path for routine updates. Git dependencies have
+# no publish age and are refreshed WITHOUT any cooldown: review their lockfile
+# rev changes manually.
+update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS="-p foo")
+	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
+	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age $(UPDATE_ARGS)
+
+# Escape hatch for an urgent update to a version younger than the cooldown,
+# e.g. `make update-allow PACKAGE=h2 VERSION=0.4.16`. The bypass applies to the
+# WHOLE resolution of this invocation (transitive picks included), so review the
+# resulting lockfile diff.
+update-allow: ## 🚨 Update one crate to a version younger than the cooldown (PACKAGE=... VERSION=...)
+	@test -n "$(PACKAGE)" -a -n "$(VERSION)" || { echo "usage: make update-allow PACKAGE=<crate> VERSION=<version>" >&2; exit 1; }
+	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
+	CARGO_RESOLVER_INCOMPATIBLE_PUBLISH_AGE=allow \
+	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age -p $(PACKAGE) --precise $(VERSION)
+
+# Stable cargo ignores the cooldown, so the lockfile can pin too-young crates
+# (or deliberately via `update-allow`); surface them without touching the file.
+cooldown-check: ## 🔎 Warn about lockfile entries younger than the publish-age cooldown
+	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null 2>&1 && \
+	if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age 2>&1); then \
+		echo "WARNING: publish-age cooldown probe failed:"; echo "$$out" | grep -v "^ *Updating " | head -20; exit 0; \
+	fi; \
+	hits=$$(echo "$$out" | grep -E "Downgrading|is too new" || true); \
+	if [ -n "$$hits" ]; then echo "WARNING: lockfile pins crates younger than the publish-age cooldown:"; echo "$$hits"; fi
 
 BENCH_ARGS ?= synthetic --mock-crypto
 

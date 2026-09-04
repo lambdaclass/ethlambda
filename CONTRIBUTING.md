@@ -96,6 +96,13 @@ All commits must have a verified signature.
 - **Comments:** Explain *why*, not *what*. Code should be self-explanatory.
 - **Error handling:** Use `Result` and `thiserror`. Avoid `.unwrap()` outside tests.
 - **Dependencies:** Adding a new crate requires justification in the PR description.
+  Resolve version bumps with `make update` (optionally `UPDATE_ARGS="-p <crate>"`): it runs
+  the resolver under a 14-day publish-age cooldown (`.cargo/config.toml`) that excludes
+  freshly published crate versions as a supply-chain precaution. A plain `cargo update` or
+  `cargo add` on stable bypasses the cooldown; `make lint`/`make test` and CI build
+  `--locked` so an unresolved manifest change fails loudly instead of silently re-resolving.
+  For an urgent fix younger than the cooldown use `make update-allow PACKAGE=<crate> VERSION=<version>`
+  and review the whole lockfile diff. Git dependencies have no publish age and are not covered.
 
 ### Review Process
 

@@ -90,6 +90,9 @@ make test                                    # All tests + forkchoice spec tests
 ### Common Operations
 ```bash
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
+make update UPDATE_ARGS="-p <crate>"                     # Bump deps under the 14-day publish-age cooldown (nightly resolver)
+make update-allow PACKAGE=<crate> VERSION=<ver>          # Escape hatch for a version younger than the cooldown
+make cooldown-check                                      # Warn about lockfile entries younger than the cooldown
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
 ```

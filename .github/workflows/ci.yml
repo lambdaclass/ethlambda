@@ -43,11 +43,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # `--locked` so the committed Cargo.lock is actually enforced (see the
+      # tooling steps below), and so a dependency bump cannot sneak past the
+      # publish-age cooldown in .cargo/config.toml by resolving on stable here.
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       # tooling/event-monitor declares its own [workspace] table, so every step
       # above stops at the root workspace members and never reaches it. Its
@@ -83,3 +86,31 @@ jobs:
           cargo run --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
             --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
             | jq -e '.schema_version == 1 and (.samples | length == 3)'
+
+  # Stable cargo ignores the publish-age cooldown in .cargo/config.toml, so the
+  # lockfile can pin too-young crates (or deliberately via `make update-allow`).
+  # Surface them as annotations; this job never fails the build.
+  cooldown:
+    name: Dependency cooldown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check lockfile against the publish-age cooldown
+        run: |
+          if ! rustup toolchain install nightly-2026-06-21 --profile minimal; then
+            echo "::warning title=Publish-age cooldown check skipped::toolchain install failed"
+            exit 0
+          fi
+          if ! cargo +nightly-2026-06-21 update --dry-run -Z min-publish-age > cooldown.txt 2>&1; then
+            # Drop the index/git refresh chatter so the excerpt is the actual error; %0A = newline in annotations
+            msg=$(grep -v '^ *Updating ' cooldown.txt | head -20 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::warning title=Publish-age cooldown probe failed::$msg"
+            exit 0
+          fi
+          hits=$(grep -E "Downgrading|is too new" cooldown.txt || true)
+          if [ -n "$hits" ]; then
+            count=$(echo "$hits" | wc -l)
+            msg=$(echo "$hits" | head -20 | sed ':a;N;$!ba;s/\n/%0A/g')
+            echo "::warning title=Lockfile pins $count crate(s) younger than the publish-age cooldown::$msg"
+          fi
