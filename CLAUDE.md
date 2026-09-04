@@ -56,7 +56,7 @@ crates/
 ```
 Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
-Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor only buffers each finished aggregate until this tick.
+Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor buffers each finished aggregate until this tick. One that finishes DURING interval 2 or 3 is gossiped on arrival instead, since the window is already open and buffering would hold it a full slot.
 Interval 3: Safe target update (fork choice)
 Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
@@ -76,18 +76,32 @@ Fork choice head update
 - One plain `std::thread` spawned in the actor's `#[started]` hook, joined in `#[stopped]`.
   Not `spawn_blocking`: it lives for the process and awaits nothing, so a blocking-pool
   thread would be parked permanently for nothing
-- Holds its own `Store` clone (same backend, same in-memory buffers), so it re-reads the
-  pool itself rather than being handed a per-slot snapshot: `select_best_job` → prove →
-  `AggregateProduced` message → repeat. Nothing eligible means a `WORKER_IDLE_POLL` sleep
-- The actor **applies** each aggregate on arrival (the pool the worker re-reads must
-  account for it, or the same group gets proved twice) but **buffers** the gossip
-  publication in `pending_aggregates` until interval 2
-- `pending_aggregates` buffers the `AttestationData` keyed by data root, never the proof:
-  the proof is already in the store's `new_payloads`, where `PayloadBuffer` dedups and
-  caps it. Publication reads it back with `Store::widest_proof_for_data`, so re-proving a
-  group after a straggler signature replaces the entry instead of queueing a second
-  near-identical 512 KiB aggregate, and what goes on the wire is the widest proof held
-  for that data
+- Holds its own `Store` clone (same backend, same in-memory buffers), so it both re-reads
+  the pool itself rather than being handed a per-slot snapshot AND writes back what it
+  produces: `select_best_job` → prove → `store_aggregate` → `AggregateProduced` message →
+  repeat. Nothing eligible means a `WORKER_IDLE_POLL` sleep
+- The WORKER stores each aggregate (payload into the pool, gossip signatures out of it)
+  before announcing it, so the message carries no proof and the actor's mailbox never
+  holds one. The actor only **buffers** the gossip publication in `pending_aggregates`
+  until interval 2
+- That write races the actor, and is safe on two counts: `insert_new_aggregated_payload`
+  records fork-choice votes with a max-merge (`should_replace_vote`), which is
+  order-independent, and a concurrent promote MOVES votes new→known rather than dropping
+  them, so the worst interleaving defers a vote or its payload by one tick.
+  `delete_gossip_signatures` can only race a duplicate of a vote the proof already binds
+- `pending_aggregates` keys by attestation data root and stores PARTICIPANT SETS, not
+  proofs. The proof is already in the payload pool, and `Store::proof_for_participants`
+  fetches the named one back at publish time, so the buffer costs a bitfield per aggregate
+  instead of up to 512 KiB. A miss means the pool let the proof go (subsumed, pruned,
+  evicted) and there is nothing left to send
+- Naming a SPECIFIC proof is what makes that read-back safe. Do NOT change it to ask the
+  pool for the best proof under a data root: the pool also holds peers' proofs for the
+  same attestation data, `PayloadBuffer` keeps a peer's disjoint proof beside ours, and
+  any "pick the best" rule would publish theirs in place of ours and leave our subnet's
+  votes off the wire entirely
+- `PendingAggregate::push` mirrors `PayloadBuffer`'s subsumption rule on the participant
+  sets, so a re-proved group replaces the narrower name, disjoint sets both survive, and
+  the names kept are the ones that still resolve. `MAX_PENDING_AGGREGATES` bounds the rest
 - `JobPolicy` gates what the worker may take, by position in the slot: backlog
   work early, a current-slot group once it holds `min_current_slot_group_sigs`, and inside
   `EARLY_AGGREGATION_WINDOW` before interval 2 nothing but that group (a backlog job is a
@@ -96,18 +110,23 @@ Fork choice head update
   guard keys on; only the sub-interval position inside it comes from the wall clock
   (`ms_into_slot`, clamped to that slot). Two independent clocks would let the worker and
   the actor disagree about the current slot, and `select_best_job` buckets on exactly that
-- The actor raises a pause flag (`AggregationWorker::pause`, RAII guard) around its own
-  `propose_block`, since both compete for the same single-threaded leanVM prover. A proof
-  already in flight is not interrupted — `aggregate_mixed` cannot be. The flag is a plain
-  bool, not a depth counter, so `propose_block` must stay its only caller
-- The worker also parks itself while the sync gate suppresses duties: it reads the shared
-  `SyncStatusController` plus its own copy of the startup-fixed `gate_duties` flag. A node
-  that is behind would otherwise prove its backlog against the same prover block import
-  needs. Read in `next_job` rather than taken as a `pause` guard, since that flag admits
-  one holder
-- `EmittedCoverage` remembers per-slot what the worker emitted, closing the window between
-  `send` and the actor's apply. Recorded on *attempt*, so a failed proof is not retried at
-  full prover cost
+- The actor parks the worker through a `PauseReason` bitset (`AtomicU8`), and the worker
+  takes no new job while any bit is set. `BlockBuild` is scoped, taken as an RAII
+  `PauseGuard` around `propose_block`, since both compete for the same single-threaded
+  leanVM prover. `Syncing` is level-driven from `duties_allowed()` on every tick via
+  `set_paused`, so a node that is behind does not prove a backlog against the prover its
+  block import needs, and `--disable-duty-sync-gate` keeps the worker running for free.
+  A proof already in flight is not interrupted — `aggregate_mixed` cannot be
+- One reason, one owner: a bitset (rather than a bool or a depth counter) makes setting
+  idempotent for the level-driven owner and stops a guard's drop from releasing someone
+  else's reason
+- Division of labor: the worker reads shared state that OTHER threads write (the
+  `AggregatorController`, which the RPC thread toggles); state the actor itself owns
+  reaches the worker as a `PauseReason`, so the policy is not re-derived in two places
+- `EmittedCoverage` remembers per-slot what the worker ATTEMPTED, so a failed proof (which
+  leaves the store untouched and re-reads identically) is not retried at full prover cost.
+  It no longer has a send-to-apply window to cover: the worker stores its own output
+  before the next selection round reads the pool
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots

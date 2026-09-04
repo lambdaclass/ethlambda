@@ -3,11 +3,12 @@
 //!
 //! One worker thread is spawned when the blockchain actor starts and lives as
 //! long as it does. It holds its own [`Store`] handle (a clone sharing the same
-//! backend and in-memory buffers), so it re-reads the pool itself instead of
-//! being handed a per-slot snapshot: pick the single best job available right
-//! now, run its expensive XMSS proof, hand the result to the actor as an
-//! [`AggregateProduced`] message, pick again. With nothing eligible it polls
-//! every [`WORKER_IDLE_POLL`].
+//! backend and in-memory buffers), so it both re-reads the pool itself instead
+//! of being handed a per-slot snapshot and writes what it produces straight
+//! back: pick the single best job available right now, run its expensive XMSS
+//! proof, [`store_aggregate`] it, tell the actor with an [`AggregateProduced`]
+//! message, pick again. With nothing eligible it polls every
+//! [`WORKER_IDLE_POLL`].
 //!
 //! It is a plain `std::thread`, not a `spawn_blocking` task. The thread runs
 //! for the process's life and spends it in leanVM proofs, so handing it to the
@@ -15,9 +16,13 @@
 //! buying nothing: the loop awaits nothing, and it reaches the actor through an
 //! unbounded channel that needs no reactor.
 //!
-//! The actor applies each aggregate to the store on arrival but holds the
-//! gossip publication until the vote-aggregation interval, so proving is free
-//! to run whenever while publication stays on the interval grid.
+//! Storing on the worker keeps the proof off the actor's mailbox: the message
+//! carries only the attestation data and the participant set naming the proof,
+//! and the actor reads the bytes back out of the pool when it publishes. That
+//! publication is what stays on the interval grid, held to the
+//! vote-aggregation interval unless the aggregate finishes inside the window
+//! (see `SlotInterval::publishes_aggregates_on_arrival`), so proving is free to
+//! run whenever.
 //!
 //! [`select_best_job`] builds the candidate pool with the same tiered scoring
 //! as `block_builder::select_attestations`: a store pass resolves every
@@ -33,16 +38,16 @@
 //! else — it would rather idle than start a recursive merge that runs into the
 //! slot's committee aggregation.
 //!
-//! The actor can also park the worker outright: it raises the pause flag
-//! around its own block build, so the prover is not shared with it (see
-//! [`AggregationWorker::pause`]). The worker parks itself as well while the
-//! sync gate is suppressing duties, so a node that is behind spends the prover
-//! on the block import that closes the gap rather than on a backlog the
-//! network has stopped waiting for.
+//! The actor parks the worker outright for as long as it needs the prover to
+//! itself, or the node has no business aggregating: around its own block
+//! build, and while the sync gate suppresses duties, so a node that is behind
+//! spends the prover on the block import that closes the gap rather than on a
+//! backlog the network has stopped waiting for. Both are [`PauseReason`]s (see
+//! [`AggregationWorker::pause`] and [`AggregationWorker::set_paused`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use ethlambda_crypto::aggregate_mixed;
@@ -64,8 +69,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
-use crate::metrics::SyncStatus;
-use crate::sync_status::SyncStatusController;
 use crate::{SlotInterval, metrics};
 
 /// How long the worker waits before re-reading the pool when it found nothing
@@ -181,36 +184,77 @@ pub struct AggregatedGroupOutput {
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
+/// Why the worker is parked. The actor owns every reason and sets them
+/// independently; the worker takes no new job while any is set.
+///
+/// A bitset rather than a single flag or a depth counter: each reason has
+/// exactly one owner, so setting one twice is idempotent, clearing one cannot
+/// clear another's, and nothing is left to leak when an owner is level-driven
+/// rather than scoped. Values are distinct bits of the `AtomicU8` in
+/// [`AggregationWorker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PauseReason {
+    /// The actor is building a block. Both it and the worker run leanVM
+    /// proofs on the same single-threaded prover, and the block is the one
+    /// with a deadline. Scoped to the build, so it is taken as a
+    /// [`PauseGuard`].
+    BlockBuild = 1 << 0,
+    /// The sync gate is suppressing this node's duties. A node that is behind
+    /// would otherwise prove a backlog the network has moved past, against
+    /// the same prover its block import needs to close the gap. Level-driven
+    /// from the actor's tick, so it is set through
+    /// [`AggregationWorker::set_paused`] rather than held as a guard.
+    Syncing = 1 << 1,
+}
+
 /// Handle to the always-on aggregation worker, held by the actor for the
 /// actor's whole lifetime.
 pub(crate) struct AggregationWorker {
     /// Cancelled by the actor's `stopped()` hook; the worker breaks out of its
     /// loop at the next job boundary.
     cancel: CancellationToken,
-    /// Raised while the actor needs the prover to itself; see [`Self::pause`].
-    paused: Arc<AtomicBool>,
+    /// Set of [`PauseReason`]s currently holding the worker back, as a bitset.
+    /// Non-zero means "take no new job"; see [`Self::pause`].
+    paused: Arc<AtomicU8>,
     /// Handle to the worker thread, held so shutdown can join it.
     handle: std::thread::JoinHandle<()>,
 }
 
+/// Set or clear one reason's bit. Read-modify-write, so reasons are
+/// independent: an owner only ever touches its own bit.
+fn set_pause_reason(paused: &AtomicU8, reason: PauseReason, on: bool) {
+    if on {
+        paused.fetch_or(reason as u8, Ordering::Release);
+    } else {
+        paused.fetch_and(!(reason as u8), Ordering::Release);
+    }
+}
+
 impl AggregationWorker {
-    /// Stop handing the worker new jobs for as long as the returned guard
-    /// lives. A proof already in flight is not interrupted (`aggregate_mixed`
-    /// cannot be), so this bounds contention rather than eliminating it.
+    /// Stop handing the worker new jobs for `reason` for as long as the
+    /// returned guard lives. A proof already in flight is not interrupted
+    /// (`aggregate_mixed` cannot be), so this bounds contention rather than
+    /// eliminating it.
     ///
-    /// **At most one live guard.** The flag is a plain boolean, not a depth
-    /// counter, so two overlapping guards would unpause the worker the moment
-    /// the first one drops, while the second still believes it has the prover
-    /// to itself. The block build is the only caller, and that is what keeps
-    /// the plain boolean correct.
-    ///
-    /// A further reason to hold the worker back belongs in [`next_job`], as a
-    /// condition the worker reads for itself the way it reads the aggregator
-    /// role and the sync gate. Turn this into an `AtomicUsize` depth counter
-    /// before adding a second guard here.
-    pub(crate) fn pause(&self) -> PauseGuard {
-        self.paused.store(true, Ordering::Release);
-        PauseGuard(self.paused.clone())
+    /// For a reason whose lifetime is a scope. A reason the actor tracks as
+    /// state instead, recomputing it each tick, belongs in
+    /// [`Self::set_paused`]. Either way one reason has one owner: two live
+    /// guards for the same reason would release it when the first drops.
+    pub(crate) fn pause(&self, reason: PauseReason) -> PauseGuard {
+        set_pause_reason(&self.paused, reason, true);
+        PauseGuard {
+            paused: self.paused.clone(),
+            reason,
+        }
+    }
+
+    /// Level-triggered form of [`Self::pause`]: bring `reason` in line with
+    /// `paused`, whatever it was before. Idempotent, so the actor can drive it
+    /// straight off a predicate it recomputes every tick without tracking
+    /// whether it already set it.
+    pub(crate) fn set_paused(&self, reason: PauseReason, paused: bool) {
+        set_pause_reason(&self.paused, reason, paused);
     }
 
     /// Cancel the worker and wait up to [`WORKER_JOIN_TIMEOUT`] for it to exit.
@@ -242,37 +286,43 @@ impl AggregationWorker {
     }
 }
 
-/// Lowers the worker's pause flag on drop, so an early return on the paused
-/// code path cannot leave the worker parked forever. Correct for exactly one
-/// live guard; see [`AggregationWorker::pause`].
-pub(crate) struct PauseGuard(Arc<AtomicBool>);
+/// Clears its own [`PauseReason`] on drop, so an early return on the paused
+/// code path cannot leave the worker parked forever. Touches no other
+/// reason's bit; see [`AggregationWorker::pause`].
+pub(crate) struct PauseGuard {
+    paused: Arc<AtomicU8>,
+    reason: PauseReason,
+}
 
 impl Drop for PauseGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        set_pause_reason(&self.paused, self.reason, false);
     }
 }
 
-/// Startup-fixed inputs the worker's gates need. All come from the CLI and
-/// never change at runtime, so the worker owns a copy instead of reaching back
-/// into the actor.
+/// Startup-fixed inputs the worker's vote-propagation gate needs. Both come
+/// from the CLI and never change at runtime, so the worker owns a copy instead
+/// of reaching back into the actor.
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
     /// Number of attestation committees (= subnet count).
     pub(crate) attestation_committee_count: u64,
     /// Attestation subnets this node subscribes to.
     pub(crate) subscribed_subnets: HashSet<u64>,
-    /// Whether a syncing node suppresses duties; cleared by the CLI
-    /// `--disable-duty-sync-gate`. Mirrors `SyncStatusTracker`'s own copy: the
-    /// tracker publishes its sync verdict through [`SyncStatusController`],
-    /// but not whether that verdict gates anything, so the worker carries the
-    /// flag itself.
-    pub(crate) gate_duties: bool,
 }
 
-/// One successful aggregate streamed back from the worker.
+/// One successful aggregate announced to the actor, after the worker has
+/// already stored it.
+///
+/// Carries no proof: [`store_aggregate`] put it in the pending payload pool,
+/// and `participants` names it there for `Store::proof_for_participants`. A
+/// proof is up to [`ByteList512KiB`], so keeping it out of the mailbox keeps
+/// the actor's queue small however far behind publication falls.
 pub(crate) struct AggregateProduced {
-    pub(crate) output: AggregatedGroupOutput,
+    pub(crate) hashed: HashedAttestationData,
+    /// Participant set of the stored proof, which is both what names it in the
+    /// pool and what the actor buffers until publication.
+    pub(crate) participants: AggregationBits,
     /// Wall time the proof itself took, observed on the worker thread.
     pub(crate) elapsed: Duration,
 }
@@ -280,14 +330,17 @@ impl Message for AggregateProduced {
     type Result = ();
 }
 
-/// Validator ids this worker has already produced a proof for, keyed by
+/// Validator ids this worker has already attempted a proof for, keyed by
 /// attestation data root, for the slot in [`Self::slot`].
 ///
-/// The actor applies an aggregate (which deletes the group's gossip
-/// signatures) only once the message reaches it, so between sending and that
-/// apply the store still shows the job as pending and the very next selection
-/// round would prove it a second time. Remembering what we emitted closes that
-/// window without making the worker a store writer.
+/// A *failed* job leaves the store exactly as it found it, so it re-reads
+/// identically and the very next selection round would run the same proof
+/// again at full prover cost. Remembering the attempt is what stops that.
+///
+/// A successful one needs no such help now that the worker stores its own
+/// output: [`store_aggregate`] returns before the next selection round, so the
+/// pool that round reads already accounts for it. Recording it anyway costs
+/// nothing and keeps one rule for both outcomes.
 #[derive(Default)]
 struct EmittedCoverage {
     slot: u64,
@@ -806,16 +859,55 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     })
 }
 
-/// Apply a worker-produced aggregate to the store. Called per message on the
-/// actor thread; gauge metrics that depend on total counts are batched into
-/// [`refresh_pool_gauges`] instead, so we pay one lock per slot rather than
-/// one per aggregate. Idempotent wrt the gossip delete.
-pub fn apply_aggregated_group(store: &mut Store, output: &AggregatedGroupOutput) {
-    store.insert_new_aggregated_payload(output.hashed.clone(), output.proof.clone());
-    store.delete_gossip_signatures(&output.keys_to_delete);
+/// Store one aggregate the worker just produced and build the announcement
+/// for the actor: the proof into the pending payload pool, and the gossip
+/// signatures it consumed out of the pool.
+///
+/// Runs on the worker thread through its own `Store` handle. `Store`'s `&mut
+/// self` does not mean exclusive access (its buffers are behind `Arc<Mutex<_>>`
+/// and the actor holds a handle of its own), so this interleaves with the
+/// actor, and both writes are safe under that:
+///
+/// - `insert_new_aggregated_payload` records the fork-choice votes before it
+///   pushes the payload, and it records them with a max-merge
+///   (`should_replace_vote`) that gives the same map whatever order concurrent
+///   writers arrive in. A promote landing in the middle moves votes from `new`
+///   to `known` rather than dropping them, so the worst interleaving leaves the
+///   vote or the payload to be promoted one tick later. Neither is lost.
+/// - `delete_gossip_signatures` removes keys this proof consumed. A signature
+///   arriving concurrently for one of them is the same validator's signature
+///   over the same attestation data, i.e. a duplicate of a vote the proof
+///   already binds, so deleting it loses nothing.
+///
+/// Gauge metrics that depend on total counts are batched into
+/// [`refresh_pool_gauges`] instead, so we pay one lock per slot rather than one
+/// per aggregate. Idempotent wrt the gossip delete.
+fn store_aggregate(
+    store: &mut Store,
+    output: AggregatedGroupOutput,
+    elapsed: Duration,
+) -> AggregateProduced {
+    let AggregatedGroupOutput {
+        hashed,
+        proof,
+        participants,
+        keys_to_delete,
+    } = output;
+    // Named before the proof moves into the pool; the bitfield is a few
+    // hundred bytes against the proof's up-to-512 KiB.
+    let bits = proof.participants.clone();
+
+    store.insert_new_aggregated_payload(hashed.clone(), proof);
+    store.delete_gossip_signatures(&keys_to_delete);
 
     metrics::inc_pq_sig_aggregated_signatures();
-    metrics::inc_pq_sig_attestations_in_aggregated_signatures(output.participants.len() as u64);
+    metrics::inc_pq_sig_attestations_in_aggregated_signatures(participants.len() as u64);
+
+    AggregateProduced {
+        hashed,
+        participants: bits,
+        elapsed,
+    }
 }
 
 /// Refresh the pool-size gauges. Called from the vote-aggregation tick, once
@@ -910,35 +1002,25 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// Spawn the always-on aggregation worker on its own thread.
 ///
 /// The worker owns a [`Store`] clone — same backend, same in-memory buffers —
-/// the shared aggregator-role flag (so a runtime toggle reaches it without a
-/// restart), the shared sync status (so the sync gate reaches it the same way),
-/// and the startup-fixed gate inputs. It runs until the returned handle's
+/// the shared aggregator-role flag (so a runtime toggle from the RPC thread
+/// reaches it without a restart), and the startup-fixed gate inputs. State the
+/// actor owns rather than shares, such as the sync verdict, reaches it as a
+/// [`PauseReason`] instead. It runs until the returned handle's
 /// [`AggregationWorker::shutdown`] cancels it.
 pub(crate) fn spawn_aggregation_worker(
     store: Store,
     actor: ActorRef<crate::BlockChainServer>,
     aggregator: AggregatorController,
-    sync_status: SyncStatusController,
     config: WorkerConfig,
 ) -> AggregationWorker {
     let cancel = CancellationToken::new();
-    let paused = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicU8::new(0));
     let handle = {
         let cancel = cancel.clone();
         let paused = paused.clone();
         std::thread::Builder::new()
             .name("aggregation-worker".to_owned())
-            .spawn(move || {
-                run_aggregation_worker(
-                    store,
-                    actor,
-                    aggregator,
-                    sync_status,
-                    config,
-                    cancel,
-                    paused,
-                )
-            })
+            .spawn(move || run_aggregation_worker(store, actor, aggregator, config, cancel, paused))
             .expect("spawning the aggregation worker thread")
     };
 
@@ -954,19 +1036,18 @@ pub(crate) fn spawn_aggregation_worker(
 /// Each round re-reads the pool through the store handle, picks the best job
 /// ([`select_best_job`]), proves it, and hands the result to the actor as an
 /// [`AggregateProduced`] message. With nothing to do — nothing eligible,
-/// paused for a block build, syncing, or no aggregation duty — it sleeps
+/// parked for some [`PauseReason`], or no aggregation duty — it sleeps
 /// [`WORKER_IDLE_POLL`] and looks again.
 ///
-/// `aggregate_mixed` cannot be interrupted, so cancellation, the pause flag
-/// and the sync gate are all only observed between jobs.
+/// `aggregate_mixed` cannot be interrupted, so both cancellation and the pause
+/// reasons are only observed between jobs.
 fn run_aggregation_worker(
-    store: Store,
+    mut store: Store,
     actor: ActorRef<crate::BlockChainServer>,
     aggregator: AggregatorController,
-    sync_status: SyncStatusController,
     config: WorkerConfig,
     cancel: CancellationToken,
-    paused: Arc<AtomicBool>,
+    paused: Arc<AtomicU8>,
 ) {
     info!("Aggregation worker started");
 
@@ -980,7 +1061,6 @@ fn run_aggregation_worker(
             &store,
             &time_config,
             &aggregator,
-            &sync_status,
             &paused,
             &config,
             &mut emitted,
@@ -1024,7 +1104,11 @@ fn run_aggregation_worker(
             "Committee signature aggregated"
         );
 
-        if actor.send(AggregateProduced { output, elapsed }).is_err() {
+        // Store before announcing, so the pool the actor reads to publish, and
+        // the one the next selection round re-reads, both already account for
+        // this aggregate.
+        let produced = store_aggregate(&mut store, output, elapsed);
+        if actor.send(produced).is_err() {
             // Actor is gone; nothing would consume further aggregates.
             break;
         }
@@ -1033,33 +1117,23 @@ fn run_aggregation_worker(
     info!("Aggregation worker stopped");
 }
 
-/// One round of job selection: honor the role flag, the pause flag and the
-/// sync gate, take the slot from the store clock and the [`JobPolicy`] from
-/// where the wall clock sits inside it, then ask [`select_best_job`] for the
-/// winner. `None` means "nothing to do right now", which inside the early
-/// window is a deliberate answer rather than an idle one.
+/// One round of job selection: honor the role flag and the pause reasons, take
+/// the slot from the store clock and the [`JobPolicy`] from where the wall
+/// clock sits inside it, then ask [`select_best_job`] for the winner. `None`
+/// means "nothing to do right now", which inside the early window is a
+/// deliberate answer rather than an idle one.
 fn next_job(
     store: &Store,
     time_config: &ChainConfig,
     aggregator: &AggregatorController,
-    sync_status: &SyncStatusController,
-    paused: &AtomicBool,
+    paused: &AtomicU8,
     config: &WorkerConfig,
     emitted: &mut EmittedCoverage,
 ) -> Option<AggregationJob> {
-    if !aggregator.is_enabled() || paused.load(Ordering::Acquire) {
-        return None;
-    }
-
-    // A node that is behind has both a large backlog and a prover the import
-    // path needs for `verify_aggregated_signature`. Proving that backlog would
-    // compete with the work that closes the gap, to produce aggregates for
-    // slots the network has moved past, so the gate that already suppresses
-    // this node's attestations and proposals suppresses its aggregation too.
-    //
-    // Read here rather than taken as a `pause` guard: that flag admits a single
-    // holder (see [`AggregationWorker::pause`]) and the block build owns it.
-    if config.gate_duties && sync_status.get() == SyncStatus::Syncing {
+    // The role flag is read here because the RPC thread writes it. Everything
+    // the actor itself owns, the sync verdict included, reaches us as a
+    // [`PauseReason`] instead of being re-derived from shared state.
+    if !aggregator.is_enabled() || paused.load(Ordering::Acquire) != 0 {
         return None;
     }
 
@@ -1850,7 +1924,6 @@ mod tests {
         let config = WorkerConfig {
             attestation_committee_count: 4,
             subscribed_subnets: HashSet::from([0, 1]),
-            gate_duties: true,
         };
         // 10 validators over 4 committees: subnets 0 and 1 hold 3 each, so a
         // group gathering both needs 4 of those 6.
@@ -1887,6 +1960,43 @@ mod tests {
                 JobPolicy::Open
             );
         }
+    }
+
+    /// The point of a bitset over a single flag: reasons are independent, so
+    /// setting one twice is idempotent (the level-driven owner sets its reason
+    /// on every tick) and releasing one leaves the others holding the worker.
+    #[test]
+    fn pause_reasons_are_independent() {
+        let paused = AtomicU8::new(0);
+
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+        set_pause_reason(&paused, PauseReason::BlockBuild, true);
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        // The build finishing leaves the sync gate still holding the worker.
+        set_pause_reason(&paused, PauseReason::BlockBuild, false);
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+
+        set_pause_reason(&paused, PauseReason::Syncing, false);
+        assert_eq!(paused.load(Ordering::Acquire), 0);
+    }
+
+    /// A guard clears its own reason and nothing else. Under the plain bool
+    /// this replaced, dropping the block-build guard released every reason.
+    #[test]
+    fn pause_guard_drop_releases_only_its_own_reason() {
+        let paused = Arc::new(AtomicU8::new(0));
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        {
+            set_pause_reason(&paused, PauseReason::BlockBuild, true);
+            let _guard = PauseGuard {
+                paused: paused.clone(),
+                reason: PauseReason::BlockBuild,
+            };
+        }
+
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
     }
 
     /// The store clock owns which slot the worker is in, so the wall-clock
