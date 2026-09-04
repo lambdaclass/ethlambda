@@ -123,10 +123,11 @@ Fork choice head update
 - Division of labor: the worker reads shared state that OTHER threads write (the
   `AggregatorController`, which the RPC thread toggles); state the actor itself owns
   reaches the worker as a `PauseReason`, so the policy is not re-derived in two places
-- `EmittedCoverage` remembers per-slot what the worker ATTEMPTED, so a failed proof (which
-  leaves the store untouched and re-reads identically) is not retried at full prover cost.
-  It no longer has a send-to-apply window to cover: the worker stores its own output
-  before the next selection round reads the pool
+- The worker keeps NO memory of what it has already proved. It does not need one: it
+  stores each aggregate before its next selection round, so the pool that round re-reads
+  already accounts for it. A FAILED proof does leave the pool untouched and will be picked
+  again, which is accepted; the failure branch sleeps `WORKER_IDLE_POLL` so a proof that
+  fails cheaply cannot spin the thread
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots

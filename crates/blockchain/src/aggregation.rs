@@ -24,6 +24,12 @@
 //! (see `SlotInterval::publishes_aggregates_on_arrival`), so proving is free to
 //! run whenever.
 //!
+//! It also means the worker needs no memory of what it has already proved: the
+//! pool its next selection round re-reads already accounts for it. A failed
+//! proof is the exception, since it leaves the pool untouched and gets picked
+//! again; that path sleeps [`WORKER_IDLE_POLL`] so a proof failing cheaply,
+//! before the prover even runs, cannot spin the thread.
+//!
 //! [`select_best_job`] builds the candidate pool with the same tiered scoring
 //! as `block_builder::select_attestations`: a store pass resolves every
 //! candidate `AttestationData`'s aggregation material once (raw-first + trim,
@@ -330,49 +336,6 @@ impl Message for AggregateProduced {
     type Result = ();
 }
 
-/// Validator ids this worker has already attempted a proof for, keyed by
-/// attestation data root, for the slot in [`Self::slot`].
-///
-/// A *failed* job leaves the store exactly as it found it, so it re-reads
-/// identically and the very next selection round would run the same proof
-/// again at full prover cost. Remembering the attempt is what stops that.
-///
-/// A successful one needs no such help now that the worker stores its own
-/// output: [`store_aggregate`] returns before the next selection round, so the
-/// pool that round reads already accounts for it. Recording it anyway costs
-/// nothing and keeps one rule for both outcomes.
-#[derive(Default)]
-struct EmittedCoverage {
-    slot: u64,
-    by_data_root: HashMap<H256, HashSet<u64>>,
-}
-
-impl EmittedCoverage {
-    /// Drop everything remembered for an earlier slot. Entries only exist to
-    /// cover the send-to-apply window, so a slot's worth is always stale by
-    /// the time the next one starts.
-    fn roll_to(&mut self, slot: u64) {
-        if self.slot != slot {
-            self.slot = slot;
-            self.by_data_root.clear();
-        }
-    }
-
-    fn record(&mut self, data_root: H256, participants: &[u64]) {
-        self.by_data_root
-            .entry(data_root)
-            .or_default()
-            .extend(participants);
-    }
-
-    /// Whether a candidate would only re-prove validators we already covered.
-    fn covers(&self, data_root: &H256, coverage: &HashSet<u64>) -> bool {
-        self.by_data_root
-            .get(data_root)
-            .is_some_and(|emitted| coverage.is_subset(emitted))
-    }
-}
-
 /// What the worker is allowed to pick up, given where the slot is.
 ///
 /// The prover is single-threaded and the slot's committee aggregate is the one
@@ -427,12 +390,7 @@ impl JobPolicy {
 /// 2. **Ranking**: scores every candidate against the head state and keeps the
 ///    lowest ordering key (current-slot before stale, then Finalize > Justify
 ///    > Build, mirroring the block builder).
-fn select_best_job(
-    store: &Store,
-    current_slot: u64,
-    policy: JobPolicy,
-    emitted: &EmittedCoverage,
-) -> Option<AggregationJob> {
+fn select_best_job(store: &Store, current_slot: u64, policy: JobPolicy) -> Option<AggregationJob> {
     let gossip_groups = store.iter_gossip_signatures();
     let new_payload_keys = if policy.admits_backlog() {
         store.new_payload_keys()
@@ -501,9 +459,6 @@ fn select_best_job(
             candidates.insert(*data_root, job);
         }
     }
-
-    // Drop candidates that would only re-prove coverage already in flight.
-    candidates.retain(|data_root, job| !emitted.covers(data_root, &job.coverage()));
 
     if candidates.is_empty() {
         return None;
@@ -1054,17 +1009,9 @@ fn run_aggregation_worker(
     // The chain's time grid never changes at runtime, so one read covers the
     // worker's whole life.
     let time_config = *store.config();
-    let mut emitted = EmittedCoverage::default();
 
     while !cancel.is_cancelled() {
-        let Some(job) = next_job(
-            &store,
-            &time_config,
-            &aggregator,
-            &paused,
-            &config,
-            &mut emitted,
-        ) else {
+        let Some(job) = next_job(&store, &time_config, &aggregator, &paused, &config) else {
             std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
@@ -1072,16 +1019,10 @@ fn run_aggregation_worker(
         let slot = job.slot;
         let raw_sigs = job.raw_ids.len();
         let children = job.children.len();
-        let data_root = job.hashed.root();
-        // Recorded whether or not the proof succeeds: a failed job re-reads
-        // identically, so without this the loop would retry it at full prover
-        // cost until a new signature arrives.
-        let attempted: Vec<u64> = job.coverage().into_iter().collect();
 
         let job_start = Instant::now();
         let output = aggregate_job(job);
         let elapsed = job_start.elapsed();
-        emitted.record(data_root, &attempted);
 
         let Some(output) = output else {
             warn!(
@@ -1092,6 +1033,11 @@ fn run_aggregation_worker(
                 "Committee signature aggregation failed"
             );
             metrics::inc_aggregator_skipped_other(1);
+            // A failure leaves the store exactly as it found it, so the next
+            // round re-reads the same pool and picks the same job. Sleep before
+            // looping: a proof that fails cheaply, before the prover runs,
+            // would otherwise spin this thread at full speed.
+            std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
 
@@ -1128,7 +1074,6 @@ fn next_job(
     aggregator: &AggregatorController,
     paused: &AtomicU8,
     config: &WorkerConfig,
-    emitted: &mut EmittedCoverage,
 ) -> Option<AggregationJob> {
     // The role flag is read here because the RPC thread writes it. Everything
     // the actor itself owns, the sync verdict included, reaches us as a
@@ -1154,7 +1099,6 @@ fn next_job(
     // hold it back to a boundary that has already passed.
     let slot = store.current_slot();
 
-    emitted.roll_to(slot);
     let policy = job_policy(
         ms_into_slot(now_ms, slot, time_config),
         time_config,
@@ -1162,7 +1106,7 @@ fn next_job(
         config,
     );
 
-    select_best_job(store, slot, policy, emitted)
+    select_best_job(store, slot, policy)
 }
 
 #[cfg(test)]
@@ -1596,7 +1540,7 @@ mod tests {
     fn select_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(select_best_job(&store, 0, JobPolicy::Open, &EmittedCoverage::default()).is_none());
+        assert!(select_best_job(&store, 0, JobPolicy::Open).is_none());
     }
 
     /// A single gossip signature with no other material to merge is dropped
@@ -1625,7 +1569,7 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(select_best_job(&store, 0, JobPolicy::Open, &EmittedCoverage::default()).is_none());
+        assert!(select_best_job(&store, 0, JobPolicy::Open).is_none());
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -1668,7 +1612,7 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            select_best_job(&store, 999, JobPolicy::Open, &EmittedCoverage::default()).is_none(),
+            select_best_job(&store, 999, JobPolicy::Open).is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -1724,13 +1668,8 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let job = select_best_job(
-            &store,
-            HEAD_SLOT,
-            JobPolicy::Open,
-            &EmittedCoverage::default(),
-        )
-        .expect("a vote for the current head must produce a job (chain view covers the tip)");
+        let job = select_best_job(&store, HEAD_SLOT, JobPolicy::Open)
+            .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(
             job.hashed.data().target.slot,
             HEAD_SLOT,
@@ -1789,30 +1728,8 @@ mod tests {
     fn select_picks_the_best_scoring_candidate() {
         let store = store_with_competing_build_tier_groups();
 
-        let job = select_best_job(&store, 999, JobPolicy::Open, &EmittedCoverage::default())
-            .expect("should produce a job");
+        let job = select_best_job(&store, 999, JobPolicy::Open).expect("should produce a job");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
-    }
-
-    /// A candidate whose whole coverage is already in flight (proved, message
-    /// not yet applied by the actor) is skipped, so the worker moves on to the
-    /// next-best group instead of re-proving the same one.
-    #[test]
-    fn select_skips_coverage_already_emitted() {
-        let store = store_with_competing_build_tier_groups();
-
-        let mut emitted = EmittedCoverage::default();
-        let first = select_best_job(&store, 999, JobPolicy::Open, &emitted).expect("first job");
-        let first_target = first.hashed.data().target.slot;
-        let covered: Vec<u64> = first.coverage().into_iter().collect();
-        emitted.record(first.hashed.root(), &covered);
-
-        let second = select_best_job(&store, 999, JobPolicy::Open, &emitted).expect("second job");
-        assert_eq!(
-            second.hashed.data().target.slot,
-            first_target - 1,
-            "the in-flight group is skipped for the next-best one"
-        );
     }
 
     /// Early in the slot a current-slot group short of the signature floor is
@@ -1828,7 +1745,6 @@ mod tests {
             &store,
             NUM_GROUPS as u64,
             JobPolicy::Backlog { min_sigs: 3 },
-            &EmittedCoverage::default(),
         )
         .expect("stale groups stay eligible");
         assert_eq!(
@@ -1851,7 +1767,6 @@ mod tests {
                 &store,
                 NUM_GROUPS as u64,
                 JobPolicy::CommitteeOnly { min_sigs: 3 },
-                &EmittedCoverage::default(),
             )
             .is_none(),
             "no current-slot group meets the floor, so the worker waits"
@@ -1868,7 +1783,6 @@ mod tests {
             &store,
             NUM_GROUPS as u64,
             JobPolicy::CommitteeOnly { min_sigs: 2 },
-            &EmittedCoverage::default(),
         )
         .expect("the current-slot group meets the floor");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
@@ -1880,13 +1794,8 @@ mod tests {
     fn select_takes_current_slot_group_once_the_policy_opens() {
         let store = store_with_competing_build_tier_groups();
 
-        let job = select_best_job(
-            &store,
-            NUM_GROUPS as u64,
-            JobPolicy::Open,
-            &EmittedCoverage::default(),
-        )
-        .expect("should produce a job");
+        let job = select_best_job(&store, NUM_GROUPS as u64, JobPolicy::Open)
+            .expect("should produce a job");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
     }
 
