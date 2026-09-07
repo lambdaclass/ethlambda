@@ -1,0 +1,31 @@
+# Standalone workspace (like tooling/event-monitor and crates/prover/sp1): the
+# `sp1` feature pulls the SP1 prover + toolchain, so this is kept out of the
+# root workspace and built on its own.
+[workspace]
+
+[package]
+name = "ethlambda-replay"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "replay"
+path = "src/main.rs"
+
+[dependencies]
+ethlambda-prover-core = { path = "../../crates/prover/core" }
+ethlambda-types = { path = "../../crates/common/types" }
+ethlambda-state-transition = { path = "../../crates/blockchain/state_transition" }
+libssz = "0.3.0"
+hex = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+eyre = "0.6"
+ethlambda-prover-sp1 = { path = "../../crates/prover/sp1", optional = true }
+
+[features]
+default = ["exec"]
+exec = []
+sp1 = ["dep:ethlambda-prover-sp1"]
