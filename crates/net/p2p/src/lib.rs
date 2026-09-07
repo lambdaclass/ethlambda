@@ -572,7 +572,6 @@ pub(crate) trait P2PProtocol: Send + Sync {
         root: H256,
         peer: PeerId,
         request_id: OutboundRequestId,
-        attempt: u32,
     ) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
@@ -614,13 +613,12 @@ impl P2PServer {
         msg: p2p_protocol::BlockFetchTimeout,
         ctx: &Context<Self>,
     ) {
-        // Any outcome for this attempt either cleared the entry or moved it on
-        // to a later attempt, which arms a watchdog of its own.
-        let outstanding = self
-            .pending_root_requests
-            .get(&msg.root)
-            .is_some_and(|pending| pending.attempts == msg.attempt);
-        if !outstanding {
+        // Every outcome path retires the request id, so an id still present is
+        // one libp2p never reported on. This has to key off the id rather than
+        // the attempt number: attempts restart at 1 for each fetch cycle, so a
+        // watchdog that outlived its own cycle would otherwise fail an
+        // unrelated attempt for the same root.
+        if self.outbound_requests.remove(&msg.request_id).is_none() {
             trace!(root = %msg.root, "Block fetch settled before the watchdog fired");
             return;
         }
@@ -628,10 +626,9 @@ impl P2PServer {
         warn!(
             root = %msg.root,
             peer = %msg.peer,
-            attempt = msg.attempt,
+            request_id = ?msg.request_id,
             "BlocksByRoot request produced no libp2p outcome, failing it"
         );
-        self.outbound_requests.remove(&msg.request_id);
         handle_fetch_failure(self, msg.root, msg.peer, ctx).await;
     }
 

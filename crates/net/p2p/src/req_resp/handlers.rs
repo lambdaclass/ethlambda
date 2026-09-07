@@ -468,14 +468,13 @@ pub async fn fetch_block_from_peer(
     };
 
     // Track the request if not already tracked (new request)
-    let attempt = server
+    server
         .pending_root_requests
         .entry(root)
         .or_insert(PendingRequest {
             attempts: 1,
             failed_peers: HashSet::new(),
-        })
-        .attempts;
+        });
 
     // Map request_id to root for failure handling
     server
@@ -492,7 +491,6 @@ pub async fn fetch_block_from_peer(
             root,
             peer,
             request_id,
-            attempt,
         },
     );
 
