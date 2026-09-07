@@ -81,6 +81,13 @@ const REQ_RESP_TIMEOUT: Duration = Duration::from_secs(10);
 /// fails through libp2p's own path first.
 const ROOT_FETCH_WATCHDOG: Duration = Duration::from_secs(15);
 
+// Inverting these would fire the watchdog on healthy-but-slow requests and
+// hide the failure path libp2p reports for itself.
+const _: () = assert!(
+    ROOT_FETCH_WATCHDOG.as_millis() > REQ_RESP_TIMEOUT.as_millis(),
+    "the fetch watchdog must outlast the libp2p request timeout"
+);
+
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
     pub(crate) failed_peers: HashSet<PeerId>,

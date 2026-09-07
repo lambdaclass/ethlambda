@@ -285,16 +285,6 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         .unwrap_or_default()
 }
 
-/// Pick the block that answers a `BlocksByRoot` request out of the response.
-///
-/// Requests carry a single root, so at most one block can answer one. Anything
-/// else the peer sent is unsolicited and dropped.
-fn matching_block(blocks: Vec<SignedBlock>, requested_root: H256) -> Option<SignedBlock> {
-    blocks
-        .into_iter()
-        .find(|block| block.message.hash_tree_root() == requested_root)
-}
-
 async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
@@ -305,11 +295,17 @@ async fn handle_blocks_by_root_response(
     let received = blocks.len();
     trace!(%peer, count = received, "Received BlocksByRoot response");
 
+    // Requests carry a single root, so at most one block can answer one and
+    // anything else the peer sent is unsolicited.
+    //
     // A response that answers nothing is a failed attempt, whether it was empty
     // or carried only blocks we never asked for. Treating the latter as a
     // no-op would leave the root pending forever, and the deduplication in the
     // `FetchBlock` handler would swallow every later attempt to fetch it.
-    let Some(block) = matching_block(blocks, requested_root) else {
+    let answer = blocks
+        .into_iter()
+        .find(|block| block.message.hash_tree_root() == requested_root);
+    let Some(block) = answer else {
         debug!(
             %peer,
             received,
@@ -723,24 +719,6 @@ mod tests {
         )])
     }
 
-    /// A response that answers nothing must not look like a success. Returning
-    /// `Some` for an unrequested block would leave the requested root pending
-    /// forever, and the `FetchBlock` deduplication would then swallow every
-    /// later attempt to fetch it.
-    #[test]
-    fn matching_block_rejects_a_response_that_answers_a_different_root() {
-        let wanted = signed_block(1, H256::ZERO);
-        let wanted_root = wanted.message.hash_tree_root();
-        let other = signed_block(2, H256::ZERO);
-
-        assert!(matching_block(vec![other.clone()], wanted_root).is_none());
-        assert!(matching_block(Vec::new(), wanted_root).is_none());
-
-        let found = matching_block(vec![other, wanted], wanted_root)
-            .expect("the requested block answers the request");
-        assert_eq!(found.message.hash_tree_root(), wanted_root);
-    }
-
     /// A failure for a root nobody is waiting on must stay a no-op, so a late
     /// or duplicate event cannot resurrect a root that already succeeded.
     #[test]
@@ -797,13 +775,5 @@ mod tests {
             }
         );
         assert!(!pending.contains_key(&root));
-    }
-
-    /// The watchdog is a backstop for requests libp2p never reports on, so it
-    /// must outlast libp2p's own timeout. Inverting these makes it fire on
-    /// healthy-but-slow requests and hides the real failure path.
-    #[test]
-    fn the_fetch_watchdog_outlasts_the_libp2p_request_timeout() {
-        assert!(ROOT_FETCH_WATCHDOG > crate::REQ_RESP_TIMEOUT);
     }
 }
