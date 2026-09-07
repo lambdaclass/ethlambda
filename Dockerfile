@@ -38,7 +38,7 @@ ENV NO_DEFAULT_FEATURES=$NO_DEFAULT_FEATURES
 ARG LOCKED="--locked"
 ENV LOCKED=$LOCKED
 
-RUN cargo chef cook --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" --recipe-path recipe.json
+RUN cargo chef cook --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" $LOCKED --recipe-path recipe.json
 
 # Build application
 # Include .git so vergen-git2 can extract version info (branch, commit SHA)
