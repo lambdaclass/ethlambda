@@ -138,6 +138,24 @@ here: a discovery dial that succeeds or fails shows up in
 |------|------|-------|-------------------------|--------|
 | `lean_discovered_peers_dialed_total` | Counter | Peers dialed as a result of discv5 discovery | On dialing a discovered peer | |
 
+### Transport Mix
+
+Which transport actually carried each established connection, read off the
+connection's own multiaddr rather than off the address we dialed: libp2p races a
+peer's QUIC and TCP addresses within one dial, so the answer is not knowable
+before the connection exists. `tcp` counts are what say the fallback in
+[Peer discovery](./discovery.md) is doing work rather than merely being
+advertised.
+
+Counts connections rather than peers, so it can exceed
+`lean_peer_connection_events_total{result="success"}`, which fires only on a
+peer's first connection. `unknown` covers a multiaddr naming neither transport,
+which nothing ethlambda binds produces.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_peer_connections_by_transport_total` | Counter | Established peer connections by the transport that carried them | On connection established | direction=inbound,outbound<br>transport=quic,tcp,unknown |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.

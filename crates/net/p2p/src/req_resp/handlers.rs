@@ -80,10 +80,8 @@ pub async fn handle_req_resp_message(
                                     .await;
                                 }
                                 Some(PendingRequestKind::Root(root)) => {
-                                    handle_blocks_by_root_response(
-                                        server, blocks, peer, request_id, root, ctx,
-                                    )
-                                    .await;
+                                    handle_blocks_by_root_response(server, blocks, peer, root, ctx)
+                                        .await;
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -99,8 +97,12 @@ pub async fn handle_req_resp_message(
                             Some(PendingRequestKind::Range { .. }) => {
                                 fail_range_request(server, &peer);
                             }
-                            Some(request @ PendingRequestKind::Root(_)) => {
-                                server.outbound_requests.insert(request_id, request);
+                            Some(PendingRequestKind::Root(root)) => {
+                                // An error response completes the exchange, so
+                                // no `OutboundFailure` follows to retire the
+                                // root. Fail it here or it stays pending
+                                // forever and deduplicates every later fetch.
+                                handle_fetch_failure(server, root, peer, ctx).await;
                             }
                             None => {}
                         }
@@ -287,44 +289,35 @@ async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
     blocks: Vec<SignedBlock>,
     peer: PeerId,
-    request_id: request_response::OutboundRequestId,
     requested_root: H256,
     ctx: &Context<P2PServer>,
 ) {
-    trace!(%peer, count = blocks.len(), "Received BlocksByRoot response");
+    let received = blocks.len();
+    trace!(%peer, count = received, "Received BlocksByRoot response");
 
-    if blocks.is_empty() {
-        // Re-insert so failure handling can find it
-        server
-            .outbound_requests
-            .insert(request_id, PendingRequestKind::Root(requested_root));
-        debug!(%peer, "Received empty BlocksByRoot response");
+    // Requests carry a single root, so at most one block can answer one and
+    // anything else the peer sent is unsolicited.
+    let answer = blocks
+        .into_iter()
+        .find(|block| block.message.hash_tree_root() == requested_root);
+    let Some(block) = answer else {
+        debug!(
+            %peer,
+            received,
+            expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
+            "BlocksByRoot response carried no matching block"
+        );
         handle_fetch_failure(server, requested_root, peer, ctx).await;
         return;
-    }
+    };
 
-    for block in blocks {
-        let root = block.message.hash_tree_root();
+    // Clean up tracking for this root
+    server.pending_root_requests.remove(&requested_root);
 
-        // Validate that this block matches what we requested
-        if root != requested_root {
-            debug!(
-                %peer,
-                received_root = %ethlambda_types::ShortRoot(&root.0),
-                expected_root = %ethlambda_types::ShortRoot(&requested_root.0),
-                "Received block with mismatched root, ignoring"
-            );
-            continue;
-        }
-
-        // Clean up tracking for this root
-        server.pending_root_requests.remove(&root);
-
-        if let Some(ref blockchain) = server.blockchain {
-            let _ = blockchain
-                .new_block(block, BlockSource::Sync)
-                .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
-        }
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_block(block, BlockSource::Sync)
+            .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
     }
 }
 
@@ -556,12 +549,19 @@ fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
+/// Retire one failed attempt at fetching `root`.
+///
+/// Every path that ends an attempt must come through here: a root left in
+/// `pending_root_requests` is deduplicated out of every later fetch, so a
+/// silent exit loses that block for the life of the process.
 async fn handle_fetch_failure(
     server: &mut P2PServer,
     root: H256,
     peer: PeerId,
     ctx: &Context<P2PServer>,
 ) {
+    // A root nobody is waiting on means a late or duplicate failure, which
+    // must not resurrect a root that already succeeded.
     let Some(pending) = server.pending_root_requests.get_mut(&root) else {
         return;
     };
