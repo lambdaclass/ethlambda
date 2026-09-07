@@ -8,10 +8,6 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
-[[bin]]
-name = "prove"
-path = "src/bin/prove.rs"
-
 [dependencies]
 sp1-sdk = "6.3.1"
 ethlambda-prover-core = { path = "../core" }
@@ -19,9 +15,6 @@ ethlambda-types = { path = "../../common/types" }
 # Serializes the whole SP1ProofWithPublicValues into `Proof` so verify can
 # recover the committed public values.
 bincode = "1.3"
-# `prove` binary: CLI flags and the async runtime the prover client needs.
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [build-dependencies]
 sp1-build = "6.3.1"

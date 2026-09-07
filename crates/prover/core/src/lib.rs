@@ -1,7 +1,5 @@
 pub use ethlambda_types::stf::{StfInput, StfPublicValues};
 
-pub mod mock_chain;
-
 /// A serialized proof of a single state transition.
 ///
 /// The bytes depend upon the specific zkVM being used, (SP1ProofWithPublicValues)
