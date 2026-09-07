@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, PendingRequestKind, ROOT_FETCH_WATCHDOG, RangeSyncState, p2p_protocol,
+    PendingRequest, PendingRequestKind, RangeSyncState, p2p_protocol,
     req_resp::RequestedBlockRoots,
 };
 
@@ -396,11 +396,7 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 /// Handles tracking in both pending_requests and request_id_map.
-pub async fn fetch_block_from_peer(
-    server: &mut P2PServer,
-    root: H256,
-    ctx: &Context<P2PServer>,
-) -> bool {
+pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     if server.connected_peers.is_empty() {
         debug!(%root, "Cannot fetch block: no connected peers");
         return false;
@@ -480,19 +476,6 @@ pub async fn fetch_block_from_peer(
     server
         .outbound_requests
         .insert(request_id, PendingRequestKind::Root(root));
-
-    // Every other exit from this attempt runs off a libp2p event, and libp2p
-    // does not always emit one, so arm a backstop that fails the attempt if
-    // nothing else does.
-    send_after(
-        ROOT_FETCH_WATCHDOG,
-        ctx.clone(),
-        p2p_protocol::BlockFetchTimeout {
-            root,
-            peer,
-            request_id,
-        },
-    );
 
     true
 }
@@ -617,7 +600,7 @@ fn record_fetch_failure(
 /// Every path that ends an attempt must come through here: a root left in
 /// `pending_root_requests` is deduplicated out of every later fetch, so a
 /// silent exit loses that block for the life of the process.
-pub(crate) async fn handle_fetch_failure(
+async fn handle_fetch_failure(
     server: &mut P2PServer,
     root: H256,
     peer: PeerId,
