@@ -297,11 +297,6 @@ async fn handle_blocks_by_root_response(
 
     // Requests carry a single root, so at most one block can answer one and
     // anything else the peer sent is unsolicited.
-    //
-    // A response that answers nothing is a failed attempt, whether it was empty
-    // or carried only blocks we never asked for. Treating the latter as a
-    // no-op would leave the root pending forever, and the deduplication in the
-    // `FetchBlock` handler would swallow every later attempt to fetch it.
     let answer = blocks
         .into_iter()
         .find(|block| block.message.hash_tree_root() == requested_root);
