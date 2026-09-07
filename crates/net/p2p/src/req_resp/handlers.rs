@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
@@ -549,47 +549,6 @@ fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
     }
 }
 
-/// What follows a failed attempt to fetch a block by root.
-#[derive(Debug, PartialEq, Eq)]
-enum FetchFailure {
-    /// Wait `backoff`, then try another peer.
-    Retry { attempts: u32, backoff: Duration },
-    /// Out of attempts. The root is no longer pending.
-    GaveUp { attempts: u32 },
-    /// Nothing was pending for this root, so the failure is late or duplicate.
-    NotPending,
-}
-
-/// Charge a failed attempt to the pending table and decide what follows.
-///
-/// Split out of [`handle_fetch_failure`] so the retry accounting is testable
-/// without a live actor.
-fn record_fetch_failure(
-    pending_root_requests: &mut HashMap<H256, PendingRequest>,
-    root: H256,
-    peer: PeerId,
-) -> FetchFailure {
-    let Some(pending) = pending_root_requests.get_mut(&root) else {
-        return FetchFailure::NotPending;
-    };
-
-    pending.failed_peers.insert(peer);
-    let attempts = pending.attempts;
-
-    if attempts >= MAX_FETCH_RETRIES {
-        pending_root_requests.remove(&root);
-        return FetchFailure::GaveUp { attempts };
-    }
-
-    pending.attempts += 1;
-    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(attempts - 1);
-
-    FetchFailure::Retry {
-        attempts,
-        backoff: Duration::from_millis(backoff_ms),
-    }
-}
-
 /// Retire one failed attempt at fetching `root`.
 ///
 /// Every path that ends an attempt must come through here: a root left in
@@ -601,16 +560,29 @@ async fn handle_fetch_failure(
     peer: PeerId,
     ctx: &Context<P2PServer>,
 ) {
-    match record_fetch_failure(&mut server.pending_root_requests, root, peer) {
-        FetchFailure::NotPending => {}
-        FetchFailure::GaveUp { attempts } => {
-            error!(%root, %peer, attempts, "Block fetch failed after max retries, giving up");
-        }
-        FetchFailure::Retry { attempts, backoff } => {
-            debug!(%root, %peer, attempts, ?backoff, "Block fetch failed, scheduling retry");
-            send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
-        }
+    // A root nobody is waiting on means a late or duplicate failure, which
+    // must not resurrect a root that already succeeded.
+    let Some(pending) = server.pending_root_requests.get_mut(&root) else {
+        return;
+    };
+
+    pending.failed_peers.insert(peer);
+
+    if pending.attempts >= MAX_FETCH_RETRIES {
+        error!(%root, %peer, attempts=%pending.attempts,
+               "Block fetch failed after max retries, giving up");
+        server.pending_root_requests.remove(&root);
+        return;
     }
+
+    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+    let backoff = Duration::from_millis(backoff_ms);
+
+    debug!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");
+
+    pending.attempts += 1;
+
+    send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
 }
 
 #[cfg(test)]
@@ -683,73 +655,5 @@ mod tests {
         assert_eq!(slots, vec![1, 2, 4]);
         assert_eq!(roots, vec![root_1, root_2, root_4]);
         assert!(!roots.contains(&side_root_3));
-    }
-
-    fn pending_root(root: H256, attempts: u32) -> HashMap<H256, PendingRequest> {
-        HashMap::from([(
-            root,
-            PendingRequest {
-                attempts,
-                failed_peers: HashSet::new(),
-            },
-        )])
-    }
-
-    /// A failure for a root nobody is waiting on must stay a no-op, so a late
-    /// or duplicate event cannot resurrect a root that already succeeded.
-    #[test]
-    fn record_fetch_failure_ignores_an_untracked_root() {
-        let mut pending = HashMap::new();
-        let outcome = record_fetch_failure(&mut pending, H256::ZERO, PeerId::random());
-
-        assert_eq!(outcome, FetchFailure::NotPending);
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn record_fetch_failure_backs_off_and_excludes_the_failing_peer() {
-        let root = H256::ZERO;
-        let peer = PeerId::random();
-        let mut pending = pending_root(root, 1);
-
-        let first = record_fetch_failure(&mut pending, root, peer);
-        assert_eq!(
-            first,
-            FetchFailure::Retry {
-                attempts: 1,
-                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
-            }
-        );
-
-        let second = record_fetch_failure(&mut pending, root, PeerId::random());
-        assert_eq!(
-            second,
-            FetchFailure::Retry {
-                attempts: 2,
-                backoff: Duration::from_millis(INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER),
-            }
-        );
-
-        let entry = pending.get(&root).expect("root is still pending");
-        assert_eq!(entry.attempts, 3);
-        assert!(entry.failed_peers.contains(&peer));
-    }
-
-    /// Giving up has to clear the entry: leaving it behind is the same
-    /// permanent lock as never failing the attempt at all.
-    #[test]
-    fn record_fetch_failure_clears_the_root_when_it_gives_up() {
-        let root = H256::ZERO;
-        let mut pending = pending_root(root, MAX_FETCH_RETRIES);
-
-        let outcome = record_fetch_failure(&mut pending, root, PeerId::random());
-
-        assert_eq!(
-            outcome,
-            FetchFailure::GaveUp {
-                attempts: MAX_FETCH_RETRIES
-            }
-        );
-        assert!(!pending.contains_key(&root));
     }
 }
