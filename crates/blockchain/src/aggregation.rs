@@ -3,11 +3,12 @@
 //!
 //! One worker thread is spawned when the blockchain actor starts and lives as
 //! long as it does. It holds its own [`Store`] handle (a clone sharing the same
-//! backend and in-memory buffers), so it re-reads the pool itself instead of
-//! being handed a per-slot snapshot: pick the single best job available right
-//! now, run its expensive XMSS proof, hand the result to the actor as an
-//! [`AggregateProduced`] message, pick again. With nothing eligible it polls
-//! every [`WORKER_IDLE_POLL`].
+//! backend and in-memory buffers), so it both re-reads the pool itself instead
+//! of being handed a per-slot snapshot and writes what it produces straight
+//! back: pick the single best job available right now, run its expensive XMSS
+//! proof, [`store_aggregate`] it, tell the actor with an [`AggregateProduced`]
+//! message, pick again. With nothing eligible it polls every
+//! [`WORKER_IDLE_POLL`].
 //!
 //! It is a plain `std::thread`, not a `spawn_blocking` task. The thread runs
 //! for the process's life and spends it in leanVM proofs, so handing it to the
@@ -15,9 +16,19 @@
 //! buying nothing: the loop awaits nothing, and it reaches the actor through an
 //! unbounded channel that needs no reactor.
 //!
-//! The actor applies each aggregate to the store on arrival but holds the
-//! gossip publication until the vote-aggregation interval, so proving is free
-//! to run whenever while publication stays on the interval grid.
+//! Storing on the worker keeps the proof off the actor's mailbox: the message
+//! carries only the attestation data and the participant set naming the proof,
+//! and the actor reads the bytes back out of the pool when it publishes. That
+//! publication is what stays on the interval grid, held to the
+//! vote-aggregation interval unless the aggregate finishes inside the window
+//! (see `SlotInterval::publishes_aggregates_on_arrival`), so proving is free to
+//! run whenever.
+//!
+//! It also means the worker needs no memory of what it has already proved: the
+//! pool its next selection round re-reads already accounts for it. A failed
+//! proof is the exception, since it leaves the pool untouched and gets picked
+//! again; that path sleeps [`WORKER_IDLE_POLL`] so a proof failing cheaply,
+//! before the prover even runs, cannot spin the thread.
 //!
 //! [`select_best_job`] builds the candidate pool with the same tiered scoring
 //! as `block_builder::select_attestations`: a store pass resolves every
@@ -33,13 +44,16 @@
 //! else — it would rather idle than start a recursive merge that runs into the
 //! slot's committee aggregation.
 //!
-//! The actor can also park the worker outright: it raises the pause flag
-//! around its own block build, so the prover is not shared with it (see
-//! [`AggregationWorker::pause`]).
+//! The actor parks the worker outright for as long as it needs the prover to
+//! itself, or the node has no business aggregating: around its own block
+//! build, and while the sync gate suppresses duties, so a node that is behind
+//! spends the prover on the block import that closes the gap rather than on a
+//! backlog the network has stopped waiting for. Both are [`PauseReason`]s (see
+//! [`AggregationWorker::pause`] and [`AggregationWorker::set_paused`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use ethlambda_crypto::aggregate_mixed;
@@ -90,6 +104,22 @@ const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
 fn vote_aggregation_offset_ms(config: &ChainConfig) -> u64 {
     // Slot 0 reduces `to_ms_since_genesis` to the offset within a slot.
     SlotInterval::Aggregation.to_ms_since_genesis(0, config)
+}
+
+/// How far into `slot` the wall clock is, in milliseconds.
+///
+/// The store clock decides which slot the worker is in, but it counts whole
+/// intervals and [`EARLY_AGGREGATION_WINDOW`] is finer than one, so the
+/// position *inside* the slot still comes from the wall clock. It is measured
+/// from `slot`'s own start and clamped to that slot, so when the two clocks
+/// disagree the answer degrades to an edge of the slot the store says we are
+/// in: short of it the permissive [`JobPolicy::Backlog`] end, past it
+/// [`JobPolicy::Open`]. It never describes a position inside some other slot.
+fn ms_into_slot(now_ms: u64, slot: u64, config: &ChainConfig) -> u64 {
+    let slot_start_ms = config.genesis_time_ms() + slot * config.milliseconds_per_slot;
+    now_ms
+        .saturating_sub(slot_start_ms)
+        .min(config.milliseconds_per_slot)
 }
 
 /// How long before the vote-aggregation boundary the worker stops taking
@@ -160,25 +190,77 @@ pub struct AggregatedGroupOutput {
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
+/// Why the worker is parked. The actor owns every reason and sets them
+/// independently; the worker takes no new job while any is set.
+///
+/// A bitset rather than a single flag or a depth counter: each reason has
+/// exactly one owner, so setting one twice is idempotent, clearing one cannot
+/// clear another's, and nothing is left to leak when an owner is level-driven
+/// rather than scoped. Values are distinct bits of the `AtomicU8` in
+/// [`AggregationWorker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PauseReason {
+    /// The actor is building a block. Both it and the worker run leanVM
+    /// proofs on the same single-threaded prover, and the block is the one
+    /// with a deadline. Scoped to the build, so it is taken as a
+    /// [`PauseGuard`].
+    BlockBuild = 1 << 0,
+    /// The sync gate is suppressing this node's duties. A node that is behind
+    /// would otherwise prove a backlog the network has moved past, against
+    /// the same prover its block import needs to close the gap. Level-driven
+    /// from the actor's tick, so it is set through
+    /// [`AggregationWorker::set_paused`] rather than held as a guard.
+    Syncing = 1 << 1,
+}
+
 /// Handle to the always-on aggregation worker, held by the actor for the
 /// actor's whole lifetime.
 pub(crate) struct AggregationWorker {
     /// Cancelled by the actor's `stopped()` hook; the worker breaks out of its
     /// loop at the next job boundary.
     cancel: CancellationToken,
-    /// Raised while the actor needs the prover to itself; see [`Self::pause`].
-    paused: Arc<AtomicBool>,
+    /// Set of [`PauseReason`]s currently holding the worker back, as a bitset.
+    /// Non-zero means "take no new job"; see [`Self::pause`].
+    paused: Arc<AtomicU8>,
     /// Handle to the worker thread, held so shutdown can join it.
     handle: std::thread::JoinHandle<()>,
 }
 
+/// Set or clear one reason's bit. Read-modify-write, so reasons are
+/// independent: an owner only ever touches its own bit.
+fn set_pause_reason(paused: &AtomicU8, reason: PauseReason, on: bool) {
+    if on {
+        paused.fetch_or(reason as u8, Ordering::Release);
+    } else {
+        paused.fetch_and(!(reason as u8), Ordering::Release);
+    }
+}
+
 impl AggregationWorker {
-    /// Stop handing the worker new jobs for as long as the returned guard
-    /// lives. A proof already in flight is not interrupted (`aggregate_mixed`
-    /// cannot be), so this bounds contention rather than eliminating it.
-    pub(crate) fn pause(&self) -> PauseGuard {
-        self.paused.store(true, Ordering::Release);
-        PauseGuard(self.paused.clone())
+    /// Stop handing the worker new jobs for `reason` for as long as the
+    /// returned guard lives. A proof already in flight is not interrupted
+    /// (`aggregate_mixed` cannot be), so this bounds contention rather than
+    /// eliminating it.
+    ///
+    /// For a reason whose lifetime is a scope. A reason the actor tracks as
+    /// state instead, recomputing it each tick, belongs in
+    /// [`Self::set_paused`]. Either way one reason has one owner: two live
+    /// guards for the same reason would release it when the first drops.
+    pub(crate) fn pause(&self, reason: PauseReason) -> PauseGuard {
+        set_pause_reason(&self.paused, reason, true);
+        PauseGuard {
+            paused: self.paused.clone(),
+            reason,
+        }
+    }
+
+    /// Level-triggered form of [`Self::pause`]: bring `reason` in line with
+    /// `paused`, whatever it was before. Idempotent, so the actor can drive it
+    /// straight off a predicate it recomputes every tick without tracking
+    /// whether it already set it.
+    pub(crate) fn set_paused(&self, reason: PauseReason, paused: bool) {
+        set_pause_reason(&self.paused, reason, paused);
     }
 
     /// Cancel the worker and wait up to [`WORKER_JOIN_TIMEOUT`] for it to exit.
@@ -210,13 +292,17 @@ impl AggregationWorker {
     }
 }
 
-/// Lowers the worker's pause flag on drop, so an early return on the paused
-/// code path cannot leave the worker parked forever.
-pub(crate) struct PauseGuard(Arc<AtomicBool>);
+/// Clears its own [`PauseReason`] on drop, so an early return on the paused
+/// code path cannot leave the worker parked forever. Touches no other
+/// reason's bit; see [`AggregationWorker::pause`].
+pub(crate) struct PauseGuard {
+    paused: Arc<AtomicU8>,
+    reason: PauseReason,
+}
 
 impl Drop for PauseGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        set_pause_reason(&self.paused, self.reason, false);
     }
 }
 
@@ -231,54 +317,23 @@ pub(crate) struct WorkerConfig {
     pub(crate) subscribed_subnets: HashSet<u64>,
 }
 
-/// One successful aggregate streamed back from the worker.
+/// One successful aggregate announced to the actor, after the worker has
+/// already stored it.
+///
+/// Carries no proof: [`store_aggregate`] put it in the pending payload pool,
+/// and `participants` names it there for `Store::proof_for_participants`. A
+/// proof is up to [`ByteList512KiB`], so keeping it out of the mailbox keeps
+/// the actor's queue small however far behind publication falls.
 pub(crate) struct AggregateProduced {
-    pub(crate) output: AggregatedGroupOutput,
+    pub(crate) hashed: HashedAttestationData,
+    /// Participant set of the stored proof, which is both what names it in the
+    /// pool and what the actor buffers until publication.
+    pub(crate) participants: AggregationBits,
     /// Wall time the proof itself took, observed on the worker thread.
     pub(crate) elapsed: Duration,
 }
 impl Message for AggregateProduced {
     type Result = ();
-}
-
-/// Validator ids this worker has already produced a proof for, keyed by
-/// attestation data root, for the slot in [`Self::slot`].
-///
-/// The actor applies an aggregate (which deletes the group's gossip
-/// signatures) only once the message reaches it, so between sending and that
-/// apply the store still shows the job as pending and the very next selection
-/// round would prove it a second time. Remembering what we emitted closes that
-/// window without making the worker a store writer.
-#[derive(Default)]
-struct EmittedCoverage {
-    slot: u64,
-    by_data_root: HashMap<H256, HashSet<u64>>,
-}
-
-impl EmittedCoverage {
-    /// Drop everything remembered for an earlier slot. Entries only exist to
-    /// cover the send-to-apply window, so a slot's worth is always stale by
-    /// the time the next one starts.
-    fn roll_to(&mut self, slot: u64) {
-        if self.slot != slot {
-            self.slot = slot;
-            self.by_data_root.clear();
-        }
-    }
-
-    fn record(&mut self, data_root: H256, participants: &[u64]) {
-        self.by_data_root
-            .entry(data_root)
-            .or_default()
-            .extend(participants);
-    }
-
-    /// Whether a candidate would only re-prove validators we already covered.
-    fn covers(&self, data_root: &H256, coverage: &HashSet<u64>) -> bool {
-        self.by_data_root
-            .get(data_root)
-            .is_some_and(|emitted| coverage.is_subset(emitted))
-    }
 }
 
 /// What the worker is allowed to pick up, given where the slot is.
@@ -335,12 +390,7 @@ impl JobPolicy {
 /// 2. **Ranking**: scores every candidate against the head state and keeps the
 ///    lowest ordering key (current-slot before stale, then Finalize > Justify
 ///    > Build, mirroring the block builder).
-fn select_best_job(
-    store: &Store,
-    current_slot: u64,
-    policy: JobPolicy,
-    emitted: &EmittedCoverage,
-) -> Option<AggregationJob> {
+fn select_best_job(store: &Store, current_slot: u64, policy: JobPolicy) -> Option<AggregationJob> {
     let gossip_groups = store.iter_gossip_signatures();
     let new_payload_keys = if policy.admits_backlog() {
         store.new_payload_keys()
@@ -409,9 +459,6 @@ fn select_best_job(
             candidates.insert(*data_root, job);
         }
     }
-
-    // Drop candidates that would only re-prove coverage already in flight.
-    candidates.retain(|data_root, job| !emitted.covers(data_root, &job.coverage()));
 
     if candidates.is_empty() {
         return None;
@@ -767,16 +814,55 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     })
 }
 
-/// Apply a worker-produced aggregate to the store. Called per message on the
-/// actor thread; gauge metrics that depend on total counts are batched into
-/// `finalize_aggregation_session` so we pay one lock per session instead of
-/// one per aggregate. Idempotent wrt the gossip delete.
-pub fn apply_aggregated_group(store: &mut Store, output: &AggregatedGroupOutput) {
-    store.insert_new_aggregated_payload(output.hashed.clone(), output.proof.clone());
-    store.delete_gossip_signatures(&output.keys_to_delete);
+/// Store one aggregate the worker just produced and build the announcement
+/// for the actor: the proof into the pending payload pool, and the gossip
+/// signatures it consumed out of the pool.
+///
+/// Runs on the worker thread through its own `Store` handle. `Store`'s `&mut
+/// self` does not mean exclusive access (its buffers are behind `Arc<Mutex<_>>`
+/// and the actor holds a handle of its own), so this interleaves with the
+/// actor, and both writes are safe under that:
+///
+/// - `insert_new_aggregated_payload` records the fork-choice votes before it
+///   pushes the payload, and it records them with a max-merge
+///   (`should_replace_vote`) that gives the same map whatever order concurrent
+///   writers arrive in. A promote landing in the middle moves votes from `new`
+///   to `known` rather than dropping them, so the worst interleaving leaves the
+///   vote or the payload to be promoted one tick later. Neither is lost.
+/// - `delete_gossip_signatures` removes keys this proof consumed. A signature
+///   arriving concurrently for one of them is the same validator's signature
+///   over the same attestation data, i.e. a duplicate of a vote the proof
+///   already binds, so deleting it loses nothing.
+///
+/// Gauge metrics that depend on total counts are batched into
+/// [`refresh_pool_gauges`] instead, so we pay one lock per slot rather than one
+/// per aggregate. Idempotent wrt the gossip delete.
+fn store_aggregate(
+    store: &mut Store,
+    output: AggregatedGroupOutput,
+    elapsed: Duration,
+) -> AggregateProduced {
+    let AggregatedGroupOutput {
+        hashed,
+        proof,
+        participants,
+        keys_to_delete,
+    } = output;
+    // Named before the proof moves into the pool; the bitfield is a few
+    // hundred bytes against the proof's up-to-512 KiB.
+    let bits = proof.participants.clone();
+
+    store.insert_new_aggregated_payload(hashed.clone(), proof);
+    store.delete_gossip_signatures(&keys_to_delete);
 
     metrics::inc_pq_sig_aggregated_signatures();
-    metrics::inc_pq_sig_attestations_in_aggregated_signatures(output.participants.len() as u64);
+    metrics::inc_pq_sig_attestations_in_aggregated_signatures(participants.len() as u64);
+
+    AggregateProduced {
+        hashed,
+        participants: bits,
+        elapsed,
+    }
 }
 
 /// Refresh the pool-size gauges. Called from the vote-aggregation tick, once
@@ -871,9 +957,11 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
 /// Spawn the always-on aggregation worker on its own thread.
 ///
 /// The worker owns a [`Store`] clone — same backend, same in-memory buffers —
-/// the shared aggregator-role flag (so a runtime toggle reaches it without a
-/// restart), and the startup-fixed gate inputs. It runs until the returned
-/// handle's [`AggregationWorker::shutdown`] cancels it.
+/// the shared aggregator-role flag (so a runtime toggle from the RPC thread
+/// reaches it without a restart), and the startup-fixed gate inputs. State the
+/// actor owns rather than shares, such as the sync verdict, reaches it as a
+/// [`PauseReason`] instead. It runs until the returned handle's
+/// [`AggregationWorker::shutdown`] cancels it.
 pub(crate) fn spawn_aggregation_worker(
     store: Store,
     actor: ActorRef<crate::BlockChainServer>,
@@ -881,7 +969,7 @@ pub(crate) fn spawn_aggregation_worker(
     config: WorkerConfig,
 ) -> AggregationWorker {
     let cancel = CancellationToken::new();
-    let paused = Arc::new(AtomicBool::new(false));
+    let paused = Arc::new(AtomicU8::new(0));
     let handle = {
         let cancel = cancel.clone();
         let paused = paused.clone();
@@ -903,35 +991,27 @@ pub(crate) fn spawn_aggregation_worker(
 /// Each round re-reads the pool through the store handle, picks the best job
 /// ([`select_best_job`]), proves it, and hands the result to the actor as an
 /// [`AggregateProduced`] message. With nothing to do — nothing eligible,
-/// paused for a block build, or no aggregation duty — it sleeps
+/// parked for some [`PauseReason`], or no aggregation duty — it sleeps
 /// [`WORKER_IDLE_POLL`] and looks again.
 ///
 /// `aggregate_mixed` cannot be interrupted, so both cancellation and the pause
-/// flag are only observed between jobs.
+/// reasons are only observed between jobs.
 fn run_aggregation_worker(
-    store: Store,
+    mut store: Store,
     actor: ActorRef<crate::BlockChainServer>,
     aggregator: AggregatorController,
     config: WorkerConfig,
     cancel: CancellationToken,
-    paused: Arc<AtomicBool>,
+    paused: Arc<AtomicU8>,
 ) {
     info!("Aggregation worker started");
 
     // The chain's time grid never changes at runtime, so one read covers the
     // worker's whole life.
     let time_config = *store.config();
-    let mut emitted = EmittedCoverage::default();
 
     while !cancel.is_cancelled() {
-        let Some(job) = next_job(
-            &store,
-            &time_config,
-            &aggregator,
-            &paused,
-            &config,
-            &mut emitted,
-        ) else {
+        let Some(job) = next_job(&store, &time_config, &aggregator, &paused, &config) else {
             std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
@@ -939,16 +1019,10 @@ fn run_aggregation_worker(
         let slot = job.slot;
         let raw_sigs = job.raw_ids.len();
         let children = job.children.len();
-        let data_root = job.hashed.root();
-        // Recorded whether or not the proof succeeds: a failed job re-reads
-        // identically, so without this the loop would retry it at full prover
-        // cost until a new signature arrives.
-        let attempted: Vec<u64> = job.coverage().into_iter().collect();
 
         let job_start = Instant::now();
         let output = aggregate_job(job);
         let elapsed = job_start.elapsed();
-        emitted.record(data_root, &attempted);
 
         let Some(output) = output else {
             warn!(
@@ -959,6 +1033,11 @@ fn run_aggregation_worker(
                 "Committee signature aggregation failed"
             );
             metrics::inc_aggregator_skipped_other(1);
+            // A failure leaves the store exactly as it found it, so the next
+            // round re-reads the same pool and picks the same job. Sleep before
+            // looping: a proof that fails cheaply, before the prover runs,
+            // would otherwise spin this thread at full speed.
+            std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
 
@@ -971,7 +1050,11 @@ fn run_aggregation_worker(
             "Committee signature aggregated"
         );
 
-        if actor.send(AggregateProduced { output, elapsed }).is_err() {
+        // Store before announcing, so the pool the actor reads to publish, and
+        // the one the next selection round re-reads, both already account for
+        // this aggregate.
+        let produced = store_aggregate(&mut store, output, elapsed);
+        if actor.send(produced).is_err() {
             // Actor is gone; nothing would consume further aggregates.
             break;
         }
@@ -980,32 +1063,50 @@ fn run_aggregation_worker(
     info!("Aggregation worker stopped");
 }
 
-/// One round of job selection: honor the role flag and the pause flag, derive
-/// the slot and the [`JobPolicy`] from the wall clock, then ask
-/// [`select_best_job`] for the winner. `None` means "nothing to do right now",
-/// which inside the early window is a deliberate answer rather than an idle
-/// one.
+/// One round of job selection: honor the role flag and the pause reasons, take
+/// the slot from the store clock and the [`JobPolicy`] from where the wall
+/// clock sits inside it, then ask [`select_best_job`] for the winner. `None`
+/// means "nothing to do right now", which inside the early window is a
+/// deliberate answer rather than an idle one.
 fn next_job(
     store: &Store,
     time_config: &ChainConfig,
     aggregator: &AggregatorController,
-    paused: &AtomicBool,
+    paused: &AtomicU8,
     config: &WorkerConfig,
-    emitted: &mut EmittedCoverage,
 ) -> Option<AggregationJob> {
-    if !aggregator.is_enabled() || paused.load(Ordering::Acquire) {
+    // The role flag is read here because the RPC thread writes it. Everything
+    // the actor itself owns, the sync verdict included, reaches us as a
+    // [`PauseReason`] instead of being re-derived from shared state.
+    if !aggregator.is_enabled() || paused.load(Ordering::Acquire) != 0 {
         return None;
     }
 
-    // Before genesis there is no slot to aggregate for.
-    let ms_since_genesis = crate::unix_now_ms().checked_sub(time_config.genesis_time_ms())?;
-    let slot = ms_since_genesis / time_config.milliseconds_per_slot;
-    let ms_into_slot = ms_since_genesis % time_config.milliseconds_per_slot;
+    let now_ms = crate::unix_now_ms();
+    // Before genesis there is no slot to aggregate for. A "has the chain
+    // started" test only; which slot we are in comes from the store clock.
+    if now_ms < time_config.genesis_time_ms() {
+        return None;
+    }
 
-    emitted.roll_to(slot);
-    let policy = job_policy(ms_into_slot, time_config, store, config);
+    // The slot comes from the store clock, the one authority the actor drives
+    // the interval grid off (`on_tick`'s idempotency guard keys on it).
+    // Derived independently from the wall clock the two could disagree — the
+    // wall clock drifts behind the monotonic tick cadence inside VMs, and a
+    // long block build leaves the store clock ahead of it — and
+    // `select_best_job` would then bucket the slot's real group as stale,
+    // proving it thin below `min_sigs`, or bucket a stale group as current and
+    // hold it back to a boundary that has already passed.
+    let slot = store.current_slot();
 
-    select_best_job(store, slot, policy, emitted)
+    let policy = job_policy(
+        ms_into_slot(now_ms, slot, time_config),
+        time_config,
+        store,
+        config,
+    );
+
+    select_best_job(store, slot, policy)
 }
 
 #[cfg(test)]
@@ -1430,7 +1531,7 @@ mod tests {
     fn select_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(select_best_job(&store, 0, JobPolicy::Open, &EmittedCoverage::default()).is_none());
+        assert!(select_best_job(&store, 0, JobPolicy::Open).is_none());
     }
 
     /// A single gossip signature with no other material to merge is dropped
@@ -1459,7 +1560,7 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(select_best_job(&store, 0, JobPolicy::Open, &EmittedCoverage::default()).is_none());
+        assert!(select_best_job(&store, 0, JobPolicy::Open).is_none());
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -1502,7 +1603,7 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            select_best_job(&store, 999, JobPolicy::Open, &EmittedCoverage::default()).is_none(),
+            select_best_job(&store, 999, JobPolicy::Open).is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -1558,13 +1659,8 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let job = select_best_job(
-            &store,
-            HEAD_SLOT,
-            JobPolicy::Open,
-            &EmittedCoverage::default(),
-        )
-        .expect("a vote for the current head must produce a job (chain view covers the tip)");
+        let job = select_best_job(&store, HEAD_SLOT, JobPolicy::Open)
+            .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(
             job.hashed.data().target.slot,
             HEAD_SLOT,
@@ -1623,30 +1719,8 @@ mod tests {
     fn select_picks_the_best_scoring_candidate() {
         let store = store_with_competing_build_tier_groups();
 
-        let job = select_best_job(&store, 999, JobPolicy::Open, &EmittedCoverage::default())
-            .expect("should produce a job");
+        let job = select_best_job(&store, 999, JobPolicy::Open).expect("should produce a job");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
-    }
-
-    /// A candidate whose whole coverage is already in flight (proved, message
-    /// not yet applied by the actor) is skipped, so the worker moves on to the
-    /// next-best group instead of re-proving the same one.
-    #[test]
-    fn select_skips_coverage_already_emitted() {
-        let store = store_with_competing_build_tier_groups();
-
-        let mut emitted = EmittedCoverage::default();
-        let first = select_best_job(&store, 999, JobPolicy::Open, &emitted).expect("first job");
-        let first_target = first.hashed.data().target.slot;
-        let covered: Vec<u64> = first.coverage().into_iter().collect();
-        emitted.record(first.hashed.root(), &covered);
-
-        let second = select_best_job(&store, 999, JobPolicy::Open, &emitted).expect("second job");
-        assert_eq!(
-            second.hashed.data().target.slot,
-            first_target - 1,
-            "the in-flight group is skipped for the next-best one"
-        );
     }
 
     /// Early in the slot a current-slot group short of the signature floor is
@@ -1662,7 +1736,6 @@ mod tests {
             &store,
             NUM_GROUPS as u64,
             JobPolicy::Backlog { min_sigs: 3 },
-            &EmittedCoverage::default(),
         )
         .expect("stale groups stay eligible");
         assert_eq!(
@@ -1685,7 +1758,6 @@ mod tests {
                 &store,
                 NUM_GROUPS as u64,
                 JobPolicy::CommitteeOnly { min_sigs: 3 },
-                &EmittedCoverage::default(),
             )
             .is_none(),
             "no current-slot group meets the floor, so the worker waits"
@@ -1702,7 +1774,6 @@ mod tests {
             &store,
             NUM_GROUPS as u64,
             JobPolicy::CommitteeOnly { min_sigs: 2 },
-            &EmittedCoverage::default(),
         )
         .expect("the current-slot group meets the floor");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
@@ -1714,13 +1785,8 @@ mod tests {
     fn select_takes_current_slot_group_once_the_policy_opens() {
         let store = store_with_competing_build_tier_groups();
 
-        let job = select_best_job(
-            &store,
-            NUM_GROUPS as u64,
-            JobPolicy::Open,
-            &EmittedCoverage::default(),
-        )
-        .expect("should produce a job");
+        let job = select_best_job(&store, NUM_GROUPS as u64, JobPolicy::Open)
+            .expect("should produce a job");
         assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
     }
 
@@ -1794,5 +1860,81 @@ mod tests {
                 JobPolicy::Open
             );
         }
+    }
+
+    /// The point of a bitset over a single flag: reasons are independent, so
+    /// setting one twice is idempotent (the level-driven owner sets its reason
+    /// on every tick) and releasing one leaves the others holding the worker.
+    #[test]
+    fn pause_reasons_are_independent() {
+        let paused = AtomicU8::new(0);
+
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+        set_pause_reason(&paused, PauseReason::BlockBuild, true);
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        // The build finishing leaves the sync gate still holding the worker.
+        set_pause_reason(&paused, PauseReason::BlockBuild, false);
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+
+        set_pause_reason(&paused, PauseReason::Syncing, false);
+        assert_eq!(paused.load(Ordering::Acquire), 0);
+    }
+
+    /// A guard clears its own reason and nothing else. Under the plain bool
+    /// this replaced, dropping the block-build guard released every reason.
+    #[test]
+    fn pause_guard_drop_releases_only_its_own_reason() {
+        let paused = Arc::new(AtomicU8::new(0));
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        {
+            set_pause_reason(&paused, PauseReason::BlockBuild, true);
+            let _guard = PauseGuard {
+                paused: paused.clone(),
+                reason: PauseReason::BlockBuild,
+            };
+        }
+
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+    }
+
+    /// The store clock owns which slot the worker is in, so the wall-clock
+    /// offset is always measured against *that* slot and clamped to it. A wall
+    /// clock lagging the store reads as the start of the store's slot, one
+    /// running ahead as its end; neither can describe a position inside a
+    /// different slot, which is what would mis-bucket the slot's own group.
+    #[test]
+    fn ms_into_slot_is_measured_against_the_store_slot() {
+        let time_config = ChainConfig::new(1_000, DEFAULT_MILLISECONDS_PER_SLOT);
+        let genesis_ms = time_config.genesis_time_ms();
+        let slot = 7;
+        let slot_start_ms = genesis_ms + slot * DEFAULT_MILLISECONDS_PER_SLOT;
+
+        assert_eq!(ms_into_slot(slot_start_ms, slot, &time_config), 0);
+        assert_eq!(
+            ms_into_slot(slot_start_ms + 1_234, slot, &time_config),
+            1_234
+        );
+
+        // Wall clock a slot and a half behind the store: clamped to the start
+        // of the store's slot, the permissive `Backlog` end.
+        let behind = slot_start_ms - DEFAULT_MILLISECONDS_PER_SLOT / 2;
+        assert_eq!(ms_into_slot(behind, slot, &time_config), 0);
+        assert_eq!(ms_into_slot(genesis_ms, slot, &time_config), 0);
+
+        // Wall clock past the end of the store's slot: clamped to the slot's
+        // width, which is at or past the vote-aggregation boundary, so `Open`.
+        let ahead = slot_start_ms + 3 * DEFAULT_MILLISECONDS_PER_SLOT;
+        assert_eq!(
+            ms_into_slot(ahead, slot, &time_config),
+            DEFAULT_MILLISECONDS_PER_SLOT
+        );
+        assert!(
+            ms_into_slot(ahead, slot, &time_config) >= vote_aggregation_offset_ms(&time_config)
+        );
+
+        // Before genesis at all: still the start of slot 0, no underflow.
+        assert_eq!(ms_into_slot(0, 0, &time_config), 0);
     }
 }
