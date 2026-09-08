@@ -1,7 +1,14 @@
 # Benchmarking block building
 
-`ethlambda benchmark` measures block building the way the node performs it when
-it proposes, against a reproducible synthetic workload, with no devnet running.
+`ethlambda benchmark` measures block building — packing a body out of the
+attestation pool and sealing it — against a reproducible synthetic workload,
+with no devnet running.
+
+That path is now the aggregation worker's, not the proposer's: since
+[block body proofs](./slots_and_intervals.md#block-body-proofs), a proposer
+adopts a candidate body someone else packed. What the benchmark measures is
+unchanged, but read its numbers as the cost of producing a candidate body proof
+rather than the cost of a proposal.
 
 Block building is otherwise only observable through the Prometheus histograms a
 live node exports. Those are noisy, depend on whatever the network happened to

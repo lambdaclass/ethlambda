@@ -20,7 +20,7 @@ use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::metrics::BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES;
 use ethlambda_blockchain::store::{on_block_without_verification, produce_block_with_signatures};
 use ethlambda_storage::{NEW_PAYLOAD_CAP, Store};
-use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
+use ethlambda_types::block::{BlockProof, SignedBlock};
 use ethlambda_types::primitives::HashTreeRoot as _;
 use eyre::WrapErr as _;
 
@@ -247,7 +247,7 @@ fn build_one_slot(
     // index.
     let signed_block = SignedBlock {
         message: block,
-        proof: MultiMessageAggregate::default(),
+        proof: BlockProof::default(),
     };
     on_block_without_verification(store, signed_block)
         .wrap_err_with(|| format!("importing the built block failed at slot {slot}"))?;

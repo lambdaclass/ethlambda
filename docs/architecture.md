@@ -67,11 +67,11 @@ order. That walk and the actor split the duties:
 
 | Interval | In `store::on_tick` | In the actor |
 | --- | --- | --- |
-| 0 | accept new attestations, if we propose this slot | nothing: the build ran at the previous interval 4 |
+| 0 | accept new attestations, if we propose this slot | assemble and publish our block from the candidate body proofs on hand |
 | 1 | nothing | produce attestations |
 | 2 | nothing | publish the aggregates the worker produced |
 | 3 | update the safe target | nothing |
-| 4 | accept accumulated attestations | build and publish the next slot's block |
+| 4 | accept accumulated attestations | build and gossip the next slot's candidate body proof (on the worker) |
 
 See [Slots and Intervals](./slots_and_intervals.md) for what each duty means at the protocol
 level, and why the proposer builds one interval early.
@@ -117,6 +117,27 @@ merges that can run past the boundary, and one of them occupying the single prov
 delay the aggregate the slot is waiting on. From interval 2 on, whatever is in hand is
 aggregated. Separately, the actor raises a pause flag around its own block build, since
 that competes for the same prover.
+
+### Proposing from a gossiped body
+
+The heavy part of proposing was never picking attestations, it was merging their proofs
+into the one aggregate a block body carries. That merge does not involve the block root —
+the proposer's signature rides beside the aggregate in `BlockProof`, not inside it — so
+whoever holds the proofs can do it, before the block exists.
+
+ethlambda splits proposing along that line. During the head-update interval each aggregator
+packs a candidate body for the next slot, merges its proofs on the aggregation worker, and
+gossips the pair as a `BlockBodyProof` (`crates/blockchain/src/body_proof.rs`). The next
+slot's proposer keeps a bounded buffer of what arrives — its own worker's candidate
+included — and at the slot boundary adopts the most valuable one that survives its checks:
+votes it can place on the chain it is extending, attestations its own state transition
+accepts, an aggregate that verifies. Nothing qualifying means an empty block, which is a
+real option rather than a failure: an attestation-less block carries no aggregate and needs
+no prover call.
+
+The proposer verifies before it signs, not after. XMSS signing keys are one-time, so a
+proposer gets exactly one signature per slot and cannot discover a bad candidate by
+importing the block and seeing whether it sticks.
 
 Block import runs a second, smaller aggregation path. `reaggregate.rs` splits an imported
 block's merged proof back into per-attestation aggregates and folds them into the local pool,

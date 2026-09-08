@@ -10,6 +10,10 @@ pub const ATTESTATION_SUBNET_TOPIC_PREFIX: &str = "attestation";
 ///
 /// Full topic format: `/leanconsensus/{FORK_DIGEST}/aggregation/ssz_snappy`
 pub const AGGREGATION_TOPIC_KIND: &str = "aggregation";
+/// Topic kind for candidate block body + attestation aggregate gossip.
+///
+/// Full topic format: `/leanconsensus/{FORK_DIGEST}/block_body_proof/ssz_snappy`
+pub const BLOCK_BODY_PROOF_TOPIC_KIND: &str = "block_body_proof";
 
 /// Build the block gossipsub topic.
 pub fn block_topic() -> libp2p::gossipsub::IdentTopic {
@@ -22,6 +26,13 @@ pub fn block_topic() -> libp2p::gossipsub::IdentTopic {
 pub fn aggregation_topic() -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!(
         "/leanconsensus/{FORK_DIGEST}/{AGGREGATION_TOPIC_KIND}/ssz_snappy"
+    ))
+}
+
+/// Build the block-body-proof gossipsub topic.
+pub fn block_body_proof_topic() -> libp2p::gossipsub::IdentTopic {
+    libp2p::gossipsub::IdentTopic::new(format!(
+        "/leanconsensus/{FORK_DIGEST}/{BLOCK_BODY_PROOF_TOPIC_KIND}/ssz_snappy"
     ))
 }
 
