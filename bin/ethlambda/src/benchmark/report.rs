@@ -36,6 +36,14 @@ pub(crate) struct Sample {
     /// Pool entries (new + known) visible to this build; reported so pool
     /// growth across iterations is visible in the samples.
     pub pool_entries: usize,
+    /// Seconds spent producing this slot's pool entries: every validator's
+    /// XMSS attestation signature plus their type-1 aggregation. That is
+    /// aggregator-side work a proposer never does, so it sits outside `wall`.
+    /// Zero in mock mode.
+    pub aggregate_seconds: f64,
+    /// Seconds to import the block after the measured span; in real mode this
+    /// includes verifying the merged multi-message aggregate.
+    pub import_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -97,6 +105,8 @@ pub(crate) struct Summary {
     pub phases: BTreeMap<String, Stats>,
     pub overhead: Stats,
     pub wall: Stats,
+    pub aggregate: Stats,
+    pub import: Stats,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +142,18 @@ impl Report {
                 .map(|sample| sample.wall_seconds)
                 .collect::<Vec<_>>(),
         );
+        let aggregate = stats(
+            &samples
+                .iter()
+                .map(|sample| sample.aggregate_seconds)
+                .collect::<Vec<_>>(),
+        );
+        let import = stats(
+            &samples
+                .iter()
+                .map(|sample| sample.import_seconds)
+                .collect::<Vec<_>>(),
+        );
 
         if wall.cv > CV_WARN_THRESHOLD {
             eprintln!(
@@ -151,6 +173,8 @@ impl Report {
                 phases,
                 overhead,
                 wall,
+                aggregate,
+                import,
             },
         }
     }
@@ -205,7 +229,11 @@ impl Report {
         for phase in &phases {
             let _ = write!(out, " {phase:>16}");
         }
-        let _ = writeln!(out, " {:>10} {:>10} {:>12}", "overhead", "wall", "root");
+        let _ = writeln!(
+            out,
+            " {:>10} {:>10} {:>10} {:>10} {:>12}",
+            "overhead", "wall", "aggregate", "import", "root"
+        );
 
         for sample in &self.samples {
             let _ = write!(out, "  {:<5}", sample.iteration);
@@ -215,9 +243,11 @@ impl Report {
             }
             let _ = writeln!(
                 out,
-                " {:>10} {:>10} {:>12}",
+                " {:>10} {:>10} {:>10} {:>10} {:>12}",
                 format_ms(sample.overhead_seconds),
                 format_ms(sample.wall_seconds),
+                format_ms(sample.aggregate_seconds),
+                format_ms(sample.import_seconds),
                 &sample.block_root[..10],
             );
         }
@@ -233,6 +263,10 @@ impl Report {
         }
         let _ = writeln!(out, "{}", stats_row("overhead", &self.summary.overhead));
         let _ = writeln!(out, "{}", stats_row("wall", &self.summary.wall));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  outside the measured span:");
+        let _ = writeln!(out, "{}", stats_row("aggregate", &self.summary.aggregate));
+        let _ = writeln!(out, "{}", stats_row("import", &self.summary.import));
         out
     }
 }

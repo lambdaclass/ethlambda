@@ -28,6 +28,10 @@ ethlambda-types.workspace = true
 ethlambda-rpc.workspace = true
 ethlambda-storage.workspace = true
 
+# Seeded XMSS keygen for the real-crypto benchmark corpus.
+leansig.workspace = true
+rand.workspace = true
+
 libssz.workspace = true
 libssz-types.workspace = true
 
