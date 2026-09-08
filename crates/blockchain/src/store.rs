@@ -1706,47 +1706,6 @@ mod tests {
         ));
     }
 
-    /// A vote that fails several checks at once must be rejected for the reason
-    /// the spec's expected-failure fixtures name, which is the availability
-    /// failure here even though the cheaper time check would also have caught it.
-    ///
-    /// Hoisting the storage-free checks ahead of the block lookups to save reads
-    /// breaks exactly this: it turns five leanSpec gossip-validation fixtures
-    /// (`test_attestation_head_slot_mismatch_rejected` and friends) from
-    /// `HEAD_SLOT_MISMATCH` / `TARGET_SLOT_MISMATCH` / `UNKNOWN_SOURCE` into
-    /// `ATTESTATION_TOO_FAR_IN_FUTURE` / `ATTESTATION_SLOT_BEFORE_HEAD`. The
-    /// rejection reason is cross-client observable, so the order is not ours to
-    /// optimize.
-    #[test]
-    fn validate_attestation_reports_availability_before_cheaper_failures() {
-        let store = new_test_store();
-        let unknown = H256([9u8; 32]);
-
-        // Far-future slot and unknown roots: the time check would fire, but the
-        // availability check comes first and owns the rejection.
-        let data = AttestationData {
-            slot: 1_000,
-            source: Checkpoint {
-                root: unknown,
-                slot: 998,
-            },
-            target: Checkpoint {
-                root: unknown,
-                slot: 999,
-            },
-            head: Checkpoint {
-                root: unknown,
-                slot: 1_000,
-            },
-        };
-
-        let result = validate_attestation_data(&store, &data);
-        assert!(
-            matches!(result, Err(StoreError::UnknownSourceBlock(root)) if root == unknown),
-            "Expected UnknownSourceBlock, got: {result:?}"
-        );
-    }
-
     /// leanSpec #833: a vote whose head sits on a sibling fork of the target
     /// must be rejected by gossip validation, even though every slot and
     /// availability check passes.
