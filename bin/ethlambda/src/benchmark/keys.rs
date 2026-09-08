@@ -4,25 +4,26 @@
 //! run seed, so two runs with the same seed use identical keys and, since XMSS
 //! signing is deterministic, identical signatures and proofs. Keys are
 //! generated only for the slots the run will sign (leansig's keygen cost scales
-//! with the active window), and `--key-cache` stores them so reruns skip keygen.
+//! with the active window), in parallel, and `--key-cache` stores them so
+//! reruns skip keygen.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
 use ethlambda_blockchain::key_manager::{KeyManager, ValidatorKeyPair};
-use ethlambda_crypto::signature::{LeanSignatureScheme, ValidatorPublicKey, ValidatorSecretKey};
+use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_types::state::ValidatorPubkeyBytes;
 use eyre::WrapErr as _;
-use leansig::{serialization::Serializable as _, signature::SignatureScheme as _};
-use rand::{SeedableRng as _, rngs::StdRng};
+use rayon::prelude::*;
 
-const PUBKEY_LEN: usize = std::mem::size_of::<ValidatorPubkeyBytes>();
+const PUBKEY_LEN: usize = size_of::<ValidatorPubkeyBytes>();
 
 #[derive(Debug, Clone, Copy)]
+#[repr(u64)]
 enum Role {
-    Attestation,
-    Proposal,
+    Attestation = 0,
+    Proposal = 1,
 }
 
 impl Role {
@@ -34,17 +35,18 @@ impl Role {
     }
 }
 
-/// One validator's generated key material: pubkeys as stored in the genesis
-/// state, secrets as leansig serialized bytes.
-struct ValidatorKeys {
-    attestation_pubkey: ValidatorPubkeyBytes,
-    proposal_pubkey: ValidatorPubkeyBytes,
-    attestation_secret: Vec<u8>,
-    proposal_secret: Vec<u8>,
+struct Key {
+    pubkey: ValidatorPubkeyBytes,
+    secret: ValidatorSecretKey,
+    cached: bool,
 }
 
 pub(crate) struct KeySet {
-    validators: Vec<ValidatorKeys>,
+    /// `(attestation_pubkey, proposal_pubkey)` per validator, for the genesis state.
+    pub genesis_pubkeys: Vec<(ValidatorPubkeyBytes, ValidatorPubkeyBytes)>,
+    /// The production signer over every validator's keys, so the benchmark
+    /// signs through exactly the code path the node uses.
+    pub key_manager: KeyManager,
 }
 
 impl KeySet {
@@ -69,123 +71,92 @@ impl KeySet {
             .filter(|epochs| *epochs >= 1)
             .ok_or_else(|| eyre::eyre!("key window must cover at least one slot"))?;
 
+        // Every key is independent and deterministic in (seed, index, role), so
+        // they are produced in parallel; `collect` keeps the job order.
         let start = Instant::now();
-        let mut generated = 0usize;
-        let mut validators = Vec::with_capacity(num_validators as usize);
-        for index in 0..num_validators {
-            let mut key = |role: Role| -> eyre::Result<(ValidatorPubkeyBytes, Vec<u8>)> {
-                let file = cache.map(|dir| {
-                    dir.join(format!(
-                        "xmss-{}-seed{seed}-v{index}-{}-w{num_slots}.bin",
-                        env!("ETHLAMBDA_LEANSIG_REV"),
-                        role.tag()
-                    ))
-                });
-                if let Some(file) = &file
-                    && file.is_file()
-                {
-                    return load_cached(file);
-                }
-                let (pubkey, secret) = generate_key(seed, index, role, num_active_epochs)?;
-                generated += 1;
-                if let Some(file) = &file {
-                    let mut bytes = pubkey.to_vec();
-                    bytes.extend_from_slice(&secret);
-                    std::fs::write(file, bytes).wrap_err_with(|| {
-                        format!("failed to write cached key {}", file.display())
-                    })?;
-                }
-                Ok((pubkey, secret))
-            };
-            let (attestation_pubkey, attestation_secret) = key(Role::Attestation)?;
-            let (proposal_pubkey, proposal_secret) = key(Role::Proposal)?;
-            validators.push(ValidatorKeys {
-                attestation_pubkey,
-                proposal_pubkey,
-                attestation_secret,
-                proposal_secret,
-            });
-        }
+        let jobs: Vec<(u64, Role)> = (0..num_validators)
+            .flat_map(|index| [(index, Role::Attestation), (index, Role::Proposal)])
+            .collect();
+        let keys: Vec<Key> = jobs
+            .into_par_iter()
+            .map(|(index, role)| load_or_generate(seed, index, role, num_active_epochs, cache))
+            .collect::<eyre::Result<_>>()?;
+        let cached = keys.iter().filter(|key| key.cached).count();
         eprintln!(
-            "validator keys ready in {:.1}s ({generated} generated, {} loaded from cache)",
+            "validator keys ready in {:.1}s ({} generated, {cached} loaded from cache)",
             start.elapsed().as_secs_f64(),
-            validators.len() * 2 - generated,
+            keys.len() - cached,
         );
-        Ok(Self { validators })
-    }
 
-    /// `(attestation_pubkey, proposal_pubkey)` per validator, for the genesis state.
-    pub(crate) fn genesis_pubkeys(&self) -> Vec<(ValidatorPubkeyBytes, ValidatorPubkeyBytes)> {
-        self.validators
-            .iter()
-            .map(|keys| (keys.attestation_pubkey, keys.proposal_pubkey))
-            .collect()
-    }
-
-    /// Decoded attestation pubkeys, indexed by validator, for type-1 aggregation.
-    pub(crate) fn attestation_pubkeys(&self) -> eyre::Result<Vec<ValidatorPublicKey>> {
-        self.validators
-            .iter()
-            .enumerate()
-            .map(|(index, keys)| {
-                ValidatorPublicKey::from_bytes(&keys.attestation_pubkey)
-                    .map_err(|err| eyre::eyre!("validator {index} attestation pubkey: {}", err.0))
-            })
-            .collect()
-    }
-
-    /// Build the production `KeyManager` over these keys, so the benchmark signs
-    /// through exactly the code path the node uses.
-    pub(crate) fn into_key_manager(self) -> eyre::Result<KeyManager> {
-        let mut keys = HashMap::with_capacity(self.validators.len());
-        for (index, validator) in self.validators.into_iter().enumerate() {
-            let decode = |bytes: &[u8], role: Role| {
-                ValidatorSecretKey::from_bytes(bytes).map_err(|err| {
-                    eyre::eyre!(
-                        "validator {index} {} secret key does not decode ({}); \
-                         if --key-cache was used, delete the cache directory and rerun",
-                        role.tag(),
-                        err.0
-                    )
-                })
+        let mut genesis_pubkeys = Vec::with_capacity(num_validators as usize);
+        let mut pairs = HashMap::with_capacity(num_validators as usize);
+        let mut keys = keys.into_iter();
+        for index in 0..num_validators {
+            let (attestation, proposal) = (keys.next(), keys.next());
+            let (Some(attestation), Some(proposal)) = (attestation, proposal) else {
+                eyre::bail!("key generation produced fewer keys than validators");
             };
-            keys.insert(
-                index as u64,
+            genesis_pubkeys.push((attestation.pubkey, proposal.pubkey));
+            pairs.insert(
+                index,
                 ValidatorKeyPair {
-                    attestation_key: decode(&validator.attestation_secret, Role::Attestation)?,
-                    proposal_key: decode(&validator.proposal_secret, Role::Proposal)?,
+                    attestation_key: attestation.secret,
+                    proposal_key: proposal.secret,
                 },
             );
         }
-        Ok(KeyManager::new(keys))
+        Ok(Self {
+            genesis_pubkeys,
+            key_manager: KeyManager::new(pairs),
+        })
     }
 }
 
-/// Deterministic keygen: the RNG is seeded from `(seed, index, role)` so every
-/// key is distinct and reproducible.
-fn generate_key(
+/// Load the cached key for `(seed, index, role)` if present, else derive it
+/// (and cache it when a cache directory is given).
+fn load_or_generate(
     seed: u64,
     index: u64,
     role: Role,
     num_active_epochs: usize,
-) -> eyre::Result<(ValidatorPubkeyBytes, Vec<u8>)> {
-    let role_bit = match role {
-        Role::Attestation => 0,
-        Role::Proposal => 1,
-    };
-    let mut rng = StdRng::seed_from_u64(seed ^ (index << 1 | role_bit).rotate_left(32));
-    let (pubkey, secret) = LeanSignatureScheme::key_gen(&mut rng, 0, num_active_epochs);
+    cache: Option<&Path>,
+) -> eyre::Result<Key> {
+    let file = cache.map(|dir| {
+        dir.join(format!(
+            "xmss-{}-seed{seed}-v{index}-{}-w{num_active_epochs}.bin",
+            env!("ETHLAMBDA_LEANSIG_REV"),
+            role.tag()
+        ))
+    });
+    if let Some(file) = &file
+        && file.is_file()
+    {
+        return load_cached(file);
+    }
+
+    let key_seed = seed ^ (index << 1 | role as u64).rotate_left(32);
+    let (pubkey, secret) = ValidatorSecretKey::generate_from_seed(key_seed, 0, num_active_epochs);
     let pubkey: ValidatorPubkeyBytes = pubkey.to_bytes().try_into().map_err(|bytes: Vec<u8>| {
         eyre::eyre!(
             "leansig pubkey is {} bytes, expected {PUBKEY_LEN}",
             bytes.len()
         )
     })?;
-    Ok((pubkey, secret.to_bytes()))
+    if let Some(file) = &file {
+        let mut bytes = pubkey.to_vec();
+        bytes.extend_from_slice(&secret.to_bytes());
+        std::fs::write(file, bytes)
+            .wrap_err_with(|| format!("failed to write cached key {}", file.display()))?;
+    }
+    Ok(Key {
+        pubkey,
+        secret,
+        cached: false,
+    })
 }
 
 /// A cache entry is the pubkey bytes followed by the serialized secret key.
-fn load_cached(file: &Path) -> eyre::Result<(ValidatorPubkeyBytes, Vec<u8>)> {
+fn load_cached(file: &Path) -> eyre::Result<Key> {
     let bytes = std::fs::read(file)
         .wrap_err_with(|| format!("failed to read cached key {}", file.display()))?;
     eyre::ensure!(
@@ -194,8 +165,17 @@ fn load_cached(file: &Path) -> eyre::Result<(ValidatorPubkeyBytes, Vec<u8>)> {
         file.display()
     );
     let (pubkey, secret) = bytes.split_at(PUBKEY_LEN);
-    let pubkey: ValidatorPubkeyBytes = pubkey.try_into().expect("split at PUBKEY_LEN");
-    Ok((pubkey, secret.to_vec()))
+    let secret = ValidatorSecretKey::from_bytes(secret).map_err(|err| {
+        eyre::eyre!(
+            "cached key {} does not decode ({err}); delete it and rerun",
+            file.display()
+        )
+    })?;
+    Ok(Key {
+        pubkey: pubkey.try_into().expect("split at PUBKEY_LEN"),
+        secret,
+        cached: true,
+    })
 }
 
 #[cfg(test)]
@@ -204,35 +184,27 @@ mod tests {
 
     #[test]
     fn keys_are_deterministic_per_seed_and_distinct_per_role() {
-        let (a_pub, a_sec) = generate_key(7, 3, Role::Attestation, 2).unwrap();
-        let (b_pub, b_sec) = generate_key(7, 3, Role::Attestation, 2).unwrap();
-        assert_eq!(a_pub, b_pub);
-        assert_eq!(a_sec, b_sec);
-        let (p_pub, _) = generate_key(7, 3, Role::Proposal, 2).unwrap();
-        assert_ne!(a_pub, p_pub);
-        let (s_pub, _) = generate_key(8, 3, Role::Attestation, 2).unwrap();
-        assert_ne!(a_pub, s_pub);
+        let a = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
+        let b = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
+        assert_eq!(a.pubkey, b.pubkey);
+        assert_eq!(a.secret.to_bytes(), b.secret.to_bytes());
+        let proposal = load_or_generate(7, 3, Role::Proposal, 2, None).unwrap();
+        assert_ne!(a.pubkey, proposal.pubkey);
+        let other_seed = load_or_generate(8, 3, Role::Attestation, 2, None).unwrap();
+        assert_ne!(a.pubkey, other_seed.pubkey);
     }
 
     #[test]
     fn cache_round_trips_and_decodes() {
-        let dir = std::env::temp_dir().join(format!(
-            "ethlambda-bench-keys-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let first = KeySet::generate(11, 1, 2, Some(&dir)).unwrap();
-        let second = KeySet::generate(11, 1, 2, Some(&dir)).unwrap();
-        assert_eq!(first.genesis_pubkeys(), second.genesis_pubkeys());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
-        let mut key_manager = second.into_key_manager().unwrap();
-        assert_eq!(key_manager.validator_ids(), vec![0]);
-        key_manager
+        let dir = tempfile::tempdir().unwrap();
+        let first = KeySet::generate(11, 1, 2, Some(dir.path())).unwrap();
+        let mut second = KeySet::generate(11, 1, 2, Some(dir.path())).unwrap();
+        assert_eq!(first.genesis_pubkeys, second.genesis_pubkeys);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        assert_eq!(second.key_manager.validator_ids(), vec![0]);
+        second
+            .key_manager
             .sign_block_root(0, 1, &ethlambda_types::primitives::H256::ZERO)
             .expect("cached key signs within its window");
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

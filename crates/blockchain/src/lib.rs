@@ -783,14 +783,13 @@ impl BlockChainServer {
         // aggregate, and merge it with every attestation aggregate into the
         // block's multi-message aggregate.
         let head_state = self.store.head_state();
-        let seal_result = block_builder::seal_block(
+        let Ok(signed_block) = block_builder::seal_block(
             &head_state,
             &mut self.key_manager,
             block,
-            &single_message_aggregates,
+            single_message_aggregates,
         )
-        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to seal block"));
-        let Ok(signed_block) = seal_result else {
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to seal block")) else {
             metrics::inc_block_building_failures();
             return;
         };

@@ -130,30 +130,12 @@ impl Report {
                 phases.insert(phase.clone(), stats(&values));
             }
         }
-        let overhead = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.overhead_seconds)
-                .collect::<Vec<_>>(),
-        );
-        let wall = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.wall_seconds)
-                .collect::<Vec<_>>(),
-        );
-        let aggregate = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.aggregate_seconds)
-                .collect::<Vec<_>>(),
-        );
-        let import = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.import_seconds)
-                .collect::<Vec<_>>(),
-        );
+        let column =
+            |value: fn(&Sample) -> f64| stats(&samples.iter().map(value).collect::<Vec<_>>());
+        let overhead = column(|sample| sample.overhead_seconds);
+        let wall = column(|sample| sample.wall_seconds);
+        let aggregate = column(|sample| sample.aggregate_seconds);
+        let import = column(|sample| sample.import_seconds);
 
         if wall.cv > CV_WARN_THRESHOLD {
             eprintln!(

@@ -17,7 +17,7 @@ use std::{
 
 use ethlambda_crypto::{
     AggregationError, aggregate_proofs, aggregate_signatures, merge_type_1s_into_type_2,
-    signature::{ValidatorPublicKey, ValidatorSignature},
+    signature::{SignatureParseError, ValidatorPublicKey, ValidatorSignature},
 };
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
@@ -27,12 +27,12 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
     block::{
-        AggregatedAttestations, Block, BlockBody, MultiMessageAggregate, SignedBlock,
-        SingleMessageAggregate,
+        AggregatedAttestations, Block, BlockBody, MultiMessageAggregate,
+        MultiMessageAggregateError, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    state::{JustifiedSlots, State},
+    state::{JustifiedSlots, State, Validator},
 };
 use tracing::{info, trace};
 
@@ -676,20 +676,7 @@ fn compact_attestations(
         let children: Vec<(Vec<_>, _)> = group_items
             .iter()
             .map(|(_, proof)| {
-                let pubkeys = proof
-                    .participant_indices()
-                    .map(|vid| {
-                        let not_in_state = StoreError::ValidatorNotInState {
-                            validator_index: vid,
-                        };
-                        let validator = head_state
-                            .validators
-                            .get(vid as usize)
-                            .ok_or(not_in_state)?;
-                        ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
-                            .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let pubkeys = resolve_attestation_pubkeys(&head_state.validators, proof)?;
                 Ok((pubkeys, proof.proof.clone()))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -898,6 +885,26 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
     );
 }
 
+/// Decode the attestation pubkeys of a proof's participants from the state.
+fn resolve_attestation_pubkeys(
+    validators: &[Validator],
+    proof: &SingleMessageAggregate,
+) -> Result<Vec<ValidatorPublicKey>, StoreError> {
+    proof
+        .participant_indices()
+        .map(|vid| {
+            let validator =
+                validators
+                    .get(vid as usize)
+                    .ok_or(StoreError::ValidatorNotInState {
+                        validator_index: vid,
+                    })?;
+            ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
+                .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
+        })
+        .collect()
+}
+
 /// Why sealing a built block failed.
 #[derive(Debug, thiserror::Error)]
 pub enum SealError {
@@ -906,19 +913,17 @@ pub enum SealError {
     #[error("proposer index {0} out of range")]
     ProposerOutOfRange(u64),
     #[error("failed to decode proposer proposal pubkey: {0}")]
-    ProposerPubkey(String),
+    ProposerPubkey(SignatureParseError),
     #[error("failed to decode proposer signature bytes: {0}")]
-    ProposerSignature(String),
-    #[error("participant {0} out of range while resolving pubkeys")]
-    ParticipantOutOfRange(u64),
-    #[error("failed to decode attestation pubkey of validator {0}: {1}")]
-    ParticipantPubkey(u64, String),
+    ProposerSignature(SignatureParseError),
+    #[error("failed to resolve participant pubkeys: {0}")]
+    Participants(#[from] StoreError),
     #[error("failed to wrap proposer signature as single-message aggregate: {0}")]
     Wrap(AggregationError),
     #[error("failed to merge single-message aggregates into a multi-message aggregate: {0}")]
     Merge(AggregationError),
     #[error("failed to build multi-message aggregate: {0}")]
-    Decode(String),
+    Decode(#[from] MultiMessageAggregateError),
 }
 
 /// Seal a built block into a `SignedBlock`: sign the block root with the
@@ -927,10 +932,11 @@ pub enum SealError {
 /// single-message aggregate into the block's single multi-message aggregate.
 ///
 /// `single_message_aggregates` are the proofs `build_block` returned alongside
-/// `block`, in the same order as `block.body.attestations`. Per-component
-/// participants are rederived at verify time from those attestations'
-/// `aggregation_bits` plus `block.proposer_index`, so nothing else needs
-/// persisting.
+/// `block`, in the same order as `block.body.attestations`; they are consumed
+/// so their proof bytes move into the merge instead of being copied.
+/// Per-component participants are rederived at verify time from those
+/// attestations' `aggregation_bits` plus `block.proposer_index`, so nothing
+/// else needs persisting.
 ///
 /// Each step is observed on the block-proposal phase histogram under
 /// [`metrics::BLOCK_PROPOSAL_SEAL_PHASES`].
@@ -938,7 +944,7 @@ pub fn seal_block(
     head_state: &State,
     key_manager: &mut KeyManager,
     block: Block,
-    single_message_aggregates: &[SingleMessageAggregate],
+    single_message_aggregates: Vec<SingleMessageAggregate>,
 ) -> Result<SignedBlock, SealError> {
     let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
     let proposer_index = block.proposer_index;
@@ -957,9 +963,9 @@ pub fn seal_block(
     // singleton single-message aggregate wrap and for the multi-message
     // aggregate merge inputs.
     let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
-        .map_err(|err| SealError::ProposerPubkey(err.0))?;
+        .map_err(SealError::ProposerPubkey)?;
     let proposer_validator_signature = ValidatorSignature::from_bytes(&proposer_signature)
-        .map_err(|err| SealError::ProposerSignature(err.0))?;
+        .map_err(SealError::ProposerSignature)?;
 
     let wrap_start = Instant::now();
     let proposer_proof_bytes = aggregate_signatures(
@@ -973,24 +979,14 @@ pub fn seal_block(
 
     let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len() + 1);
     for sma in single_message_aggregates {
-        let pubkeys = sma
-            .participant_indices()
-            .map(|vid| {
-                let validator = validators
-                    .get(vid as usize)
-                    .ok_or(SealError::ParticipantOutOfRange(vid))?;
-                ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
-                    .map_err(|err| SealError::ParticipantPubkey(vid, err.0))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        merge_inputs.push((pubkeys, sma.proof.clone()));
+        let pubkeys = resolve_attestation_pubkeys(validators, &sma)?;
+        merge_inputs.push((pubkeys, sma.proof));
     }
     merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
 
     let merge_start = Instant::now();
     let merged_bytes = merge_type_1s_into_type_2(merge_inputs).map_err(SealError::Merge)?;
-    let proof = MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice())
-        .map_err(|err| SealError::Decode(err.to_string()))?;
+    let proof = MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice())?;
     metrics::observe_block_proposal_phase("merge_type2", merge_start.elapsed());
 
     Ok(SignedBlock {

@@ -1,16 +1,23 @@
-//! Synthetic benchmark corpus: deterministic validators, a genesis store, and
-//! per-slot attestation-pool seeding.
+//! Synthetic benchmark corpus: deterministic validators, a genesis store,
+//! per-slot attestation-pool seeding, and the crypto-mode-specific steps of one
+//! slot (seal, import, which phases to expect).
 
 use std::sync::Arc;
 use std::time::Instant;
 
+use ethlambda_blockchain::block_builder::seal_block;
 use ethlambda_blockchain::key_manager::KeyManager;
-use ethlambda_blockchain::store::produce_attestation_data;
+use ethlambda_blockchain::metrics::{
+    BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES, BLOCK_PROPOSAL_SEAL_PHASES,
+};
+use ethlambda_blockchain::store::{
+    StoreError, on_block, on_block_without_verification, produce_attestation_data,
+};
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData, validator_indices},
-    block::SingleMessageAggregate,
+    block::{Block, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
     constants::DEFAULT_MILLISECONDS_PER_SLOT,
     primitives::HashTreeRoot as _,
     state::{State, Validator, ValidatorPubkeyBytes},
@@ -22,17 +29,18 @@ use eyre::WrapErr as _;
 /// clock, so runs are reproducible at any time of day.
 const GENESIS_TIME: u64 = 1_700_000_000;
 
-/// How the corpus produces pool entries and genesis pubkeys.
+/// Everything that differs between a mock and a real-crypto run.
 pub(crate) enum CryptoMode {
-    /// Empty placeholder proofs and placeholder pubkey bytes. No code path
-    /// decodes either: verification is skipped and best-proof compaction never
-    /// resolves pubkeys.
+    /// Empty placeholder proofs and placeholder pubkey bytes, no seal, and
+    /// unverified import. No code path decodes the placeholders.
     Mock,
-    /// Real XMSS signatures aggregated into real leanVM type-1 proofs, over the
-    /// genesis pubkeys of the seeded key set.
+    /// Real XMSS signatures aggregated into real leanVM type-1 proofs, the
+    /// proposer's real seal, and verified import.
     Real {
+        /// `(attestation_pubkey, proposal_pubkey)` per validator, for genesis.
         genesis_pubkeys: Vec<(ValidatorPubkeyBytes, ValidatorPubkeyBytes)>,
-        attestation_pubkeys: Vec<ValidatorPublicKey>,
+        /// Signs attestations for the corpus and block roots for the seal.
+        key_manager: KeyManager,
     },
 }
 
@@ -95,73 +103,68 @@ impl SyntheticCorpus {
     ///
     /// Mirrors what committee aggregators gossip during a slot: several
     /// aggregates for the same `AttestationData`, each covering a validator
-    /// subset. In real mode each subset's validators sign the data through
-    /// `key_manager` and the signatures are aggregated into a type-1 proof; in
-    /// mock mode the proofs are empty. The proposal tick then promotes the
-    /// entries to the known pool, exactly as on a live node. Entries are
-    /// inserted in a fixed order because pool insertion order pins within-entry
-    /// proof choice during selection.
+    /// subset. In real mode each subset's validators sign the data and the
+    /// signatures are aggregated into a type-1 proof; in mock mode the proofs
+    /// are empty. The proposal tick then promotes the entries to the known
+    /// pool, exactly as on a live node. Entries are inserted in a fixed order
+    /// because pool insertion order pins within-entry proof choice during
+    /// selection.
     pub(crate) fn seed_pool(
-        &self,
+        &mut self,
         store: &mut Store,
-        key_manager: &mut KeyManager,
         attestation_slot: u64,
     ) -> eyre::Result<SeedOutcome> {
         let data = produce_attestation_data(store, attestation_slot);
+        let hashed = HashedAttestationData::new(data.clone());
         let groups = participant_groups(self.num_validators, self.proofs_per_data);
 
-        let aggregate_start = Instant::now();
-        let entries = match &self.crypto {
-            CryptoMode::Mock => groups
-                .into_iter()
-                .map(|participants| {
-                    (
-                        HashedAttestationData::new(data.clone()),
-                        SingleMessageAggregate::empty(participants),
-                    )
-                })
-                .collect(),
-            CryptoMode::Real {
-                attestation_pubkeys,
-                ..
-            } => {
+        let (entries, aggregate_seconds) = match &mut self.crypto {
+            CryptoMode::Mock => {
+                let entries = groups
+                    .into_iter()
+                    .map(|participants| {
+                        (hashed.clone(), SingleMessageAggregate::empty(participants))
+                    })
+                    .collect();
+                (entries, 0.0)
+            }
+            CryptoMode::Real { key_manager, .. } => {
+                let start = Instant::now();
+                let validators = store.head_state().validators;
                 let message = data.hash_tree_root();
                 let slot: u32 = attestation_slot.try_into().expect("slot exceeds u32");
                 let mut entries = Vec::with_capacity(groups.len());
                 for participants in groups {
-                    let indices: Vec<u64> = validator_indices(&participants).collect();
-                    let mut pubkeys = Vec::with_capacity(indices.len());
-                    let mut signatures = Vec::with_capacity(indices.len());
-                    for &validator in &indices {
-                        let bytes = key_manager
+                    let mut pubkeys = Vec::new();
+                    let mut signatures = Vec::new();
+                    for validator in validator_indices(&participants) {
+                        let pubkey_bytes = &validators
+                            .get(validator as usize)
+                            .ok_or_else(|| eyre::eyre!("validator {validator} not in state"))?
+                            .attestation_pubkey;
+                        pubkeys.push(ValidatorPublicKey::from_bytes(pubkey_bytes)?);
+                        let signature = key_manager
                             .sign_attestation(validator, &data)
                             .wrap_err_with(|| {
                                 format!("validator {validator} failed to sign slot {slot}")
                             })?;
-                        let signature = ValidatorSignature::from_bytes(&bytes)
-                            .map_err(|err| eyre::eyre!("signature bytes: {}", err.0))?;
-                        pubkeys.push(attestation_pubkeys[validator as usize].clone());
-                        signatures.push(signature);
+                        signatures.push(ValidatorSignature::from_bytes(&signature)?);
                     }
+                    let count = signatures.len();
                     let proof =
                         ethlambda_crypto::aggregate_signatures(pubkeys, signatures, &message, slot)
                             .wrap_err_with(|| {
                                 format!(
-                                    "type-1 aggregation of {} signatures failed at slot {slot}",
-                                    indices.len()
+                                    "type-1 aggregation of {count} signatures failed at slot {slot}"
                                 )
                             })?;
                     entries.push((
-                        HashedAttestationData::new(data.clone()),
+                        hashed.clone(),
                         SingleMessageAggregate::new(participants, proof),
                     ));
                 }
-                entries
+                (entries, start.elapsed().as_secs_f64())
             }
-        };
-        let aggregate_seconds = match self.crypto {
-            CryptoMode::Mock => 0.0,
-            CryptoMode::Real { .. } => aggregate_start.elapsed().as_secs_f64(),
         };
         store.insert_new_aggregated_payloads_batch(entries);
 
@@ -178,6 +181,49 @@ impl SyntheticCorpus {
             pool_entries: pending + store.known_aggregated_payloads_count(),
             aggregate_seconds,
         })
+    }
+
+    /// Turn the built block into a `SignedBlock` the way the proposer does. Mock
+    /// mode has nothing to sign with, so it ships an empty proof, the way the
+    /// fork-choice spec tests do.
+    pub(crate) fn seal(
+        &mut self,
+        store: &Store,
+        block: Block,
+        aggregates: Vec<SingleMessageAggregate>,
+    ) -> eyre::Result<SignedBlock> {
+        match &mut self.crypto {
+            CryptoMode::Mock => Ok(SignedBlock {
+                message: block,
+                proof: MultiMessageAggregate::default(),
+            }),
+            CryptoMode::Real { key_manager, .. } => {
+                let head_state = store.head_state();
+                Ok(seal_block(&head_state, key_manager, block, aggregates)?)
+            }
+        }
+    }
+
+    /// Import the sealed block. Real mode verifies the merged proof, so a bad
+    /// seal fails the run instead of producing a report about invalid blocks.
+    pub(crate) fn import(&self, store: &mut Store, block: SignedBlock) -> Result<(), StoreError> {
+        match self.crypto {
+            CryptoMode::Mock => on_block_without_verification(store, block),
+            CryptoMode::Real { .. } => on_block(store, block),
+        }
+    }
+
+    /// The phases one slot observes exactly once: the build phases always, plus
+    /// the seal phases when the seal runs.
+    pub(crate) fn phases(&self) -> impl Iterator<Item = &'static str> {
+        let seal = match self.crypto {
+            CryptoMode::Mock => &[][..],
+            CryptoMode::Real { .. } => BLOCK_PROPOSAL_SEAL_PHASES,
+        };
+        BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES
+            .iter()
+            .chain(seal)
+            .copied()
     }
 }
 
@@ -260,17 +306,16 @@ mod tests {
     fn real_seeding_produces_verifiable_proofs() {
         use crate::benchmark::keys::KeySet;
         let keys = KeySet::generate(1, 2, 2, None).unwrap();
-        let corpus = SyntheticCorpus::new(
+        let mut corpus = SyntheticCorpus::new(
             2,
             1,
             CryptoMode::Real {
-                genesis_pubkeys: keys.genesis_pubkeys(),
-                attestation_pubkeys: keys.attestation_pubkeys().unwrap(),
+                genesis_pubkeys: keys.genesis_pubkeys,
+                key_manager: keys.key_manager,
             },
         );
-        let mut key_manager = keys.into_key_manager().unwrap();
         let mut store = corpus.genesis_store(1);
-        let outcome = corpus.seed_pool(&mut store, &mut key_manager, 0).unwrap();
+        let outcome = corpus.seed_pool(&mut store, 0).unwrap();
         assert_eq!(outcome.pool_entries, 1);
         assert!(outcome.aggregate_seconds > 0.0);
 
@@ -282,11 +327,12 @@ mod tests {
             .next()
             .expect("one seeded entry");
         let proof = &proofs[0];
+        let validators = store.head_state().validators;
         let pubkeys = proof
             .participant_indices()
             .map(|index| {
-                let validator = &store.head_state().validators[index as usize];
-                ValidatorPublicKey::from_bytes(&validator.attestation_pubkey).unwrap()
+                ValidatorPublicKey::from_bytes(&validators[index as usize].attestation_pubkey)
+                    .unwrap()
             })
             .collect();
         ethlambda_crypto::verify_aggregated_signature(

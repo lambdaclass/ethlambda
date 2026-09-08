@@ -499,7 +499,7 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
-// --- Block Proposal Attestation Selection (build_block fixed-point loop) ---
+// --- Block Proposal (build_block phases, then the seal in seal_block) ---
 
 static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
     std::sync::LazyLock::new(|| {
