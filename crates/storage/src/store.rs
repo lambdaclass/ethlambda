@@ -11,14 +11,15 @@ use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
     attestation::{
         AggregatedAttestation, AggregationBits, AttestationData, HashedAttestationData,
-        bits_is_subset, validator_indices,
+        bits_is_subset, bits_same_set, validator_indices,
     },
     block::{Block, BlockBody, BlockHeader, BlockProof, SignedBlock, SingleMessageAggregate},
+    chain_config::ChainConfig,
     checkpoint::Checkpoint,
     constants::INTERVALS_PER_SLOT,
     genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
-    state::{ChainConfig, State, anchor_pair_is_consistent},
+    state::{State, anchor_pair_is_consistent},
 };
 use libssz::{SszDecode, SszEncode};
 
@@ -97,7 +98,9 @@ const KEY_LATEST_FINALIZED: &[u8] = b"latest_finalized";
 ///
 /// Snapshots are the only entries written to `States` (plus the bootstrap
 /// anchor); they are never pruned and bound state-reconstruction diff walks to
-/// at most this many steps. ~68 minutes at 4-second slots.
+/// at most this many steps. A slot count, not a duration: the walk cost is
+/// per-slot, so it does not follow the configured cadence. ~68 minutes at the
+/// default 4-second slots.
 const SNAPSHOT_ANCHOR_INTERVAL: u64 = 1_024;
 
 /// Number of reconstructed/imported states memoized in memory.
@@ -111,24 +114,28 @@ const STATE_CACHE_CAPACITY: usize = 32;
 /// Keep block proofs for at least this many slots below the tip, even once
 /// finalized. Proofs older than this window are pruned only when the window
 /// lies entirely within finalized history; see [`Store::prune_old_block_proofs`].
-/// ~1 day at 4-second slots.
+/// ~1 day at the default 4-second slots, proportionally longer on a slower one.
 const BLOCK_PROOF_PRUNING_RANGE: u64 = 21_600;
 
-/// ~30 minutes of resume window at 4-second slots (1800 / 4 = 450).
+/// Resume window, in slots. A slot count rather than a wall-clock window: the
+/// cost of resuming is replaying this many slots, whatever they last. ~30
+/// minutes at the default 4-second slots (1800 / 4 = 450).
 pub const MAX_RESUMABLE_DB_STATE_AGE: u64 = 450;
 
 /// Hard cap for the known aggregated payload buffer (number of distinct attestation messages).
-/// With 1 attestation/slot, this holds ~500 messages (~33 min at 4s/slot).
+/// With 1 attestation/slot, this holds ~500 messages (~33 min at the default
+/// 4s/slot).
 const AGGREGATED_PAYLOAD_CAP: usize = 512;
 
 /// Hard cap for the new (pending) aggregated payload buffer.
-/// Smaller than known since new payloads are drained every interval (~4s).
+/// Smaller than known since new payloads are drained every interval.
 /// Public so pool-seeding callers (the block-building benchmark) can reject
 /// workloads that a single insertion batch would silently evict.
 pub const NEW_PAYLOAD_CAP: usize = 64;
 
 /// Hard cap for the gossip signature buffer (individual signatures, not distinct data_roots).
-/// With 4 validators and 4-second slots, 2048 signatures covers ~512 slots (~34 min).
+/// With 4 validators, 2048 signatures covers ~512 slots (~34 min at the
+/// default 4-second slots).
 /// Each XMSS signature is ~3KB, so worst-case memory is ~6 MB.
 const GOSSIP_SIGNATURE_CAP: usize = 2048;
 
@@ -258,6 +265,29 @@ impl PayloadBuffer {
     /// Return the number of proofs for a given data_root without cloning.
     fn proof_count_for_root(&self, data_root: &H256) -> usize {
         self.data.get(data_root).map_or(0, |e| e.proofs.len())
+    }
+
+    /// The proof for `data_root` binding exactly `participants`, cloned.
+    /// `None` when the buffer holds no such proof, i.e. it was never inserted,
+    /// or [`Self::push`] dropped it as subsumed by a wider one, or it was
+    /// evicted or pruned since.
+    ///
+    /// Matches on the participant set rather than picking a "best" proof for
+    /// the root: the buffer holds peers' proofs for the same attestation data
+    /// alongside ours, and only an exact match identifies the one a caller
+    /// meant. Clones one proof where [`Self::proofs_for_root`] clones them all,
+    /// and a proof is up to 512 KiB.
+    fn proof_for_participants(
+        &self,
+        data_root: &H256,
+        participants: &AggregationBits,
+    ) -> Option<SingleMessageAggregate> {
+        self.data
+            .get(data_root)?
+            .proofs
+            .iter()
+            .find(|proof| bits_same_set(&proof.participants, participants))
+            .cloned()
     }
 
     /// Return cloned proofs for a given data_root, or empty vec if none.
@@ -531,9 +561,9 @@ pub struct Store {
     /// The config is written once at bootstrap and has no setter, so a plain copy
     /// per `Store` cannot go stale: sharing it behind an `Arc` would buy nothing.
     /// It stays in `Table::Metadata` under `KEY_CONFIG` because `from_db_state`
-    /// reads it back to reject a DB whose `genesis_time` disagrees with the config
-    /// file; this field only spares every caller a backend round trip and a
-    /// `Result` it could never act on.
+    /// reads it back to reject a DB whose genesis time or slot duration disagrees
+    /// with the config file; this field only spares every caller a backend round
+    /// trip and a `Result` it could never act on.
     config: ChainConfig,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
@@ -557,8 +587,16 @@ impl Store {
     ///
     /// Uses the state's `latest_block_header` as the anchor block header.
     /// No block body is stored since it's not available.
-    pub fn from_anchor_state(backend: Arc<dyn StorageBackend>, anchor_state: State) -> Self {
-        Self::init_store(backend, anchor_state, None)
+    ///
+    /// `milliseconds_per_slot` comes from the network's config file: the anchor
+    /// state carries the genesis time but not the cadence, which the spec's SSZ
+    /// `Config` has no field for.
+    pub fn from_anchor_state(
+        backend: Arc<dyn StorageBackend>,
+        anchor_state: State,
+        milliseconds_per_slot: u64,
+    ) -> Self {
+        Self::init_store(backend, anchor_state, None, milliseconds_per_slot)
             .expect("store initialization should succeed in from_anchor_state")
     }
 
@@ -576,6 +614,7 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_block: Block,
+        milliseconds_per_slot: u64,
     ) -> Result<Self, GetForkchoiceStoreError> {
         if !anchor_pair_is_consistent(&mut anchor_state, &anchor_block) {
             return Err(GetForkchoiceStoreError::AnchorPairInconsistent {
@@ -584,10 +623,13 @@ impl Store {
             });
         }
 
-        Ok(
-            Self::init_store(backend, anchor_state, Some(anchor_block.body))
-                .expect("store initialization should succeed in get_forkchoice_store"),
+        Ok(Self::init_store(
+            backend,
+            anchor_state,
+            Some(anchor_block.body),
+            milliseconds_per_slot,
         )
+        .expect("store initialization should succeed in get_forkchoice_store"))
     }
 
     /// Build a Store from the state already persisted in the storage backend.
@@ -621,8 +663,26 @@ impl Store {
             {
                 return Ok(None);
             }
-            ChainConfig::from_ssz_bytes(&bytes).expect("valid config")
+            ChainConfig::from_persisted_ssz_bytes(&bytes).expect("valid config")
         };
+
+        // The slot duration is absent from the state, so `verify_state` below
+        // cannot see it: compare the persisted config directly. A data
+        // directory built at another cadence indexes its blocks against a
+        // different time grid, which makes it as foreign as another genesis.
+        genesis
+            .verify_time_config(&persisted_config)
+            .inspect_err(|err| {
+                error!(
+                    %err,
+                    db_genesis_time = persisted_config.genesis_time,
+                    db_milliseconds_per_slot = persisted_config.milliseconds_per_slot,
+                    expected_genesis_time = genesis.genesis_time,
+                    expected_milliseconds_per_slot = genesis.milliseconds_per_slot,
+                    "Persisted DB was built on a different time grid; refusing to reuse this data directory"
+                )
+            })?;
+
         let store = Self {
             backend,
             config: persisted_config,
@@ -635,9 +695,9 @@ impl Store {
             state_cache: new_state_cache(),
         };
 
-        // Compare against the finalized state rather than the persisted
-        // `ChainConfig`: the config carries only `genesis_time`, so it cannot
-        // catch a chain that shares our genesis time but not our validator
+        // Also compare against the finalized state: the persisted config
+        // carries no validator registry, so the check above cannot catch a
+        // chain that shares our genesis time and cadence but not our validator
         // set. Finalized is chosen over head because it is the state the
         // anchor is rebuilt from and it never gets pruned.
         let finalized = store.latest_finalized()?.root;
@@ -666,7 +726,9 @@ impl Store {
         backend: Arc<dyn StorageBackend>,
         mut anchor_state: State,
         anchor_body: Option<BlockBody>,
+        milliseconds_per_slot: u64,
     ) -> Result<Self, Error> {
+        let config = ChainConfig::new(anchor_state.config.genesis_time, milliseconds_per_slot);
         // Save original state_root for validation
         let original_state_root = anchor_state.latest_block_header.state_root;
 
@@ -699,7 +761,7 @@ impl Store {
             // Metadata
             let metadata_entries = vec![
                 (KEY_TIME.to_vec(), 0u64.to_ssz()),
-                (KEY_CONFIG.to_vec(), anchor_state.config.to_ssz()),
+                (KEY_CONFIG.to_vec(), config.to_ssz()),
                 (KEY_HEAD.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_SAFE_TARGET.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
@@ -760,7 +822,7 @@ impl Store {
 
         Ok(Self {
             backend,
-            config: anchor_state.config,
+            config,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             fork_choice: Default::default(),
@@ -795,7 +857,8 @@ impl Store {
 
     /// Returns the current store time in interval counts since genesis.
     ///
-    /// Each increment represents one 800ms interval. Use [`Self::current_slot`]
+    /// Each increment represents one interval, a fifth of the configured slot.
+    /// Use [`Self::current_slot`]
     /// for the slot; the interval within it is `time() % INTERVALS_PER_SLOT`.
     pub fn time(&self) -> Result<u64, Error> {
         self.get_metadata(KEY_TIME)
@@ -1544,6 +1607,36 @@ impl Store {
         (new, known)
     }
 
+    /// The proof for `data_root` binding exactly `participants`, from the new
+    /// buffer or, failing that, the known one. `None` when neither holds it.
+    ///
+    /// Lets a caller hold on to the identity of a proof it put in the pool and
+    /// fetch the proof itself back later, without keeping a copy of the bytes.
+    /// A `None` is meaningful rather than an error: the proof is gone because
+    /// a wider one subsumed it, because it was promoted past a prune, or
+    /// because the buffer's cap evicted it, and in each case there is nothing
+    /// left for the caller to do with it.
+    ///
+    /// Checks the known buffer too, since a proposer's interval-0 promote
+    /// moves the new buffer wholesale before the vote-aggregation interval.
+    pub fn proof_for_participants(
+        &self,
+        data_root: &H256,
+        participants: &AggregationBits,
+    ) -> Option<SingleMessageAggregate> {
+        let from_new = self
+            .new_payloads
+            .lock()
+            .unwrap()
+            .proof_for_participants(data_root, participants);
+        from_new.or_else(|| {
+            self.known_payloads
+                .lock()
+                .unwrap()
+                .proof_for_participants(data_root, participants)
+        })
+    }
+
     /// Return attestation data entries from the new (pending) payload buffer.
     ///
     /// Used to iterate over data that has pending proofs but may lack gossip
@@ -1762,6 +1855,7 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
 
     /// Validator at `index` whose two pubkeys are filled with `seed`, so
@@ -1779,6 +1873,7 @@ mod tests {
     fn genesis_config(genesis_time: u64, validators: &[Validator]) -> GenesisConfig {
         GenesisConfig {
             genesis_time,
+            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
             genesis_validators: validators
                 .iter()
                 .map(|v| GenesisValidatorEntry {
@@ -1902,7 +1997,7 @@ mod tests {
             let backend = Arc::new(InMemoryBackend::new());
             Self {
                 backend,
-                config: ChainConfig { genesis_time: 0 },
+                config: ChainConfig::new(0, DEFAULT_MILLISECONDS_PER_SLOT),
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 fork_choice: Default::default(),
@@ -1918,7 +2013,7 @@ mod tests {
         fn test_store_with_backend(backend: Arc<InMemoryBackend>) -> Self {
             Self {
                 backend,
-                config: ChainConfig { genesis_time: 0 },
+                config: ChainConfig::new(0, DEFAULT_MILLISECONDS_PER_SLOT),
                 new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
                 known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
                 fork_choice: Default::default(),
@@ -1935,7 +2030,11 @@ mod tests {
     #[test]
     fn block_root_index_tracks_canonical_chain_across_reorgs() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let anchor_root = store.head().expect("head root");
 
         let block_1 = signed_block(1, anchor_root);
@@ -1995,8 +2094,11 @@ mod tests {
     #[test]
     fn from_db_state_preserves_block_root_index() {
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store =
-            Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
 
         let block = signed_block(1, store.head().expect("head root"));
         let block_root = block.message.hash_tree_root();
@@ -2326,6 +2428,82 @@ mod tests {
         // Should be 1 distinct data entry with 3 proofs
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.data[&data_root].proofs.len(), 3);
+    }
+
+    /// The lookup an aggregator's publication path depends on: our own proof
+    /// comes back even while a peer's disjoint proof for the same attestation
+    /// data sits next to it. Anything that picked a single "best" proof per
+    /// root could return the peer's and leave our subnet's votes off the wire.
+    #[test]
+    fn proof_for_participants_returns_ours_beside_a_disjoint_peer_proof() {
+        let mut store = Store::test_store();
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+        let ours = make_proof_for_validators(&[0, 1, 2]);
+        let theirs = make_proof_for_validators(&[5, 6, 7, 8]);
+
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data.clone()), ours.clone());
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data), theirs.clone());
+
+        let found = store
+            .proof_for_participants(&data_root, &ours.participants)
+            .expect("our own proof is still in the pool");
+        assert_eq!(
+            validator_indices(&found.participants).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        let found = store
+            .proof_for_participants(&data_root, &theirs.participants)
+            .expect("the peer's proof is addressable too");
+        assert_eq!(
+            validator_indices(&found.participants).collect::<Vec<_>>(),
+            vec![5, 6, 7, 8]
+        );
+    }
+
+    /// A `None` covers every way the pool can let go of a proof: subsumed by a
+    /// wider one, never inserted, or promoted into the known buffer, which the
+    /// lookup follows.
+    #[test]
+    fn proof_for_participants_reports_what_the_pool_no_longer_holds() {
+        let mut store = Store::test_store();
+        let data = make_att_data(1);
+        let data_root = data.hash_tree_root();
+        let narrow = make_proof_for_validators(&[0, 1]);
+        let wide = make_proof_for_validators(&[0, 1, 2]);
+
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(data.clone()),
+            narrow.clone(),
+        );
+        store.insert_new_aggregated_payload(HashedAttestationData::new(data), wide.clone());
+
+        // `push` dropped the narrower proof the wider one subsumes.
+        assert!(
+            store
+                .proof_for_participants(&data_root, &narrow.participants)
+                .is_none()
+        );
+        assert!(
+            store
+                .proof_for_participants(&data_root, &wide.participants)
+                .is_some()
+        );
+
+        // The lookup follows a promote out of the new buffer.
+        store.promote_new_aggregated_payloads();
+        assert!(
+            store
+                .proof_for_participants(&data_root, &wide.participants)
+                .is_some()
+        );
+
+        let never_inserted = make_proof_for_validators(&[42]);
+        assert!(
+            store
+                .proof_for_participants(&data_root, &never_inserted.participants)
+                .is_none()
+        );
     }
 
     #[test]
@@ -3007,7 +3185,11 @@ mod tests {
     #[test]
     fn get_signed_block_synthesizes_blank_proof_for_genesis_anchor() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
 
         let head_root = store.head().expect("head root must exist");
         let signed = store
@@ -3044,7 +3226,11 @@ mod tests {
             .expect("put header");
         batch.commit().expect("commit");
 
-        let store = Store::from_anchor_state(backend, State::from_genesis(0, vec![]));
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         assert!(
             store
                 .get_signed_block(&root)
@@ -3058,7 +3244,11 @@ mod tests {
     #[test]
     fn from_anchor_state_stores_bootstrap_snapshot() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend.clone(), State::from_genesis(0, vec![]));
+        let store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
 
         let anchor_root = store.head().expect("Failed to get head block root");
         assert!(has_key(backend.as_ref(), Table::States, &anchor_root));
@@ -3080,7 +3270,11 @@ mod tests {
     fn from_db_state_returns_some_on_matching_genesis() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
-        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         assert!(
             Store::from_db_state(backend, &genesis_config(12345, &[]))
                 .expect("Failed to get store")
@@ -3094,7 +3288,11 @@ mod tests {
     fn from_db_state_errors_on_genesis_time_mismatch() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write an initial state to the backend.
-        let _ = Store::from_anchor_state(backend.clone(), State::from_genesis(12345, vec![]));
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `expect_err`.
         let Err(err) = Store::from_db_state(backend, &genesis_config(99999, &[])) else {
@@ -3109,6 +3307,66 @@ mod tests {
         ));
     }
 
+    /// The case neither the state nor the validator registry can see: the slot
+    /// duration is deliberately absent from the SSZ state, so it has to be
+    /// caught against the persisted config.
+    #[test]
+    fn from_db_state_errors_on_slot_duration_mismatch() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        let mut genesis = genesis_config(12345, &[]);
+        genesis.milliseconds_per_slot = 8_000;
+        let Err(err) = Store::from_db_state(backend, &genesis) else {
+            panic!("slot duration mismatch must be fatal");
+        };
+        assert!(matches!(
+            err,
+            Error::GenesisMismatch(GenesisMismatch::SlotDuration {
+                expected: 8_000,
+                got: DEFAULT_MILLISECONDS_PER_SLOT,
+            })
+        ));
+    }
+
+    /// A data directory written before the slot duration was persisted holds a
+    /// bare SSZ `StateConfig` under `KEY_CONFIG`. It ran the default cadence,
+    /// so it must still resume rather than fail to decode.
+    #[test]
+    fn from_db_state_resumes_a_pre_slot_duration_data_directory() {
+        use ethlambda_types::state::StateConfig;
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let _ = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(12345, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        // Roll `KEY_CONFIG` back to the legacy layout.
+        let legacy = StateConfig {
+            genesis_time: 12345,
+        };
+        let mut batch = backend.begin_write().expect("write batch");
+        let entries = vec![(KEY_CONFIG.to_vec(), legacy.to_ssz())];
+        batch
+            .put_batch(Table::Metadata, entries)
+            .expect("put legacy config");
+        batch.commit().expect("commit");
+
+        let store = Store::from_db_state(backend, &genesis_config(12345, &[]))
+            .expect("legacy config must decode")
+            .expect("store must be resumable");
+        assert_eq!(
+            *store.config(),
+            ChainConfig::new(12345, DEFAULT_MILLISECONDS_PER_SLOT)
+        );
+    }
+
     /// The case a `genesis_time`-only check cannot see: same network start
     /// time, different validator registry.
     #[test]
@@ -3118,6 +3376,7 @@ mod tests {
         let _ = Store::from_anchor_state(
             backend.clone(),
             State::from_genesis(12345, persisted.clone()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
         );
 
         let mut foreign = persisted;
@@ -3135,9 +3394,7 @@ mod tests {
     fn from_db_state_returns_none_when_latest_finalized_is_missing() {
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
         // Write only KEY_CONFIG, leaving KEY_LATEST_FINALIZED absent.
-        let config = ChainConfig {
-            genesis_time: 12345,
-        };
+        let config = ChainConfig::new(12345, DEFAULT_MILLISECONDS_PER_SLOT);
         let mut batch = backend.begin_write().expect("write batch");
         batch
             .put_batch(

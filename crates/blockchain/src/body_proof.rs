@@ -476,7 +476,7 @@ mod tests {
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{BlockHeader, MultiMessageAggregate},
         checkpoint::Checkpoint,
-        state::{ChainConfig, JustificationValidators, JustifiedSlots, Validator},
+        state::{JustificationValidators, JustifiedSlots, StateConfig, Validator},
     };
     use libssz_types::SszList;
 
@@ -510,7 +510,7 @@ mod tests {
     /// there only once a block builds on it.
     fn head_state() -> State {
         State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: BlockHeader {
                 slot: HEAD_SLOT,

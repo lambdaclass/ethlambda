@@ -122,6 +122,7 @@ mod tests {
     };
     use ethlambda_blockchain::{ChainEvent, EventBus};
     use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use futures_util::StreamExt;
     use http_body_util::BodyExt;
     use std::sync::Arc;
@@ -130,7 +131,11 @@ mod tests {
     use crate::test_utils::create_test_state;
 
     async fn events_response(events: &EventBus, uri: &str) -> axum::response::Response {
-        let store = Store::from_anchor_state(Arc::new(InMemoryBackend::new()), create_test_state());
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            create_test_state(),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
         let app = crate::test_utils::test_api_router(store).layer(Extension(events.clone()));
         app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await

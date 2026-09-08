@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ethlambda_blockchain::{MILLISECONDS_PER_SLOT, spec_test_runner, store};
+use ethlambda_blockchain::{spec_test_runner, store};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     block::{Block, SignedBlock},
+    constants::DEFAULT_MILLISECONDS_PER_SLOT,
     primitives::HashTreeRoot as _,
     state::State,
 };
@@ -58,14 +59,20 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
         // Initialize the store with the anchor state and block
         let genesis_time = anchor_state.config.genesis_time;
         let backend = Arc::new(InMemoryBackend::new());
-        let mut st = Store::get_forkchoice_store(backend, anchor_state, anchor_block)
-            .expect("anchor state and block must match");
+        let mut st = Store::get_forkchoice_store(
+            backend,
+            anchor_state,
+            anchor_block,
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
+        .expect("anchor state and block must match");
 
         // Step 2: Run the state transition function with the block fixture
         let signed_block: SignedBlock = test.signed_block.into();
 
         // Advance time to the block's slot
-        let block_time_ms = genesis_time * 1000 + signed_block.message.slot * MILLISECONDS_PER_SLOT;
+        let block_time_ms =
+            genesis_time * 1000 + signed_block.message.slot * st.config().milliseconds_per_slot;
         store::on_tick(&mut st, block_time_ms, true);
 
         // Process the block (this includes signature verification)

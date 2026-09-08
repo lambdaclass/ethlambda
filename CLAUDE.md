@@ -19,7 +19,7 @@ crates/
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
     ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
-    ├─ src/aggregation.rs   # Always-on signature aggregation worker (+ body-proof jobs)
+    ├─ src/aggregation.rs   # Always-on aggregation worker (own thread + Store clone; also body-proof jobs)
     ├─ src/body_proof.rs    # Candidate block bodies: build, buffer, and the proposer's choice
     ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
     ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
@@ -53,17 +53,14 @@ crates/
 - Communication via `mpsc::unbounded_channel`
 - Shared storage via `Arc<dyn StorageBackend>` (clone Store, share backend)
 
-### Tick-Based Validator Duties (4-second slots, 5 intervals per slot)
+### Tick-Based Validator Duties (5 intervals per slot; 4-second slots by default)
 ```
 Interval 0: Accept attestations (if proposing), then assemble+publish our block from the buffered BlockBodyProof candidates (or an empty body)
 Interval 1: Attestation production (all validators, including proposer)
-Interval 2: Publish the aggregates the always-on worker produced since the last such interval
+Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor buffers each finished aggregate until this tick. One that finishes DURING interval 2 or 3 is gossiped on arrival instead, since the window is already open and buffering would hold it a full slot.
 Interval 3: Safe target update (fork choice)
 Interval 4: Accept accumulated attestations; the worker packs the NEXT slot's candidate BlockBodyProof, gossiped as it finishes
 ```
-Aggregation itself is NOT interval-bound: one always-on `spawn_blocking` worker holds a
-`Store` clone and proves the best job it can find, continuously (`aggregation.rs`). The
-intervals above only govern *publication*.
 
 ### Attestation Pipeline
 ```
@@ -75,6 +72,63 @@ Fork choice head update
 ```
 (Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
 `extract_latest_new_attestations`/`extract_latest_known_attestations`.)
+
+### Always-On Aggregation Worker (`aggregation.rs`)
+- One plain `std::thread` spawned in the actor's `#[started]` hook, joined in `#[stopped]`.
+  Not `spawn_blocking`: it lives for the process and awaits nothing, so a blocking-pool
+  thread would be parked permanently for nothing
+- Holds its own `Store` clone (same backend, same in-memory buffers), so it both re-reads
+  the pool itself rather than being handed a per-slot snapshot AND writes back what it
+  produces: `select_best_job` → prove → `store_aggregate` → `AggregateProduced` message →
+  repeat. Nothing eligible means a `WORKER_IDLE_POLL` sleep
+- The WORKER stores each aggregate (payload into the pool, gossip signatures out of it)
+  before announcing it, so the message carries no proof and the actor's mailbox never
+  holds one. The actor only **buffers** the gossip publication in `pending_aggregates`
+  until interval 2
+- That write races the actor, and is safe on two counts: `insert_new_aggregated_payload`
+  records fork-choice votes with a max-merge (`should_replace_vote`), which is
+  order-independent, and a concurrent promote MOVES votes new→known rather than dropping
+  them, so the worst interleaving defers a vote or its payload by one tick.
+  `delete_gossip_signatures` can only race a duplicate of a vote the proof already binds
+- `pending_aggregates` keys by attestation data root and stores PARTICIPANT SETS, not
+  proofs. The proof is already in the payload pool, and `Store::proof_for_participants`
+  fetches the named one back at publish time, so the buffer costs a bitfield per aggregate
+  instead of up to 512 KiB. A miss means the pool let the proof go (subsumed, pruned,
+  evicted) and there is nothing left to send
+- Naming a SPECIFIC proof is what makes that read-back safe. Do NOT change it to ask the
+  pool for the best proof under a data root: the pool also holds peers' proofs for the
+  same attestation data, `PayloadBuffer` keeps a peer's disjoint proof beside ours, and
+  any "pick the best" rule would publish theirs in place of ours and leave our subnet's
+  votes off the wire entirely
+- `PendingAggregate::push` mirrors `PayloadBuffer`'s subsumption rule on the participant
+  sets, so a re-proved group replaces the narrower name, disjoint sets both survive, and
+  the names kept are the ones that still resolve. `MAX_PENDING_AGGREGATES` bounds the rest
+- `JobPolicy` gates what the worker may take, by position in the slot: backlog
+  work early, a current-slot group once it holds `min_current_slot_group_sigs`, and inside
+  `EARLY_AGGREGATION_WINDOW` before interval 2 nothing but that group (a backlog job is a
+  recursive merge that would occupy the single prover across the boundary)
+- *Which* slot comes from `store.current_slot()`, the same clock `on_tick`'s idempotency
+  guard keys on; only the sub-interval position inside it comes from the wall clock
+  (`ms_into_slot`, clamped to that slot). Two independent clocks would let the worker and
+  the actor disagree about the current slot, and `select_best_job` buckets on exactly that
+- The actor parks the worker through a `PauseReason` bitset (`AtomicU8`), and the worker
+  takes no new job while any bit is set. `BlockBuild` is scoped, taken as an RAII
+  `PauseGuard` around `propose_block`, since both compete for the same single-threaded
+  leanVM prover. `Syncing` is level-driven from `duties_allowed()` on every tick via
+  `set_paused`, so a node that is behind does not prove a backlog against the prover its
+  block import needs, and `--disable-duty-sync-gate` keeps the worker running for free.
+  A proof already in flight is not interrupted — `aggregate_mixed` cannot be
+- One reason, one owner: a bitset (rather than a bool or a depth counter) makes setting
+  idempotent for the level-driven owner and stops a guard's drop from releasing someone
+  else's reason
+- Division of labor: the worker reads shared state that OTHER threads write (the
+  `AggregatorController`, which the RPC thread toggles); state the actor itself owns
+  reaches the worker as a `PauseReason`, so the policy is not re-derived in two places
+- The worker keeps NO memory of what it has already proved. It does not need one: it
+  stores each aggregate before its next selection round, so the pool that round re-reads
+  already accounts for it. A FAILED proof does leave the pool untouched and will be picked
+  again, which is accepted; the failure branch sleeps `WORKER_IDLE_POLL` so a proof that
+  fails cheaply cannot spin the thread
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -94,6 +148,8 @@ make test                                    # All tests + forkchoice spec tests
 ### Common Operations
 ```bash
 rm -rf leanSpec && make leanSpec/fixtures                # Download latest released test fixtures
+make update UPDATE_ARGS="-p <crate>"                     # Bump deps under the 14-day publish-age cooldown (nightly resolver)
+make cooldown-check                                      # Fail if a lockfile pins crates younger than the cooldown (same as CI)
 make docker-build                                        # Build Docker image (DOCKER_TAG=local)
 make run-devnet                                          # Run local devnet with lean-quickstart
 ```
@@ -277,7 +333,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ## Networking (libp2p)
 
 ### Protocols
-- **Transport**: QUIC over UDP (TLS 1.3)
+- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial (list order confers no preference; the default `dial_concurrency_factor` starts both handshakes)
+  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `NodeOptions::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations + candidate block bodies (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|block_body_proof|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -287,8 +344,8 @@ actual_slot = finalized_slot + 1 + relative_index
 ### Peer Discovery (discv5, opt-in)
 - Off by default; `--discovery.enable` plus `--discovery.port` (own UDP socket, must differ from `--gossipsub-port`)
 - Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
-- ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`secp256k1`/`eth2`/`attnets`
-- Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, `quic` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
+- ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
+- Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
 - Candidates ranked by uncovered attestation subnets. See [`docs/discovery.md`](docs/discovery.md)
 
 ### Retry Strategy on Block Requests
@@ -310,15 +367,22 @@ one port is supported and not a misconfiguration. See [`docs/rpc.md`](docs/rpc.m
 **Genesis:** `config.yaml` (YAML format, cross-client compatible)
 ```yaml
 GENESIS_TIME: 1770407233
+MILLISECONDS_PER_SLOT: 4000  # optional, defaults to DEFAULT_MILLISECONDS_PER_SLOT
 GENESIS_VALIDATORS:
   - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
+- `MILLISECONDS_PER_SLOT` must be a multiple of `INTERVALS_PER_SLOT` and at least
+  `MIN_MILLISECONDS_PER_SLOT`: the knob slows a network down, it does not speed one up,
+  since timings fixed in milliseconds (`EARLY_AGGREGATION_WINDOW`) are sized for the spec
+  cadence. It is persisted in the DB's `Metadata["config"]` and a resume with a different
+  value is refused. Other clients ignore the key and stay at their compile-time 4s, so it
+  only takes effect on an all-ethlambda network
 - All genesis state fields (checkpoints, justified_slots, etc.) initialize to zero/empty defaults
 - Matches Ream/Zeam format — no extra state fields in the config file
 
-**Bootnodes:** ENR records (Base64-encoded, RLP decoded for QUIC port + secp256k1 pubkey)
+**Bootnodes:** ENR records (Base64-encoded, RLP decoded for the `quic`/`tcp`/`udp` ports + secp256k1 pubkey). A `0` port means absent everywhere, on read and on write. `build_swarm` dedups by `PeerId`: two entries naming one key merge into a single dial
 
 ## Testing
 
@@ -347,7 +411,7 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
-- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate on the always-on worker → publish at interval 2 → promote to known → packed into a candidate body proof at interval 4
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregation worker picks it up on its next selection round → publish at interval 2 → promote to known → packed into a candidate body proof at interval 4
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
 ### Runtime Aggregator Toggle (Hot-Standby Model)

@@ -8,6 +8,7 @@ use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
     block::SingleMessageAggregate,
+    constants::DEFAULT_MILLISECONDS_PER_SLOT,
     state::{State, Validator, ValidatorPubkeyBytes},
 };
 
@@ -45,7 +46,11 @@ impl SyntheticCorpus {
             })
             .collect();
         let genesis_state = State::from_genesis(GENESIS_TIME, validators);
-        Store::from_anchor_state(Arc::new(InMemoryBackend::new()), genesis_state)
+        Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            genesis_state,
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
     }
 
     /// Seed the pending ("new") pool with the full validator set's attestations
