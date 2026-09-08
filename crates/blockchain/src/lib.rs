@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -9,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    block::SignedBlock,
     chain_config::ChainConfig,
     primitives::{H256, HashTreeRoot as _},
 };
@@ -780,116 +779,20 @@ impl BlockChainServer {
             block.body.attestations.iter(),
         );
 
-        // Sign the block root with the proposal key
-        let block_root = block.hash_tree_root();
-        let Ok(proposer_signature) = self
-            .key_manager
-            .sign_block_root(validator_id, slot as u32, &block_root)
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        // Wrap the proposer's raw XMSS signature into a singleton
-        // single-message aggregate SNARK, then merge it with every attestation
-        // single-message aggregate into the single multi-message aggregate.
+        // Sign the block root, wrap the signature as a singleton single-message
+        // aggregate, and merge it with every attestation aggregate into the
+        // block's multi-message aggregate.
         let head_state = self.store.head_state();
-        let validators = &head_state.validators;
-        let Some(proposer_validator) = validators.get(validator_id as usize) else {
-            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        // Decode the proposer's proposal pubkey once and reuse it both for the
-        // singleton single-message aggregate wrap and for the multi-message
-        // aggregate merge inputs.
-        let Ok(proposer_pubkey) = ValidatorPublicKey::from_bytes(
-            &proposer_validator.proposal_pubkey,
+        let seal_result = block_builder::seal_block(
+            &head_state,
+            &mut self.key_manager,
+            block,
+            &single_message_aggregates,
         )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-        ) else {
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to seal block"));
+        let Ok(signed_block) = seal_result else {
             metrics::inc_block_building_failures();
             return;
-        };
-
-        let Ok(proposer_validator_signature) =
-            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
-                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
-            })
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
-            vec![proposer_pubkey.clone()],
-            vec![proposer_validator_signature],
-            &block_root,
-            slot as u32,
-        )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as single-message aggregate"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-            Vec::with_capacity(single_message_aggregates.len() + 1);
-        let mut resolve_failed = false;
-        for sma in &single_message_aggregates {
-            let mut pubkeys = Vec::new();
-            for vid in sma.participant_indices() {
-                let Some(validator) = validators.get(vid as usize) else {
-                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
-                    resolve_failed = true;
-                    break;
-                };
-                match ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(err) => {
-                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
-                        resolve_failed = true;
-                        break;
-                    }
-                }
-            }
-            if resolve_failed {
-                break;
-            }
-            merge_inputs.push((pubkeys, sma.proof.clone()));
-        }
-        if resolve_failed {
-            metrics::inc_block_building_failures();
-            return;
-        }
-        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
-
-        // Merge yields raw lean-multisig type-2 bytes. Per-component
-        // participants are rederived at verify time from
-        // `block.body.attestations[i].aggregation_bits` plus
-        // `block.proposer_index`, so nothing else needs persisting.
-        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
-        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
-            Ok(p) => p,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
-        let signed_block = SignedBlock {
-            message: block,
-            proof,
         };
 
         // Stop timing here: the build is done, and the alignment wait below must
