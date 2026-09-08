@@ -195,9 +195,7 @@ fn checkpoint_is_ancestor(
 
     // Resolve the ancestor against the canonical index once. `None` means the
     // index has nothing to say about that slot, so the parent walk stays the only
-    // sound answer: a miss must never be read as "not an ancestor". That is what
-    // keeps this correct for a slot below the anchor this store was bootstrapped
-    // from, where the index simply has no entry to offer.
+    // sound answer: a miss must never be read as "not an ancestor".
     let ancestor_is_canonical = store
         .canonical_root_at_slot(ancestor.slot)
         .expect("canonical block root")
