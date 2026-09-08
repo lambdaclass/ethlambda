@@ -5,16 +5,18 @@ reference in a few places, mainly for performance reasons. This page lists those
 deviations; each will be fleshed out with rationale, implementation notes, and
 trade-offs over time.
 
-## Asynchronous signature aggregation with an early start and an early stop
+## Continuous signature aggregation, published on the interval grid
 
-Aggregation runs off the main BlockChainServer actor loop, may start before its
-interval, and stops early once it runs out of time.
+Aggregation is not a per-slot duty in ethlambda: it runs continuously off the main
+BlockChainServer actor loop, and only the publication of its results sits on the interval
+grid.
 
-- **ethlambda:** the actor snapshots everything aggregation needs (`snapshot_aggregation_inputs`, `crates/blockchain/src/aggregation.rs`) and spawns a `tokio::task::spawn_blocking` worker (`run_aggregation_worker`, `aggregation.rs`). Candidates are the store's gossip-signature groups plus payload-only groups (`new_payload_keys`, which need at least two existing proofs to merge). A tiered greedy selector orders them by consensus value (current-slot before stale, then `Finalize > Justify > Build`, mirroring the block builder) and emits at most `MAX_AGGREGATION_JOBS` jobs, dropping to a single job in the slot before one of our validators proposes. The worker streams each finished group back as an `AggregateProduced` message; the actor loop is never blocked on XMSS work.
-- **Early start:** a session normally fires at interval 2, but may start up to `EARLY_AGGREGATION_WINDOW` earlier once the 2/3 signature threshold is already met (`maybe_start_early_aggregation`, `crates/blockchain/src/lib.rs`), so the proof lands earlier in the slot.
-- **Early stop:** a `send_after(AGGREGATION_DEADLINE, ...)` timer cancels the session that long after **session start**, so a session that started early also ends early (`AGGREGATION_DEADLINE`, `aggregation.rs`). The worker checks `cancel.is_cancelled()` before each job (`aggregation.rs`); in-flight jobs finish, remaining jobs are dropped.
-- **leanSpec:** `aggregate()` is called inline and synchronously from `tick_interval`, at interval 2 only. It walks every attestation data with fresh evidence, with no job cap, no time budget, no worker, and no cancellation.
-- **Equivalence:** on cancellation the worker emits only the groups that finished, so a slot may pack fewer aggregates than the synchronous path would; any such subset still yields a valid block, affecting how many votes are included rather than signature validity. The job cap has the same character: it bounds prover work per slot, not what a block may carry.
+- **ethlambda:** one worker thread (`spawn_aggregation_worker`, `crates/blockchain/src/aggregation.rs`) is started with the actor and lives as long as it does. It holds its own `Store` handle and loops: pick the single best job (`select_best_job`), prove it, send it to the actor as an `AggregateProduced` message, pick again; an idle round sleeps `WORKER_IDLE_POLL`. Candidates are the store's gossip-signature groups plus payload-only groups (`new_payload_keys`, which need at least two existing proofs to merge), ranked by consensus value (current-slot before stale, then `Finalize > Justify > Build`, mirroring the block builder). The actor loop is never blocked on XMSS work.
+- **Deferred publication:** the actor applies each aggregate to its store on arrival — so the pool the worker re-reads accounts for it — but buffers the gossip publication until interval 2 (`publish_pending_aggregates`, `crates/blockchain/src/lib.rs`). Proving therefore happens whenever there is work; the network still only sees aggregates at the vote-aggregation interval.
+- **What the worker may take up** is a function of where the slot is (`JobPolicy`, `aggregation.rs`). Early in the slot: backlog work, plus a current-slot group that already holds two thirds of the signatures this node expects (`min_current_slot_group_sigs`), so a slot's votes go out as one wide aggregate instead of several thin ones. Inside the last `EARLY_AGGREGATION_WINDOW` before interval 2: that group and nothing else, since a backlog job is a recursive merge that would occupy the single prover across the boundary and delay the aggregate the slot is waiting on. From interval 2 on: everything, however few signatures back it.
+- **Yielding to the block build:** the actor raises the worker's pause flag around `propose_block` (`AggregationWorker::pause`), since both run leanVM proofs and only the block has a deadline. A proof already in flight is not interrupted.
+- **leanSpec:** `aggregate()` is called inline and synchronously from `tick_interval`, at interval 2 only. It walks every attestation data with fresh evidence, with no worker, no gate, and no separation between producing an aggregate and publishing it.
+- **Equivalence:** the worker produces the same aggregates over a slot, at different times; what a block may carry is unchanged. Where the two can differ is count: a slot whose proving overruns publishes fewer aggregates than the synchronous path would, which affects how many votes are included rather than signature validity.
 
 ## Attestation scoring on block building
 

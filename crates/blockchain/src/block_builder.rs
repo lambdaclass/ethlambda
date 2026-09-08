@@ -307,11 +307,11 @@ struct ChainContext<'a> {
 /// finalized, and the running per-target-root voter set.
 ///
 /// Shared by `select_attestations` (block proposal) and
-/// `aggregation::snapshot_aggregation_inputs` (interval-2 aggregation) so the
-/// two selectors project justification/finalization identically. The
-/// aggregator's projection is optimistic (a produced proof is not a processed
-/// block), but that only affects the ordering of prover work within the
-/// deadline, never the correctness of any produced proof.
+/// `aggregation::select_best_job` (the aggregation worker) so the two
+/// selectors project justification/finalization identically. The aggregator's
+/// projection is optimistic (a produced proof is not a processed block), but
+/// that only affects which job the worker picks next, never the correctness of
+/// any produced proof.
 pub(crate) struct ProjectedState {
     pub(crate) justified_slots: JustifiedSlots,
     pub(crate) finalized_slot: u64,

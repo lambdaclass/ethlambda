@@ -68,8 +68,10 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 | `lean_gossip_signatures` | Gauge | Number of gossip signatures in fork-choice store | On gossip signatures update | | | ✅ |
 | `lean_latest_new_aggregated_payloads` | Gauge | Number of new aggregated payload items | On `latest_new_aggregated_payloads` update | | | ✅ |
 | `lean_latest_known_aggregated_payloads` | Gauge | Number of known aggregated payload items | On `latest_known_aggregated_payloads` update | | | ✅ |
-| `lean_committee_signatures_aggregation_time_seconds` | Histogram | Time taken to aggregate committee signatures | On committee signatures aggregation | | 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
+| `lean_committee_signatures_aggregation_time_seconds` | Histogram | Wall time one committee-signature aggregate's proof took | On each aggregate the aggregation worker produces | | 0.05, 0.1, 0.25, 0.5, 0.75, 1, 2, 3, 4 | ✅ |
 | `lean_node_sync_status` | Gauge | Node sync status | On node sync status change | status=idle,syncing,synced | | ✅ |
+
+Three of these changed quantity when aggregation moved to the always-on worker, so thresholds and alerts carried over from before that change are comparing against something else now. `lean_committee_signatures_aggregation_time_seconds` used to time a whole interval-2 session, covering every group that session proved, and now times a single proof, so readings drop accordingly. `lean_aggregator_skipped_total{reason="other"}` counted jobs a cancelled session dropped unattempted, and now counts proofs the worker attempted and failed. `reason="not_synced"`, previously always zero, now fires once per vote-aggregation interval on an aggregator whose worker the sync gate is parking.
 
 ## State Transition Metrics
 
@@ -166,9 +168,9 @@ Blocks anchor to interval 0 of their own slot and attestations to interval 1 of 
 
 Only gossip-received blocks are sampled here: blocks fetched via req/resp during sync are excluded, since sync backfill delivers blocks long after they were due and would swamp these histograms with catch-up noise rather than gossip-health signal.
 
-The aggregate metrics do include an aggregator's own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not quite the same measurement: delivery of a locally produced aggregate is held until the interval-2 boundary, so it lands near zero unless proving overran the interval, whereas a received one adds propagation on top of whenever the producer managed to publish it.
+The aggregate metrics do include an aggregator's own freshly produced aggregates, which never come back over gossip; without them an aggregator would report an empty aggregate profile. The two populations are not the same measurement. A local aggregate is sampled when it is published, and since proving runs continuously off the interval grid, publication happens at one of two times: an aggregate finishing outside intervals 2 and 3 is held to the interval-2 boundary and lands in the lowest bucket by construction, while one finishing inside them goes out on arrival and carries its real offset from that boundary. Only the second kind says anything about when a proof finished. A received aggregate still adds propagation on top of whenever the producer managed to publish it.
 
-In practice the distribution is bimodal and dominated by production rather than propagation: a mode in the lowest bucket for aggregates that made their interval, plus a tail for those whose proving overran it. A late aggregate is late for every node at once, so that tail shows up on receivers too and is not evidence of a slow network. Read a rising tail as aggregation cost, and cross-check `lean_pq_sig_aggregated_signatures_building_time_seconds` and `lean_committee_signatures_aggregation_time_seconds` to confirm.
+On an aggregator the distribution therefore carries a structural component: a spike in the lowest bucket, one sample per buffered aggregate, on top of the genuine arrival profile of peers' aggregates and of our own on-arrival publications. Nothing separates them by label, so a slot that buffers several aggregates pulls the whole histogram down. A rising tail is still aggregation cost rather than a slow link, since a late aggregate is late for every node at once. For this node's own proving cost use `lean_pq_sig_aggregated_signatures_building_time_seconds` and `lean_committee_signatures_aggregation_time_seconds` instead.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
@@ -190,7 +192,7 @@ In practice the distribution is bimodal and dominated by production rather than 
 Observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section (the `section` label). The slot is the X-axis. These are sampled roughly once per slot, but emission is gated by the section's source data, so a gauge can retain its previous value:
 
 - `timely`, `late`, `block`, `combined` and the `diff_validators` directions are emitted on block import, and **only when the canonical head block carries that round's votes** (otherwise the round is skipped and prior values are kept).
-- `agg_start_new` is emitted at interval 2, right before fork-choice aggregation runs.
+- `agg_start_new` is emitted at interval 2, and only on a node holding the aggregator role, so the series stays a measurement of what our own aggregation covered by the boundary. On a non-aggregator the same reading would come from `new_payloads` filled by gossip, a different population.
 - `proposal_combined` is emitted only when this node proposes a block.
 
 | Name | Type | Usage | Sample collection event | Labels |

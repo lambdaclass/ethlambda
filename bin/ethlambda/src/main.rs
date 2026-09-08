@@ -35,7 +35,6 @@ use tokio_util::sync::CancellationToken;
 
 use cli::NodeOptions;
 use command::Command;
-
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
@@ -256,10 +255,10 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
 
     // Attestation subnets this node subscribes to, computed once and shared by
     // the P2P swarm (to open gossip subscriptions) and the blockchain actor
-    // (to size the early-aggregation threshold), so both agree on which subnets
-    // feed this node's gossip groups. Subscriptions are fixed at startup and
-    // are not re-evaluated when the aggregator role is toggled at runtime; see
-    // the hot-standby note on SwarmConfig.
+    // (to size the aggregation worker's vote-propagation gate), so both agree
+    // on which subnets feed this node's gossip groups. Subscriptions are fixed
+    // at startup and are not re-evaluated when the aggregator role is toggled
+    // at runtime; see the hot-standby note on SwarmConfig.
     let subscribed_subnets = attestation_subscription_subnets(
         &validator_ids,
         attestation_committee_count,
