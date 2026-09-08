@@ -245,10 +245,7 @@ fn checkpoint_is_ancestor(
 
 /// Validate incoming attestation before processing.
 ///
-/// Ensures the vote respects the basic laws of time and topology. The order is
-/// fixed by the spec's expected-failure fixtures, which pin which reason a vote
-/// failing several checks at once is rejected for, so these must not be
-/// reordered to make a cheaper check run first:
+/// Ensures the vote respects the basic laws of time and topology:
 ///     1. The blocks voted for must exist in our store.
 ///     2. A vote cannot span backwards in time (source > target).
 ///     3. The head must be at least as recent as source and target.
