@@ -594,17 +594,21 @@ pub fn finalize_aggregation_session(store: &Store) {
 /// responsible for, starting at its duty subnet.
 ///
 /// Used as a scoring lens rather than an admission filter: a proof reaching
-/// outside the window is still selectable, it just earns no credit for the
-/// part that falls outside (see [`select_proofs_greedily`]). That keeps a
-/// proof straddling the boundary usable for its in-window half.
+/// outside the window will earn no credit for the part that falls outside
+/// once [`select_proofs_greedily`] takes a window. That keeps a proof
+/// straddling the boundary usable for its in-window half.
 ///
 /// Windows belonging to different duty subnets overlap at the same width
 /// (`{0,1}` and `{1,2}` share subnet 1). That is deliberate: every aggregator
 /// stays busy, and `--skip-redundant-aggregation` is what trades the overlap
 /// away.
-// Not wired into any call site yet; later tasks build the duty-subnet
-// assignment and the scoring lens that consume these.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired up by the window-scored child selection task"
+    )
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SubnetWindow {
     start: u64,
@@ -612,18 +616,31 @@ pub(crate) struct SubnetWindow {
     committee_count: u64,
 }
 
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired up by the window-scored child selection task"
+    )
+)]
 impl SubnetWindow {
     /// Build a window of `width` subnets starting at `start`.
     ///
     /// A `committee_count` of 0 is not a real configuration (the CLI parser
     /// enforces `>= 1`), but is treated as "no subnet structure" so nothing
-    /// downstream has to guard against a division by zero.
+    /// downstream has to guard against a division by zero. `width` is clamped
+    /// to `committee_count` so the stored representation is canonical: two
+    /// windows covering the same subnets always compare equal.
     pub(crate) fn new(start: u64, width: u64, committee_count: u64) -> Self {
         let start = if committee_count == 0 {
             0
         } else {
             start % committee_count
+        };
+        let width = if committee_count == 0 {
+            width
+        } else {
+            width.min(committee_count)
         };
         Self {
             start,
@@ -634,10 +651,15 @@ impl SubnetWindow {
 
     /// Whether `subnet` falls inside the window, wrapping past the top.
     pub(crate) fn contains_subnet(&self, subnet: u64) -> bool {
-        if self.committee_count == 0 || self.width >= self.committee_count {
+        if self.committee_count == 0 {
             return true;
         }
-        let offset = (subnet + self.committee_count - self.start) % self.committee_count;
+        let subnet = subnet % self.committee_count;
+        let offset = if subnet >= self.start {
+            subnet - self.start
+        } else {
+            self.committee_count - self.start + subnet
+        };
         offset < self.width
     }
 
@@ -654,23 +676,21 @@ impl SubnetWindow {
 ///
 /// A proof's reach is how far up the reduction tree it has climbed: raw
 /// per-subnet aggregates have reach 1, a merge of two of them has reach 2.
-// Not wired into any call site yet; later tasks build the duty-subnet
-// assignment and the scoring lens that consume this.
-#[allow(dead_code)]
-pub(crate) fn reach(bits: &AggregationBits, committee_count: u64) -> u64 {
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired up by the window-scored child selection task"
+    )
+)]
+pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 {
     if committee_count == 0 {
         return 0;
     }
-    let mut seen = vec![false; committee_count as usize];
-    let mut count = 0;
-    for vid in validator_indices(bits) {
-        let subnet = (vid % committee_count) as usize;
-        if !seen[subnet] {
-            seen[subnet] = true;
-            count += 1;
-        }
-    }
-    count
+    validator_indices(bits)
+        .map(|vid| vid % committee_count)
+        .collect::<HashSet<_>>()
+        .len() as u64
 }
 
 /// The window width for a pool whose best proof has reach `max_reach`.
@@ -683,14 +703,18 @@ pub(crate) fn reach(bits: &AggregationBits, committee_count: u64) -> u64 {
 /// Deriving the width instead of choosing it is what makes the scheme work:
 /// windows nest, so "use the widest window that yields a viable job" would
 /// collapse to the full committee set for every aggregator on the first round.
-// Not wired into any call site yet; later tasks build the duty-subnet
-// assignment and the scoring lens that consume this.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired up by the window-scored child selection task"
+    )
+)]
 pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
     if committee_count == 0 || max_reach == 0 {
         return 1;
     }
-    (2 * max_reach).min(committee_count).max(1)
+    max_reach.saturating_mul(2).min(committee_count)
 }
 
 /// Maximum number of existing proofs reused as children in a single
@@ -921,17 +945,25 @@ mod tests {
     #[test]
     fn reach_counts_distinct_subnets() {
         // C = 4, so subnet(vid) = vid % 4.
-        assert_eq!(reach(&make_bits(&[0, 4, 8]), 4), 1, "all in subnet 0");
-        assert_eq!(reach(&make_bits(&[0, 1]), 4), 2);
-        assert_eq!(reach(&make_bits(&[0, 1, 2, 3]), 4), 4);
-        assert_eq!(reach(&make_bits(&[3, 4]), 4), 2, "wraps across the top");
+        assert_eq!(
+            subnet_reach(&make_bits(&[0, 4, 8]), 4),
+            1,
+            "all in subnet 0"
+        );
+        assert_eq!(subnet_reach(&make_bits(&[0, 1]), 4), 2);
+        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2, 3]), 4), 4);
+        assert_eq!(
+            subnet_reach(&make_bits(&[3, 4]), 4),
+            2,
+            "wraps across the top"
+        );
     }
 
     /// With a single committee every validator is in subnet 0, so every proof
     /// has reach 1.
     #[test]
     fn reach_is_one_for_a_single_committee() {
-        assert_eq!(reach(&make_bits(&[0, 1, 2, 3]), 1), 1);
+        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2, 3]), 1), 1);
     }
 
     /// Width is just wide enough to hold two proofs of the pool's current best
@@ -994,6 +1026,44 @@ mod tests {
         let w = SubnetWindow::new(0, 1, 1);
         for vid in 0..10 {
             assert!(w.contains_validator(vid));
+        }
+    }
+
+    /// A committee count of 0 cannot come from the CLI, but every primitive
+    /// still has to answer without dividing by zero. The agreed answers are
+    /// "no subnet structure": the window admits everything, nothing has any
+    /// reach, and the width sits at its floor.
+    #[test]
+    fn zero_committee_count_disables_the_subnet_scheme() {
+        let w = SubnetWindow::new(7, 3, 0);
+        assert!(w.contains_subnet(0));
+        assert!(w.contains_subnet(u64::MAX));
+        assert!(w.contains_validator(0));
+        assert!(w.contains_validator(u64::MAX));
+
+        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2]), 0), 0);
+        assert_eq!(window_width(0, 0), 1);
+        assert_eq!(window_width(5, 0), 1);
+    }
+
+    /// A start at or past the committee count is folded back into range, so
+    /// the duty subnet never has to be pre-reduced by the caller.
+    #[test]
+    fn subnet_window_folds_an_out_of_range_start() {
+        assert_eq!(SubnetWindow::new(6, 2, 4), SubnetWindow::new(2, 2, 4));
+        let w = SubnetWindow::new(6, 2, 4);
+        assert!(w.contains_subnet(2));
+        assert!(w.contains_subnet(3));
+        assert!(!w.contains_subnet(0));
+        assert!(!w.contains_subnet(1));
+    }
+
+    /// A zero-width window admits nothing.
+    #[test]
+    fn subnet_window_of_zero_width_contains_nothing() {
+        let w = SubnetWindow::new(1, 0, 4);
+        for subnet in 0..4 {
+            assert!(!w.contains_subnet(subnet));
         }
     }
 
