@@ -85,6 +85,19 @@ pub(crate) struct NodeOptions {
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Narrow recursive aggregation to the widest level this node's duty
+    /// subnet owns in the slot. Requires --is-aggregator.
+    ///
+    /// By default every aggregator merges proofs for a window of subnets
+    /// starting at its duty subnet, and windows belonging to neighbouring duty
+    /// subnets overlap, so some prover work is duplicated. With this flag an
+    /// aggregator only works at a width whose tiling it owns in the current
+    /// slot, and otherwise falls back to a narrower one. The owner rotates
+    /// with the slot, so no node is permanently the one sitting out, and the
+    /// narrowest width is owned by everyone, so per-subnet aggregation of raw
+    /// signatures is never skipped.
+    #[arg(long, default_value = "false", requires = "is_aggregator")]
+    pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

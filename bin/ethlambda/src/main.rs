@@ -25,7 +25,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -285,13 +285,11 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         attestation_committee_count,
         gate_duties: !options.disable_duty_sync_gate,
         subscribed_subnets: subscribed_subnets.clone(),
-        // TODO(cli): --aggregate-subnet-ids reaches the actor only as an
-        // unordered set, so its first entry cannot yet name the duty subnet;
-        // fall back to the lowest subscribed subnet. `min` because HashSet
-        // iteration order is not stable and the duty subnet must be. The
-        // redundancy-skipping rotation has no flag yet either, so it stays off.
-        aggregation_duty_subnet: subscribed_subnets.iter().copied().min().unwrap_or(0),
-        skip_redundant_aggregation: false,
+        aggregation_duty_subnet: resolve_aggregation_duty_subnet(
+            options.aggregate_subnet_ids.as_deref(),
+            &subscribed_subnets,
+        ),
+        skip_redundant_aggregation: options.skip_redundant_aggregation,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
@@ -825,12 +823,61 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
+/// The subnet this node is responsible for when scoring recursive aggregation.
+///
+/// Operators assign it explicitly so co-located aggregators land on different
+/// subnets and merge different proofs. Without an assignment, fall back to the
+/// lowest subnet this node already listens on: `min` rather than an arbitrary
+/// pick because `HashSet` iteration order is not stable and the duty subnet
+/// must be.
+fn resolve_aggregation_duty_subnet(
+    assigned_subnet_ids: Option<&[u64]>,
+    subscribed_subnets: &HashSet<u64>,
+) -> u64 {
+    assigned_subnet_ids
+        .and_then(|ids| ids.first().copied())
+        .or_else(|| subscribed_subnets.iter().copied().min())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
+
+    /// The duty subnet is the first explicitly assigned subnet, so an operator
+    /// can place co-located aggregators on different subnets deliberately.
+    #[test]
+    fn duty_subnet_prefers_the_first_assigned_id() {
+        let subscribed = HashSet::from([0u64, 1, 2, 3]);
+        assert_eq!(
+            resolve_aggregation_duty_subnet(Some(&[3, 1]), &subscribed),
+            3,
+            "the first assigned id wins, not the lowest"
+        );
+    }
+
+    /// With no assignment, the lowest subscribed subnet is used, which is
+    /// stable across restarts unlike an arbitrary pick from the set.
+    #[test]
+    fn duty_subnet_falls_back_to_the_lowest_subscribed() {
+        let subscribed = HashSet::from([5u64, 2]);
+        assert_eq!(resolve_aggregation_duty_subnet(None, &subscribed), 2);
+    }
+
+    /// A node with nothing assigned and nothing subscribed still needs an
+    /// answer; subnet 0 always exists.
+    #[test]
+    fn duty_subnet_defaults_to_zero_with_nothing_to_go_on() {
+        assert_eq!(resolve_aggregation_duty_subnet(None, &HashSet::new()), 0);
+        assert_eq!(
+            resolve_aggregation_duty_subnet(Some(&[]), &HashSet::from([4u64])),
+            4,
+            "an empty assignment list is no assignment at all"
+        );
+    }
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
