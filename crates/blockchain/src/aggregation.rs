@@ -25,7 +25,7 @@ use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_storage::Store;
 use ethlambda_types::{
     ShortRoot,
-    attestation::{AggregationBits, AttestationData, HashedAttestationData},
+    attestation::{AggregationBits, AttestationData, HashedAttestationData, validator_indices},
     block::{ByteList512KiB, SingleMessageAggregate},
     constants::{INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT},
     primitives::H256,
@@ -590,6 +590,109 @@ pub fn finalize_aggregation_session(store: &Store) {
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 }
 
+/// The contiguous cyclic run of subnets an aggregator is currently
+/// responsible for, starting at its duty subnet.
+///
+/// Used as a scoring lens rather than an admission filter: a proof reaching
+/// outside the window is still selectable, it just earns no credit for the
+/// part that falls outside (see [`select_proofs_greedily`]). That keeps a
+/// proof straddling the boundary usable for its in-window half.
+///
+/// Windows belonging to different duty subnets overlap at the same width
+/// (`{0,1}` and `{1,2}` share subnet 1). That is deliberate: every aggregator
+/// stays busy, and `--skip-redundant-aggregation` is what trades the overlap
+/// away.
+// Not wired into any call site yet; later tasks build the duty-subnet
+// assignment and the scoring lens that consume these.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SubnetWindow {
+    start: u64,
+    width: u64,
+    committee_count: u64,
+}
+
+#[allow(dead_code)]
+impl SubnetWindow {
+    /// Build a window of `width` subnets starting at `start`.
+    ///
+    /// A `committee_count` of 0 is not a real configuration (the CLI parser
+    /// enforces `>= 1`), but is treated as "no subnet structure" so nothing
+    /// downstream has to guard against a division by zero.
+    pub(crate) fn new(start: u64, width: u64, committee_count: u64) -> Self {
+        let start = if committee_count == 0 {
+            0
+        } else {
+            start % committee_count
+        };
+        Self {
+            start,
+            width,
+            committee_count,
+        }
+    }
+
+    /// Whether `subnet` falls inside the window, wrapping past the top.
+    pub(crate) fn contains_subnet(&self, subnet: u64) -> bool {
+        if self.committee_count == 0 || self.width >= self.committee_count {
+            return true;
+        }
+        let offset = (subnet + self.committee_count - self.start) % self.committee_count;
+        offset < self.width
+    }
+
+    /// Whether `vid`'s subnet falls inside the window.
+    pub(crate) fn contains_validator(&self, vid: u64) -> bool {
+        if self.committee_count == 0 {
+            return true;
+        }
+        self.contains_subnet(vid % self.committee_count)
+    }
+}
+
+/// The number of distinct subnets `bits` reaches into.
+///
+/// A proof's reach is how far up the reduction tree it has climbed: raw
+/// per-subnet aggregates have reach 1, a merge of two of them has reach 2.
+// Not wired into any call site yet; later tasks build the duty-subnet
+// assignment and the scoring lens that consume this.
+#[allow(dead_code)]
+pub(crate) fn reach(bits: &AggregationBits, committee_count: u64) -> u64 {
+    if committee_count == 0 {
+        return 0;
+    }
+    let mut seen = vec![false; committee_count as usize];
+    let mut count = 0;
+    for vid in validator_indices(bits) {
+        let subnet = (vid % committee_count) as usize;
+        if !seen[subnet] {
+            seen[subnet] = true;
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The window width for a pool whose best proof has reach `max_reach`.
+///
+/// Wide enough to hold two proofs at the current level, capped at the
+/// committee count, so the window only widens after the pool has actually
+/// climbed. An empty pool has nothing to merge, so it sits at the narrowest
+/// width and the aggregator falls back to its own raw signatures.
+///
+/// Deriving the width instead of choosing it is what makes the scheme work:
+/// windows nest, so "use the widest window that yields a viable job" would
+/// collapse to the full committee set for every aggregator on the first round.
+// Not wired into any call site yet; later tasks build the duty-subnet
+// assignment and the scoring lens that consume this.
+#[allow(dead_code)]
+pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
+    if committee_count == 0 || max_reach == 0 {
+        return 1;
+    }
+    (2 * max_reach).min(committee_count).max(1)
+}
+
 /// Maximum number of existing proofs reused as children in a single
 /// aggregation job. Recursive aggregation is costly, so we limit the
 /// number of children to avoid unbounded aggregation times.
@@ -809,6 +912,89 @@ mod tests {
                 index: i as u64,
             })
             .collect()
+    }
+
+    // ---- subnet windows ----
+
+    /// Reach counts distinct subnets, not validators: two validators in the
+    /// same subnet contribute one.
+    #[test]
+    fn reach_counts_distinct_subnets() {
+        // C = 4, so subnet(vid) = vid % 4.
+        assert_eq!(reach(&make_bits(&[0, 4, 8]), 4), 1, "all in subnet 0");
+        assert_eq!(reach(&make_bits(&[0, 1]), 4), 2);
+        assert_eq!(reach(&make_bits(&[0, 1, 2, 3]), 4), 4);
+        assert_eq!(reach(&make_bits(&[3, 4]), 4), 2, "wraps across the top");
+    }
+
+    /// With a single committee every validator is in subnet 0, so every proof
+    /// has reach 1.
+    #[test]
+    fn reach_is_one_for_a_single_committee() {
+        assert_eq!(reach(&make_bits(&[0, 1, 2, 3]), 1), 1);
+    }
+
+    /// Width is just wide enough to hold two proofs of the pool's current best
+    /// reach, capped at the committee count. An empty pool starts at 1.
+    #[test]
+    fn window_width_doubles_the_pools_best_reach() {
+        assert_eq!(window_width(0, 4), 1, "empty pool");
+        assert_eq!(window_width(1, 4), 2);
+        assert_eq!(window_width(2, 4), 4);
+        assert_eq!(window_width(4, 4), 4, "capped at the committee count");
+
+        // Non-power-of-two committee counts need no special handling.
+        assert_eq!(window_width(1, 6), 2);
+        assert_eq!(window_width(2, 6), 4);
+        assert_eq!(window_width(4, 6), 6);
+        assert_eq!(window_width(2, 7), 4);
+        assert_eq!(window_width(4, 7), 7);
+
+        // A single committee pins the width at 1, which is also the whole set.
+        assert_eq!(window_width(0, 1), 1);
+        assert_eq!(window_width(1, 1), 1);
+    }
+
+    /// The window is a contiguous cyclic run of subnets starting at the duty
+    /// subnet.
+    #[test]
+    fn subnet_window_wraps_around_the_committee_count() {
+        let w = SubnetWindow::new(3, 2, 4);
+        assert!(w.contains_subnet(3));
+        assert!(w.contains_subnet(0), "wraps past the top");
+        assert!(!w.contains_subnet(1));
+        assert!(!w.contains_subnet(2));
+    }
+
+    /// A window as wide as the committee count contains everything, whatever
+    /// its start.
+    #[test]
+    fn subnet_window_at_full_width_contains_every_subnet() {
+        let w = SubnetWindow::new(2, 4, 4);
+        for subnet in 0..4 {
+            assert!(w.contains_subnet(subnet));
+        }
+    }
+
+    /// Validators are mapped to subnets by `vid % C` before the membership
+    /// test.
+    #[test]
+    fn subnet_window_maps_validators_through_their_subnet() {
+        let w = SubnetWindow::new(0, 2, 4);
+        assert!(w.contains_validator(0), "subnet 0");
+        assert!(w.contains_validator(5), "subnet 1");
+        assert!(!w.contains_validator(6), "subnet 2");
+        assert!(w.contains_validator(4), "subnet 0 again");
+    }
+
+    /// With one committee the window is the whole validator set, so the lens
+    /// is vacuous.
+    #[test]
+    fn subnet_window_is_vacuous_for_a_single_committee() {
+        let w = SubnetWindow::new(0, 1, 1);
+        for vid in 0..10 {
+            assert!(w.contains_validator(vid));
+        }
     }
 
     /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
