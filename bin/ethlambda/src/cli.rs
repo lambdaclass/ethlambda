@@ -83,6 +83,13 @@ pub(crate) struct NodeOptions {
     pub(crate) attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    ///
+    /// The first ID is also this node's aggregation duty subnet: where its
+    /// aggregation window starts, and what --skip-redundant-aggregation
+    /// rotates ownership over. Order matters, so give co-located aggregators
+    /// different first IDs. Unset, the duty subnet falls back to the lowest
+    /// subscribed subnet, which is the same value on every node whose
+    /// validators span all subnets.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
     /// Narrow recursive aggregation to the widest level this node's duty
@@ -96,6 +103,12 @@ pub(crate) struct NodeOptions {
     /// with the slot, so no node is permanently the one sitting out, and the
     /// narrowest width is owned by everyone, so per-subnet aggregation of raw
     /// signatures is never skipped.
+    ///
+    /// Worth enabling when leanVM prover CPU is the bottleneck on co-located
+    /// aggregators. The cost is that the widest level in a given slot has a
+    /// single producer, so a node that is down or late forfeits that slot's
+    /// widest merge; the narrower levels still run and the next slot rotates
+    /// to a different owner.
     #[arg(long, default_value = "false", requires = "is_aggregator")]
     pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage

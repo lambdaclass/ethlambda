@@ -279,16 +279,23 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    let aggregation_duty_subnet = resolve_aggregation_duty_subnet(
+        options.aggregate_subnet_ids.as_deref(),
+        &subscribed_subnets,
+    );
+    info!(
+        aggregation_duty_subnet,
+        assigned = options.aggregate_subnet_ids.is_some(),
+        "Resolved aggregation duty subnet"
+    );
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
         attestation_committee_count,
         gate_duties: !options.disable_duty_sync_gate,
         subscribed_subnets: subscribed_subnets.clone(),
-        aggregation_duty_subnet: resolve_aggregation_duty_subnet(
-            options.aggregate_subnet_ids.as_deref(),
-            &subscribed_subnets,
-        ),
+        aggregation_duty_subnet,
         skip_redundant_aggregation: options.skip_redundant_aggregation,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
@@ -825,11 +832,11 @@ async fn fetch_initial_state(
 
 /// The subnet this node is responsible for when scoring recursive aggregation.
 ///
-/// Operators assign it explicitly so co-located aggregators land on different
-/// subnets and merge different proofs. Without an assignment, fall back to the
-/// lowest subnet this node already listens on: `min` rather than an arbitrary
-/// pick because `HashSet` iteration order is not stable and the duty subnet
-/// must be.
+/// Operators assign it explicitly via --aggregate-subnet-ids so co-located
+/// aggregators land on different subnets and merge different proofs. Without
+/// an assignment, fall back to the lowest subnet this node already listens
+/// on: `min` rather than an arbitrary pick because `HashSet` iteration order
+/// is not stable and the duty subnet must be.
 fn resolve_aggregation_duty_subnet(
     assigned_subnet_ids: Option<&[u64]>,
     subscribed_subnets: &HashSet<u64>,
@@ -872,10 +879,15 @@ mod tests {
     #[test]
     fn duty_subnet_defaults_to_zero_with_nothing_to_go_on() {
         assert_eq!(resolve_aggregation_duty_subnet(None, &HashSet::new()), 0);
+    }
+
+    /// An empty list is no assignment at all, so the subscription fallback
+    /// still applies rather than the last-resort zero.
+    #[test]
+    fn duty_subnet_treats_an_empty_assignment_as_no_assignment() {
         assert_eq!(
             resolve_aggregation_duty_subnet(Some(&[]), &HashSet::from([4u64])),
-            4,
-            "an empty assignment list is no assignment at all"
+            4
         );
     }
 
