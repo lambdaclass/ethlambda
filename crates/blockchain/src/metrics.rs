@@ -315,6 +315,15 @@ static LEAN_AGGREGATION_NARROWED_TOTAL: std::sync::LazyLock<IntCounter> =
         .unwrap()
     });
 
+static LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_window_fallback_total",
+            "Candidates whose windowed selection was not viable and fell back to the full committee set"
+        )
+        .unwrap()
+    });
+
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -857,6 +866,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_STARTS_TOTAL);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_NARROWED_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
@@ -1088,6 +1098,13 @@ pub fn observe_aggregation_window_width(width: u64) {
 /// rotation narrowed below what their pool alone would have allowed.
 pub fn inc_aggregation_narrowed() {
     LEAN_AGGREGATION_NARROWED_TOTAL.inc();
+}
+
+/// Increment the count of candidates whose windowed selection was not viable
+/// (a strided proof pool can leave a contiguous window holding a single
+/// proof) and so fell back to a full-committee-width window.
+pub fn inc_aggregation_window_fallback() {
+    LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL.inc();
 }
 
 /// Update a table byte size gauge.

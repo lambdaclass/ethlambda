@@ -308,13 +308,14 @@ pub fn snapshot_aggregation_inputs(
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
         let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
         record_window_metrics(&derived);
-        if let Some(job) = resolve_job(
+        if let Some(job) = resolve_job_with_window_fallback(
             hashed.clone(),
             validator_sigs,
             &new_proofs,
             &known_proofs,
             validators,
-            &derived.window,
+            &derived,
+            window_config.committee_count,
         ) {
             candidates.insert(data_root, job);
         }
@@ -333,13 +334,14 @@ pub fn snapshot_aggregation_inputs(
         let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
         record_window_metrics(&derived);
         let hashed = HashedAttestationData::new(att_data.clone());
-        if let Some(job) = resolve_job(
+        if let Some(job) = resolve_job_with_window_fallback(
             hashed,
             &[],
             &new_proofs,
             &known_proofs,
             validators,
-            &derived.window,
+            &derived,
+            window_config.committee_count,
         ) {
             candidates.insert(*data_root, job);
         }
@@ -579,6 +581,53 @@ fn resolve_job(
         raw_ids,
         keys_to_delete,
     })
+}
+
+/// A window can decline a merge the unwindowed pool would have allowed: the
+/// window is a contiguous run of subnets, but the pool need not be contiguous
+/// in subnet space, so a sparse aggregator placement can leave a window
+/// holding a single proof. Falling back to the full committee set means the
+/// window can only ever improve on the unwindowed selection, never lose
+/// coverage relative to it.
+///
+/// Skipped when `derived.narrowed`: there the empty result is
+/// `--skip-redundant-aggregation` deliberately sitting this candidate out at
+/// a level another duty subnet owns this slot (see [`effective_width`]), not
+/// a placement gap. Falling back there would have every unowned duty subnet
+/// redo the owner's exact merge, which is the redundant work the flag exists
+/// to avoid.
+///
+/// `resolve_job` is store-free, so trying it twice is cheap.
+fn resolve_job_with_window_fallback(
+    hashed: HashedAttestationData,
+    validator_sigs: &[(u64, ValidatorSignature)],
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+    validators: &[Validator],
+    derived: &CandidateWindow,
+    committee_count: u64,
+) -> Option<AggregationJob> {
+    let primary = resolve_job(
+        hashed.clone(),
+        validator_sigs,
+        new_proofs,
+        known_proofs,
+        validators,
+        &derived.window,
+    );
+    if primary.is_some() || derived.narrowed {
+        return primary;
+    }
+    metrics::inc_aggregation_window_fallback();
+    let full = SubnetWindow::new(0, committee_count.max(1), committee_count);
+    resolve_job(
+        hashed,
+        validator_sigs,
+        new_proofs,
+        known_proofs,
+        validators,
+        &full,
+    )
 }
 
 /// Resolve each child's participant pubkeys. Drops any child whose pubkeys
@@ -2276,6 +2325,54 @@ mod tests {
         assert!(
             snapshot_for(3).is_none(),
             "duty 3 narrows to 1: nothing to merge"
+        );
+    }
+
+    /// Regression: a strided aggregator placement (this project's devnets
+    /// place single-subnet aggregators this way) can leave a window holding
+    /// only one proof, where the pre-window (unwindowed) selection would have
+    /// merged two. Committee count 8, sixteen validators (two per subnet, so
+    /// a single-subnet aggregator's proof has reach 1), proofs on subnets 0,
+    /// 3, 5 and 7 only. Duty subnet 0 derives width 2 (max_reach 1), so its
+    /// window is {0,1}: only the subnet-0 proof scores, the other three lie
+    /// wholly outside and are skipped, leaving one child. That is not viable
+    /// on its own (`resolve_job`'s viability guard needs at least two
+    /// children when there are no raw sigs), so without the fallback this
+    /// candidate would be dropped entirely.
+    ///
+    /// The expected coverage is derived from the unwindowed (full-width)
+    /// greedy selection by hand, not asserted against the windowed run: with
+    /// every proof the same size (2 validators), `select_proofs_greedily`'s
+    /// `max_by_key` ties break toward the *last* candidate in pool order
+    /// (std's documented tie-breaking), so a full window picks subnet 7's
+    /// proof first, then subnet 5's, capping at `MAX_AGGREGATION_CHILDREN`
+    /// before subnets 0 or 3 are ever reached.
+    #[test]
+    fn window_fallback_recovers_a_merge_a_strided_placement_would_drop() {
+        const COMMITTEE_COUNT: u64 = 8;
+        const VALIDATOR_COUNT: usize = 16;
+
+        let pool = [
+            make_bits(&[0, 8]),
+            make_bits(&[3, 11]),
+            make_bits(&[5, 13]),
+            make_bits(&[7, 15]),
+        ];
+        let store = store_with_payload_only_proofs(VALIDATOR_COUNT, &pool);
+        let config = AggregationWindowConfig {
+            duty_subnet: 0,
+            committee_count: COMMITTEE_COUNT,
+            skip_redundant: false,
+        };
+
+        let snapshot = snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config).expect(
+            "the full-width fallback recovers a viable job the windowed selection alone drops",
+        );
+
+        assert_eq!(
+            snapshot.jobs[0].coverage(),
+            HashSet::from([5, 7, 13, 15]),
+            "coverage matches the unwindowed selection's last-two-by-pool-order tie-break"
         );
     }
 
