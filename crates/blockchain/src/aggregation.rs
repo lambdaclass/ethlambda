@@ -232,8 +232,8 @@ pub fn snapshot_aggregation_inputs(
     let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
 
     // Vacuous single-committee window: every aggregator scores the full pool
-    // until the per-candidate window derivation task (Task 4) replaces this
-    // with the aggregator's real duty window.
+    // until each candidate gets the aggregator's real duty window derived
+    // from the pool's subnet reach.
     let window = SubnetWindow::new(0, 1, 1);
 
     for (hashed, validator_sigs) in &gossip_groups {
@@ -604,9 +604,8 @@ pub fn finalize_aggregation_session(store: &Store) {
 /// responsible for, starting at its duty subnet.
 ///
 /// Used as a scoring lens rather than an admission filter: a proof reaching
-/// outside the window will earn no credit for the part that falls outside
-/// once [`select_proofs_greedily`] takes a window. That keeps a proof
-/// straddling the boundary usable for its in-window half.
+/// outside the window earns no credit for the part that falls outside. That
+/// keeps a proof straddling the boundary usable for its in-window half.
 ///
 /// Windows belonging to different duty subnets overlap at the same width
 /// (`{0,1}` and `{1,2}` share subnet 1). That is deliberate: every aggregator
@@ -731,9 +730,11 @@ const MAX_AGGREGATION_CHILDREN: usize = 2;
 /// The window scores, it does not filter. A proof reaching outside the window
 /// stays selectable and is judged on its in-window part alone; one lying
 /// wholly outside scores zero and is skipped. Either way, a selected proof
-/// contributes **all** of its participants to `covered`, in-window or not: the
-/// aggregate binds them, and `resolve_job` needs to see them to trim raw
-/// signatures that would otherwise be double-included.
+/// contributes **all** of its participants to `covered`, in-window or not.
+/// That keeps the marginal-coverage score honest across rounds: the aggregate
+/// binds every participant of a chosen child, so a later round must not be
+/// paid again for coverage an earlier one already secured, whichever side of
+/// the window it sits on.
 ///
 /// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
 fn select_proofs_greedily(
@@ -749,19 +750,21 @@ fn select_proofs_greedily(
         let mut remaining: Vec<&SingleMessageAggregate> = proof_set.iter().collect();
 
         while selected.len() < MAX_AGGREGATION_CHILDREN && !remaining.is_empty() {
-            let best_idx = remaining
+            // A zero-scoring best means nothing left in this set adds
+            // in-window coverage, so the set is exhausted.
+            let Some((best_idx, _)) = remaining
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, p)| in_window_new_coverage(p, &covered, window))
-                .map(|(i, _)| i)
-                .expect("remaining is non-empty");
-
-            if in_window_new_coverage(remaining[best_idx], &covered, window) == 0 {
+                .map(|(i, p)| (i, in_window_new_coverage(p, &covered, window)))
+                .max_by_key(|&(_, score)| score)
+                .filter(|&(_, score)| score > 0)
+            else {
                 break;
-            }
+            };
 
             // Record every newly covered participant, not just the in-window
-            // ones: the produced aggregate binds all of them.
+            // ones: the aggregate binds all of them, so a later round must not
+            // score them as new.
             let new_coverage: HashSet<u64> = remaining[best_idx]
                 .participant_indices()
                 .filter(|vid| !covered.contains(vid))
@@ -1156,6 +1159,11 @@ mod tests {
             select_proofs_greedily(&[wide, narrow], &[], HashSet::new(), &window);
 
         assert_eq!(
+            selected.len(),
+            2,
+            "the wide proof is still taken, second, for its one in-window validator"
+        );
+        assert_eq!(
             selected[0].participant_indices().collect::<HashSet<_>>(),
             HashSet::from([4, 5]),
             "two in-window validators beat one in-window plus two outside"
@@ -1176,6 +1184,28 @@ mod tests {
             select_proofs_greedily(&[proof], &[], HashSet::from([0]), &window);
 
         assert!(selected.is_empty());
+    }
+
+    /// Exhausting the new-proof set on in-window score does not end
+    /// selection: the known set is still consulted, and a known proof with
+    /// in-window coverage is taken.
+    #[test]
+    fn select_proofs_greedily_falls_through_to_known_proofs_within_the_window() {
+        // C = 4, window {0,1}. The only new proof sits in subnet 2, so it
+        // scores zero and the new set is exhausted immediately.
+        let new_outside = SingleMessageAggregate::empty(make_bits(&[2, 6]));
+        let known_inside = SingleMessageAggregate::empty(make_bits(&[0, 1]));
+        let window = SubnetWindow::new(0, 2, 4);
+
+        let (selected, covered) =
+            select_proofs_greedily(&[new_outside], &[known_inside], HashSet::new(), &window);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(
+            covered,
+            HashSet::from([0, 1]),
+            "only the known proof is taken"
+        );
     }
 
     /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
