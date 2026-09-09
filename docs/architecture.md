@@ -114,6 +114,33 @@ Aggregators go one step further and republish those aggregates on gossip. Each s
 fresh SNARK, so `reaggregate.rs` caps how many it does per block, and the actor skips the
 whole path while the node is catching up.
 
+### Subnet-windowed aggregation
+
+Two aggregators handed the same pool of existing proofs would otherwise pick the same two
+children every session, since the greedy selection in `aggregation.rs` is deterministic: all
+that duplicated leanVM proving buys nothing once one of them publishes. Each aggregator instead
+scores that pool through a window: a contiguous run of subnets starting at its duty subnet, the
+first value of `--aggregate-subnet-ids` (or the lowest subnet it subscribes to, if that flag is
+unset). A proof outside the window still counts if it partly overlaps, but earns credit only
+for its in-window share, so aggregators with different windows tend to land on different
+children without anyone being excluded from merging.
+
+The width is derived, not chosen: wide enough to hold two proofs at the pool's current best
+reach, capped at the committee count, so it only widens once a data root's proof has actually
+climbed. Deriving it this way keeps aggregators in step without coordinating: two aggregators
+looking at the same pool always agree on the width. A window can still decline a merge the
+unwindowed pool would have allowed, when the proof pool is sparse relative to the window's
+contiguous span (a strided aggregator placement is the common cause); selection then retries
+once with the full committee set, so the feature can only improve on the pre-window selection,
+never regress below it.
+
+`--skip-redundant-aggregation` trades some of that safety net away on purpose. With it set, an
+aggregator narrows to the widest level its duty subnet owns in the current slot, rotating with
+the slot so every duty subnet gets a turn, and sits out entirely once the level it derived is
+one it does not own. That is a deliberate cost, not a bug: the narrowest level is owned by
+everyone, so per-subnet raw-signature aggregation is never skipped, only the wider, more
+expensive merges rotate between aggregators.
+
 ### Sync gate
 
 `sync_status.rs` tracks how far the local head lags the slot clock. Past the threshold the
