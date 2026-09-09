@@ -222,6 +222,13 @@ struct CandidateWindow {
 /// owns: two aggregators holding the same pool derive the same width, and the
 /// reduction tree stays in step. Narrowing the reach to a window would make
 /// the width self-referential and desynchronize it across the network.
+///
+/// Only one session runs per slot (see [`snapshot_aggregation_inputs`]), and
+/// this candidate's own pool is still empty at that point: a produced
+/// aggregate is held until the interval-2 boundary before publication, so
+/// nothing from this slot has landed yet. A current-slot candidate therefore
+/// always derives the narrowest width; the pool only has something to reach
+/// into once a data root has stayed live past its own slot.
 fn window_for_candidate(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
@@ -285,6 +292,15 @@ fn record_window_metrics(derived: &CandidateWindow) {
 /// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
 /// the caller is about to build a block at interval 4 (see
 /// `BlockChainServer::start_aggregation_session`).
+///
+/// Exactly one session runs per slot, so in practice a data root gets about
+/// one windowed merge rather than a multi-round climb: the current slot's
+/// own candidate always derives the narrowest width and has no children (see
+/// [`window_for_candidate`]), so the window only ever scores a stale
+/// candidate carrying an earlier slot's data, and `max_jobs` caps that to at
+/// most one job per session. The widening the window buys therefore plays
+/// out across the slots a data root stays live for, by aggregators holding
+/// different windows on different slots, not within one slot.
 pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
@@ -826,11 +842,14 @@ pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 
 /// Wide enough to hold two proofs at the current level, capped at the
 /// committee count, so the window only widens after the pool has actually
 /// climbed. An empty pool has nothing to merge, so it sits at the narrowest
-/// width and the aggregator falls back to its own raw signatures.
+/// width and the aggregator falls back to its own raw signatures; the current
+/// slot's own candidate is the common case of this, since nothing has been
+/// published for it yet (see [`window_for_candidate`]).
 ///
 /// Deriving the width instead of choosing it is what makes the scheme work:
 /// windows nest, so "use the widest window that yields a viable job" would
-/// collapse to the full committee set for every aggregator on the first round.
+/// collapse to the full committee set for every aggregator the first time a
+/// data root is aggregated.
 pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
     if committee_count == 0 || max_reach == 0 {
         return 1;
@@ -2185,6 +2204,11 @@ mod tests {
     /// aggregator merges its own subnet with the next. Round 2's pool holds
     /// what round 1 published, all reach 2, so the width is 4 and every
     /// aggregator reaches the full validator set.
+    ///
+    /// The two rounds are constructed here as two separate stores, not
+    /// observed from one session: only one session runs per slot, so in
+    /// production these would be two successive slots' sessions for a data
+    /// root that stays live, not two rounds back to back within one session.
     #[test]
     fn four_aggregators_climb_from_per_subnet_proofs_to_full_coverage() {
         const COMMITTEE_COUNT: u64 = 4;
