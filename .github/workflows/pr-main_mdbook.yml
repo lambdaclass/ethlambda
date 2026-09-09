@@ -85,7 +85,6 @@ jobs:
             --exclude '127\.0\.0\.1'
             --exclude 'eprint\.iacr\.org'
             --exclude '^https?://(www\.)?x\.com'
-            --exclude '^https?://(www\.)?twitter\.com'
             docs/
           fail: true
 
