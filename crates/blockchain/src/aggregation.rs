@@ -208,21 +208,26 @@ pub struct AggregationWindowConfig {
 /// scoring candidates remain.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
-/// The window this aggregator uses for one candidate `AttestationData`, and
-/// the width its pool alone would have allowed.
+/// The window derived for one candidate, and whether the redundancy-skipping
+/// rotation narrowed it below what the candidate's pool alone allowed.
+struct CandidateWindow {
+    window: SubnetWindow,
+    narrowed: bool,
+}
+
+/// The window this aggregator uses for one candidate `AttestationData`.
 ///
-/// The width comes from the best reach across the candidate's whole proof
-/// pool, not the part inside any window, so every aggregator on the network
-/// derives the same width for the same data root and the reduction tree stays
-/// in step. The returned `base_width` is that pool-derived width before the
-/// redundancy-skipping rotation narrows it, so the caller can report how often
-/// the rotation bit.
+/// The width is taken over the candidate's whole pool rather than the part
+/// inside any window, so it does not depend on which subnets this aggregator
+/// owns: two aggregators holding the same pool derive the same width, and the
+/// reduction tree stays in step. Narrowing the reach to a window would make
+/// the width self-referential and desynchronize it across the network.
 fn window_for_candidate(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     current_slot: u64,
-    config: &AggregationWindowConfig,
-) -> (SubnetWindow, u64) {
+    config: AggregationWindowConfig,
+) -> CandidateWindow {
     let max_reach = new_proofs
         .iter()
         .chain(known_proofs.iter())
@@ -236,10 +241,19 @@ fn window_for_candidate(
         current_slot,
         config.skip_redundant,
     );
-    (
-        SubnetWindow::new(config.duty_subnet, width, config.committee_count),
-        base_width,
-    )
+    CandidateWindow {
+        window: SubnetWindow::new(config.duty_subnet, width, config.committee_count),
+        narrowed: width < base_width,
+    }
+}
+
+/// Report one candidate's derived window. Kept out of `window_for_candidate`
+/// so the derivation stays pure and unit-testable without a metrics registry.
+fn record_window_metrics(derived: &CandidateWindow) {
+    metrics::observe_aggregation_window_width(derived.window.width());
+    if derived.narrowed {
+        metrics::inc_aggregation_narrowed();
+    }
 }
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
@@ -285,23 +299,19 @@ pub fn snapshot_aggregation_inputs(
     let validators = &head_state.validators;
 
     let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
-    let mut widest_width_used = 0u64;
-    let mut any_narrowed = false;
 
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
-        let (window, base_width) =
-            window_for_candidate(&new_proofs, &known_proofs, current_slot, &window_config);
-        widest_width_used = widest_width_used.max(window.width());
-        any_narrowed = any_narrowed || window.width() < base_width;
+        let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
+        record_window_metrics(&derived);
         if let Some(job) = resolve_job(
             hashed.clone(),
             validator_sigs,
             &new_proofs,
             &known_proofs,
             validators,
-            &window,
+            &derived.window,
         ) {
             candidates.insert(data_root, job);
         }
@@ -317,23 +327,23 @@ pub fn snapshot_aggregation_inputs(
             continue;
         }
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
-        let (window, base_width) =
-            window_for_candidate(&new_proofs, &known_proofs, current_slot, &window_config);
-        widest_width_used = widest_width_used.max(window.width());
-        any_narrowed = any_narrowed || window.width() < base_width;
+        let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
+        record_window_metrics(&derived);
         let hashed = HashedAttestationData::new(att_data.clone());
-        if let Some(job) = resolve_job(hashed, &[], &new_proofs, &known_proofs, validators, &window)
-        {
+        if let Some(job) = resolve_job(
+            hashed,
+            &[],
+            &new_proofs,
+            &known_proofs,
+            validators,
+            &derived.window,
+        ) {
             candidates.insert(*data_root, job);
         }
     }
 
     if candidates.is_empty() {
         return None;
-    }
-    metrics::set_aggregation_window_width(widest_width_used);
-    if any_narrowed {
-        metrics::inc_aggregation_narrowed();
     }
     let groups_considered = candidates.len();
     let validator_count = validators.len();
@@ -744,10 +754,19 @@ pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 
     if committee_count == 0 {
         return 0;
     }
-    validator_indices(bits)
-        .map(|vid| vid % committee_count)
-        .collect::<HashSet<_>>()
-        .len() as u64
+    // Stop as soon as every subnet has been seen rather than scanning the rest
+    // of a wide proof's set bits: `committee_count` is CLI-supplied with no
+    // upper bound, so a `Vec<bool>` presence table sized by it is not safe,
+    // but the early exit alone turns a saturated pool from a full scan into a
+    // handful of insertions.
+    let mut seen: HashSet<u64> = HashSet::new();
+    for vid in validator_indices(bits) {
+        seen.insert(vid % committee_count);
+        if seen.len() as u64 == committee_count {
+            break;
+        }
+    }
+    seen.len() as u64
 }
 
 /// The window width for a pool whose best proof has reach `max_reach`.
@@ -1107,6 +1126,36 @@ mod tests {
         // A single committee pins the width at 1, which is also the whole set.
         assert_eq!(window_width(0, 1), 1);
         assert_eq!(window_width(1, 1), 1);
+    }
+
+    /// The derived width does not depend on which subnets an aggregator owns.
+    /// Two aggregators holding the same pool must agree on it, or the
+    /// reduction tree desynchronizes across the network.
+    #[test]
+    fn window_width_is_independent_of_the_duty_subnet() {
+        let pool = [
+            SingleMessageAggregate::empty(make_bits(&[0, 4])),
+            SingleMessageAggregate::empty(make_bits(&[1, 5])),
+        ];
+
+        let widths: Vec<u64> = (0..4)
+            .map(|duty_subnet| {
+                let config = AggregationWindowConfig {
+                    duty_subnet,
+                    committee_count: 4,
+                    skip_redundant: false,
+                };
+                window_for_candidate(&pool, &[], WINDOW_TEST_SLOT, config)
+                    .window
+                    .width()
+            })
+            .collect();
+
+        assert_eq!(
+            widths,
+            vec![2, 2, 2, 2],
+            "reach-1 pool gives width 2 for every duty subnet"
+        );
     }
 
     /// The window is a contiguous cyclic run of subnets starting at the duty
@@ -1963,7 +2012,9 @@ mod tests {
     ///
     /// Deliberately carries no gossip signatures: a payload-only candidate
     /// isolates child selection from the raw-signature path, which is what the
-    /// window changes.
+    /// window changes. Each proof carries empty proof bytes (`empty`), so the
+    /// resulting store can drive selection but never a real merge; a future
+    /// end-to-end test reusing this helper needs its own real proofs.
     fn store_with_payload_only_proofs(participant_sets: &[AggregationBits]) -> Store {
         let hashes: Vec<H256> = (0..WINDOW_TEST_SLOT)
             .map(|i| H256([(i + 1) as u8; 32]))

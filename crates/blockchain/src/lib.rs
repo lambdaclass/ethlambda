@@ -522,11 +522,12 @@ impl BlockChainServer {
             MAX_AGGREGATION_JOBS
         };
 
-        // duty_subnet and skip_redundant are placeholders until the CLI flags
-        // that set them (--aggregate-subnet-ids, --skip-redundant-aggregation)
-        // are wired through to the config.
+        // Until the ordered --aggregate-subnet-ids list reaches the actor, take
+        // the duty subnet from the subscription set computed at startup: this
+        // node's validators' subnets plus any aggregator-only ids. `min` because
+        // HashSet iteration order is not stable and the duty subnet must be.
         let window_config = aggregation::AggregationWindowConfig {
-            duty_subnet: 0,
+            duty_subnet: self.subscribed_subnets.iter().copied().min().unwrap_or(0),
             committee_count: self.attestation_committee_count,
             skip_redundant: false,
         };
