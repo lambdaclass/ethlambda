@@ -476,7 +476,7 @@ mod tests {
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         block::{BlockHeader, MultiMessageAggregate},
         checkpoint::Checkpoint,
-        state::{JustificationValidators, JustifiedSlots, StateConfig, Validator},
+        state::{JustificationValidators, JustifiedSlots, PUBLIC_KEY_SIZE, StateConfig, Validator},
     };
     use libssz_types::SszList;
 
@@ -526,8 +526,8 @@ mod tests {
             validators: SszList::try_from(
                 (0..NUM_VALIDATORS)
                     .map(|i| Validator {
-                        attestation_pubkey: [i as u8; 52],
-                        proposal_pubkey: [i as u8; 52],
+                        attestation_pubkey: [i as u8; PUBLIC_KEY_SIZE],
+                        proposal_pubkey: [i as u8; PUBLIC_KEY_SIZE],
                         index: i as u64,
                     })
                     .collect::<Vec<_>>(),

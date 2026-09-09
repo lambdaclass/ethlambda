@@ -2,10 +2,10 @@ use std::path::PathBuf;
 
 use vergen_git2::{Emitter, Git2Builder, RustcBuilder};
 
-/// Crate names whose resolved git revision is embedded in the binary, one per
-/// upstream crypto repository: `leansig` for leanSig, `lean-multisig` for
-/// leanVM (the direct dependency `ethlambda-crypto` builds against).
-const LEANSIG_PACKAGE: &str = "leansig";
+/// Crate name whose resolved git revision is embedded in the binary.
+/// leanVM owns the whole crypto stack (it internalized XMSS), and every crate
+/// ethlambda takes from it resolves to one revision, so this single pin
+/// identifies the crypto the binary was built against.
 const LEANVM_PACKAGE: &str = "lean-multisig";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -25,25 +25,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Embed the resolved leanSig and leanVM git revisions from the workspace
-/// Cargo.lock.
+/// Embed the resolved leanVM git revision from the workspace Cargo.lock.
 ///
-/// The crypto dependencies are pinned upstream (leansig to a moving branch,
-/// leanVM to a rev), so a `cargo update` or a rev bump changes the measured
-/// crypto with little or no ethlambda diff; benchmark reports embed these
-/// revisions to keep results interpretable across lock bumps.
+/// leanVM is pinned to a rev upstream, so a `cargo update` or a rev bump
+/// changes the measured crypto with little or no ethlambda diff; benchmark
+/// reports embed the revision to keep results interpretable across lock bumps.
 fn emit_crypto_revs() {
-    let revs = lockfile_git_revs();
-    for (package, env_var) in [
-        (LEANSIG_PACKAGE, "ETHLAMBDA_LEANSIG_REV"),
-        (LEANVM_PACKAGE, "ETHLAMBDA_LEANVM_REV"),
-    ] {
-        let rev = revs
-            .as_ref()
-            .and_then(|revs| revs.get(package).cloned())
-            .unwrap_or_else(|| "unknown".to_string());
-        println!("cargo:rustc-env={env_var}={rev}");
-    }
+    let rev = lockfile_git_revs()
+        .and_then(|revs| revs.get(LEANVM_PACKAGE).cloned())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("cargo:rustc-env=ETHLAMBDA_LEANVM_REV={rev}");
     if let Some(lockfile) = workspace_lockfile() {
         println!("cargo:rerun-if-changed={}", lockfile.display());
     }
@@ -77,7 +68,7 @@ fn lockfile_git_revs() -> Option<std::collections::HashMap<String, String>> {
                 source = Some(value.trim_matches('"').to_string());
             }
         }
-        // source = "git+https://github.com/leanEthereum/leanSig?branch=devnet4#<rev>"
+        // source = "git+https://github.com/leanEthereum/leanVM.git?rev=<rev>#<rev>"
         let (Some(name), Some(source)) = (name, source) else {
             continue;
         };

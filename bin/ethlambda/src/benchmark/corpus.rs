@@ -9,7 +9,7 @@ use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData},
     block::SingleMessageAggregate,
     constants::DEFAULT_MILLISECONDS_PER_SLOT,
-    state::{State, Validator, ValidatorPubkeyBytes},
+    state::{PUBLIC_KEY_SIZE, State, Validator, ValidatorPubkeyBytes},
 };
 
 /// Fixed genesis time for synthetic runs. The harness derives every tick
@@ -124,7 +124,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 fn synthetic_pubkey(rng_state: &mut u64) -> ValidatorPubkeyBytes {
-    let mut bytes = [0u8; 52];
+    let mut bytes = [0u8; PUBLIC_KEY_SIZE];
     for chunk in bytes.chunks_mut(8) {
         let word = splitmix64(rng_state).to_le_bytes();
         chunk.copy_from_slice(&word[..chunk.len()]);
