@@ -231,6 +231,11 @@ pub fn snapshot_aggregation_inputs(
 
     let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
 
+    // Vacuous single-committee window: every aggregator scores the full pool
+    // until the per-candidate window derivation task (Task 4) replaces this
+    // with the aggregator's real duty window.
+    let window = SubnetWindow::new(0, 1, 1);
+
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
@@ -240,6 +245,7 @@ pub fn snapshot_aggregation_inputs(
             &new_proofs,
             &known_proofs,
             validators,
+            &window,
         ) {
             candidates.insert(data_root, job);
         }
@@ -256,7 +262,8 @@ pub fn snapshot_aggregation_inputs(
         }
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
         let hashed = HashedAttestationData::new(att_data.clone());
-        if let Some(job) = resolve_job(hashed, &[], &new_proofs, &known_proofs, validators) {
+        if let Some(job) = resolve_job(hashed, &[], &new_proofs, &known_proofs, validators, &window)
+        {
             candidates.insert(*data_root, job);
         }
     }
@@ -420,6 +427,8 @@ fn trace_skipped_candidate(reason: &'static str, att_data: &AttestationData, dat
 /// 2. Runs [`select_proofs_greedily`] seeded with that `covered` set so a
 ///    chosen child only adds coverage beyond the raw sigs; capped at
 ///    [`MAX_AGGREGATION_CHILDREN`].
+///    Selection is scored through `window`, so a child is valued by the
+///    in-window validators it adds; see [`select_proofs_greedily`].
 /// 3. Trims any raw sig whose validator id ended up in the chosen children's
 ///    participant union. This is not just an efficiency win: `aggregate_mixed`
 ///    must never receive a validator both as a raw participant and inside a
@@ -434,6 +443,7 @@ fn resolve_job(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
+    window: &SubnetWindow,
 ) -> Option<AggregationJob> {
     let data_root = hashed.root();
     let mut raw_by_id: HashMap<u64, (ValidatorPublicKey, ValidatorSignature)> = HashMap::new();
@@ -448,7 +458,7 @@ fn resolve_job(
     }
     let seed_covered: HashSet<u64> = raw_by_id.keys().copied().collect();
 
-    let (child_proofs, _) = select_proofs_greedily(new_proofs, known_proofs, seed_covered);
+    let (child_proofs, _) = select_proofs_greedily(new_proofs, known_proofs, seed_covered, window);
     let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
     let child_id_set: HashSet<u64> = accepted_child_ids.iter().copied().collect();
 
@@ -602,13 +612,6 @@ pub fn finalize_aggregation_session(store: &Store) {
 /// (`{0,1}` and `{1,2}` share subnet 1). That is deliberate: every aggregator
 /// stays busy, and `--skip-redundant-aggregation` is what trades the overlap
 /// away.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired up by the window-scored child selection task"
-    )
-)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SubnetWindow {
     start: u64,
@@ -616,13 +619,6 @@ pub(crate) struct SubnetWindow {
     committee_count: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired up by the window-scored child selection task"
-    )
-)]
 impl SubnetWindow {
     /// Build a window of `width` subnets starting at `start`.
     ///
@@ -680,7 +676,7 @@ impl SubnetWindow {
     not(test),
     expect(
         dead_code,
-        reason = "wired up by the window-scored child selection task"
+        reason = "wired up by the per-candidate window derivation task"
     )
 )]
 pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 {
@@ -707,7 +703,7 @@ pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 
     not(test),
     expect(
         dead_code,
-        reason = "wired up by the window-scored child selection task"
+        reason = "wired up by the per-candidate window derivation task"
     )
 )]
 pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
@@ -722,20 +718,29 @@ pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
 /// number of children to avoid unbounded aggregation times.
 const MAX_AGGREGATION_CHILDREN: usize = 2;
 
-/// Greedy set-cover selection of proofs to maximize validator coverage.
+/// Greedy set-cover selection of proofs, scored through the aggregator's
+/// subnet window.
 ///
 /// Processes proof sets in priority order (new before known). Within each set,
-/// repeatedly picks the proof covering the most uncovered validators until no
-/// proof adds new coverage. `seed_covered` primes the coverage set before
-/// selection starts — [`resolve_job`] seeds it with raw-signature validator
-/// ids so a chosen proof is only picked for coverage beyond what raw sigs
-/// already provide.
+/// repeatedly picks the proof adding the most *in-window* new coverage until
+/// no proof adds any. `seed_covered` primes the coverage set before selection
+/// starts: [`resolve_job`] seeds it with raw-signature validator ids so a
+/// chosen proof is only picked for coverage beyond what raw sigs already
+/// provide.
+///
+/// The window scores, it does not filter. A proof reaching outside the window
+/// stays selectable and is judged on its in-window part alone; one lying
+/// wholly outside scores zero and is skipped. Either way, a selected proof
+/// contributes **all** of its participants to `covered`, in-window or not: the
+/// aggregate binds them, and `resolve_job` needs to see them to trim raw
+/// signatures that would otherwise be double-included.
 ///
 /// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
 fn select_proofs_greedily(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     seed_covered: HashSet<u64>,
+    window: &SubnetWindow,
 ) -> (Vec<SingleMessageAggregate>, HashSet<u64>) {
     let mut selected: Vec<SingleMessageAggregate> = Vec::new();
     let mut covered: HashSet<u64> = seed_covered;
@@ -747,22 +752,20 @@ fn select_proofs_greedily(
             let best_idx = remaining
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, p)| {
-                    p.participant_indices()
-                        .filter(|vid| !covered.contains(vid))
-                        .count()
-                })
+                .max_by_key(|(_, p)| in_window_new_coverage(p, &covered, window))
                 .map(|(i, _)| i)
                 .expect("remaining is non-empty");
 
+            if in_window_new_coverage(remaining[best_idx], &covered, window) == 0 {
+                break;
+            }
+
+            // Record every newly covered participant, not just the in-window
+            // ones: the produced aggregate binds all of them.
             let new_coverage: HashSet<u64> = remaining[best_idx]
                 .participant_indices()
                 .filter(|vid| !covered.contains(vid))
                 .collect();
-
-            if new_coverage.is_empty() {
-                break;
-            }
 
             selected.push(remaining.swap_remove(best_idx).clone());
             covered.extend(new_coverage);
@@ -774,6 +777,19 @@ fn select_proofs_greedily(
     }
 
     (selected, covered)
+}
+
+/// How many validators `proof` would newly cover whose subnet is inside
+/// `window`. The greedy selection score.
+fn in_window_new_coverage(
+    proof: &SingleMessageAggregate,
+    covered: &HashSet<u64>,
+    window: &SubnetWindow,
+) -> usize {
+    proof
+        .participant_indices()
+        .filter(|vid| !covered.contains(vid) && window.contains_validator(*vid))
+        .count()
 }
 
 /// Build an AggregationBits bitfield from a list of validator indices.
@@ -1067,6 +1083,101 @@ mod tests {
         }
     }
 
+    // ---- window-scored child selection ----
+
+    /// A window covering every subnet reproduces the pre-window selection:
+    /// greedy picks by total new coverage.
+    #[test]
+    fn select_proofs_greedily_full_window_picks_by_total_coverage() {
+        let small = SingleMessageAggregate::empty(make_bits(&[0]));
+        let large = SingleMessageAggregate::empty(make_bits(&[1, 2, 3]));
+        let window = SubnetWindow::new(0, 4, 4);
+
+        let (selected, covered) =
+            select_proofs_greedily(&[small, large], &[], HashSet::new(), &window);
+
+        assert_eq!(selected.len(), 2);
+        assert_eq!(
+            selected[0].participant_indices().collect::<HashSet<_>>(),
+            HashSet::from([1, 2, 3]),
+            "the larger proof is picked first"
+        );
+        assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+    }
+
+    /// A proof whose participants all sit outside the window scores zero and
+    /// is never selected, even when it is the only thing on offer.
+    #[test]
+    fn select_proofs_greedily_skips_proofs_wholly_outside_the_window() {
+        // C = 4, window {0,1}. Validators 2 and 6 are both in subnet 2.
+        let outside = SingleMessageAggregate::empty(make_bits(&[2, 6]));
+        let window = SubnetWindow::new(0, 2, 4);
+
+        let (selected, covered) = select_proofs_greedily(&[outside], &[], HashSet::new(), &window);
+
+        assert!(selected.is_empty(), "nothing in the window to gain");
+        assert!(covered.is_empty());
+    }
+
+    /// A proof straddling the window boundary is selected for its in-window
+    /// contribution, and its out-of-window participants still land in
+    /// `covered`: the produced aggregate genuinely binds them, so a later raw
+    /// signature for one of them must be trimmed.
+    #[test]
+    fn select_proofs_greedily_covers_out_of_window_participants_of_a_chosen_proof() {
+        // C = 4, window {0,1}. Validator 1 is in subnet 1 (inside),
+        // validator 2 is in subnet 2 (outside).
+        let straddling = SingleMessageAggregate::empty(make_bits(&[1, 2]));
+        let window = SubnetWindow::new(0, 2, 4);
+
+        let (selected, covered) =
+            select_proofs_greedily(&[straddling], &[], HashSet::new(), &window);
+
+        assert_eq!(selected.len(), 1, "picked for its in-window half");
+        assert_eq!(
+            covered,
+            HashSet::from([1, 2]),
+            "the out-of-window participant is covered too"
+        );
+    }
+
+    /// In-window coverage beats total coverage: a proof with fewer validators
+    /// overall wins when more of them fall inside the window.
+    #[test]
+    fn select_proofs_greedily_prefers_in_window_coverage_over_total() {
+        // C = 4, window {0,1}.
+        // `wide` covers 3 validators but only validator 0 is in the window.
+        // `narrow` covers 2 validators, both in the window.
+        let wide = SingleMessageAggregate::empty(make_bits(&[0, 2, 6]));
+        let narrow = SingleMessageAggregate::empty(make_bits(&[4, 5]));
+        let window = SubnetWindow::new(0, 2, 4);
+
+        let (selected, _covered) =
+            select_proofs_greedily(&[wide, narrow], &[], HashSet::new(), &window);
+
+        assert_eq!(
+            selected[0].participant_indices().collect::<HashSet<_>>(),
+            HashSet::from([4, 5]),
+            "two in-window validators beat one in-window plus two outside"
+        );
+    }
+
+    /// The seed set still suppresses proofs that add nothing new, and it does
+    /// so through the window: a proof whose only in-window validators are
+    /// already covered scores zero.
+    #[test]
+    fn select_proofs_greedily_respects_the_seed_within_the_window() {
+        // C = 4, window {0,1}. Validator 0 (subnet 0) is already covered by a
+        // raw signature; validator 2 (subnet 2) is outside the window.
+        let proof = SingleMessageAggregate::empty(make_bits(&[0, 2]));
+        let window = SubnetWindow::new(0, 2, 4);
+
+        let (selected, _covered) =
+            select_proofs_greedily(&[proof], &[], HashSet::from([0]), &window);
+
+        assert!(selected.is_empty());
+    }
+
     /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
     /// only need `ValidatorSignature::from_bytes` to succeed. `resolve_job`
     /// never checks signature validity, only that it clones and carries a
@@ -1163,6 +1274,7 @@ mod tests {
             &[proof_c],
             &[],
             &validators,
+            &SubnetWindow::new(0, 1, 1),
         )
         .expect("raw {0,1} plus a filling child for {2} should be viable");
 
@@ -1194,6 +1306,7 @@ mod tests {
             &[proof_cde],
             &[],
             &validators,
+            &SubnetWindow::new(0, 1, 1),
         )
         .expect("raw {0,1,2} plus a child for {2,3,4} should be viable");
 
@@ -1215,7 +1328,14 @@ mod tests {
     fn resolve_job_rejects_lone_raw_signature_with_no_children() {
         let validators = make_validators(5);
         let validator_sigs = vec![(0u64, dummy_sig())];
-        let resolved = resolve_job(dummy_hashed(), &validator_sigs, &[], &[], &validators);
+        let resolved = resolve_job(
+            dummy_hashed(),
+            &validator_sigs,
+            &[],
+            &[],
+            &validators,
+            &SubnetWindow::new(0, 1, 1),
+        );
         assert!(resolved.is_none());
     }
 
@@ -1227,8 +1347,15 @@ mod tests {
         let proof_a = SingleMessageAggregate::empty(make_bits(&[0]));
         let proof_b = SingleMessageAggregate::empty(make_bits(&[1]));
 
-        let resolved = resolve_job(dummy_hashed(), &[], &[proof_a, proof_b], &[], &validators)
-            .expect("two children with no raw sigs should be viable");
+        let resolved = resolve_job(
+            dummy_hashed(),
+            &[],
+            &[proof_a, proof_b],
+            &[],
+            &validators,
+            &SubnetWindow::new(0, 1, 1),
+        )
+        .expect("two children with no raw sigs should be viable");
 
         assert!(resolved.raw_ids.is_empty());
         assert_eq!(resolved.children.len(), 2);
