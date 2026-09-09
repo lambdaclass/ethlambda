@@ -712,6 +712,45 @@ pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
     max_reach.saturating_mul(2).min(committee_count)
 }
 
+/// Narrow `width` to the widest level this duty subnet owns in `slot`, when
+/// `--skip-redundant-aggregation` is on.
+///
+/// At width `w` the non-overlapping tiling of the committee set starts at
+/// multiples of `w`, rotated by the slot, so the owner test is
+/// `duty_subnet % w == slot % w`. An aggregator that does not own the derived
+/// width halves down until it owns one. Width 1 is owned by everyone, so the
+/// raw-signature path is never skipped and only the recursive levels rotate.
+///
+/// When `w` does not divide the committee count the tiling is ragged at the
+/// wrap, so a slot can leave a subnet uncovered at the widest level. That
+/// costs a round of climbing, not correctness: the level below still covers
+/// it.
+///
+/// Assumes `width >= 1`: the loop only ever halves, so it can't produce a
+/// zero on its own, and `window_width` (the only caller) never hands it one.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "wired up by the per-candidate window derivation task"
+    )
+)]
+pub(crate) fn effective_width(
+    width: u64,
+    duty_subnet: u64,
+    slot: u64,
+    skip_redundant: bool,
+) -> u64 {
+    if !skip_redundant {
+        return width;
+    }
+    let mut w = width;
+    while w > 1 && duty_subnet % w != slot % w {
+        w /= 2;
+    }
+    w
+}
+
 /// Maximum number of existing proofs reused as children in a single
 /// aggregation job. Recursive aggregation is costly, so we limit the
 /// number of children to avoid unbounded aggregation times.
@@ -1206,6 +1245,58 @@ mod tests {
             HashSet::from([0, 1]),
             "only the known proof is taken"
         );
+    }
+
+    // ---- effective width and the dedup phase ----
+
+    /// Without the flag, the derived width is used as-is.
+    #[test]
+    fn effective_width_is_the_base_width_when_not_deduping() {
+        for duty_subnet in 0..4 {
+            for slot in 0..4 {
+                assert_eq!(effective_width(4, duty_subnet, slot, false), 4);
+            }
+        }
+    }
+
+    /// With the flag, an aggregator works at the derived width only when it
+    /// owns the phase for that width, and otherwise halves down until it does.
+    /// Width 1 is always owned, so raw-signature aggregation is never skipped.
+    #[test]
+    fn effective_width_rotates_which_aggregator_works_widest() {
+        let row = |slot: u64| {
+            (0..4)
+                .map(|duty_subnet| effective_width(4, duty_subnet, slot, true))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(row(0), vec![4, 1, 2, 1]);
+        assert_eq!(row(1), vec![1, 4, 1, 2]);
+        assert_eq!(row(2), vec![2, 1, 4, 1]);
+        assert_eq!(row(3), vec![1, 2, 1, 4]);
+    }
+
+    /// Every duty subnet gets the widest slot in turn: over C slots each one
+    /// reaches the full width exactly once.
+    #[test]
+    fn effective_width_gives_every_aggregator_a_turn() {
+        for duty_subnet in 0..4u64 {
+            let widest_slots: Vec<u64> = (0..4)
+                .filter(|&slot| effective_width(4, duty_subnet, slot, true) == 4)
+                .collect();
+            assert_eq!(widest_slots, vec![duty_subnet]);
+        }
+    }
+
+    /// A width of 1 is owned by every aggregator in every slot, so the flag
+    /// never idles the raw-signature path.
+    #[test]
+    fn effective_width_never_narrows_below_one() {
+        for duty_subnet in 0..4 {
+            for slot in 0..8 {
+                assert_eq!(effective_width(1, duty_subnet, slot, true), 1);
+            }
+        }
     }
 
     /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
