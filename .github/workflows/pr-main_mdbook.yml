@@ -78,12 +78,17 @@ jobs:
         with:
           # eprint.iacr.org returns 403 to non-browser User-Agents (anti-bot
           # protection on the IACR preprint server); the URLs themselves are
-          # valid in a real browser.
+          # valid in a real browser. x.com (and twitter.com, which redirects
+          # to it) does the same intermittently, so the project's social links
+          # failed unrelated PRs. Both are anchored to the URL origin so hosts
+          # merely ending in "x.com" are still checked.
           args: >-
             --no-progress
             --exclude 'localhost'
             --exclude '127\.0\.0\.1'
             --exclude 'eprint\.iacr\.org'
+            --exclude '^https?://(www\.)?x\.com'
+            --exclude '^https?://(www\.)?twitter\.com'
             docs/
           fail: true
 
