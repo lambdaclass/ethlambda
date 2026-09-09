@@ -228,6 +228,14 @@ fn window_for_candidate(
     current_slot: u64,
     config: AggregationWindowConfig,
 ) -> CandidateWindow {
+    // Reduce before the rotation, not just inside `SubnetWindow::new`: at a
+    // width that does not divide the committee count, an out-of-range duty
+    // subnet would otherwise rotate on different slots from its reduced twin.
+    let duty_subnet = if config.committee_count == 0 {
+        0
+    } else {
+        config.duty_subnet % config.committee_count
+    };
     let max_reach = new_proofs
         .iter()
         .chain(known_proofs.iter())
@@ -235,14 +243,9 @@ fn window_for_candidate(
         .max()
         .unwrap_or(0);
     let base_width = window_width(max_reach, config.committee_count);
-    let width = effective_width(
-        base_width,
-        config.duty_subnet,
-        current_slot,
-        config.skip_redundant,
-    );
+    let width = effective_width(base_width, duty_subnet, current_slot, config.skip_redundant);
     CandidateWindow {
-        window: SubnetWindow::new(config.duty_subnet, width, config.committee_count),
+        window: SubnetWindow::new(duty_subnet, width, config.committee_count),
         narrowed: width < base_width,
     }
 }
@@ -1155,6 +1158,28 @@ mod tests {
             widths,
             vec![2, 2, 2, 2],
             "reach-1 pool gives width 2 for every duty subnet"
+        );
+    }
+
+    /// A duty subnet at or above the committee count is reduced before it
+    /// reaches the rotation, so it behaves as its in-range twin. Nothing
+    /// validates the flag's upper bound, so this is reachable from the CLI.
+    #[test]
+    fn window_for_candidate_reduces_an_out_of_range_duty_subnet() {
+        let pool = [SingleMessageAggregate::empty(make_bits(&[0, 4]))];
+        let derived = |duty_subnet: u64| {
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: 4,
+                skip_redundant: true,
+            };
+            window_for_candidate(&pool, &[], WINDOW_TEST_SLOT, config).window
+        };
+
+        assert_eq!(
+            derived(6),
+            derived(2),
+            "6 reduces to 2 at committee count 4"
         );
     }
 

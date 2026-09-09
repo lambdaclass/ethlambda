@@ -285,10 +285,11 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         attestation_committee_count,
         gate_duties: !options.disable_duty_sync_gate,
         subscribed_subnets: subscribed_subnets.clone(),
-        // The ordered --aggregate-subnet-ids CLI flag that will let an operator
-        // pick the duty subnet explicitly is not wired up yet, so fall back to
-        // the lowest subnet this node subscribes to. `min` because HashSet
-        // iteration order is not stable and the duty subnet must be.
+        // TODO(cli): --aggregate-subnet-ids reaches the actor only as an
+        // unordered set, so its first entry cannot yet name the duty subnet;
+        // fall back to the lowest subscribed subnet. `min` because HashSet
+        // iteration order is not stable and the duty subnet must be. The
+        // redundancy-skipping rotation has no flag yet either, so it stays off.
         aggregation_duty_subnet: subscribed_subnets.iter().copied().min().unwrap_or(0),
         skip_redundant_aggregation: false,
         proposer_config: ProposerConfig {

@@ -285,7 +285,8 @@ pub struct BlockChainServer {
     aggregation_duty_subnet: u64,
 
     /// Whether to narrow the aggregation window to the widest level this duty
-    /// subnet owns in the slot.
+    /// subnet owns in the slot, trading window overlap for less duplicated
+    /// prover work. See [`aggregation::effective_width`] for the rotation.
     skip_redundant_aggregation: bool,
 
     /// Proposer-side block-building policy
