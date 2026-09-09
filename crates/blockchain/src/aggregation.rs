@@ -1161,25 +1161,35 @@ mod tests {
         );
     }
 
-    /// A duty subnet at or above the committee count is reduced before it
-    /// reaches the rotation, so it behaves as its in-range twin. Nothing
-    /// validates the flag's upper bound, so this is reachable from the CLI.
+    /// A duty subnet at or above the committee count is reduced *before* the
+    /// width rotation, not merely inside `SubnetWindow::new`. Nothing
+    /// validates the upper bound of `--aggregate-subnet-ids`, so this is
+    /// reachable from the CLI.
+    ///
+    /// Committee count 3 is load-bearing: the rotation halves on a width that
+    /// does not divide it, so an unreduced duty subnet 4 owns width 2 at slot
+    /// 0 while its reduced twin 1 narrows to 1. At a committee count the width
+    /// divides, both rotate identically and the bug hides.
     #[test]
     fn window_for_candidate_reduces_an_out_of_range_duty_subnet() {
-        let pool = [SingleMessageAggregate::empty(make_bits(&[0, 4]))];
+        let pool = [
+            SingleMessageAggregate::empty(make_bits(&[0])),
+            SingleMessageAggregate::empty(make_bits(&[1])),
+        ];
         let derived = |duty_subnet: u64| {
             let config = AggregationWindowConfig {
                 duty_subnet,
-                committee_count: 4,
+                committee_count: 3,
                 skip_redundant: true,
             };
-            window_for_candidate(&pool, &[], WINDOW_TEST_SLOT, config).window
+            window_for_candidate(&pool, &[], 0, config).window
         };
 
+        assert_eq!(derived(4).width(), derived(1).width());
         assert_eq!(
-            derived(6),
-            derived(2),
-            "6 reduces to 2 at committee count 4"
+            derived(4),
+            derived(1),
+            "4 reduces to 1 at committee count 3"
         );
     }
 
@@ -2040,15 +2050,18 @@ mod tests {
     /// window changes. Each proof carries empty proof bytes (`empty`), so the
     /// resulting store can drive selection but never a real merge; a future
     /// end-to-end test reusing this helper needs its own real proofs.
-    fn store_with_payload_only_proofs(participant_sets: &[AggregationBits]) -> Store {
+    ///
+    /// `validator_count` is a parameter rather than always `WINDOW_TEST_VALIDATORS`
+    /// so a wider-committee test (more subnets than the default four) can size
+    /// its own validator set.
+    fn store_with_payload_only_proofs(
+        validator_count: usize,
+        participant_sets: &[AggregationBits],
+    ) -> Store {
         let hashes: Vec<H256> = (0..WINDOW_TEST_SLOT)
             .map(|i| H256([(i + 1) as u8; 32]))
             .collect();
-        let mut store = new_test_store(make_head_state(
-            WINDOW_TEST_SLOT,
-            WINDOW_TEST_VALIDATORS,
-            &hashes,
-        ));
+        let mut store = new_test_store(make_head_state(WINDOW_TEST_SLOT, validator_count, &hashes));
         let head_root = store.head().expect("head read works");
 
         let head = Checkpoint {
@@ -2078,16 +2091,23 @@ mod tests {
     /// Two aggregators on different duty subnets, given the same pool of
     /// per-subnet proofs, select different children: the whole point of the
     /// window. Drives the real `snapshot_aggregation_inputs` path.
+    ///
+    /// A two-subnet smoke case; the full four-subnet climb (and its second
+    /// round) is pinned by `four_aggregators_climb_from_per_subnet_proofs_to_full_coverage`,
+    /// so keep both.
     #[test]
     fn snapshot_gives_different_duty_subnets_different_children() {
         // Four reach-1 proofs (one per subnet), so the derived width is 2 and
         // duty subnet s covers {s, s+1}.
-        let store = store_with_payload_only_proofs(&[
-            make_bits(&[0, 4]),
-            make_bits(&[1, 5]),
-            make_bits(&[2, 6]),
-            make_bits(&[3, 7]),
-        ]);
+        let store = store_with_payload_only_proofs(
+            WINDOW_TEST_VALIDATORS,
+            &[
+                make_bits(&[0, 4]),
+                make_bits(&[1, 5]),
+                make_bits(&[2, 6]),
+                make_bits(&[3, 7]),
+            ],
+        );
 
         let for_subnet = |duty_subnet: u64| {
             let config = AggregationWindowConfig {
@@ -2120,8 +2140,81 @@ mod tests {
     fn four_aggregators_climb_from_per_subnet_proofs_to_full_coverage() {
         const COMMITTEE_COUNT: u64 = 4;
 
-        let coverage_for = |pool: &[AggregationBits], duty_subnet: u64| -> HashSet<u64> {
-            let store = store_with_payload_only_proofs(pool);
+        let coverage_for = |store: &Store, duty_subnet: u64| -> HashSet<u64> {
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: COMMITTEE_COUNT,
+                skip_redundant: false,
+            };
+            snapshot_aggregation_inputs(store, WINDOW_TEST_SLOT, 1, config)
+                .expect("a payload-only merge is viable")
+                .jobs[0]
+                .coverage()
+        };
+
+        let round_1 = store_with_payload_only_proofs(
+            WINDOW_TEST_VALIDATORS,
+            &[
+                make_bits(&[0, 4]),
+                make_bits(&[1, 5]),
+                make_bits(&[2, 6]),
+                make_bits(&[3, 7]),
+            ],
+        );
+
+        assert_eq!(coverage_for(&round_1, 0), HashSet::from([0, 4, 1, 5]));
+        assert_eq!(coverage_for(&round_1, 1), HashSet::from([1, 5, 2, 6]));
+        assert_eq!(coverage_for(&round_1, 2), HashSet::from([2, 6, 3, 7]));
+        assert_eq!(coverage_for(&round_1, 3), HashSet::from([3, 7, 0, 4]));
+
+        // The pool now holds what round 1 published.
+        let round_2 = store_with_payload_only_proofs(
+            WINDOW_TEST_VALIDATORS,
+            &[
+                make_bits(&[0, 4, 1, 5]),
+                make_bits(&[1, 5, 2, 6]),
+                make_bits(&[2, 6, 3, 7]),
+                make_bits(&[3, 7, 0, 4]),
+            ],
+        );
+
+        let all_validators: HashSet<u64> = (0..WINDOW_TEST_VALIDATORS as u64).collect();
+        for duty_subnet in 0..COMMITTEE_COUNT {
+            assert_eq!(
+                coverage_for(&round_2, duty_subnet),
+                all_validators,
+                "duty subnet {duty_subnet} reaches every validator once the width is 4"
+            );
+        }
+    }
+
+    /// A genuine mid-climb widening: the window grows but stays a proper
+    /// subset of the committee set, wide enough to change which children get
+    /// picked. Unreachable at four committees (there the only states are
+    /// width 2 and width 4, i.e. full), so this uses eight committees and
+    /// sixteen validators: a reach-2 pool derives width 4, half the committee.
+    ///
+    /// Each proof merges a disjoint pair of adjacent subnets, so within any
+    /// width-4 window exactly two proofs score (the other two lie wholly
+    /// outside and are skipped), leaving no tie to break. Duty subnets four
+    /// apart get non-overlapping windows and therefore disjoint children.
+    #[test]
+    fn wider_window_at_eight_committees_selects_disjoint_halves() {
+        const COMMITTEE_COUNT: u64 = 8;
+        const VALIDATOR_COUNT: usize = 16;
+
+        // Reach-2 proofs, one per disjoint subnet pair: {0,1}, {2,3}, {4,5}, {6,7}.
+        let store = store_with_payload_only_proofs(
+            VALIDATOR_COUNT,
+            &[
+                make_bits(&[0, 8, 1, 9]),
+                make_bits(&[2, 10, 3, 11]),
+                make_bits(&[4, 12, 5, 13]),
+                make_bits(&[6, 14, 7, 15]),
+            ],
+        );
+
+        let coverage_for = |duty_subnet: u64| -> HashSet<u64> {
             let config = AggregationWindowConfig {
                 duty_subnet,
                 committee_count: COMMITTEE_COUNT,
@@ -2133,45 +2226,71 @@ mod tests {
                 .coverage()
         };
 
-        let round_1 = vec![
+        assert_eq!(
+            coverage_for(0),
+            HashSet::from([0, 8, 1, 9, 2, 10, 3, 11]),
+            "duty 0's width-4 window {{0,1,2,3}} covers the first two pairs"
+        );
+        assert_eq!(
+            coverage_for(4),
+            HashSet::from([4, 12, 5, 13, 6, 14, 7, 15]),
+            "duty 4's window {{4,5,6,7}} covers the other two pairs, disjoint from duty 0's"
+        );
+    }
+
+    /// With the redundancy-skipping rotation on, a duty subnet that does not
+    /// own the derived width narrows to 1, which leaves a single scoring proof
+    /// and therefore no viable job at all. Those aggregators fall back to
+    /// their own raw signatures in production; here the pool is payload-only,
+    /// so the session is simply empty for them.
+    #[test]
+    fn skip_redundant_leaves_unowned_duty_subnets_without_a_job() {
+        let pool = [
             make_bits(&[0, 4]),
             make_bits(&[1, 5]),
             make_bits(&[2, 6]),
             make_bits(&[3, 7]),
         ];
+        let snapshot_for = |duty_subnet: u64| {
+            let store = store_with_payload_only_proofs(WINDOW_TEST_VALIDATORS, &pool);
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: 4,
+                skip_redundant: true,
+            };
+            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+        };
 
-        assert_eq!(coverage_for(&round_1, 0), HashSet::from([0, 4, 1, 5]));
-        assert_eq!(coverage_for(&round_1, 1), HashSet::from([1, 5, 2, 6]));
-        assert_eq!(coverage_for(&round_1, 2), HashSet::from([2, 6, 3, 7]));
-        assert_eq!(coverage_for(&round_1, 3), HashSet::from([3, 7, 0, 4]));
-
-        // The pool now holds what round 1 published.
-        let round_2 = vec![
-            make_bits(&[0, 4, 1, 5]),
-            make_bits(&[1, 5, 2, 6]),
-            make_bits(&[2, 6, 3, 7]),
-            make_bits(&[3, 7, 0, 4]),
-        ];
-
-        let all_eight: HashSet<u64> = (0..8).collect();
-        for duty_subnet in 0..COMMITTEE_COUNT {
-            assert_eq!(
-                coverage_for(&round_2, duty_subnet),
-                all_eight,
-                "duty subnet {duty_subnet} reaches every validator once the width is 4"
-            );
-        }
+        assert!(
+            snapshot_for(0).is_some(),
+            "duty 0 owns width 2 at this slot"
+        );
+        assert!(
+            snapshot_for(2).is_some(),
+            "duty 2 owns width 2 at this slot"
+        );
+        assert!(
+            snapshot_for(1).is_none(),
+            "duty 1 narrows to 1: nothing to merge"
+        );
+        assert!(
+            snapshot_for(3).is_none(),
+            "duty 3 narrows to 1: nothing to merge"
+        );
     }
 
-    /// With a single committee the window is the whole validator set, so the
-    /// duty subnet makes no difference and selection is what it was before
-    /// windows existed.
+    /// Guards `vacuous_window_config`: at a committee count of 1 the window
+    /// covers everything whatever the duty subnet, so the pre-window tests
+    /// that use it keep testing what they used to. Uses an out-of-range duty
+    /// subnet to pin that the fold happens before any window arithmetic.
     #[test]
     fn a_single_committee_ignores_the_duty_subnet() {
-        let pool = vec![make_bits(&[0, 1]), make_bits(&[2, 3])];
+        let store = store_with_payload_only_proofs(
+            WINDOW_TEST_VALIDATORS,
+            &[make_bits(&[0, 1]), make_bits(&[2, 3])],
+        );
 
         let coverage_for = |duty_subnet: u64| -> HashSet<u64> {
-            let store = store_with_payload_only_proofs(&pool);
             let config = AggregationWindowConfig {
                 duty_subnet,
                 committee_count: 1,
@@ -2184,7 +2303,11 @@ mod tests {
         };
 
         assert_eq!(coverage_for(0), HashSet::from([0, 1, 2, 3]));
-        assert_eq!(coverage_for(3), HashSet::from([0, 1, 2, 3]));
+        assert_eq!(
+            coverage_for(3),
+            HashSet::from([0, 1, 2, 3]),
+            "duty subnet 3 is out of range at committee count 1 and folds to 0"
+        );
     }
 
     /// Number of competing candidates built by
