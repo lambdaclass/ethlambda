@@ -285,6 +285,12 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         attestation_committee_count,
         gate_duties: !options.disable_duty_sync_gate,
         subscribed_subnets: subscribed_subnets.clone(),
+        // The ordered --aggregate-subnet-ids CLI flag that will let an operator
+        // pick the duty subnet explicitly is not wired up yet, so fall back to
+        // the lowest subnet this node subscribes to. `min` because HashSet
+        // iteration order is not stable and the duty subnet must be.
+        aggregation_duty_subnet: subscribed_subnets.iter().copied().min().unwrap_or(0),
+        skip_redundant_aggregation: false,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,

@@ -65,6 +65,14 @@ pub struct BlockChainConfig {
     pub gate_duties: bool,
     /// Attestation subnets this node subscribes to.
     pub subscribed_subnets: HashSet<u64>,
+    /// The subnet this aggregator is responsible for when scoring recursive
+    /// aggregation. Aggregators on different duty subnets merge different
+    /// children, which is what stops them all producing the same proof.
+    pub aggregation_duty_subnet: u64,
+    /// Whether the aggregator narrows its subnet window to the widest level it
+    /// owns in the slot, trading window overlap for less duplicated prover
+    /// work.
+    pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -167,6 +175,8 @@ impl BlockChain {
             attestation_committee_count,
             gate_duties,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
         } = config;
 
@@ -195,6 +205,8 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -266,6 +278,15 @@ pub struct BlockChainServer {
     /// shared with the P2P swarm via [`ethlambda_p2p::attestation_subscription_subnets`].
     /// Used to scale the early-aggregation threshold.
     subscribed_subnets: HashSet<u64>,
+
+    /// The subnet this aggregator is responsible for. Scores which children
+    /// recursive aggregation merges, so aggregators on different duty subnets
+    /// build different proofs.
+    aggregation_duty_subnet: u64,
+
+    /// Whether to narrow the aggregation window to the widest level this duty
+    /// subnet owns in the slot.
+    skip_redundant_aggregation: bool,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -522,14 +543,10 @@ impl BlockChainServer {
             MAX_AGGREGATION_JOBS
         };
 
-        // Until the ordered --aggregate-subnet-ids list reaches the actor, take
-        // the duty subnet from the subscription set computed at startup: this
-        // node's validators' subnets plus any aggregator-only ids. `min` because
-        // HashSet iteration order is not stable and the duty subnet must be.
         let window_config = aggregation::AggregationWindowConfig {
-            duty_subnet: self.subscribed_subnets.iter().copied().min().unwrap_or(0),
+            duty_subnet: self.aggregation_duty_subnet,
             committee_count: self.attestation_committee_count,
-            skip_redundant: false,
+            skip_redundant: self.skip_redundant_aggregation,
         };
         let Some(snapshot) =
             aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs, window_config)
