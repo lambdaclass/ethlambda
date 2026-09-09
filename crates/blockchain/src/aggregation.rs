@@ -184,11 +184,63 @@ impl Message for EarlyAggregationCheck {
     type Result = ();
 }
 
+/// The aggregator's subnet-window duty, as read by
+/// [`snapshot_aggregation_inputs`].
+///
+/// Grouped rather than passed as three loose arguments, matching
+/// `BlockChainConfig` and `ProposerConfig`.
+#[derive(Clone, Copy, Debug)]
+pub struct AggregationWindowConfig {
+    /// The subnet this aggregator is responsible for: the first value of
+    /// `--aggregate-subnet-ids`.
+    pub duty_subnet: u64,
+    /// Number of attestation committees, i.e. the subnet count.
+    pub committee_count: u64,
+    /// Whether to narrow to the widest level this duty subnet owns in the
+    /// slot, trading coverage overlap for less duplicated prover work. See
+    /// [`effective_width`].
+    pub skip_redundant: bool,
+}
+
 /// Maximum number of aggregation jobs selected per interval-2 session. Caps
 /// leanVM prover work against [`aggregation_deadline`]: the greedy loop in
 /// [`snapshot_aggregation_inputs`] stops after this many rounds even if
 /// scoring candidates remain.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
+
+/// The window this aggregator uses for one candidate `AttestationData`, and
+/// the width its pool alone would have allowed.
+///
+/// The width comes from the best reach across the candidate's whole proof
+/// pool, not the part inside any window, so every aggregator on the network
+/// derives the same width for the same data root and the reduction tree stays
+/// in step. The returned `base_width` is that pool-derived width before the
+/// redundancy-skipping rotation narrows it, so the caller can report how often
+/// the rotation bit.
+fn window_for_candidate(
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+    current_slot: u64,
+    config: &AggregationWindowConfig,
+) -> (SubnetWindow, u64) {
+    let max_reach = new_proofs
+        .iter()
+        .chain(known_proofs.iter())
+        .map(|proof| subnet_reach(&proof.participants, config.committee_count))
+        .max()
+        .unwrap_or(0);
+    let base_width = window_width(max_reach, config.committee_count);
+    let width = effective_width(
+        base_width,
+        config.duty_subnet,
+        current_slot,
+        config.skip_redundant,
+    );
+    (
+        SubnetWindow::new(config.duty_subnet, width, config.committee_count),
+        base_width,
+    )
+}
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
 /// thread, touches the store, does no heavy cryptography. Returns `None` when
@@ -202,6 +254,8 @@ pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 ///    (`store.iter_gossip_signatures()`) and payload-only groups
 ///    (`store.new_payload_keys()` not already a gossip candidate, requiring
 ///    at least two existing proofs to merge).
+///    Each candidate's window is derived from the best reach in its own proof
+///    pool (see [`window_for_candidate`]) and scores child selection.
 /// 2. **Greedy loop**, at most `max_jobs` rounds: each round
 ///    scores every unselected candidate against the projected state and
 ///    keeps the lowest ordering key (current-slot before stale, then
@@ -218,6 +272,7 @@ pub fn snapshot_aggregation_inputs(
     store: &Store,
     current_slot: u64,
     max_jobs: usize,
+    window_config: AggregationWindowConfig,
 ) -> Option<AggregationSnapshot> {
     let gossip_groups = store.iter_gossip_signatures();
     let new_payload_keys = store.new_payload_keys();
@@ -230,15 +285,16 @@ pub fn snapshot_aggregation_inputs(
     let validators = &head_state.validators;
 
     let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
-
-    // Vacuous single-committee window: every aggregator scores the full pool
-    // until each candidate gets the aggregator's real duty window derived
-    // from the pool's subnet reach.
-    let window = SubnetWindow::new(0, 1, 1);
+    let mut widest_width_used = 0u64;
+    let mut any_narrowed = false;
 
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
+        let (window, base_width) =
+            window_for_candidate(&new_proofs, &known_proofs, current_slot, &window_config);
+        widest_width_used = widest_width_used.max(window.width());
+        any_narrowed = any_narrowed || window.width() < base_width;
         if let Some(job) = resolve_job(
             hashed.clone(),
             validator_sigs,
@@ -261,6 +317,10 @@ pub fn snapshot_aggregation_inputs(
             continue;
         }
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
+        let (window, base_width) =
+            window_for_candidate(&new_proofs, &known_proofs, current_slot, &window_config);
+        widest_width_used = widest_width_used.max(window.width());
+        any_narrowed = any_narrowed || window.width() < base_width;
         let hashed = HashedAttestationData::new(att_data.clone());
         if let Some(job) = resolve_job(hashed, &[], &new_proofs, &known_proofs, validators, &window)
         {
@@ -270,6 +330,10 @@ pub fn snapshot_aggregation_inputs(
 
     if candidates.is_empty() {
         return None;
+    }
+    metrics::set_aggregation_window_width(widest_width_used);
+    if any_narrowed {
+        metrics::inc_aggregation_narrowed();
     }
     let groups_considered = candidates.len();
     let validator_count = validators.len();
@@ -665,19 +729,17 @@ impl SubnetWindow {
         }
         self.contains_subnet(vid % self.committee_count)
     }
+
+    /// The window's width in subnets, for metrics reporting.
+    pub(crate) fn width(&self) -> u64 {
+        self.width
+    }
 }
 
 /// The number of distinct subnets `bits` reaches into.
 ///
 /// A proof's reach is how far up the reduction tree it has climbed: raw
 /// per-subnet aggregates have reach 1, a merge of two of them has reach 2.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired up by the per-candidate window derivation task"
-    )
-)]
 pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 {
     if committee_count == 0 {
         return 0;
@@ -698,13 +760,6 @@ pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 
 /// Deriving the width instead of choosing it is what makes the scheme work:
 /// windows nest, so "use the widest window that yields a viable job" would
 /// collapse to the full committee set for every aggregator on the first round.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired up by the per-candidate window derivation task"
-    )
-)]
 pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
     if committee_count == 0 || max_reach == 0 {
         return 1;
@@ -728,13 +783,6 @@ pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
 /// power of two, since `window_width` caps at the committee count, so the
 /// ladder truncates: 7 narrows to 3, then to 1. Each level is still an
 /// exclusive partition by residue, so ownership stays exclusive throughout.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "wired up by the per-candidate window derivation task"
-    )
-)]
 pub(crate) fn effective_width(
     width: u64,
     duty_subnet: u64,
@@ -998,6 +1046,18 @@ mod tests {
                 index: i as u64,
             })
             .collect()
+    }
+
+    /// A single-committee config, for tests that predate the subnet window
+    /// and want it to stay out of the way: with `committee_count` 1 every
+    /// validator shares one subnet, so the derived window always covers the
+    /// whole pool regardless of duty subnet.
+    fn vacuous_window_config() -> AggregationWindowConfig {
+        AggregationWindowConfig {
+            duty_subnet: 0,
+            committee_count: 1,
+            skip_redundant: false,
+        }
     }
 
     // ---- subnet windows ----
@@ -1738,7 +1798,10 @@ mod tests {
     fn snapshot_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
+        assert!(
+            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_none()
+        );
     }
 
     /// A single gossip signature with no other material to merge is dropped
@@ -1767,7 +1830,10 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS).is_none());
+        assert!(
+            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_none()
+        );
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -1810,7 +1876,8 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS).is_none(),
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -1866,14 +1933,103 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let snapshot = snapshot_aggregation_inputs(&store, HEAD_SLOT, MAX_AGGREGATION_JOBS)
-            .expect("a vote for the current head must produce a job (chain view covers the tip)");
+        let snapshot = snapshot_aggregation_inputs(
+            &store,
+            HEAD_SLOT,
+            MAX_AGGREGATION_JOBS,
+            vacuous_window_config(),
+        )
+        .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(
             snapshot.jobs[0].hashed.data().target.slot,
             HEAD_SLOT,
             "the job aggregates the vote targeting the current head"
         );
+    }
+
+    /// Head slot used by the subnet-window tests.
+    const WINDOW_TEST_SLOT: u64 = 4;
+
+    /// Validator count for the subnet-window tests: eight, so with four
+    /// committees each subnet holds exactly two (validator `v` in subnet
+    /// `v % 4`).
+    const WINDOW_TEST_VALIDATORS: usize = 8;
+
+    /// A store whose `new_payloads` buffer holds one proof per entry in
+    /// `participant_sets`, all bound to the same `AttestationData`, so
+    /// `snapshot_aggregation_inputs` sees a single candidate whose pool is
+    /// exactly those proofs.
+    ///
+    /// Deliberately carries no gossip signatures: a payload-only candidate
+    /// isolates child selection from the raw-signature path, which is what the
+    /// window changes.
+    fn store_with_payload_only_proofs(participant_sets: &[AggregationBits]) -> Store {
+        let hashes: Vec<H256> = (0..WINDOW_TEST_SLOT)
+            .map(|i| H256([(i + 1) as u8; 32]))
+            .collect();
+        let mut store = new_test_store(make_head_state(
+            WINDOW_TEST_SLOT,
+            WINDOW_TEST_VALIDATORS,
+            &hashes,
+        ));
+        let head_root = store.head().expect("head read works");
+
+        let head = Checkpoint {
+            root: head_root,
+            slot: WINDOW_TEST_SLOT,
+        };
+        let att_data = AttestationData {
+            slot: WINDOW_TEST_SLOT,
+            head,
+            target: head,
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let hashed = HashedAttestationData::new(att_data);
+
+        for bits in participant_sets {
+            store.insert_new_aggregated_payload(
+                hashed.clone(),
+                SingleMessageAggregate::empty(bits.clone()),
+            );
+        }
+        store
+    }
+
+    /// Two aggregators on different duty subnets, given the same pool of
+    /// per-subnet proofs, select different children: the whole point of the
+    /// window. Drives the real `snapshot_aggregation_inputs` path.
+    #[test]
+    fn snapshot_gives_different_duty_subnets_different_children() {
+        // Four reach-1 proofs (one per subnet), so the derived width is 2 and
+        // duty subnet s covers {s, s+1}.
+        let store = store_with_payload_only_proofs(&[
+            make_bits(&[0, 4]),
+            make_bits(&[1, 5]),
+            make_bits(&[2, 6]),
+            make_bits(&[3, 7]),
+        ]);
+
+        let for_subnet = |duty_subnet: u64| {
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: 4,
+                skip_redundant: false,
+            };
+            let snapshot = snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+                .expect("a payload-only merge is viable");
+            snapshot.jobs[0]
+                .accepted_child_ids
+                .iter()
+                .copied()
+                .collect::<HashSet<u64>>()
+        };
+
+        assert_eq!(for_subnet(0), HashSet::from([0, 4, 1, 5]));
+        assert_eq!(for_subnet(2), HashSet::from([2, 6, 3, 7]));
     }
 
     /// Number of competing candidates built by
@@ -1927,8 +2083,9 @@ mod tests {
     fn snapshot_caps_jobs_at_max_aggregation_jobs() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS)
-            .expect("should produce jobs");
+        let snapshot =
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .expect("should produce jobs");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
         assert_eq!(snapshot.jobs.len(), MAX_AGGREGATION_JOBS);
 
@@ -1953,7 +2110,8 @@ mod tests {
     fn snapshot_caps_jobs_at_one_for_proposer() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, 1).expect("should produce a job");
+        let snapshot = snapshot_aggregation_inputs(&store, 999, 1, vacuous_window_config())
+            .expect("should produce a job");
         assert_eq!(snapshot.groups_considered, NUM_GROUPS);
         assert_eq!(snapshot.jobs.len(), 1);
         assert_eq!(

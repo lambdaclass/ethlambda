@@ -522,7 +522,16 @@ impl BlockChainServer {
             MAX_AGGREGATION_JOBS
         };
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        // duty_subnet and skip_redundant are placeholders until the CLI flags
+        // that set them (--aggregate-subnet-ids, --skip-redundant-aggregation)
+        // are wired through to the config.
+        let window_config = aggregation::AggregationWindowConfig {
+            duty_subnet: 0,
+            committee_count: self.attestation_committee_count,
+            skip_redundant: false,
+        };
+        let Some(snapshot) =
+            aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs, window_config)
         else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;

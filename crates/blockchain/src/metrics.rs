@@ -1055,6 +1055,36 @@ pub fn inc_aggregator_skipped_other(count: u64) {
         .inc_by(count);
 }
 
+/// Set `lean_aggregation_window_width`: the widest subnet window the
+/// aggregator derived this session. Climbs as the proof pool climbs the
+/// reduction tree, so a value pinned at the committee count means the pool is
+/// already saturated and the window is doing nothing.
+pub fn set_aggregation_window_width(width: u64) {
+    static LEAN_AGGREGATION_WINDOW_WIDTH: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_aggregation_window_width",
+                "Width in subnets of the aggregator's current subnet window"
+            )
+            .unwrap()
+        });
+    LEAN_AGGREGATION_WINDOW_WIDTH.set(width.try_into().unwrap_or_default());
+}
+
+/// Increment `lean_aggregation_narrowed_total`: the redundancy-skipping check
+/// knocked this aggregator below the width its pool would have allowed.
+pub fn inc_aggregation_narrowed() {
+    static LEAN_AGGREGATION_NARROWED_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_aggregation_narrowed_total",
+                "Times the redundancy-skipping check narrowed the aggregation window"
+            )
+            .unwrap()
+        });
+    LEAN_AGGREGATION_NARROWED_TOTAL.inc();
+}
+
 /// Update a table byte size gauge.
 pub fn update_table_bytes(table_name: &str, bytes: u64) {
     LEAN_TABLE_BYTES
