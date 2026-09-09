@@ -101,12 +101,14 @@ The exposed metrics follow [the leanMetrics specification](https://github.com/le
 |--------|-------|-------|-------------------------|--------|-----------|
 |`lean_attestation_committee_count`| Gauge | Number of attestation committees | On node start | | ✅ |
 |`lean_attestation_committee_subnet`| Gauge | Node's attestation committee subnet | On node start | | ✅ |
-|`lean_aggregation_window_width`| Histogram | Width in subnets of the subnet window derived for one aggregation candidate; climbs from 1 as the shared proof pool climbs the reduction tree, and pinned at the committee count means the pool is already saturated so the window is doing nothing (buckets 1, 2, 4, 8, 16, 32, 64) | During aggregation, once per candidate `AttestationData` | | ✅ |
-|`lean_aggregation_narrowed_total`| Counter | Candidates whose window the redundancy-skipping rotation narrowed below what their proof pool alone allowed (only increments with `--skip-redundant-aggregation`) | During aggregation, once per candidate `AttestationData` that was narrowed | | ✅ |
+|`lean_aggregation_window_width`| Histogram | Width in subnets of the subnet window derived for one aggregation candidate | On each aggregation candidate | | ✅ |
+|`lean_aggregation_narrowed_total`| Counter | Candidates whose window the redundancy-skipping rotation narrowed below what their proof pool alone allowed | On each narrowed aggregation candidate | | ✅ |
 |`lean_connected_peers`| Gauge | Number of connected peers | On scrape | client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam | ✅(*) |
 |`lean_gossip_mesh_peers`| Gauge | Number of peers in the gossipsub mesh | On scrape | client=`<name>_<N>`,unknown (ex. zeam_0) | ✅(*) |
 |`lean_peer_connection_events_total`| Counter | Total number of peer connection events | On peer connection | direction=inbound,outbound<br>result=success,timeout,error | ✅ |
 |`lean_peer_disconnection_events_total`| Counter | Total number of peer disconnection events | On peer disconnection | direction=inbound,outbound<br>reason=timeout,remote_close,local_close,error | ✅ |
+
+> Both are emitted only by aggregators, once per candidate `AttestationData` per interval-2 session. `lean_aggregation_window_width` has buckets 1, 2, 4, 8, 16, 32, 64 and climbs from 1 as the shared proof pool climbs the reduction tree; it is capped at `lean_attestation_committee_count`, so samples pinned there mean the window no longer restricts selection. Compare against that gauge rather than reading the buckets alone: at a committee count that is not a power of two, two different widths can share a bucket. `lean_aggregation_narrowed_total` only increments with `--skip-redundant-aggregation`; read it against `lean_aggregation_window_width_count` for the share of candidates narrowed.
 
 ## Custom Metrics (non-leanMetrics)
 

@@ -1077,8 +1077,9 @@ pub fn inc_aggregator_skipped_other(count: u64) {
 }
 
 /// Observe one candidate's derived subnet window width. Climbs as the proof
-/// pool climbs the reduction tree, so a candidate pinned at the committee
-/// count means its pool is already saturated and the window is doing nothing.
+/// pool climbs the reduction tree, pinning at the committee count once the
+/// best proof reaches half the committees; a candidate pinned there means the
+/// window no longer restricts selection.
 pub fn observe_aggregation_window_width(width: u64) {
     LEAN_AGGREGATION_WINDOW_WIDTH.observe(width as f64);
 }
