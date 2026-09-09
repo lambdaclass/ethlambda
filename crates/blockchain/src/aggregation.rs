@@ -2108,6 +2108,85 @@ mod tests {
         assert_eq!(for_subnet(2), HashSet::from([2, 6, 3, 7]));
     }
 
+    /// The reduction tree the whole feature exists to produce. Four
+    /// aggregators on four duty subnets, one AttestationData, eight validators
+    /// (validator v in subnet v % 4).
+    ///
+    /// Round 1's pool holds reach-1 proofs, so the width is 2 and each
+    /// aggregator merges its own subnet with the next. Round 2's pool holds
+    /// what round 1 published, all reach 2, so the width is 4 and every
+    /// aggregator reaches the full validator set.
+    #[test]
+    fn four_aggregators_climb_from_per_subnet_proofs_to_full_coverage() {
+        const COMMITTEE_COUNT: u64 = 4;
+
+        let coverage_for = |pool: &[AggregationBits], duty_subnet: u64| -> HashSet<u64> {
+            let store = store_with_payload_only_proofs(pool);
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: COMMITTEE_COUNT,
+                skip_redundant: false,
+            };
+            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+                .expect("a payload-only merge is viable")
+                .jobs[0]
+                .coverage()
+        };
+
+        let round_1 = vec![
+            make_bits(&[0, 4]),
+            make_bits(&[1, 5]),
+            make_bits(&[2, 6]),
+            make_bits(&[3, 7]),
+        ];
+
+        assert_eq!(coverage_for(&round_1, 0), HashSet::from([0, 4, 1, 5]));
+        assert_eq!(coverage_for(&round_1, 1), HashSet::from([1, 5, 2, 6]));
+        assert_eq!(coverage_for(&round_1, 2), HashSet::from([2, 6, 3, 7]));
+        assert_eq!(coverage_for(&round_1, 3), HashSet::from([3, 7, 0, 4]));
+
+        // The pool now holds what round 1 published.
+        let round_2 = vec![
+            make_bits(&[0, 4, 1, 5]),
+            make_bits(&[1, 5, 2, 6]),
+            make_bits(&[2, 6, 3, 7]),
+            make_bits(&[3, 7, 0, 4]),
+        ];
+
+        let all_eight: HashSet<u64> = (0..8).collect();
+        for duty_subnet in 0..COMMITTEE_COUNT {
+            assert_eq!(
+                coverage_for(&round_2, duty_subnet),
+                all_eight,
+                "duty subnet {duty_subnet} reaches every validator once the width is 4"
+            );
+        }
+    }
+
+    /// With a single committee the window is the whole validator set, so the
+    /// duty subnet makes no difference and selection is what it was before
+    /// windows existed.
+    #[test]
+    fn a_single_committee_ignores_the_duty_subnet() {
+        let pool = vec![make_bits(&[0, 1]), make_bits(&[2, 3])];
+
+        let coverage_for = |duty_subnet: u64| -> HashSet<u64> {
+            let store = store_with_payload_only_proofs(&pool);
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: 1,
+                skip_redundant: false,
+            };
+            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+                .expect("a payload-only merge is viable")
+                .jobs[0]
+                .coverage()
+        };
+
+        assert_eq!(coverage_for(0), HashSet::from([0, 1, 2, 3]));
+        assert_eq!(coverage_for(3), HashSet::from([0, 1, 2, 3]));
+    }
+
     /// Number of competing candidates built by
     /// [`store_with_competing_build_tier_groups`]; more than either job cap so
     /// both cap tests actually bind.
