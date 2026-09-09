@@ -288,6 +288,16 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         assigned = options.aggregate_subnet_ids.is_some(),
         "Resolved aggregation duty subnet"
     );
+    if options.skip_redundant_aggregation && options.aggregate_subnet_ids.is_none() {
+        warn!(
+            aggregation_duty_subnet,
+            "--skip-redundant-aggregation is set but the duty subnet was derived, not assigned: \
+             every co-located aggregator whose validators span all subnets derives the same duty \
+             subnet, so they will narrow in lockstep in the same slot instead of taking turns, \
+             and the widest level gets no producer at all in most slots. Give each aggregator a \
+             distinct first --aggregate-subnet-ids value to fix this."
+        );
+    }
 
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
