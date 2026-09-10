@@ -1,15 +1,18 @@
 //! Offline block-building benchmark (`ethlambda benchmark`).
 //!
-//! Drives the exact production proposer path — `produce_block_with_signatures`,
-//! the same entry `BlockChainServer::propose_block` uses — against a synthetic
-//! in-memory chain, and reports per-phase timing distributions. Gossip publish
-//! and the slot-alignment sleep are outside the measured span, matching the
-//! node's own `lean_block_building_time_seconds` boundary.
+//! Drives the exact production proposer path — `produce_block_with_signatures`
+//! then `seal_block`, the same entries `BlockChainServer::propose_block` uses —
+//! against a synthetic in-memory chain, and reports per-phase timing
+//! distributions. Gossip publish and the slot-alignment sleep are outside the
+//! measured span, matching the node's own `lean_block_building_time_seconds`
+//! boundary. With `--mock-crypto` the seal is skipped (there are no keys to
+//! sign with) and only the build is measured.
 //!
 //! See docs/benchmarking.md for what is and is not measured, how to read a
 //! report, and the current limitations.
 
 mod corpus;
+mod keys;
 mod report;
 
 use std::collections::{BTreeMap, HashMap};
@@ -17,13 +20,12 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
-use ethlambda_blockchain::metrics::BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES;
-use ethlambda_blockchain::store::{on_block_without_verification, produce_block_with_signatures};
+use ethlambda_blockchain::store::produce_block_with_signatures;
 use ethlambda_storage::{NEW_PAYLOAD_CAP, Store};
-use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
 use ethlambda_types::primitives::HashTreeRoot as _;
 use eyre::WrapErr as _;
 
+use corpus::CryptoMode;
 use report::{Environment, Params, Report, Sample};
 
 #[derive(Debug, clap::Args)]
@@ -63,16 +65,17 @@ struct SyntheticOptions {
     /// same seed and parameters produce identical per-iteration block roots.
     #[arg(long, default_value = "42")]
     seed: u64,
+    /// Directory caching the seed-derived XMSS keys, so reruns skip key
+    /// generation (about a second per key). Entries are keyed by leanVM
+    /// revision, seed, validator index and run length. Real crypto only.
+    #[arg(long, conflicts_with = "mock_crypto")]
+    key_cache: Option<PathBuf>,
     #[command(flatten)]
     common: CommonOptions,
 }
 
 impl SyntheticOptions {
     fn validate(&self) -> eyre::Result<()> {
-        eyre::ensure!(
-            self.common.mock_crypto,
-            "real-crypto benchmarking is not implemented yet; rerun with --mock-crypto"
-        );
         // The pending pool evicts whole data-root entries FIFO once its proof
         // cap is exceeded, so a single slot's batch larger than the cap would
         // silently seed nothing and every measured block would be empty.
@@ -108,9 +111,10 @@ struct CommonOptions {
     #[arg(long, default_value = "10", value_parser = clap::value_parser!(u64).range(1..))]
     iterations: u64,
     /// Seed pools with empty placeholder proofs instead of real XMSS/leanVM
-    /// crypto. Measures selection + best-proof compaction + state transition
-    /// only; runs in seconds. Conflicts with --enable-proposer-aggregation,
-    /// whose recursive aggregation needs real proof bytes.
+    /// crypto, and skip the seal. Measures selection + best-proof compaction +
+    /// state transition only; runs in seconds. Conflicts with
+    /// --enable-proposer-aggregation, whose recursive aggregation needs real
+    /// proof bytes.
     #[arg(long, conflicts_with = "enable_proposer_aggregation")]
     mock_crypto: bool,
     /// Mirrors the node flag: collapse same-data proofs via recursive leanVM
@@ -148,18 +152,41 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
         enable_proposer_aggregation: common.enable_proposer_aggregation,
         max_attestations_per_block: common.max_attestations_per_block,
     };
-    let corpus = corpus::SyntheticCorpus::new(options.num_validators, options.proofs_per_data);
-    let mut store = corpus.genesis_store(options.seed);
-
     let total_slots = options
         .warmup_slots
         .checked_add(common.iterations)
         .ok_or_else(|| eyre::eyre!("--warmup-slots plus --iterations overflows u64"))?;
 
+    // Attestations are signed for slots 0..total_slots and blocks for
+    // 1..=total_slots, so the keys must be active for total_slots + 1 epochs.
+    let crypto = if common.mock_crypto {
+        CryptoMode::Mock
+    } else {
+        // Compile the aggregation bytecode before anything proves, exactly as
+        // the node does at startup. Without the arena, matching the node's
+        // default: the arena keeps the prover's buffers resident, which would
+        // make the benchmark measure a configuration the node only runs under
+        // --prover-arena.
+        ethlambda_crypto::init_leanvm(false);
+        let keys = keys::KeySet::generate(
+            options.seed,
+            options.num_validators,
+            total_slots + 1,
+            options.key_cache.as_deref(),
+        )?;
+        CryptoMode::Real {
+            genesis_pubkeys: keys.genesis_pubkeys,
+            key_manager: keys.key_manager,
+        }
+    };
+    let mut corpus =
+        corpus::SyntheticCorpus::new(options.num_validators, options.proofs_per_data, crypto);
+    let mut store = corpus.genesis_store(options.seed);
+
     let mut samples = Vec::with_capacity(common.iterations as usize);
     for slot in 1..=total_slots {
         let sample = build_one_slot(
-            &corpus,
+            &mut corpus,
             &mut store,
             slot,
             options.num_validators,
@@ -201,20 +228,23 @@ fn log_progress(slot: u64, total_slots: u64, measured: bool, sample: &Sample) {
     let label = if measured { "measured" } else { "warmup" };
     eprintln!(
         "[{slot}/{total_slots}] {label}: built block in {:.3}ms \
-         (attestations={}, pool_entries={})",
+         (attestations={}, pool_entries={}, aggregate={:.3}s, import={:.3}s)",
         sample.wall_seconds * 1e3,
         sample.attestations_packed,
         sample.pool_entries,
+        sample.aggregate_seconds,
+        sample.import_seconds,
     );
 }
 
-/// Seed the pool, build one block the way the proposer does, and import it.
+/// Seed the pool, build and seal one block the way the proposer does, and
+/// import it.
 ///
 /// The returned sample carries `iteration: 0`; the caller sets it for the slots
 /// it keeps. Warmup and measured slots do exactly the same work — only whether
 /// the sample is kept differs — so there is one code path for both.
 fn build_one_slot(
-    corpus: &corpus::SyntheticCorpus,
+    corpus: &mut corpus::SyntheticCorpus,
     store: &mut Store,
     slot: u64,
     num_validators: u64,
@@ -223,8 +253,11 @@ fn build_one_slot(
     // Seed the pending pool with the previous slot's attestations, exactly
     // where gossip aggregates would sit before the proposal tick promotes them
     // to the known pool. Entries from earlier slots stay in the known pool, as
-    // they would on a live node.
-    let pool_entries = corpus.seed_pool(store, slot - 1)?;
+    // they would on a live node. Signing and aggregating them is aggregator
+    // work, so it is timed separately and kept out of the measured span.
+    let seeded = corpus
+        .seed_pool(store, slot - 1)
+        .wrap_err_with(|| format!("seeding the pool failed for slot {slot}"))?;
 
     // Round-robin proposer, matching `is_proposer`.
     let proposer = slot % num_validators;
@@ -234,23 +267,25 @@ fn build_one_slot(
     let (block, aggregates, _checkpoints) =
         produce_block_with_signatures(store, slot, proposer, proposer_config)
             .wrap_err_with(|| format!("block build failed at slot {slot}"))?;
-    let wall_seconds = build_start.elapsed().as_secs_f64();
-    let phases = phases.finish()?;
-
-    let block_root = block.hash_tree_root();
-    let attestations_packed = block.body.attestations.len();
     let aggregates_count = aggregates.len();
+    let signed_block = corpus
+        .seal(store, block, aggregates)
+        .wrap_err_with(|| format!("sealing the block failed at slot {slot}"))?;
+    let wall_seconds = build_start.elapsed().as_secs_f64();
+    let phases = phases.finish(corpus.phases())?;
+
+    let block_root = signed_block.message.hash_tree_root();
+    let attestations_packed = signed_block.message.body.attestations.len();
 
     // Import the built block (outside the measured span) so the next iteration
     // builds one slot ahead of head, like a live proposer; building repeatedly
     // on a fixed head would make `process_slots` cost grow with the iteration
     // index.
-    let signed_block = SignedBlock {
-        message: block,
-        proof: MultiMessageAggregate::default(),
-    };
-    on_block_without_verification(store, signed_block)
+    let import_start = Instant::now();
+    corpus
+        .import(store, signed_block)
         .wrap_err_with(|| format!("importing the built block failed at slot {slot}"))?;
+    let import_seconds = import_start.elapsed().as_secs_f64();
 
     // Clamped: the unattributed preamble makes the remainder positive in
     // practice, but summing many small phase values can round just above the
@@ -267,14 +302,16 @@ fn build_one_slot(
         overhead_seconds,
         attestations_packed,
         aggregates: aggregates_count,
-        pool_entries,
+        pool_entries: seeded.pool_entries,
+        aggregate_seconds: seeded.aggregate_seconds,
+        import_seconds,
     })
 }
 
 const PHASE_HISTOGRAM: &str = "lean_block_proposal_attestation_build_phase_seconds";
 
-/// Exact per-phase durations for one block build, taken from the block-proposal
-/// phase histogram in the default prometheus registry.
+/// Exact per-phase durations for one block build and seal, taken from the
+/// block-proposal phase histogram in the default prometheus registry.
 ///
 /// Histogram sums accumulate the raw f64 seconds of every observation, so the
 /// difference between two readings IS the build's phase time — bucket
@@ -289,16 +326,19 @@ impl PhaseTimer {
         Self { before: read() }
     }
 
-    /// Per-phase durations since [`PhaseTimer::start`].
+    /// Per-phase durations since [`PhaseTimer::start`] for `expected` phases.
     ///
-    /// Each phase must have been observed exactly once — one `build_block` in
-    /// this single-threaded process — so anything else means the accounting
-    /// drifted and attribution would be wrong. That is a hard error, not a
-    /// warning: a silently mis-attributed report is worse than no report.
-    fn finish(self) -> eyre::Result<BTreeMap<String, f64>> {
+    /// Each phase must have been observed exactly once — one build (and one
+    /// seal) in this single-threaded process — so anything else means the
+    /// accounting drifted and attribution would be wrong. That is a hard error,
+    /// not a warning: a silently mis-attributed report is worse than no report.
+    fn finish(
+        self,
+        expected: impl Iterator<Item = &'static str>,
+    ) -> eyre::Result<BTreeMap<String, f64>> {
         let after = read();
         let mut phases = BTreeMap::new();
-        for &phase in BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES {
+        for phase in expected {
             let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
             let (sum_after, count_after) = after.get(phase).copied().unwrap_or((0.0, 0));
             let observations = count_after.saturating_sub(count_before);

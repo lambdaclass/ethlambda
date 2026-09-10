@@ -28,6 +28,9 @@ ethlambda-types.workspace = true
 ethlambda-rpc.workspace = true
 ethlambda-storage.workspace = true
 
+# Parallel XMSS keygen for the real-crypto benchmark corpus.
+rayon.workspace = true
+
 libssz.workspace = true
 libssz-types.workspace = true
 
@@ -56,7 +59,8 @@ libc.workspace = true
 # tests would otherwise wait out the real retry backoff. Dev-only, so the
 # feature never reaches the shipped binary.
 tokio = { workspace = true, features = ["test-util"] }
-# Keygen writes a directory of key files, so its tests need a throwaway one.
+# Keygen writes a directory of key files and the benchmark corpus writes a
+# key set, so their tests need a throwaway directory.
 tempfile = "3"
 
 [build-dependencies]

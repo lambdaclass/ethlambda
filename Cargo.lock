@@ -1950,6 +1950,7 @@ dependencies = [
  "libc",
  "libssz",
  "libssz-types",
+ "rayon",
  "reqwest",
  "serde",
  "serde_json",
