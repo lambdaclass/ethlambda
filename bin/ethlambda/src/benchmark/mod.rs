@@ -66,7 +66,7 @@ struct SyntheticOptions {
     #[arg(long, default_value = "42")]
     seed: u64,
     /// Directory caching the seed-derived XMSS keys, so reruns skip key
-    /// generation (about a second per key). Entries are keyed by leansig
+    /// generation (about a second per key). Entries are keyed by leanVM
     /// revision, seed, validator index and run length. Real crypto only.
     #[arg(long, conflicts_with = "mock_crypto")]
     key_cache: Option<PathBuf>,
@@ -162,6 +162,12 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
     let crypto = if common.mock_crypto {
         CryptoMode::Mock
     } else {
+        // Compile the aggregation bytecode before anything proves, exactly as
+        // the node does at startup: leanVM panics on the first prove otherwise.
+        // Without the arena, matching the node's default: the arena keeps the
+        // prover's buffers resident, which would make the benchmark measure a
+        // configuration the node only runs under --prover-arena.
+        ethlambda_crypto::init_leanvm(false);
         let keys = keys::KeySet::generate(
             options.seed,
             options.num_validators,

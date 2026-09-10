@@ -20,7 +20,7 @@ use ethlambda_types::{
     block::{Block, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
     constants::DEFAULT_MILLISECONDS_PER_SLOT,
     primitives::HashTreeRoot as _,
-    state::{State, Validator, ValidatorPubkeyBytes},
+    state::{PUBLIC_KEY_SIZE, State, Validator, ValidatorPubkeyBytes},
 };
 use eyre::WrapErr as _;
 
@@ -257,7 +257,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 fn synthetic_pubkey(rng_state: &mut u64) -> ValidatorPubkeyBytes {
-    let mut bytes = [0u8; 52];
+    let mut bytes = [0u8; PUBLIC_KEY_SIZE];
     for chunk in bytes.chunks_mut(8) {
         let word = splitmix64(rng_state).to_le_bytes();
         chunk.copy_from_slice(&word[..chunk.len()]);

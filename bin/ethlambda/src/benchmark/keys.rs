@@ -3,7 +3,7 @@
 //! Every validator gets an attestation key and a proposal key derived from the
 //! run seed, so two runs with the same seed use identical keys and, since XMSS
 //! signing is deterministic, identical signatures and proofs. Keys are
-//! generated only for the slots the run will sign (leansig's keygen cost scales
+//! generated only for the slots the run will sign (XMSS keygen cost scales
 //! with the active window), in parallel, and `--key-cache` stores them so
 //! reruns skip keygen.
 
@@ -51,10 +51,10 @@ pub(crate) struct KeySet {
 
 impl KeySet {
     /// Generate, or load from `cache`, keys for `num_validators` validators, each
-    /// active for epochs (slots) `0..num_slots`.
+    /// active for slots `0..num_slots`.
     ///
-    /// Cache entries are keyed by the leansig revision, seed, validator index,
-    /// role and window, so a leansig bump or a different run shape never reuses
+    /// Cache entries are keyed by the leanVM revision, seed, validator index,
+    /// role and window, so a rev bump or a different run shape never reuses
     /// a stale key.
     pub(crate) fn generate(
         seed: u64,
@@ -66,10 +66,7 @@ impl KeySet {
             std::fs::create_dir_all(dir)
                 .wrap_err_with(|| format!("failed to create key cache {}", dir.display()))?;
         }
-        let num_active_epochs = usize::try_from(num_slots)
-            .ok()
-            .filter(|epochs| *epochs >= 1)
-            .ok_or_else(|| eyre::eyre!("key window must cover at least one slot"))?;
+        eyre::ensure!(num_slots >= 1, "key window must cover at least one slot");
 
         // Every key is independent and deterministic in (seed, index, role), so
         // they are produced in parallel; `collect` keeps the job order.
@@ -79,7 +76,7 @@ impl KeySet {
             .collect();
         let keys: Vec<Key> = jobs
             .into_par_iter()
-            .map(|(index, role)| load_or_generate(seed, index, role, num_active_epochs, cache))
+            .map(|(index, role)| load_or_generate(seed, index, role, num_slots, cache))
             .collect::<eyre::Result<_>>()?;
         let cached = keys.iter().filter(|key| key.cached).count();
         eprintln!(
@@ -118,13 +115,13 @@ fn load_or_generate(
     seed: u64,
     index: u64,
     role: Role,
-    num_active_epochs: usize,
+    num_active_slots: u64,
     cache: Option<&Path>,
 ) -> eyre::Result<Key> {
     let file = cache.map(|dir| {
         dir.join(format!(
-            "xmss-{}-seed{seed}-v{index}-{}-w{num_active_epochs}.bin",
-            env!("ETHLAMBDA_LEANSIG_REV"),
+            "xmss-{}-seed{seed}-v{index}-{}-w{num_active_slots}.bin",
+            env!("ETHLAMBDA_LEANVM_REV"),
             role.tag()
         ))
     });
@@ -135,16 +132,17 @@ fn load_or_generate(
     }
 
     let key_seed = seed ^ (index << 1 | role as u64).rotate_left(32);
-    let (pubkey, secret) = ValidatorSecretKey::generate_from_seed(key_seed, 0, num_active_epochs);
+    let (pubkey, secret) = ValidatorSecretKey::generate_from_seed(key_seed, 0, num_active_slots)
+        .wrap_err("failed to generate XMSS key")?;
     let pubkey: ValidatorPubkeyBytes = pubkey.to_bytes().try_into().map_err(|bytes: Vec<u8>| {
         eyre::eyre!(
-            "leansig pubkey is {} bytes, expected {PUBKEY_LEN}",
+            "XMSS pubkey is {} bytes, expected {PUBKEY_LEN}",
             bytes.len()
         )
     })?;
     if let Some(file) = &file {
         let mut bytes = pubkey.to_vec();
-        bytes.extend_from_slice(&secret.to_bytes());
+        bytes.extend_from_slice(&secret.to_bytes().wrap_err("failed to encode secret key")?);
         std::fs::write(file, bytes)
             .wrap_err_with(|| format!("failed to write cached key {}", file.display()))?;
     }
@@ -187,7 +185,7 @@ mod tests {
         let a = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
         let b = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
         assert_eq!(a.pubkey, b.pubkey);
-        assert_eq!(a.secret.to_bytes(), b.secret.to_bytes());
+        assert_eq!(a.secret.to_bytes().unwrap(), b.secret.to_bytes().unwrap());
         let proposal = load_or_generate(7, 3, Role::Proposal, 2, None).unwrap();
         assert_ne!(a.pubkey, proposal.pubkey);
         let other_seed = load_or_generate(8, 3, Role::Attestation, 2, None).unwrap();

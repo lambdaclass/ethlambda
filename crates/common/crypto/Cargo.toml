@@ -12,17 +12,17 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 
+xmss.workspace = true
+lean-multisig.workspace = true
+ssz.workspace = true
+postcard.workspace = true
 
-lean-multisig = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df" }
-# leansig_wrapper provides XmssPublicKey/XmssSignature types used by lean-multisig's public API
-leansig_wrapper = { git = "https://github.com/leanEthereum/leanVM.git", rev = "e2592df" }
-
-leansig.workspace = true
 thiserror.workspace = true
-rand.workspace = true
+tracing.workspace = true
 
 [features]
 shadow-integration = []
 
 [dev-dependencies]
 hex.workspace = true
+ssz.workspace = true
