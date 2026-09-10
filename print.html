@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-b76d671a.js";
+            window.path_to_searchindex_js = "searchindex-d1711995.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -2026,7 +2026,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 <tr><td><code>lean_block_building_time_seconds</code></td><td>Histogram</td><td>Time taken to build a block</td><td>On block production</td><td></td><td>0.1, 0.25, 0.5, 0.75, 1, 2, 4, 8</td><td>✅</td></tr>
 <tr><td><code>lean_block_building_success_total</code></td><td>Counter</td><td>Successful block builds</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_building_failures_total</code></td><td>Counter</td><td>Failed block builds (error building the block, signing the block root, or processing it locally)</td><td>On block production failure</td><td></td><td></td><td>✅</td></tr>
-<tr><td><code>lean_block_proposal_attestation_build_phase_seconds</code></td><td>Histogram</td><td>Phase-level time in block-proposal attestation selection</td><td>On block production</td><td>phase=select_payloads,compact,stf_simulate</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td><td>✅</td></tr>
+<tr><td><code>lean_block_proposal_attestation_build_phase_seconds</code></td><td>Histogram</td><td>Phase-level time in block proposal: attestation selection, compaction, state transition, then the seal (proposer signature, type-1 wrap, type-2 merge)</td><td>On block production</td><td>phase=select_payloads,compact,stf_simulate,sign_proposer,wrap_proposer,merge_type2</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_attestation_builds_total</code></td><td>Counter</td><td>Attestations selected during block-proposal selection (one per selection-loop round that picks an <code>AttestationData</code>)</td><td>On each attestation selection</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_child_payloads_consumed_total</code></td><td>Counter</td><td>Child aggregated payloads selected during greedy proof picking (before compaction)</td><td>On block production</td><td></td><td></td><td>✅</td></tr>
 <tr><td><code>lean_block_proposal_attestation_data_selected</code></td><td>Histogram</td><td>Distinct <code>AttestationData</code> entries in the proposal block body</td><td>On block production</td><td></td><td>0, 1, 2, 4, 8, 16, 32</td><td>✅</td></tr>
@@ -3114,13 +3114,20 @@ trades network realism for repeatability: the same parameters produce the same
 blocks every run, so two reports differ only where the code differs.</p>
 <h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
 <pre><code class="language-bash">make bench                                  # defaults, mock crypto
+BENCH_ARGS="synthetic" make bench           # real XMSS/leanVM crypto
 BENCH_ARGS="synthetic --iterations 50" make bench
 </code></pre>
 <p><code>make bench</code> is a thin wrapper. The binary takes the same arguments directly:</p>
-<pre><code class="language-bash">ethlambda benchmark synthetic --mock-crypto --num-validators 8 --iterations 10
+<pre><code class="language-bash">ethlambda benchmark synthetic --num-validators 8 --iterations 10 --key-cache ~/.cache/ethlambda-bench-keys
+ethlambda benchmark synthetic --mock-crypto --num-validators 8 --iterations 10
 </code></pre>
-<p>A default mock run finishes in well under a second, which is why CI can afford
-to run one on every pull request.</p>
+<p>Without <code>--mock-crypto</code> the run uses real cryptography end to end: seed-derived
+XMSS keys, real attestation signatures aggregated into leanVM type-1 proofs, and
+the proposer’s real seal (block-root signature, singleton type-1 wrap, type-2
+merge), with every built block imported through the verifying <code>on_block</code> path.
+A default real run takes a few minutes; <code>--key-cache</code> saves the seed-derived
+keys so reruns skip key generation. A default mock run finishes in well under a
+second, which is why CI can afford to run one on every pull request.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3131,8 +3138,9 @@ to run one on every pull request.</p>
 <tr><td><code>--warmup-slots</code></td><td><code>8</code></td><td>Unmeasured slots built first, so measured builds run on a state with realistic historical roots and justifications</td></tr>
 <tr><td><code>--iterations</code></td><td><code>10</code></td><td>Measured builds, one block each</td></tr>
 <tr><td><code>--proofs-per-data</code></td><td><code>1</code></td><td>Aggregates seeded per <code>AttestationData</code>, mimicking committee aggregators over disjoint validator subsets</td></tr>
-<tr><td><code>--seed</code></td><td><code>42</code></td><td>Seed for the validator set; fixes the whole run</td></tr>
-<tr><td><code>--mock-crypto</code></td><td>off</td><td>Placeholder proofs instead of real XMSS/leanVM signatures. <strong>Currently required</strong> — see <a href="#limitations">Limitations</a></td></tr>
+<tr><td><code>--seed</code></td><td><code>42</code></td><td>Seed for the validator set and its XMSS keys; fixes the whole run</td></tr>
+<tr><td><code>--key-cache &lt;dir&gt;</code></td><td>—</td><td>Cache the seed-derived XMSS keys on disk (keyed by leansig revision, seed, validator index and run length). Real crypto only</td></tr>
+<tr><td><code>--mock-crypto</code></td><td>off</td><td>Placeholder proofs instead of real XMSS/leanVM signatures, and no seal. Measures selection, compaction and the state transition only</td></tr>
 <tr><td><code>--enable-proposer-aggregation</code></td><td>off</td><td>Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation</td></tr>
 <tr><td><code>--max-attestations-per-block</code></td><td><code>3</code></td><td>Mirrors the node flag: distinct <code>AttestationData</code> per block</td></tr>
 <tr><td><code>--format</code></td><td><code>human</code></td><td><code>human</code> or <code>json</code></td></tr>
@@ -3143,9 +3151,9 @@ to run one on every pull request.</p>
 <p>Logs go to stderr and the report to stdout, so <code>--format json</code> pipes straight
 into <code>jq</code>.</p>
 <h2 id="what-it-measures"><a class="header" href="#what-it-measures">What it measures</a></h2>
-<p>Each iteration enters <code>produce_block_with_signatures</code> — the same function
-<code>BlockChainServer::propose_block</code> calls — and the harness reports the phases
-inside it:</p>
+<p>Each iteration enters <code>produce_block_with_signatures</code> and then <code>seal_block</code> —
+the same functions <code>BlockChainServer::propose_block</code> calls — and the harness
+reports the phases inside them:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -3153,20 +3161,36 @@ inside it:</p>
 </thead>
 <tbody>
 <tr><td><code>select_payloads</code></td><td>Choosing which attestations go in the block</td></tr>
-<tr><td><code>compact</code></td><td>Collapsing or picking among proofs for the same data</td></tr>
+<tr><td><code>compact</code></td><td>Collapsing or picking among proofs for the same data; with <code>--enable-proposer-aggregation</code> this is a real recursive leanVM aggregation</td></tr>
 <tr><td><code>stf_simulate</code></td><td>The state transition that seals <code>state_root</code></td></tr>
-<tr><td><code>overhead</code></td><td>The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone</td></tr>
+<tr><td><code>sign_proposer</code></td><td>The proposer’s XMSS signature over the block root (real crypto only)</td></tr>
+<tr><td><code>wrap_proposer</code></td><td>Wrapping that signature into a singleton type-1 proof (real crypto only)</td></tr>
+<tr><td><code>merge_type2</code></td><td>Merging every type-1 proof into the block’s type-2 proof (real crypto only)</td></tr>
+<tr><td><code>overhead</code></td><td>The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone, pubkey resolution</td></tr>
 <tr><td><code>wall</code></td><td>The whole span</td></tr>
 </tbody>
 </table>
 </div>
 <p><code>overhead</code> is <code>wall</code> minus the sum of the phases, so the columns add up by
-construction.</p>
+construction. In mock mode there is nothing to sign with, so the seal is skipped
+and its three phases are absent.</p>
 <p>Deliberately <strong>outside</strong> the measured span, matching the boundary of the node’s
 own <code>lean_block_building_time_seconds</code> metric: gossip publish, the
 slot-alignment sleep, and importing the block that was just built. The import
 still happens between iterations — otherwise every iteration would build on the
-same head and <code>process_slots</code> would get more expensive as the run went on.</p>
+same head and <code>process_slots</code> would get more expensive as the run went on. Two
+such costs are reported anyway, because they are real crypto worth watching:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Column</th><th>Work</th></tr>
+</thead>
+<tbody>
+<tr><td><code>aggregate</code></td><td>Producing the slot’s pool entries: every validator’s attestation signature plus their type-1 aggregation. Aggregator-side work a proposer never does; zero in mock mode</td></tr>
+<tr><td><code>import</code></td><td>Importing the built block; in real mode this includes verifying its type-2 proof</td></tr>
+</tbody>
+</table>
+</div>
 <p>Phase times come from the sample sums of the existing
 <code>lean_block_proposal_attestation_build_phase_seconds</code> histogram, read before and
 after each build. Histogram sums accumulate raw f64 seconds, so the difference
@@ -3175,18 +3199,24 @@ part. Nothing is added to the hot path for the benchmark’s benefit. The harnes
 asserts each phase was observed exactly once per build and fails the run
 otherwise, because a mis-attributed report is worse than no report.</p>
 <h2 id="reading-a-report"><a class="header" href="#reading-a-report">Reading a report</a></h2>
-<pre><code>Block-building benchmark — synthetic workload (mock crypto)
-  validators=8 warmup_slots=8 iterations=10 proofs_per_data=1 seed=42
+<pre><code>Block-building benchmark — synthetic workload (real crypto)
+  validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
   ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
 
-  iter           compact  select_payloads     stf_simulate   overhead       wall         root
-  1              0.000ms          0.002ms          0.015ms    0.068ms    0.085ms   0x7282cc99
-  ...
+  iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
+  1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33
+  2              0.001ms       1175.326ms          0.015ms          2.024ms          0.015ms         73.124ms    0.119ms 1250.623ms   94.691ms   20.472ms   0xf7e48c73
 
   phase              count        min       mean        p50        p90        max
-  select_payloads       10    0.002ms    0.002ms    0.002ms    0.003ms    0.003ms
+  compact                2    0.001ms    0.001ms    0.001ms    0.001ms    0.001ms
+  merge_type2            2  550.641ms  862.983ms 1175.326ms 1175.326ms 1175.326ms
   ...
+  wall                   2  616.350ms  933.487ms 1250.623ms 1250.623ms 1250.623ms
+
+  outside the measured span:
+  aggregate              2   94.691ms   99.119ms  103.548ms  103.548ms  103.548ms
+  import                 2   19.205ms   19.838ms   20.472ms   20.472ms   20.472ms
 </code></pre>
 <p>Every measured iteration gets its own row, and the summary follows below it.
 Outliers are never discarded: XMSS signing and OTS window advancement produce
@@ -3209,19 +3239,21 @@ they <em>cannot</em> be compared:</p>
 <li><code>leansig</code> and <code>leanvm</code> are the resolved revisions the binary was built
 against, read from <code>Cargo.lock</code> at build time. leanSig tracks a moving branch
 and leanVM performs the signature aggregation, so either one moving changes
-the measured crypto.</li>
+the measured crypto. Real-mode roots also depend on the seed-derived keys, so
+the same seed on the same leansig revision reproduces the same signatures and
+the same roots.</li>
 <li><code>os</code>, <code>arch</code> and <code>threads</code> change results across machines.</li>
 </ul>
 <p>Two reports that disagree on any of those are not measuring the same thing.</p>
 <h2 id="limitations"><a class="header" href="#limitations">Limitations</a></h2>
 <ul>
-<li><strong><code>--mock-crypto</code> is required.</strong> Real XMSS/leanVM pools are not wired up yet,
-so the run measures selection, compaction and the state transition — not
-signing or aggregation.</li>
-<li><strong>The seal phase is not measured.</strong> Signing, type-1 wrapping and type-2
-merging happen after the measured span and are not reported.</li>
 <li><strong>Synthetic workloads only.</strong> Replaying a real datadir is not implemented, so
 results reflect a synthetic chain rather than a deep production state.</li>
+<li><strong>Short-lived keys.</strong> Real-mode XMSS keys are generated for exactly the slots
+the run signs, so key generation is cheap but the OTS window advancement a
+long-lived validator key performs every 65,536 slots is never exercised.</li>
+<li><strong>Mock mode skips the seal.</strong> Without keys there is nothing to sign, so the
+three seal phases only appear in real runs.</li>
 </ul>
 <h2 id="in-ci"><a class="header" href="#in-ci">In CI</a></h2>
 <p>The Test job runs a short mock benchmark and asserts the JSON report’s shape
