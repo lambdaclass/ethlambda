@@ -77,9 +77,10 @@ than fetching what it needs. The wipe matters as much as the re-download, since
 the tarballs unpack side by side into one directory, and layering a new release
 over an old one would keep cases the new one deleted.
 
-`make test` runs the whole workspace with nothing excluded, and still needs no
-fixture download. Two gates keep it that way, both tied to the
-`beacon-spec-tests` feature that `make test-beacon` turns on:
+`make test` covers the whole workspace, in two halves, and still needs no
+fixture download. The halves are all that `test-node`'s `--exclude` flags do;
+nothing is dropped to keep the beacon suite out. Two gates keep it that way,
+both tied to the `beacon-spec-tests` feature that `make test-beacon` turns on:
 
 - The `beacon_spec_tests` target declares `required-features =
   ["beacon-spec-tests"]`, so `cargo test` skips building it entirely.

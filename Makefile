@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -9,16 +9,34 @@ fmt: ## 🎨 Format all code using rustfmt
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
 
-test: leanSpec/fixtures ## 🧪 Run all tests
-	# release-fast: release-grade opt-level to avoid stack overflows during
-	# signature verification/aggregation, without paying for LTO on every rebuild
-	#
-	# The Beacon Chain spec tests have their own target and are not run here:
-	# their fixtures are a separate multi-gigabyte download, and the suite has to
-	# be built once per preset. Nothing is excluded to achieve that any more, now
-	# that they live in ethlambda-state-transition beside lean's own; their test
-	# target requires the `beacon-spec-tests` feature, so this command skips it.
-	cargo test --locked --workspace --profile release-fast
+# release-fast: release-grade opt-level to avoid stack overflows during
+# signature verification/aggregation, without paying for LTO on every rebuild
+#
+# The Beacon Chain spec tests have their own target and are not run here: their
+# fixtures are a separate multi-gigabyte download, and the suite has to be built
+# once per preset. The `--exclude` flags below only divide the halves: the
+# beacon target requires the `beacon-spec-tests` feature, so these commands skip
+# it without excluding anything.
+TEST=cargo test --locked --profile release-fast
+
+# Two halves, one CI job each: undivided, a release-grade build of every test
+# target measured 14 GiB against the 13-14 GiB a stock runner has free. Both
+# halves build the shared dependency graph, so what the split halves is the
+# linked test binaries.
+#
+# Named once, and `test-node` is the workspace minus this list, so the two are
+# exhaustive by construction and a crate added later cannot silently go
+# untested. Keep them roughly even by build weight; the boundary means nothing
+# else.
+CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto
+
+test: test-consensus test-node ## 🧪 Run all tests
+
+test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
+	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
+
+test-node: leanSpec/fixtures ## 🧪 Run the node half of the workspace suite
+	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
 
 # --lib as well as the spec target: the BLS and KZG modules keep their fixture
 # vectors as unit tests, which are `ignore`d unless this feature is on.

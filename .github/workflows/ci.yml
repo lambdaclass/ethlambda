@@ -28,6 +28,10 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  # `lint`, `presets` and `tooling` were one job. Split because serially they
+  # took 34 minutes and, between them, more disk than a runner has: a full disk
+  # reaches `rust-lld` through `mmap`, so it is reported as
+  # `ld terminated with signal 7 [Bus error]` rather than as ENOSPC.
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -41,14 +45,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Setup cache
-        # Tools under tooling/ are separate Cargo workspaces with their own
-        # target dir and Cargo.lock, so they need listing explicitly or their
-        # builds are neither cached nor reflected in the cache key.
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            .
-            tooling/event-monitor
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -56,37 +53,49 @@ jobs:
       - name: Cargo check
         run: cargo check --locked --workspace --all-targets
 
+      # Seconds, not minutes: same fingerprints as `check` above.
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      # Two features gate code that no step above reaches, so both would rot
-      # silently between merges.
-      #
-      # `beacon-spec-tests` guards the beacon spec-test target, which declares it
-      # as a required feature so that `cargo test` skips a suite whose fixtures
-      # are a multi-gigabyte download. `--all-targets` above therefore never
-      # builds it. The `beacon-spec-tests` job below does download them and run
-      # the suite for real, so this step is not what proves the runners work; it
-      # is here because that job is by far the slowest in the workflow, and
-      # because this is the only place the runners are linted at `-D warnings`.
-      #
-      # `preset-minimal` is a whole second compilation, because the beacon
-      # containers' SSZ bounds are const-generic arguments and every step so far
-      # builds the default (mainnet) preset only. The fixture-reading unit tests
-      # stay `ignore`d here, since `beacon-spec-tests` is off.
-      #
-      # `--lib` on both: this job downloads no fixtures, and each crate's
-      # integration targets (`ssz_spectests`, `stf_spectests`) walk the leanSpec
-      # tree, which only the `test` job below has. The unit tests are what the
-      # preset actually changes, and they need nothing on disk.
-      #
-      # The spec suite is compiled under BOTH presets, not just the default. Its
-      # `genesis` runner is `#![cfg(feature = "preset-minimal")]`, because the
-      # release ships genesis fixtures for that preset only, so a mainnet-preset
-      # build type-checks every runner except that one, and it is the sole
-      # coverage `beacon::genesis` has. The minimal leg below would catch a break
-      # there as well, but only after a fixture download and a full release-fast
-      # build; this catches it in the lint job's already-warm cache.
+  # Two features gate code that no step in `lint` reaches, so both would rot
+  # silently between merges.
+  #
+  # `beacon-spec-tests` guards the beacon spec-test target, which declares it as
+  # a required feature so that `cargo test` skips a suite whose fixtures are a
+  # multi-gigabyte download. `--all-targets` in `lint` therefore never builds
+  # it. The `beacon-spec-tests` job below does download them and run the suite
+  # for real, so this job is not what proves the runners work; it is here
+  # because that job is by far the slowest in the workflow, and because this is
+  # the only place the runners are linted at `-D warnings`.
+  #
+  # `preset-minimal` is a whole second compilation, because the beacon
+  # containers' SSZ bounds are const-generic arguments and everything in `lint`
+  # builds the default (mainnet) preset only. The fixture-reading unit tests
+  # stay `ignore`d here, since `beacon-spec-tests` is off.
+  #
+  # `--lib`: this job downloads no fixtures, and the integration targets
+  # (`ssz_spectests`, `stf_spectests`) walk the leanSpec tree, which only `test`
+  # has. Both presets, not just the default: the spec suite's `genesis` runner
+  # is `#![cfg(feature = "preset-minimal")]`, so a mainnet build type-checks
+  # every runner except the sole coverage `beacon::genesis` has.
+  presets:
+    name: Test minimal preset
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy
+
+      # Its own entry, keyed on the job id by the action's default. These
+      # builds share almost no artifacts with `lint`'s, so on one key each run
+      # would evict the other's.
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Check the beacon spec-test suite compiles
         run: |
           cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests -- -D warnings
@@ -97,14 +106,30 @@ jobs:
           cargo test -p ethlambda-types --lib --features preset-minimal
           cargo test -p ethlambda-state-transition --lib --features preset-minimal
 
-      # tooling/event-monitor declares its own [workspace] table, so every step
-      # above stops at the root workspace members and never reaches it. Its
-      # tests run in this job rather than in `test` because clippy has already
-      # compiled the test targets, and because they need none of that job's
-      # leanSpec fixtures.
-      # `--locked` so the committed Cargo.lock is actually enforced: without it
-      # cargo silently resolves and rewrites the lockfile in CI, and a stale or
-      # missing entry never fails the build.
+  # tooling/event-monitor declares its own [workspace] table, so both jobs above
+  # stop at the root members and never reach it. Hence its own job, and the
+  # `workspaces` input below pointing the cache at its target dir.
+  #
+  # `--locked` so the committed Cargo.lock is actually enforced: without it
+  # cargo silently resolves and rewrites the lockfile in CI, and a stale or
+  # missing entry never fails the build.
+  tooling:
+    name: Tooling
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tooling/event-monitor
+
       - name: Lint tooling
         working-directory: tooling/event-monitor
         run: |
@@ -115,24 +140,29 @@ jobs:
         working-directory: tooling/event-monitor
         run: cargo test --locked
 
+  # The workspace suite in two halves; `CONSENSUS_CRATES` in the Makefile
+  # defines them and says why. Both need the leanSpec fixtures and share one
+  # cache entry for them, so only the first leg to arrive downloads anything.
   test:
-    name: Test
+    name: Test (${{ matrix.half }})
     runs-on: ubuntu-latest
+    strategy:
+      # Which half broke is most of the triage, so report both.
+      fail-fast: false
+      matrix:
+        half: [consensus, node]
     steps:
       - uses: actions/checkout@v6
 
-      # This job builds the entire workspace at `release-fast`, which is the
-      # largest build in the workflow and no longer fits the runner's root
-      # filesystem unmodified.
-      - name: Free disk space
-        uses: ./.github/actions/free-disk-space
-
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
+        with:
+          make-target: test-${{ matrix.half }}
 
-      # Reuses the release build from the test step; validates the benchmark
-      # harness end-to-end and its JSON output contract in a few seconds.
+      # This is the half that builds `bin/ethlambda`, so the binary is already
+      # linked. Validates the harness and its JSON contract in a few seconds.
       - name: Benchmark smoke (mock crypto)
+        if: matrix.half == 'node'
         run: |
           cargo run --locked --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
             --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
@@ -198,12 +228,6 @@ jobs:
       CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
     steps:
       - uses: actions/checkout@v6
-
-      # Not yet observed to run out, unlike `test` above, but it is the same
-      # squeeze: a release-grade build plus the largest fixture download in the
-      # workflow, on the same root filesystem.
-      - name: Free disk space
-        uses: ./.github/actions/free-disk-space
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master

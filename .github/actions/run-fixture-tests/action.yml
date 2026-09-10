@@ -1,8 +1,16 @@
 name: "Run fixture-based tests"
 description: >-
   Fetches the latest leanSpec test fixtures (cached by release SHA), sets up the
-  Rust toolchain, and runs the workspace test suite via `make test`. Assumes the
+  Rust toolchain, and runs a fixture-backed `make` target. Assumes the
   repository has already been checked out by the caller.
+
+inputs:
+  make-target:
+    description: >-
+      Which target to run. CI passes one half of the suite per job, because the
+      two together no longer fit a single runner's root filesystem.
+    required: false
+    default: "test"
 
 runs:
   using: "composite"
@@ -106,17 +114,20 @@ runs:
       with:
         toolchain: "1.97.1"
 
+    # Keyed by target so the two halves do not evict each other: the default
+    # key covers the job id, which is one value for every leg of a matrix.
     - name: Setup cache
       uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.make-target }}
 
     - name: Run tests
       shell: bash
-      run: make test
+      run: make ${{ inputs.make-target }}
 
-    # What the build actually consumed, which is the number that says how close
-    # the next run is to the ceiling; `free-disk-space` reports only what was
-    # available before it. `always()` because the reading matters most on the
-    # failure this instruments, where the build is the thing that ran out.
+    # How close this half is to the ceiling, which is why the suite is split in
+    # halves at all. `always()` because the reading matters most on the failure
+    # it instruments, where the build is the thing that ran out.
     - name: Report disk usage after the build
       if: always()
       shell: bash
