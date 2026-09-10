@@ -69,8 +69,8 @@ pub struct BlockChainConfig {
     /// aggregation. Aggregators on different duty subnets merge different
     /// children, which is what stops them all producing the same proof.
     pub aggregation_duty_subnet: u64,
-    /// Whether the aggregator narrows its subnet window to the widest level it
-    /// owns in the slot, trading window overlap for less duplicated prover
+    /// Whether the aggregator sits out candidates whose level another duty
+    /// subnet owns in the slot, trading window overlap for less duplicated prover
     /// work.
     pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
@@ -284,9 +284,9 @@ pub struct BlockChainServer {
     /// build different proofs.
     aggregation_duty_subnet: u64,
 
-    /// Whether to narrow the aggregation window to the widest level this duty
-    /// subnet owns in the slot, trading window overlap for less duplicated
-    /// prover work. See [`aggregation::effective_width`] for the rotation.
+    /// Whether to sit out aggregation candidates whose level another duty
+    /// subnet owns this slot, trading window overlap for less duplicated
+    /// prover work. See [`aggregation::owns_width`] for the rotation.
     skip_redundant_aggregation: bool,
 
     /// Proposer-side block-building policy

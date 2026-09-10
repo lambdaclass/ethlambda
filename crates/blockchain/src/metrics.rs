@@ -306,11 +306,11 @@ static LEAN_AGGREGATION_EARLY_STARTS_TOTAL: std::sync::LazyLock<IntCounter> =
         .unwrap()
     });
 
-static LEAN_AGGREGATION_NARROWED_TOTAL: std::sync::LazyLock<IntCounter> =
+static LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL: std::sync::LazyLock<IntCounter> =
     std::sync::LazyLock::new(|| {
         register_int_counter!(
-            "lean_aggregation_narrowed_total",
-            "Candidates whose window the redundancy-skipping check narrowed"
+            "lean_aggregation_skipped_redundant_total",
+            "Candidates the redundancy-skipping check left to another duty subnet"
         )
         .unwrap()
     });
@@ -865,7 +865,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_STARTS_TOTAL);
-    std::sync::LazyLock::force(&LEAN_AGGREGATION_NARROWED_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
@@ -1094,10 +1094,10 @@ pub fn observe_aggregation_window_width(width: u64) {
     LEAN_AGGREGATION_WINDOW_WIDTH.observe(width as f64);
 }
 
-/// Increment the count of candidates whose window the redundancy-skipping
-/// rotation narrowed below what their pool alone would have allowed.
-pub fn inc_aggregation_narrowed() {
-    LEAN_AGGREGATION_NARROWED_TOTAL.inc();
+/// Increment the count of candidates this aggregator sat out because the
+/// redundancy-skipping rotation gave their level to another duty subnet.
+pub fn inc_aggregation_skipped_redundant() {
+    LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL.inc();
 }
 
 /// Increment the count of candidates whose windowed selection was not viable

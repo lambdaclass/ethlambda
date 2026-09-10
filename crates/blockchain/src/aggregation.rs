@@ -196,9 +196,9 @@ pub struct AggregationWindowConfig {
     pub duty_subnet: u64,
     /// Number of attestation committees, i.e. the subnet count.
     pub committee_count: u64,
-    /// Whether to narrow to the widest level this duty subnet owns in the
-    /// slot, trading coverage overlap for less duplicated prover work. See
-    /// [`effective_width`].
+    /// Whether to sit out candidates whose level another duty subnet owns
+    /// this slot, trading coverage overlap for less duplicated prover work.
+    /// See [`owns_width`].
     pub skip_redundant: bool,
 }
 
@@ -208,20 +208,25 @@ pub struct AggregationWindowConfig {
 /// scoring candidates remain.
 pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
-/// The window derived for one candidate, and whether the redundancy-skipping
-/// rotation narrowed it below what the candidate's pool alone allowed.
-struct CandidateWindow {
-    window: SubnetWindow,
-    narrowed: bool,
-}
-
-/// The window this aggregator uses for one candidate `AttestationData`.
+/// The window this aggregator uses for one candidate `AttestationData`, or
+/// `None` when `--skip-redundant-aggregation` is on and another duty subnet
+/// owns this candidate's level in this slot.
 ///
-/// The width is taken over the candidate's whole pool rather than the part
-/// inside any window, so it does not depend on which subnets this aggregator
-/// owns: two aggregators holding the same pool derive the same width, and the
-/// reduction tree stays in step. Narrowing the reach to a window would make
-/// the width self-referential and desynchronize it across the network.
+/// The width comes from the *anchor*: the largest-coverage pool proof that
+/// touches the duty subnet (see [`anchor_reach`]). Anchoring on a proof that
+/// covers our own subnet keeps the window tied to work we can contribute to,
+/// and it gives the raw-signature path a floor. A pool holding nothing on our
+/// subnet yields no anchor, hence the narrowest window, hence a job built
+/// from our own raw signatures instead of a merge of other aggregators'
+/// proofs, which is exactly the case where nobody else can do the work for
+/// us.
+///
+/// The width is therefore *not* uniform across the network: two aggregators
+/// on different duty subnets can derive different widths from one lopsided
+/// pool. That costs tiling precision (windows at different widths nest rather
+/// than tile) but no correctness, and it buys immunity to a single sparse
+/// wide proof, one validator in each of many subnets, collapsing every
+/// aggregator's window to the full committee set.
 ///
 /// Only one session runs per slot (see [`snapshot_aggregation_inputs`]), and
 /// this candidate's own pool is still empty at that point: a produced
@@ -234,36 +239,49 @@ fn window_for_candidate(
     known_proofs: &[SingleMessageAggregate],
     current_slot: u64,
     config: AggregationWindowConfig,
-) -> CandidateWindow {
-    // Reduce before the rotation, not just inside `SubnetWindow::new`: at a
-    // width that does not divide the committee count, an out-of-range duty
-    // subnet would otherwise rotate on different slots from its reduced twin.
+) -> Option<SubnetWindow> {
+    // Reduce before both the anchor search and the ownership test, not just
+    // inside `SubnetWindow::new`: an out-of-range duty subnet matches no
+    // validator's subnet, so it would find no anchor at all, and at a width
+    // that does not divide the committee count it would rotate on different
+    // slots from its reduced twin.
     let duty_subnet = if config.committee_count == 0 {
         0
     } else {
         config.duty_subnet % config.committee_count
     };
-    let max_reach = new_proofs
-        .iter()
-        .chain(known_proofs.iter())
-        .map(|proof| subnet_reach(&proof.participants, config.committee_count))
-        .max()
-        .unwrap_or(0);
-    let base_width = window_width(max_reach, config.committee_count);
-    let width = effective_width(base_width, duty_subnet, current_slot, config.skip_redundant);
-    CandidateWindow {
-        window: SubnetWindow::new(duty_subnet, width, config.committee_count),
-        narrowed: width < base_width,
+    let reach = anchor_reach(
+        new_proofs,
+        known_proofs,
+        duty_subnet,
+        config.committee_count,
+    );
+    let width = window_width(reach, config.committee_count);
+    if config.skip_redundant && !owns_width(duty_subnet, current_slot, width) {
+        return None;
     }
+    Some(SubnetWindow::new(
+        duty_subnet,
+        width,
+        config.committee_count,
+    ))
 }
 
-/// Report one candidate's derived window. Kept out of `window_for_candidate`
-/// so the derivation stays pure and unit-testable without a metrics registry.
-fn record_window_metrics(derived: &CandidateWindow) {
-    metrics::observe_aggregation_window_width(derived.window.width());
-    if derived.narrowed {
-        metrics::inc_aggregation_narrowed();
+/// [`window_for_candidate`] plus the metrics for its outcome. Kept apart from
+/// the derivation so that stays pure and unit-testable without a metrics
+/// registry.
+fn metered_window_for_candidate(
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+    current_slot: u64,
+    config: AggregationWindowConfig,
+) -> Option<SubnetWindow> {
+    let window = window_for_candidate(new_proofs, known_proofs, current_slot, config);
+    match &window {
+        Some(window) => metrics::observe_aggregation_window_width(window.width()),
+        None => metrics::inc_aggregation_skipped_redundant(),
     }
+    window
 }
 
 /// Build a snapshot of everything needed to aggregate. Runs on the actor
@@ -322,16 +340,19 @@ pub fn snapshot_aggregation_inputs(
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
-        let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
-        record_window_metrics(&derived);
+        let Some(window) =
+            metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)
+        else {
+            continue;
+        };
         if let Some(job) = resolve_job_with_window_fallback(
             hashed.clone(),
             validator_sigs,
             &new_proofs,
             &known_proofs,
             validators,
-            &derived,
-            window_config.committee_count,
+            &window,
+            window_config,
         ) {
             candidates.insert(data_root, job);
         }
@@ -347,8 +368,11 @@ pub fn snapshot_aggregation_inputs(
             continue;
         }
         let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
-        let derived = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
-        record_window_metrics(&derived);
+        let Some(window) =
+            metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)
+        else {
+            continue;
+        };
         let hashed = HashedAttestationData::new(att_data.clone());
         if let Some(job) = resolve_job_with_window_fallback(
             hashed,
@@ -356,8 +380,8 @@ pub fn snapshot_aggregation_inputs(
             &new_proofs,
             &known_proofs,
             validators,
-            &derived,
-            window_config.committee_count,
+            &window,
+            window_config,
         ) {
             candidates.insert(*data_root, job);
         }
@@ -606,12 +630,10 @@ fn resolve_job(
 /// window can only ever improve on the unwindowed selection, never lose
 /// coverage relative to it.
 ///
-/// Skipped when `derived.narrowed`: there the empty result is
-/// `--skip-redundant-aggregation` deliberately sitting this candidate out at
-/// a level another duty subnet owns this slot (see [`effective_width`]), not
-/// a placement gap. Falling back there would have every unowned duty subnet
-/// redo the owner's exact merge, which is the redundant work the flag exists
-/// to avoid.
+/// Skipped entirely under `--skip-redundant-aggregation`. That flag is a
+/// request to do strictly less prover work, and every width below the
+/// committee count has several owners, so a fallback would have all of them
+/// retry at full width and rebuild the duplication the flag buys away.
 ///
 /// `resolve_job` is store-free, so trying it twice is cheap.
 fn resolve_job_with_window_fallback(
@@ -620,8 +642,8 @@ fn resolve_job_with_window_fallback(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
-    derived: &CandidateWindow,
-    committee_count: u64,
+    window: &SubnetWindow,
+    config: AggregationWindowConfig,
 ) -> Option<AggregationJob> {
     let primary = resolve_job(
         hashed.clone(),
@@ -629,12 +651,13 @@ fn resolve_job_with_window_fallback(
         new_proofs,
         known_proofs,
         validators,
-        &derived.window,
+        window,
     );
-    if primary.is_some() || derived.narrowed {
+    if primary.is_some() || config.skip_redundant {
         return primary;
     }
     metrics::inc_aggregation_window_fallback();
+    let committee_count = config.committee_count;
     let full = SubnetWindow::new(0, committee_count.max(1), committee_count);
     resolve_job(
         hashed,
@@ -837,60 +860,102 @@ pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 
     seen.len() as u64
 }
 
-/// The window width for a pool whose best proof has reach `max_reach`.
+/// The window width for an anchor proof of reach `anchor_reach`.
 ///
-/// Wide enough to hold two proofs at the current level, capped at the
+/// Wide enough to hold two proofs at the anchor's level, capped at the
 /// committee count, so the window only widens after the pool has actually
-/// climbed. An empty pool has nothing to merge, so it sits at the narrowest
-/// width and the aggregator falls back to its own raw signatures; the current
-/// slot's own candidate is the common case of this, since nothing has been
-/// published for it yet (see [`window_for_candidate`]).
+/// climbed. A reach of 0 means no anchor was found, so there is nothing to
+/// merge on our subnet and the window sits at its narrowest, leaving the
+/// aggregator to its own raw signatures. The current slot's own candidate is
+/// the common case of this, since nothing has been published for it yet (see
+/// [`window_for_candidate`]).
 ///
 /// Deriving the width instead of choosing it is what makes the scheme work:
 /// windows nest, so "use the widest window that yields a viable job" would
 /// collapse to the full committee set for every aggregator the first time a
 /// data root is aggregated.
-pub(crate) fn window_width(max_reach: u64, committee_count: u64) -> u64 {
-    if committee_count == 0 || max_reach == 0 {
+pub(crate) fn window_width(anchor_reach: u64, committee_count: u64) -> u64 {
+    if committee_count == 0 || anchor_reach == 0 {
         return 1;
     }
-    max_reach.saturating_mul(2).min(committee_count)
+    anchor_reach.saturating_mul(2).min(committee_count)
 }
 
-/// Narrow `width` to the widest level this duty subnet owns in `slot`, when
-/// `--skip-redundant-aggregation` is on.
+/// The reach of the proof this aggregator anchors its window on: the
+/// largest-coverage proof in the pool that touches `duty_subnet`. Zero when
+/// the pool holds nothing on that subnet.
 ///
-/// At width `w` the non-overlapping tiling of the committee set starts at
-/// multiples of `w`, rotated by `slot % w`, so the owner test is
-/// `duty_subnet % w == slot % w`. An aggregator that does not own the derived
-/// width halves down until it owns one. Width 1 is owned by everyone, so the
-/// raw-signature path is never skipped and only the recursive levels rotate.
+/// Anchoring on a proof that covers our own subnet, rather than on the
+/// widest proof anywhere in the pool, does two things. It ties the window to
+/// a level we can actually contribute to, and it makes "no anchor" mean "no
+/// peer has covered my subnet", which is precisely when this aggregator's
+/// raw signatures are irreplaceable and it should be aggregating them rather
+/// than merging other aggregators' proofs.
+///
+/// Coverage rather than reach picks the anchor, so a sparse proof spanning
+/// many subnets with a single validator in each no longer sets the width. A
+/// coverage tie falls to the larger reach, which keeps the derived width
+/// independent of the pool's iteration order.
+fn anchor_reach(
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+    duty_subnet: u64,
+    committee_count: u64,
+) -> u64 {
+    new_proofs
+        .iter()
+        .chain(known_proofs.iter())
+        .filter_map(|proof| anchor_key(&proof.participants, duty_subnet, committee_count))
+        .max()
+        .map_or(0, |(_coverage, reach)| reach)
+}
+
+/// `(coverage, reach)` for a proof that touches `duty_subnet`, or `None` when
+/// it does not. The ordering of this pair is the anchor ranking.
+///
+/// A committee count of 0 means no subnet structure, so every non-empty proof
+/// is an anchor and reach is 0 throughout; [`window_width`] floors the width
+/// either way.
+fn anchor_key(
+    bits: &AggregationBits,
+    duty_subnet: u64,
+    committee_count: u64,
+) -> Option<(usize, u64)> {
+    let mut coverage = 0usize;
+    let mut touches_duty = false;
+    for vid in validator_indices(bits) {
+        coverage += 1;
+        if committee_count == 0 || vid % committee_count == duty_subnet {
+            touches_duty = true;
+        }
+    }
+    // `subnet_reach` walks the bits a second time, but only for the proofs
+    // that are anchor candidates at all.
+    touches_duty.then(|| (coverage, subnet_reach(bits, committee_count)))
+}
+
+/// Whether `duty_subnet` owns the width-`width` tiling of the committee set
+/// in `slot`. Consulted only under `--skip-redundant-aggregation`, where a
+/// duty subnet that does not own a candidate's width sits that candidate out
+/// so its job budget goes to the next-best `AttestationData` instead.
+///
+/// At width `w` the non-overlapping tiling starts at multiples of `w`,
+/// rotated by `slot % w`, so the test is `duty_subnet % w == slot % w`. The
+/// rotation walks with the slot, so no duty subnet is permanently the one
+/// sitting out. Width 1 is owned by everyone, which is what keeps a candidate
+/// with no anchor on our subnet, the raw-signature case, from ever being
+/// skipped.
 ///
 /// When `w` does not divide the committee count the tiling is ragged at the
 /// wrap: a slot can leave a subnet uncovered at the widest level, or hand two
 /// duty subnets overlapping windows. Neither costs correctness, only a round
-/// of climbing or a round of duplicated work. `w` is also not necessarily a
-/// power of two, since `window_width` caps at the committee count, so the
-/// ladder truncates: 7 narrows to 3, then to 1. Each level is still an
-/// exclusive partition by residue, so ownership stays exclusive throughout.
-pub(crate) fn effective_width(
-    width: u64,
-    duty_subnet: u64,
-    slot: u64,
-    skip_redundant: bool,
-) -> u64 {
+/// of climbing or a round of duplicated work.
+pub(crate) fn owns_width(duty_subnet: u64, slot: u64, width: u64) -> bool {
     // Floor at the narrowest window rather than trusting the caller: a width
-    // of 0 would idle the raw-signature path, which no configuration should
-    // be able to ask for.
+    // of 0 would divide by zero, and no configuration should be able to idle
+    // the raw-signature path.
     let width = width.max(1);
-    if !skip_redundant {
-        return width;
-    }
-    let mut w = width;
-    while w > 1 && duty_subnet % w != slot % w {
-        w /= 2;
-    }
-    w
+    duty_subnet % width == slot % width
 }
 
 /// Maximum number of existing proofs reused as children in a single
@@ -1199,11 +1264,12 @@ mod tests {
         assert_eq!(window_width(1, 1), 1);
     }
 
-    /// The derived width does not depend on which subnets an aggregator owns.
-    /// Two aggregators holding the same pool must agree on it, or the
-    /// reduction tree desynchronizes across the network.
+    /// The anchor is the largest-coverage proof touching the duty subnet, so
+    /// a duty subnet the pool does not reach gets no anchor and therefore the
+    /// narrowest window: the aggregator is left to its own raw signatures
+    /// rather than merging proofs it has no stake in.
     #[test]
-    fn window_width_is_independent_of_the_duty_subnet() {
+    fn window_width_follows_the_anchor_on_the_duty_subnet() {
         let pool = [
             SingleMessageAggregate::empty(make_bits(&[0, 4])),
             SingleMessageAggregate::empty(make_bits(&[1, 5])),
@@ -1217,15 +1283,73 @@ mod tests {
                     skip_redundant: false,
                 };
                 window_for_candidate(&pool, &[], WINDOW_TEST_SLOT, config)
-                    .window
+                    .expect("no rotation without the flag")
                     .width()
             })
             .collect();
 
         assert_eq!(
             widths,
-            vec![2, 2, 2, 2],
-            "reach-1 pool gives width 2 for every duty subnet"
+            vec![2, 2, 1, 1],
+            "subnets 0 and 1 have a reach-1 anchor; 2 and 3 have none"
+        );
+    }
+
+    /// Coverage, not reach, picks the anchor. A sparse proof spanning every
+    /// subnet with one validator each would otherwise set the width to the
+    /// committee count for every aggregator and switch the window off
+    /// network-wide.
+    #[test]
+    fn a_sparse_wide_proof_does_not_set_the_width() {
+        let pool = [
+            // Reach 4, coverage 4: one validator in each subnet.
+            SingleMessageAggregate::empty(make_bits(&[0, 1, 2, 3])),
+            // Reach 1, coverage 6: subnet 0 only, but far more of it.
+            SingleMessageAggregate::empty(make_bits(&[0, 4, 8, 12, 16, 20])),
+        ];
+
+        assert_eq!(
+            anchor_reach(&pool, &[], 0, 4),
+            1,
+            "the denser proof anchors"
+        );
+        assert_eq!(window_width(anchor_reach(&pool, &[], 0, 4), 4), 2);
+
+        // Subnet 1 is only in the sparse proof, so there it does set the width.
+        assert_eq!(anchor_reach(&pool, &[], 1, 4), 4);
+    }
+
+    /// A pool with nothing on the duty subnet has no anchor at all.
+    #[test]
+    fn anchor_reach_is_zero_without_a_proof_on_the_duty_subnet() {
+        let pool = [
+            SingleMessageAggregate::empty(make_bits(&[0, 4])),
+            SingleMessageAggregate::empty(make_bits(&[1, 5])),
+        ];
+        assert_eq!(anchor_reach(&pool, &[], 2, 4), 0);
+        assert_eq!(window_width(0, 4), 1, "which floors the window");
+    }
+
+    /// A coverage tie falls to the larger reach, so the width does not depend
+    /// on which order the pool happens to be iterated in.
+    #[test]
+    fn anchor_reach_breaks_a_coverage_tie_on_reach() {
+        let narrow = SingleMessageAggregate::empty(make_bits(&[0, 4]));
+        let wide = SingleMessageAggregate::empty(make_bits(&[0, 1]));
+
+        assert_eq!(anchor_reach(&[narrow.clone(), wide.clone()], &[], 0, 4), 2);
+        assert_eq!(anchor_reach(&[wide, narrow], &[], 0, 4), 2);
+    }
+
+    /// The known set is searched for an anchor alongside the new set.
+    #[test]
+    fn anchor_reach_spans_both_proof_sets() {
+        let new = [SingleMessageAggregate::empty(make_bits(&[1, 5]))];
+        let known = [SingleMessageAggregate::empty(make_bits(&[0, 1]))];
+        assert_eq!(
+            anchor_reach(&new, &known, 0, 4),
+            2,
+            "only `known` reaches 0"
         );
     }
 
@@ -1234,30 +1358,39 @@ mod tests {
     /// validates the upper bound of `--aggregate-subnet-ids`, so this is
     /// reachable from the CLI.
     ///
-    /// Committee count 3 is load-bearing: the rotation halves on a width that
-    /// does not divide it, so an unreduced duty subnet 4 owns width 2 at slot
-    /// 0 while its reduced twin 1 narrows to 1. At a committee count the width
-    /// divides, both rotate identically and the bug hides.
+    /// Reduction is load-bearing twice over. Unreduced, duty subnet 4 matches
+    /// no validator's subnet at committee count 3, so it would find no anchor
+    /// and sit at width 1; and at a width that does not divide the committee
+    /// count it would rotate on different slots from its reduced twin. Slot 1
+    /// separates both from the reduced answer: subnet 1 anchors at reach 1,
+    /// so width 2, which it owns at slot 1 but not at slot 0.
     #[test]
     fn window_for_candidate_reduces_an_out_of_range_duty_subnet() {
         let pool = [
             SingleMessageAggregate::empty(make_bits(&[0])),
             SingleMessageAggregate::empty(make_bits(&[1])),
         ];
-        let derived = |duty_subnet: u64| {
+        let derived = |slot: u64, duty_subnet: u64| {
             let config = AggregationWindowConfig {
                 duty_subnet,
                 committee_count: 3,
                 skip_redundant: true,
             };
-            window_for_candidate(&pool, &[], 0, config).window
+            window_for_candidate(&pool, &[], slot, config)
         };
 
-        assert_eq!(derived(4).width(), derived(1).width());
+        assert_eq!(derived(0, 4), derived(0, 1), "4 reduces to 1 at slot 0");
         assert_eq!(
-            derived(4),
-            derived(1),
-            "4 reduces to 1 at committee count 3"
+            derived(0, 1),
+            None,
+            "subnet 1 does not own width 2 at slot 0"
+        );
+
+        assert_eq!(derived(1, 4), derived(1, 1), "4 reduces to 1 at slot 1");
+        assert_eq!(
+            derived(1, 1),
+            Some(SubnetWindow::new(1, 2, 3)),
+            "unreduced, 4 would find no anchor and sit at width 1 instead"
         );
     }
 
@@ -1463,77 +1596,77 @@ mod tests {
         );
     }
 
-    // ---- effective width and the ownership rotation ----
+    // ---- the ownership rotation ----
 
-    /// Without the flag, the derived width is used as-is.
+    /// At a given width the owners tile the committee set: they are spaced a
+    /// full width apart, so their windows are disjoint. Eight duty subnets at
+    /// width 4 put two owners in each slot, which tells a tiling apart from
+    /// "exactly one owner".
     #[test]
-    fn effective_width_is_the_base_width_when_not_skipping() {
-        for duty_subnet in 0..4 {
-            for slot in 0..4 {
-                assert_eq!(effective_width(4, duty_subnet, slot, false), 4);
-            }
-        }
-    }
-
-    /// With the flag, an aggregator works at the derived width only when it
-    /// owns the phase for that width, and otherwise halves down until it does.
-    /// Width 1 is always owned, so raw-signature aggregation is never skipped.
-    /// Widening to eight duty subnets puts two owners in each slot, spaced a
-    /// full width apart, so the test can tell the tiling apart from "exactly
-    /// one owner".
-    #[test]
-    fn effective_width_rotates_which_aggregator_works_widest() {
-        let row = |slot: u64| {
+    fn owners_tile_the_committee_set_at_a_given_width() {
+        let owners = |slot: u64| {
             (0..8)
-                .map(|duty_subnet| effective_width(4, duty_subnet, slot, true))
-                .collect::<Vec<_>>()
+                .filter(|&duty_subnet| owns_width(duty_subnet, slot, 4))
+                .collect::<Vec<u64>>()
         };
 
-        // Two owners per slot, spaced a full width apart, so their windows
-        // are disjoint.
-        assert_eq!(row(0), vec![4, 1, 2, 1, 4, 1, 2, 1]);
-        assert_eq!(row(1), vec![1, 4, 1, 2, 1, 4, 1, 2]);
-        assert_eq!(row(2), vec![2, 1, 4, 1, 2, 1, 4, 1]);
-        assert_eq!(row(3), vec![1, 2, 1, 4, 1, 2, 1, 4]);
+        assert_eq!(owners(0), vec![0, 4]);
+        assert_eq!(owners(1), vec![1, 5]);
+        assert_eq!(owners(2), vec![2, 6]);
+        assert_eq!(owners(3), vec![3, 7]);
     }
 
-    /// Every duty subnet gets the widest slot in turn: over C slots each one
-    /// reaches the full width exactly once.
+    /// Every duty subnet gets its turn: over `width` slots each one owns the
+    /// level exactly once, so none is permanently the one sitting out.
     #[test]
-    fn effective_width_gives_every_aggregator_a_turn() {
+    fn ownership_gives_every_aggregator_a_turn() {
         for duty_subnet in 0..4u64 {
-            let widest_slots: Vec<u64> = (0..4)
-                .filter(|&slot| effective_width(4, duty_subnet, slot, true) == 4)
+            let owned_slots: Vec<u64> = (0..4)
+                .filter(|&slot| owns_width(duty_subnet, slot, 4))
                 .collect();
-            assert_eq!(widest_slots, vec![duty_subnet]);
+            assert_eq!(owned_slots, vec![duty_subnet]);
         }
     }
 
-    /// Narrowing bottoms out at 1: width 1 is owned by every aggregator in
-    /// every slot, and a degenerate 0 floors to 1 rather than idling the
-    /// raw-signature path.
+    /// Width 1 is owned by every aggregator in every slot, so a candidate
+    /// with no anchor on our subnet, which is the raw-signature case, is
+    /// never skipped. A degenerate 0 floors to 1 rather than dividing by
+    /// zero.
     #[test]
-    fn effective_width_never_narrows_below_one() {
+    fn the_narrowest_width_is_owned_by_everyone() {
         for duty_subnet in 0..4 {
             for slot in 0..8 {
-                assert_eq!(effective_width(1, duty_subnet, slot, true), 1);
-                assert_eq!(effective_width(0, duty_subnet, slot, true), 1);
-                assert_eq!(effective_width(0, duty_subnet, slot, false), 1);
+                assert!(owns_width(duty_subnet, slot, 1));
+                assert!(owns_width(duty_subnet, slot, 0));
             }
         }
     }
 
-    /// Widths capped at an odd committee count truncate as they halve, and
-    /// every level is still an exclusive partition by residue.
+    /// A width that does not divide the committee count still partitions the
+    /// duty subnets by residue, so every one of them owns the level exactly
+    /// once per `width` slots. The tiling is only ragged in how many owners a
+    /// slot has: at committee count 7 and width 4 the residue class `{3}` has
+    /// a single member below 7 while the others have two.
     #[test]
-    fn effective_width_halves_through_non_power_of_two_widths() {
-        for slot in 0..7u64 {
-            let widths: Vec<u64> = (0..7)
-                .map(|duty_subnet| effective_width(7, duty_subnet, slot, true))
-                .collect();
-            assert_eq!(widths.iter().filter(|&&w| w == 7).count(), 1);
-            assert!(widths.iter().all(|&w| [1, 3, 7].contains(&w)));
+    fn ownership_is_exclusive_at_a_non_dividing_width() {
+        const COMMITTEE_COUNT: u64 = 7;
+        const WIDTH: u64 = 4;
+
+        for duty_subnet in 0..COMMITTEE_COUNT {
+            let owned = (0..WIDTH)
+                .filter(|&slot| owns_width(duty_subnet, slot, WIDTH))
+                .count();
+            assert_eq!(owned, 1, "duty subnet {duty_subnet} owns one slot in four");
         }
+
+        let owners_per_slot: Vec<usize> = (0..WIDTH)
+            .map(|slot| {
+                (0..COMMITTEE_COUNT)
+                    .filter(|&d| owns_width(d, slot, WIDTH))
+                    .count()
+            })
+            .collect();
+        assert_eq!(owners_per_slot, vec![2, 2, 2, 1], "ragged at the wrap");
     }
 
     /// A cheap-but-real XMSS signature (tiny lifetime, cached) for tests that
@@ -2126,34 +2259,57 @@ mod tests {
         validator_count: usize,
         participant_sets: &[AggregationBits],
     ) -> Store {
+        let (mut store, hashes) = window_test_store(validator_count);
+        let att_data = window_test_att_data(&store, WINDOW_TEST_SLOT, &hashes);
+        insert_payload_only_candidate(&mut store, att_data, participant_sets);
+        store
+    }
+
+    /// The chain the subnet-window tests run against: head at
+    /// [`WINDOW_TEST_SLOT`], with `hashes[i]` the block root at slot `i`.
+    fn window_test_store(validator_count: usize) -> (Store, Vec<H256>) {
         let hashes: Vec<H256> = (0..WINDOW_TEST_SLOT)
             .map(|i| H256([(i + 1) as u8; 32]))
             .collect();
-        let mut store = new_test_store(make_head_state(WINDOW_TEST_SLOT, validator_count, &hashes));
-        let head_root = store.head().expect("head read works");
+        let store = new_test_store(make_head_state(WINDOW_TEST_SLOT, validator_count, &hashes));
+        (store, hashes)
+    }
 
-        let head = Checkpoint {
-            root: head_root,
-            slot: WINDOW_TEST_SLOT,
+    /// A vote for the canonical block at `slot`, sourced at genesis. Distinct
+    /// slots give distinct data roots, so a test can put more than one
+    /// candidate in front of `snapshot_aggregation_inputs`.
+    fn window_test_att_data(store: &Store, slot: u64, hashes: &[H256]) -> AttestationData {
+        let root = if slot == WINDOW_TEST_SLOT {
+            store.head().expect("head read works")
+        } else {
+            hashes[slot as usize]
         };
-        let att_data = AttestationData {
-            slot: WINDOW_TEST_SLOT,
-            head,
-            target: head,
+        let checkpoint = Checkpoint { root, slot };
+        AttestationData {
+            slot,
+            head: checkpoint,
+            target: checkpoint,
             source: Checkpoint {
                 root: hashes[0],
                 slot: 0,
             },
-        };
-        let hashed = HashedAttestationData::new(att_data);
+        }
+    }
 
+    /// Bind `participant_sets` to `att_data` as payload-only proofs, making
+    /// one aggregation candidate whose pool is exactly those proofs.
+    fn insert_payload_only_candidate(
+        store: &mut Store,
+        att_data: AttestationData,
+        participant_sets: &[AggregationBits],
+    ) {
+        let hashed = HashedAttestationData::new(att_data);
         for bits in participant_sets {
             store.insert_new_aggregated_payload(
                 hashed.clone(),
                 SingleMessageAggregate::empty(bits.clone()),
             );
         }
-        store
     }
 
     /// Two aggregators on different duty subnets, given the same pool of
@@ -2311,11 +2467,78 @@ mod tests {
         );
     }
 
+    /// A skipped candidate hands its job budget to the next-best
+    /// `AttestationData` rather than being downgraded to a narrower merge of
+    /// its own. Two candidates, one job:
+    ///
+    /// - the current-slot candidate's pool is reach-2, so width 4, which at
+    ///   [`WINDOW_TEST_SLOT`] only duty subnet 0 owns;
+    /// - the stale candidate's pool is reach-1, so width 2, which duty
+    ///   subnets 0 and 2 own at that slot.
+    ///
+    /// Duty subnet 2 therefore skips the current-slot candidate that
+    /// outranks everything (current-slot groups always precede stale ones)
+    /// and spends its one job on the stale candidate instead.
+    #[test]
+    fn a_skipped_candidate_hands_its_budget_to_the_next_best() {
+        const STALE_SLOT: u64 = WINDOW_TEST_SLOT - 1;
+
+        let (mut store, hashes) = window_test_store(WINDOW_TEST_VALIDATORS);
+        // The stale candidate votes for a block below the tip, which
+        // `entry_passes_filters` looks up in `get_block_roots` rather than in
+        // the state's `historical_block_hashes`.
+        insert_test_block(
+            &mut store,
+            hashes[STALE_SLOT as usize],
+            STALE_SLOT,
+            hashes[STALE_SLOT as usize - 1],
+        );
+        let current = window_test_att_data(&store, WINDOW_TEST_SLOT, &hashes);
+        let stale = window_test_att_data(&store, STALE_SLOT, &hashes);
+        let current_pool = [make_bits(&[0, 4, 1, 5]), make_bits(&[2, 6, 3, 7])];
+        let stale_pool = [
+            make_bits(&[0, 4]),
+            make_bits(&[1, 5]),
+            make_bits(&[2, 6]),
+            make_bits(&[3, 7]),
+        ];
+        insert_payload_only_candidate(&mut store, current, &current_pool);
+        insert_payload_only_candidate(&mut store, stale, &stale_pool);
+
+        let job_slot = |duty_subnet: u64, skip_redundant: bool| -> Option<u64> {
+            let config = AggregationWindowConfig {
+                duty_subnet,
+                committee_count: 4,
+                skip_redundant,
+            };
+            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+                .map(|snapshot| snapshot.jobs[0].hashed.data().slot)
+        };
+
+        assert_eq!(
+            job_slot(2, false),
+            Some(WINDOW_TEST_SLOT),
+            "without the flag the current-slot candidate always wins the budget"
+        );
+        assert_eq!(
+            job_slot(2, true),
+            Some(STALE_SLOT),
+            "duty 2 does not own width 4, so its budget moves to the next best"
+        );
+        assert_eq!(
+            job_slot(0, true),
+            Some(WINDOW_TEST_SLOT),
+            "duty 0 owns width 4 at this slot and keeps the better candidate"
+        );
+    }
+
     /// With the redundancy-skipping rotation on, a duty subnet that does not
-    /// own the derived width narrows to 1, which leaves a single scoring proof
-    /// and therefore no viable job at all. Those aggregators fall back to
-    /// their own raw signatures in production; here the pool is payload-only,
-    /// so the session is simply empty for them.
+    /// own the derived width sits the candidate out so its job budget can go
+    /// to the next-best `AttestationData`. Here that candidate is the only
+    /// one, so the session is simply empty for those aggregators; in
+    /// production the budget lands on the current slot's own candidate, whose
+    /// empty pool gives it no anchor and therefore width 1, which everybody
+    /// owns.
     #[test]
     fn skip_redundant_leaves_unowned_duty_subnets_without_a_job() {
         let pool = [
@@ -2344,11 +2567,11 @@ mod tests {
         );
         assert!(
             snapshot_for(1).is_none(),
-            "duty 1 narrows to 1: nothing to merge"
+            "duty 1 does not own width 2 at this slot"
         );
         assert!(
             snapshot_for(3).is_none(),
-            "duty 3 narrows to 1: nothing to merge"
+            "duty 3 does not own width 2 at this slot"
         );
     }
 

@@ -92,23 +92,24 @@ pub(crate) struct NodeOptions {
     /// validators span all subnets.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
-    /// Narrow recursive aggregation to the widest level this node's duty
-    /// subnet owns in the slot. Requires --is-aggregator.
+    /// Sit out aggregation candidates whose level another duty subnet owns
+    /// this slot. Requires --is-aggregator.
     ///
     /// By default every aggregator merges proofs for a window of subnets
     /// starting at its duty subnet, and windows belonging to neighbouring duty
     /// subnets overlap, so some prover work is duplicated. With this flag an
-    /// aggregator only works at a width whose tiling it owns in the current
-    /// slot, and otherwise falls back to a narrower one. The owner rotates
-    /// with the slot, so no node is permanently the one sitting out, and the
-    /// narrowest width is owned by everyone, so per-subnet aggregation of raw
-    /// signatures is never skipped.
+    /// aggregator skips a candidate whose width it does not own in the current
+    /// slot and spends that job on the next-best attestation data instead. The
+    /// owner rotates with the slot, so no node is permanently the one sitting
+    /// out, and the narrowest width is owned by everyone, so a candidate whose
+    /// pool holds nothing on this node's subnet, which is the raw-signature
+    /// case, is never skipped.
     ///
     /// Worth enabling when leanVM prover CPU is the bottleneck on co-located
-    /// aggregators. The cost is that the widest level in a given slot has a
-    /// single producer, so a node that is down or late forfeits that slot's
-    /// widest merge; the narrower levels still run and the next slot rotates
-    /// to a different owner.
+    /// aggregators. The cost is that a level in a given slot has few
+    /// producers, so a node that is down or late forfeits that slot's merge at
+    /// its level; the narrower levels still run and the next slot rotates to a
+    /// different owner.
     #[arg(long, default_value = "false", requires = "is_aggregator")]
     pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage
