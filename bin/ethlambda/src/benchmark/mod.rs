@@ -162,6 +162,12 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
     let crypto = if common.mock_crypto {
         CryptoMode::Mock
     } else {
+        // Compile the aggregation bytecode before anything proves, exactly as
+        // the node does at startup: leanVM panics on the first prove otherwise.
+        // Without the arena, matching the node's default: the arena keeps the
+        // prover's buffers resident, which would make the benchmark measure a
+        // configuration the node only runs under --prover-arena.
+        ethlambda_crypto::init_leanvm(false);
         let keys = keys::KeySet::generate(
             options.seed,
             options.num_validators,
