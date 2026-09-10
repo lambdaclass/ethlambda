@@ -110,6 +110,19 @@ pub(crate) struct NodeOptions {
     /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
+    /// Prove on leanVM's bump arena instead of the system allocator.
+    ///
+    /// Buys proving throughput with memory: the arena's slabs stay faulted in
+    /// across proofs (a phase reset abandons their contents, it does not return
+    /// the pages), and on Linux it also stops glibc trimming its own heap. RSS
+    /// therefore ratchets up to the process's allocation high-water mark and
+    /// stays there for the lifetime of the node. Off by default so a long-lived
+    /// node keeps bounded memory; worth enabling on hosts with memory to spare
+    /// where proving latency is the constraint.
+    ///
+    /// Read once at startup: the allocator is fixed before the first proof.
+    #[arg(long, default_value = "false")]
+    pub(crate) prover_arena: bool,
     /// Maximum number of distinct attestations to pack when building a block.
     ///
     /// Bounds how many distinct `AttestationData` entries the proposer includes

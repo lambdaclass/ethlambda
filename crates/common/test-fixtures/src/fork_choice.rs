@@ -138,8 +138,8 @@ pub struct AttestationStepData {
 /// steps (leanSpec PR #717 schema).
 ///
 /// `participants` arrives as `{ data: [bool, ...] }` and `proof` as
-/// `{ data: "0x<hex>" }`; the latter is the lean-multisig single-message
-/// aggregate `compress_without_pubkeys()` bytes for that AttestationData.
+/// `{ data: "0x<hex>" }`; the latter is the leanVM single-message
+/// aggregate `to_bytes_without_pubkeys()` bytes for that AttestationData.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProofStepData {

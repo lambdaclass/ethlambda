@@ -173,15 +173,15 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Catch XMSS keys up to the current slot before the first tick
+        // Warm the XMSS signing caches for the current slot before the first tick.
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap we need to catch up through
+        // exactly the gap the first duty will be at
         let now_ms = unix_now_ms();
         let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
             / time_config.milliseconds_per_slot) as u32;
-        key_manager.advance_keys_to(current_slot);
+        key_manager.prepare_keys_for(current_slot);
 
         let handle = BlockChainServer {
             store,
@@ -474,8 +474,8 @@ impl BlockChainServer {
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
 
-        // Advance XMSS keys for next slot so the signing paths don't have to
-        self.key_manager.advance_keys_to((slot + 1) as u32);
+        // Warm the XMSS signing caches for the next slot so the signing paths don't have to
+        self.key_manager.prepare_keys_for((slot + 1) as u32);
     }
 
     /// Kick off a committee-signature aggregation session:

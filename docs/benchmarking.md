@@ -40,7 +40,7 @@ second, which is why CI can afford to run one on every pull request.
 | `--iterations` | `10` | Measured builds, one block each |
 | `--proofs-per-data` | `1` | Aggregates seeded per `AttestationData`, mimicking committee aggregators over disjoint validator subsets |
 | `--seed` | `42` | Seed for the validator set and its XMSS keys; fixes the whole run |
-| `--key-cache <dir>` | — | Cache the seed-derived XMSS keys on disk (keyed by leansig revision, seed, validator index and run length). Real crypto only |
+| `--key-cache <dir>` | — | Cache the seed-derived XMSS keys on disk (keyed by leanVM revision, seed, validator index and run length). Real crypto only |
 | `--mock-crypto` | off | Placeholder proofs instead of real XMSS/leanVM signatures, and no seal. Measures selection, compaction and the state transition only |
 | `--enable-proposer-aggregation` | off | Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation |
 | `--max-attestations-per-block` | `3` | Mirrors the node flag: distinct `AttestationData` per block |
@@ -97,7 +97,7 @@ otherwise, because a mis-attributed report is worse than no report.
 Block-building benchmark — synthetic workload (real crypto)
   validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=362a7c9b os=macos arch=aarch64 threads=14
 
   iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
   1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33
@@ -115,7 +115,7 @@ Block-building benchmark — synthetic workload (real crypto)
 ```
 
 Every measured iteration gets its own row, and the summary follows below it.
-Outliers are never discarded: XMSS signing and OTS window advancement produce
+Outliers are never discarded: XMSS signing and its Merkle-subtree cache misses produce
 legitimate heavy tails, and hiding them would misrepresent the thing being
 measured. A coefficient of variation above 10% is flagged so a noisy run is not
 mistaken for a result.
@@ -136,12 +136,11 @@ Same seed and same parameters produce identical root sequences, so a baseline
 and a candidate can be diffed directly. The header line exists to tell you when
 they *cannot* be compared:
 
-- `leansig` and `leanvm` are the resolved revisions the binary was built
-  against, read from `Cargo.lock` at build time. leanSig tracks a moving branch
-  and leanVM performs the signature aggregation, so either one moving changes
-  the measured crypto. Real-mode roots also depend on the seed-derived keys, so
-  the same seed on the same leansig revision reproduces the same signatures and
-  the same roots.
+- `leanvm` is the resolved revision the binary was built against, read from
+  `Cargo.lock` at build time. leanVM owns the whole signature stack (XMSS and
+  aggregation), so a rev bump changes the measured crypto. Real-mode roots also
+  depend on the seed-derived keys, so the same seed on the same leanVM revision
+  reproduces the same signatures and the same roots.
 - `os`, `arch` and `threads` change results across machines.
 
 Two reports that disagree on any of those are not measuring the same thing.

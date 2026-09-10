@@ -24,6 +24,7 @@
 
 use std::collections::HashSet;
 
+use ethlambda_crypto::SignerSet;
 use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -71,11 +72,11 @@ pub fn reaggregate_from_block(
     let validators = &parent_state.validators;
     let num_validators = validators.len() as u64;
 
-    // Per-component pubkeys: one entry per body attestation in order, then
-    // the proposer entry. Layout is invariant per block, so it's resolved
-    // once and reused for every split call below.
-    let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(attestations.len() + 1);
+    // The claims the merged proof carries: one per body attestation in order,
+    // then the proposer's. The layout is invariant per block, so it is resolved
+    // once and reused for every split call below. Every split needs all of
+    // them, since none is on the wire and the decode rebuilds the whole set.
+    let mut components: Vec<SignerSet> = Vec::with_capacity(attestations.len() + 1);
     for att in &attestations {
         let mut pubkeys = Vec::new();
         for vid in validator_indices(&att.aggregation_bits) {
@@ -91,7 +92,14 @@ pub fn reaggregate_from_block(
             };
             pubkeys.push(pk);
         }
-        pubkeys_per_component.push(pubkeys);
+        let Ok(att_slot) = u32::try_from(att.data.slot) else {
+            warn!(
+                slot = att.data.slot,
+                "Reaggregation aborted: attestation slot out of range"
+            );
+            return Vec::new();
+        };
+        components.push(SignerSet::new(att.data.hash_tree_root(), att_slot, pubkeys));
     }
     if block.proposer_index >= num_validators {
         return Vec::new();
@@ -101,7 +109,18 @@ pub fn reaggregate_from_block(
     else {
         return Vec::new();
     };
-    pubkeys_per_component.push(vec![proposer_pubkey]);
+    let Ok(block_slot) = u32::try_from(block.slot) else {
+        warn!(
+            slot = block.slot,
+            "Reaggregation aborted: block slot out of range"
+        );
+        return Vec::new();
+    };
+    components.push(SignerSet::new(
+        block.hash_tree_root(),
+        block_slot,
+        vec![proposer_pubkey],
+    ));
 
     let candidates = select_candidates(store, &attestations);
     if candidates.is_empty() {
@@ -117,17 +136,15 @@ pub fn reaggregate_from_block(
     for candidate in candidates {
         let att = &attestations[candidate.idx];
         let data_root = candidate.data_root;
-        let slot_u32: u32 = match att.data.slot.try_into() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
+        // Already range-checked while the claims were resolved above.
+        let slot_u32 = components[candidate.idx].slot;
 
         // Step 1: SNARK-split this attestation's component out of the block's
         // merged multi-message aggregate proof.
         let merged_bytes = signed_block.proof.proof_bytes();
         let split_bytes = match ethlambda_crypto::split_type_2_by_message(
             merged_bytes,
-            pubkeys_per_component.clone(),
+            &components,
             &data_root,
         ) {
             Ok(bytes) => bytes,
@@ -152,7 +169,7 @@ pub fn reaggregate_from_block(
 
             // First child: the split-from-block proof, paired with the
             // pubkeys derived from the block attestation's participant set.
-            let block_att_pubkeys = pubkeys_per_component[candidate.idx].clone();
+            let block_att_pubkeys = components[candidate.idx].public_keys.clone();
             children.push((block_att_pubkeys, split_bytes));
 
             // Remaining children: local partial single-message aggregates for the same data.
