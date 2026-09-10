@@ -15,7 +15,10 @@ use std::{
     time::Instant,
 };
 
-use ethlambda_crypto::{aggregate_proofs, signature::ValidatorPublicKey};
+use ethlambda_crypto::{
+    AggregationError, aggregate_proofs, aggregate_signatures, merge_type_1s_into_type_2,
+    signature::{SignatureParseError, ValidatorPublicKey, ValidatorSignature},
+};
 use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
     slot_is_justifiable_after,
@@ -23,14 +26,22 @@ use ethlambda_state_transition::{
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
-    block::{AggregatedAttestations, Block, BlockBody, SingleMessageAggregate},
+    block::{
+        AggregatedAttestations, Block, BlockBody, MultiMessageAggregate,
+        MultiMessageAggregateError, SignedBlock, SingleMessageAggregate,
+    },
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
-    state::{JustifiedSlots, State},
+    state::{JustifiedSlots, State, Validator},
 };
 use tracing::{info, trace};
 
-use crate::{MAX_ATTESTATIONS_DATA, metrics, store::StoreError};
+use crate::{
+    MAX_ATTESTATIONS_DATA,
+    key_manager::{KeyManager, KeyManagerError},
+    metrics,
+    store::StoreError,
+};
 
 /// Post-block checkpoints extracted from the state transition in `build_block`.
 ///
@@ -665,20 +676,7 @@ fn compact_attestations(
         let children: Vec<(Vec<_>, _)> = group_items
             .iter()
             .map(|(_, proof)| {
-                let pubkeys = proof
-                    .participant_indices()
-                    .map(|vid| {
-                        let not_in_state = StoreError::ValidatorNotInState {
-                            validator_index: vid,
-                        };
-                        let validator = head_state
-                            .validators
-                            .get(vid as usize)
-                            .ok_or(not_in_state)?;
-                        ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
-                            .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let pubkeys = resolve_attestation_pubkeys(&head_state.validators, proof)?;
                 Ok((pubkeys, proof.proof.clone()))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
@@ -887,6 +885,116 @@ fn trace_skipped_attestation(reason: &'static str, att: &AttestationData, data_r
     );
 }
 
+/// Decode the attestation pubkeys of a proof's participants from the state.
+fn resolve_attestation_pubkeys(
+    validators: &[Validator],
+    proof: &SingleMessageAggregate,
+) -> Result<Vec<ValidatorPublicKey>, StoreError> {
+    proof
+        .participant_indices()
+        .map(|vid| {
+            let validator =
+                validators
+                    .get(vid as usize)
+                    .ok_or(StoreError::ValidatorNotInState {
+                        validator_index: vid,
+                    })?;
+            ValidatorPublicKey::from_bytes(&validator.attestation_pubkey)
+                .map_err(|_| StoreError::PubkeyDecodingFailed(vid))
+        })
+        .collect()
+}
+
+/// Why sealing a built block failed.
+#[derive(Debug, thiserror::Error)]
+pub enum SealError {
+    #[error("failed to sign block root: {0}")]
+    Signing(#[from] KeyManagerError),
+    #[error("proposer index {0} out of range")]
+    ProposerOutOfRange(u64),
+    #[error("failed to decode proposer proposal pubkey: {0}")]
+    ProposerPubkey(SignatureParseError),
+    #[error("failed to decode proposer signature bytes: {0}")]
+    ProposerSignature(SignatureParseError),
+    #[error("failed to resolve participant pubkeys: {0}")]
+    Participants(#[from] StoreError),
+    #[error("failed to wrap proposer signature as single-message aggregate: {0}")]
+    Wrap(AggregationError),
+    #[error("failed to merge single-message aggregates into a multi-message aggregate: {0}")]
+    Merge(AggregationError),
+    #[error("failed to build multi-message aggregate: {0}")]
+    Decode(#[from] MultiMessageAggregateError),
+}
+
+/// Seal a built block into a `SignedBlock`: sign the block root with the
+/// proposer's proposal key, wrap that raw XMSS signature into a singleton
+/// single-message aggregate SNARK, then merge it with every attestation
+/// single-message aggregate into the block's single multi-message aggregate.
+///
+/// `single_message_aggregates` are the proofs `build_block` returned alongside
+/// `block`, in the same order as `block.body.attestations`; they are consumed
+/// so their proof bytes move into the merge instead of being copied.
+/// Per-component participants are rederived at verify time from those
+/// attestations' `aggregation_bits` plus `block.proposer_index`, so nothing
+/// else needs persisting.
+///
+/// Each step is observed on the block-proposal phase histogram under
+/// [`metrics::BLOCK_PROPOSAL_SEAL_PHASES`].
+pub fn seal_block(
+    head_state: &State,
+    key_manager: &mut KeyManager,
+    block: Block,
+    single_message_aggregates: Vec<SingleMessageAggregate>,
+) -> Result<SignedBlock, SealError> {
+    let slot: u32 = block.slot.try_into().expect("slot exceeds u32");
+    let proposer_index = block.proposer_index;
+    let block_root = block.hash_tree_root();
+
+    let sign_start = Instant::now();
+    let proposer_signature = key_manager.sign_block_root(proposer_index, slot, &block_root)?;
+    metrics::observe_block_proposal_phase("sign_proposer", sign_start.elapsed());
+
+    let validators = &head_state.validators;
+    let proposer_validator = validators
+        .get(proposer_index as usize)
+        .ok_or(SealError::ProposerOutOfRange(proposer_index))?;
+
+    // Decode the proposer's proposal pubkey once and reuse it both for the
+    // singleton single-message aggregate wrap and for the multi-message
+    // aggregate merge inputs.
+    let proposer_pubkey = ValidatorPublicKey::from_bytes(&proposer_validator.proposal_pubkey)
+        .map_err(SealError::ProposerPubkey)?;
+    let proposer_validator_signature = ValidatorSignature::from_bytes(&proposer_signature)
+        .map_err(SealError::ProposerSignature)?;
+
+    let wrap_start = Instant::now();
+    let proposer_proof_bytes = aggregate_signatures(
+        vec![proposer_pubkey.clone()],
+        vec![proposer_validator_signature],
+        &block_root,
+        slot,
+    )
+    .map_err(SealError::Wrap)?;
+    metrics::observe_block_proposal_phase("wrap_proposer", wrap_start.elapsed());
+
+    let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len() + 1);
+    for sma in single_message_aggregates {
+        let pubkeys = resolve_attestation_pubkeys(validators, &sma)?;
+        merge_inputs.push((pubkeys, sma.proof));
+    }
+    merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+
+    let merge_start = Instant::now();
+    let merged_bytes = merge_type_1s_into_type_2(merge_inputs).map_err(SealError::Merge)?;
+    let proof = MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice())?;
+    metrics::observe_block_proposal_phase("merge_type2", merge_start.elapsed());
+
+    Ok(SignedBlock {
+        message: block,
+        proof,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -972,7 +1080,7 @@ mod tests {
     fn build_block_caps_attestation_data_entries() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz::SszEncode;
         use libssz_types::SszList;
@@ -1008,7 +1116,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1134,7 +1242,7 @@ mod tests {
     fn build_block_respects_configured_attestation_limit() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1165,7 +1273,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1266,7 +1374,7 @@ mod tests {
     fn build_block_without_proposer_aggregation_keeps_single_best_proof_per_data() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1294,7 +1402,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),
@@ -1568,7 +1676,7 @@ mod tests {
         use ethlambda_state_transition::justified_slots_ops;
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1601,7 +1709,7 @@ mod tests {
         };
 
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint {
@@ -1697,7 +1805,7 @@ mod tests {
     fn build_block_cascades_projected_justification_across_rounds() {
         use ethlambda_types::{
             block::BlockHeader,
-            state::{ChainConfig, JustificationValidators, JustifiedSlots},
+            state::{JustificationValidators, JustifiedSlots, StateConfig},
         };
         use libssz_types::SszList;
 
@@ -1723,7 +1831,7 @@ mod tests {
             body_root: BlockBody::default().hash_tree_root(),
         };
         let head_state = State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: HEAD_SLOT,
             latest_block_header: head_header,
             latest_justified: Checkpoint::default(),

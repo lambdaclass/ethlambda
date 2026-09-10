@@ -28,7 +28,7 @@ fn run(path: &Path) -> datatest_stable::Result<()> {
 fn run_ssz_test(test: &SszTestCase) -> datatest_stable::Result<()> {
     match test.type_name.as_str() {
         // Consensus containers
-        "Config" => run_typed_test::<ssz_types::Config, ethlambda_types::state::ChainConfig>(test),
+        "Config" => run_typed_test::<ssz_types::Config, ethlambda_types::state::StateConfig>(test),
         "Checkpoint" => {
             run_typed_test::<ssz_types::Checkpoint, ethlambda_types::checkpoint::Checkpoint>(test)
         }

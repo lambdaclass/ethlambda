@@ -146,7 +146,7 @@ pub(crate) mod test_utils {
         block::{Block, BlockBody, BlockHeader},
         checkpoint::Checkpoint,
         primitives::{H256, HashTreeRoot as _},
-        state::{ChainConfig, JustificationValidators, JustifiedSlots, State},
+        state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz::SszEncode;
 
@@ -173,7 +173,7 @@ pub(crate) mod test_utils {
         };
 
         State {
-            config: ChainConfig { genesis_time: 1000 },
+            config: StateConfig { genesis_time: 1000 },
             slot: 0,
             latest_block_header: genesis_header,
             latest_justified: genesis_checkpoint,
@@ -228,6 +228,7 @@ mod tests {
     use super::*;
     use axum::{body::Body, http::Request, http::StatusCode, http::header};
     use ethlambda_storage::{ForkCheckpoints, Store, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use http_body_util::BodyExt;
     use serde_json::json;
     use std::sync::Arc;
@@ -239,7 +240,7 @@ mod tests {
     async fn test_get_latest_justified_checkpoint() {
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         let app = test_utils::test_api_router(store.clone());
 
@@ -277,7 +278,7 @@ mod tests {
         use libssz::SszEncode;
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         // Build expected SSZ with zeroed state_root (canonical post-state form)
         let finalized = store
@@ -337,7 +338,8 @@ mod tests {
                 vec![H256::ZERO, target_root].try_into().unwrap();
             anchor_state.justified_slots = JustifiedSlots::with_length(2).unwrap();
 
-            let store = Store::from_anchor_state(backend, anchor_state);
+            let store =
+                Store::from_anchor_state(backend, anchor_state, DEFAULT_MILLISECONDS_PER_SLOT);
             (store, target_root)
         }
 
@@ -360,7 +362,7 @@ mod tests {
             let state = create_test_state();
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
-            let store = Store::from_anchor_state(backend, state);
+            let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
             let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}")).await;
@@ -381,7 +383,7 @@ mod tests {
             let state = create_test_state();
             let anchor_root = anchor_root_of(&state);
             let backend = Arc::new(InMemoryBackend::new());
-            let store = Store::from_anchor_state(backend, state);
+            let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
             let app = test_utils::test_api_router(store);
 
             let response = send(app, &format!("/lean/v0/blocks/0x{anchor_root:x}/header")).await;
@@ -414,7 +416,7 @@ mod tests {
         async fn get_block_invalid_id_returns_400() {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
-            let store = Store::from_anchor_state(backend, state);
+            let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
             let app = test_utils::test_api_router(store);
 
             let response = send(app, "/lean/v0/blocks/not-a-valid-id").await;
@@ -426,7 +428,7 @@ mod tests {
         async fn get_block_missing_root_returns_404() {
             let state = create_test_state();
             let backend = Arc::new(InMemoryBackend::new());
-            let store = Store::from_anchor_state(backend, state);
+            let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
             let app = test_utils::test_api_router(store);
 
             let missing = format!("0x{}", "aa".repeat(32));
@@ -468,7 +470,7 @@ mod tests {
 
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let mut store = Store::from_anchor_state(backend, state);
+        let mut store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         // Build a non-genesis signed block with empty body and empty proof blob.
         let block = Block {
@@ -537,7 +539,7 @@ mod tests {
         // the HTTP endpoint stays consistent and returns 200 rather than 404.
         let state = create_test_state();
         let backend = Arc::new(InMemoryBackend::new());
-        let store = Store::from_anchor_state(backend, state);
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
         // The body the endpoint serves must round-trip to a `SignedBlock`
         // matching the genesis header paired with the synthetic blank proof —

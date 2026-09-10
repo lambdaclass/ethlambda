@@ -281,6 +281,7 @@ fn select_candidates(store: &Store, attestations: &[AggregatedAttestation]) -> V
 mod tests {
     use super::*;
     use ethlambda_storage::{Store, backend::InMemoryBackend};
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
         checkpoint::Checkpoint,
@@ -314,7 +315,11 @@ mod tests {
 
     fn empty_store() -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
-        Store::from_anchor_state(backend, State::from_genesis(0, vec![]))
+        Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
     }
 
     #[test]

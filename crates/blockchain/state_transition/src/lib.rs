@@ -675,7 +675,7 @@ mod tests {
         block::BlockBody,
         checkpoint::Checkpoint,
         primitives::H256,
-        state::{ChainConfig, JustifiedSlots, State, Validator},
+        state::{JustifiedSlots, State, StateConfig, Validator},
     };
     use libssz_types::SszList;
 
@@ -831,7 +831,7 @@ mod tests {
         justified_slots_ops::set_justified(&mut justified_slots, 0, 3);
 
         let mut state = State {
-            config: ChainConfig { genesis_time: 0 },
+            config: StateConfig { genesis_time: 0 },
             slot: 10,
             latest_block_header: BlockHeader {
                 slot: 9,
@@ -902,7 +902,7 @@ mod tests {
         justified_slots_ops::extend_to_slot(&mut justified_slots, 4, 6);
 
         let mut state = State {
-            config: ChainConfig { genesis_time: 0 },
+            config: StateConfig { genesis_time: 0 },
             slot: 7,
             latest_block_header: BlockHeader {
                 slot: 6,
@@ -955,7 +955,7 @@ mod tests {
         let r1 = H256([1u8; 32]);
 
         let mut state = State {
-            config: ChainConfig { genesis_time: 0 },
+            config: StateConfig { genesis_time: 0 },
             slot: 2,
             latest_block_header: BlockHeader {
                 slot: 1,
@@ -1001,7 +1001,7 @@ mod tests {
     #[test]
     fn process_attestations_rejects_empty_validator_registry() {
         let mut state = State {
-            config: ChainConfig { genesis_time: 0 },
+            config: StateConfig { genesis_time: 0 },
             slot: 1,
             latest_block_header: BlockHeader {
                 slot: 0,

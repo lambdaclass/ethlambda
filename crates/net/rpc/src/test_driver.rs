@@ -37,6 +37,7 @@ use ethlambda_test_fixtures::{
     Block as FixtureBlock, TestState, fork_choice::ForkChoiceStep,
     state_transition::StateTransitionRunRequest, verify_signatures::TestSignedBlock,
 };
+use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
 use ethlambda_types::{
     block::Block,
     checkpoint::Checkpoint,
@@ -79,7 +80,11 @@ pub type DriverState = Arc<RwLock<Store>>;
 /// Used as the placeholder seed before the first `fork_choice/init` call.
 pub fn empty_driver_store() -> Store {
     let backend = Arc::new(InMemoryBackend::new());
-    Store::from_anchor_state(backend, State::from_genesis(0, vec![]))
+    Store::from_anchor_state(
+        backend,
+        State::from_genesis(0, vec![]),
+        DEFAULT_MILLISECONDS_PER_SLOT,
+    )
 }
 
 /// Build the test-driver router, including a `/lean/v0/health` endpoint so the
@@ -133,7 +138,7 @@ struct VerifySignaturesRequest {
 struct DriverSnapshot {
     head_slot: u64,
     head_root: H256,
-    /// Store time in 800 ms intervals since genesis (matches [`Store::time`]).
+    /// Store time in intervals since genesis (matches [`Store::time`]).
     time: u64,
     /// `Checkpoint` already serializes as `{root, slot}`, which is the shape
     /// hive's `DriverCheckpoint` expects; no wrapper type needed.
@@ -205,7 +210,7 @@ async fn init_fork_choice(
     }
 
     let backend = Arc::new(InMemoryBackend::new());
-    let new_store = Store::from_anchor_state(backend, state);
+    let new_store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
 
     *driver.write().await = new_store;
 

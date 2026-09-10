@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -7,12 +7,42 @@ fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
 lint: ## 🔍 Run clippy on all workspace crates
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during
 	# signature verification/aggregation, without paying for LTO on every rebuild
-	cargo test --workspace --profile release-fast
+	cargo test --locked --workspace --profile release-fast
+
+# Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
+# is nightly-only, everything else runs on the stable toolchain pinned in
+# rust-toolchain.toml.
+RESOLVER_TOOLCHAIN := nightly-2026-06-21
+
+# Versions published less than 14 days ago are excluded from resolution.
+# Resolution done on stable (`cargo add`, plain `cargo update`) is NOT covered;
+# this target is the intended path for routine updates. Git dependencies have
+# no publish age and are refreshed WITHOUT any cooldown: review their lockfile
+# rev changes manually.
+update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS="-p foo")
+	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
+	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age $(UPDATE_ARGS)
+
+# Stable cargo ignores the cooldown, so a lockfile can pin too-young crates;
+# same check as the CI `cooldown` job, without touching the files. A cooldown
+# downgrade is annotated with the too-young version's publish date; downgrades
+# for other reasons carry no such note and are not flagged.
+cooldown-check: ## 🔎 Fail if a lockfile pins crates younger than the publish-age cooldown
+	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
+	status=0; \
+	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do \
+		if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age --manifest-path $$manifest 2>&1); then \
+			echo "WARNING: publish-age cooldown probe failed for $$manifest:"; echo "$$out" | grep -v "^ *Updating " | head -20; continue; \
+		fi; \
+		hits=$$(echo "$$out" | grep -E "^ *Downgrading .*published" || true); \
+		if [ -n "$$hits" ]; then echo "ERROR: $$manifest pins crates younger than the publish-age cooldown:"; echo "$$hits"; status=1; fi; \
+	done; \
+	exit $$status
 
 BENCH_ARGS ?= synthetic --mock-crypto
 

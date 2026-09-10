@@ -14,17 +14,24 @@ blocks every run, so two reports differ only where the code differs.
 
 ```bash
 make bench                                  # defaults, mock crypto
+BENCH_ARGS="synthetic" make bench           # real XMSS/leanVM crypto
 BENCH_ARGS="synthetic --iterations 50" make bench
 ```
 
 `make bench` is a thin wrapper. The binary takes the same arguments directly:
 
 ```bash
+ethlambda benchmark synthetic --num-validators 8 --iterations 10 --key-cache ~/.cache/ethlambda-bench-keys
 ethlambda benchmark synthetic --mock-crypto --num-validators 8 --iterations 10
 ```
 
-A default mock run finishes in well under a second, which is why CI can afford
-to run one on every pull request.
+Without `--mock-crypto` the run uses real cryptography end to end: seed-derived
+XMSS keys, real attestation signatures aggregated into leanVM type-1 proofs, and
+the proposer's real seal (block-root signature, singleton type-1 wrap, type-2
+merge), with every built block imported through the verifying `on_block` path.
+A default real run takes a few minutes; `--key-cache` saves the seed-derived
+keys so reruns skip key generation. A default mock run finishes in well under a
+second, which is why CI can afford to run one on every pull request.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -32,8 +39,9 @@ to run one on every pull request.
 | `--warmup-slots` | `8` | Unmeasured slots built first, so measured builds run on a state with realistic historical roots and justifications |
 | `--iterations` | `10` | Measured builds, one block each |
 | `--proofs-per-data` | `1` | Aggregates seeded per `AttestationData`, mimicking committee aggregators over disjoint validator subsets |
-| `--seed` | `42` | Seed for the validator set; fixes the whole run |
-| `--mock-crypto` | off | Placeholder proofs instead of real XMSS/leanVM signatures. **Currently required** — see [Limitations](#limitations) |
+| `--seed` | `42` | Seed for the validator set and its XMSS keys; fixes the whole run |
+| `--key-cache <dir>` | — | Cache the seed-derived XMSS keys on disk (keyed by leansig revision, seed, validator index and run length). Real crypto only |
+| `--mock-crypto` | off | Placeholder proofs instead of real XMSS/leanVM signatures, and no seal. Measures selection, compaction and the state transition only |
 | `--enable-proposer-aggregation` | off | Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation |
 | `--max-attestations-per-block` | `3` | Mirrors the node flag: distinct `AttestationData` per block |
 | `--format` | `human` | `human` or `json` |
@@ -44,26 +52,36 @@ into `jq`.
 
 ## What it measures
 
-Each iteration enters `produce_block_with_signatures` — the same function
-`BlockChainServer::propose_block` calls — and the harness reports the phases
-inside it:
+Each iteration enters `produce_block_with_signatures` and then `seal_block` —
+the same functions `BlockChainServer::propose_block` calls — and the harness
+reports the phases inside them:
 
 | Phase | Work |
 | --- | --- |
 | `select_payloads` | Choosing which attestations go in the block |
-| `compact` | Collapsing or picking among proofs for the same data |
+| `compact` | Collapsing or picking among proofs for the same data; with `--enable-proposer-aggregation` this is a real recursive leanVM aggregation |
 | `stf_simulate` | The state transition that seals `state_root` |
-| `overhead` | The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone |
+| `sign_proposer` | The proposer's XMSS signature over the block root (real crypto only) |
+| `wrap_proposer` | Wrapping that signature into a singleton type-1 proof (real crypto only) |
+| `merge_type2` | Merging every type-1 proof into the block's type-2 proof (real crypto only) |
+| `overhead` | The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone, pubkey resolution |
 | `wall` | The whole span |
 
 `overhead` is `wall` minus the sum of the phases, so the columns add up by
-construction.
+construction. In mock mode there is nothing to sign with, so the seal is skipped
+and its three phases are absent.
 
 Deliberately **outside** the measured span, matching the boundary of the node's
 own `lean_block_building_time_seconds` metric: gossip publish, the
 slot-alignment sleep, and importing the block that was just built. The import
 still happens between iterations — otherwise every iteration would build on the
-same head and `process_slots` would get more expensive as the run went on.
+same head and `process_slots` would get more expensive as the run went on. Two
+such costs are reported anyway, because they are real crypto worth watching:
+
+| Column | Work |
+| --- | --- |
+| `aggregate` | Producing the slot's pool entries: every validator's attestation signature plus their type-1 aggregation. Aggregator-side work a proposer never does; zero in mock mode |
+| `import` | Importing the built block; in real mode this includes verifying its type-2 proof |
 
 Phase times come from the sample sums of the existing
 `lean_block_proposal_attestation_build_phase_seconds` histogram, read before and
@@ -76,18 +94,24 @@ otherwise, because a mis-attributed report is worse than no report.
 ## Reading a report
 
 ```
-Block-building benchmark — synthetic workload (mock crypto)
-  validators=8 warmup_slots=8 iterations=10 proofs_per_data=1 seed=42
+Block-building benchmark — synthetic workload (real crypto)
+  validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
   ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
 
-  iter           compact  select_payloads     stf_simulate   overhead       wall         root
-  1              0.000ms          0.002ms          0.015ms    0.068ms    0.085ms   0x7282cc99
-  ...
+  iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
+  1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33
+  2              0.001ms       1175.326ms          0.015ms          2.024ms          0.015ms         73.124ms    0.119ms 1250.623ms   94.691ms   20.472ms   0xf7e48c73
 
   phase              count        min       mean        p50        p90        max
-  select_payloads       10    0.002ms    0.002ms    0.002ms    0.003ms    0.003ms
+  compact                2    0.001ms    0.001ms    0.001ms    0.001ms    0.001ms
+  merge_type2            2  550.641ms  862.983ms 1175.326ms 1175.326ms 1175.326ms
   ...
+  wall                   2  616.350ms  933.487ms 1250.623ms 1250.623ms 1250.623ms
+
+  outside the measured span:
+  aggregate              2   94.691ms   99.119ms  103.548ms  103.548ms  103.548ms
+  import                 2   19.205ms   19.838ms   20.472ms   20.472ms   20.472ms
 ```
 
 Every measured iteration gets its own row, and the summary follows below it.
@@ -115,20 +139,22 @@ they *cannot* be compared:
 - `leansig` and `leanvm` are the resolved revisions the binary was built
   against, read from `Cargo.lock` at build time. leanSig tracks a moving branch
   and leanVM performs the signature aggregation, so either one moving changes
-  the measured crypto.
+  the measured crypto. Real-mode roots also depend on the seed-derived keys, so
+  the same seed on the same leansig revision reproduces the same signatures and
+  the same roots.
 - `os`, `arch` and `threads` change results across machines.
 
 Two reports that disagree on any of those are not measuring the same thing.
 
 ## Limitations
 
-- **`--mock-crypto` is required.** Real XMSS/leanVM pools are not wired up yet,
-  so the run measures selection, compaction and the state transition — not
-  signing or aggregation.
-- **The seal phase is not measured.** Signing, type-1 wrapping and type-2
-  merging happen after the measured span and are not reported.
 - **Synthetic workloads only.** Replaying a real datadir is not implemented, so
   results reflect a synthetic chain rather than a deep production state.
+- **Short-lived keys.** Real-mode XMSS keys are generated for exactly the slots
+  the run signs, so key generation is cheap but the OTS window advancement a
+  long-lived validator key performs every 65,536 slots is never exercised.
+- **Mock mode skips the seal.** Without keys there is nothing to sign, so the
+  three seal phases only appear in real runs.
 
 ## In CI
 
