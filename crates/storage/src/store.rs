@@ -1320,6 +1320,26 @@ impl Store {
         })
     }
 
+    /// Return the canonical block root at `slot`, or `None` when the canonical
+    /// chain has no block there.
+    ///
+    /// The index is maintained atomically with the head in
+    /// [`update_checkpoints`](Self::update_checkpoints), so it always describes
+    /// the branch ending at the stored head. It can lag a freshly imported block
+    /// that fork choice has not selected yet, but it never runs ahead of the head.
+    ///
+    /// A `None` covers two cases the index cannot tell apart: a slot the
+    /// canonical chain skipped, and a slot below the anchor this store was
+    /// bootstrapped from. Callers that use this to *reject* something must treat
+    /// `None` as "unknown" rather than "not canonical".
+    pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        Ok(view
+            .get(Table::BlockRoots, &encode_block_root_key(slot))
+            .expect("get block root")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root")))
+    }
+
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
     ///
     /// Missing slots or blocks are skipped. This keeps the current request
@@ -1333,6 +1353,10 @@ impl Store {
         let view = self.backend.begin_read().expect("read view");
         let mut blocks = Vec::new();
         for slot in start_slot..=end_slot {
+            // Read the index through this range's own view rather than via
+            // `canonical_root_at_slot`, which opens a fresh one per call: a
+            // range must be served from a single snapshot so a head change
+            // partway through cannot splice two branches into one response.
             let Some(root_bytes) = view
                 .get(Table::BlockRoots, &encode_block_root_key(slot))
                 .expect("get block root")
@@ -1913,12 +1937,11 @@ mod tests {
             .is_some()
     }
 
-    /// Return the canonical block root at `slot` for storage-index assertions.
-    fn block_root_by_slot(backend: &dyn StorageBackend, slot: u64) -> Option<H256> {
-        let view = backend.begin_read().expect("read view");
-        view.get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
-            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+    /// Canonical block root at `slot`, for storage-index assertions.
+    fn canonical_root(store: &Store, slot: u64) -> Option<H256> {
+        store
+            .canonical_root_at_slot(slot)
+            .expect("canonical block root")
     }
 
     /// Generate a deterministic H256 root from an index.
@@ -2021,13 +2044,10 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(root_3))
             .expect("update head to block 3");
 
-        assert_eq!(
-            block_root_by_slot(store.backend.as_ref(), 0),
-            Some(anchor_root)
-        );
-        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), Some(root_1));
-        assert_eq!(block_root_by_slot(store.backend.as_ref(), 2), None);
-        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), Some(root_3));
+        assert_eq!(canonical_root(&store, 0), Some(anchor_root));
+        assert_eq!(canonical_root(&store, 1), Some(root_1));
+        assert_eq!(canonical_root(&store, 2), None);
+        assert_eq!(canonical_root(&store, 3), Some(root_3));
 
         let side_block_2 = signed_block(2, anchor_root);
         let side_root_2 = side_block_2.message.hash_tree_root();
@@ -2044,20 +2064,11 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(side_root_4))
             .expect("update head to side block 4");
 
-        assert_eq!(
-            block_root_by_slot(store.backend.as_ref(), 0),
-            Some(anchor_root)
-        );
-        assert_eq!(block_root_by_slot(store.backend.as_ref(), 1), None);
-        assert_eq!(
-            block_root_by_slot(store.backend.as_ref(), 2),
-            Some(side_root_2)
-        );
-        assert_eq!(block_root_by_slot(store.backend.as_ref(), 3), None);
-        assert_eq!(
-            block_root_by_slot(store.backend.as_ref(), 4),
-            Some(side_root_4)
-        );
+        assert_eq!(canonical_root(&store, 0), Some(anchor_root));
+        assert_eq!(canonical_root(&store, 1), None);
+        assert_eq!(canonical_root(&store, 2), Some(side_root_2));
+        assert_eq!(canonical_root(&store, 3), None);
+        assert_eq!(canonical_root(&store, 4), Some(side_root_4));
     }
 
     #[test]
