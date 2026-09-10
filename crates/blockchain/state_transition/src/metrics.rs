@@ -2,6 +2,7 @@
 
 use std::sync::LazyLock;
 
+pub use ethlambda_metrics::TimingGuard;
 use ethlambda_metrics::*;
 
 static LEAN_STATE_TRANSITION_SLOTS_PROCESSED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
@@ -29,21 +30,6 @@ static LEAN_FINALIZATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
-
-/// Increment the slots processed counter by the given amount.
-pub fn inc_slots_processed(count: u64) {
-    LEAN_STATE_TRANSITION_SLOTS_PROCESSED_TOTAL.inc_by(count);
-}
-
-/// Increment the attestations processed counter by the given amount.
-pub fn inc_attestations_processed(count: u64) {
-    LEAN_STATE_TRANSITION_ATTESTATIONS_PROCESSED_TOTAL.inc_by(count);
-}
-
-/// Increment the finalization counter with the given result.
-pub fn inc_finalizations(result: &str) {
-    LEAN_FINALIZATIONS_TOTAL.with_label_values(&[result]).inc();
-}
 
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
@@ -83,6 +69,21 @@ static LEAN_STATE_TRANSITION_ATTESTATIONS_PROCESSING_TIME_SECONDS: LazyLock<Hist
         )
         .unwrap()
     });
+
+/// Increment the slots processed counter by the given amount.
+pub fn inc_slots_processed(count: u64) {
+    LEAN_STATE_TRANSITION_SLOTS_PROCESSED_TOTAL.inc_by(count);
+}
+
+/// Increment the attestations processed counter by the given amount.
+pub fn inc_attestations_processed(count: u64) {
+    LEAN_STATE_TRANSITION_ATTESTATIONS_PROCESSED_TOTAL.inc_by(count);
+}
+
+/// Increment the finalization counter with the given result.
+pub fn inc_finalizations(result: &str) {
+    LEAN_FINALIZATIONS_TOTAL.with_label_values(&[result]).inc();
+}
 
 /// Start timing state transition. Records duration when the guard is dropped.
 pub fn time_state_transition() -> TimingGuard {

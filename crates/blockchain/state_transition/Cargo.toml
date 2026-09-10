@@ -11,9 +11,13 @@ version.workspace = true
 
 [dependencies]
 ethlambda-types.workspace = true
-ethlambda-metrics.workspace = true
-
 thiserror.workspace = true
+
+# Host-only: prometheus (metrics) and tracing have no meaning in the zkVM guest
+# and prometheus doesn't build for the target. Included on every target except
+# the zkVM guest (`target_os = "zkvm"`), which drops them automatically.
+[target.'cfg(not(target_os = "zkvm"))'.dependencies]
+ethlambda-metrics.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -21,7 +21,7 @@ mod node;
 mod spec;
 pub mod test_driver;
 
-pub(crate) use base::json_response;
+pub(crate) use base::{json_response, ssz_response};
 
 #[derive(Debug, Clone)]
 pub struct RpcConfig {
