@@ -6,8 +6,8 @@ use std::ops::Range;
 use ethlambda_types::{attestation::SIGNATURE_SIZE, primitives::H256, state::PUBLIC_KEY_SIZE};
 use ssz::{Decode, Encode};
 use xmss::{
-    PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssPublicKey, XmssSecretKey, XmssSignature,
-    XmssSignatureError, xmss_sign, xmss_verify,
+    PUB_KEY_SSZ_LEN, SIGNATURE_SSZ_LEN, XmssKeyGenError, XmssPublicKey, XmssSecretKey,
+    XmssSignature, XmssSignatureError, xmss_key_gen_from_seed, xmss_sign, xmss_verify,
 };
 
 // `ethlambda-types` hardcodes the XMSS wire sizes so it can stay free of the
@@ -107,6 +107,24 @@ impl ValidatorSecretKey {
         let sk = postcard::from_bytes::<LeanSigSecretKey>(bytes)
             .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sk })
+    }
+
+    /// Derive a key pair deterministically from `seed`, active for slots
+    /// `activation_slot..activation_slot + num_active_slots`.
+    ///
+    /// The seed fully determines the key, so this exists for tests and
+    /// benchmarks that need reproducible validators. Real validator keys must
+    /// come from a cryptographically secure RNG, never from this. Keygen cost
+    /// scales with `num_active_slots`.
+    pub fn generate_from_seed(
+        seed: u64,
+        activation_slot: u64,
+        num_active_slots: u64,
+    ) -> Result<(ValidatorPublicKey, Self), XmssKeyGenError> {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        let (pk, sk) = xmss_key_gen_from_seed(seed_bytes, activation_slot, num_active_slots)?;
+        Ok((ValidatorPublicKey { inner: pk }, Self { inner: sk }))
     }
 
     /// Serialize the secret key to its postcard key-file form.
