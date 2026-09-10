@@ -97,7 +97,7 @@ otherwise, because a mis-attributed report is worse than no report.
 Block-building benchmark — synthetic workload (real crypto)
   validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=5a4f55c1 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=362a7c9b os=macos arch=aarch64 threads=14
 
   iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
   1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33

@@ -33,7 +33,7 @@
 use ethlambda_types::{block::ByteList512KiB, primitives::H256};
 
 use crate::signature::{ValidatorPublicKey, ValidatorSignature};
-use leanvm::{AggregateSignature, WireKeys, XmssGroup, aggregate, xmss};
+use leanvm::{ClaimSelection, EthereumProof, SignatureClaims, XmssClaimGroup, aggregate, xmss};
 use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 use tracing::error;
@@ -189,34 +189,51 @@ pub enum VerificationError {
 ///
 /// Getting this structure wrong is not caught at decode: it changes the digest
 /// the proof is checked against, so it surfaces as a verification failure.
-fn wire_keys(components: &[SignerSet]) -> Result<WireKeys, ConflictingMessages> {
-    let mut groups: Vec<XmssGroup> = Vec::with_capacity(components.len());
+fn wire_keys(components: &[SignerSet]) -> Result<SignatureClaims, ConflictingMessages> {
+    let mut groups: Vec<XmssClaimGroup> = Vec::with_capacity(components.len());
     for component in components {
         let keys = component.public_keys.iter().map(|pk| pk.as_inner().clone());
-        match groups.iter_mut().find(|(slot, ..)| *slot == component.slot) {
-            Some((_, message, group_keys)) => {
-                if *message != component.message.0 {
+        match groups
+            .iter_mut()
+            .find(|group| group.epoch == component.slot)
+        {
+            Some(group) => {
+                if group.message != component.message.0 {
                     return Err(ConflictingMessages {
                         slot: component.slot,
                     });
                 }
-                group_keys.extend(keys);
+                group.keys.extend(keys);
             }
-            None => groups.push((component.slot, component.message.0, keys.collect())),
+            None => groups.push(XmssClaimGroup {
+                epoch: component.slot,
+                message: component.message.0,
+                keys: keys.collect(),
+            }),
         }
     }
-    for (_, _, keys) in &mut groups {
-        sort_dedup(keys);
+    for group in &mut groups {
+        sort_dedup(&mut group.keys);
     }
-    groups.sort_unstable_by_key(|(slot, ..)| *slot);
-    Ok((groups, Vec::new()))
+    groups.sort_unstable_by_key(|group| group.epoch);
+    Ok(SignatureClaims {
+        xmss: groups,
+        sphincs: Vec::new(),
+    })
 }
 
 /// [`wire_keys`] for a single claim, which cannot conflict with itself.
-fn one_group(message: &H256, slot: u32, public_keys: &[ValidatorPublicKey]) -> WireKeys {
+fn one_group(message: &H256, slot: u32, public_keys: &[ValidatorPublicKey]) -> SignatureClaims {
     let mut keys: Vec<_> = public_keys.iter().map(|pk| pk.as_inner().clone()).collect();
     sort_dedup(&mut keys);
-    (vec![(slot, message.0, keys)], Vec::new())
+    SignatureClaims {
+        xmss: vec![XmssClaimGroup {
+            epoch: slot,
+            message: message.0,
+            keys,
+        }],
+        sphincs: Vec::new(),
+    }
 }
 
 /// A group's keys as leanVM's signer set requires them: strictly sorted, so the
@@ -250,19 +267,19 @@ fn decompress_children(
     children: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>,
     message: &H256,
     slot: u32,
-) -> Result<Vec<AggregateSignature>, AggregationError> {
+) -> Result<Vec<EthereumProof>, AggregationError> {
     children
         .into_iter()
         .enumerate()
         .map(|(index, (pubkeys, proof_bytes))| {
             let keys = one_group(message, slot, &pubkeys);
-            AggregateSignature::from_bytes_without_pubkeys(proof_bytes.iter().as_slice(), keys)
+            EthereumProof::from_bytes_without_pubkeys(proof_bytes.iter().as_slice(), keys)
                 .map_err(|_| AggregationError::ChildDeserializationFailed(index))
         })
         .collect()
 }
 
-fn compress_to_byte_list(sig: &AggregateSignature) -> Result<ByteList512KiB, AggregationError> {
+fn compress_to_byte_list(sig: &EthereumProof) -> Result<ByteList512KiB, AggregationError> {
     let serialized = sig.to_bytes_without_pubkeys();
     let len = serialized.len();
     ByteList512KiB::try_from(serialized).map_err(|_| AggregationError::ProofTooBig(len))
@@ -323,7 +340,8 @@ pub fn aggregate_signatures(
 
     let _permit = acquire_prover();
 
-    let proof = aggregate(&[], raw_xmss, vec![], None, LOG_INV_RATE).map_err(aggregation_failed)?;
+    let proof =
+        aggregate(&[], raw_xmss, vec![], &[], None, LOG_INV_RATE).map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
 }
@@ -373,7 +391,7 @@ pub fn aggregate_mixed(
 
     let _permit = acquire_prover();
 
-    let proof = aggregate(&children_native, raw_xmss, vec![], None, LOG_INV_RATE)
+    let proof = aggregate(&children_native, raw_xmss, vec![], &[], None, LOG_INV_RATE)
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
@@ -410,7 +428,7 @@ pub fn aggregate_proofs(
 
     let _permit = acquire_prover();
 
-    let proof = aggregate(&children_native, vec![], vec![], None, LOG_INV_RATE)
+    let proof = aggregate(&children_native, vec![], vec![], &[], None, LOG_INV_RATE)
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
@@ -440,7 +458,7 @@ pub fn verify_aggregated_signature(
     }
 
     let keys = one_group(message, slot, &public_keys);
-    let sig = AggregateSignature::from_bytes_without_pubkeys(proof_data.iter().as_slice(), keys)
+    let sig = EthereumProof::from_bytes_without_pubkeys(proof_data.iter().as_slice(), keys)
         .map_err(|_| VerificationError::DeserializationFailed)?;
 
     sig.verify()
@@ -484,19 +502,19 @@ pub fn merge_type_1s_into_type_2(
         return Ok(dummy);
     }
 
-    let type_1s_native: Vec<AggregateSignature> = type_1s
+    let type_1s_native: Vec<EthereumProof> = type_1s
         .iter()
         .enumerate()
         .map(|(index, (claim, proof_bytes))| {
             let keys = one_group(&claim.message, claim.slot, &claim.public_keys);
-            AggregateSignature::from_bytes_without_pubkeys(proof_bytes.iter().as_slice(), keys)
+            EthereumProof::from_bytes_without_pubkeys(proof_bytes.iter().as_slice(), keys)
                 .map_err(|_| AggregationError::ChildDeserializationFailed(index))
         })
         .collect::<Result<_, _>>()?;
 
     let _permit = acquire_prover();
 
-    let merged = aggregate(&type_1s_native, vec![], vec![], None, LOG_INV_RATE)
+    let merged = aggregate(&type_1s_native, vec![], vec![], &[], None, LOG_INV_RATE)
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&merged)
@@ -517,7 +535,7 @@ pub fn verify_type_2_signature(
     }
 
     let keys = wire_keys(components)?;
-    let sig = AggregateSignature::from_bytes_without_pubkeys(proof_data, keys)
+    let sig = EthereumProof::from_bytes_without_pubkeys(proof_data, keys)
         .map_err(|_| VerificationError::DeserializationFailed)?;
 
     sig.verify()
@@ -549,7 +567,7 @@ pub fn split_type_2_by_message(
     }
 
     let keys = wire_keys(components)?;
-    let type_2 = AggregateSignature::from_bytes_without_pubkeys(proof_data, keys)
+    let type_2 = EthereumProof::from_bytes_without_pubkeys(proof_data, keys)
         .map_err(|_| AggregationError::DeserializationFailed)?;
 
     // A slot carries one message, so a message that appears at all appears in
@@ -557,18 +575,27 @@ pub fn split_type_2_by_message(
     let mut matches = type_2
         .xmss_signers()
         .iter()
-        .filter(|(_, group_message, _)| *group_message == message.0);
+        .filter(|group| group.message == message.0);
     let group = match (matches.next(), matches.next()) {
         (Some(group), None) => group.clone(),
         (None, _) => return Err(AggregationError::UnknownMessage),
         (Some(_), Some(_)) => return Err(AggregationError::MultipleMessages),
     };
 
-    let declare: WireKeys = (vec![group], Vec::new());
+    let kept = SignatureClaims {
+        xmss: vec![group],
+        sphincs: Vec::new(),
+    };
+    // No blobs: ethlambda makes no LeanDA claim, so the selection publishes the
+    // one signature group and no DA roots.
+    let declare = ClaimSelection {
+        signatures: &kept,
+        da_commitments: &[],
+    };
 
     let _permit = acquire_prover();
 
-    let component = aggregate(&[type_2], vec![], vec![], Some(&declare), LOG_INV_RATE)
+    let component = aggregate(&[type_2], vec![], vec![], &[], Some(declare), LOG_INV_RATE)
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&component)
@@ -649,18 +676,19 @@ mod tests {
             SignerSet::new(msg_a, 4, vec![pk(2)]),
             SignerSet::new(msg_b, 9, vec![pk(1), pk(2)]),
         ];
-        let (groups, sphincs) = wire_keys(&components).expect("one message per slot");
+        let claims = wire_keys(&components).expect("one message per slot");
+        let groups = &claims.xmss;
 
-        assert!(sphincs.is_empty(), "ethlambda signs XMSS only");
-        let slots: Vec<u32> = groups.iter().map(|(slot, ..)| *slot).collect();
+        assert!(claims.sphincs.is_empty(), "ethlambda signs XMSS only");
+        let slots: Vec<u32> = groups.iter().map(|group| group.epoch).collect();
         assert_eq!(slots, vec![4, 9], "groups sorted by slot");
-        assert_eq!(groups[0].1, msg_a.0);
-        assert_eq!(groups[1].1, msg_b.0);
-        assert_eq!(groups[0].2.len(), 1);
+        assert_eq!(groups[0].message, msg_a.0);
+        assert_eq!(groups[1].message, msg_b.0);
+        assert_eq!(groups[0].keys.len(), 1);
         // Keys 1, 2, 3 unioned across the two slot-9 claims, deduplicated.
-        assert_eq!(groups[1].2.len(), 3);
+        assert_eq!(groups[1].keys.len(), 3);
         assert!(
-            groups[1].2.windows(2).all(|w| w[0] < w[1]),
+            groups[1].keys.windows(2).all(|w| w[0] < w[1]),
             "keys strictly sorted"
         );
     }
