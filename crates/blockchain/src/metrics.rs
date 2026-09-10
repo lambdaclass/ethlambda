@@ -36,6 +36,13 @@ pub const ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS: &[&str] = &["block_onl
 pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
     &["select_payloads", "compact", "stf_simulate"];
 
+/// Phases of sealing a built block (`block_builder::seal_block`), observed on
+/// the same histogram: `sign_proposer` (XMSS signature over the block root),
+/// `wrap_proposer` (singleton single-message aggregate over that signature),
+/// `merge_type2` (merge of every single-message aggregate into the block's
+/// multi-message aggregate).
+pub const BLOCK_PROPOSAL_SEAL_PHASES: &[&str] = &["sign_proposer", "wrap_proposer", "merge_type2"];
+
 /// Where a gossip message landed relative to the interval it was due in.
 ///
 /// Kept private to the module: unlike [`SyncStatus`] (which the RPC layer
@@ -520,15 +527,17 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
-// --- Block Proposal Attestation Selection (build_block fixed-point loop) ---
+// --- Block Proposal (build_block phases, then the seal in seal_block) ---
 
 static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
     std::sync::LazyLock::new(|| {
         register_histogram_vec!(
             "lean_block_proposal_attestation_build_phase_seconds",
-            "Phase-level time in block-proposal attestation selection: select_payloads (greedy \
-             per-AttestationData proof pick), compact (recursive merge of proofs per \
-             AttestationData), stf_simulate (candidate block state transition).",
+            "Phase-level time in block proposal: select_payloads (greedy per-AttestationData \
+             proof pick), compact (recursive merge of proofs per AttestationData), \
+             stf_simulate (candidate block state transition), sign_proposer (XMSS block-root \
+             signature), wrap_proposer (singleton single-message aggregate over it), \
+             merge_type2 (multi-message aggregate merge).",
             &["phase"],
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
@@ -1195,8 +1204,8 @@ pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
 }
 
-/// Observe the duration of a block-proposal attestation-selection phase.
-/// `phase` must be one of [`BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`].
+/// Observe the duration of a block-proposal phase. `phase` must be one of
+/// [`BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`] or [`BLOCK_PROPOSAL_SEAL_PHASES`].
 pub fn observe_block_proposal_phase(phase: &str, elapsed: Duration) {
     LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS
         .with_label_values(&[phase])
