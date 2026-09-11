@@ -313,6 +313,24 @@ static LEAN_AGGREGATION_EARLY_STARTS_TOTAL: std::sync::LazyLock<IntCounter> =
         .unwrap()
     });
 
+static LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_skipped_redundant_total",
+            "Candidates the redundancy-skipping check left to another duty subnet"
+        )
+        .unwrap()
+    });
+
+static LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_window_fallback_total",
+            "Candidates whose windowed selection was not viable and fell back to the full committee set"
+        )
+        .unwrap()
+    });
+
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -430,6 +448,16 @@ static LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS: std::sync::LazyLock<Histogram>
             "lean_aggregation_early_start_lead_seconds",
             "How far before the interval-2 boundary an early aggregation session started",
             vec![0.075, 0.15, 0.225, 0.3, 0.375, 0.45, 0.525, 0.6]
+        )
+        .unwrap()
+    });
+
+static LEAN_AGGREGATION_WINDOW_WIDTH: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_aggregation_window_width",
+            "Width in subnets of the subnet window derived for one aggregation candidate",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
         )
         .unwrap()
     });
@@ -846,6 +874,8 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_STARTS_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
@@ -858,6 +888,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
     std::sync::LazyLock::force(&LEAN_AGGREGATION_EARLY_START_LEAD_SECONDS);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_WIDTH);
     std::sync::LazyLock::force(&LEAN_TICK_INTERVAL_DURATION_SECONDS);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
@@ -1062,6 +1093,27 @@ pub fn inc_aggregator_skipped_other(count: u64) {
     LEAN_AGGREGATOR_SKIPPED_TOTAL
         .with_label_values(&["other"])
         .inc_by(count);
+}
+
+/// Observe one candidate's derived subnet window width. Climbs as the proof
+/// pool climbs the reduction tree, pinning at the committee count once the
+/// best proof reaches half the committees; a candidate pinned there means the
+/// window no longer restricts selection.
+pub fn observe_aggregation_window_width(width: u64) {
+    LEAN_AGGREGATION_WINDOW_WIDTH.observe(width as f64);
+}
+
+/// Increment the count of candidates this aggregator sat out because the
+/// redundancy-skipping rotation gave their level to another duty subnet.
+pub fn inc_aggregation_skipped_redundant() {
+    LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL.inc();
+}
+
+/// Increment the count of candidates whose windowed selection was not viable
+/// (a strided proof pool can leave a contiguous window holding a single
+/// proof) and so fell back to a full-committee-width window.
+pub fn inc_aggregation_window_fallback() {
+    LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL.inc();
 }
 
 /// Update a table byte size gauge.

@@ -83,8 +83,35 @@ pub(crate) struct NodeOptions {
     pub(crate) attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    ///
+    /// The first ID is also this node's aggregation duty subnet: where its
+    /// aggregation window starts, and what --skip-redundant-aggregation
+    /// rotates ownership over. Order matters, so give co-located aggregators
+    /// different first IDs. Unset, the duty subnet falls back to the lowest
+    /// subscribed subnet, which is the same value on every node whose
+    /// validators span all subnets.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Sit out aggregation candidates whose level another duty subnet owns
+    /// this slot. Requires --is-aggregator.
+    ///
+    /// By default every aggregator merges proofs for a window of subnets
+    /// starting at its duty subnet, and windows belonging to neighbouring duty
+    /// subnets overlap, so some prover work is duplicated. With this flag an
+    /// aggregator skips a candidate whose width it does not own in the current
+    /// slot and spends that job on the next-best attestation data instead. The
+    /// owner rotates with the slot, so no node is permanently the one sitting
+    /// out, and the narrowest width is owned by everyone, so a candidate whose
+    /// pool holds nothing on this node's subnet, which is the raw-signature
+    /// case, is never skipped.
+    ///
+    /// Worth enabling when leanVM prover CPU is the bottleneck on co-located
+    /// aggregators. The cost is that a level in a given slot has few
+    /// producers, so a node that is down or late forfeits that slot's merge at
+    /// its level; the narrower levels still run and the next slot rotates to a
+    /// different owner.
+    #[arg(long, default_value = "false", requires = "is_aggregator")]
+    pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

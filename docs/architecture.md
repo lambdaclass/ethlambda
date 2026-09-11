@@ -114,6 +114,43 @@ Aggregators go one step further and republish those aggregates on gossip. Each s
 fresh SNARK, so `reaggregate.rs` caps how many it does per block, and the actor skips the
 whole path while the node is catching up.
 
+### Subnet-windowed aggregation
+
+Two aggregators handed the same pool of existing proofs would otherwise pick the same two
+children every session, since the greedy selection in `aggregation.rs` is deterministic: all
+that duplicated leanVM proving buys nothing once one of them publishes. Each aggregator instead
+scores that pool through a window: a contiguous run of subnets starting at its duty subnet, the
+first value of `--aggregate-subnet-ids` (or the lowest subnet it subscribes to, if that flag is
+unset). A proof outside the window still counts if it partly overlaps, but earns credit only
+for its in-window share, so aggregators with different windows tend to land on different
+children without anyone being excluded from merging.
+
+The width is derived, not chosen: wide enough to hold two proofs at the reach of the
+aggregator's *anchor*, capped at the committee count, so it only widens once a data root's
+proof has actually climbed. The anchor is the largest-coverage proof in the candidate's pool
+that touches the aggregator's own duty subnet. Picking it by coverage rather than by reach
+keeps a sparse proof, one validator in each of many subnets, from setting the width for
+everybody; requiring it to touch the duty subnet means "no anchor" says "no peer has covered
+my subnet", which is exactly when this node's raw signatures are irreplaceable, and the
+narrowest window then leaves it aggregating those instead of merging other aggregators'
+proofs. The price is that two aggregators reading one lopsided pool can derive different
+widths, so their windows nest rather than tile; that costs a round of climbing, not
+correctness.
+
+A window can still decline a merge the unwindowed pool would have allowed, when the proof pool
+is sparse relative to the window's contiguous span (a strided aggregator placement is the
+common cause); selection then retries once with the full committee set, so the feature can
+only improve on the pre-window selection, never regress below it.
+
+`--skip-redundant-aggregation` trades that safety net away on purpose. With it set, an
+aggregator sits out any candidate whose derived width it does not own in the current slot
+(`duty_subnet % width == slot % width`), and the freed job goes to the next-best attestation
+data rather than to a narrower merge of the same one. Ownership rotates with the slot, so
+every duty subnet gets a turn, and the narrowest width is owned by everyone, so a candidate
+with no anchor on this node's subnet is never skipped. The full-width fallback is disabled
+under the flag: every width below the committee count has several owners, so retrying there
+would rebuild exactly the duplication the flag buys away.
+
 ### Sync gate
 
 `sync_status.rs` tracks how far the local head lags the slot clock. Past the threshold the
