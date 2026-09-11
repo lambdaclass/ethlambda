@@ -22,7 +22,7 @@ use primitives::HashTreeRoot as _;
 /// of how the merged proof is serialised.
 ///
 /// </div>
-#[derive(Clone, SszEncode, SszDecode)]
+#[derive(Clone, PartialEq, SszEncode, SszDecode)]
 pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
@@ -193,7 +193,7 @@ pub struct BlockHeader {
 }
 
 /// A complete block including header and body.
-#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Block {
     /// The slot in which the block was proposed.
     pub slot: u64,
@@ -243,7 +243,7 @@ impl Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
-#[derive(Debug, Default, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///

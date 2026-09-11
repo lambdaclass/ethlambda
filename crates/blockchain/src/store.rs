@@ -9,6 +9,7 @@ use ethlambda_types::{
         Attestation, AttestationData, HashedAttestationData, SignedAggregatedAttestation,
         SignedAttestation, validator_indices,
     },
+    beacon::containers::{BeaconState, SignedBeaconBlock},
     block::{Block, BlockHeader, SignedBlock, SingleMessageAggregate},
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
@@ -87,7 +88,7 @@ pub fn update_head(store: &mut Store) -> HeadUpdate {
     let finalized = store
         .get_state(&new_head)
         .expect("head state exists")
-        .map(|state| state.latest_finalized)
+        .map(|state| state.expect_lean().latest_finalized)
         .filter(|finalized| {
             store
                 .get_block_header(&finalized.root)
@@ -345,10 +346,11 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
     // The bound is in intervals, not slots: a whole-slot margin would let an
     // adversary pre-publish next-slot aggregates ahead of any honest validator.
     let attestation_start_interval = data.slot.saturating_mul(INTERVALS_PER_SLOT);
-    if attestation_start_interval > store.time().unwrap() + GOSSIP_DISPARITY_INTERVALS {
+    let store_intervals = store.intervals_since_genesis();
+    if attestation_start_interval > store_intervals + GOSSIP_DISPARITY_INTERVALS {
         return Err(StoreError::AttestationTooFarInFuture {
             attestation_slot: data.slot,
-            store_time: store.time().unwrap(),
+            store_time: store_intervals,
         });
     }
 
@@ -357,36 +359,57 @@ fn validate_attestation_data(store: &Store, data: &AttestationData) -> Result<()
 
 /// Process a tick event.
 ///
-/// `store.time()` represents interval-count-since-genesis: each increment is one
-/// interval, a fifth of the configured slot. Slot and interval-within-slot are
-/// derived as:
-///   slot     = store.time() / INTERVALS_PER_SLOT
-///   interval = store.time() % INTERVALS_PER_SLOT
+/// Walks the store clock forward one interval at a time, running that
+/// interval's duty at each step, and stops at the last interval boundary at or
+/// before `timestamp_ms`. The clock itself is `Store::time_ms`, the single row
+/// both chains share; this function reads and writes it on the interval grid,
+/// which `Store::intervals_since_genesis` derives. Slot and
+/// interval-within-slot are:
+///   slot     = store.intervals_since_genesis() / INTERVALS_PER_SLOT
+///   interval = store.intervals_since_genesis() % INTERVALS_PER_SLOT
+///
+/// The clock lands on a boundary rather than on `timestamp_ms` itself because
+/// the boundary is what was actually processed: the leftover milliseconds
+/// carry no duty that has run. Nothing needs finer than that from the store,
+/// since the actor schedules against its own wall-clock reading.
 pub fn on_tick(store: &mut Store, timestamp_ms: u64, has_proposal: bool) {
     // Convert UNIX timestamp (ms) to interval count since genesis
-    let time_delta_ms = timestamp_ms.saturating_sub(store.config().genesis_time_ms());
-    let time = time_delta_ms / store.config().milliseconds_per_interval();
+    let genesis_time_ms = store.config().genesis_time_ms();
+    let milliseconds_per_interval = store.config().milliseconds_per_interval();
+    let time_delta_ms = timestamp_ms.saturating_sub(genesis_time_ms);
+    let time = time_delta_ms / milliseconds_per_interval;
+
+    // The clock, set to the start of interval `intervals`. Every write below
+    // goes through this, so the row can only ever hold a boundary.
+    let set_interval = |store: &mut Store, intervals: u64| {
+        store
+            .set_time_ms(genesis_time_ms + intervals * milliseconds_per_interval)
+            .expect("set_time_ms should succeed");
+    };
 
     // If we're more than a slot behind, fast-forward to a slot before.
     // Operations are idempotent, so this should be fine.
-    if time.saturating_sub(store.time().unwrap()) > INTERVALS_PER_SLOT {
-        store
-            .set_time(time - INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+    //
+    // The one place the clock moves backwards, and deliberately: it is what
+    // makes the loop below replay the last slot. A `timestamp_ms` that simply
+    // precedes the store's own clock (the fork-choice fixtures' `tick_to_slot`
+    // ticks to a block's slot start, which can) leaves it alone instead, since
+    // neither this branch nor the loop fires.
+    if time.saturating_sub(store.intervals_since_genesis()) > INTERVALS_PER_SLOT {
+        set_interval(store, time - INTERVALS_PER_SLOT);
     }
 
-    while store.time().unwrap() < time {
-        store
-            .set_time(store.time().unwrap() + 1)
-            .expect("set_time should succeed");
+    while store.intervals_since_genesis() < time {
+        let intervals = store.intervals_since_genesis() + 1;
+        set_interval(store, intervals);
 
-        let slot = store.current_slot();
-        let interval = SlotInterval::from_intervals_since_genesis(store.time().unwrap());
+        let slot = intervals / INTERVALS_PER_SLOT;
+        let interval = SlotInterval::from_intervals_since_genesis(intervals);
 
         trace!(%slot, ?interval, "processing tick");
 
         // has_proposal is only signaled for the final tick (matching Python spec behavior)
-        let is_final_tick = store.time().unwrap() == time;
+        let is_final_tick = intervals == time;
         let should_signal_proposal = has_proposal && is_final_tick;
 
         // NOTE: here we assume on_tick never skips intervals.
@@ -447,6 +470,7 @@ pub fn on_gossip_attestation(
         .get_state(&target.root)
         .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(target.root))?;
+    let target_state = target_state.expect_lean();
     if validator_id >= target_state.validators.len() as u64 {
         return Err(StoreError::ValidatorNotInState {
             validator_index: validator_id,
@@ -534,7 +558,7 @@ fn on_gossip_aggregated_attestation_core(
         .get_state(&aggregated.data.target.root)
         .expect("target state exists")
         .ok_or(StoreError::MissingTargetState(aggregated.data.target.root))?;
-    let validators = &target_state.validators;
+    let validators = &target_state.expect_lean().validators;
     let num_validators = validators.len() as u64;
 
     let participant_indices: Vec<u64> = aggregated.proof.participant_indices().collect();
@@ -651,6 +675,7 @@ fn on_block_core(
             parent_root: block.parent_root,
             slot,
         })?;
+    let parent_state = parent_state.expect_lean();
 
     // Bound the block's slot before the state transition runs (leanSpec #1182).
     //
@@ -669,7 +694,12 @@ fn on_block_core(
     // Horizon is the current slot plus one whole slot of margin, so an intended
     // early block still imports (mirrors the attestation future-slot guard, but
     // with a whole-slot rather than one-interval margin).
-    let current_slot = store.current_slot();
+    //
+    // From the interval clock, so that it mirrors that guard rather than merely
+    // resembling it: `on_tick` rewinds the interval clock by a slot to replay
+    // one after a gap, and reading the shared UNIX-second clock here instead
+    // would quietly widen the horizon by that slot.
+    let current_slot = store.intervals_since_genesis() / INTERVALS_PER_SLOT;
     if slot > current_slot + 1 {
         return Err(StoreError::BlockTooFarInFuture {
             block_slot: slot,
@@ -699,15 +729,17 @@ fn on_block_core(
     let sig_verification_start = std::time::Instant::now();
     if verify {
         // Validate cryptographic signatures
-        verify_block_signatures(&parent_state, &signed_block)?;
+        verify_block_signatures(parent_state, &signed_block)?;
     }
     let sig_verification = sig_verification_start.elapsed();
 
     let block = signed_block.message.clone();
 
-    // Execute state transition function to compute post-block state
+    // Execute state transition function to compute post-block state. Clones
+    // through the cache's `Arc` since the transition mutates in place and the
+    // store's own cached parent state must be left untouched.
     let state_transition_start = std::time::Instant::now();
-    let mut post_state = parent_state;
+    let mut post_state = parent_state.clone();
     ethlambda_state_transition::state_transition(&mut post_state, &block)?;
     let state_transition = state_transition_start.elapsed();
 
@@ -733,10 +765,10 @@ fn on_block_core(
 
     // Store signed block and state
     store
-        .insert_signed_block(block_root, signed_block.clone())
+        .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block.clone()))
         .expect("DB insert should succeed");
     store
-        .insert_state(block_root, post_state)
+        .insert_state(block_root, BeaconState::Lean(post_state))
         .expect("DB insert should succeed");
 
     // Block-included attestations are intentionally not counted here.
@@ -883,11 +915,12 @@ pub fn get_attestation_target_with_checkpoints(
 /// with `UnknownSourceBlock`).
 pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
     let head_root = store.head().unwrap();
-    let mut source = store
+    let head_state = store
         .get_state(&head_root)
         .expect("head state exists")
-        .unwrap()
-        .latest_justified;
+        .unwrap();
+    let head_state = head_state.expect_lean();
+    let mut source = head_state.latest_justified;
 
     // Replace the placeholder genesis root with the real (head) one. This only
     // fires on the genesis head, whose state still holds the zero-root
@@ -921,7 +954,7 @@ pub fn produce_attestation_data(store: &Store, slot: u64) -> AttestationData {
 /// before returning the canonical head.
 fn get_proposal_head(store: &mut Store, slot: u64) -> H256 {
     // Calculate time corresponding to this slot
-    let config = *store.config();
+    let config = store.config().time_grid();
     let slot_time_ms = config.genesis_time_ms()
         + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &config);
 
@@ -953,6 +986,7 @@ pub fn produce_block_with_signatures(
             parent_root: head_root,
             slot,
         })?;
+    let head_state = head_state.expect_lean();
 
     // Validate proposer authorization for this slot
     let num_validators = head_state.validators.len() as u64;
@@ -971,7 +1005,7 @@ pub fn produce_block_with_signatures(
     let (block, signatures, post_checkpoints) = {
         let _timing = metrics::time_block_building_payload_aggregation();
         build_block(
-            &head_state,
+            head_state,
             slot,
             validator_index,
             head_root,
@@ -1347,8 +1381,8 @@ mod tests {
         bits
     }
 
-    /// The store clock counts intervals, so it has to advance once per
-    /// configured interval rather than once per hardcoded 800 ms.
+    /// The interval clock counts intervals, so it has to advance once per
+    /// configured interval rather than once per hardcoded fraction of a second.
     #[test]
     fn on_tick_advances_one_interval_per_configured_interval() {
         use ethlambda_storage::backend::InMemoryBackend;
@@ -1362,18 +1396,81 @@ mod tests {
         let mut store = Store::from_anchor_state(backend, genesis_state, MILLISECONDS_PER_SLOT);
         let genesis_ms = GENESIS_TIME * 1_000;
 
-        // One interval in: still short of the second boundary at 1600 ms.
+        // One interval in: still short of the interval boundary.
         on_tick(&mut store, genesis_ms + 1_599, false);
-        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.intervals_since_genesis(), 0);
 
         on_tick(&mut store, genesis_ms + 1_600, false);
-        assert_eq!(store.time().unwrap(), 1);
+        assert_eq!(store.intervals_since_genesis(), 1);
         assert_eq!(store.current_slot(), 0);
 
         // A whole slot in: five intervals, so the slot rolls over.
         on_tick(&mut store, genesis_ms + MILLISECONDS_PER_SLOT, false);
-        assert_eq!(store.time().unwrap(), INTERVALS_PER_SLOT);
+        assert_eq!(store.intervals_since_genesis(), INTERVALS_PER_SLOT);
         assert_eq!(store.current_slot(), 1);
+    }
+
+    /// One tick walks the clock interval by interval, and every reading derived
+    /// from it must agree about where it landed.
+    #[test]
+    fn on_tick_leaves_every_derived_clock_on_the_interval_it_processed() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        const GENESIS_TIME: u64 = 1_770_407_233;
+        const MILLISECONDS_PER_SLOT: u64 = 8_000;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_state = State::from_genesis(GENESIS_TIME, vec![]);
+        let mut store = Store::from_anchor_state(backend, genesis_state, MILLISECONDS_PER_SLOT);
+        let genesis_ms = GENESIS_TIME * 1_000;
+
+        for slot in 0..4u64 {
+            for interval in 0..INTERVALS_PER_SLOT {
+                let ms = genesis_ms
+                    + slot * MILLISECONDS_PER_SLOT
+                    + interval * (MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT);
+                on_tick(&mut store, ms, false);
+
+                let intervals = store.intervals_since_genesis();
+                assert_eq!(intervals, slot * INTERVALS_PER_SLOT + interval);
+                assert_eq!(
+                    store.current_slot(),
+                    intervals / INTERVALS_PER_SLOT,
+                    "slot {slot} interval {interval}"
+                );
+                // The row itself holds the boundary that was processed, which
+                // here is the tick's own timestamp because every one of these
+                // lands on one.
+                assert_eq!(store.time_ms().expect("time"), ms);
+            }
+        }
+    }
+
+    /// `tick_to_slot` in the fork-choice fixtures ticks to a block's slot
+    /// start, which can precede a tick already applied. The clock may not walk
+    /// backwards when it does. (The deliberate replay rewind is a different
+    /// case: it needs the target to be more than a slot *ahead*.)
+    #[test]
+    fn on_tick_never_rewinds_the_clock_for_an_earlier_timestamp() {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+
+        const GENESIS_TIME: u64 = 1_000;
+        const MILLISECONDS_PER_SLOT: u64 = 8_000;
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let genesis_state = State::from_genesis(GENESIS_TIME, vec![]);
+        let mut store = Store::from_anchor_state(backend, genesis_state, MILLISECONDS_PER_SLOT);
+        let genesis_ms = GENESIS_TIME * 1_000;
+
+        on_tick(&mut store, genesis_ms + 3 * MILLISECONDS_PER_SLOT, false);
+        let advanced_time = store.time_ms().expect("time");
+        let advanced_intervals = store.intervals_since_genesis();
+
+        on_tick(&mut store, genesis_ms + MILLISECONDS_PER_SLOT, false);
+        assert_eq!(store.time_ms().expect("time"), advanced_time);
+        assert_eq!(store.intervals_since_genesis(), advanced_intervals);
     }
 
     #[test]
@@ -1473,8 +1570,19 @@ mod tests {
             proof: make_signed_block_proof(0, vec![]),
         };
         store
-            .insert_signed_block(root, signed_block)
+            .insert_signed_block(root, SignedBeaconBlock::Lean(signed_block))
             .expect("insert test block should succeed");
+    }
+
+    /// Put `store`'s clock at the start of interval `intervals` since genesis.
+    ///
+    /// These tests are about the interval grid, but the store keeps one
+    /// millisecond row, so this is the conversion, written once and read off
+    /// the store's own configuration rather than a repeated literal.
+    fn set_interval_clock(store: &mut Store, intervals: u64) {
+        let config = store.config();
+        let ms = config.genesis_time_ms() + intervals * config.milliseconds_per_interval();
+        store.set_time_ms(ms).expect("set_time_ms should succeed");
     }
 
     fn new_test_store() -> Store {
@@ -1510,6 +1618,7 @@ mod tests {
         // `latest_block_header.parent_root`, and `get_state(b)` then returns it
         // from the cache.
         let genesis_state = store.get_state(&genesis).expect("genesis state").unwrap();
+        let genesis_state = genesis_state.expect_lean();
         let mut head_state = genesis_state.clone();
         head_state.slot = genesis_state.slot + 1;
         head_state.latest_justified = head_justified;
@@ -1518,7 +1627,7 @@ mod tests {
         hbh.push(genesis);
         head_state.historical_block_hashes = hbh.try_into().expect("within limit");
         store
-            .insert_state(b, head_state)
+            .insert_state(b, BeaconState::Lean(head_state))
             .expect("insert head state should succeed");
 
         // Store's global justified latched onto a higher, off-head checkpoint,
@@ -1530,9 +1639,7 @@ mod tests {
         store
             .update_checkpoints(ForkCheckpoints::new(b, Some(off_head_justified), None))
             .expect("update_checkpoints should succeed");
-        store
-            .set_time(2 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 2 * INTERVALS_PER_SLOT);
 
         let data = produce_attestation_data(&store, 2);
 
@@ -1573,9 +1680,7 @@ mod tests {
         store
             .update_checkpoints(ForkCheckpoints::head_only(b3))
             .expect("update_checkpoints should succeed");
-        store
-            .set_time(3 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 3 * INTERVALS_PER_SLOT);
 
         let data = AttestationData {
             slot: 3,
@@ -1720,9 +1825,7 @@ mod tests {
         insert_test_block(&mut store, base, 1, genesis);
         insert_test_block(&mut store, fork_left, 2, base);
         insert_test_block(&mut store, fork_right, 3, base);
-        store
-            .set_time(3 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 3 * INTERVALS_PER_SLOT);
 
         // source=base, target=fork_left, head=fork_right: target and head share a
         // parent (base) but neither is an ancestor of the other.
@@ -1764,9 +1867,7 @@ mod tests {
         insert_test_block(&mut store, fork_left, 2, base);
         insert_test_block(&mut store, fork_right, 3, base);
         insert_test_block(&mut store, fork_right_head, 4, fork_right);
-        store
-            .set_time(4 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 4 * INTERVALS_PER_SLOT);
 
         // source=fork_left (abandoned branch), target=head=fork_right_head:
         // source precedes target in slot but lies off the target's chain.
@@ -1807,9 +1908,7 @@ mod tests {
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
         insert_test_block(&mut store, b3, 3, b2);
-        store
-            .set_time(3 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 3 * INTERVALS_PER_SLOT);
 
         // head=b3 at slot 3, but the vote's own slot is 2: it claims to have seen
         // a head that did not yet exist when the vote was cast.
@@ -1849,9 +1948,7 @@ mod tests {
         let b2 = H256([2u8; 32]);
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
-        store
-            .set_time(2 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 2 * INTERVALS_PER_SLOT);
 
         // A crafted gossip vote with a near-`u64::MAX` slot. The head-consistency
         // check passes (slot >= head.slot), so this exercises the time check.
@@ -1882,9 +1979,7 @@ mod tests {
         let b2 = H256([2u8; 32]);
         insert_test_block(&mut store, b1, 1, genesis);
         insert_test_block(&mut store, b2, 2, b1);
-        store
-            .set_time(2 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 2 * INTERVALS_PER_SLOT);
 
         let data = AttestationData {
             slot: 2,
@@ -1922,9 +2017,7 @@ mod tests {
         insert_test_block(&mut store, block_2, 2, block_1);
         insert_test_block(&mut store, orph_2, 2, block_1);
         insert_test_block(&mut store, orph_3, 3, orph_2);
-        store
-            .set_time(3 * INTERVALS_PER_SLOT)
-            .expect("set_time should succeed");
+        set_interval_clock(&mut store, 3 * INTERVALS_PER_SLOT);
 
         // Vote entirely on the orphan branch: source=block_1, target=orph_2,
         // head=orph_3. Source/target/head form one parent chain, so every
@@ -1989,7 +2082,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store =
             Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
-        store.set_time(0).expect("set_time should succeed");
+        set_interval_clock(&mut store, 0);
 
         // current_slot = 0, so the horizon is slot 1; a slot-2 block overshoots it.
         let block = Block {
@@ -2030,7 +2123,7 @@ mod tests {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store =
             Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
-        store.set_time(0).expect("set_time should succeed");
+        set_interval_clock(&mut store, 0);
 
         // Parent (genesis) sits at slot 0, so a slot one past the limit overshoots.
         let gap_slot = HISTORICAL_ROOTS_LIMIT as u64 + 1;

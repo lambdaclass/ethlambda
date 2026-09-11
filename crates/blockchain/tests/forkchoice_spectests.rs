@@ -221,9 +221,10 @@ fn validate_checks(
     all_blocks: &HashMap<H256, (u64, H256)>,
 ) -> datatest_stable::Result<()> {
     // Validate time check: fixtures encode the expected store time in intervals
-    // since genesis (matching `Store::time()`).
+    // since genesis, which is `Store::intervals_since_genesis()` and not the
+    // `Store::time_ms()` row it derives from.
     if let Some(expected_time) = checks.time {
-        let actual_time = st.time().expect("store time is always set");
+        let actual_time = st.intervals_since_genesis();
         if actual_time != expected_time {
             return Err(format!(
                 "Step {}: time mismatch: expected {}, got {}",

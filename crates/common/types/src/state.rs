@@ -14,7 +14,7 @@ use primitives::HashTreeRoot as _;
 /// The main consensus state object
 #[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct State {
-    /// The chain's configuration parameters
+    /// The chain's genesis parameters
     pub config: StateConfig,
     /// The current slot number
     pub slot: u64,
@@ -115,11 +115,14 @@ impl State {
     }
 }
 
-/// The chain config carried inside [`State`], the spec's `Config` container.
+/// The genesis parameters baked into the state and hashed into its root, the
+/// spec's `Config` container (leanSpec's `GenesisConfig`,
+/// `forks/lstar/containers/state.py`).
 ///
-/// Merkleized into the state root, so its layout is fixed by the spec and no
-/// field may be added here. [`crate::chain_config::ChainConfig`] is the node's
-/// own view: this plus the slot duration.
+/// Spec-fixed and cross-client: adding a field here changes every lean state
+/// root and forks this client off every other one.
+/// [`crate::chain_config::ChainConfig`] is the node's own runtime view, a
+/// different type for a different job: this plus the slot duration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct StateConfig {
     pub genesis_time: u64,
@@ -163,4 +166,29 @@ pub fn anchor_pair_is_consistent(state: &mut State, block: &Block) -> bool {
     }
 
     block.state_root == computed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::State;
+    use crate::primitives::HashTreeRoot as _;
+
+    /// Captured from the build that introduced this test.
+    const EXPECTED_GENESIS_ROOT: &str =
+        "97720dcece1942bac508933252fb58550e4ec357842b4465956459a42920d053";
+
+    /// The container's layout is cross-client, so this pins the genesis
+    /// state's root: a field reorder, an added field, or a type change
+    /// disguised as a rename fails here rather than in interop.
+    #[test]
+    fn the_genesis_state_root_is_fixed() {
+        let state = State::from_genesis(1234, vec![]);
+        let root = state.hash_tree_root();
+
+        assert_eq!(
+            hex::encode(root.0),
+            EXPECTED_GENESIS_ROOT,
+            "the genesis state root changed; every other lean client disagrees now"
+        );
+    }
 }

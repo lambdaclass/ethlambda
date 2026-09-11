@@ -962,6 +962,63 @@ pub use mainnet::*;
 #[cfg(feature = "preset-minimal")]
 pub use minimal::*;
 
+/// Which of the two presets the constants above were taken from.
+///
+/// The re-export just below the two modules picks one at compile time, so
+/// nothing in this crate can ask *which* one it got. A persisted artifact can:
+/// every SSZ container in this crate is bounded by these constants, so a state
+/// written by one preset's build is a different shape from the same state
+/// written by the other's, and a data directory has to say which it holds.
+/// [`Preset::ACTIVE`] is what a writer records and a reader compares against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preset {
+    Mainnet,
+    Minimal,
+}
+
+impl Preset {
+    /// The preset this build compiles its containers against.
+    pub const ACTIVE: Preset = if cfg!(feature = "preset-minimal") {
+        Preset::Minimal
+    } else {
+        Preset::Mainnet
+    };
+
+    /// The byte this preset is stored under. Spelled out rather than derived
+    /// from the variant order, because it is a storage format and not a
+    /// discriminant: reordering the variants must not reinterpret a directory.
+    pub const fn selector(self) -> u8 {
+        match self {
+            Preset::Mainnet => 0,
+            Preset::Minimal => 1,
+        }
+    }
+
+    /// The inverse of [`Preset::selector`].
+    pub const fn from_selector(byte: u8) -> Option<Preset> {
+        match byte {
+            0 => Some(Preset::Mainnet),
+            1 => Some(Preset::Minimal),
+            _ => None,
+        }
+    }
+
+    /// The specification's own name for this preset, as it appears in a
+    /// configuration directory or a fixture tree.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Preset::Mainnet => "mainnet",
+            Preset::Minimal => "minimal",
+        }
+    }
+}
+
+impl core::fmt::Display for Preset {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Preset values that a later fork retunes without changing any container's
 /// shape.
 ///
@@ -1216,7 +1273,32 @@ pub mod retuned {
 
 #[cfg(test)]
 mod tests {
-    use super::{mainnet, minimal};
+    use super::{Preset, mainnet, minimal};
+
+    #[test]
+    fn selectors_are_pinned_to_their_on_disk_values() {
+        // These bytes are a storage format: changing one makes every existing
+        // data directory claim to have been written by the other preset.
+        assert_eq!(Preset::Mainnet.selector(), 0);
+        assert_eq!(Preset::Minimal.selector(), 1);
+
+        for preset in [Preset::Mainnet, Preset::Minimal] {
+            assert_eq!(Preset::from_selector(preset.selector()), Some(preset));
+        }
+        assert_eq!(Preset::from_selector(2), None);
+    }
+
+    #[test]
+    fn the_active_preset_matches_the_constants_that_were_re_exported() {
+        // The point of `ACTIVE` is that it cannot drift from the `pub use`
+        // above it, which is what a persisted selector is trusted to describe.
+        let (expected, slots_per_epoch) = match Preset::ACTIVE {
+            Preset::Mainnet => (Preset::Mainnet, mainnet::SLOTS_PER_EPOCH),
+            Preset::Minimal => (Preset::Minimal, minimal::SLOTS_PER_EPOCH),
+        };
+        assert_eq!(Preset::ACTIVE, expected);
+        assert_eq!(super::SLOTS_PER_EPOCH, slots_per_epoch);
+    }
 
     /// Values pinned directly from the specification, so a typo or an accidental
     /// edit shows up as a failing test rather than a silent divergence from

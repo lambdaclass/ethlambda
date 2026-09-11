@@ -47,3 +47,21 @@ pub(crate) fn lean_fork_unreachable(function: &str) -> ! {
          passed a fork it should have dispatched on first"
     )
 }
+
+/// Panics, naming the Beacon Chain-only function a lean block reached.
+///
+/// The block-shaped counterpart to [`lean_state_unreachable`], for the same
+/// reason this module exists at all: `ethlambda_types`'s own
+/// `lean_block_unreachable` is `pub(crate)` there and cannot be imported here.
+/// [`crate::beacon::containers::SignedBeaconBlock`] carries a `Lean` variant so
+/// the storage layer can take one block type; nothing in this crate's beacon
+/// `stf` module transitions it, so reaching this function still means a caller
+/// dispatched on the wrong chain.
+#[cold]
+#[track_caller]
+pub(crate) fn lean_block_unreachable(function: &str) -> ! {
+    unreachable!(
+        "lean block reached a beacon accessor ({function}); \
+         BlockChainServer must dispatch on fork_name() before this point"
+    )
+}

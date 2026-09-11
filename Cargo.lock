@@ -731,6 +731,8 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -2073,6 +2075,7 @@ dependencies = [
  "c-kzg",
  "datatest-stable",
  "ethlambda-metrics",
+ "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
@@ -2102,11 +2105,13 @@ dependencies = [
  "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "lru",
+ "proptest",
  "rand 0.10.1",
  "rocksdb",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "xdelta3",
 ]
 
 [[package]]
@@ -8669,6 +8674,18 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.18",
  "time",
+]
+
+[[package]]
+name = "xdelta3"
+version = "0.1.5"
+source = "git+https://github.com/sigp/xdelta3-rs?rev=fe3906605c87#fe3906605c87b6c0515bd7c8fc671f47875e3ccc"
+dependencies = [
+ "bindgen",
+ "cc",
+ "libc",
+ "log",
+ "rand 0.9.4",
 ]
 
 [[package]]

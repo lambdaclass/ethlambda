@@ -49,6 +49,7 @@ use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
+    beacon::containers::SignedBeaconBlock,
     genesis::GenesisConfig,
     state::{State, ValidatorPubkeyBytes},
 };
@@ -1092,7 +1093,7 @@ async fn fetch_initial_state(
     .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
     .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
     store
-        .insert_signed_block(anchor_root, signed_block)
+        .insert_signed_block(anchor_root, SignedBeaconBlock::Lean(signed_block))
         .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::StoreInsertSignedBlock)?;
     Ok(store)

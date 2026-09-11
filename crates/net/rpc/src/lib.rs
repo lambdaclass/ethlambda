@@ -321,10 +321,11 @@ mod tests {
         let finalized = store
             .latest_finalized()
             .expect("latest finalized checkpoint exists");
-        let mut expected_state = store
+        let expected_state = store
             .get_state(&finalized.root)
             .expect("expected state")
             .unwrap();
+        let mut expected_state = expected_state.expect_lean().clone();
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
@@ -499,6 +500,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
+            beacon::containers::SignedBeaconBlock,
             block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
@@ -528,7 +530,7 @@ mod tests {
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
         store
-            .insert_signed_block(block_root, signed_block.clone())
+            .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block.clone()))
             .expect("insert_signed_block should succeed");
         store
             .update_checkpoints(ForkCheckpoints::new(
@@ -590,6 +592,7 @@ mod tests {
             )
             .expect("genesis served via get_signed_block")
             .unwrap();
+        let genesis_block = genesis_block.expect_lean();
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
             proof: MultiMessageAggregate::default(),

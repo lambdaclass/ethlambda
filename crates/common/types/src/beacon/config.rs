@@ -30,10 +30,15 @@
 //! never again once that state exists, but the beacon STF's `genesis` module
 //! needs them and the `genesis` fixture suite checks them.
 
+use libssz_derive::{SszDecode, SszEncode};
+use libssz_types::SszList;
+
 use crate::beacon::constants;
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, Version};
+use crate::chain_config::ChainConfig;
+use crate::constants::INTERVALS_PER_SLOT;
 
 /// One entry in fulu's blob schedule: from `epoch` onward (until a later
 /// entry takes over), a block may carry up to `max_blobs_per_block` blobs.
@@ -41,13 +46,21 @@ use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Gwei, U256, Uint256, 
 /// Modeled as a plain struct rather than a `(Epoch, u64)` tuple so that
 /// [`Config::max_blobs_per_block`]'s search reads as "find the entry", not
 /// "find the pair".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
 pub struct BlobScheduleEntry {
     /// The first epoch this entry applies to.
     pub epoch: Epoch,
     /// The blob count limit from `epoch` onward.
     pub max_blobs_per_block: u64,
 }
+
+/// How many blob-schedule entries a persisted [`Config`] can carry.
+///
+/// A storage bound, not a consensus one: SSZ needs a bounded list and the real
+/// schedule holds roughly one entry per fork, so this is generous. Raising it
+/// changes the on-disk encoding, which is why the database carries a format
+/// version.
+pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 
 /// The runtime configuration for one network: fork scheduling plus every
 /// other value the state transition and fork choice read at runtime rather
@@ -56,7 +69,7 @@ pub struct BlobScheduleEntry {
 /// Construct one with [`Config::mainnet`], [`Config::minimal`], or
 /// [`Config::active`]; adjust a single fork's activation epoch with
 /// [`Config::with_fork_epoch`] for fixture-driven tests that need one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
 pub struct Config {
     // -- Genesis construction ---------------------------------------------
     /// How many active validators the chain needs before it may start.
@@ -70,6 +83,17 @@ pub struct Config {
     /// The delay exists so that validators who deposited just before the
     /// threshold was crossed still have time to get their nodes running.
     pub genesis_delay: u64,
+    /// The wall-clock second the chain's slot 0 began, which every slot
+    /// boundary is computed from.
+    ///
+    /// Distinct from [`Self::min_genesis_time`], which is only the earliest
+    /// time the deposit-driven genesis rules would have permitted: on mainnet
+    /// that is 1606824000 against an actual genesis of 1606824023. Reusing
+    /// that one for the clock would put every slot boundary 23 seconds off.
+    ///
+    /// On a beacon chain this is read off the anchor state at bootstrap. On a
+    /// lean chain it comes from the genesis config file.
+    pub genesis_time: u64,
 
     // -- Fork scheduling --------------------------------------------------
     /// The `Fork.current_version` a phase0 block or attestation signs under,
@@ -239,7 +263,7 @@ pub struct Config {
     /// count limit change again after electra without a new hard fork per
     /// change. Read through [`Config::max_blobs_per_block`] rather than
     /// directly.
-    pub blob_schedule: Vec<BlobScheduleEntry>,
+    pub blob_schedule: SszList<BlobScheduleEntry, MAX_BLOB_SCHEDULE_ENTRIES>,
 }
 
 /// Mainnet's `TERMINAL_TOTAL_DIFFICULTY`.
@@ -271,6 +295,7 @@ impl Config {
             min_genesis_active_validator_count: 16_384,
             min_genesis_time: 1_606_824_000,
             genesis_delay: 604_800,
+            genesis_time: 1_606_824_023,
             genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
             altair_fork_version: [0x01, 0x00, 0x00, 0x00],
             altair_fork_epoch: 74_240,
@@ -330,7 +355,9 @@ impl Config {
                     epoch: 419_072,
                     max_blobs_per_block: 21,
                 },
-            ],
+            ]
+            .try_into()
+            .expect("mainnet blob schedule within bound"),
         }
     }
 
@@ -347,6 +374,10 @@ impl Config {
             min_genesis_active_validator_count: 64,
             min_genesis_time: 1_578_009_600,
             genesis_delay: 300,
+            // `minimal` is a base for spec fixtures, not a network of its
+            // own: no real chain ever started under it, so there is no real
+            // wall-clock second to record here.
+            genesis_time: 0,
             genesis_fork_version: [0x00, 0x00, 0x00, 0x01],
             altair_fork_version: [0x01, 0x00, 0x00, 0x01],
             altair_fork_epoch: constants::FAR_FUTURE_EPOCH,
@@ -395,8 +426,62 @@ impl Config {
 
             max_blobs_per_block_deneb: 6,
             max_blobs_per_block_electra: 9,
-            blob_schedule: Vec::new(),
+            blob_schedule: SszList::new(),
         }
+    }
+
+    /// The configuration a lean chain runs on: a real `genesis_time`, the slot
+    /// duration its network config file sets, and a placeholder for everything
+    /// else.
+    ///
+    /// A lean chain has no beacon fork schedule, no Eth1 deposit contract and
+    /// no execution layer, but it is stored through the same `Metadata["config"]`
+    /// row as a beacon chain so that one accessor serves both. The placeholders
+    /// are chosen so that a beacon-shaped gate reading this by mistake fails
+    /// closed: every fork epoch is `FAR_FUTURE_EPOCH`, so no fork ever reads as
+    /// activated, rather than epoch 0, which would read as "activated at
+    /// genesis" for all seven of them.
+    pub fn lean(genesis_time: u64, slot_duration_ms: u64) -> Self {
+        Self {
+            genesis_time,
+            slot_duration_ms,
+            // Truncated on a cadence that is not a whole number of seconds.
+            // Nothing on the lean path reads it: lean schedules every duty off
+            // `slot_duration_ms`, and the second-resolution field exists for
+            // the beacon spec's own `compute_time_at_slot`.
+            seconds_per_slot: slot_duration_ms / 1_000,
+            altair_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            bellatrix_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            capella_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            deneb_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            ..Config::mainnet()
+        }
+    }
+
+    /// Genesis as a millisecond timestamp, the zero point every tick
+    /// computation measures from.
+    pub fn genesis_time_ms(&self) -> u64 {
+        self.genesis_time * 1_000
+    }
+
+    /// Interval duration in milliseconds.
+    ///
+    /// Exact on a lean chain: [`crate::genesis::GenesisConfig`] rejects a slot
+    /// duration that is not a multiple of [`INTERVALS_PER_SLOT`].
+    pub fn milliseconds_per_interval(&self) -> u64 {
+        self.slot_duration_ms / INTERVALS_PER_SLOT
+    }
+
+    /// This configuration's time grid, the part a lean node schedules duties
+    /// off.
+    ///
+    /// A [`ChainConfig`] rather than a borrow of `self`: it is two `u64`s and
+    /// `Copy`, so a caller can hold it across the `&mut Store` the tick
+    /// pipeline takes, and the metrics helpers can keep taking it by value.
+    pub fn time_grid(&self) -> ChainConfig {
+        ChainConfig::new(self.genesis_time, self.slot_duration_ms)
     }
 
     /// The configuration matching the compiled-in preset: [`Config::minimal`]
@@ -537,6 +622,8 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use libssz::{SszDecode as _, SszEncode as _};
+
     use super::*;
 
     #[test]
@@ -643,5 +730,51 @@ mod tests {
             config.max_blobs_per_block(0),
             config.max_blobs_per_block_electra
         );
+    }
+
+    #[test]
+    fn a_config_round_trips_through_ssz() {
+        let config = Config::mainnet();
+        let bytes = config.to_ssz();
+        assert_eq!(
+            Config::from_ssz_bytes(&bytes).expect("valid config"),
+            config
+        );
+    }
+
+    #[test]
+    fn a_lean_config_carries_its_time_grid_and_nothing_else_meaningful() {
+        let config = Config::lean(1_770_407_233, 4_000);
+        assert_eq!(config.genesis_time, 1_770_407_233);
+        assert_eq!(config.slot_duration_ms, 4_000);
+        assert_eq!(config.seconds_per_slot, 4);
+
+        // Every fork epoch is FAR_FUTURE_EPOCH: a lean chain has no beacon
+        // fork schedule, and a placeholder that reads as "scheduled at epoch
+        // 0" would make a beacon-shaped gate fire on a lean chain.
+        assert_eq!(config.altair_fork_epoch, constants::FAR_FUTURE_EPOCH);
+        assert_eq!(config.fulu_fork_epoch, constants::FAR_FUTURE_EPOCH);
+    }
+
+    #[test]
+    fn a_lean_config_round_trips_through_ssz() {
+        let config = Config::lean(7, 4_000);
+        let bytes = config.to_ssz();
+        assert_eq!(
+            Config::from_ssz_bytes(&bytes).expect("valid config"),
+            config
+        );
+    }
+
+    #[test]
+    fn genesis_time_is_not_min_genesis_time() {
+        // Different quantities, and mainnet is the case that proves it:
+        // min_genesis_time is the earliest the deposit-driven rules permit,
+        // 23 seconds before the chain actually started. Reusing it for the
+        // clock would put every slot boundary 23 seconds off.
+        let config = Config::mainnet();
+        assert_eq!(config.min_genesis_time, 1_606_824_000);
+        assert_eq!(config.genesis_time, 1_606_824_023);
+        assert_ne!(config.genesis_time, config.min_genesis_time);
     }
 }

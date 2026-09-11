@@ -18,6 +18,7 @@ use spawned_concurrency::tasks::{Context, send_after};
 use std::time::Duration;
 use tracing::{debug, error, trace, warn};
 
+use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
@@ -311,10 +312,19 @@ async fn handle_lean_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        if let Ok(Some(signed_block)) = server.store.get_signed_block(root) {
-            blocks.push(signed_block);
+        match server.store.get_signed_block(root) {
+            Ok(Some(SignedBeaconBlock::Lean(signed_block))) => blocks.push(signed_block),
+            // This handler only ever runs against a lean store, so a beacon
+            // block here would mean the chain tag lied; surface it loudly
+            // rather than silently dropping it like a genuinely missing block.
+            Ok(Some(other)) => error!(
+                %root,
+                fork = %other.fork_name(),
+                "BlocksByRoot found a non-lean block in a lean store"
+            ),
+            // Missing blocks are silently skipped (per spec)
+            Ok(None) | Err(_) => {}
         }
-        // Missing blocks are silently skipped (per spec)
     }
 
     let found = blocks.len();
@@ -852,25 +862,25 @@ mod tests {
         let block_1 = signed_block(1, store.head().expect("head block exists"));
         let root_1 = block_1.message.hash_tree_root();
         store
-            .insert_signed_block(root_1, block_1)
+            .insert_signed_block(root_1, SignedBeaconBlock::Lean(block_1))
             .expect("insert test block should succeed");
 
         let block_2 = signed_block(2, root_1);
         let root_2 = block_2.message.hash_tree_root();
         store
-            .insert_signed_block(root_2, block_2)
+            .insert_signed_block(root_2, SignedBeaconBlock::Lean(block_2))
             .expect("insert test block should succeed");
 
         let side_block_3 = signed_block(3, root_1);
         let side_root_3 = side_block_3.message.hash_tree_root();
         store
-            .insert_signed_block(side_root_3, side_block_3)
+            .insert_signed_block(side_root_3, SignedBeaconBlock::Lean(side_block_3))
             .expect("insert test block should succeed");
 
         let block_4 = signed_block(4, root_2);
         let root_4 = block_4.message.hash_tree_root();
         store
-            .insert_signed_block(root_4, block_4)
+            .insert_signed_block(root_4, SignedBeaconBlock::Lean(block_4))
             .expect("insert test block should succeed");
         store
             .update_checkpoints(ForkCheckpoints::head_only(root_4))

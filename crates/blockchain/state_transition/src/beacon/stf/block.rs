@@ -68,6 +68,9 @@ pub fn process_block(
         containers::SignedBeaconBlock::Fulu(signed) => {
             fulu::process_block(state, &signed.message, config, engine)
         }
+        containers::SignedBeaconBlock::Lean(_) => {
+            crate::beacon::lean_block_unreachable("process_block")
+        }
     }
 }
 

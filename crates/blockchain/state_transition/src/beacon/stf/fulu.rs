@@ -319,7 +319,9 @@ mod tests {
         config.blob_schedule = vec![BlobScheduleEntry {
             epoch: 0,
             max_blobs_per_block: raised_limit,
-        }];
+        }]
+        .try_into()
+        .expect("one entry is within the bound");
 
         let state = fulu_state_with_validators(4, header.clone());
         let commitment_count = (config.max_blobs_per_block_electra + 1) as usize;
@@ -350,7 +352,9 @@ mod tests {
         config.blob_schedule = vec![BlobScheduleEntry {
             epoch: 0,
             max_blobs_per_block: raised_limit,
-        }];
+        }]
+        .try_into()
+        .expect("one entry is within the bound");
 
         let state = fulu_state_with_validators(4, header.clone());
         let body = body_with_commitments(&state, &config, &header, (raised_limit + 1) as usize);

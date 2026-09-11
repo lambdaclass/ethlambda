@@ -54,11 +54,11 @@ use libssz::{SszDecode as _, SszEncode as _};
 
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
-use crate::beacon::lean_state_unreachable;
 use crate::beacon::primitives::{
     BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
     WithdrawalIndex,
 };
+use crate::beacon::{beacon_value_unreachable, lean_block_unreachable, lean_state_unreachable};
 
 /// Runs `$body` against whichever fork's state this is.
 ///
@@ -137,9 +137,33 @@ macro_rules! dispatch_state_from {
 
 /// Runs `$body` against whichever fork's block this is.
 ///
-/// [`SignedBeaconBlock`] has no lean variant, so unlike `dispatch_state!` there
-/// is no boundary arm and nothing to name in a panic.
+/// The block-shaped counterpart to `dispatch_state!`: `$function` names the
+/// accessor for the lean arm's panic, the same way it does there.
 macro_rules! dispatch_block {
+    ($self:expr, $function:expr, |$block:ident| $body:expr) => {
+        match $self {
+            SignedBeaconBlock::Phase0($block) => $body,
+            SignedBeaconBlock::Altair($block) => $body,
+            SignedBeaconBlock::Bellatrix($block) => $body,
+            SignedBeaconBlock::Capella($block) => $body,
+            SignedBeaconBlock::Deneb($block) => $body,
+            SignedBeaconBlock::Electra($block) => $body,
+            SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
+        }
+    };
+}
+
+/// Runs `$body` against whichever block this is, the lean one included.
+///
+/// The counterpart to `dispatch_block!` for the accessors every variant can
+/// answer for real. Lean's `Block` declares `slot`, `proposer_index`,
+/// `parent_root` and `state_root` under exactly those names and matching
+/// types, which is why the `message:`/`outer:` split in
+/// `signed_beacon_block_accessors!` is the same line as "answerable for lean".
+///
+/// No `$function` parameter, because no arm panics.
+macro_rules! dispatch_block_including_lean {
     ($self:expr, |$block:ident| $body:expr) => {
         match $self {
             SignedBeaconBlock::Phase0($block) => $body,
@@ -149,6 +173,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Deneb($block) => $body,
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Lean($block) => $body,
         }
     };
 }
@@ -177,6 +202,28 @@ pub enum BeaconState {
 }
 
 impl BeaconState {
+    /// The lean [`State`](crate::state::State) this value wraps.
+    ///
+    /// The mirror image of `dispatch_state!`'s `Lean` arm. That arm fires when a
+    /// lean state reaches a beacon accessor; this one fires when a beacon state
+    /// reaches a caller that only ever runs against a lean store, which every
+    /// reader on the `/lean/v0` surface and in the lean state transition is.
+    ///
+    /// Such a caller would otherwise write the peel out by hand, so this owns it
+    /// once: a data directory holds one chain for its whole life (see the storage
+    /// crate's `Chain`), which is what makes the other arm unreachable rather
+    /// than an error worth returning.
+    ///
+    /// `#[track_caller]` so the panic still reports the call site, the way the
+    /// `let ... else { unreachable!() }` written inline there would have.
+    #[track_caller]
+    pub fn expect_lean(&self) -> &crate::state::State {
+        match self {
+            BeaconState::Lean(state) => state,
+            other => beacon_value_unreachable("state", other.fork_name()),
+        }
+    }
+
     /// The fork whose rules and shape apply to this state.
     pub fn fork_name(&self) -> ForkName {
         match self {
@@ -219,8 +266,6 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
-            // Lean has a real shape, unlike SignedBeaconBlock::from_ssz's
-            // ForkName::Lean arm: there is something to build here.
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
             )?)),
@@ -533,9 +578,34 @@ pub enum SignedBeaconBlock {
     /// Fulu's block. See the enum doc for why this wraps
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
+
+    /// The Lean consensus protocol's block.
+    ///
+    /// Not a Beacon Chain shape, and here for the same reason
+    /// [`BeaconState::Lean`] is: so the storage layer takes one block type and
+    /// splits inside its methods rather than growing a method per chain.
+    Lean(crate::block::SignedBlock),
 }
 
 impl SignedBeaconBlock {
+    /// The lean [`SignedBlock`](crate::block::SignedBlock) this value wraps.
+    ///
+    /// The block-shaped counterpart to [`BeaconState::expect_lean`], and the
+    /// mirror image of `dispatch_block!`'s `Lean` arm. Takes `self` by value,
+    /// since the callers that peel a block back off go on to own it.
+    ///
+    /// For a caller that has some other arm to run instead of panicking, match
+    /// on [`SignedBeaconBlock::Lean`] directly; this is for the callers whose
+    /// store is lean by construction.
+    #[track_caller]
+    pub fn expect_lean(self) -> crate::block::SignedBlock {
+        let fork = self.fork_name();
+        match self {
+            SignedBeaconBlock::Lean(block) => block,
+            _ => beacon_value_unreachable("block", fork),
+        }
+    }
+
     /// The fork whose rules apply to this block.
     ///
     /// Not the same question as "what shape is this value": `Fulu` and
@@ -551,6 +621,7 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Deneb(_) => ForkName::Deneb,
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
+            SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
 
@@ -583,19 +654,20 @@ impl SignedBeaconBlock {
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
-            // There is no lean variant of SignedBeaconBlock, and this fork
-            // value comes straight from the caller, so a bad argument is
-            // reported rather than crashing.
-            ForkName::Lean => Err(Error::UnsupportedForFork {
-                function: "SignedBeaconBlock::from_ssz",
-                fork: ForkName::Lean,
-            }),
+            ForkName::Lean => Ok(SignedBeaconBlock::Lean(
+                crate::block::SignedBlock::from_ssz_bytes(bytes)?,
+            )),
         }
     }
 
     /// Encodes the signed block.
+    ///
+    /// Answers for [`SignedBeaconBlock::Lean`] rather than treating it as
+    /// unreachable, unlike the accessors that read a beacon field: this is the
+    /// inverse of [`SignedBeaconBlock::from_ssz`], which builds that variant,
+    /// so refusing here would make decoding a block and re-encoding it panic.
     pub fn to_ssz(&self) -> Vec<u8> {
-        dispatch_block!(self, |block| block.to_ssz())
+        dispatch_block_including_lean!(self, |block| block.to_ssz())
     }
 
     /// The merkle root of the unsigned `message`, which is what the proposer's
@@ -605,8 +677,13 @@ impl SignedBeaconBlock {
     /// root of the whole signed container (message and signature together),
     /// which no code in this crate needs yet but which would mean something
     /// different from this method if added later.
+    ///
+    /// Answers for [`SignedBeaconBlock::Lean`] too, for the reason
+    /// [`SignedBeaconBlock::to_ssz`] gives: lean's `Block` merkleizes through
+    /// the same `HashTreeRoot` blanket impl as every beacon fork's `message`
+    /// does, re-exported under this module's own `Root` alias.
     pub fn message_hash_tree_root(&self) -> Root {
-        dispatch_block!(self, |block| block.message.hash_tree_root())
+        dispatch_block_including_lean!(self, |block| block.message.hash_tree_root())
     }
 }
 
@@ -618,9 +695,15 @@ impl SignedBeaconBlock {
 /// `shared_state_accessors`'s is: every field here happens to be `Copy`, so
 /// the split is not `copy` versus `reference` but `message` versus `outer`,
 /// separating the fields nested under `message` from `signature`, the one
-/// field [`SignedBeaconBlock`] carries directly. As with
-/// `shared_state_accessors`, the arms come from `dispatch_block!` rather than
-/// from a variant list of this macro's own.
+/// field [`SignedBeaconBlock`] carries directly.
+///
+/// That split turns out to also be the lean boundary. Lean's `Block` declares
+/// `slot`, `proposer_index`, `parent_root` and `state_root` under exactly the
+/// `message:` names and types, so those accessors dispatch through
+/// `dispatch_block_including_lean!` and answer for lean for real. `signature`
+/// has no lean equivalent, since lean signs with a `MultiMessageAggregate`
+/// proof rather than a `BlsSignature`, so it stays on the panicking
+/// `dispatch_block!`.
 macro_rules! signed_beacon_block_accessors {
     (
         message: [$(($field:ident, $ty:ty)),* $(,)?],
@@ -629,13 +712,13 @@ macro_rules! signed_beacon_block_accessors {
         impl SignedBeaconBlock {
             $(
                 pub fn $field(&self) -> $ty {
-                    dispatch_block!(self, |block| block.message.$field)
+                    dispatch_block_including_lean!(self, |block| block.message.$field)
                 }
             )*
 
             $(
                 pub fn $outer_field(&self) -> $outer_ty {
-                    dispatch_block!(self, |block| block.$outer_field)
+                    dispatch_block!(self, stringify!($outer_field), |block| block.$outer_field)
                 }
             )*
         }
@@ -702,5 +785,48 @@ mod tests {
         // panic rather than a silent wrong answer.
         let state = BeaconState::Lean(crate::state::State::from_genesis(0, Vec::new()));
         let _ = state.slot();
+    }
+
+    #[test]
+    fn a_lean_block_answers_the_shared_accessors() {
+        let lean = crate::block::SignedBlock {
+            message: crate::block::Block {
+                slot: 9,
+                proposer_index: 3,
+                parent_root: crate::primitives::H256::from([1u8; 32]),
+                state_root: crate::primitives::H256::from([2u8; 32]),
+                body: Default::default(),
+            },
+            proof: Default::default(),
+        };
+        let block = SignedBeaconBlock::Lean(lean);
+
+        assert_eq!(block.fork_name(), ForkName::Lean);
+        assert_eq!(block.slot(), 9);
+        assert_eq!(block.proposer_index(), 3);
+        assert_eq!(
+            block.parent_root(),
+            crate::primitives::H256::from([1u8; 32])
+        );
+        assert_eq!(block.state_root(), crate::primitives::H256::from([2u8; 32]));
+    }
+
+    #[test]
+    #[should_panic(expected = "lean block reached a beacon accessor")]
+    fn a_lean_block_has_no_bls_signature() {
+        // A lean block carries a MultiMessageAggregate proof, not a
+        // BlsSignature, so this accessor has nothing to answer with. Named
+        // rather than silent, the same way the state accessors are.
+        let lean = crate::block::SignedBlock {
+            message: crate::block::Block {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: crate::primitives::H256::ZERO,
+                state_root: crate::primitives::H256::ZERO,
+                body: Default::default(),
+            },
+            proof: Default::default(),
+        };
+        let _ = SignedBeaconBlock::Lean(lean).signature();
     }
 }

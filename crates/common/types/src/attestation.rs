@@ -96,7 +96,7 @@ pub fn blank_xmss_signature() -> XmssSignature {
 }
 
 /// Aggregated attestation consisting of participation bits and message.
-#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct AggregatedAttestation {
     /// Bitfield indicating which validators participated in the aggregation.
     #[serde(serialize_with = "serialize_aggregation_bits")]

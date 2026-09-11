@@ -5,6 +5,7 @@ use axum::{
     routing::get,
 };
 use ethlambda_storage::Store;
+use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::primitives::H256;
 use libssz::SszEncode;
 
@@ -23,10 +24,14 @@ pub(crate) async fn get_latest_finalized_state(
     axum::extract::State(store): axum::extract::State<Store>,
 ) -> impl IntoResponse {
     let finalized = store.latest_finalized().expect("finalized block exists");
-    let mut state = store
+    let state = store
         .get_state(&finalized.root)
         .expect("finalized state exists")
         .unwrap();
+    // This endpoint is under the lean `/lean/v0/` surface, so a beacon state
+    // here would mean the store's chain tag lied, mirroring
+    // `get_latest_finalized_block`'s handling of `get_signed_block` below.
+    let mut state = state.expect_lean().clone();
 
     // Zero state_root to match the canonical post-state representation.
     // The spec's state_transition sets state_root to zero during process_block_header,
@@ -44,7 +49,13 @@ pub(crate) async fn get_latest_finalized_block(
     // Genesis has no stored signature; `get_signed_block` synthesizes a
     // placeholder blank proof so this always returns 200.
     match store.get_signed_block(&finalized.root) {
-        Ok(Some(block)) => ssz_response(block.to_ssz()),
+        Ok(Some(SignedBeaconBlock::Lean(block))) => ssz_response(block.to_ssz()),
+        // This endpoint is under the lean `/lean/v0/` surface, so a beacon
+        // block here would mean the store's chain tag lied.
+        Ok(Some(other)) => panic!(
+            "lean/v0/blocks/finalized found a {} block in a lean store",
+            other.fork_name()
+        ),
         Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }

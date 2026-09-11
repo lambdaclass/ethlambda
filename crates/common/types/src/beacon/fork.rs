@@ -6,6 +6,27 @@
 
 use core::fmt;
 
+use crate::beacon::preset;
+
+/// How many slots apart full state snapshots are written for lean, in
+/// [`ForkName::snapshot_interval`].
+///
+/// A slot count, not a duration: the reconstruction walk costs the same per
+/// slot whatever the configured cadence is. ~68 minutes at the default
+/// 4-second slots.
+///
+/// Matches what `crates/storage/src/store.rs`'s `SNAPSHOT_ANCHOR_INTERVAL`
+/// used before that value moved here, so lean's on-disk layout is unchanged.
+/// Snapshots bound a diff-chain reconstruction walk to at most this many
+/// steps.
+const LEAN_SNAPSHOT_INTERVAL: u64 = 1_024;
+
+/// How many slots apart full state snapshots are written for the Beacon
+/// Chain, in [`ForkName::snapshot_interval`]: one epoch, so a
+/// reconstruction fold is bounded at one epoch of blocks plus a single
+/// decode.
+const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
+
 /// A named fork of the Beacon Chain, ordered oldest to newest, followed by
 /// Lean.
 ///
@@ -108,6 +129,23 @@ impl ForkName {
         }
     }
 
+    /// How many slots apart full state snapshots are written for this fork.
+    ///
+    /// A storage tuning parameter, not a consensus one, which is why it lives
+    /// here rather than on `Config`: putting it in a config a chain agrees on
+    /// would imply the two had to agree on it.
+    ///
+    /// Lean's interval does not survive contact with a ~350 MB beacon state,
+    /// since the reconstruction fold would apply that many deltas; beacon
+    /// takes an epoch, so the fold is bounded at one epoch of blocks plus a
+    /// single decode.
+    pub const fn snapshot_interval(self) -> u64 {
+        match self {
+            ForkName::Lean => LEAN_SNAPSHOT_INTERVAL,
+            _ => BEACON_SNAPSHOT_INTERVAL,
+        }
+    }
+
     /// The inverse of [`ForkName::selector`].
     ///
     /// `None` for a byte this build does not know, which means a corrupt or
@@ -201,6 +239,21 @@ mod tests {
         assert_eq!(
             ForkName::from_selector(ForkName::Lean.selector()),
             Some(ForkName::Lean)
+        );
+    }
+
+    #[test]
+    fn the_snapshot_interval_is_per_chain() {
+        // Lean's interval must match what the storage layer used before this
+        // was factored out, or lean's on-disk layout silently changes.
+        assert_eq!(ForkName::Lean.snapshot_interval(), LEAN_SNAPSHOT_INTERVAL);
+        assert_eq!(
+            ForkName::Electra.snapshot_interval(),
+            BEACON_SNAPSHOT_INTERVAL
+        );
+        assert_ne!(
+            ForkName::Lean.snapshot_interval(),
+            ForkName::Electra.snapshot_interval()
         );
     }
 

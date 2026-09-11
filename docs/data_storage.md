@@ -116,16 +116,16 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
-| Table             | Key         | Value                                     | Pruned?                          |
-| ----------------- | ----------- | ----------------------------------------- | -------------------------------- |
-| `BlockHeaders`    | root        | `BlockHeader`                             | never                            |
-| `BlockBodies`     | root        | `BlockBody`                               | never                            |
-| `BlockProof`      | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
-| `BlockRoots`      | slot        | block root (`H256`)                       | never                            |
-| `States`          | root        | full `State` snapshot                     | never                            |
-| `StateDiffs`      | root        | `StateDiff`                               | never                            |
-| `Metadata`        | string      | SSZ scalars                               | never                            |
-| `LiveChain`       | slot ‖ root | `parent_root`                             | yes: below finalized             |
+| Table              | Key         | Value                                     | Pruned?                          |
+| ------------------ | ----------- | ----------------------------------------- | --------------------------------- |
+| `BlockHeaders`     | root        | `BlockHeader`, or a whole beacon block    | never                            |
+| `BlockBodies`      | root        | `BlockBody` (lean only)                   | never                            |
+| `BlockProof`       | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockRoots`       | slot        | block root (`H256`)                       | never                            |
+| `States`           | root        | full `State` snapshot                     | never                            |
+| `StateDiffs`       | root        | `StateDiff`                               | never                            |
+| `Metadata`         | string      | SSZ scalars                               | never                            |
+| `LiveChain`        | slot ‖ root | `parent_root`                             | yes: below finalized             |
 
 ### Key encoding
 
@@ -150,13 +150,32 @@ block, and never pruned: headers are the permanent record of the chain.
 Headers are also read back during state reconstruction (see
 [State Storage](#state-storage-snapshots--diffs)).
 
+On a **beacon** directory this row holds the whole `SignedBeaconBlock`
+instead, prefixed with a one-byte fork selector the way a `States` value is,
+since a beacon block's shape varies by fork and SSZ carries no type tag. The
+two shapes never coexist in one table: a data directory holds one chain for
+its whole life (see `Chain`).
+
+`Store::block_entry` is the chain-agnostic reader for a stored block's slot
+and parent root, and is what the fork-choice tree walk and the `BlockRoots`
+index diff share. On the beacon arm it decodes the whole block to reach those
+two fields, so a caller walking a chain of them should build
+`Store::block_index` once instead, which reads the same links out of
+`LiveChain`.
+
 ### BlockBodies
 
-`root → BlockBody`. Written for every block **except** those with an empty
-body: if `header.body_root == EMPTY_BODY_ROOT` (the hash tree root of
-`BlockBody::default()`), nothing is stored and reads synthesize
+`root → BlockBody`, **lean only**. Written for every block **except** those
+with an empty body: if `header.body_root == EMPTY_BODY_ROOT` (the hash tree
+root of `BlockBody::default()`), nothing is stored and reads synthesize
 `BlockBody::default()`. This covers the genesis block and checkpoint sync
 anchors, whose bodies are either empty or unavailable. Never pruned.
+
+The split exists so a header-only query need not pay for the body, and so an
+empty body can be left out entirely. A beacon block has neither property, and
+nothing reads a beacon header without its block, so the beacon arm writes no
+row here at all: a second row would only add a write and a way for the two to
+disagree.
 
 ### BlockProof
 
@@ -213,28 +232,78 @@ diff contains and how states are rebuilt.
 String keys mapping to SSZ-encoded scalars — the `Store`'s own persistent
 fields:
 
-| Key                | Type              | Meaning                                                |
-| ------------------ | ----------------- | ------------------------------------------------------ |
-| `time`             | `u64`             | Intervals elapsed since genesis (the store clock)      |
-| `config`           | `ChainConfig` | Genesis time and slot duration                         |
-| `head`             | `H256`            | Current fork choice head                               |
-| `safe_target`      | `H256`            | Current safe target (see [lmd_ghost.md](lmd_ghost.md)) |
-| `latest_justified` | `Checkpoint`      | Latest justified checkpoint                            |
-| `latest_finalized` | `Checkpoint`      | Latest finalized checkpoint                            |
+| Key                            | Type         | Chain  | Meaning                                                       |
+| ------------------------------ | ------------ | ------ | ------------------------------------------------------------- |
+| `db_version`                   | `u64`        | both   | On-disk format version this directory was written at          |
+| `chain`                        | raw byte     | both   | Which consensus protocol this directory holds (`Chain`)       |
+| `preset`                       | raw byte     | both   | Which SSZ preset the writing build used (`Preset`)            |
+| `time`                         | `u64`        | both   | The store clock, as a **UNIX timestamp in milliseconds**      |
+| `config`                       | `Config`     | both   | The node's runtime configuration                              |
+| `head`                         | `H256`       | both   | Current fork choice head                                      |
+| `safe_target`                  | `H256`       | lean   | Current safe target (see [lmd_ghost.md](lmd_ghost.md))        |
+| `latest_justified`             | `Checkpoint` | both   | Latest justified checkpoint                                   |
+| `latest_finalized`             | `Checkpoint` | both   | Latest finalized checkpoint                                   |
+| `beacon_unrealized_justified`  | `Checkpoint` | beacon | Unrealized justified checkpoint (beacon `Checkpoint`)         |
+| `beacon_unrealized_finalized`  | `Checkpoint` | beacon | Unrealized finalized checkpoint (beacon `Checkpoint`)         |
 
-`config` is the odd one out: `init_store` writes it once at bootstrap and
-nothing ever rewrites it afterward (it has a getter, `Store::config`, but no
-setter). Because it never changes, the `Store` keeps a copy in memory and
-reads of it never reach the backend. It is also part of the DB's fingerprint:
-`from_db_state` refuses to resume a data directory belonging to another
-network (see [Startup and Restore](#startup-and-restore)). Every other
-`Metadata` key is mutated in place as the chain progresses.
+Rows marked for one chain are never written on the other, so reaching one
+through the wrong chain's accessor panics naming the key rather than reading a
+zero. That is deliberate: a data directory holds one chain for its whole life.
+
+#### One clock, three readings
+
+`time` is the only clock either chain keeps, and it is a UNIX millisecond.
+Milliseconds because the row has to be fine enough for the finest grid either
+chain schedules on, which is lean's interval: with `INTERVALS_PER_SLOT`
+intervals to a slot, most interval boundaries fall strictly between two whole
+seconds, and a second-resolution row could not name them.
+
+Everything coarser is derived from it, exactly and in one direction:
+
+| Reading | Method | Used by |
+| --- | --- | --- |
+| Milliseconds past genesis | `Store::ms_since_genesis` | placing a moment within the current slot, against the beacon basis-point deadlines |
+| Intervals past genesis | `Store::intervals_since_genesis` | lean's tick pipeline, its future-slot guards, its fork-choice fixtures and the Hive driver |
+| Slot | `Store::current_slot` | both chains, including the beacon `get_slots_since_genesis` |
+
+Nothing stores a derived reading, so none of them can fall out of step with
+the row or with each other. The beacon specification denominates its own
+`Store.time` in seconds, so `on_tick` and `on_tick_per_slot` convert on the
+way in and the fixture harness divides on the way out; that conversion lives
+at those edges rather than in a second row.
+
+Lean's `on_tick` writes the row only at interval boundaries, since the
+boundary is what it has actually processed: it walks forward one interval at a
+time running that interval's duty, and the leftover milliseconds up to the
+tick's own timestamp carry no duty that has run. The one time it moves the
+clock backwards is the deliberate rewind that replays a slot after a gap.
+
+#### Format and shape tags
+
+`db_version`, `chain` and `preset` are what `from_db_state` checks before it
+decodes anything else, and the two tags are raw bytes rather than SSZ for that
+reason: they have to be readable by a build that would decode the rest of the
+directory into the wrong shape. `db_version` catches a layout change this build
+knows about; `chain` catches lean rows being opened as beacon or the reverse;
+`preset` catches a `preset-minimal` build opening a mainnet directory, which
+the other two cannot, since both presets write the same layout at the same
+version while bounding every SSZ container differently. None of the three has a
+migration path.
+
+`config` is the odd one out among the mutable rows: `init_store` and
+`init_beacon` write it once at bootstrap and nothing ever rewrites it afterward
+(it has a getter, `Store::config`, but no setter). Because it never changes,
+the `Store` keeps a copy in memory and reads of it never reach the backend. It
+is also part of the DB's fingerprint: `from_db_state` refuses to resume a data
+directory belonging to another network (see
+[Startup and Restore](#startup-and-restore)). Every other `Metadata` key is
+mutated in place as the chain progresses.
 
 Note that this is *not* the SSZ `StateConfig` carried inside `State`. That one is
 merkleized into the state root, so its layout is fixed by the spec and holds only
-`genesis_time`; `ChainConfig` adds the slot duration, which the node needs to
-schedule duties but which never enters a state root. A blob written before the slot
-duration existed still decodes, filling in the 4-second default that chain ran on.
+`genesis_time`; the runtime `Config` adds the slot duration and the beacon fork
+schedule, which the node needs to schedule duties but which never enter a state
+root.
 
 ### LiveChain
 
@@ -334,7 +403,7 @@ sequence of independent write batches:
    │       justified a higher slot)    (+ triggers pruning)
    │
    ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
-   │                            │            BlockBodies[root]    (if non-empty)
+   │                            │            BlockBodies[root]    (lean, if non-empty)
    │                            ├─one batch─ BlockProof[slot‖root]
    │                            │            LiveChain[slot‖root]
    │                            ┘
@@ -395,15 +464,17 @@ and the (non-finalized) fork choice index are disposable.
 
 ## In-Memory Only (Lost on Restart)
 
-Four `Store` fields never touch the backend. All are bounded buffers shared
-across `Store` clones:
+Five `Store` fields never touch the backend. All are bounded buffers (or, for
+`beacon`, bounded in practice by the validator set and the unfinalized window)
+shared across `Store` clones:
 
 | Buffer              | Capacity        | Contents                                                                                 |
 | ------------------- | --------------- | ---------------------------------------------------------------------------------------- |
 | `new_payloads`      | 64 messages     | Pending aggregated attestation proofs, not yet active for fork choice                    |
 | `known_payloads`    | 512 messages    | Fork-choice-active aggregated proofs                                                     |
 | `gossip_signatures` | 2048 signatures | Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case) |
-| `state_cache`       | 32 states       | LRU memoization of reconstructed/imported states                                         |
+| `state_cache`       | 32 states       | LRU memoization of block *and* checkpoint post-states (either chain), each held behind an `Arc` so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error |
+| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. None of it is persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, PoW blocks stand in for an execution-client call a restarted node would simply make again, and unrealized justifications are refilled as a node re-imports the unfinalized window from its anchor |
 
 The payload buffers evict FIFO when full, and redundant proofs (whose
 participants are a subset of an existing proof for the same attestation data)
@@ -431,14 +502,20 @@ A `Store` is created through one of three constructors in
 | `from_db_state`        | Resume from an existing data directory | Re-opens the persisted store as-is                                                                 |
 
 The first two funnel into `init_store`, which writes the anchor in **one
-atomic batch**: all six `Metadata` keys (time = 0, config, head = safe_target
-= anchor root, justified = finalized = anchor checkpoint), the anchor header,
-its `BlockRoots` entry, the body if non-empty, a full snapshot into `States`
-(the base of every future diff chain), and the anchor's `LiveChain` entry.
+atomic batch**: the `Metadata` keys a lean directory needs (the format version
+and the chain and preset tags, time, config, head = safe_target = anchor root,
+justified = finalized = anchor checkpoint), the anchor header, its
+`BlockRoots` entry, the body if non-empty, a full snapshot into `States` (the
+base of every future diff chain), and the anchor's `LiveChain` entry. `time`
+starts at genesis rather than at zero because it is an absolute timestamp, so
+genesis is the value that means "the clock has not moved yet"; every derived
+reading is zero there.
 
 `from_db_state` is the restore path: it reads `config` and `latest_finalized`
-from `Metadata`, returning `None` for an empty DB. A populated DB from another
-network is fatal instead: the persisted `config`'s genesis time and slot
+from `Metadata`, returning `None` for an empty DB. Before either, it checks the
+three format tags above and fails with `Error::DbVersionMismatch`,
+`Error::WrongChain` or `Error::PresetMismatch` rather than reading on. A
+populated DB from another network is fatal too: the persisted `config`'s genesis time and slot
 duration, plus the finalized state's genesis time and validator registry, are
 compared against the genesis config, and a mismatch fails with
 `Error::GenesisMismatch` rather than being treated as empty, since writing a

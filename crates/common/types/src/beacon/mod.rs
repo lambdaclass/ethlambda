@@ -53,6 +53,43 @@ pub(crate) fn lean_fork_unreachable(function: &str) -> ! {
     )
 }
 
+/// Panics, naming the Beacon Chain-only block accessor a lean block reached.
+///
+/// The block-shaped counterpart to [`lean_state_unreachable`]. A lean block is
+/// a real variant of [`containers::SignedBeaconBlock`] and answers every
+/// accessor whose field it actually has; this is for the one it does not,
+/// `signature`, since lean signs with a `MultiMessageAggregate` proof rather
+/// than a `BlsSignature`.
+#[cold]
+#[track_caller]
+pub(crate) fn lean_block_unreachable(function: &str) -> ! {
+    unreachable!(
+        "lean block reached a beacon accessor ({function}); \
+         a lean block has no BLS signature"
+    )
+}
+
+/// Panics, naming the beacon fork a lean-only caller reached.
+///
+/// The mirror image of [`lean_state_unreachable`] and [`lean_block_unreachable`]:
+/// those fire when a lean value meets a beacon accessor, this one when a beacon
+/// value meets a caller that only ever runs against a lean store. Both mean a
+/// handler dispatched on the wrong thing, so both are `unreachable!` rather than
+/// a `Result` no correct caller would see.
+///
+/// Written once here, like its counterparts, so the wording cannot drift across
+/// the call sites that peel [`containers::BeaconState::Lean`] back off. The
+/// fork it actually found is what says which chain's value took the wrong path.
+#[cold]
+#[track_caller]
+pub(crate) fn beacon_value_unreachable(what: &str, fork: fork::ForkName) -> ! {
+    unreachable!(
+        "a {fork:?} {what} reached a lean-only caller; \
+         a data directory holds one chain for its whole life, so the store's \
+         chain tag and the caller disagree"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     /// A type-level assertion that the namespace does not reintroduce a second

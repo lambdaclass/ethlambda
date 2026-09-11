@@ -88,4 +88,6 @@ pub use ethlambda_types::beacon::{config, constants, containers, error, fork, pr
 
 pub use error::{Error, Result, verify};
 pub use fork::ForkName;
-pub(crate) use lean_boundary::{lean_fork_unreachable, lean_state_unreachable};
+pub(crate) use lean_boundary::{
+    lean_block_unreachable, lean_fork_unreachable, lean_state_unreachable,
+};

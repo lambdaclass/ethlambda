@@ -69,7 +69,7 @@ pub struct BlockChainConfig {
 }
 
 // The interval grid lives in `ethlambda-types` because `ethlambda-storage` also
-// derives slots from `store.time()` and must not carry a second copy of a
+// derives slots from the store clock and must not carry a second copy of a
 // consensus-critical constant.
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
 pub use ethlambda_types::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
@@ -171,12 +171,12 @@ impl BlockChain {
 
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
-        let time_config = *store.config();
+        let time_config = store.config().time_grid();
         let genesis_time = time_config.genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Catch XMSS keys up to the current slot before the first tick
-        // store.time() doesn't work here: after an offline gap it lags wall-clock by
+        // The store clock doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
         let now_ms = unix_now_ms();
         let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
@@ -293,7 +293,7 @@ pub struct BlockChainServer {
 
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
 
         // Calculate current slot and interval from milliseconds
         let time_since_genesis_ms = timestamp_ms.saturating_sub(time_config.genesis_time_ms());
@@ -307,7 +307,7 @@ impl BlockChainServer {
         // inside VMs, so a tick scheduled for the next interval boundary can fire
         // while the wall clock still reads the previous interval.
         let tick_interval = time_since_genesis_ms / time_config.milliseconds_per_interval();
-        let store_time = self.store.time().expect("store time exists");
+        let store_time = self.store.intervals_since_genesis();
 
         if store_time > 0 && tick_interval <= store_time {
             debug!(
@@ -528,7 +528,7 @@ impl BlockChainServer {
         };
 
         let session_id = slot;
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
         let t2_ms = time_config.genesis_time_ms()
             + SlotInterval::Aggregation.to_ms_since_genesis(slot, &time_config);
         // Interval-2 boundary as a wall-clock instant; the worker holds each
@@ -598,7 +598,7 @@ impl BlockChainServer {
         // Only fire inside the early-aggregation window
         // `[T2 - EARLY_AGGREGATION_WINDOW, T2)`, where T2 is the current
         // slot's interval-2 boundary; the slot is derived from the wall clock.
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
         let Some(ms_since_genesis) = unix_now_ms().checked_sub(time_config.genesis_time_ms())
         else {
             return;
@@ -730,7 +730,7 @@ impl BlockChainServer {
     async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
         let slot_start_ms = time_config.genesis_time_ms()
             + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config);
 
@@ -862,7 +862,7 @@ impl BlockChainServer {
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
         // compute the wall-clock slot fresh for the head-recency gate.
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
         let wall_clock_slot = unix_now_ms().saturating_sub(time_config.genesis_time_ms())
             / time_config.milliseconds_per_slot;
         pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
@@ -942,7 +942,7 @@ impl BlockChainServer {
         // Catching this early also avoids persisting bogus future blocks to
         // RocksDB and triggering BlocksByRoot fan-out for fabricated parents.
         let block_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
-        let store_time = self.store.time().expect("store time exists");
+        let store_time = self.store.intervals_since_genesis();
         if block_start_interval > store_time + GOSSIP_DISPARITY_INTERVALS {
             warn!(
                 %slot,
@@ -1001,12 +1001,14 @@ impl BlockChainServer {
                 {
                     // Parent state available — enqueue for processing, cascade
                     // handles the rest via the outer loop.
-                    let block = self
+                    let fetched = self
                         .store
                         .get_signed_block(&missing_root)
                         .expect("header and parent state exist, so the full signed block must too")
                         .unwrap();
-                    queue.push_back(block);
+                    // This cascade only ever runs against a lean store, so a
+                    // beacon block here would mean the chain tag lied.
+                    queue.push_back(fetched.expect_lean());
                     return;
                 }
                 // Block exists but parent doesn't have state — register as pending
@@ -1117,13 +1119,16 @@ impl BlockChainServer {
             self.pending_block_parents.remove(&block_root);
 
             // Load block data from DB
-            let Ok(Some(child_block)) = self.store.get_signed_block(&block_root) else {
+            let Ok(Some(fetched)) = self.store.get_signed_block(&block_root) else {
                 warn!(
                     block_root = %ShortRoot(&block_root.0),
                     "Pending block missing from DB, skipping"
                 );
                 continue;
             };
+            // This cascade only ever runs against a lean store, so a beacon
+            // block here would mean the chain tag lied.
+            let child_block = fetched.expect_lean();
 
             let slot = child_block.message.slot;
             trace!(%parent_root, %slot, "Processing pending child block");
@@ -1211,7 +1216,7 @@ impl BlockChainServer {
     /// lifetime of the process.
     fn is_arrival_observable(&self, slot: u64) -> bool {
         let slot_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
-        let store_time = self.store.time().expect("store time exists");
+        let store_time = self.store.intervals_since_genesis();
         slot_start_interval <= store_time + GOSSIP_DISPARITY_INTERVALS
     }
 }
@@ -1250,7 +1255,7 @@ impl BlockChainServer {
         let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
 
-        let time_config = *self.store.config();
+        let time_config = self.store.config().time_grid();
         let remaining_at_entry = ms_until_next_interval(now_ms, &time_config);
         let now_after_tick = unix_now_ms();
         let elapsed = now_after_tick.saturating_sub(now_ms);
@@ -1327,7 +1332,11 @@ impl Handler<NewBlock> for BlockChainServer {
                 block: msg.block.message.hash_tree_root(),
             });
             if self.is_arrival_observable(slot) {
-                metrics::observe_gossip_block_arrival(arrival_ms, self.store.config(), slot);
+                metrics::observe_gossip_block_arrival(
+                    arrival_ms,
+                    &self.store.config().time_grid(),
+                    slot,
+                );
             }
         }
         self.on_block(msg.block);
@@ -1339,13 +1348,20 @@ impl Handler<NewAttestation> for BlockChainServer {
         let arrival_ms = unix_now_ms();
         let data_slot = msg.attestation.data.slot;
         if self.is_arrival_observable(data_slot) {
-            metrics::observe_gossip_attestation_arrival(arrival_ms, self.store.config(), data_slot);
+            metrics::observe_gossip_attestation_arrival(
+                arrival_ms,
+                &self.store.config().time_grid(),
+                data_slot,
+            );
         }
         self.on_gossip_attestation(&msg.attestation);
         // Early aggregation only advances the current slot's group counts, so a
         // late- or future-slot attestation can never cross the threshold; skip
         // the check unless this attestation is for the store's current slot.
-        let current_slot = self.store.current_slot();
+        // From the interval clock, the one the tick pipeline drives: this
+        // gates on the slot the store has actually ticked into, not on the one
+        // the wall clock has reached.
+        let current_slot = self.store.intervals_since_genesis() / INTERVALS_PER_SLOT;
         if data_slot == current_slot {
             self.maybe_start_early_aggregation(ctx).await;
         }
@@ -1355,7 +1371,7 @@ impl Handler<NewAttestation> for BlockChainServer {
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        metrics::observe_gossip_aggregation_arrival(arrival_ms, self.store.config());
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, &self.store.config().time_grid());
         self.on_gossip_aggregated_attestation(msg.attestation);
     }
 }
@@ -1389,7 +1405,7 @@ impl Handler<AggregateProduced> for BlockChainServer {
         // and costs little in practice: a late aggregate is late for every node
         // at once, so both populations are dominated by production time rather
         // than propagation and their distributions look alike.
-        metrics::observe_gossip_aggregation_arrival(arrival_ms, self.store.config());
+        metrics::observe_gossip_aggregation_arrival(arrival_ms, &self.store.config().time_grid());
 
         // Publish alignment is enforced upstream: the worker delays delivery of
         // this message until the interval-2 boundary, so by the time it lands

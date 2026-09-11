@@ -51,6 +51,16 @@ lto = false
 codegen-units = 16
 debug = "line-tables-only"
 incremental = true
+# Inheriting `release` would leave these off, so a `debug_assert!` would run
+# nowhere: the suite runs under this profile, and a plain `dev` build is not a
+# fallback because signature verification and aggregation stack-overflow
+# without release-grade opt-level. Turning them on here is what makes
+# `debug_assertions` mean "checked in tests, absent from shipped binaries".
+debug-assertions = true
+# Set explicitly rather than inherited, so arithmetic behaviour stays identical
+# to `release` regardless of what Cargo defaults this to alongside
+# `debug-assertions`.
+overflow-checks = false
 
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
@@ -116,6 +126,19 @@ libssz = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83
 libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
 libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
 libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+
+# VCDIFF delta compression for beacon state diffs.
+#
+# Sigma Prime's maintained fork of the unmaintained liushuyu/xdelta3-rs on
+# crates.io, kept alive for lighthouse's own state-diff layer. Pinned by rev
+# rather than tracking a branch, for the same reason libssz is: this decides
+# whether a reconstructed state is correct, so a routine `cargo update` must
+# not be able to move it.
+#
+# `default-features = false` is required, not tidiness: the default `stream`
+# feature pulls futures-io/futures-util for an async API whose module does not
+# compile at this rev. The one-shot in-memory API used here is outside it.
+xdelta3 = { git = "https://github.com/sigp/xdelta3-rs", rev = "fe3906605c87", default-features = false }
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }

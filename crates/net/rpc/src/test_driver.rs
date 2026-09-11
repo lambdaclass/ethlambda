@@ -352,7 +352,7 @@ fn snapshot_store(store: &Store) -> DriverSnapshot {
     DriverSnapshot {
         head_slot: store.head_slot(),
         head_root: store.head().expect("head exists"),
-        time: store.time().expect("store time exists"),
+        time: store.intervals_since_genesis(),
         justified_checkpoint: store
             .latest_justified()
             .expect("latest justified checkpoint exists"),
@@ -383,7 +383,7 @@ mod tests {
         // Head, time, checkpoints all read without panicking; that's the
         // contract `init_fork_choice` relies on before the first reset.
         let _ = store.head();
-        assert_eq!(store.time().unwrap(), 0);
+        assert_eq!(store.intervals_since_genesis(), 0);
         assert_eq!(store.latest_justified().unwrap().slot, 0);
         assert_eq!(store.latest_finalized().unwrap().slot, 0);
     }

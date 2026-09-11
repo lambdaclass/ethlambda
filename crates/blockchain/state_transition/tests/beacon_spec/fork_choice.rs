@@ -83,8 +83,8 @@
 //! # `anchor_block.ssz_snappy` is unsigned; `get_forkchoice_store` wants signed
 //!
 //! [`fork_choice::get_forkchoice_store`] takes a [`SignedBeaconBlock`],
-//! matching what `Store::blocks` holds (see that module's own documentation
-//! for why the store holds a signed block at all). The fixture's
+//! matching what the store holds blocks as (see that module's own
+//! documentation for why the store holds a signed block at all). The fixture's
 //! `anchor_block.ssz_snappy` is an unsigned `BeaconBlock`, so
 //! [`decode_anchor_block`] decodes it as the fork's own unsigned container
 //! and wraps it in a zero-signature signed one; the anchor block's signature
@@ -462,6 +462,11 @@ fn block_attestations_and_slashings(
                 .map(fork_choice::AttesterSlashing::Electra)
                 .collect(),
         ),
+        // Never reached: `decode_anchor_block` and `decode_signed_block` both
+        // decode through `case.fork`, and every path that could produce
+        // `ForkName::Lean` panics via `lean_is_not_a_fixture_fork` before a
+        // `SignedBeaconBlock` value exists.
+        SignedBeaconBlock::Lean(_) => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
 
@@ -710,13 +715,14 @@ fn check_checkpoint(
 }
 
 /// Checks `head` against [`fork_choice::get_head`]'s root, and that root's
-/// slot in `store.blocks` against the fixture's redundant `slot` field.
-fn check_head(expected: &HeadCheck, store: &Store, config: &Config) -> Result<(), String> {
+/// slot (read through [`fork_choice::get_forkchoice_store`]'s store) against
+/// the fixture's redundant `slot` field.
+fn check_head(expected: &HeadCheck, store: &mut Store, config: &Config) -> Result<(), String> {
     let actual_root =
         fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
     let actual_slot = store
-        .blocks
-        .get(&actual_root)
+        .get_signed_block(&actual_root)
+        .expect("get")
         .map(|block| block.slot())
         .ok_or_else(|| {
             format!(
@@ -743,7 +749,7 @@ fn check_head(expected: &HeadCheck, store: &Store, config: &Config) -> Result<()
 /// fixture supplies separately.
 fn check_get_proposer_head(
     expected_hex: &str,
-    store: &Store,
+    store: &mut Store,
     config: &Config,
 ) -> Result<(), String> {
     let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
@@ -761,7 +767,7 @@ fn check_get_proposer_head(
 /// a per-validator registry.
 fn check_should_override_forkchoice_update(
     expected: &ShouldOverrideForkchoiceUpdateCheck,
-    store: &Store,
+    store: &mut Store,
     config: &Config,
 ) -> Result<(), String> {
     let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
@@ -783,21 +789,32 @@ fn check_should_override_forkchoice_update(
 }
 
 /// Applies one `checks` step: every field the fixture sets must match.
-fn apply_checks(store: &Store, checks: &Checks, config: &Config) -> Result<(), String> {
+fn apply_checks(store: &mut Store, checks: &Checks, config: &Config) -> Result<(), String> {
     if let Some(expected) = checks.time {
-        check_u64("time", expected, store.time)?;
+        // The fixture's `time` is the specification's seconds; the store keeps
+        // one millisecond row for both chains, so the caller converts.
+        let time_seconds = store.time_ms().expect("store time exists") / 1_000;
+        check_u64("time", expected, time_seconds)?;
     }
     if let Some(expected) = checks.genesis_time {
-        check_u64("genesis_time", expected, store.genesis_time)?;
+        check_u64("genesis_time", expected, store.config().genesis_time)?;
     }
     if let Some(expected) = &checks.justified_checkpoint {
-        check_checkpoint("justified_checkpoint", expected, store.justified_checkpoint)?;
+        check_checkpoint(
+            "justified_checkpoint",
+            expected,
+            store.beacon_justified_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.finalized_checkpoint {
-        check_checkpoint("finalized_checkpoint", expected, store.finalized_checkpoint)?;
+        check_checkpoint(
+            "finalized_checkpoint",
+            expected,
+            store.beacon_finalized_checkpoint(),
+        )?;
     }
     if let Some(expected) = &checks.proposer_boost_root {
-        check_root("proposer_boost_root", expected, store.proposer_boost_root)?;
+        check_root("proposer_boost_root", expected, store.proposer_boost_root())?;
     }
     if let Some(expected) = &checks.head {
         check_head(expected, store, config)?;
@@ -827,13 +844,14 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
     let anchor_block = decode_anchor_block(case)?;
 
-    let mut store = fork_choice::get_forkchoice_store(anchor_state, anchor_block, config)
+    let backend = Arc::new(ethlambda_storage::backend::InMemoryBackend::new());
+    let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
-            Some(checks) => apply_checks(&store, checks, config),
+            Some(checks) => apply_checks(&mut store, checks, config),
             None => apply_execution_step(&mut store, case, step, config),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
