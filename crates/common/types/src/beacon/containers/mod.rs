@@ -238,6 +238,36 @@ impl BeaconState {
         }
     }
 
+    /// Byte offset of `slot` in an encoded beacon `BeaconState`.
+    ///
+    /// `genesis_time` (u64) and `genesis_validators_root` (Root) are both
+    /// fixed-size and lead the container at every fork, so `slot` follows
+    /// them at a constant offset with no variable-length offset to resolve
+    /// first.
+    const SLOT_OFFSET: usize = 8 + 32;
+
+    /// The `slot` of an encoded beacon state, without decoding the rest.
+    ///
+    /// The inverse problem to [`BeaconState::from_ssz`]: that one is told the
+    /// fork, this one recovers the value a caller works the fork out from.
+    /// Checkpoint sync needs it because SSZ carries no type tag and the state
+    /// arrives as bytes off an HTTP response.
+    ///
+    /// Reads the *beacon* layout. [`BeaconState::Lean`] opens with `config`
+    /// instead, so lean bytes yield a meaningless number here rather than an
+    /// error; every caller already knows which chain it is talking to.
+    pub fn slot_from_ssz(bytes: &[u8]) -> Result<Slot> {
+        let end = Self::SLOT_OFFSET + 8;
+        let slot_bytes =
+            bytes
+                .get(Self::SLOT_OFFSET..end)
+                .ok_or(libssz::DecodeError::InvalidByteLength {
+                    expected: end,
+                    got: bytes.len(),
+                })?;
+        Ok(Slot::from_ssz_bytes(slot_bytes)?)
+    }
+
     /// Decodes a state of a known fork.
     ///
     /// The fork cannot be recovered from the bytes, since SSZ carries no type
@@ -345,8 +375,6 @@ macro_rules! shared_state_accessors {
 
 shared_state_accessors!(
     copy: [
-        (genesis_time, genesis_time_mut, u64),
-        (genesis_validators_root, genesis_validators_root_mut, Root),
         (slot, slot_mut, Slot),
         (eth1_deposit_index, eth1_deposit_index_mut, u64),
         (previous_justified_checkpoint, previous_justified_checkpoint_mut, Checkpoint),
@@ -368,6 +396,56 @@ shared_state_accessors!(
         (justification_bits, justification_bits_mut, JustificationBits),
     ],
 );
+
+impl BeaconState {
+    /// The genesis time of the chain this state belongs to.
+    ///
+    /// Answers for lean as well as every beacon fork. It is a genesis
+    /// identity rather than a beacon field, and lean keeps it in
+    /// `state.config.genesis_time` rather than at the top level. Widened for
+    /// the same reason `dispatch_state_including_lean!` widens `to_ssz` and
+    /// `hash_tree_root`: one comparison then recognizes either chain's own
+    /// state, which is what lets checkpoint sync and the resume path share
+    /// an implementation.
+    pub fn genesis_time(&self) -> u64 {
+        match self {
+            BeaconState::Lean(state) => state.config.genesis_time,
+            beacon => dispatch_state!(beacon, "genesis_time", |state| state.genesis_time),
+        }
+    }
+
+    /// The root committing to the genesis validator registry.
+    ///
+    /// Lean has no such field. Its registry is fixed at genesis, nothing in
+    /// the state transition mutates it, the same invariant `StateDiff` relies
+    /// on when it omits `validators`, so the root of the registry at any
+    /// slot is the root it had at genesis, which is the quantity beacon
+    /// stores. That equivalence is what lets one comparison serve both
+    /// chains.
+    ///
+    /// O(1) on beacon, where it is a stored field, and a merkleization of the
+    /// registry on lean. Called at startup, not on a hot path.
+    pub fn genesis_validators_root(&self) -> Root {
+        match self {
+            BeaconState::Lean(state) => state.validators.hash_tree_root(),
+            beacon => dispatch_state!(beacon, "genesis_validators_root", |state| state
+                .genesis_validators_root),
+        }
+    }
+
+    /// Beacon-only, unlike the read above: genesis construction sets this
+    /// field (`state_transition::beacon::genesis`), and a lean state has no
+    /// such field to hand out a `&mut` to.
+    pub fn genesis_time_mut(&mut self) -> &mut u64 {
+        dispatch_state!(self, "genesis_time_mut", |state| &mut state.genesis_time)
+    }
+
+    /// Beacon-only, for the reason given on [`BeaconState::genesis_time_mut`].
+    pub fn genesis_validators_root_mut(&mut self) -> &mut Root {
+        dispatch_state!(self, "genesis_validators_root_mut", |state| &mut state
+            .genesis_validators_root)
+    }
+}
 
 impl BeaconState {
     /// The validator at `index`.
@@ -741,6 +819,49 @@ signed_beacon_block_accessors!(
 mod tests {
     use super::*;
 
+    /// Single-validator lean state. The pubkeys are placeholders; nothing here
+    /// verifies a signature.
+    fn lean_state(genesis_time: u64, attestation_pubkey: u8) -> crate::state::State {
+        crate::state::State::from_genesis(
+            genesis_time,
+            vec![crate::state::Validator {
+                attestation_pubkey: [attestation_pubkey; 52],
+                proposal_pubkey: [2u8; 52],
+                index: 0,
+            }],
+        )
+    }
+
+    #[test]
+    fn a_lean_state_answers_the_genesis_identity_reads() {
+        let inner = lean_state(1_770_407_233, 1);
+        let expected_root = inner.validators.hash_tree_root();
+        let state = BeaconState::Lean(inner);
+
+        assert_eq!(state.genesis_time(), 1_770_407_233);
+        assert_eq!(state.genesis_validators_root(), expected_root);
+    }
+
+    #[test]
+    fn a_different_lean_registry_gives_a_different_root() {
+        let one = BeaconState::Lean(lean_state(1_770_407_233, 1));
+        let other = BeaconState::Lean(lean_state(1_770_407_233, 9));
+
+        assert_ne!(
+            one.genesis_validators_root(),
+            other.genesis_validators_root()
+        );
+    }
+
+    /// The writes stay beacon-only: a lean state has no
+    /// `genesis_validators_root` field to hand out a `&mut` to.
+    #[test]
+    #[should_panic(expected = "lean state reached a beacon accessor")]
+    fn the_genesis_validators_root_write_stays_beacon_only() {
+        let mut state = BeaconState::Lean(lean_state(0, 1));
+        let _ = state.genesis_validators_root_mut();
+    }
+
     #[test]
     fn a_lean_state_reports_the_lean_fork() {
         let state = BeaconState::Lean(crate::state::State::from_genesis(0, Vec::new()));
@@ -828,5 +949,23 @@ mod tests {
             proof: Default::default(),
         };
         let _ = SignedBeaconBlock::Lean(lean).signature();
+    }
+
+    #[test]
+    fn slot_from_ssz_reads_the_slot_at_its_fixed_offset() {
+        // The prefix every beacon fork's BeaconState opens with:
+        // genesis_time (8) + genesis_validators_root (32) + slot (8).
+        let mut bytes = vec![0u8; 48];
+        bytes[..8].copy_from_slice(&1_606_824_023u64.to_le_bytes());
+        bytes[8..40].copy_from_slice(&[7u8; 32]);
+        bytes[40..48].copy_from_slice(&9_876_543u64.to_le_bytes());
+
+        assert_eq!(BeaconState::slot_from_ssz(&bytes).unwrap(), 9_876_543);
+    }
+
+    #[test]
+    fn slot_from_ssz_rejects_a_buffer_too_short_to_hold_one() {
+        let bytes = vec![0u8; 47];
+        assert!(BeaconState::slot_from_ssz(&bytes).is_err());
     }
 }

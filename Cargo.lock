@@ -1925,6 +1925,7 @@ dependencies = [
  "ethlambda-network-api",
  "ethlambda-p2p",
  "ethlambda-rpc",
+ "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
  "eyre",

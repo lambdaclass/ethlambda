@@ -17,7 +17,7 @@ bin/ethlambda/              # Entry point, CLI, orchestration
   ├─ src/cli.rs             # Options { common, network: Lean | Mainnet }
   ├─ src/command.rs         # Sub-command dispatch + default-subcommand injection
   ├─ src/beacon.rs          # Mainnet wire params: built-in genesis, fork digest
-  ├─ src/checkpoint_sync.rs # Lean checkpoint sync (`/lean/v0/...`)
+  ├─ src/checkpoint_sync.rs # Checkpoint sync for both chains (lean's `/lean/v0/...`, beacon's Beacon API)
   ├─ assets/mainnet/genesis.ssz  # Mainnet genesis BeaconState (eth-clients/mainnet's file)
   └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
@@ -344,9 +344,14 @@ Two consequences of "one call site" worth knowing. `P2P::spawn` now runs
 *before* `BlockChain::spawn`, so gossip arriving in between hits a `P2PServer`
 whose `blockchain` is still `None` and is dropped; every access is an `if let
 Some`, and the window is a handful of statements. And `beacon` now binds
-`--api-port` and serves the `/lean/v0` routes off an empty in-memory store,
-which answers for a chain that is not running; that is an accepted placeholder,
-not a design.
+`--api-port` off a real, DB-backed anchored `Store`, not an empty in-memory
+placeholder: checkpoint sync or resume gives it one, the same way `node` gets
+its own. The lean-shaped `/lean/v0/...` routes still don't answer for it,
+though: they read metadata keys and state variants a beacon directory never
+carries, so calling one of them, e.g. `GET /lean/v0/states/finalized`, panics
+that request rather than quietly answering for a chain that is not running.
+That panic is deliberate, not an accepted placeholder: failing loudly beats
+making up an answer for a chain this process never imports past its anchor.
 
 `RunningNode.blockchain` is an `Option` for the same reason: the mainnet
 follower decodes gossip and imports nothing, so it has no chain actor to stop or
@@ -372,21 +377,27 @@ uncompressed and about 4 ms to decode: a deflated copy is under a third the
 size, but paying for it means a zip or gzip decoder in the dependency graph to
 read one build-time constant.
 
-Two consequences. `beacon` now takes **no** network configuration: a bare
-`ethlambda beacon` boots, and `--checkpoint-sync-url` is accepted there but
-unused (it is declared once for both sub-commands, and the anchor work will want
-it back). And a build with `ethlambda-types/preset-minimal` on cannot decode
-this asset, because the minimal preset shortens the state's fixed-size vectors;
-nothing enables that feature for this binary, and failing is the right answer if
-anything does.
+Two consequences. `beacon` takes **no genesis** configuration: `genesis_time`
+and `genesis_validators_root` need nothing from the command line. And a build
+with `ethlambda-types/preset-minimal` on cannot decode this asset, because the
+minimal preset shortens the state's fixed-size vectors; nothing enables that
+feature for this binary, and failing is the right answer if anything does.
 
-These values used to come from a Beacon API's `/eth/v1/beacon/genesis`, which
-made a `beacon` run depend on a checkpoint provider being reachable. They are
-properties of the chain, not of a provider. Lean's checkpoint sync is untouched:
-it fetches a *finalized* anchor, which genuinely has no local source.
-The URL cleaning, base-URL trim and first-success fan-out that the two paths
-once shared through a `checkpoint_common` module now live in
-`checkpoint_sync.rs`, its only remaining caller.
+`--checkpoint-sync-url` is no longer merely accepted-but-unused on `beacon`:
+the anchor work has landed, and this flag is now how `beacon` fetches its
+finalized `BeaconState` and anchor block from a standard Beacon API server,
+required on a fresh data directory since this chain has no genesis-sync path
+(see `docs/checkpoint_sync.md`).
+
+These genesis values used to come from a Beacon API's `/eth/v1/beacon/genesis`,
+which made a `beacon` run depend on a checkpoint provider being reachable. They
+are properties of the chain, not of a provider. Checkpoint sync itself is a
+separate concern, and now runs on both chains: lean still fetches a
+*finalized* anchor, which genuinely has no local source, and `beacon` fetches
+one too. The URL cleaning, base-URL trim and first-success fan-out that the
+old genesis-fetching path and lean's checkpoint sync once shared through a
+`checkpoint_common` module live in `checkpoint_sync.rs`, which today serves
+both chains' anchor fetches rather than lean's alone.
 
 ## HTTP Servers (API + Metrics)
 
@@ -396,14 +407,18 @@ when they are equal it merges all three routers onto a single listener, so point
 one port is supported and not a misconfiguration.
 
 Both sub-commands bind through one call to `start_rpc_server`, from one site in `run_node`, so
-both serve all three routers. `beacon` reaches it with placeholders: the empty in-memory `Store`
-its `P2PServer` already holds, an `AggregatorController` seeded `false`, and a default
-`SyncStatusController` and `EventBus`. Those endpoints therefore answer for a chain that is not
-running. That is deliberate for now, to keep one HTTP call site rather than two; giving the beacon
-follower its own surface belongs with the anchor work. `start_http_servers(config, api_router,
-shutdown)` still takes `api_router` as an `Option` and `crates/net/rpc/tests/http_servers.rs`
-still covers the `None` arm, because that is the shape the beacon follower returns to once it has
-a surface of its own.
+both serve all three routers. `beacon` reaches it with a mix now: the real, DB-backed anchored
+`Store` its `P2PServer` already holds (checkpoint sync or resume gave it one, the same way `node`
+gets its own), alongside an `AggregatorController` seeded `false` and a default
+`SyncStatusController` and `EventBus`, which stay placeholders since this chain has no aggregator
+duty and imports nothing to report sync status on. The lean-shaped `/lean/v0/...` routes still
+don't answer for a `beacon` run, though: they read metadata keys and state variants a beacon
+directory never carries, so calling one panics that request rather than answering for a chain that
+is not running (see "One startup path for both chains" above). That is deliberate for now, to keep
+one HTTP call site rather than two; giving the beacon follower its own surface is a change of its
+own. `start_http_servers(config, api_router, shutdown)` still takes `api_router` as an `Option` and
+`crates/net/rpc/tests/http_servers.rs` still covers the `None` arm, because that is the shape the
+beacon follower returns to once it has a surface of its own.
 
 See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 

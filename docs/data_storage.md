@@ -229,8 +229,10 @@ diff contains and how states are rebuilt.
 
 ### Metadata
 
-String keys mapping to SSZ-encoded scalars — the `Store`'s own persistent
-fields:
+String keys mapping to (mostly) SSZ-encoded scalars — the `Store`'s own
+persistent fields. Four are written on every directory, whichever chain it
+holds; the rest are chain-specific, since lean and a beacon directory keep
+different checkpoints.
 
 | Key                            | Type         | Chain  | Meaning                                                       |
 | ------------------------------ | ------------ | ------ | ------------------------------------------------------------- |
@@ -290,14 +292,54 @@ the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.
 
-`config` is the odd one out among the mutable rows: `init_store` and
-`init_beacon` write it once at bootstrap and nothing ever rewrites it afterward
-(it has a getter, `Store::config`, but no setter). Because it never changes,
-the `Store` keeps a copy in memory and reads of it never reach the backend. It
-is also part of the DB's fingerprint: `from_db_state` refuses to resume a data
-directory belonging to another network (see
-[Startup and Restore](#startup-and-restore)). Every other `Metadata` key is
-mutated in place as the chain progresses.
+`config` and `chain` are the odd ones out among the mutable rows: written once
+at bootstrap (`init_store` for lean, `init_beacon` for beacon) and never
+rewritten afterward (`config` has a getter, `Store::config`, and `chain` has
+`Store::chain`, but neither has a setter). Because they never change, the
+`Store` keeps a copy of each in memory, and reads of them never reach the
+backend. Every other `Metadata` key is mutated in place as the chain
+progresses.
+
+`config` used to double as the DB's fingerprint on its own, with
+`from_db_state` refusing to resume a data directory belonging to another
+network. `from_db_state` no longer judges the network or the chain (see
+[Startup and Restore](#startup-and-restore)): it reads `config` and `chain`
+back and hands both to the caller, which compares `config`'s `genesis_time`
+and slot duration (and `genesis_validators_root`, computed off the anchored
+state itself rather than stored in `Metadata`) against the network it was
+configured for, and `chain` against the sub-command it is running.
+
+A beacon directory **shares** `head`, `latest_justified` and `latest_finalized`
+rather than keeping parallel ones. `init_beacon` seeds all three from one
+trusted anchor, exactly as `init_store` seeds them on a lean directory, so
+`update_checkpoints` is a single writer for both chains instead of growing an
+absent-key branch per chain. The specification gives a trusted anchor's
+finality the same starting value as its justification, rather than one actually
+reached through the FFG rules, which is why both start equal.
+
+The two chains denominate a checkpoint differently, and the stored form is
+lean's: a beacon epoch is written as its own start slot. That is what makes the
+conversion exact in both directions, through
+`Store::beacon_checkpoint_as_stored` on the way in and
+`Store::beacon_finalized_checkpoint` on the way out, and it is what lets the
+shared finalization-advance comparison read a beacon checkpoint with no second
+rule for it.
+
+Note what is *not* in the table. There is no stored beacon head row:
+`beacon_head()` derives its pair from `head` plus the head block's own entry,
+because a second row denominated in `slot ‖ root` would be a value that could
+drift from the first.
+
+`init_beacon` writes the two beacon-only keys plus `db_version`, `chain`,
+`preset`, `config`, `time`, `head`, `latest_justified` and `latest_finalized`
+in one atomic batch. A directory's finalized state root, whichever chain it
+holds, is read through `Store::finalized_state_root`. That needs no
+chain-specific branch: both chains keep their finalized checkpoint in
+`latest_finalized`, and the epoch-to-slot conversion above touches only the
+slot, never the root. It treats a zero root as `Error::UnanchoredDirectory`
+rather than a valid answer, since both `init_store` and `init_beacon` always
+anchor at a real block root, so a zero root means the directory was built some
+other way or its metadata was corrupted at rest.
 
 Note that this is *not* the SSZ `StateConfig` carried inside `State`. That one is
 merkleized into the state root, so its layout is fixed by the spec and holds only
@@ -492,14 +534,15 @@ network. Everything persisted in the eight tables survives.
 
 ## Startup and Restore
 
-A `Store` is created through one of three constructors in
+A `Store` is created through one of four constructors in
 `crates/storage/src/store.rs`:
 
-| Constructor            | When                                   | What it does                                                                                       |
-| ---------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `from_anchor_state`    | Genesis boot                           | Initializes from the genesis state (no anchor block body)                                          |
-| `get_forkchoice_store` | [Checkpoint sync](checkpoint_sync.md)  | Initializes from a downloaded finalized state + anchor block, after validating they are consistent |
-| `from_db_state`        | Resume from an existing data directory | Re-opens the persisted store as-is                                                                 |
+| Constructor            | When                                    | What it does                                                                                       |
+| ---------------------- | ---------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `from_anchor_state`    | Lean genesis boot                       | Initializes from the genesis state (no anchor block body)                                          |
+| `get_forkchoice_store` | Lean [checkpoint sync](checkpoint_sync.md) | Initializes from a downloaded finalized state + anchor block, after validating they are consistent |
+| `init_beacon`          | Beacon [checkpoint sync](checkpoint_sync.md) | Writes a beacon directory's `Metadata` in one atomic batch, all seeded to one trusted anchor. The anchor block and state themselves are written separately, by `ethlambda_state_transition::beacon::fork_choice::get_forkchoice_store` (the specification's own construction rules, which this crate cannot depend on) |
+| `from_db_state`        | Resume from an existing data directory   | Loads whichever chain the directory holds, without judging whether it is the right one            |
 
 The first two funnel into `init_store`, which writes the anchor in **one
 atomic batch**: the `Metadata` keys a lean directory needs (the format version
@@ -511,21 +554,36 @@ starts at genesis rather than at zero because it is an absolute timestamp, so
 genesis is the value that means "the clock has not moved yet"; every derived
 reading is zero there.
 
-`from_db_state` is the restore path: it reads `config` and `latest_finalized`
-from `Metadata`, returning `None` for an empty DB. Before either, it checks the
-three format tags above and fails with `Error::DbVersionMismatch`,
-`Error::WrongChain` or `Error::PresetMismatch` rather than reading on. A
-populated DB from another network is fatal too: the persisted `config`'s genesis time and slot
-duration, plus the finalized state's genesis time and validator registry, are
-compared against the genesis config, and a mismatch fails with
-`Error::GenesisMismatch` rather than being treated as empty, since writing a
-fresh anchor would leave the foreign chain's rows in place to be served to
-peers. The slot duration has to be checked against the persisted `config`
-because it is absent from the state by design. At startup the node prefers
-this path but only
-accepts the on-disk store if its head is at most `MAX_RESUMABLE_DB_STATE_AGE
-= 450` slots (~30 minutes) behind the current slot; a staler DB falls through
-to checkpoint sync, which writes a fresh anchor on top of the existing data.
+`init_beacon`'s own atomic batch is the beacon-directory keys listed under
+[Metadata](#metadata) above; the anchor's `States`/`BlockHeaders`/`BlockBodies`
+entries are written by its caller instead, through the same `insert_state` and
+`insert_signed_block` an ordinary block import uses.
+
+`from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`
+and `config` from `Metadata`, returning `None` for an empty DB. A format
+mismatch is still fatal, failing with `Error::DbVersionMismatch` or
+`Error::PresetMismatch` rather than reading on, but `from_db_state` no longer
+judges the network or the chain: it hands back whichever chain the directory
+holds, without comparing either against anything. That comparison is now the
+caller's job. `fetch_initial_state` (lean) and `fetch_initial_beacon_state`
+(beacon) each check `Store::chain()` against the sub-command they are running
+under, read the finalized state back through `Store::finalized_state_root`
+(see [Metadata](#metadata) above), and run `verify_state_genesis` against it.
+A chain mismatch aborts with `CheckpointSyncError::WrongChain`; a genesis
+mismatch aborts with `CheckpointSyncError::Genesis`, wrapping
+`GenesisMismatch::GenesisTime` or `::GenesisValidatorsRoot`. Both used to be
+raised from inside `from_db_state` itself, as `storage::Error::GenesisMismatch`
+and `::WrongChain`; neither variant exists in the storage crate anymore, now
+that the check that needed them moved one layer up, to the caller that
+actually knows which network and which chain it wants. Either failure is not
+treated as an empty directory: writing a fresh anchor on top would leave the
+foreign chain's rows in place, to be served to peers.
+
+At startup, each chain prefers this path but only accepts the on-disk store if
+its head is at most `MAX_RESUMABLE_DB_STATE_AGE = 450` slots behind the
+current slot: ~30 minutes at lean's four-second slots, ~90 minutes at beacon's
+twelve-second ones. A staler DB falls through to checkpoint sync, which writes
+a fresh anchor on top of the existing data.
 
 ## Key Files
 

@@ -24,7 +24,6 @@ use ethlambda_types::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
     },
     checkpoint::Checkpoint,
-    genesis::GenesisConfig,
     primitives::{H256, HashTreeRoot as _},
     state::{State, anchor_pair_is_consistent},
 };
@@ -33,7 +32,7 @@ use libssz::{SszDecode, SszEncode};
 use crate::beacon_state_delta;
 use crate::state_diff::StateDiff;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::info;
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -841,52 +840,37 @@ impl Store {
         .expect("store initialization should succeed in get_forkchoice_store"))
     }
 
-    /// Build a Store from the state already persisted in the storage backend.
+    /// Load the chain a data directory holds, without judging whether it is
+    /// ours.
     ///
-    /// Returns `None` when the backend holds no chain state yet, leaving the
-    /// caller to initialize one from genesis or a checkpoint.
+    /// Returns `None` when the backend has never held a chain of either kind,
+    /// leaving the caller to initialize one from genesis or a checkpoint.
+    ///
+    /// **The caller must check [`Store::chain`] and verify the finalized
+    /// state's genesis against the network it was configured for before
+    /// writing anything.** This returns a usable `Store` for a foreign chain
+    /// as readily as for our own, and initializing a new anchor on top of a
+    /// foreign one would leave that chain's rows in place, reachable through
+    /// the slot-indexed reads that serve `BlocksByRange`, so peers would be
+    /// served another network's blocks.
+    ///
+    /// Loading and judging are separate because the judgement needs the
+    /// configured network and this crate does not know it. `main`'s
+    /// `fetch_initial_state` is the caller, and it discharges the obligation
+    /// immediately; the beacon path grows its own alongside it.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::GenesisMismatch`] when the persisted chain was started
-    /// from a different genesis than `genesis`. This is fatal rather than a
-    /// fall back to "treat the DB as empty": writing a new anchor on top would
-    /// leave the foreign chain's rows in place, and slot-indexed reads such as
-    /// [`Self::get_signed_blocks_by_slot_range`] would then serve them to
-    /// peers.
-    pub fn from_db_state(
-        backend: Arc<dyn StorageBackend>,
-        genesis: &GenesisConfig,
-    ) -> Result<Option<Self>, Error> {
-        let persisted_config = {
+    /// [`Error::DbVersionMismatch`] when the directory was written by a build
+    /// with a different on-disk format. There is no migration.
+    pub fn from_db_state(backend: Arc<dyn StorageBackend>) -> Result<Option<Self>, Error> {
+        let (config, chain) = {
             // Written by both `init_store` and `init_beacon`, so a backend
             // missing this has never held a chain of either kind.
             let view = backend.begin_read().expect("read view");
             let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
                 return Ok(None);
             };
-
-            let chain_tag = view
-                .get(Table::Metadata, KEY_CHAIN)
-                .expect("get chain")
-                .and_then(|bytes| bytes.first().copied())
-                .and_then(Chain::from_selector);
-            let has_lean_checkpoint = view
-                .get(Table::Metadata, KEY_LATEST_FINALIZED)
-                .expect("get latest finalized")
-                .is_some();
-
-            // `init_beacon` never writes `KEY_LATEST_FINALIZED`; that key is
-            // lean's own checkpoint, seeded only by `init_store`. So "has this
-            // directory ever held a chain" can no longer be answered by that
-            // key alone once beacon directories exist: a fully-formed beacon
-            // directory would otherwise read as empty here, and the caller
-            // would go on to bootstrap a lean chain on top of it. The chain
-            // tag is what disambiguates a genuine beacon directory from a
-            // half-written one.
-            if chain_tag != Some(Chain::Beacon) && !has_lean_checkpoint {
-                return Ok(None);
-            }
 
             let found = view
                 .get(Table::Metadata, KEY_DB_VERSION)
@@ -898,10 +882,6 @@ impl Store {
                     found,
                     expected: DB_VERSION,
                 });
-            }
-            let chain = chain_tag.expect("a versioned directory always carries a chain tag");
-            if chain != Chain::Lean {
-                return Err(Error::WrongChain);
             }
 
             // Before the config decode below and well before any state read:
@@ -921,55 +901,18 @@ impl Store {
                 });
             }
 
-            Config::from_ssz_bytes(&bytes).expect("valid config")
+            let chain = view
+                .get(Table::Metadata, KEY_CHAIN)
+                .expect("get chain")
+                .and_then(|bytes| bytes.first().copied())
+                .and_then(Chain::from_selector)
+                .expect("a versioned directory always carries a chain tag");
+
+            (Config::from_ssz_bytes(&bytes).expect("valid config"), chain)
         };
 
-        // The slot duration is absent from the state, so `verify_state` below
-        // cannot see it: compare the persisted config's time grid directly. A
-        // data directory built at another cadence indexes its blocks against a
-        // different time grid, which makes it as foreign as another genesis.
-        let persisted_grid = persisted_config.time_grid();
-        genesis
-            .verify_time_config(&persisted_grid)
-            .inspect_err(|err| {
-                error!(
-                    %err,
-                    db_genesis_time = persisted_grid.genesis_time,
-                    db_milliseconds_per_slot = persisted_grid.milliseconds_per_slot,
-                    expected_genesis_time = genesis.genesis_time,
-                    expected_milliseconds_per_slot = genesis.milliseconds_per_slot,
-                    "Persisted DB was built on a different time grid; refusing to reuse this data directory"
-                )
-            })?;
-
-        let store = Self::from_parts(backend, Arc::new(persisted_config), Chain::Lean);
-
-        // Compare against the finalized state rather than the persisted
-        // runtime `Config`: its time grid alone cannot catch a chain that
-        // shares our genesis time and cadence but not our validator set.
-        // Finalized is chosen over head because it is the state the
-        // anchor is rebuilt from and it never gets pruned.
-        let finalized = store.latest_finalized()?.root;
-        let state = store
-            .get_state(&finalized)?
-            .ok_or(Error::UnexpectedMissingState(finalized))?;
-        // `store` was just built with `Chain::Lean` above, and `chain !=
-        // Chain::Lean` was already rejected earlier in this function, so
-        // this can only be `BeaconState::Lean`.
-        let state = state.expect_lean();
-        genesis.verify_state(state).inspect_err(|err| {
-            error!(
-                %err,
-                db_genesis_time = state.config.genesis_time,
-                db_validators = state.validators.len(),
-                expected_genesis_time = genesis.genesis_time,
-                expected_validators = genesis.genesis_validators.len(),
-                "Persisted DB belongs to a different network; refusing to reuse this data directory"
-            )
-        })?;
-
-        info!("Loaded store from persisted DB state");
-        Ok(Some(store))
+        info!(?chain, "Loaded store from persisted DB state");
+        Ok(Some(Self::from_parts(backend, Arc::new(config), chain)))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -1345,6 +1288,29 @@ impl Store {
     /// Returns the latest finalized checkpoint.
     pub fn latest_finalized(&self) -> Result<Checkpoint, Error> {
         Ok(self.get_metadata(KEY_LATEST_FINALIZED))
+    }
+
+    /// The root of the finalized state, whichever chain this store holds.
+    ///
+    /// Reads [`KEY_LATEST_FINALIZED`] without asking which chain it is on:
+    /// both keep their finalized checkpoint there, and the epoch-to-slot
+    /// conversion the beacon accessors apply
+    /// ([`Store::beacon_finalized_checkpoint`]) touches only the slot, never
+    /// the root. So a caller that wants just the anchor, such as a resume
+    /// path's genesis check, needs no chain-specific branch at all.
+    ///
+    /// Every initialized directory has one: `init_store` anchors at the
+    /// genesis or checkpoint block, and `init_beacon` takes its anchor as an
+    /// argument and writes it in the same atomic batch as the rest of the
+    /// metadata. A zero root is therefore not a state either bootstrap path
+    /// can produce; see [`Error::UnanchoredDirectory`] for what it takes to
+    /// reach one.
+    pub fn finalized_state_root(&self) -> Result<H256, Error> {
+        let root = self.latest_finalized()?.root;
+        if root.is_zero() {
+            return Err(Error::UnanchoredDirectory);
+        }
+        Ok(root)
     }
 
     // ============ Checkpoint Updates ============
@@ -2913,33 +2879,6 @@ mod tests {
     use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
     use ethlambda_types::beacon::primitives::Uint256;
     use ethlambda_types::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
-    use ethlambda_types::genesis::{GenesisMismatch, GenesisValidatorEntry};
-
-    /// Validator at `index` whose two pubkeys are filled with `seed`, so
-    /// changing the seed changes the registry without changing its size.
-    fn validator(index: u64, seed: u8) -> Validator {
-        Validator {
-            attestation_pubkey: [seed; 52],
-            proposal_pubkey: [seed.wrapping_add(1); 52],
-            index,
-        }
-    }
-
-    /// Genesis config describing a chain started at `genesis_time` with
-    /// `validators`, for the `from_db_state` identity check.
-    fn genesis_config(genesis_time: u64, validators: &[Validator]) -> GenesisConfig {
-        GenesisConfig {
-            genesis_time,
-            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
-            genesis_validators: validators
-                .iter()
-                .map(|v| GenesisValidatorEntry {
-                    attestation_pubkey: v.attestation_pubkey,
-                    proposal_pubkey: v.proposal_pubkey,
-                })
-                .collect(),
-        }
-    }
 
     /// Insert a block header (and dummy body + proof) for a given root, slot,
     /// and parent. The stored header equals `header_at(slot, parent_root)`, so a
@@ -3278,7 +3217,7 @@ mod tests {
             .expect("put preset");
         batch.commit().expect("commit");
 
-        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
+        let Err(err) = Store::from_db_state(backend) else {
             panic!("a directory built against another preset must not be reused");
         };
         let Error::PresetMismatch { found, expected } = err else {
@@ -3306,7 +3245,7 @@ mod tests {
             .expect("delete preset");
         batch.commit().expect("commit");
 
-        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
+        let Err(err) = Store::from_db_state(backend) else {
             panic!("a directory with no preset recorded must not be reused");
         };
         assert!(matches!(err, Error::PresetMismatch { found: None, .. }));
@@ -3433,7 +3372,7 @@ mod tests {
 
         // Matched rather than `expect_err`: that would need `Store: Debug`, and
         // the store holds a `dyn StorageBackend` and buffers with no `Debug`.
-        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
+        let Err(err) = Store::from_db_state(backend) else {
             panic!("an unversioned database must not be reused");
         };
         assert!(matches!(
@@ -3443,41 +3382,6 @@ mod tests {
                 expected: DB_VERSION
             }
         ));
-    }
-
-    #[test]
-    fn from_db_state_refuses_a_beacon_data_directory() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let _ = Store::from_anchor_state(
-            backend.clone(),
-            State::from_genesis(7, vec![]),
-            DEFAULT_MILLISECONDS_PER_SLOT,
-        );
-
-        // Rewrite only the chain byte: everything else is a valid lean chain,
-        // so this pins the check to the chain tag rather than to a side effect
-        // of a half-written directory.
-        let mut batch = backend.begin_write().expect("write batch");
-        let entries = vec![(KEY_CHAIN.to_vec(), vec![Chain::Beacon.selector()])];
-        batch
-            .put_batch(Table::Metadata, entries)
-            .expect("put chain");
-        batch.commit().expect("commit");
-
-        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
-            panic!("a beacon data directory must not be opened as lean");
-        };
-        assert!(matches!(err, Error::WrongChain));
-    }
-
-    #[test]
-    fn an_empty_directory_is_none_not_a_version_mismatch() {
-        // The order of checks in from_db_state matters: "has this directory
-        // ever held a chain" must be answered before the format checks, or a
-        // fresh directory reports a version mismatch instead of being empty.
-        let backend = Arc::new(InMemoryBackend::new());
-        let result = Store::from_db_state(backend, &genesis_config(7, &[]));
-        assert!(matches!(result, Ok(None)));
     }
 
     // ============ Block Signature Pruning Tests ============
@@ -3552,7 +3456,7 @@ mod tests {
             .update_checkpoints(ForkCheckpoints::head_only(block_root))
             .expect("update head");
 
-        let restored = Store::from_db_state(backend, &genesis_config(12345, &[]))
+        let restored = Store::from_db_state(backend)
             .expect("restore store")
             .expect("store exists");
         let blocks = restored
@@ -4920,130 +4824,47 @@ mod tests {
     // ============ from_db_state Tests ============
 
     #[test]
-    fn from_db_state_returns_none_on_empty_backend() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        assert!(
-            Store::from_db_state(backend, &genesis_config(12345, &[]))
-                .expect("Failed to get store")
-                .is_none()
-        );
+    fn from_db_state_is_none_on_an_untouched_backend() {
+        let backend = Arc::new(InMemoryBackend::new());
+
+        assert!(Store::from_db_state(backend).unwrap().is_none());
     }
 
     #[test]
-    fn from_db_state_returns_some_on_matching_genesis() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        // Write an initial state to the backend.
-        let _ = Store::from_anchor_state(
+    fn from_db_state_loads_a_lean_directory_as_lean() {
+        let backend = Arc::new(InMemoryBackend::new());
+        Store::from_anchor_state(
             backend.clone(),
-            State::from_genesis(12345, vec![]),
+            State::from_genesis(0, Vec::new()),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
-        assert!(
-            Store::from_db_state(backend, &genesis_config(12345, &[]))
-                .expect("Failed to get store")
-                .is_some()
-        );
+
+        let store = Store::from_db_state(backend).unwrap().unwrap();
+
+        assert_eq!(store.chain(), Chain::Lean);
     }
 
-    /// Previously this returned `None` ("treat as empty"), which let the caller
-    /// write a fresh anchor over another network's rows. It is now fatal.
+    /// A beacon directory loads rather than erroring: judging whether it is
+    /// the chain the caller wanted is the caller's job now.
     #[test]
-    fn from_db_state_errors_on_genesis_time_mismatch() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        // Write an initial state to the backend.
-        let _ = Store::from_anchor_state(
-            backend.clone(),
-            State::from_genesis(12345, vec![]),
-            DEFAULT_MILLISECONDS_PER_SLOT,
-        );
-        // `Store` is not `Debug`, so unwrap the error by pattern rather than
-        // with `expect_err`.
-        let Err(err) = Store::from_db_state(backend, &genesis_config(99999, &[])) else {
-            panic!("genesis time mismatch must be fatal");
+    fn from_db_state_loads_a_beacon_directory_as_beacon() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let anchor = BeaconCheckpoint {
+            epoch: 0,
+            root: H256::from([1u8; 32]),
         };
-        assert!(matches!(
-            err,
-            Error::GenesisMismatch(GenesisMismatch::GenesisTime {
-                expected: 99999,
-                got: 12345,
-            })
-        ));
-    }
-
-    /// The case neither the state nor the validator registry can see: the slot
-    /// duration is deliberately absent from the SSZ state, so it has to be
-    /// caught against the persisted config.
-    #[test]
-    fn from_db_state_errors_on_slot_duration_mismatch() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        let _ = Store::from_anchor_state(
+        Store::init_beacon(
             backend.clone(),
-            State::from_genesis(12345, vec![]),
-            DEFAULT_MILLISECONDS_PER_SLOT,
+            1_606_824_023,
+            Config::mainnet(),
+            anchor.root,
+            Store::beacon_checkpoint_as_stored(anchor),
         );
 
-        let mut genesis = genesis_config(12345, &[]);
-        genesis.milliseconds_per_slot = 8_000;
-        let Err(err) = Store::from_db_state(backend, &genesis) else {
-            panic!("slot duration mismatch must be fatal");
-        };
-        assert!(matches!(
-            err,
-            Error::GenesisMismatch(GenesisMismatch::SlotDuration {
-                expected: 8_000,
-                got: DEFAULT_MILLISECONDS_PER_SLOT,
-            })
-        ));
-    }
+        let store = Store::from_db_state(backend).unwrap().unwrap();
 
-    // `from_db_state_resumes_a_pre_slot_duration_data_directory` lived here: a
-    // data directory holding the legacy bare-`StateConfig` row under
-    // `KEY_CONFIG` had to keep decoding. The `DB_VERSION` gate refuses every
-    // pre-versioning directory before that row is read, so the legacy layout is
-    // unreachable; `from_db_state_rejects_an_unversioned_database` covers what
-    // happens to one now.
-
-    /// The case a `genesis_time`-only check cannot see: same network start
-    /// time, different validator registry.
-    #[test]
-    fn from_db_state_errors_on_validator_set_mismatch() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        let persisted = vec![validator(0, 1), validator(1, 2)];
-        let _ = Store::from_anchor_state(
-            backend.clone(),
-            State::from_genesis(12345, persisted.clone()),
-            DEFAULT_MILLISECONDS_PER_SLOT,
-        );
-
-        let mut foreign = persisted;
-        foreign[1] = validator(1, 9);
-        let Err(err) = Store::from_db_state(backend, &genesis_config(12345, &foreign)) else {
-            panic!("validator set mismatch must be fatal");
-        };
-        assert!(matches!(
-            err,
-            Error::GenesisMismatch(GenesisMismatch::ValidatorPubkey { index: 1 })
-        ));
-    }
-
-    #[test]
-    fn from_db_state_returns_none_when_latest_finalized_is_missing() {
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        // Write only KEY_CONFIG, leaving KEY_LATEST_FINALIZED absent.
-        let config = Config::lean(12345, DEFAULT_MILLISECONDS_PER_SLOT);
-        let mut batch = backend.begin_write().expect("write batch");
-        batch
-            .put_batch(
-                Table::Metadata,
-                vec![(KEY_CONFIG.to_vec(), config.to_ssz())],
-            )
-            .expect("put config");
-        batch.commit().expect("commit");
-        assert!(
-            Store::from_db_state(backend, &genesis_config(12345, &[]))
-                .expect("Failed to get store")
-                .is_none()
-        );
+        assert_eq!(store.chain(), Chain::Beacon);
+        assert_eq!(store.config().genesis_time, 1_606_824_023);
     }
 
     #[test]
@@ -5068,7 +4889,7 @@ mod tests {
         );
 
         // And it survives a reopen through Metadata["config"].
-        let reopened = Store::from_db_state(backend, &genesis_config(7, &[]))
+        let reopened = Store::from_db_state(backend)
             .expect("reopen")
             .expect("populated directory");
         assert_eq!(reopened.config().genesis_time, 7);
@@ -5181,6 +5002,53 @@ mod tests {
     }
 
     #[test]
+    fn finalized_state_root_answers_on_a_lean_directory() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let state = State::from_genesis(0, Vec::new());
+        let store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
+
+        let root = store.finalized_state_root().unwrap();
+
+        assert_eq!(root, store.latest_finalized().unwrap().root);
+    }
+
+    #[test]
+    fn finalized_state_root_answers_on_a_beacon_directory() {
+        let anchor = BeaconCheckpoint {
+            epoch: 4,
+            root: H256::from([5u8; 32]),
+        };
+        let store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor.root,
+            Store::beacon_checkpoint_as_stored(anchor),
+        );
+
+        assert_eq!(store.finalized_state_root().unwrap(), anchor.root);
+    }
+
+    /// A directory whose checkpoint names no root was written and never
+    /// anchored. There is nothing to resume from, and it is not an empty
+    /// directory either.
+    #[test]
+    fn finalized_state_root_rejects_a_directory_with_no_anchor() {
+        let store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            H256::ZERO,
+            Store::beacon_checkpoint_as_stored(BeaconCheckpoint::default()),
+        );
+
+        assert!(matches!(
+            store.finalized_state_root(),
+            Err(Error::UnanchoredDirectory)
+        ));
+    }
+
+    #[test]
     fn the_beacon_clock_head_and_checkpoints_round_trip() {
         // Anchored at a block the store then holds, mirroring
         // `get_forkchoice_store`: the head row names the anchor from
@@ -5257,16 +5125,5 @@ mod tests {
 
         let reopened = beacon_test_store(backend);
         assert_eq!(reopened.unrealized_justification(&root), None);
-    }
-
-    #[test]
-    fn from_db_state_refuses_a_directory_written_by_init_beacon() {
-        let backend = Arc::new(InMemoryBackend::new());
-        let _ = beacon_test_store(backend.clone());
-
-        let Err(err) = Store::from_db_state(backend, &genesis_config(7, &[])) else {
-            panic!("a beacon data directory must not be opened as lean");
-        };
-        assert!(matches!(err, Error::WrongChain));
     }
 }

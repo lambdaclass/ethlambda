@@ -57,7 +57,7 @@ pub(crate) struct CommonOptions {
     /// and reaches peers only through discv5, if that is enabled.
     #[arg(long)]
     pub(crate) bootnodes: Option<PathBuf>,
-    /// Base URL(s) of the lean API servers to take a checkpoint from, e.g.
+    /// Base URL(s) of the peer API servers to take a checkpoint from, e.g.
     /// `http://peer:5052`.
     ///
     /// Multiple URLs may be supplied for redundancy, either comma-separated
@@ -75,15 +75,13 @@ pub(crate) struct CommonOptions {
     /// URL ending in `/lean/v0/states/finalized` is accepted and the trailing
     /// path is stripped.
     ///
-    /// On `beacon` this does nothing. It used to read the Beacon API's
-    /// `/eth/v1/beacon/genesis` for the two values the fork digest is derived
-    /// from; those now come from the genesis state built into the binary, so
-    /// that follower takes no network configuration at all. The flag stays
-    /// accepted there, rather than rejected, because it is declared once for
-    /// both sub-commands and an operator's existing `beacon` invocation should
-    /// keep working. It is unused, not deprecated: the anchor work needs a
-    /// finalized beacon state from somewhere, and this is where it will come
-    /// from.
+    /// On `beacon` this reads each peer's standard Beacon API,
+    /// `/eth/v2/debug/beacon/states/finalized` and `/eth/v2/beacon/blocks/{slot}`,
+    /// with the same resumable-directory precedence `node` uses. Unlike
+    /// `node`, there is no genesis fallback: mainnet's genesis is built into
+    /// the binary, but this follower imports nothing, so anchoring there
+    /// would park it at slot 0 while claiming to follow a live chain. With
+    /// neither a resumable directory nor a URL, startup aborts.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
     #[command(flatten)]
@@ -616,10 +614,9 @@ mod tests {
     }
 
     #[test]
-    fn beacon_still_accepts_a_checkpoint_sync_url_it_ignores() {
-        // Declared once for both sub-commands, so `beacon` parses it; nothing
-        // on that path reads it. Rejecting it would break invocations written
-        // against the version that required it, for no gain.
+    fn beacon_accepts_a_checkpoint_sync_url() {
+        // Declared once for both sub-commands, so `beacon` parses it the same
+        // way `node` does; it is now how a beacon follower gets its anchor.
         let options = parse_beacon(vec![
             "ethlambda",
             "beacon",

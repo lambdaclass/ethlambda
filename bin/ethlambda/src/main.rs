@@ -45,12 +45,13 @@ use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
     build_swarm, discovery::DiscoverySpawnConfig, parse_enrs,
 };
-use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
+use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
+    beacon::config::Config,
     beacon::containers::SignedBeaconBlock,
-    genesis::GenesisConfig,
+    genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
 };
 use eyre::WrapErr;
@@ -61,7 +62,7 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
-    MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
+    Chain, MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
 };
 
 const ASCII_ART: &str = r#"
@@ -166,8 +167,11 @@ struct ChainSetup {
     /// [`DiscoverySpawnConfig`] is operator-supplied and identical either way,
     /// so it is filled in once, below the match.
     discovery: DiscoveryWireEntries,
-    /// Backs the lean req/resp handlers. Mainnet's is an empty in-memory store
-    /// that nothing on that path reads; a DB-backed one arrives with the anchor.
+    /// Backs the req/resp handlers on both chains. Lean's is the live chain
+    /// `BlockChain` drives; mainnet's is the checkpoint anchor
+    /// `fetch_initial_beacon_state` resumed from disk or checkpoint-synced.
+    /// Nothing on the mainnet path imports past that anchor, so its state
+    /// never advances once the node is running.
     store: Store,
     /// PeerId to node name, for logs. Empty on mainnet, which has no roster.
     node_names: HashMap<PeerId, String>,
@@ -188,10 +192,11 @@ struct ChainSetup {
 /// validator duties, a RocksDB store, checkpoint sync and the `/lean/v0` API.
 /// `Network::Mainnet` is the wire and nothing above it: it derives mainnet's
 /// fork digest, joins discv5, subscribes to the global gossip topics and logs
-/// what it decodes. It keeps no chain, so it has no fork choice and no state to
-/// answer from; the `/lean/v0` API is served there too, off an empty store, so
-/// that one HTTP call site serves both. Those endpoints answer for a chain that
-/// is not running, and fixing that is its own change.
+/// what it decodes. It keeps no chain, so it has no fork choice, only the
+/// checkpoint anchor `fetch_initial_beacon_state` resolves at startup; the
+/// `/lean/v0` API is served there too, off that anchored store, so that one
+/// HTTP call site serves both. Those endpoints answer for a chain that imports
+/// nothing past its anchor, and fixing that is its own change.
 //
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
@@ -290,6 +295,22 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    // Both chains keep a RocksDB directory now, so this is resolved once
+    // rather than in each arm. Opening it before the match also means a bad
+    // `--data-dir` fails before any network configuration is derived.
+    let data_dir =
+        std::path::absolute(&common.data_dir).unwrap_or_else(|_| common.data_dir.clone());
+    info!(data_dir = %data_dir.display(), "Initializing DB");
+    std::fs::create_dir_all(&data_dir)
+        .wrap_err_with(|| format!("failed to create data directory {}", data_dir.display()))?;
+    let backend = Arc::new(
+        RocksDBBackend::open(&data_dir)
+            .map_err(|err| eyre::eyre!("{err}"))
+            .wrap_err_with(|| format!("failed to open RocksDB at {}", data_dir.display()))?,
+    );
+
+    let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
+
     // The one place the two chains diverge. Everything above is shared setup;
     // everything below is shared startup and, in `wait_for_shutdown`, shared
     // teardown.
@@ -348,22 +369,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             let validator_keys =
                 read_validator_keys(&validators_path, &validator_keys_dir, &lean.node_id)
                     .wrap_err("failed to load validator keys")?;
-
-            let data_dir =
-                std::path::absolute(&common.data_dir).unwrap_or_else(|_| common.data_dir.clone());
-            info!(data_dir = %data_dir.display(), "Initializing DB");
-            std::fs::create_dir_all(&data_dir).wrap_err_with(|| {
-                format!("failed to create data directory {}", data_dir.display())
-            })?;
-            let backend = Arc::new(
-                RocksDBBackend::open(&data_dir)
-                    .map_err(|err| eyre::eyre!("{err}"))
-                    .wrap_err_with(|| {
-                        format!("failed to open RocksDB at {}", data_dir.display())
-                    })?,
-            );
-
-            let clean_checkpoint_urls = checkpoint_sync::clean_urls(&common.checkpoint_sync_url);
 
             let store =
                 fetch_initial_state(&clean_checkpoint_urls, &genesis_config, backend.clone())
@@ -432,16 +437,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
             let params = beacon::wire_params()?;
 
-            // An empty lean store. `P2PServer` holds one for the lean handlers;
-            // no beacon path reads it, because this node decodes gossip and
-            // imports nothing. A DB-backed beacon store arrives with the anchor.
-            let store = Store::from_anchor_state(
-                Arc::new(ethlambda_storage::backend::InMemoryBackend::default()),
-                State::from_genesis(params.wire.genesis_time, Vec::new()),
-                // The lean cadence, for a lean store no beacon path reads: the
-                // beacon chain's own slot duration lives in `params.wire`.
-                DEFAULT_MILLISECONDS_PER_SLOT,
-            );
+            let store = fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone())
+                .await
+                .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
             ChainSetup {
                 wire: WireConfig::Beacon(Box::new(params.wire)),
@@ -1020,11 +1018,55 @@ async fn fetch_initial_state(
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
     let validators = genesis.validators();
 
-    // Prefer resuming from on-disk state to avoid re-downloading what we already
-    // have. Tried before the checkpoint-sync and genesis paths so that a restart
-    // without `--checkpoint-sync-url` keeps the chain instead of writing a
-    // slot-0 anchor over it.
-    if let Some(store) = Store::from_db_state(backend.clone(), genesis)? {
+    // Prefer resuming from on-disk state to avoid re-downloading what we
+    // already have. Tried before the checkpoint-sync and genesis paths so that
+    // a restart without `--checkpoint-sync-url` keeps the chain instead of
+    // writing a slot-0 anchor over it.
+    //
+    // `from_db_state` loads without judging, so the identity check is here:
+    // the wrong chain or the wrong genesis aborts startup rather than being
+    // built on top of.
+    if let Some(store) = Store::from_db_state(backend.clone())? {
+        if store.chain() != Chain::Lean {
+            return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
+                expected: Chain::Lean,
+                found: store.chain(),
+            });
+        }
+
+        // The slot duration is deliberately absent from the SSZ state, so the
+        // state check below cannot see it: compare the persisted config's time
+        // grid. A data directory built at another cadence indexes its blocks
+        // against a different time grid, which makes it as foreign as another
+        // genesis.
+        let persisted_grid = store.config().time_grid();
+        genesis
+            .verify_time_config(&persisted_grid)
+            .inspect_err(|err| {
+                error!(
+                    %err,
+                    db_genesis_time = persisted_grid.genesis_time,
+                    db_milliseconds_per_slot = persisted_grid.milliseconds_per_slot,
+                    expected_genesis_time = genesis.genesis_time,
+                    expected_milliseconds_per_slot = genesis.milliseconds_per_slot,
+                    "Persisted DB was built on a different time grid; refusing to reuse this data directory"
+                )
+            })?;
+
+        let root = store.finalized_state_root()?;
+        let state = store
+            .get_state(&root)?
+            .ok_or(ethlambda_storage::Error::UnexpectedMissingState(root))?;
+        genesis.verify_state(&state).inspect_err(|err| {
+            error!(
+                %err,
+                db_genesis_time = state.genesis_time(),
+                expected_genesis_time = genesis.genesis_time,
+                expected_validators = genesis.genesis_validators.len(),
+                "Persisted DB belongs to a different network; refusing to reuse this data directory"
+            )
+        })?;
+
         let now_ms = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
@@ -1067,7 +1109,7 @@ async fn fetch_initial_state(
     let (state, signed_block) = checkpoint_sync::fetch_anchor_with_retry(
         checkpoint_urls,
         genesis.genesis_time,
-        &validators,
+        genesis.genesis_validators_root(),
     )
     .await?;
 
@@ -1099,11 +1141,116 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
+/// Fetch the initial state for a beacon node.
+///
+/// The beacon twin of [`fetch_initial_state`], with the same precedence: a
+/// resumable directory wins over a download, and a download wins over a
+/// directory that has fallen too far behind
+/// ([`MAX_RESUMABLE_DB_STATE_AGE`]).
+///
+/// One row differs. Lean initializes from its genesis config when there is
+/// neither a DB nor a URL; beacon aborts. The mainnet genesis state is built
+/// into the binary, so anchoring there is possible, but this node imports
+/// nothing, so it would park at slot 0 while claiming to follow mainnet.
+///
+/// Staleness reuses [`MAX_RESUMABLE_DB_STATE_AGE`], which is expressed in
+/// slots: 90 minutes at beacon's 12-second slots against 30 at lean's four.
+/// Worth revisiting when block import lands and the cost of a gap becomes
+/// real.
+async fn fetch_initial_beacon_state(
+    checkpoint_urls: &[String],
+    backend: Arc<dyn StorageBackend>,
+) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
+    let config = Config::mainnet();
+    let genesis = beacon::mainnet_genesis()
+        .expect("the built-in mainnet genesis decodes, checked at startup");
+
+    if let Some(store) = Store::from_db_state(backend.clone())? {
+        if store.chain() != Chain::Beacon {
+            return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
+                expected: Chain::Beacon,
+                found: store.chain(),
+            });
+        }
+
+        let root = store.finalized_state_root()?;
+        let state = store
+            .get_state(&root)?
+            .ok_or(ethlambda_storage::Error::UnexpectedMissingState(root))?;
+        verify_state_genesis(
+            &state,
+            genesis.genesis_time,
+            genesis.genesis_validators_root,
+        )
+        .inspect_err(|err| {
+            error!(
+                %err,
+                db_genesis_time = state.genesis_time(),
+                expected_genesis_time = genesis.genesis_time,
+                "Persisted DB belongs to a different network; refusing to reuse this data directory"
+            )
+        })?;
+
+        let now = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .expect("already past the unix epoch")
+            .as_secs();
+        let current_slot = now.saturating_sub(genesis.genesis_time) / config.seconds_per_slot;
+        // `init_beacon` writes the head in the same batch as the finalized
+        // checkpoint, and `finalized_state_root` above has already succeeded,
+        // so a directory that got this far has one. Asserting beats
+        // substituting a slot, which would read as maximally stale and force a
+        // re-sync of a directory that should have resumed.
+        let (head_slot, _) = store
+            .beacon_head()
+            .expect("an anchored directory has a head");
+        let gap = current_slot.saturating_sub(head_slot);
+
+        if gap <= MAX_RESUMABLE_DB_STATE_AGE {
+            info!(head_slot, current_slot, gap, "Resuming from existing DB");
+            return Ok(store);
+        }
+        if checkpoint_urls.is_empty() {
+            warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+            return Ok(store);
+        }
+        warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
+    }
+
+    if checkpoint_urls.is_empty() {
+        return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
+    }
+
+    info!(?checkpoint_urls, "Starting beacon checkpoint sync");
+
+    let (state, block) = checkpoint_sync::fetch_beacon_anchor_with_retry(
+        checkpoint_urls,
+        &config,
+        genesis.genesis_time,
+        genesis.genesis_validators_root,
+    )
+    .await?;
+
+    info!(
+        slot = state.slot(),
+        fork = %state.fork_name(),
+        validators = state.validators().len(),
+        finalized_epoch = state.finalized_checkpoint().epoch,
+        anchor_block_slot = block.slot(),
+        "Beacon checkpoint sync complete"
+    );
+
+    fork_choice::get_forkchoice_store(backend, state, block, &config)
+        .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
+        .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::command::{Command, try_parse_from};
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
@@ -1341,12 +1488,12 @@ validators:
         };
 
         assert!(
-            matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
+            matches!(err, checkpoint_sync::CheckpointSyncError::Genesis(_)),
             "unexpected error: {err}"
         );
         // The foreign chain is left untouched, not overwritten with a new anchor.
-        let store = Store::from_db_state(backend, &seeded_genesis)
-            .expect("original DB still loads under its own genesis")
+        let store = Store::from_db_state(backend)
+            .expect("original DB still loads")
             .expect("store exists");
         assert_eq!(store.head_slot(), SEEDED_HEAD_SLOT);
     }
@@ -1367,9 +1514,95 @@ validators:
         };
 
         assert!(
-            matches!(err, checkpoint_sync::CheckpointSyncError::DbState(_)),
+            matches!(err, checkpoint_sync::CheckpointSyncError::Genesis(_)),
             "unexpected error: {err}"
         );
+    }
+
+    /// A lean node must refuse a beacon-tagged data directory outright rather
+    /// than building lean rows on top of it: doing so would leave the beacon
+    /// chain's blocks in place, still reachable through the slot-indexed reads
+    /// that serve `BlocksByRange`, so peers would be served the wrong chain.
+    #[tokio::test]
+    async fn fails_when_db_holds_a_beacon_chain() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
+
+        let backend = Arc::new(InMemoryBackend::default());
+        // Non-zero root, the way the storage crate's own tests build a beacon
+        // anchor: a zero root would trip `UnanchoredDirectory` before the
+        // chain-tag check this test targets ever ran.
+        let anchor = BeaconCheckpoint {
+            epoch: 0,
+            root: H256::from([1u8; 32]),
+        };
+        Store::init_beacon(
+            backend.clone(),
+            now_secs(),
+            Config::mainnet(),
+            anchor.root,
+            Store::beacon_checkpoint_as_stored(anchor),
+        );
+
+        let genesis = test_genesis(now_secs());
+        let Err(err) = fetch_initial_state(&[], &genesis, backend).await else {
+            panic!("a beacon data directory must not be opened as lean");
+        };
+
+        assert!(
+            matches!(
+                err,
+                checkpoint_sync::CheckpointSyncError::WrongChain {
+                    expected: Chain::Lean,
+                    found: Chain::Beacon,
+                }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Beacon has no genesis-sync path: with nothing on disk and no URL, there
+    /// is no anchor to start from and startup says so rather than parking a
+    /// node at slot 0 claiming to follow mainnet.
+    #[tokio::test]
+    async fn beacon_without_a_db_or_a_url_aborts() {
+        let backend = Arc::new(InMemoryBackend::default());
+
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = fetch_initial_beacon_state(&[], backend).await else {
+            panic!("no anchor is available");
+        };
+
+        assert!(matches!(
+            err,
+            checkpoint_sync::CheckpointSyncError::BeaconGenesisSync
+        ));
+    }
+
+    /// A lean directory is not a beacon one. Loading it would write beacon
+    /// rows over a lean chain's tables, and the slot-indexed reads behind
+    /// `BlocksByRange` would serve its blocks to beacon peers.
+    #[tokio::test]
+    async fn beacon_refuses_a_lean_data_directory() {
+        let genesis = test_genesis(now_secs());
+        let backend = Arc::new(InMemoryBackend::default());
+        seed_db(backend.clone(), &genesis);
+
+        let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = fetch_initial_beacon_state(&urls, backend).await else {
+            panic!("a lean directory is not resumable as beacon");
+        };
+
+        assert!(matches!(
+            err,
+            checkpoint_sync::CheckpointSyncError::WrongChain {
+                expected: Chain::Beacon,
+                found: Chain::Lean,
+            }
+        ));
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot

@@ -170,7 +170,9 @@ use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::kzg;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Epoch, Gwei, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex};
+use crate::beacon::primitives::{
+    Epoch, Gwei, HashTreeRoot as _, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex,
+};
 use crate::beacon::stf;
 
 // ---------------------------------------------------------------------------
@@ -461,12 +463,32 @@ pub fn get_forkchoice_store(
         anchor_block.fork_name() == anchor_state.fork_name(),
         "anchor_block's fork matches anchor_state's",
     )?;
-    verify(
-        anchor_block.state_root() == anchor_state.hash_tree_root(),
-        "anchor_block.state_root == hash_tree_root(anchor_state)",
-    )?;
 
     let anchor_root = anchor_block.message_hash_tree_root();
+
+    // The specification asserts `anchor_block.state_root ==
+    // hash_tree_root(anchor_state)`, which holds only when the anchor state is
+    // the block's own post-state. A checkpoint-synced anchor is not: the
+    // Beacon API's finalized state is the state at
+    // `finalized_checkpoint.epoch.start_slot()`, and when that slot was empty
+    // the state has been advanced past its own `latest_block_header`.
+    //
+    // Lighthouse makes the same deviation, validating the header instead:
+    // `beacon_node/beacon_chain/src/builder.rs`, `weak_subjectivity_state`.
+    // The header root still pins the pair, since it names exactly one block.
+    //
+    // `state_root` is zero only while the state is still inside the block's
+    // own slot, where the specification has not filled it in yet; substituting
+    // the state's root there is what `get_latest_block_root` does upstream.
+    let mut header = anchor_state.latest_block_header().clone();
+    if header.state_root == Root::ZERO {
+        header.state_root = anchor_state.hash_tree_root();
+    }
+    verify(
+        header.hash_tree_root() == anchor_root,
+        "hash_tree_root(anchor_state.latest_block_header) == hash_tree_root(anchor_block.message)",
+    )?;
+
     let anchor_epoch = get_current_epoch(&anchor_state);
     let justified_checkpoint = Checkpoint {
         epoch: anchor_epoch,
@@ -1855,6 +1877,8 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
 
     use super::*;
+    use crate::beacon::containers::BeaconBlockHeader;
+    use crate::beacon::helpers::test_state;
 
     /// A store backed by a fresh in-memory backend, with every checkpoint at
     /// its default (genesis) value and no anchor block or state written.
@@ -1908,6 +1932,50 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// An exact anchor pair: `state` is `block`'s own post-state.
+    ///
+    /// Built as a fixed point, the way the state transition produces one. The
+    /// state's `latest_block_header` names the block with a zero `state_root`,
+    /// which is how the specification leaves it inside the block's own slot;
+    /// the state's root is then computed against that, and written back into
+    /// the block. `BeaconBlock` and `BeaconBlockHeader` merkleize identically,
+    /// five fields with the body's root standing in for the body, so the
+    /// header root and the block root agree once the zero is substituted.
+    fn anchor_pair() -> (BeaconState, SignedBeaconBlock) {
+        let mut state = test_state::with_validators(4);
+        let parent_root = state.latest_block_header().parent_root;
+        let mut signed = block(state.slot(), parent_root);
+
+        let SignedBeaconBlock::Phase0(inner) = &signed else {
+            unreachable!("`block` builds a phase0 signed block");
+        };
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            slot: inner.message.slot,
+            proposer_index: inner.message.proposer_index,
+            parent_root,
+            state_root: Root::ZERO,
+            body_root: inner.message.body.hash_tree_root(),
+        };
+
+        let state_root = state.hash_tree_root();
+        let SignedBeaconBlock::Phase0(inner) = &mut signed else {
+            unreachable!("`block` builds a phase0 signed block");
+        };
+        inner.message.state_root = state_root;
+
+        (state, signed)
+    }
+
+    /// Advance a state one empty slot by hand, the way `process_slot` does:
+    /// fill in the header's `state_root`, then move the slot on. The state is
+    /// then past its own anchor block, which is the shape a checkpoint-synced
+    /// anchor arrives in when the finalized epoch boundary was empty.
+    fn advance_one_empty_slot(state: &mut BeaconState) {
+        let root = state.hash_tree_root();
+        state.latest_block_header_mut().state_root = root;
+        *state.slot_mut() += 1;
     }
 
     #[test]
@@ -2066,5 +2134,59 @@ mod tests {
         let (slot, root) = store.beacon_head().expect("head recorded");
         assert_eq!(root, head);
         assert_eq!(slot, store.block_entry(&head).expect("head block").0);
+    }
+
+    /// The specification's assertion cannot hold for a checkpoint-synced
+    /// anchor: the finalized state sits at the epoch boundary, so when that
+    /// slot was empty it has advanced past its own `latest_block_header` and
+    /// `block.state_root` is no longer the state's root. The header root is
+    /// what still identifies the pair.
+    #[test]
+    fn get_forkchoice_store_accepts_a_state_advanced_past_its_anchor_block() {
+        let (mut state, block) = anchor_pair();
+        advance_one_empty_slot(&mut state);
+        assert_ne!(block.state_root(), state.hash_tree_root());
+
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        );
+
+        assert!(store.is_ok(), "{:?}", store.err());
+    }
+
+    /// The exact pair, which the specification's own assertion accepts too,
+    /// must keep working: a full client anchors at genesis this way.
+    #[test]
+    fn get_forkchoice_store_accepts_an_exact_anchor_pair() {
+        let (state, block) = anchor_pair();
+
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        );
+
+        assert!(store.is_ok(), "{:?}", store.err());
+    }
+
+    /// Relaxing the state-root check must not accept any block at all: the
+    /// header still names exactly one.
+    #[test]
+    fn get_forkchoice_store_rejects_a_block_the_state_does_not_name() {
+        let (state, _) = anchor_pair();
+        let unrelated = block(state.slot(), Root::repeat_byte(9));
+
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            unrelated,
+            &Config::active(),
+        );
+
+        assert!(store.is_err());
     }
 }

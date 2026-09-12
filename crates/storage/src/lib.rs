@@ -7,7 +7,7 @@ mod store;
 
 pub use api::{ALL_TABLES, StorageBackend, StorageReadView, StorageWriteBatch, Table};
 /// Error type returned by the fallible [`Store`] operations, exported so
-/// callers can match on it (e.g. to distinguish [`Error::GenesisMismatch`]).
+/// callers can match on it (e.g. to distinguish [`Error::DbVersionMismatch`]).
 pub use error::Error;
 pub use store::{
     CacheKey, Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError,

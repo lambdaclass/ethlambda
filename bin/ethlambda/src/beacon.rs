@@ -324,6 +324,20 @@ mod tests {
         assert_eq!(genesis.genesis_validators_root, mainnet_gvr());
     }
 
+    /// The fast path in [`BeaconState::slot_from_ssz`] reads a byte offset
+    /// rather than the container, so pin it against a genuine encoded mainnet
+    /// state. The slot is moved off zero first: at zero an offset landing in
+    /// the `fork` field that follows would read zero too and pass.
+    #[test]
+    fn the_state_slot_offset_matches_a_real_encoded_state() {
+        let mut state = mainnet_genesis_state().expect("the built-in archive decodes");
+        *state.slot_mut() = 12_345;
+
+        let bytes = state.to_ssz();
+
+        assert_eq!(BeaconState::slot_from_ssz(&bytes).unwrap(), 12_345);
+    }
+
     /// Startup derives every wire parameter without touching the network.
     ///
     /// The point of the change: this used to require a reachable Beacon API, so

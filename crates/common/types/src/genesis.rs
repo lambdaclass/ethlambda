@@ -1,9 +1,11 @@
 use serde::Deserialize;
 
+use crate::beacon::containers::BeaconState;
 use crate::chain_config::ChainConfig;
 use crate::constants::{
     DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT,
 };
+use crate::primitives::{H256, HashTreeRoot as _};
 use crate::state::{State, Validator, ValidatorPubkeyBytes};
 
 /// Ways a state can fail to belong to the configured genesis.
@@ -11,20 +13,18 @@ use crate::state::{State, Validator, ValidatorPubkeyBytes};
 /// Raised for any state whose provenance we have not established ourselves:
 /// one downloaded through checkpoint sync, or one loaded from a data directory
 /// that may have been written by a different network.
+///
+/// Two values identify a genesis on either chain. The registry root subsumes
+/// what used to be four separate checks, count, sequential indices, and both
+/// pubkeys per validator, because a list's root commits to all of them.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GenesisMismatch {
     #[error("genesis time mismatch: expected {expected}, got {got}")]
     GenesisTime { expected: u64, got: u64 },
     #[error("slot duration mismatch: expected {expected} ms, got {got} ms")]
     SlotDuration { expected: u64, got: u64 },
-    #[error("validator count mismatch: expected {expected}, got {got}")]
-    ValidatorCount { expected: usize, got: usize },
-    #[error(
-        "validator at position {position} has non-sequential index (expected {position}, got {got})"
-    )]
-    NonSequentialIndex { position: usize, got: u64 },
-    #[error("validator {index} pubkey mismatch (attestation or proposal key)")]
-    ValidatorPubkey { index: usize },
+    #[error("genesis validators root mismatch: expected {expected}, got {got}")]
+    GenesisValidatorsRoot { expected: H256, got: H256 },
 }
 
 /// A single validator entry in the genesis config with dual public keys.
@@ -70,20 +70,28 @@ impl GenesisConfig {
             .collect()
     }
 
+    /// The root committing to this config's validator registry.
+    ///
+    /// Built through [`State::from_genesis`] rather than hashing the `Vec`
+    /// that [`GenesisConfig::validators`] returns. The state holds an SSZ
+    /// list, whose root mixes in the length and pads to the type's limit, so
+    /// a `Vec` root is a different value; going through the state guarantees
+    /// the same type as the one the comparison runs against, rather than
+    /// naming it here and letting the two drift.
+    ///
+    /// Startup-only, so building a whole state for one field is not worth
+    /// avoiding.
+    pub fn genesis_validators_root(&self) -> H256 {
+        State::from_genesis(self.genesis_time, self.validators())
+            .validators
+            .hash_tree_root()
+    }
+
     /// Verify `state` was produced by this genesis.
     ///
-    /// Compares the genesis time and the full validator registry: count,
-    /// sequential indices, and both pubkeys per validator. The validator set is
-    /// fixed at genesis (nothing in the state transition mutates it), so any
-    /// state of a chain started from this config must carry exactly this
-    /// registry, whatever slot it sits at.
-    ///
-    /// This is a network-identity check, not a consistency check: it says
-    /// nothing about whether the state is internally coherent. Callers that
-    /// accept a state from an untrusted source pair it with their own sanity
-    /// checks.
-    pub fn verify_state(&self, state: &State) -> Result<(), GenesisMismatch> {
-        verify_state_genesis(state, self.genesis_time, &self.validators())
+    /// The parsed-config front door onto [`verify_state_genesis`].
+    pub fn verify_state(&self, state: &BeaconState) -> Result<(), GenesisMismatch> {
+        verify_state_genesis(state, self.genesis_time, self.genesis_validators_root())
     }
 
     /// Verify a persisted [`ChainConfig`] belongs to this network.
@@ -139,43 +147,36 @@ where
 }
 
 /// Verify `state` was produced by the genesis described by `genesis_time` and
-/// `expected_validators`.
+/// `genesis_validators_root`.
 ///
-/// The implementation behind [`GenesisConfig::verify_state`], for callers that
-/// hold the genesis time and validator registry separately rather than as a
-/// parsed config.
+/// Serves both chains and both entry points: a state loaded from a data
+/// directory and one downloaded through checkpoint sync, lean or beacon. Lean
+/// has no `genesis_validators_root` field, but its registry never mutates, so
+/// the root of the registry it carries is the root it had at genesis, see
+/// [`crate::beacon::containers::BeaconState::genesis_validators_root`].
+///
+/// This is a network-identity check, not a consistency check: it says nothing
+/// about whether the state is internally coherent. Callers that accept a state
+/// from an untrusted source pair it with their own sanity checks.
 pub fn verify_state_genesis(
-    state: &State,
+    state: &BeaconState,
     genesis_time: u64,
-    expected_validators: &[Validator],
+    genesis_validators_root: H256,
 ) -> Result<(), GenesisMismatch> {
-    if state.config.genesis_time != genesis_time {
+    let found_time = state.genesis_time();
+    if found_time != genesis_time {
         return Err(GenesisMismatch::GenesisTime {
             expected: genesis_time,
-            got: state.config.genesis_time,
+            got: found_time,
         });
     }
 
-    if state.validators.len() != expected_validators.len() {
-        return Err(GenesisMismatch::ValidatorCount {
-            expected: expected_validators.len(),
-            got: state.validators.len(),
+    let found_root = state.genesis_validators_root();
+    if found_root != genesis_validators_root {
+        return Err(GenesisMismatch::GenesisValidatorsRoot {
+            expected: genesis_validators_root,
+            got: found_root,
         });
-    }
-
-    let pairs = state.validators.iter().zip(expected_validators.iter());
-    for (position, (actual, expected)) in pairs.enumerate() {
-        if actual.index != position as u64 {
-            return Err(GenesisMismatch::NonSequentialIndex {
-                position,
-                got: actual.index,
-            });
-        }
-        if actual.attestation_pubkey != expected.attestation_pubkey
-            || actual.proposal_pubkey != expected.proposal_pubkey
-        {
-            return Err(GenesisMismatch::ValidatorPubkey { index: position });
-        }
     }
 
     Ok(())
@@ -199,10 +200,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        primitives::HashTreeRoot as _,
-        state::{State, Validator},
-    };
+    use crate::state::{State, Validator};
 
     const ATT_PUBKEY_A: &str = "cd323f232b34ab26d6db7402c886e74ca81cfd3a0c659d2fe022356f25592f7d2d25ca7b19604f5a180037046cf2a02e1da4a800";
     const PROP_PUBKEY_A: &str = "b7b0f72e24801b02bda64073cb4de6699a416b37dfead227d7ca3922647c940fa03e4c012e8a0e656b731934aeac124a5337e333";
@@ -322,19 +320,37 @@ GENESIS_VALIDATORS:
     }
 
     #[test]
-    fn verify_state_accepts_state_from_same_genesis() {
+    fn verify_state_genesis_accepts_a_state_of_that_genesis() {
+        use crate::beacon::containers::BeaconState;
+
         let config = test_config();
-        assert_eq!(config.verify_state(&state_of(&config)), Ok(()));
+        let state = BeaconState::Lean(state_of(&config));
+
+        assert_eq!(
+            verify_state_genesis(
+                &state,
+                config.genesis_time,
+                config.genesis_validators_root()
+            ),
+            Ok(())
+        );
     }
 
     #[test]
-    fn verify_state_rejects_different_genesis_time() {
+    fn verify_state_genesis_rejects_a_different_genesis_time() {
+        use crate::beacon::containers::BeaconState;
+
         let config = test_config();
         let mut other = test_config();
         other.genesis_time = config.genesis_time + 1;
+        let state = BeaconState::Lean(state_of(&other));
 
         assert_eq!(
-            config.verify_state(&state_of(&other)),
+            verify_state_genesis(
+                &state,
+                config.genesis_time,
+                config.genesis_validators_root()
+            ),
             Err(GenesisMismatch::GenesisTime {
                 expected: config.genesis_time,
                 got: config.genesis_time + 1,
@@ -342,49 +358,69 @@ GENESIS_VALIDATORS:
         );
     }
 
+    /// Same count and same genesis time, different keys.
     #[test]
-    fn verify_state_rejects_different_validator_count() {
-        let config = test_config();
-        let mut other = test_config();
-        other.genesis_validators.pop();
+    fn verify_state_genesis_rejects_a_different_registry() {
+        use crate::beacon::containers::BeaconState;
 
-        assert_eq!(
-            config.verify_state(&state_of(&other)),
-            Err(GenesisMismatch::ValidatorCount {
-                expected: 3,
-                got: 2,
-            })
-        );
-    }
-
-    /// Same validator count and same genesis time, different keys: the case a
-    /// genesis-time-only check cannot see.
-    #[test]
-    fn verify_state_rejects_different_validator_keys() {
         let config = test_config();
         let mut other = test_config();
         other.genesis_validators.swap(0, 1);
+        let state = BeaconState::Lean(state_of(&other));
 
-        assert_eq!(
-            config.verify_state(&state_of(&other)),
-            Err(GenesisMismatch::ValidatorPubkey { index: 0 })
-        );
+        assert!(matches!(
+            verify_state_genesis(
+                &state,
+                config.genesis_time,
+                config.genesis_validators_root()
+            ),
+            Err(GenesisMismatch::GenesisValidatorsRoot { .. })
+        ));
     }
 
+    /// Stands in for the old field-by-field `ValidatorCount` check: a
+    /// registry one validator shorter than expected roots differently, even
+    /// though every validator it does carry matches.
     #[test]
-    fn verify_state_rejects_non_sequential_validator_indices() {
+    fn verify_state_genesis_rejects_a_shorter_registry() {
+        use crate::beacon::containers::BeaconState;
+
+        let config = test_config();
+        let mut other = test_config();
+        other.genesis_validators.pop();
+        let state = BeaconState::Lean(state_of(&other));
+
+        assert!(matches!(
+            verify_state_genesis(
+                &state,
+                config.genesis_time,
+                config.genesis_validators_root()
+            ),
+            Err(GenesisMismatch::GenesisValidatorsRoot { .. })
+        ));
+    }
+
+    /// Stands in for the old field-by-field `NonSequentialIndex` check.
+    /// `GenesisConfig::validators()` always renumbers sequentially from
+    /// position, so this registry cannot be reached through a config; it is
+    /// built directly, the way the check it stands in for once did.
+    #[test]
+    fn verify_state_genesis_rejects_non_sequential_indices() {
+        use crate::beacon::containers::BeaconState;
+
         let config = test_config();
         let mut validators = config.validators();
         validators[1].index = 7;
-        let state = State::from_genesis(config.genesis_time, validators);
+        let state = BeaconState::Lean(State::from_genesis(config.genesis_time, validators));
 
-        assert_eq!(
-            config.verify_state(&state),
-            Err(GenesisMismatch::NonSequentialIndex {
-                position: 1,
-                got: 7,
-            })
-        );
+        assert!(matches!(
+            verify_state_genesis(
+                &state,
+                config.genesis_time,
+                config.genesis_validators_root()
+            ),
+            Err(GenesisMismatch::GenesisValidatorsRoot { .. })
+        ));
     }
 
     #[test]
@@ -475,6 +511,37 @@ GENESIS_VALIDATORS:
                 expected: config.genesis_time,
                 got: config.genesis_time + 1,
             })
+        );
+    }
+
+    #[test]
+    fn genesis_validators_root_matches_what_a_state_of_that_genesis_reports() {
+        use crate::beacon::containers::BeaconState;
+
+        let config = test_config();
+        let state = BeaconState::Lean(State::from_genesis(
+            config.genesis_time,
+            config.validators(),
+        ));
+
+        assert_eq!(
+            config.genesis_validators_root(),
+            state.genesis_validators_root()
+        );
+    }
+
+    /// Same count and same genesis time, different keys: the case a
+    /// genesis-time-only check cannot see, and the reason the registry is
+    /// committed to at all.
+    #[test]
+    fn genesis_validators_root_changes_with_the_registry() {
+        let config = test_config();
+        let mut other = test_config();
+        other.genesis_validators.swap(0, 1);
+
+        assert_ne!(
+            config.genesis_validators_root(),
+            other.genesis_validators_root()
         );
     }
 }
