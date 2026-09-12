@@ -4,14 +4,16 @@
 //! One dispatch and one set of handlers: `handle_req_resp_message` matches the
 //! flat `Request` and `ResponsePayload`, so the enum variant is the only place
 //! the two chains are told apart. Handler names follow the same convention the
-//! variants do, lean prefixed and beacon bare. What is chain-specific below the
-//! dispatch is the *body* of a handler, never the path to it; encoding lives
-//! further down still, in `crate::lean::encoding` and `crate::beacon::encoding`.
+//! variants do, lean prefixed and beacon bare; a handler that serves both wires
+//! carries neither chain's name, which is why `handle_blocks_by_root_response`
+//! reads as it does. What is chain-specific below the dispatch is the *body* of
+//! a handler, never the path to it; encoding lives further down still, in
+//! `crate::lean::encoding` and `crate::beacon::encoding`.
 
 use std::collections::HashSet;
 
 use ethlambda_network_api::BlockSource;
-use ethlambda_storage::Store;
+use ethlambda_storage::{Chain, Store};
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use spawned_concurrency::tasks::{Context, send_after};
@@ -30,13 +32,17 @@ use super::{
 use crate::beacon::BeaconWire;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{BeaconStatus, Goodbye, Ping};
-use crate::lean::messages::{
-    BlocksByRangeRequest, BlocksByRootRequest, RequestedBlockRoots, Status,
+use crate::beacon::protocols::{
+    BLOCKS_BY_RANGE_V2 as BEACON_BLOCKS_BY_RANGE_PROTOCOL,
+    BLOCKS_BY_ROOT_V2 as BEACON_BLOCKS_BY_ROOT_PROTOCOL,
+    MAX_REQUEST_BLOCKS as MAX_BEACON_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB,
 };
+use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::{
     BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
     BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
 };
+use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
     PendingRequest, PendingRequestKind, RangeSyncState, metrics, p2p_protocol,
@@ -59,19 +65,34 @@ pub async fn handle_req_resp_message(
                         trace!(kind = "status_request", peer_count, "P2P message received");
                         handle_lean_status_request(server, status, channel, peer).await;
                     }
-                    Request::LeanBlocksByRoot(request) => {
+                    // One variant for both wires, so which handler answers it
+                    // comes from `server.wire` rather than from the message.
+                    // See `Wire::is_beacon`.
+                    Request::BlocksByRoot(request) => {
                         trace!(
                             kind = "blocks_by_root_request",
                             peer_count, "P2P message received"
                         );
-                        handle_lean_blocks_by_root_request(server, request, channel, peer).await;
+                        if server.wire.is_beacon() {
+                            handle_beacon_blocks_by_root_request(server, peer, request, channel)
+                                .await;
+                        } else {
+                            handle_lean_blocks_by_root_request(server, request, channel, peer)
+                                .await;
+                        }
                     }
-                    Request::LeanBlocksByRange(request) => {
+                    Request::BlocksByRange(request) => {
                         trace!(
                             kind = "blocks_by_range_request",
                             peer_count, "P2P message received"
                         );
-                        handle_lean_blocks_by_range_request(server, request, channel, peer).await;
+                        if server.wire.is_beacon() {
+                            handle_beacon_blocks_by_range_request(server, peer, request, channel)
+                                .await;
+                        } else {
+                            handle_lean_blocks_by_range_request(server, request, channel, peer)
+                                .await;
+                        }
                     }
                     // The beacon protocols. One arm each rather than a grouping
                     // variant that the beacon handler would have to
@@ -120,7 +141,7 @@ pub async fn handle_req_resp_message(
                                 kind = "beacon_status_response",
                                 peer_count, "P2P message received"
                             );
-                            handle_status_response(server, peer, status);
+                            handle_status_response(server, peer, status).await;
                         }
                         ResponsePayload::Pong(ping) => {
                             trace!(kind = "beacon_pong", peer_count, "P2P message received");
@@ -133,24 +154,39 @@ pub async fn handle_req_resp_message(
                             );
                             handle_metadata_response(peer);
                         }
-                        ResponsePayload::LeanBlocks(blocks) => {
+                        ResponsePayload::Blocks(blocks) => {
                             trace!(kind = "blocks_response", peer_count, "P2P message received");
-
+                            // Dispatched on what was asked for first and on the
+                            // wire second, because only the range answer is
+                            // handled differently by the two chains: a by-root
+                            // answer is one shared handler, since the block it
+                            // carries either has the root that was asked for or
+                            // the request has failed, on either wire.
                             match server.outbound_requests.remove(&request_id) {
+                                Some(PendingRequestKind::Root(root)) => {
+                                    handle_blocks_by_root_response(server, blocks, peer, root, ctx)
+                                        .await;
+                                }
                                 Some(PendingRequestKind::Range {
                                     start_slot,
                                     end_slot,
                                 }) => {
-                                    handle_lean_blocks_by_range_response(
-                                        server, blocks, peer, start_slot, end_slot,
-                                    )
-                                    .await;
-                                }
-                                Some(PendingRequestKind::Root(root)) => {
-                                    handle_lean_blocks_by_root_response(
-                                        server, blocks, peer, root, ctx,
-                                    )
-                                    .await;
+                                    if server.wire.is_beacon() {
+                                        handle_beacon_blocks_by_range_response(
+                                            server, peer, blocks, start_slot, end_slot,
+                                        )
+                                        .await;
+                                    } else {
+                                        // `new_block` takes lean's concrete
+                                        // block, so the shared payload is
+                                        // peeled here, at the one point that
+                                        // needs the narrower type.
+                                        let blocks = lean_blocks(blocks);
+                                        handle_lean_blocks_by_range_response(
+                                            server, blocks, peer, start_slot, end_slot,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -234,6 +270,30 @@ pub async fn handle_req_resp_message(
     }
 }
 
+/// The lean blocks in a shared block payload.
+///
+/// `ResponsePayload::Blocks` spans both chains, but a lean import path needs
+/// lean's own `SignedBlock`, so the narrowing happens once here. A block of any
+/// other fork on this path means a peer answered a lean protocol with a beacon
+/// block; it is dropped with a log rather than silently, since nothing else
+/// would notice.
+fn lean_blocks(blocks: Vec<SignedBeaconBlock>) -> Vec<SignedBlock> {
+    blocks
+        .into_iter()
+        .filter_map(|block| match block {
+            SignedBeaconBlock::Lean(block) => Some(block),
+            other => {
+                debug!(
+                    slot = other.slot(),
+                    fork = %other.fork_name(),
+                    "Dropping a non-lean block from a lean block response"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
 /// Answer a request with a success payload.
 ///
 /// Every request handler on either chain ends here, which is most of what the
@@ -312,25 +372,19 @@ async fn handle_lean_blocks_by_root_request(
 
     let mut blocks = Vec::new();
     for root in request.roots.iter() {
-        match server.store.get_signed_block(root) {
-            Ok(Some(SignedBeaconBlock::Lean(signed_block))) => blocks.push(signed_block),
-            // This handler only ever runs against a lean store, so a beacon
-            // block here would mean the chain tag lied; surface it loudly
-            // rather than silently dropping it like a genuinely missing block.
-            Ok(Some(other)) => error!(
-                %root,
-                fork = %other.fork_name(),
-                "BlocksByRoot found a non-lean block in a lean store"
-            ),
-            // Missing blocks are silently skipped (per spec)
-            Ok(None) | Err(_) => {}
+        // A missing block is silently skipped, per spec. A block of the wrong
+        // fork is not filtered here either: `write_blocks_response` refuses to
+        // put one on this chain's wire, which is the only place it could do
+        // harm.
+        if let Ok(Some(block)) = server.store.get_signed_block(root) {
+            blocks.push(block);
         }
     }
 
     let found = blocks.len();
     trace!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
-    respond(server, channel, ResponsePayload::LeanBlocks(blocks));
+    respond(server, channel, ResponsePayload::Blocks(blocks));
 }
 
 async fn handle_lean_blocks_by_range_request(
@@ -366,14 +420,20 @@ async fn handle_lean_blocks_by_range_request(
         "Responding to BlocksByRange request"
     );
 
-    respond(server, channel, ResponsePayload::LeanBlocks(blocks));
+    respond(server, channel, ResponsePayload::Blocks(blocks));
 }
 
-fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<SignedBlock> {
-    if count == 0 {
-        return Vec::new();
-    }
-
+/// The canonical blocks in `[start_slot, start_slot + count)`, on either chain.
+///
+/// One reader for both `blocks_by_range` protocols. The `BlockRoots` index it
+/// walks is written for either chain and keyed by slot alone, and the store
+/// dispatches on which chain's rows sit behind it, so there is nothing left
+/// here for a chain to decide.
+///
+/// A window that overflows `u64` yields an empty answer rather than a panic,
+/// which is not a nicety: `start_slot` and `count` are attacker-supplied. A
+/// `count` of zero takes the same path, since there is no last offset to add.
+fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<SignedBeaconBlock> {
     let Some(end_slot) = count
         .checked_sub(1)
         .and_then(|last_offset| start_slot.checked_add(last_offset))
@@ -394,9 +454,23 @@ fn canonical_blocks_by_range(store: &Store, start_slot: u64, count: u64) -> Vec<
         .unwrap_or_default()
 }
 
-async fn handle_lean_blocks_by_root_response(
+/// Take delivery of a by-root answer, on either chain.
+///
+/// One handler for both wires, because a by-root answer is the same exchange
+/// on each: a request carries exactly one root, so the peer either sent the
+/// block under that root or it answered nothing, and the two outcomes are the
+/// same either way. An answer that carries no matching block — an empty one
+/// included, which is only the same case with nothing to search — is a failed
+/// attempt and must go through [`handle_fetch_failure`], or the root stays in
+/// `pending_root_requests` and deduplicates every later fetch of it.
+///
+/// The import at the end is where the chains part, and the split is already
+/// made for us: `blockchain` is `None` on a beacon node, which has no
+/// `BlockChain` actor to import into, so a beacon block fetched by root is
+/// checked and dropped exactly as a gossiped one is.
+async fn handle_blocks_by_root_response(
     server: &mut P2PServer,
-    blocks: Vec<SignedBlock>,
+    blocks: Vec<SignedBeaconBlock>,
     peer: PeerId,
     requested_root: H256,
     ctx: &Context<P2PServer>,
@@ -408,7 +482,7 @@ async fn handle_lean_blocks_by_root_response(
     // anything else the peer sent is unsolicited.
     let answer = blocks
         .into_iter()
-        .find(|block| block.message.hash_tree_root() == requested_root);
+        .find(|block| block.message_hash_tree_root() == requested_root);
     let Some(block) = answer else {
         debug!(
             %peer,
@@ -423,11 +497,32 @@ async fn handle_lean_blocks_by_root_response(
     // Clean up tracking for this root
     server.pending_root_requests.remove(&requested_root);
 
-    if let Some(ref blockchain) = server.blockchain {
-        let _ = blockchain
-            .new_block(block, BlockSource::Sync)
-            .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
-    }
+    let Some(ref blockchain) = server.blockchain else {
+        debug!(
+            %peer,
+            slot = block.slot(),
+            block_root = %ethlambda_types::ShortRoot(&requested_root.0),
+            "Block fetched by root has no importer; dropping"
+        );
+        return;
+    };
+
+    // Reached only on a lean node, which is the only wire that has an actor to
+    // hand this to. A block of any other fork here means a peer answered a lean
+    // protocol with a beacon block; it is dropped with a log rather than
+    // silently, for the reason `lean_blocks` gives.
+    let SignedBeaconBlock::Lean(block) = block else {
+        debug!(
+            slot = block.slot(),
+            fork = %block.fork_name(),
+            "Dropping a non-lean block from a lean block response"
+        );
+        return;
+    };
+
+    let _ = blockchain
+        .new_block(block, BlockSource::Sync)
+        .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
 }
 
 async fn handle_lean_blocks_by_range_response(
@@ -471,13 +566,22 @@ async fn handle_lean_blocks_by_range_response(
 
     if let Some(state) = &mut server.range_sync_state {
         state.complete_batch(end_slot);
-        if state.current_range.is_empty() || state.peer_set.is_empty() {
+        if range_session_exhausted(state) {
             server.range_sync_state = None;
             return;
         }
     }
 
     request_next_range_batch(server).await;
+}
+
+/// Whether a range sync session has nothing left to do: either the requested
+/// range is now empty, or every peer that had something left to offer has
+/// dropped out of `peer_set`. Shared by both chains' range-response handlers,
+/// since a session left in place once it is exhausted disables the resync
+/// path permanently, on either wire.
+fn range_session_exhausted(state: &RangeSyncState) -> bool {
+    state.current_range.is_empty() || state.peer_set.is_empty()
 }
 
 /// Build a Status message from the current Store state.
@@ -500,6 +604,13 @@ pub fn build_status(store: &Store) -> Status {
 
 /// Fetch a missing block from a random connected peer.
 /// Handles tracking in both pending_requests and request_id_map.
+///
+/// Peer selection is chain-agnostic (which peers already failed to answer for
+/// this root has nothing to do with which wire is speaking), but the actual
+/// send is not: `Handler<FetchBlock>` in `lib.rs` calls this unconditionally,
+/// so a beacon node must not put a lean-framed `BlocksByRoot` request on its
+/// beacon streams, which is what asking via `Request::BlocksByRoot` +
+/// `BLOCKS_BY_ROOT_PROTOCOL_V1` unconditionally would do.
 pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     if server.connected_peers.is_empty() {
         debug!(%root, "Cannot fetch block: no connected peers");
@@ -544,30 +655,51 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         }
     };
 
-    // Create BlocksByRoot request with single root
-    let mut roots = RequestedBlockRoots::new();
-    if let Err(err) = roots.push(root) {
-        error!(%root, ?err, "Failed to create BlocksByRoot request");
-        return false;
-    }
-    let request = BlocksByRootRequest { roots };
-
     let excluded = server.connected_peers.len() - pool.len();
-    trace!(%peer, %root, excluded, "Sending BlocksByRoot request for missing block");
-    let Some(request_id) = server
-        .swarm_handle
-        .send_request(
-            peer,
-            Request::LeanBlocksByRoot(request),
-            libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-        )
-        .await
-    else {
-        debug!(%root, "Failed to send BlocksByRoot request (swarm adapter closed)");
-        return false;
+
+    let sent = if server.wire.is_beacon() {
+        trace!(%peer, %root, excluded, "Sending BeaconBlocksByRoot request for missing block");
+        request_beacon_block_by_root(server, peer, root)
+            .await
+            .is_some()
+    } else {
+        // Create BlocksByRoot request with single root
+        let mut roots = RequestedBlockRoots::new();
+        if let Err(err) = roots.push(root) {
+            error!(%root, ?err, "Failed to create BlocksByRoot request");
+            return false;
+        }
+        let request = BlocksByRootRequest { roots };
+
+        trace!(%peer, %root, excluded, "Sending BlocksByRoot request for missing block");
+        let Some(request_id) = server
+            .swarm_handle
+            .send_request(
+                peer,
+                Request::BlocksByRoot(request),
+                libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+            )
+            .await
+        else {
+            debug!(%root, "Failed to send BlocksByRoot request (swarm adapter closed)");
+            return false;
+        };
+        // Map request_id to root for failure handling. `request_beacon_block_by_root`
+        // does this itself in the beacon arm above.
+        server
+            .outbound_requests
+            .insert(request_id, PendingRequestKind::Root(root));
+        true
     };
 
-    // Track the request if not already tracked (new request)
+    if !sent {
+        debug!(%root, "Failed to send by-root request (swarm adapter closed)");
+        return false;
+    }
+
+    // Track the request if not already tracked (new request). Common to both
+    // arms: this is what dedupes a repeated fetch and what the retry path
+    // reads.
     server
         .pending_root_requests
         .entry(root)
@@ -575,11 +707,6 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
             attempts: 1,
             failed_peers: HashSet::new(),
         });
-
-    // Map request_id to root for failure handling
-    server
-        .outbound_requests
-        .insert(request_id, PendingRequestKind::Root(root));
 
     true
 }
@@ -593,10 +720,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
         return true;
     };
 
-    let request = BlocksByRangeRequest {
-        start_slot: batch.start,
-        count: batch.end - batch.start,
-    };
+    let request = BlocksByRangeRequest::new(batch.start, batch.end - batch.start);
     let count = request.count;
 
     trace!(
@@ -615,7 +739,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
         .swarm_handle
         .send_request(
             peer,
-            Request::LeanBlocksByRange(request),
+            Request::BlocksByRange(request),
             libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
         )
         .await
@@ -641,6 +765,59 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
             end_slot: batch.end - 1,
         },
     );
+
+    true
+}
+
+/// The beacon counterpart of [`request_next_range_batch`].
+///
+/// Same [`RangeSyncState::next_batch`] planning, but sent through
+/// [`request_beacon_blocks_by_range`] rather than a raw `swarm_handle.send_request`:
+/// that is what makes the beacon protocol id apply instead of lean's, and what
+/// makes [`MAX_REQUEST_BLOCKS_DENEB`] the real per-request ceiling rather than
+/// the larger `MAX_REQUEST_BLOCKS` that `next_batch` plans a batch against.
+/// `request_beacon_blocks_by_range` already records the `outbound_requests`
+/// entry with whatever it actually sent (clamped or not), so
+/// [`RangeSyncState::complete_batch`] still advances by the true request span
+/// on the next response even when this batch was clamped smaller than
+/// `next_batch` planned.
+async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
+    let Some((peer, batch)) = server
+        .range_sync_state
+        .as_ref()
+        .and_then(RangeSyncState::next_batch)
+    else {
+        return true;
+    };
+
+    let planned = batch.end - batch.start;
+    // `planned`, not `count`: `next_batch` plans against `MAX_REQUEST_BLOCKS`
+    // and the send clamps to `MAX_REQUEST_BLOCKS_DENEB`, so the number that
+    // goes on the wire is the one `request_beacon_blocks_by_range` traces.
+    trace!(
+        %peer,
+        start_slot = batch.start,
+        planned,
+        "Planning a BeaconBlocksByRange request (single batch)"
+    );
+
+    if request_beacon_blocks_by_range(server, peer, batch.start, planned)
+        .await
+        .is_none()
+    {
+        debug!(
+            %peer,
+            start_slot = batch.start,
+            planned,
+            "Failed to send BeaconBlocksByRange request"
+        );
+        fail_range_request(server, &peer);
+        return false;
+    }
+
+    if let Some(state) = &mut server.range_sync_state {
+        state.in_flight = true;
+    }
 
     true
 }
@@ -722,15 +899,37 @@ fn beacon_wire_or_refuse(
 }
 
 /// Answer `status/N` with our own, and record what the peer told us.
+///
+/// Does not use [`beacon_wire_or_refuse`]: that helper takes `&mut P2PServer`
+/// and returns a `&BeaconWire` tied to its whole lifetime, which is fine for
+/// [`handle_ping`] and [`handle_metadata_request`] below, neither of which
+/// needs another field of `server` alive at the same time. This handler does:
+/// `build_status` now reads `&server.store` alongside `wire`, and a `wire`
+/// borrowed through that helper's `&mut P2PServer` parameter would hold the
+/// whole server borrowed for as long as it lives, not just `server.wire`,
+/// which would make `&server.store` a conflicting borrow. Reading
+/// `server.wire.beacon()` directly, as below, borrows only that one field, so
+/// `&server.store` can be taken alongside it.
 async fn handle_status_request(
     server: &mut P2PServer,
     peer: PeerId,
     peer_status: BeaconStatus,
     channel: ResponseChannel<Response>,
 ) {
-    let Some((wire, channel)) = beacon_wire_or_refuse(server, peer, channel) else {
+    if server.wire.beacon().is_none() {
+        warn!(%peer, "Beacon request arrived on a lean node; refusing");
+        refuse(
+            server,
+            channel,
+            ResponseCode::INVALID_REQUEST,
+            "this node does not speak the beacon protocols",
+        );
         return;
-    };
+    }
+    // Re-taken as a shared borrow of just `server.wire`, now that the
+    // `refuse` above (which needs `&mut server`) is behind us.
+    let wire = server.wire.beacon().expect("checked above");
+
     if peer_status.fork_digest() != wire.fork_digest {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
@@ -750,7 +949,8 @@ async fn handle_status_request(
             "Beacon status received"
         );
     }
-    let our_status = beacon_handler::build_status(wire, StatusVersion::of(&peer_status));
+    let our_status =
+        beacon_handler::build_status(&server.store, wire, StatusVersion::of(&peer_status));
     respond(server, channel, ResponsePayload::Status(our_status));
 }
 
@@ -793,8 +993,36 @@ fn handle_goodbye(peer: PeerId, Goodbye { reason }: Goodbye) {
     trace!(%peer, reason, "Peer said goodbye");
 }
 
-/// Record the peer's answer to our handshake. Nothing is driven off one yet.
-fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: BeaconStatus) {
+/// The `[start_slot, end_exclusive)` a beacon range sync should now cover,
+/// given how far this node has fetched and a peer's advertised head. `None`
+/// when the peer is not ahead of `fetched_through`.
+///
+/// Takes `fetched_through` rather than a `Store`, deliberately: this is
+/// `server.beacon_fetched_through`, not `server.store.head_slot()`. See that
+/// field's own doc comment on `P2PServer` for why the store's head is the
+/// wrong signal to drive this off. Bounded by [`MAX_SYNC_RANGE`], the same
+/// ceiling `handle_lean_status_response` bounds its own request span by.
+fn beacon_sync_target(fetched_through: u64, peer_head_slot: u64) -> Option<std::ops::Range<u64>> {
+    if peer_head_slot <= fetched_through {
+        return None;
+    }
+    let gap = peer_head_slot - fetched_through;
+    let start_slot = fetched_through.saturating_add(1);
+    let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
+    Some(start_slot..end_exclusive)
+}
+
+/// Record the peer's answer to our handshake, and start or extend the
+/// anchor-to-head range sync when [`beacon_sync_target`] says it leaves this
+/// node behind.
+///
+/// The beacon counterpart of `handle_lean_status_response`: same merge-or-
+/// create on `range_sync_state` and the same kick of the first batch,
+/// differing only in what "behind" is measured against (see
+/// [`beacon_sync_target`]) and in which function sends the batch
+/// ([`request_next_beacon_range_batch`], so the beacon protocol id and
+/// `MAX_REQUEST_BLOCKS_DENEB` apply).
+async fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: BeaconStatus) {
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -808,12 +1036,38 @@ fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: BeaconSt
         metrics::inc_beacon_status_digest_mismatch();
         return;
     }
+    let peer_head_slot = status.head_slot();
     trace!(
         %peer,
-        peer_head_slot = status.head_slot(),
+        peer_head_slot,
         peer_finalized_epoch = status.finalized_epoch(),
         "Beacon handshake complete"
     );
+
+    let Some(target_range) = beacon_sync_target(server.beacon_fetched_through, peer_head_slot)
+    else {
+        return;
+    };
+
+    debug!(
+        %peer,
+        peer_head_slot,
+        fetched_through = server.beacon_fetched_through,
+        start_slot = target_range.start,
+        end_exclusive = target_range.end,
+        "Beacon peer status head is ahead of what has been fetched"
+    );
+
+    let end_exclusive = target_range.end;
+    match &mut server.range_sync_state {
+        Some(state) => state.merge_peer(peer, peer_head_slot, end_exclusive),
+        None => {
+            server.range_sync_state = Some(RangeSyncState::new(target_range, peer, peer_head_slot));
+        }
+    }
+
+    request_next_beacon_range_batch(server).await;
+    trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
 }
 
 /// Record a pong. Nothing is driven off one yet.
@@ -824,6 +1078,272 @@ fn handle_pong(peer: PeerId, ping: Ping) {
 /// Record a peer's metadata. Nothing is driven off one yet.
 fn handle_metadata_response(peer: PeerId) {
     debug!(%peer, "Peer metadata received");
+}
+
+/// The beacon store this node can serve blocks out of, or a refusal.
+///
+/// Two things have to hold before a block request can be answered: this process
+/// speaks the beacon wire at all, and the data directory behind it actually
+/// holds a beacon chain. The anchor makes the second true for an ordinary
+/// `ethlambda beacon` run, so this is a guard against a lean directory rather
+/// than the common path. It is a refusal rather than an empty answer because
+/// the difference matters to the peer: `RESOURCE_UNAVAILABLE` is the spec's own
+/// code for a peer "unable to reply to block requests", where an empty stream
+/// claims we looked and had nothing, and `INVALID_REQUEST` would blame the
+/// asker for a request that was fine.
+fn beacon_block_store_or_refuse(
+    server: &mut P2PServer,
+    peer: PeerId,
+    channel: ResponseChannel<Response>,
+) -> Option<ResponseChannel<Response>> {
+    let (_, channel) = beacon_wire_or_refuse(server, peer, channel)?;
+    if server.store.chain() != Chain::Beacon {
+        debug!(%peer, "Beacon block request arrived with no beacon chain behind it; refusing");
+        refuse(
+            server,
+            channel,
+            ResponseCode::RESOURCE_UNAVAILABLE,
+            "this node holds no beacon chain",
+        );
+        return None;
+    }
+    Some(channel)
+}
+
+/// Answer `beacon_blocks_by_range/2` off the canonical chain.
+///
+/// The counterpart of [`handle_lean_blocks_by_range_request`], and the same
+/// shape: reject an empty or oversized window, then read the canonical branch
+/// for the slots asked for. What differs is the ceiling. A `count` above
+/// `MAX_REQUEST_BLOCKS` is a protocol violation and is refused; a `count` merely
+/// above `MAX_REQUEST_BLOCKS_DENEB` is a peer on older logic, and the spec
+/// allows "Clients MAY limit the number of blocks in the response", so it is
+/// truncated rather than refused.
+///
+/// `step` is deprecated and legal only as 1. It is judged here rather than at
+/// decode so the peer learns which rule it broke: a codec refusal drops the
+/// stream with no response on it, where this answers `INVALID_REQUEST`. Phase0
+/// does permit answering a larger step with a single block, but that leniency
+/// is for a transition that finished years ago, and the spec's own requirement
+/// on the requester is a MUST.
+async fn handle_beacon_blocks_by_range_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    request: BlocksByRangeRequest,
+    channel: ResponseChannel<Response>,
+) {
+    let Some(channel) = beacon_block_store_or_refuse(server, peer, channel) else {
+        return;
+    };
+
+    if request.count == 0 || request.count > MAX_BEACON_REQUEST_BLOCKS {
+        refuse(
+            server,
+            channel,
+            ResponseCode::INVALID_REQUEST,
+            "invalid BeaconBlocksByRange request",
+        );
+        return;
+    }
+    if request.step != 1 {
+        debug!(%peer, step = request.step, "BeaconBlocksByRange named a deprecated step");
+        refuse(
+            server,
+            channel,
+            ResponseCode::INVALID_REQUEST,
+            "BeaconBlocksByRange step must be 1",
+        );
+        return;
+    }
+
+    let count = request.count.min(MAX_REQUEST_BLOCKS_DENEB);
+    let blocks = canonical_blocks_by_range(&server.store, request.start_slot, count);
+
+    trace!(
+        %peer,
+        start_slot = request.start_slot,
+        count = request.count,
+        served = count,
+        found = blocks.len(),
+        "Responding to BeaconBlocksByRange request"
+    );
+
+    respond(server, channel, ResponsePayload::Blocks(blocks));
+}
+
+/// Answer `beacon_blocks_by_root/2` with whichever of the roots is held.
+///
+/// The counterpart of [`handle_lean_blocks_by_root_request`]: a root this node
+/// does not hold is skipped rather than answered with an error chunk, since the
+/// response is "a list of `SignedBeaconBlock` whose length is less than or equal
+/// to the number of requested blocks". The order the peer asked in is the order
+/// it gets back, which is why the response cannot be described as a slot range.
+async fn handle_beacon_blocks_by_root_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    request: BlocksByRootRequest,
+    channel: ResponseChannel<Response>,
+) {
+    let Some(channel) = beacon_block_store_or_refuse(server, peer, channel) else {
+        return;
+    };
+
+    let requested = request.roots.len();
+    let mut blocks = Vec::new();
+    for root in request.roots.iter().take(MAX_REQUEST_BLOCKS_DENEB as usize) {
+        match server.store.get_signed_block(root) {
+            Ok(Some(SignedBeaconBlock::Lean(_))) => error!(
+                %root,
+                "BeaconBlocksByRoot found a lean block in a beacon store"
+            ),
+            Ok(Some(block)) => blocks.push(block),
+            // A root we do not hold is not an error to report: the spec answers
+            // it by simply leaving the block out.
+            Ok(None) | Err(_) => {}
+        }
+    }
+
+    trace!(
+        %peer,
+        requested,
+        found = blocks.len(),
+        "Responding to BeaconBlocksByRoot request"
+    );
+
+    respond(server, channel, ResponsePayload::Blocks(blocks));
+}
+
+/// Ask `peer` for the beacon blocks in `[start_slot, start_slot + count)`.
+///
+/// Returns the request id, so a caller can pair the answer with what it asked
+/// for. `count` is clamped to `MAX_REQUEST_BLOCKS_DENEB`, the ceiling that has
+/// applied since deneb and so the only one that matters on a live network:
+/// asking for more is a protocol violation the peer is entitled to refuse.
+pub async fn request_beacon_blocks_by_range(
+    server: &mut P2PServer,
+    peer: PeerId,
+    start_slot: u64,
+    count: u64,
+) -> Option<request_response::OutboundRequestId> {
+    let count = count.min(MAX_REQUEST_BLOCKS_DENEB);
+    if count == 0 {
+        return None;
+    }
+    let request = BlocksByRangeRequest::new(start_slot, count);
+    trace!(%peer, start_slot, count, "Sending BeaconBlocksByRange request");
+    let request_id = server
+        .swarm_handle
+        .send_request(
+            peer,
+            Request::BlocksByRange(request),
+            libp2p::StreamProtocol::new(BEACON_BLOCKS_BY_RANGE_PROTOCOL),
+        )
+        .await?;
+    server.outbound_requests.insert(
+        request_id,
+        PendingRequestKind::Range {
+            start_slot,
+            end_slot: start_slot.saturating_add(count - 1),
+        },
+    );
+    Some(request_id)
+}
+
+/// Ask `peer` for one beacon block by root.
+///
+/// One root per request rather than a batch, matching
+/// [`fetch_block_from_peer`]'s shape on the lean side: the tracking that pairs
+/// an answer with a request is keyed on a single root, and a block fetched by
+/// root is always fetched because one specific parent is missing.
+pub async fn request_beacon_block_by_root(
+    server: &mut P2PServer,
+    peer: PeerId,
+    root: H256,
+) -> Option<request_response::OutboundRequestId> {
+    let mut roots = RequestedBlockRoots::new();
+    if let Err(err) = roots.push(root) {
+        error!(%root, ?err, "Failed to create BeaconBlocksByRoot request");
+        return None;
+    }
+    trace!(%peer, %root, "Sending BeaconBlocksByRoot request");
+    let request_id = server
+        .swarm_handle
+        .send_request(
+            peer,
+            Request::BlocksByRoot(BlocksByRootRequest { roots }),
+            libp2p::StreamProtocol::new(BEACON_BLOCKS_BY_ROOT_PROTOCOL),
+        )
+        .await?;
+    server
+        .outbound_requests
+        .insert(request_id, PendingRequestKind::Root(root));
+    Some(request_id)
+}
+
+/// Take delivery of a range answer, checking it against what was asked for,
+/// and drive the range session on from it.
+///
+/// Nothing imports the result yet: this chain has no `BlockChain` actor, so a
+/// block that passes every check below is counted and dropped, exactly as a
+/// gossiped beacon block is. The checks run anyway, because they are what
+/// makes the answer trustworthy and they are what an importer would otherwise
+/// have to repeat.
+///
+/// The counterpart of [`handle_lean_blocks_by_range_response`]. The by-root
+/// answer has no counterpart here, because it needs none:
+/// [`handle_blocks_by_root_response`] answers for both wires. A block outside
+/// the range is dropped on its own rather than failing the batch, since the
+/// rest of the answer may still be what was requested. The chunk-level checks
+/// that *do* fail the whole answer, on the fork digest and the SSZ shape,
+/// already ran in the codec.
+async fn handle_beacon_blocks_by_range_response(
+    server: &mut P2PServer,
+    peer: PeerId,
+    blocks: Vec<SignedBeaconBlock>,
+    start_slot: u64,
+    end_slot: u64,
+) {
+    trace!(%peer, count = blocks.len(), "Received beacon blocks response");
+
+    if blocks.is_empty() {
+        fail_range_request(server, &peer);
+        debug!(%peer, start_slot, end_slot, "Received empty BeaconBlocksByRange response");
+        return;
+    }
+
+    let received = blocks.len();
+    let mut accepted = 0usize;
+    let mut highest_accepted_slot: Option<u64> = None;
+
+    for block in &blocks {
+        let slot = block.slot();
+        if slot < start_slot || slot > end_slot {
+            debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
+            continue;
+        }
+
+        highest_accepted_slot = Some(highest_accepted_slot.map_or(slot, |max: u64| max.max(slot)));
+        accepted += 1;
+    }
+
+    // Nothing consumes these yet; see this function's doc comment. Logged rather
+    // than silently dropped so a fetch that is working is visible from outside.
+    debug!(%peer, received, accepted, "Beacon blocks received");
+
+    // Highest slot that arrived and passed its checks, not the highest imported:
+    // see `beacon_fetched_through`'s own doc comment on `P2PServer` for why
+    // range sync must be driven off this rather than the store's head.
+    if let Some(highest) = highest_accepted_slot {
+        server.beacon_fetched_through = server.beacon_fetched_through.max(highest);
+    }
+    if let Some(state) = &mut server.range_sync_state {
+        state.complete_batch(end_slot);
+        if range_session_exhausted(state) {
+            server.range_sync_state = None;
+            return;
+        }
+    }
+    request_next_beacon_range_batch(server).await;
 }
 
 #[cfg(test)]
@@ -887,14 +1407,59 @@ mod tests {
             .expect("update_checkpoints should succeed");
 
         let blocks = canonical_blocks_by_range(&store, 1, 4);
-        let slots: Vec<_> = blocks.iter().map(|block| block.message.slot).collect();
+        let slots: Vec<_> = blocks.iter().map(SignedBeaconBlock::slot).collect();
         let roots: Vec<_> = blocks
             .iter()
-            .map(|block| block.message.hash_tree_root())
+            .map(SignedBeaconBlock::message_hash_tree_root)
             .collect();
 
         assert_eq!(slots, vec![1, 2, 4]);
         assert_eq!(roots, vec![root_1, root_2, root_4]);
         assert!(!roots.contains(&side_root_3));
+    }
+
+    #[test]
+    fn beacon_sync_target_keys_off_fetched_through_not_store_head() {
+        // A batch already taken off the wire but not imported leaves the
+        // store's own head behind `fetched_through`; the sync target must
+        // still be computed from `fetched_through`. See
+        // `beacon_fetched_through`'s doc comment on `P2PServer` for why the
+        // store's head is the wrong signal to drive this off: on this branch
+        // it never moves at all, and on the live follower it is what pulled
+        // 11,213 blocks off the wire to import 100.
+        assert_eq!(beacon_sync_target(100, 150), Some(101..151));
+        // A peer at or behind what has already been fetched has nothing to
+        // offer, regardless of what the store's own (possibly much lower)
+        // head happens to be.
+        assert_eq!(beacon_sync_target(150, 150), None);
+        assert_eq!(beacon_sync_target(150, 100), None);
+    }
+
+    #[test]
+    fn beacon_sync_target_is_bounded_by_max_sync_range() {
+        let target = beacon_sync_target(0, u64::MAX).expect("peer is far ahead");
+        assert_eq!(target, 1..(1 + MAX_SYNC_RANGE));
+    }
+
+    #[test]
+    fn a_range_session_is_exhausted_by_an_empty_range_or_an_empty_peer_set() {
+        let peer = PeerId::random();
+        // Far more range than one batch covers.
+        let mut state = RangeSyncState::new(10..1074, peer, 2000);
+        state.in_flight = true;
+        state.complete_batch(73);
+        assert!(!range_session_exhausted(&state));
+
+        // The whole range in one batch, which leaves nothing to ask for.
+        let mut whole_range = RangeSyncState::new(10..74, peer, 200);
+        whole_range.in_flight = true;
+        whole_range.complete_batch(73);
+        assert!(range_session_exhausted(&whole_range));
+
+        // The range itself is not exhausted, but its only peer is gone.
+        let lone_peer = PeerId::random();
+        let mut peer_gone = RangeSyncState::new(10..20, lone_peer, 15);
+        peer_gone.fail_peer(&lone_peer);
+        assert!(range_session_exhausted(&peer_gone));
     }
 }

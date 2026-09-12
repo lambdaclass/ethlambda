@@ -6,9 +6,12 @@
 //! module.
 //!
 //! Nothing here is shared with lean. What *is* shared is one layer down: the
-//! discv5 stack in [`crate::discovery`], the `ssz_snappy` framing in
-//! [`crate::req_resp::encoding`], and `compute_message_id` in [`crate`], all of
-//! which are the beacon spec's to begin with.
+//! discv5 stack in [`crate::discovery`], the `ssz_snappy` framing and the
+//! chunk-per-item response loop in [`crate::req_resp::encoding`], and
+//! `compute_message_id` in [`crate`], all of which are the beacon spec's to
+//! begin with. Both chains serve blocks as a chunk per block, so that loop is
+//! written once and handed the two things the chains disagree about: how wide
+//! the `<context-bytes>` field is, and how a chunk body becomes a block.
 
 pub mod decode;
 pub mod encoding;
@@ -19,7 +22,7 @@ pub mod swarm;
 pub mod topics;
 
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::primitives::ForkDigest;
+use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 
 /// Everything the beacon wire needs after startup has computed it.
 ///
@@ -31,9 +34,41 @@ pub struct BeaconWire {
     pub topics: topics::BeaconTopics,
     pub config: Config,
     pub genesis_time: u64,
+    /// The chain every fork digest is bound to.
+    ///
+    /// Carried alongside `fork_digest`, which is only the *current* one:
+    /// a block response labels each chunk with the digest of that block's own
+    /// epoch, so serving history means computing digests this node never runs
+    /// on. See [`encoding`]'s module docs for the rule.
+    pub genesis_validators_root: Root,
     /// Advertised in `Ping` responses and in `MetaData`. Never bumped today:
     /// nothing this node advertises changes at runtime.
     pub metadata_seq_number: u64,
+}
+
+impl BeaconWire {
+    /// The two values the codec needs to put a block chunk on or off the wire.
+    pub fn codec_context(&self) -> BeaconContext {
+        BeaconContext {
+            config: self.config.clone(),
+            genesis_validators_root: self.genesis_validators_root,
+        }
+    }
+}
+
+/// The beacon chain's identity, as the request/response codec needs it.
+///
+/// A block chunk's `<context-bytes>` are a function of the block's slot, the
+/// fork schedule and the chain, so the codec cannot compute them from the
+/// payload alone the way it can for every other beacon protocol. `P2PServer`
+/// holds the same two values on its [`BeaconWire`], but the codec runs below
+/// the actor and never sees it, so it is handed its own copy at
+/// [`crate::build_swarm`] time. Lean's half of the codec needs nothing, which is
+/// why this is an `Option` there rather than a second codec type.
+#[derive(Debug, Clone)]
+pub struct BeaconContext {
+    pub config: Config,
+    pub genesis_validators_root: Root,
 }
 
 /// Beacon-chain networking constants.

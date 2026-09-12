@@ -118,6 +118,35 @@ pub enum BeaconMetaData {
     V3(MetaDataV3),
 }
 
+/// `BeaconBlocksByRange`'s body **as it goes on the wire**.
+///
+/// Not what the rest of the crate passes around: a request for a slot window is
+/// the same question on either chain, so [`crate::req_resp::Request`] carries
+/// the shared
+/// [`BlocksByRangeRequest`](crate::req_resp::messages::BlocksByRangeRequest),
+/// which belongs to neither wire, and `crate::beacon::encoding` converts to and
+/// from this at the wire boundary.
+///
+/// The third field is why the conversion exists. `step` is deprecated and must
+/// be 1, but it is **still on the wire**: altair says the v2 request is
+/// unchanged from phase0's, and lighthouse pins this protocol's request length
+/// to `min == max == 24 bytes`, so a two-field body is refused before it is
+/// ever decoded. Nothing constructs this with a `step` other than 1, and a peer
+/// that sends another value is refused.
+///
+/// `BeaconBlocksByRoot` has no counterpart here. Its body is the bare
+/// `List[Root, MAX_REQUEST_BLOCKS]`, and `Root` *is* `H256` with the same 1024
+/// bound, so lean's `RequestedBlockRoots` is already that type exactly; the
+/// encoder unwraps lean's container rather than converting anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct BeaconBlocksByRangeRequest {
+    pub start_slot: Slot,
+    pub count: u64,
+    /// Deprecated: must be 1. See the container's doc comment for why a field
+    /// with one legal value is still carried.
+    pub step: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

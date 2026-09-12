@@ -437,6 +437,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
             let params = beacon::wire_params()?;
 
+            // The anchored beacon store. `P2PServer` holds it for the lean
+            // handlers, and the two beacon block handlers read it too: it is
+            // what `beacon_blocks_by_{range,root}/2` are answered from.
             let store = fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone())
                 .await
                 .inspect_err(|err| error!(%err, "Failed to initialize state"))?;

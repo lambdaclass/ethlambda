@@ -1,4 +1,5 @@
 use std::io;
+use std::sync::Arc;
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libssz::{SszDecode, SszEncode};
@@ -9,10 +10,15 @@ use super::{
     messages::{ErrorMessage, Request, Response, ResponseCode, ResponsePayload},
 };
 
-use crate::beacon::messages::{Goodbye, Ping};
-use crate::beacon::{encoding as beacon_encoding, protocols};
+use crate::beacon::messages::{BeaconBlocksByRangeRequest, Goodbye, Ping};
+use crate::beacon::{BeaconContext, encoding as beacon_encoding, protocols};
+use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots};
 use crate::lean::{encoding as lean_encoding, protocols as lean_protocols};
 use crate::metrics;
+
+/// Protocols whose response payload has one shape forever write no context
+/// bytes, which is every protocol here except the two beacon block ones.
+const NO_CONTEXT: &[u8] = &[];
 
 /// Short label extracted from a libp2p protocol id, used as the `protocol`
 /// label on req/resp size metrics.
@@ -22,28 +28,87 @@ fn protocol_label(protocol: &str) -> &'static str {
         .unwrap_or("unknown")
 }
 
-/// Write one success chunk: the code byte, then the compressed payload.
+/// Write one success chunk: the code byte, the context bytes, then the
+/// compressed payload.
 ///
-/// Four of the five [`ResponsePayload`] variants answer with exactly one chunk
-/// and differ only in how the body is encoded. `LeanBlocks` is the exception,
-/// writing a code byte per block, which is why this is a helper rather than the
-/// tail of `write_response`.
+/// `response_chunk ::= <result> | <context-bytes> | <encoding-dependent-header>
+/// | <encoded-payload>`, and this writes it in that order. `context` is empty
+/// on every lean protocol and on the beacon protocols whose payload shape does
+/// not depend on the fork; it is the four-byte `ForkDigest` on the two block
+/// protocols. Passing an empty slice emits nothing, which is exactly what
+/// "`<context-bytes>` is empty by default" means.
+///
+/// The single-chunk response payloads differ only in how their body is encoded,
+/// so they all end here. The two block payloads write a chunk per block, which
+/// is why this is a helper rather than the tail of `write_response`.
 pub(crate) async fn write_success_chunk<T>(
     io: &mut T,
     label: &'static str,
+    context: &[u8],
     encoded: Vec<u8>,
 ) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
 {
     io.write_all(&[ResponseCode::SUCCESS.into()]).await?;
+    if !context.is_empty() {
+        io.write_all(context).await?;
+    }
     let compressed_size = write_payload(io, &encoded).await?;
     metrics::observe_reqresp_response_chunk_size(label, encoded.len(), compressed_size);
     Ok(())
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Codec;
+/// The request/response codec, for whichever chain the node is on.
+///
+/// One codec for both, mirroring the single [`Request`] and the single
+/// dispatch above it. It is stateless for lean and for six of beacon's seven
+/// protocols; the two block protocols are the exception, because a chunk's
+/// `<context-bytes>` are a function of the block's slot, the fork schedule and
+/// the chain, none of which the payload alone supplies.
+///
+/// Deliberately not `Default`. `request_response::Behaviour::new` would
+/// construct one through that impl, and a beacon node whose codec came out
+/// contextless would negotiate the block protocols and then fail every chunk;
+/// [`crate::build_swarm`] uses `with_codec` and [`Codec::lean`] or
+/// [`Codec::beacon`] instead, so
+/// the context is decided in the same match that decides the protocol set.
+#[derive(Debug, Clone)]
+pub struct Codec {
+    /// `None` on a lean node, which registers none of the protocols that read
+    /// it.
+    beacon: Option<Arc<BeaconContext>>,
+}
+
+impl Codec {
+    /// The codec for a lean node: no beacon protocol is registered, so there is
+    /// no context to carry.
+    pub fn lean() -> Self {
+        Self { beacon: None }
+    }
+
+    /// The codec for a beacon node, holding what the block protocols need.
+    pub fn beacon(context: BeaconContext) -> Self {
+        Self {
+            beacon: Some(Arc::new(context)),
+        }
+    }
+
+    /// The beacon context, or the error a block chunk cannot be framed without.
+    ///
+    /// Unreachable in a correctly built node: the block protocols are only
+    /// registered on the beacon arm of [`crate::build_swarm`], which is the same
+    /// arm that supplies the context. Surfaced as an error rather than an
+    /// `expect` because it is reachable from a peer's stream, and a codec panic
+    /// takes the whole swarm down.
+    fn beacon_context(&self, protocol: &str) -> io::Result<&BeaconContext> {
+        self.beacon.as_deref().ok_or_else(|| {
+            invalid(format!(
+                "{protocol} needs a beacon fork context, which this node has none of"
+            ))
+        })
+    }
+}
 
 impl libp2p::request_response::Codec for Codec {
     type Protocol = libp2p::StreamProtocol;
@@ -82,6 +147,21 @@ impl libp2p::request_response::Codec for Codec {
             protocols::GOODBYE_V1 => Ok(Request::Goodbye(
                 Goodbye::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
             )),
+            // Twenty-four bytes here against lean's sixteen, the third of them
+            // the deprecated `step`. It is carried up rather than checked here:
+            // a peer that sets it wrong is answered with INVALID_REQUEST by the
+            // handler, which refusing at decode could not do.
+            protocols::BLOCKS_BY_RANGE_V2 => {
+                let wire = BeaconBlocksByRangeRequest::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?;
+                Ok(Request::BlocksByRange(wire.into()))
+            }
+            // The bare list, with no container around it: this body is an SSZ
+            // *field* where lean's is an SSZ container holding the same list.
+            protocols::BLOCKS_BY_ROOT_V2 => Ok(Request::BlocksByRoot(BlocksByRootRequest {
+                roots: RequestedBlockRoots::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?,
+            })),
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -126,6 +206,17 @@ impl libp2p::request_response::Codec for Codec {
                 })
                 .await
             }
+            protocols::BLOCKS_BY_RANGE_V2 | protocols::BLOCKS_BY_ROOT_V2 => {
+                let context = self.beacon_context(protocol.as_ref())?;
+                let blocks = beacon_encoding::decode_blocks_response(
+                    io,
+                    label,
+                    &context.config,
+                    context.genesis_validators_root,
+                )
+                .await?;
+                Ok(Response::success(ResponsePayload::Blocks(blocks)))
+            }
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -142,17 +233,34 @@ impl libp2p::request_response::Codec for Codec {
         trace!(?req, "Writing request");
 
         // One arm per variant, each delegating to its own chain's module: this
-        // is the whole of what the codec knows about either encoding.
+        // is the whole of what the codec knows about either encoding. The two
+        // block requests are the exception, because one variant is carried by
+        // both wires and only the negotiated protocol says which framing to
+        // write.
         let encoded = match &req {
             Request::LeanStatus(status) => lean_encoding::encode_status(status),
-            Request::LeanBlocksByRoot(request) => lean_encoding::encode_blocks_by_root(request),
-            Request::LeanBlocksByRange(request) => lean_encoding::encode_blocks_by_range(request),
+            Request::BlocksByRoot(request) => match protocol.as_ref() {
+                lean_protocols::BLOCKS_BY_ROOT_V1 => lean_encoding::encode_blocks_by_root(request),
+                // The bare list: beacon's body is an SSZ field, so the
+                // container lean wraps it in comes back off here.
+                protocols::BLOCKS_BY_ROOT_V2 => request.roots.to_ssz(),
+                other => return Err(invalid(format!("not a blocks_by_root protocol: {other}"))),
+            },
+            Request::BlocksByRange(request) => match protocol.as_ref() {
+                lean_protocols::BLOCKS_BY_RANGE_V1 => {
+                    lean_encoding::encode_blocks_by_range(request)
+                }
+                protocols::BLOCKS_BY_RANGE_V2 => BeaconBlocksByRangeRequest::from(request).to_ssz(),
+                other => return Err(invalid(format!("not a blocks_by_range protocol: {other}"))),
+            },
             Request::Status(status) => beacon_encoding::encode_status(protocol.as_ref(), status)?,
-            Request::Ping(ping) => beacon_encoding::encode_ping(ping),
+            // Versionless bodies, so there is nothing for the beacon module to
+            // decide and they encode straight from the container.
+            Request::Ping(ping) => ping.to_ssz(),
             // The spec's MetaData request is empty, and `write_payload` of an
             // empty slice emits no bytes at all.
             Request::MetaData(_) => Vec::new(),
-            Request::Goodbye(goodbye) => beacon_encoding::encode_goodbye(goodbye),
+            Request::Goodbye(goodbye) => goodbye.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -174,21 +282,38 @@ impl libp2p::request_response::Codec for Codec {
         match resp {
             Response::Success { payload } => match &payload {
                 ResponsePayload::LeanStatus(status) => {
-                    write_success_chunk(io, label, lean_encoding::encode_status(status)).await
+                    write_success_chunk(io, label, NO_CONTEXT, lean_encoding::encode_status(status))
+                        .await
                 }
-                ResponsePayload::LeanBlocks(blocks) => {
-                    lean_encoding::write_blocks_response(io, label, blocks).await
-                }
+                // One payload, two framings, picked by the negotiated
+                // protocol the same way the two block requests are.
+                ResponsePayload::Blocks(blocks) => match protocol.as_ref() {
+                    lean_protocols::BLOCKS_BY_ROOT_V1 | lean_protocols::BLOCKS_BY_RANGE_V1 => {
+                        lean_encoding::write_blocks_response(io, label, blocks).await
+                    }
+                    protocols::BLOCKS_BY_RANGE_V2 | protocols::BLOCKS_BY_ROOT_V2 => {
+                        let context = self.beacon_context(protocol.as_ref())?;
+                        beacon_encoding::write_blocks_response(
+                            io,
+                            label,
+                            &context.config,
+                            context.genesis_validators_root,
+                            blocks,
+                        )
+                        .await
+                    }
+                    other => Err(invalid(format!("not a block protocol: {other}"))),
+                },
                 ResponsePayload::Status(status) => {
                     let encoded = beacon_encoding::encode_status(protocol.as_ref(), status)?;
-                    write_success_chunk(io, label, encoded).await
+                    write_success_chunk(io, label, NO_CONTEXT, encoded).await
                 }
                 ResponsePayload::Pong(ping) => {
-                    write_success_chunk(io, label, beacon_encoding::encode_ping(ping)).await
+                    write_success_chunk(io, label, NO_CONTEXT, ping.to_ssz()).await
                 }
                 ResponsePayload::MetaData(metadata) => {
                     let encoded = beacon_encoding::encode_metadata(protocol.as_ref(), metadata)?;
-                    write_success_chunk(io, label, encoded).await
+                    write_success_chunk(io, label, NO_CONTEXT, encoded).await
                 }
             },
             Response::Error { code, message } => {
@@ -208,11 +333,13 @@ impl libp2p::request_response::Codec for Codec {
 
 /// Read a single-chunk response: one result-code byte, then one payload.
 ///
-/// Lean's `Status` and every beacon protocol this node registers answer with
+/// Lean's `Status` and every beacon protocol but the two block ones answer with
 /// exactly one chunk, so there is no EOF loop here; the multi-chunk shape is
-/// [`decode_blocks_response`]. `decode` turns the body into a payload, and is
-/// handed the negotiated protocol id because the beacon containers pick their
-/// version off it.
+/// [`crate::lean::encoding::decode_blocks_response`] and its beacon
+/// counterpart, both of which run the shared
+/// [`crate::req_resp::encoding::read_chunked_response`] loop. `decode` turns the
+/// body into a payload, and is handed the negotiated protocol id because the
+/// beacon containers pick their version off it.
 async fn decode_single_chunk<T, F>(
     io: &mut T,
     protocol: &str,
@@ -255,10 +382,27 @@ mod tests {
         SyncnetsBits,
     };
     use crate::beacon::protocols;
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::primitives::Root;
     use futures::io::Cursor;
     use libp2p::StreamProtocol;
     use libp2p::request_response::Codec as _;
+
+    /// Ethereum mainnet's `genesis_validators_root`.
+    fn mainnet_gvr() -> Root {
+        Root::from_slice(
+            &hex::decode("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95")
+                .expect("valid hex"),
+        )
+    }
+
+    /// A codec built the way `build_swarm`'s beacon arm builds one.
+    fn codec() -> Codec {
+        Codec::beacon(BeaconContext {
+            config: Config::mainnet(),
+            genesis_validators_root: mainnet_gvr(),
+        })
+    }
 
     fn status() -> BeaconStatus {
         BeaconStatus::V1(StatusV1 {
@@ -274,12 +418,12 @@ mod tests {
     async fn request_round_trip(protocol: &'static str, request: Request) -> Request {
         let stream_protocol = StreamProtocol::new(protocol);
         let mut buffer = Cursor::new(Vec::new());
-        Codec
+        codec()
             .write_request(&stream_protocol, &mut buffer, request)
             .await
             .expect("writes");
         let mut buffer = Cursor::new(buffer.into_inner());
-        Codec
+        codec()
             .read_request(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
@@ -289,12 +433,12 @@ mod tests {
     async fn response_round_trip(protocol: &'static str, response: Response) -> Response {
         let stream_protocol = StreamProtocol::new(protocol);
         let mut buffer = Cursor::new(Vec::new());
-        Codec
+        codec()
             .write_response(&stream_protocol, &mut buffer, response)
             .await
             .expect("writes");
         let mut buffer = Cursor::new(buffer.into_inner());
-        Codec
+        codec()
             .read_response(&stream_protocol, &mut buffer)
             .await
             .expect("reads")
@@ -313,7 +457,7 @@ mod tests {
         // whichever variant the caller happened to build.
         let stream_protocol = StreamProtocol::new(protocols::STATUS_V2);
         let mut buffer = Cursor::new(Vec::new());
-        let result = Codec
+        let result = codec()
             .write_request(&stream_protocol, &mut buffer, Request::Status(status()))
             .await;
         assert!(

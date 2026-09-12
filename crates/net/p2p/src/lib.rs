@@ -39,7 +39,7 @@ use ethlambda_network_api::{
         FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
     },
 };
-use ethlambda_storage::Store;
+use ethlambda_storage::{Chain, Store};
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -92,6 +92,16 @@ mod req_resp;
 pub(crate) mod swarm_adapter;
 
 pub use libp2p::PeerId;
+
+/// Asking a peer for beacon blocks, by range and by root.
+///
+/// Both are driven from inside this crate: `fetch_block_from_peer` sends the
+/// by-root one, and `request_next_beacon_range_batch` the by-range one, off a
+/// peer's `Status`. They stay public because the answer stops at this crate:
+/// this node has no beacon `BlockChain` actor to import into, so a fetched
+/// block is checked and dropped, and the importer that changes that is expected
+/// to drive its own fetches from outside rather than through the range session.
+pub use req_resp::{request_beacon_block_by_root, request_beacon_blocks_by_range};
 
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
 const MAX_FETCH_RETRIES: u32 = 10;
@@ -321,6 +331,17 @@ impl Wire {
             Wire::Lean(_) => None,
         }
     }
+
+    /// Which chain's handler a shared request belongs to.
+    ///
+    /// The two block requests are one `Request` variant for both wires, so the
+    /// dispatch reads this instead of a tag on the message. A node speaks one
+    /// wire for its whole life, so this is the same answer every time and is
+    /// already recorded here; carrying it on the message would be a second copy
+    /// of it.
+    pub(crate) fn is_beacon(&self) -> bool {
+        matches!(self, Wire::Beacon(_))
+    }
 }
 
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
@@ -417,7 +438,11 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         wire,
     } = config;
 
-    let (seen_ttl, protocols, identify_version, connection_limits) = match &wire {
+    // The codec comes out of this match too, not from `Default`: the two beacon
+    // block protocols frame their chunks against the fork schedule and the
+    // chain, so whatever decides that the protocols are registered has to decide
+    // that the context is there. See [`Codec`].
+    let (seen_ttl, protocols, identify_version, connection_limits, codec) = match &wire {
         WireConfig::Lean(lean) => (
             Duration::from_millis(lean.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS),
             vec![
@@ -437,12 +462,17 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             // Use the same `protocol_version` string as zeam
             "/ipfs/0.1.0",
             unlimited_connections(),
+            Codec::lean(),
         ),
         WireConfig::Beacon(beacon) => (
             beacon::swarm::seen_ttl(&beacon.config),
             beacon::protocols::registrations(),
             beacon::swarm::IDENTIFY_PROTOCOL_VERSION,
             beacon::swarm::connection_limits(),
+            Codec::beacon(beacon::BeaconContext {
+                config: beacon.config.clone(),
+                genesis_validators_root: beacon.genesis_validators_root,
+            }),
         ),
     };
 
@@ -452,7 +482,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     )
     .expect("failed to initiate behaviour");
 
-    let req_resp = request_response::Behaviour::new(protocols, Default::default());
+    let req_resp = request_response::Behaviour::with_codec(codec, protocols, Default::default());
 
     let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
@@ -603,6 +633,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 topics,
                 config: beacon.config,
                 genesis_time: beacon.genesis_time,
+                genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
             }))
         }
@@ -646,6 +677,13 @@ impl P2P {
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
+        // Seeded from the anchor the store was bootstrapped at, so the first
+        // range request starts where the chain does rather than at slot 0.
+        let beacon_fetched_through = match store.chain() {
+            Chain::Beacon => store.beacon_head().map_or(0, |(slot, _)| slot),
+            Chain::Lean => 0,
+        };
+
         let server = P2PServer {
             swarm_handle,
             store,
@@ -655,6 +693,7 @@ impl P2P {
             pending_root_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
+            beacon_fetched_through,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: DiscoveryState::new(discovery, built.local_peer_id),
@@ -695,6 +734,24 @@ pub struct P2PServer {
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
     pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
+
+    /// Highest beacon slot taken off the wire, whether or not anything has
+    /// imported it.
+    ///
+    /// Range sync decides its next request from this rather than from the
+    /// store's own head, and the difference is not a nicety. On this branch
+    /// nothing imports at all, so the store's head never moves and a sync
+    /// driven off it would re-request the same range forever. Once there is an
+    /// importer the head still lags, because delivery is a message and import
+    /// is work: the store trails a delivered batch by the whole actor mailbox,
+    /// which on the live follower meant 11,213 blocks off the wire to import
+    /// 100, each duplicate paying a `hash_tree_root` before the store could
+    /// reject it. Advanced on arrival, the ratio was 1.7:1.
+    ///
+    /// Not persisted, and deliberately not in the store: it describes this
+    /// process's in-flight fetching, not chain history, and a restart should
+    /// start again from the anchor it actually resumes at.
+    pub(crate) beacon_fetched_through: u64,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
@@ -874,7 +931,11 @@ async fn handle_swarm_event(
                 // borrow of `server.wire` is alive across the send.
                 let beacon_status = server.wire.beacon().map(|wire| {
                     (
-                        beacon::handler::build_status(wire, beacon::handler::StatusVersion::V1),
+                        beacon::handler::build_status(
+                            &server.store,
+                            wire,
+                            beacon::handler::StatusVersion::V1,
+                        ),
                         hex::encode(wire.fork_digest),
                     )
                 });

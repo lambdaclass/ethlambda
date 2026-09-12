@@ -293,6 +293,14 @@ actual_slot = finalized_slot + 1 + relative_index
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
+  - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
+    Both serve from the checkpoint-anchored store, and `build_status` now advertises it
+    (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
+    have a reason to ask. Asking runs too: a peer's Status starts a range session paced by
+    `P2PServer::beacon_fetched_through` rather than the store's head. There is still no
+    importer, so fetched blocks are checked and dropped.
+    Their chunks carry four `<context-bytes>` (the block's own epoch's fork digest), which is why
+    `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
 
 ### Peer Discovery (discv5)
 - Always on, on both chains, on `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `CommonOptions::validate_ports`). There is no `--discovery.enable`: mainnet bootnode ENRs are not statically dialable so a crawl is its only way to find a peer, and a lean node with no `--bootnodes` is in the same position. Co-located nodes on one host must each pass `--discovery.port`

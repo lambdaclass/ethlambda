@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::preset;
-use ethlambda_types::beacon::primitives::ForkDigest;
+use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 
 /// How long gossipsub remembers a message id, so a duplicate arriving late is
 /// dropped rather than re-forwarded.
@@ -82,6 +82,9 @@ pub struct BeaconWireConfig {
     pub fork_digest: ForkDigest,
     pub config: Config,
     pub genesis_time: u64,
+    /// The chain the digests are bound to. See
+    /// [`BeaconWire::genesis_validators_root`](crate::beacon::BeaconWire).
+    pub genesis_validators_root: Root,
 }
 
 #[cfg(test)]
@@ -140,6 +143,7 @@ mod tests {
                 fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
                 config: Config::mainnet(),
                 genesis_time: 1_606_824_023,
+                genesis_validators_root: Root::ZERO,
             })),
         })
         .expect("swarm builds");

@@ -255,6 +255,7 @@ pub fn wire_params() -> eyre::Result<BeaconWireParams> {
             fork_digest: fork_id.fork_digest,
             config: chain,
             genesis_time: genesis.genesis_time,
+            genesis_validators_root: genesis.genesis_validators_root,
         },
         fork_id,
     })

@@ -2021,14 +2021,25 @@ impl Store {
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
     ///
-    /// Missing slots or blocks are skipped. This keeps the current request
-    /// behavior while centralizing the slot-index lookup so the storage backend
-    /// can optimize range reads later.
+    /// Missing slots or blocks are skipped, which is what both chains'
+    /// `BlocksByRange` wants: "In cases where a slot is empty for a given slot
+    /// number, no block is returned."
+    ///
+    /// Canonical by construction rather than by filtering: `BlockRoots` holds
+    /// one root per slot on the branch ending at the current head, maintained by
+    /// [`update_checkpoints`](Self::update_checkpoints), so a sibling block at a
+    /// slot the head does not descend from is never read. Blocks come back in
+    /// ascending slot order because the loop walks the range in it.
+    ///
+    /// One method for both chains, split inline the same way
+    /// [`get_signed_block`](Self::get_signed_block) is. The index walk above the
+    /// split is identical: `BlockRoots` is written for either chain and keyed by
+    /// slot alone, so only the read of the row it points at differs.
     pub fn get_signed_blocks_by_slot_range(
         &self,
         start_slot: u64,
         end_slot: u64,
-    ) -> Result<Vec<SignedBlock>, Error> {
+    ) -> Result<Vec<SignedBeaconBlock>, Error> {
         let view = self.backend.begin_read().expect("read view");
         let mut blocks = Vec::new();
         for slot in start_slot..=end_slot {
@@ -2043,8 +2054,21 @@ impl Store {
                 continue;
             };
             let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
-            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
-                blocks.push(block);
+            match self.chain {
+                Chain::Lean => {
+                    if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
+                        blocks.push(SignedBeaconBlock::Lean(block));
+                    }
+                }
+                // A beacon block is one row, so there is no equivalent of the
+                // lean arm's "header found but proof pruned" `None`: the row is
+                // there or the slot is skipped.
+                Chain::Beacon => {
+                    if let Some(bytes) = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get")
+                    {
+                        blocks.push(decode_beacon_block_value(&bytes));
+                    }
+                }
             }
         }
         Ok(blocks)
@@ -3463,7 +3487,7 @@ mod tests {
             .get_signed_blocks_by_slot_range(1, 1)
             .expect("get blocks by slot range");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+        assert_eq!(blocks[0].message_hash_tree_root(), block_root);
     }
 
     #[test]

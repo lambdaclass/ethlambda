@@ -27,8 +27,19 @@ pub struct BlocksByRootRequest {
     pub roots: RequestedBlockRoots,
 }
 
+/// `blocks_by_range/1`'s body **as it goes on this chain's wire**.
+///
+/// Two fields where beacon's body has three: this chain has no deprecated
+/// `step`. The shared
+/// [`BlocksByRangeRequest`](crate::req_resp::messages::BlocksByRangeRequest)
+/// that [`crate::req_resp::Request`] carries has one, so `crate::lean::encoding`
+/// converts, filling it with 1 on the way in and dropping it on the way out.
+///
+/// `BlocksByRootRequest` needs no such counterpart: its body is the same list
+/// either chain asks for, and only beacon's lack of a container around it
+/// differs, which beacon's encoder handles.
 #[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct BlocksByRangeRequest {
+pub struct LeanBlocksByRangeRequest {
     pub start_slot: u64,
     pub count: u64,
 }

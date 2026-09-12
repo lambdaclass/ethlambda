@@ -1,10 +1,14 @@
 //! The request/response protocols `ethlambda beacon` registers.
 //!
 //! Registered by direction, following the same subscribe-only-what-you-consume
-//! rule the topics follow. `beacon_blocks_by_{range,root}/2` are deliberately
-//! absent: nothing calls them until the anchor-to-head fetch lands, and an
-//! unregistered protocol is refused at stream negotiation rather than answered
-//! with a lie. The sidecar protocols are absent for the same reason.
+//! rule the topics follow. The sidecar protocols are deliberately absent:
+//! nothing custodies a blob or a data column, and an unregistered protocol is
+//! refused at stream negotiation rather than answered with a lie.
+//!
+//! Only version 2 of the two block protocols is registered. Version 1 is
+//! deprecated by the spec, which lets a client answer it with an empty list,
+//! and its chunks carry no `<context-bytes>`, so serving it would mean a second
+//! encoder for a shape no mainnet peer needs.
 
 use libp2p::StreamProtocol;
 use libp2p::request_response::ProtocolSupport;
@@ -16,6 +20,35 @@ pub const METADATA_V1: &str = "/eth2/beacon_chain/req/metadata/1/ssz_snappy";
 pub const METADATA_V2: &str = "/eth2/beacon_chain/req/metadata/2/ssz_snappy";
 pub const METADATA_V3: &str = "/eth2/beacon_chain/req/metadata/3/ssz_snappy";
 pub const GOODBYE_V1: &str = "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
+pub const BLOCKS_BY_RANGE_V2: &str = "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
+pub const BLOCKS_BY_ROOT_V2: &str = "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
+
+/// `MAX_REQUEST_BLOCKS`: the ceiling phase0 put on either block request.
+///
+/// This is what an inbound request is *judged* against, because it is the
+/// widest a peer may ever legitimately have been built to ask for.
+pub const MAX_REQUEST_BLOCKS: u64 = 1024;
+
+/// `MAX_REQUEST_BLOCKS_DENEB`: the ceiling from deneb on, and so the real one
+/// on any live network.
+///
+/// This is what an outbound request is *built* to, and what an answer is
+/// truncated to. Kept separate from [`MAX_REQUEST_BLOCKS`] rather than
+/// collapsed into it, because the two ceilings answer different questions:
+/// asking for more than this is a protocol violation, while *receiving* a
+/// request for more than this is only a peer running pre-deneb logic. The spec
+/// allows "Clients MAY limit the number of blocks in the response", so that
+/// peer is answered with this many rather than refused.
+pub const MAX_REQUEST_BLOCKS_DENEB: u64 = 128;
+
+// Everything this node sends is built to the deneb ceiling and everything it
+// serves is truncated to it, while an inbound request is judged against the
+// phase0 one. Reversing the two would put every outbound request over the limit
+// the peer enforces, so it is refused at compile time rather than in a test.
+const _: () = assert!(
+    MAX_REQUEST_BLOCKS_DENEB < MAX_REQUEST_BLOCKS,
+    "the ceiling requests are built to has to fit inside the one they are judged against"
+);
 
 /// The protocols this node registers, with the direction it supports each in.
 ///
@@ -32,6 +65,14 @@ pub fn registrations() -> Vec<(StreamProtocol, ProtocolSupport)> {
         (StreamProtocol::new(METADATA_V2), ProtocolSupport::Full),
         (StreamProtocol::new(METADATA_V3), ProtocolSupport::Full),
         (StreamProtocol::new(GOODBYE_V1), ProtocolSupport::Inbound),
+        (
+            StreamProtocol::new(BLOCKS_BY_RANGE_V2),
+            ProtocolSupport::Full,
+        ),
+        (
+            StreamProtocol::new(BLOCKS_BY_ROOT_V2),
+            ProtocolSupport::Full,
+        ),
     ]
 }
 
@@ -45,6 +86,8 @@ pub fn label(protocol: &str) -> Option<&'static str> {
         METADATA_V2 => Some("beacon_metadata_v2"),
         METADATA_V3 => Some("beacon_metadata_v3"),
         GOODBYE_V1 => Some("beacon_goodbye"),
+        BLOCKS_BY_RANGE_V2 => Some("beacon_blocks_by_range_v2"),
+        BLOCKS_BY_ROOT_V2 => Some("beacon_blocks_by_root_v2"),
         _ => None,
     }
 }
@@ -82,28 +125,5 @@ mod tests {
             .find(|(protocol, _)| protocol.as_ref() == GOODBYE_V1)
             .expect("goodbye is registered");
         assert!(matches!(goodbye.1, ProtocolSupport::Inbound));
-    }
-
-    #[test]
-    fn no_block_or_sidecar_protocol_is_registered() {
-        // Deliberate: nothing consumes them until the anchor-to-head fetch
-        // lands, and a registered protocol with no caller is an untested
-        // encoder that peers can reach.
-        let absent = [
-            "beacon_blocks_by_range",
-            "beacon_blocks_by_root",
-            "blob_sidecars_by_range",
-            "blob_sidecars_by_root",
-            "data_column_sidecars_by_range",
-            "data_column_sidecars_by_root",
-        ];
-        for (protocol, _) in registrations() {
-            for name in absent {
-                assert!(
-                    !protocol.as_ref().contains(name),
-                    "{protocol} must not be registered yet"
-                );
-            }
-        }
     }
 }

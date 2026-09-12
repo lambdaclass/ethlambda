@@ -7,22 +7,29 @@
 //!
 //! Beacon's half is all version dispatch, because three of its protocols carry
 //! a different container per negotiated version. This half has no versions at
-//! all; what it has instead is the **multi-chunk** block response, which no
-//! beacon protocol this node registers uses.
+//! all, and no `<context-bytes>` on any chunk: every container here has had one
+//! shape for the chain's whole life, so there is nothing for a chunk to say
+//! about which one it is.
 
 use std::io;
 
+use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::block::SignedBlock;
-use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite};
+use libp2p::futures::{AsyncRead, AsyncWrite};
 use libssz::{SszDecode, SszEncode};
-use tracing::{debug, warn};
+use tracing::{error, warn};
 
-use super::messages::{BlocksByRangeRequest, BlocksByRootRequest, Status};
+use super::messages::{BlocksByRootRequest, LeanBlocksByRangeRequest, Status};
 use super::protocols;
-use crate::metrics;
 use crate::req_resp::codec::write_success_chunk;
-use crate::req_resp::encoding::{MAX_PAYLOAD_SIZE, decode_payload, invalid};
-use crate::req_resp::messages::{ErrorMessage, Request, Response, ResponseCode, ResponsePayload};
+use crate::req_resp::encoding::{ChunkLimits, MAX_PAYLOAD_SIZE, invalid, read_chunked_response};
+use crate::req_resp::messages::BlocksByRangeRequest;
+use crate::req_resp::messages::{Request, Response, ResponsePayload};
+
+/// This chain's chunks carry no context bytes. Named rather than written as a
+/// bare `0`/`&[]` at each call site, so the reason travels with the value.
+const NO_CONTEXT: &[u8] = &[];
 
 /// Decode a request body on one of this chain's protocols.
 ///
@@ -32,11 +39,10 @@ pub fn decode_request(protocol: &str, payload: &[u8]) -> Option<io::Result<Reque
     let request = match protocol {
         protocols::STATUS_V1 => Status::from_ssz_bytes(payload).map(Request::LeanStatus),
         protocols::BLOCKS_BY_ROOT_V1 => {
-            BlocksByRootRequest::from_ssz_bytes(payload).map(Request::LeanBlocksByRoot)
+            BlocksByRootRequest::from_ssz_bytes(payload).map(Request::BlocksByRoot)
         }
-        protocols::BLOCKS_BY_RANGE_V1 => {
-            BlocksByRangeRequest::from_ssz_bytes(payload).map(Request::LeanBlocksByRange)
-        }
+        protocols::BLOCKS_BY_RANGE_V1 => LeanBlocksByRangeRequest::from_ssz_bytes(payload)
+            .map(|wire| Request::BlocksByRange(wire.into())),
         _ => return None,
     };
     Some(request.map_err(|err| invalid(format!("{err:?}"))))
@@ -52,9 +58,30 @@ pub fn encode_blocks_by_root(request: &BlocksByRootRequest) -> Vec<u8> {
     request.to_ssz()
 }
 
-/// Encode a `blocks_by_range/1` body.
+/// Encode a `blocks_by_range/1` body, which is the shared request minus the
+/// `step` this chain's wire has no field for.
 pub fn encode_blocks_by_range(request: &BlocksByRangeRequest) -> Vec<u8> {
-    request.to_ssz()
+    LeanBlocksByRangeRequest::from(request).to_ssz()
+}
+
+/// This chain's wire body for a slot window: the shared request without `step`.
+impl From<&BlocksByRangeRequest> for LeanBlocksByRangeRequest {
+    fn from(request: &BlocksByRangeRequest) -> Self {
+        Self {
+            start_slot: request.start_slot,
+            count: request.count,
+        }
+    }
+}
+
+/// The shared request a wire body describes.
+///
+/// `step` becomes 1, which is what this chain not having the field means. It is
+/// never anything else, so the lean handler has nothing to check.
+impl From<LeanBlocksByRangeRequest> for BlocksByRangeRequest {
+    fn from(wire: LeanBlocksByRangeRequest) -> Self {
+        Self::new(wire.start_slot, wire.count)
+    }
 }
 
 /// Decode the body of a single-chunk `status/1` response.
@@ -66,11 +93,10 @@ pub fn decode_status_response(payload: &[u8]) -> io::Result<ResponsePayload> {
 
 /// Read a block response, which is one chunk per block rather than one chunk.
 ///
-/// Reads until EOF, collecting the blocks that decoded. Each chunk carries its
-/// own response code; a chunk with an error code is logged and skipped rather
-/// than ending the stream, so a peer that holds some of what was asked for can
-/// answer with that much. The stream ends at EOF, when the peer closes after
-/// sending everything it has.
+/// The loop, the per-chunk metrics and the skip-on-error-code rule are
+/// [`read_chunked_response`]'s, shared with beacon's block response; what is
+/// this chain's own is that a chunk has no context bytes to read and decodes as
+/// exactly one container.
 ///
 /// Always `Ok(Response::Success)`, possibly with an empty vector: either no
 /// chunk arrived, or none of them carried SUCCESS. It is `Err` only on an I/O
@@ -79,40 +105,21 @@ pub async fn decode_blocks_response<T>(io: &mut T, protocol_label: &str) -> io::
 where
     T: AsyncRead + Unpin + Send,
 {
-    let mut blocks = Vec::new();
+    let limits = ChunkLimits {
+        has_context: false,
+        // The widest answer either of this chain's block protocols can be asked
+        // for: `blocks_by_range` is refused above it, and `blocks_by_root`
+        // cannot name more roots than the request list holds.
+        max_chunks: protocols::MAX_REQUEST_BLOCKS as usize,
+    };
+    let blocks = read_chunked_response(io, protocol_label, limits, |_, payload| {
+        SignedBlock::from_ssz_bytes(payload)
+            .map(SignedBeaconBlock::Lean)
+            .map_err(|err| invalid(format!("{err:?}")))
+    })
+    .await?;
 
-    loop {
-        let mut result_byte = 0_u8;
-        if let Err(err) = io.read_exact(std::slice::from_mut(&mut result_byte)).await {
-            if err.kind() == io::ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(err);
-        }
-
-        let code = ResponseCode::from(result_byte);
-        let decoded = decode_payload(io).await?;
-        let payload = decoded.uncompressed;
-        metrics::observe_reqresp_response_chunk_size(
-            protocol_label,
-            payload.len(),
-            decoded.compressed_size,
-        );
-
-        if code != ResponseCode::SUCCESS {
-            let error_message = ErrorMessage::from_ssz_bytes(&payload)
-                .map(|msg| String::from_utf8_lossy(&msg).into_owned())
-                .unwrap_or_else(|_| "<invalid error message>".to_string());
-            debug!(?code, %error_message, "Skipping block chunk with non-success code");
-            continue;
-        }
-
-        let block =
-            SignedBlock::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?;
-        blocks.push(block);
-    }
-
-    Ok(Response::success(ResponsePayload::LeanBlocks(blocks)))
+    Ok(Response::success(ResponsePayload::Blocks(blocks)))
 }
 
 /// Write a block response: one result code and one payload per block.
@@ -123,12 +130,25 @@ where
 pub async fn write_blocks_response<T>(
     io: &mut T,
     label: &'static str,
-    blocks: &[SignedBlock],
+    blocks: &[SignedBeaconBlock],
 ) -> io::Result<()>
 where
     T: AsyncWrite + Unpin + Send,
 {
     for block in blocks {
+        // `SignedBeaconBlock` spans both chains, so this is the one place a
+        // beacon-shaped block could be written onto a lean stream. It would
+        // encode without complaint and decode as garbage at the peer, so it is
+        // refused here rather than trusted to be impossible: a lean directory
+        // holding one would mean the store's chain tag lied.
+        if block.fork_name() != ForkName::Lean {
+            error!(
+                slot = block.slot(),
+                fork = %block.fork_name(),
+                "Refusing to write a non-lean block to a lean block response"
+            );
+            continue;
+        }
         let encoded = block.to_ssz();
         if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
             warn!(
@@ -137,7 +157,7 @@ where
             );
             continue;
         }
-        write_success_chunk(io, label, encoded).await?;
+        write_success_chunk(io, label, NO_CONTEXT, encoded).await?;
     }
     Ok(())
 }
