@@ -5,9 +5,10 @@ describes what it puts on the wire; [`discovery.md`](./discovery.md) covers the
 discv5 stack it shares with lean, and [`cli.md`](./cli.md) the flags and the
 startup order.
 
-It follows and imports nothing. A checkpoint-anchored store sits behind it, and
-the two block protocols serve from it, but there is no chain actor: a block that
-arrives on gossip, or that this node fetched, is checked and then dropped.
+It follows, from its checkpoint anchor to the tip: a chain actor imports what
+gossip announces and what range sync fetches, and the two block protocols serve
+other peers from the same store. It publishes nothing, and it does not read the
+aggregate topic, so fork choice learns its votes from block bodies.
 
 ## Running it
 
@@ -200,22 +201,17 @@ session, which sends through `request_beacon_blocks_by_range`; and
 `fetch_block_from_peer`, which picks its protocol from the wire so a beacon
 node cannot put a lean-framed `BlocksByRoot` on its beacon streams.
 
-The by-root path has no caller in practice on this branch, since reaching it
-needs a chain actor asking for a missing parent and the follower still sets
-`chain: None`. The range path does run, and **the blocks it fetches are counted
-and dropped**, exactly as gossiped beacon blocks are, since there is no actor to
-import them into. That is deliberate: the range and root checks are what make an
-answer trustworthy and are what an importer would otherwise repeat, and the
-watermark that paces the session is the piece that has to be right before an
-importer exists. It does mean this branch spends a peer's bandwidth on blocks it
-discards.
+Both paths now import. A fetched block reaches the chain actor as
+`BlockSource::Sync`, keeping every per-block range and root check on the way in,
+and the by-root path is what resolves a gossiped block's missing parent.
 
-Range sync is paced by `P2PServer::beacon_fetched_through`, not by the store's
-head. Nothing here imports, so the head never moves and a head-driven session
-would re-request the same range forever. The reasoning holds once an importer
-does exist: delivery is a message and import is work, so the store trails a
-delivered batch by the whole actor mailbox, which on the live follower meant
-11,213 blocks off the wire to import 100.
+Range sync is paced by `P2PServer::beacon_fetched_through`, the highest slot
+handed to the actor, not by the store's head. Delivery is a message and import
+is work, so the store trails a delivered batch by the whole actor mailbox.
+Driven off the head, every resync tick re-requested the part still draining,
+which on the live follower meant 11,213 blocks off the wire to import 100, each
+duplicate paying a `hash_tree_root` before the store could reject it. Paced off
+the watermark, the ratio was 1.7:1.
 
 `Status` is store-derived: head from `Store::beacon_head`, the finalized
 checkpoint from `Store::beacon_finalized_checkpoint`, and

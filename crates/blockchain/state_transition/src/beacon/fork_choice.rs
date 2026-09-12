@@ -169,6 +169,7 @@ use crate::beacon::helpers::electra as electra_helpers;
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::kzg;
+use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Epoch, Gwei, HashTreeRoot as _, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex,
@@ -221,21 +222,48 @@ impl Attestation {
     /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair, so this
     /// dispatches once here rather than leaving that match to every caller.
     pub fn verified_attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
+        self.indices(state, true)
+    }
+
+    /// The attesters this attestation names, taking `state`'s word for the
+    /// committees and checking nothing else.
+    ///
+    /// Only sound for an attestation that has already been through
+    /// `process_block`, which is why [`on_block_attestation`] is its only
+    /// caller: `process_attestation` runs the same `get_indexed_attestation`
+    /// and the same `is_valid_indexed_attestation` the verifying sibling above
+    /// does, so for a block's own attestations that verdict is already in hand
+    /// and re-reaching it is the expensive part of the import.
+    pub fn attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
+        self.indices(state, false)
+    }
+
+    /// The body both accessors above share: the one place this enum's two
+    /// shapes actually matter, since building the indexed form and checking it
+    /// needs the fork-specific
+    /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair. Kept as
+    /// one dispatch so a new attestation shape cannot be added to the
+    /// verifying path and forgotten on the other.
+    fn indices(&self, state: &BeaconState, verify_signature: bool) -> Result<Vec<ValidatorIndex>> {
         match self {
             Attestation::Phase0(attestation) => {
                 let indexed = phase0_attestation::get_indexed_attestation(state, attestation)?;
-                verify(
-                    phase0_attestation::is_valid_indexed_attestation(state, &indexed),
-                    "is_valid_indexed_attestation(target_state, indexed_attestation)",
-                )?;
+                if verify_signature {
+                    verify(
+                        phase0_attestation::is_valid_indexed_attestation(state, &indexed),
+                        "is_valid_indexed_attestation(target_state, indexed_attestation)",
+                    )?;
+                }
                 Ok(indexed.attesting_indices.into_inner())
             }
             Attestation::Electra(attestation) => {
                 let indexed = electra_helpers::get_indexed_attestation(state, attestation)?;
-                verify(
-                    electra_helpers::is_valid_indexed_attestation(state, &indexed),
-                    "is_valid_indexed_attestation(target_state, indexed_attestation)",
-                )?;
+                if verify_signature {
+                    verify(
+                        electra_helpers::is_valid_indexed_attestation(state, &indexed),
+                        "is_valid_indexed_attestation(target_state, indexed_attestation)",
+                    )?;
+                }
                 Ok(indexed.attesting_indices.into_inner())
             }
         }
@@ -332,6 +360,95 @@ impl AttesterSlashing {
             }
         }
     }
+}
+
+/// The attestations and attester slashings carried in `block`'s body, each
+/// wrapped in the fork-generic shape [`on_block_attestation`] and
+/// [`on_attester_slashing`] take.
+///
+/// Lives here, beside the two enums it builds, because the fork-to-shape
+/// mapping is theirs: phase0 through deneb share
+/// [`phase0::Attestation`]/[`phase0::AttesterSlashing`], electra and fulu the
+/// `electra` pair. Both consumers of a block's own operations, the chain actor
+/// and the `fork_choice` fixture runner, read it from here, so a new fork
+/// reshaping `body.attestations` cannot be handled in one and forgotten in the
+/// other.
+pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<AttesterSlashing>) {
+    match block {
+        SignedBeaconBlock::Electra(block) => (
+            block
+                .message
+                .body
+                .attestations
+                .iter()
+                .cloned()
+                .map(Attestation::Electra)
+                .collect(),
+            block
+                .message
+                .body
+                .attester_slashings
+                .iter()
+                .cloned()
+                .map(AttesterSlashing::Electra)
+                .collect(),
+        ),
+        SignedBeaconBlock::Fulu(block) => (
+            block
+                .message
+                .body
+                .attestations
+                .iter()
+                .cloned()
+                .map(Attestation::Electra)
+                .collect(),
+            block
+                .message
+                .body
+                .attester_slashings
+                .iter()
+                .cloned()
+                .map(AttesterSlashing::Electra)
+                .collect(),
+        ),
+        SignedBeaconBlock::Phase0(block) => phase0_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+        ),
+        SignedBeaconBlock::Altair(block) => phase0_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+        ),
+        SignedBeaconBlock::Bellatrix(block) => phase0_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+        ),
+        SignedBeaconBlock::Capella(block) => phase0_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+        ),
+        SignedBeaconBlock::Deneb(block) => phase0_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+        ),
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
+    }
+}
+
+/// Phase0 through deneb share one attestation and slashing shape, so their
+/// five arms above share one body.
+///
+/// Takes iterators rather than the lists themselves: each fork's body names
+/// its own `SszList` bound, so a parameter typed on the list would need one
+/// generic per bound, and `.iter()` erases exactly that difference.
+fn phase0_operations<'a>(
+    attestations: impl Iterator<Item = &'a phase0::Attestation>,
+    slashings: impl Iterator<Item = &'a phase0::AttesterSlashing>,
+) -> (Vec<Attestation>, Vec<AttesterSlashing>) {
+    (
+        attestations.cloned().map(Attestation::Phase0).collect(),
+        slashings.cloned().map(AttesterSlashing::Phase0).collect(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,6 +1641,23 @@ pub fn validate_on_attestation(
     is_from_block: bool,
     config: &Config,
 ) -> Result<()> {
+    validate_on_attestation_indexed(store, data, is_from_block, config, &store.block_index())
+}
+
+/// [`validate_on_attestation`] against an already-built block index.
+///
+/// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
+/// shape) for the reason [`filter_block_tree`] does: a caller validating every
+/// attestation carried in one block ([`on_block_attestation`]) would otherwise
+/// re-scan `Table::LiveChain` once per attestation, and that table grows one
+/// row per imported block on a chain whose blocks are never pruned from it.
+fn validate_on_attestation_indexed(
+    store: &Store,
+    data: AttestationData,
+    is_from_block: bool,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<()> {
     let target = data.target;
 
     // If the given attestation is not from a beacon block message, we have to
@@ -1542,11 +1676,6 @@ pub fn validate_on_attestation(
     // unknown, delay consideration until block is found.
     verify(store.has_block(&target.root), "target.root in store.blocks")?;
 
-    // Built here rather than below, where the LMD walk needs it: it already
-    // holds this block's slot, so the "known block" check and the walk read
-    // one scan between them instead of a scan plus a point lookup.
-    let index = store.block_index();
-
     // Attestations must be for a known block. If block is unknown, delay
     // consideration until the block is found.
     let (head_block_slot, _) = *index.get(&data.beacon_block_root).ok_or(Error::SpecAssert(
@@ -1560,7 +1689,7 @@ pub fn validate_on_attestation(
     )?;
 
     // LMD vote must be consistent with FFG vote target.
-    let checkpoint_block = get_checkpoint_block(&index, data.beacon_block_root, target.epoch)?;
+    let checkpoint_block = get_checkpoint_block(index, data.beacon_block_root, target.epoch)?;
     verify(
         target.root == checkpoint_block,
         "target.root == get_checkpoint_block(store, attestation.data.beacon_block_root, target.epoch)",
@@ -1828,6 +1957,56 @@ pub fn on_attestation(
     let attesting_indices = attestation.verified_attesting_indices(&target_state)?;
 
     // Update latest messages for attesting indices.
+    update_latest_messages(store, &attesting_indices, data);
+
+    Ok(())
+}
+
+/// [`on_attestation`] for an attestation carried inside a block, given the
+/// post-state of the block that carried it.
+///
+/// Has the same effect on `store` as `on_attestation(store, attestation, true,
+/// config)`, and reaches it without materializing the target checkpoint's
+/// state. Two things make that equivalent rather than merely cheaper:
+///
+/// * The aggregate signature does not need checking again. `process_block`
+///   ran `process_attestation` over this exact attestation on the way to
+///   producing `block_state`, and that runs the same
+///   `is_valid_indexed_attestation` the verifying path here would. A block
+///   whose attestation failed it never became a block; one that is in the
+///   store carries a verdict this node reached itself.
+/// * `block_state` names the same committees the target checkpoint's state
+///   would. `get_beacon_committee` for a slot in epoch `E` reads the active
+///   validator set at `E` and the seed at `E`, and that seed is the randao mix
+///   from `E - MIN_SEED_LOOKAHEAD - 1`, fixed before `E` began. The target
+///   checkpoint is an ancestor of this block by
+///   [`validate_on_attestation`]'s own LMD/FFG consistency check, so both
+///   states share that history. It is the same equivalence `process_attestation`
+///   relies on when it validates a previous-epoch attestation against the
+///   current state.
+///
+/// What it buys: a target checkpoint's root is the last block at or before
+/// the boundary *on the attester's branch*, so an attester whose view lagged
+/// names a mid-epoch block. Once that block's post-state falls out of the
+/// recency cache, [`checkpoint_state`] rebuilds a ~350MB state by replaying
+/// every block since the last pinned boundary, and the attestation is not
+/// even the reason the import is happening. Observed on a mainnet follower:
+/// one import at 78.9s against a 3.6s steady state, on a 23-block replay for
+/// a target 16 blocks behind the head.
+/// `index` is [`Store::block_index`], built once for the whole block rather
+/// than per attestation: it is a full `Table::LiveChain` scan, and that table
+/// carries a row for every block this node ever imported.
+pub fn on_block_attestation(
+    store: &mut Store,
+    attestation: &Attestation,
+    block_state: &BeaconState,
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<()> {
+    let data = attestation.data();
+    validate_on_attestation_indexed(store, data, true, config, index)?;
+
+    let attesting_indices = attestation.attesting_indices(block_state)?;
     update_latest_messages(store, &attesting_indices, data);
 
     Ok(())

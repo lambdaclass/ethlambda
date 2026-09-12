@@ -51,9 +51,12 @@
 //! `attester_slashing_<root>` files unchanged; electra and fulu need
 //! `electra::Attestation`/`electra::AttesterSlashing` instead (EIP-7549). Both
 //! [`fork_choice::Attestation`] and [`fork_choice::AttesterSlashing`] wrap the
-//! two shapes, so [`decode_attestation`], [`decode_attester_slashing`], and
-//! [`block_attestations_and_slashings`] each dispatch on `case.fork` once,
-//! matching how [`decode_anchor_block`] already dispatches for blocks.
+//! two shapes, so [`decode_attestation`] and [`decode_attester_slashing`]
+//! each dispatch on `case.fork` once, matching how [`decode_anchor_block`]
+//! already dispatches for blocks. A block's own body is read through
+//! [`fork_choice::block_operations`], which makes that same dispatch beside
+//! the two enums it builds, so this runner and the chain actor cannot
+//! disagree about a fork's attestation shape.
 //!
 //! # Checks this runner does not model
 //!
@@ -323,153 +326,6 @@ fn decode_attester_slashing(
     }
 }
 
-/// The attestations and attester slashings carried in `block`'s body, each
-/// already wrapped in [`fork_choice::Attestation`]/
-/// [`fork_choice::AttesterSlashing`]. Phase0 through deneb share
-/// `phase0::Attestation`/`phase0::AttesterSlashing`; electra and fulu share
-/// `electra::Attestation`/`electra::AttesterSlashing`. See the module
-/// documentation.
-fn block_attestations_and_slashings(
-    block: &SignedBeaconBlock,
-) -> (
-    Vec<fork_choice::Attestation>,
-    Vec<fork_choice::AttesterSlashing>,
-) {
-    match block {
-        SignedBeaconBlock::Phase0(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Phase0)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Phase0)
-                .collect(),
-        ),
-        SignedBeaconBlock::Altair(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Phase0)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Phase0)
-                .collect(),
-        ),
-        SignedBeaconBlock::Bellatrix(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Phase0)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Phase0)
-                .collect(),
-        ),
-        SignedBeaconBlock::Capella(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Phase0)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Phase0)
-                .collect(),
-        ),
-        SignedBeaconBlock::Deneb(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Phase0)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Phase0)
-                .collect(),
-        ),
-        SignedBeaconBlock::Electra(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Electra)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Electra)
-                .collect(),
-        ),
-        SignedBeaconBlock::Fulu(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(fork_choice::Attestation::Electra)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(fork_choice::AttesterSlashing::Electra)
-                .collect(),
-        ),
-        // Never reached: `decode_anchor_block` and `decode_signed_block` both
-        // decode through `case.fork`, and every path that could produce
-        // `ForkName::Lean` panics via `lean_is_not_a_fixture_fork` before a
-        // `SignedBeaconBlock` value exists.
-        SignedBeaconBlock::Lean(_) => lean_is_not_a_fixture_fork("fork_choice"),
-    }
-}
-
 /// Decodes a `pow_block_<root>.ssz_snappy` file named by an `on_merge_block`
 /// step.
 fn decode_pow_block(case: &Case, name: &str) -> Result<fork_choice::PowBlock, String> {
@@ -559,7 +415,7 @@ fn apply_block(
     };
     // Collected before `on_block` moves `signed_block` in, so they are still
     // available for the replay below after a successful call.
-    let (attestations, attester_slashings) = block_attestations_and_slashings(&signed_block);
+    let (attestations, attester_slashings) = fork_choice::block_operations(&signed_block);
 
     match (
         fork_choice::on_block(store, signed_block, config, &blob_evidence),

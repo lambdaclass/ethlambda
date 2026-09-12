@@ -2,15 +2,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
+use ethlambda_state_transition::beacon::error::Error as BeaconError;
+use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::is_proposer;
-use ethlambda_storage::{ALL_TABLES, Store};
+use ethlambda_storage::{ALL_TABLES, Chain, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
+    beacon::containers::SignedBeaconBlock,
     block::SignedBlock,
     chain_config::ChainConfig,
-    primitives::{H256, HashTreeRoot as _},
+    primitives::H256,
 };
 
 use crate::aggregation::{
@@ -79,10 +82,24 @@ pub use sync_status::SyncStatusController;
 /// Bounds the clock skew the time check is willing to absorb when admitting a
 /// vote whose slot has not yet started locally. One interval is a fifth of the
 /// configured slot, the lean analogue of mainnet's
-/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+/// [`MAXIMUM_GOSSIP_CLOCK_DISPARITY`].
 ///
 /// See: leanSpec PR #682.
 pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
+
+/// How far ahead of the wall clock a beacon block may sit and still be held
+/// for its slot rather than rejected.
+///
+/// The phase0 p2p-interface constant of the same name, which is what
+/// [`GOSSIP_DISPARITY_INTERVALS`] is lean's analogue of. Mainnet clients
+/// admit a block this far early and queue it to its slot; past it the block
+/// is not early, it is wrong.
+///
+/// It is also what keeps [`BlockChainServer::defer_early_block`] from being a
+/// flood target: a hold keeps the whole block in memory until its slot
+/// starts, so holding anything merely "in the future" would let one peer
+/// spend this node's memory on blocks for slots years away.
+pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
@@ -130,15 +147,38 @@ impl SlotInterval {
     }
 }
 
-/// Milliseconds until the next interval boundary, measured relative to genesis.
-fn ms_until_next_interval(now_ms: u64, config: &ChainConfig) -> u64 {
-    let genesis_time_ms = config.genesis_time_ms();
-    // Before genesis: wait until genesis itself.
+/// Milliseconds until the next `cadence_ms` boundary, measured relative to
+/// genesis. Before genesis, milliseconds until genesis itself.
+///
+/// Both tick cadences run through this: lean's is one fifth of a slot
+/// ([`ms_until_next_interval`]), beacon's a whole slot
+/// ([`ms_until_next_beacon_slot`]). One body, so the pre-genesis case and the
+/// "a sample exactly on a boundary waits a whole cadence rather than zero"
+/// property cannot hold on one grid and not the other.
+fn ms_until_next_boundary(now_ms: u64, genesis_time_ms: u64, cadence_ms: u64) -> u64 {
     let Some(ms_since_genesis) = now_ms.checked_sub(genesis_time_ms) else {
         return genesis_time_ms - now_ms;
     };
-    let ms_per_interval = config.milliseconds_per_interval();
-    ms_per_interval - (ms_since_genesis % ms_per_interval)
+    cadence_ms - (ms_since_genesis % cadence_ms)
+}
+
+/// Milliseconds until the next interval boundary: lean's tick cadence, one
+/// fifth of a slot.
+fn ms_until_next_interval(now_ms: u64, config: &ChainConfig) -> u64 {
+    ms_until_next_boundary(
+        now_ms,
+        config.genesis_time_ms(),
+        config.milliseconds_per_interval(),
+    )
+}
+
+/// Milliseconds until the next slot boundary: beacon's tick cadence.
+///
+/// A beacon follower has no sub-slot duties (see [`ChainDuties::Beacon`]'s
+/// documentation), so it ticks once per slot rather than once per lean
+/// interval.
+fn ms_until_next_beacon_slot(now_ms: u64, genesis_time_ms: u64, slot_duration_ms: u64) -> u64 {
+    ms_until_next_boundary(now_ms, genesis_time_ms, slot_duration_ms)
 }
 
 /// Current UNIX timestamp in milliseconds.
@@ -150,16 +190,29 @@ fn unix_now_ms() -> u64 {
 }
 
 impl BlockChain {
-    /// Spawn the blockchain actor.
+    /// Spawn the blockchain actor for the lean chain.
     ///
     /// `events` is the chain-event publication bus: the spawned actor is its
     /// sole publisher; consumers subscribe read-only receivers.
+    ///
+    /// Asserts `store.chain() == Chain::Lean`: pairing a lean-shaped
+    /// `BlockChainConfig` (validator keys, aggregator role, proposer policy)
+    /// with a beacon store would corrupt the directory the moment any duty
+    /// touched it, so this is a programming error to catch here rather than
+    /// a runtime condition to branch on. Use [`Self::spawn_beacon`] for a
+    /// beacon store.
     pub fn spawn(
         store: Store,
         validator_keys: HashMap<u64, ValidatorKeyPair>,
         config: BlockChainConfig,
         events: EventBus,
     ) -> BlockChain {
+        assert_eq!(
+            store.chain(),
+            Chain::Lean,
+            "BlockChain::spawn requires a lean store; use BlockChain::spawn_beacon for a beacon one"
+        );
+
         let BlockChainConfig {
             aggregator,
             sync_status_controller,
@@ -172,7 +225,6 @@ impl BlockChain {
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = store.config().time_grid();
-        let genesis_time = time_config.genesis_time;
         let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Catch XMSS keys up to the current slot before the first tick
@@ -183,22 +235,88 @@ impl BlockChain {
             / time_config.milliseconds_per_slot) as u32;
         key_manager.advance_keys_to(current_slot);
 
-        let handle = BlockChainServer {
-            store,
-            p2p: None,
+        let lean = LeanDuties {
             key_manager,
-            pending_blocks: HashMap::new(),
             aggregator,
-            pending_block_parents: HashMap::new(),
             current_aggregation: None,
-            last_tick_instant: None,
             attestation_committee_count,
             subscribed_subnets,
             proposer_config,
             pre_merge_coverage: None,
-            sync_status: SyncStatusTracker::new(gate_duties),
+        };
+
+        Self::start_actor(
+            store,
+            SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+            ChainDuties::Lean(Box::new(lean)),
+        )
+    }
+
+    /// Spawn the blockchain actor for the beacon chain, as a follower with no
+    /// validator duties.
+    ///
+    /// No validator keys, no key advance, no aggregator role: a beacon
+    /// follower only imports blocks and runs fork choice (see
+    /// [`ChainDuties::Beacon`]). Feeding it gossip and calling this from
+    /// `run_node` are later slices; this constructor only builds the actor.
+    ///
+    /// Uses [`SyncStatusTracker::new`]`(false)`: the tracker still drives the
+    /// `lean_node_sync_status` metric (the name predates beacon support), but
+    /// there are no duties on this arm for it to gate.
+    ///
+    /// Asserts `store.chain() == Chain::Beacon`, the mirror image of
+    /// [`Self::spawn`]'s assertion, for the same reason: a mismatch here is a
+    /// programming error, not a condition to recover from.
+    pub fn spawn_beacon(
+        store: Store,
+        sync_status_controller: SyncStatusController,
+        events: EventBus,
+    ) -> BlockChain {
+        assert_eq!(
+            store.chain(),
+            Chain::Beacon,
+            "BlockChain::spawn_beacon requires a beacon store; use BlockChain::spawn for a lean one"
+        );
+
+        metrics::set_node_sync_status(metrics::SyncStatus::Idle);
+
+        Self::start_actor(
+            store,
+            SyncStatusTracker::new(false),
+            sync_status_controller,
+            events,
+            ChainDuties::Beacon,
+        )
+    }
+
+    /// Start the actor and arm its first tick: everything the two public
+    /// constructors above do identically, once.
+    ///
+    /// The first `Tick` is armed for genesis, or immediately when genesis is
+    /// already past (`unwrap_or_default` on a negative duration). That is the
+    /// contract both chains' tick loops are entered through, which is why it
+    /// is stated in one place rather than per chain.
+    fn start_actor(
+        store: Store,
+        sync_status: SyncStatusTracker,
+        sync_status_controller: SyncStatusController,
+        events: EventBus,
+        duties: ChainDuties,
+    ) -> BlockChain {
+        let genesis_time = store.config().genesis_time;
+
+        let handle = BlockChainServer {
+            store,
+            p2p: None,
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            last_tick_instant: None,
+            sync_status,
+            sync_status_controller,
+            events,
+            duties,
         }
         .start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
@@ -229,14 +347,96 @@ pub struct BlockChainServer {
     // P2P protocol ref (set via InitP2P message)
     p2p: Option<BlockChainToP2PRef>,
 
-    key_manager: key_manager::KeyManager,
-
     // Pending block roots waiting for their parent (block data stored in DB)
     pending_blocks: HashMap<H256, HashSet<H256>>,
     // Maps pending block_root → its cached missing ancestor. Resolved by walking the
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+
+    /// Last tick instant for measuring interval duration.
+    last_tick_instant: Option<Instant>,
+
+    /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
+    /// validator duties while syncing, unless that gating was disabled at
+    /// startup via `--disable-duty-sync-gate` (then it is metric-only). On a
+    /// beacon follower ([`BlockChain::spawn_beacon`]) there are no duties to
+    /// gate, so it is always constructed observe-only there.
+    sync_status: SyncStatusTracker,
+
+    /// Shared, read-only mirror of `sync_status` for readers outside the actor
+    /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
+    /// `update_sync_status` with the same `SyncStatus` fed to the metric.
+    sync_status_controller: SyncStatusController,
+
+    /// Chain-event publication bus. The actor is the sole publisher; consumers
+    /// only subscribe, preserving the one-directional write flow.
+    events: EventBus,
+
+    /// The lean-only or beacon-only half of this actor's state. See
+    /// [`ChainDuties`].
+    duties: ChainDuties,
+}
+
+/// The lean-only or beacon-only half of [`BlockChainServer`]'s state.
+///
+/// Every field a lean validator needs (key material, aggregator role, the
+/// in-flight aggregation session, proposer policy, ...) means nothing on a
+/// beacon follower: it has no validator keys, casts no votes, and builds no
+/// blocks of its own. Splitting them behind this enum, rather than leaving
+/// them on [`BlockChainServer`] directly and trusting every call site to
+/// check the chain before touching one, turns "beacon has no validator
+/// duties" into a compile-time fact instead of a convention: the field
+/// simply is not there to read on that arm.
+///
+/// A lean-only *message handler* opens with
+/// `let ChainDuties::Lean(_) = &self.duties else { return };`: dropping a
+/// message that does not apply to this chain is a legitimate runtime outcome,
+/// and the handler is the actor's outer boundary where that decision belongs.
+///
+/// Everything below that boundary reads the payload through
+/// [`BlockChainServer::lean`]/[`BlockChainServer::lean_mut`], which panic
+/// rather than return. Since [`BlockChain::spawn`] and
+/// [`BlockChain::spawn_beacon`] each assert their store's chain tag matches
+/// the duties they build, reaching one from a beacon follower is a
+/// programming error, not a condition to absorb: a silent `return` in the
+/// middle of a duty would leave it half-done and look exactly like a real
+/// early exit.
+///
+/// Boxes the `Lean` payload: `LeanDuties` carries a key manager, a subnet
+/// set and an aggregation session, and clippy's `large_enum_variant` flags
+/// the gap against a `Beacon` arm that carries nothing at all.
+enum ChainDuties {
+    /// Validator duties: signing, committee aggregation, proposing. See
+    /// [`LeanDuties`].
+    Lean(Box<LeanDuties>),
+    /// Chain-following only: import blocks, run fork choice, tick once per
+    /// slot boundary. A follower holds no state of its own beyond the store:
+    /// even a block that arrives before its slot waits in a timer rather than
+    /// in a field here (see [`BlockChainServer::defer_early_block`]).
+    Beacon,
+}
+
+/// Panics, naming the validator duty a beacon follower reached.
+///
+/// The same shape as `state_transition`'s `lean_boundary` helpers, and for
+/// the mirror-image reason: `ChainDuties::Beacon` carries no validator state,
+/// so a duty asking for it means the caller dispatched on the wrong chain.
+/// `#[cold]` and `#[track_caller]` so the panic still reports the duty's own
+/// file and line, the way an `unreachable!` written inline there would have.
+#[cold]
+#[track_caller]
+fn beacon_has_no_duties() -> ! {
+    unreachable!(
+        "a beacon follower reached a lean validator duty; \
+         BlockChain::spawn_beacon builds ChainDuties::Beacon, so the caller \
+         must dispatch on the chain before this point"
+    )
+}
+
+/// Validator-duty state, live only on [`ChainDuties::Lean`].
+struct LeanDuties {
+    key_manager: key_manager::KeyManager,
 
     /// Whether this node acts as a committee aggregator.
     ///
@@ -247,13 +447,10 @@ pub struct BlockChainServer {
 
     /// The slot's one committee-signature aggregation session (started at
     /// interval 2, or early via the 2/3 trigger). Deliberately persists after
-    /// the worker finishes — that persistence is the once-per-slot latch the
-    /// early trigger and the interval-2 skip both check — until the next
+    /// the worker finishes (that persistence is the once-per-slot latch the
+    /// early trigger and the interval-2 skip both check) until the next
     /// session start replaces it.
     current_aggregation: Option<AggregationSession>,
-
-    /// Last tick instant for measuring interval duration.
-    last_tick_instant: Option<Instant>,
 
     /// Number of attestation committees (= subnet count). Used by the
     /// attestation aggregate coverage emission and the early-aggregation
@@ -275,20 +472,22 @@ pub struct BlockChainServer {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+}
 
-    /// Stateful sync heuristic used by `lean_node_sync_status`. Also gates
-    /// validator duties while syncing, unless that gating was disabled at
-    /// startup via `--disable-duty-sync-gate` (then it is metric-only).
-    sync_status: SyncStatusTracker,
-
-    /// Shared, read-only mirror of `sync_status` for readers outside the actor
-    /// (the RPC `/lean/v0/node/syncing` endpoint). Written from
-    /// `update_sync_status` with the same `SyncStatus` fed to the metric.
-    sync_status_controller: SyncStatusController,
-
-    /// Chain-event publication bus. The actor is the sole publisher; consumers
-    /// only subscribe, preserving the one-directional write flow.
-    events: EventBus,
+/// Error from importing a block, whichever chain it belongs to.
+///
+/// [`BlockChainServer::process_block`] runs one of two import calls
+/// depending on the block's variant: lean's [`store::on_block`] returns
+/// [`StoreError`], beacon's [`fork_choice::on_block`] returns
+/// [`BeaconError`]. Wrapping both here, rather than picking one chain's
+/// error type to stand in for both, keeps each chain's own error type
+/// exactly as its own module defines it.
+#[derive(Debug, thiserror::Error)]
+enum ImportError {
+    #[error(transparent)]
+    Lean(#[from] StoreError),
+    #[error(transparent)]
+    Beacon(#[from] BeaconError),
 }
 
 impl BlockChainServer {
@@ -306,14 +505,28 @@ impl BlockChainServer {
         // by the monotonic clock (`tokio::sleep`). The wall clock can drift behind it
         // inside VMs, so a tick scheduled for the next interval boundary can fire
         // while the wall clock still reads the previous interval.
-        let tick_interval = time_since_genesis_ms / time_config.milliseconds_per_interval();
-        let store_time = self.store.intervals_since_genesis();
+        //
+        // The store clock is one Unix millisecond row on either chain, but the
+        // grids differ: lean counts intervals since genesis, beacon Unix
+        // seconds. This tick's own position and the store's own reading are
+        // both derived in whichever unit that chain keeps, so the comparison
+        // below has one unit per arm rather than one across both.
+        let (tick_time, store_time) = match self.store.chain() {
+            Chain::Lean => (
+                time_since_genesis_ms / time_config.milliseconds_per_interval(),
+                self.store.intervals_since_genesis(),
+            ),
+            Chain::Beacon => (
+                timestamp_ms / 1000,
+                self.store.time_ms().expect("store time exists") / 1_000,
+            ),
+        };
 
-        if store_time > 0 && tick_interval <= store_time {
+        if store_time > 0 && tick_time <= store_time {
             debug!(
                 %slot,
                 ?interval,
-                tick_interval,
+                tick_time,
                 store_time,
                 "Skipping already-processed tick"
             );
@@ -321,8 +534,10 @@ impl BlockChainServer {
         }
 
         // Fail fast: a state with zero validators is invalid and would cause
-        // panics in proposer selection and attestation processing.
-        if self.store.head_state().validators.is_empty() {
+        // panics in proposer selection and attestation processing. Lean-only:
+        // `head_state` peels a lean `State` and panics on a beacon store, which
+        // has no validator set of its own to check.
+        if self.store.chain() == Chain::Lean && self.store.head_state().validators.is_empty() {
             error!("Head state has no validators, skipping tick");
             return;
         }
@@ -335,7 +550,8 @@ impl BlockChainServer {
         // the tick see a consistent value even if the admin API toggles it
         // mid-tick. Mirror it to the gauge from the actor side so
         // `lean_is_aggregator` reflects the value the actor is acting on.
-        let is_aggregator = self.aggregator.is_enabled();
+        // Always false on a beacon follower, which holds no such role.
+        let is_aggregator = self.is_aggregator();
         metrics::set_is_aggregator(is_aggregator);
 
         // ==== interval 4 (pre-tick) ====
@@ -353,12 +569,14 @@ impl BlockChainServer {
         // observability.
         if interval == SlotInterval::EndOfSlot
             && let Some(snapshot) = coverage::snapshot_new_payloads(&self.store)
+            && let ChainDuties::Lean(lean) = &mut self.duties
         {
-            self.pre_merge_coverage = Some(snapshot);
+            lean.pre_merge_coverage = Some(snapshot);
         }
 
         // Whether one of our validators proposes this slot. Drives the store's
-        // interval-0 attestation acceptance.
+        // interval-0 attestation acceptance. `get_our_proposer` answers `None`
+        // on a beacon follower, which carries no validator keys.
         let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
             .then(|| self.get_our_proposer(slot))
             .flatten()
@@ -367,11 +585,92 @@ impl BlockChainServer {
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal.
         // Snapshot/diff around the call so attestation-driven head or
         // finalization moves surface as chain events.
+        //
+        // Which call that is depends on the chain. Lean's `store::on_tick`
+        // carries its own fork-choice work; beacon's clock advance does not, so
+        // the head recompute follows it here. It is still needed for a slot in
+        // which nothing arrived, the block path having one of its own (see
+        // [`Self::recompute_beacon_head`], which both share).
         let pre_tick = ChainEventSnapshot::capture(&self.store);
-        store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+        match self.store.chain() {
+            Chain::Lean => store::on_tick(&mut self.store, timestamp_ms, is_proposer),
+            Chain::Beacon => {
+                let config = self.store.config();
+                // Loops `on_tick_per_slot` over every boundary crossed since the
+                // last call, so a tick delayed by a long import still resets
+                // proposer boost and pulls up unrealized checkpoints for each
+                // slot it skipped, not just the latest one.
+                fork_choice::on_tick(&mut self.store, timestamp_ms / 1000, &config);
+                self.recompute_beacon_head();
+            }
+        }
         // `slot` above is already derived from `timestamp_ms` (the wall clock
         // at tick time), so it doubles as the wall-clock slot for the gate.
         pre_tick.diff_and_emit(&self.store, &self.events, slot);
+
+        // Per-interval duties for this tick. Lean-only, so this is where a
+        // beacon follower's tick ends: it has no validator duties (see
+        // [`ChainDuties::Beacon`]), and everything a tick owes it happened
+        // above.
+        self.run_interval_duties(interval, slot, is_aggregator, ctx)
+            .await;
+
+        // Update safe target slot metric (updated by store.on_tick at interval 3).
+        // Lean-only: a beacon store keeps no safe target.
+        if self.store.chain() == Chain::Lean {
+            metrics::update_safe_target_slot(self.store.safe_target_slot());
+        }
+
+        // Head may change when attestations are promoted at intervals 0/4.
+        // Beacon moves the justified and finalized pair without importing
+        // anything, when the clock advance above crosses an epoch boundary and
+        // pulls up unrealized checkpoints.
+        self.refresh_chain_metrics();
+    }
+
+    /// Push the head, justified and finalized slots to their gauges.
+    ///
+    /// The two places a tick or an import can move any of the three
+    /// ([`Self::on_tick`] and [`Self::process_block`]) refresh all three, so
+    /// they read the chain the same way: head through [`Self::head_slot`],
+    /// which is the only spelling of that dispatch.
+    fn refresh_chain_metrics(&self) {
+        metrics::update_head_slot(self.head_slot());
+        let latest_justified_slot = self
+            .store
+            .latest_justified()
+            .expect("Error: Latest justified checkpoint does not exist")
+            .slot;
+        metrics::update_latest_justified_slot(latest_justified_slot);
+        let latest_finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("Error: Latest finalized checkpoint does not exist")
+            .slot;
+        metrics::update_latest_finalized_slot(latest_finalized_slot);
+    }
+
+    /// Run this tick's validator duties, the interval grid `on_tick` sits on.
+    ///
+    /// Lean-only, and it says so itself rather than making the caller ask:
+    /// [`ChainDuties::Beacon`] carries no validator state for any of these to
+    /// read, and a beacon follower ticks once per slot, which lands it on
+    /// [`SlotInterval::BlockPublication`] where there is nothing to do anyway.
+    ///
+    /// `is_aggregator` is passed in rather than read here so every duty in the
+    /// tick acts on the one value the tick started with, even if the admin API
+    /// toggles the role underneath it.
+    async fn run_interval_duties(
+        &mut self,
+        interval: SlotInterval,
+        slot: u64,
+        is_aggregator: bool,
+        ctx: &Context<Self>,
+    ) {
+        if !matches!(self.duties, ChainDuties::Lean(_)) {
+            return;
+        }
+        let time_config = self.store.config().time_grid();
 
         // Per-interval duties for this tick. Intervals 0 (block publish) and 3
         // (safe-target update) are driven inside `store::on_tick` above, so they
@@ -401,14 +700,14 @@ impl BlockChainServer {
                 if slot > 0 {
                     coverage::emit_post_block_coverage(
                         &self.store,
-                        self.pre_merge_coverage.as_ref(),
-                        self.attestation_committee_count,
+                        self.lean().pre_merge_coverage.as_ref(),
+                        self.lean().attestation_committee_count,
                         slot - 1,
                     );
                 }
                 if self.sync_status.duties_allowed() {
                     self.produce_attestations(slot, is_aggregator);
-                } else if !self.key_manager.validator_ids().is_empty() {
+                } else if !self.lean().key_manager.validator_ids().is_empty() {
                     info!(%slot, "Skipping attestations while syncing");
                 }
 
@@ -432,6 +731,7 @@ impl BlockChainServer {
                     // session (running or finished) — it IS the slot's session,
                     // so don't start a second one.
                     let already_started = self
+                        .lean()
                         .current_aggregation
                         .as_ref()
                         .is_some_and(|session| session.session_id == slot);
@@ -469,13 +769,59 @@ impl BlockChainServer {
             }
         }
 
-        // Update safe target slot metric (updated by store.on_tick at interval 3)
-        metrics::update_safe_target_slot(self.store.safe_target_slot());
-        // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
-        metrics::update_head_slot(self.store.head_slot());
+        // Advance XMSS keys for next slot so the signing paths don't have to.
+        // Here rather than back in `on_tick` because it is a validator duty
+        // like the rest of this function: a beacon follower holds no keys, and
+        // the early return above is what keeps it from asking for them.
+        self.lean_mut()
+            .key_manager
+            .advance_keys_to((slot + 1) as u32);
+    }
 
-        // Advance XMSS keys for next slot so the signing paths don't have to
-        self.key_manager.advance_keys_to((slot + 1) as u32);
+    /// This chain's head slot: `Store::head_slot` on lean,
+    /// `Store::beacon_head` on beacon, which decode different tables. Zero on
+    /// a beacon store with no head recorded yet.
+    fn head_slot(&self) -> u64 {
+        match self.store.chain() {
+            Chain::Lean => self.store.head_slot(),
+            Chain::Beacon => self.store.beacon_head().map_or(0, |(slot, _)| slot),
+        }
+    }
+
+    /// Whether this node acts as a committee aggregator, read fresh so a
+    /// runtime toggle takes effect without a restart. Always false on a beacon
+    /// follower: the role is a lean validator duty.
+    fn is_aggregator(&self) -> bool {
+        matches!(&self.duties, ChainDuties::Lean(lean) if lean.aggregator.is_enabled())
+    }
+
+    /// This node's validator-duty state, for a caller that has already
+    /// established it is running the lean chain.
+    ///
+    /// Panics on a beacon follower, through the same reasoning as
+    /// `state_transition`'s `lean_boundary` pair: the two spawn constructors
+    /// assert the store's chain tag against the duties they build, so a
+    /// beacon follower reaching a validator duty is a dispatch bug above this
+    /// method. `#[track_caller]` so the panic names the duty that asked
+    /// rather than this accessor. A lean-only *message* is dropped at its
+    /// handler instead, which is the boundary where that is a real outcome;
+    /// see [`ChainDuties`].
+    #[track_caller]
+    fn lean(&self) -> &LeanDuties {
+        match &self.duties {
+            ChainDuties::Lean(lean) => lean,
+            ChainDuties::Beacon => beacon_has_no_duties(),
+        }
+    }
+
+    /// [`Self::lean`] for a duty that mutates its own state (the key manager,
+    /// the aggregation session). Same panic, same reason.
+    #[track_caller]
+    fn lean_mut(&mut self) -> &mut LeanDuties {
+        match &mut self.duties {
+            ChainDuties::Lean(lean) => lean,
+            ChainDuties::Beacon => beacon_has_no_duties(),
+        }
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -487,9 +833,9 @@ impl BlockChainServer {
     ///
     /// Both entry points land here — the interval-2 tick and the early
     /// 2/3-threshold trigger — so the proposer cap applies to whichever one
-    /// starts the slot's session.
+    /// starts the slot's session. Lean-only.
     async fn start_aggregation_session(&mut self, slot: u64, ctx: &Context<Self>) {
-        if let Some(prior) = self.current_aggregation.take() {
+        if let Some(prior) = self.lean_mut().current_aggregation.take() {
             prior.cancel.cancel();
             if !prior.worker.is_finished() {
                 warn!(
@@ -508,7 +854,8 @@ impl BlockChainServer {
             }
         }
 
-        coverage::emit_agg_start_new_coverage(&self.store, self.attestation_committee_count);
+        let attestation_committee_count = self.lean().attestation_committee_count;
+        coverage::emit_agg_start_new_coverage(&self.store, attestation_committee_count);
 
         // Limit ourselves to a single round of aggregation if we propose next round.
         // This buys us time to build the block before the next slot's interval-0 tick.
@@ -572,7 +919,7 @@ impl BlockChainServer {
             AggregationDeadline { session_id },
         );
 
-        self.current_aggregation = Some(AggregationSession {
+        self.lean_mut().current_aggregation = Some(AggregationSession {
             session_id,
             early,
             cancel,
@@ -591,8 +938,10 @@ impl BlockChainServer {
     /// yields no jobs (possible only when no signer's pubkey resolves, i.e. a
     /// corrupted validator registry), no session is installed and the check
     /// retries on later inserts — each retry is a no-op session attempt.
+    /// Lean-only.
     async fn maybe_start_early_aggregation(&mut self, ctx: &Context<Self>) {
-        if !self.aggregator.is_enabled() {
+        let lean = self.lean();
+        if !lean.aggregator.is_enabled() {
             return;
         }
         // Only fire inside the early-aggregation window
@@ -611,7 +960,7 @@ impl BlockChainServer {
             return;
         }
         let slot = ms_since_genesis / time_config.milliseconds_per_slot;
-        if self
+        if lean
             .current_aggregation
             .as_ref()
             .is_some_and(|session| session.session_id == slot)
@@ -628,12 +977,12 @@ impl BlockChainServer {
         // committees, subnet `s` holds `N / C` validators, plus one more when
         // `s < N % C`. (0 only when there are no such validators, which never
         // triggers.)
-        let min_group_sigs = if self.attestation_committee_count == 0 {
+        let min_group_sigs = if lean.attestation_committee_count == 0 {
             0
         } else {
             let validator_count = self.store.head_state().validators.len() as u64;
-            let committee_count = self.attestation_committee_count;
-            let expected_votes: u64 = self
+            let committee_count = lean.attestation_committee_count;
+            let expected_votes: u64 = lean
                 .subscribed_subnets
                 .iter()
                 .filter(|&&subnet| subnet < committee_count)
@@ -656,27 +1005,40 @@ impl BlockChainServer {
         self.start_aggregation_session(slot, ctx).await;
     }
 
-    /// Returns the validator ID if any of our validators is the proposer for this slot.
+    /// Returns the validator ID if any of our validators is the proposer for
+    /// this slot.
+    ///
+    /// Answers `None` on a beacon follower rather than panicking through
+    /// [`Self::lean`], and that is load-bearing: `on_tick` is chain-generic
+    /// and asks this on every [`SlotInterval::BlockPublication`], which is the
+    /// one interval a beacon follower's once-per-slot tick lands on.
     fn get_our_proposer(&self, slot: u64) -> Option<u64> {
+        let ChainDuties::Lean(lean) = &self.duties else {
+            return None;
+        };
         let head_state = self.store.head_state();
         let num_validators = head_state.validators.len() as u64;
 
-        self.key_manager
+        lean.key_manager
             .validator_ids()
             .into_iter()
             .find(|&vid| is_proposer(vid, slot, num_validators))
     }
 
+    /// Lean-only.
     fn produce_attestations(&mut self, slot: u64, is_aggregator: bool) {
+        let validator_ids = self.lean().key_manager.validator_ids();
+
         let _timing = metrics::time_attestations_production();
 
         // Produce attestation data once for all validators
         let attestation_data = store::produce_attestation_data(&self.store, slot);
 
         // For each registered validator, produce and publish attestation
-        for validator_id in self.key_manager.validator_ids() {
+        for validator_id in validator_ids {
             // Sign the attestation
             let Ok(signature) = self
+                .lean_mut()
                 .key_manager
                 .sign_attestation(validator_id, &attestation_data)
                 .inspect_err(
@@ -727,12 +1089,17 @@ impl BlockChainServer {
     /// common case under load) we publish at once. The whole proposal is
     /// self-contained here, so it never depends on the interval-0 tick — which
     /// `handle_tick` skips whenever this build overruns its interval.
+    ///
+    /// Lean-only: a beacon follower has no validator duties, so it never
+    /// proposes.
     async fn propose_block(&mut self, slot: u64, validator_id: u64) {
         info!(%slot, %validator_id, "We are the proposer for this slot");
 
         let time_config = self.store.config().time_grid();
         let slot_start_ms = time_config.genesis_time_ms()
             + SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config);
+
+        let proposer_config = self.lean().proposer_config;
 
         // Build the block. `produce_block_with_signatures` advances the store to
         // this slot's interval 0 (accepting attestations) before building — one
@@ -755,7 +1122,7 @@ impl BlockChainServer {
             &mut self.store,
             slot,
             validator_id,
-            self.proposer_config,
+            proposer_config,
         )
         .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to build block"));
 
@@ -775,7 +1142,7 @@ impl BlockChainServer {
 
         coverage::emit_proposal_coverage(
             &self.store,
-            self.attestation_committee_count,
+            self.lean().attestation_committee_count,
             block.body.attestations.iter(),
         );
 
@@ -785,7 +1152,7 @@ impl BlockChainServer {
         let head_state = self.store.head_state();
         let Ok(signed_block) = block_builder::seal_block(
             &head_state,
-            &mut self.key_manager,
+            &mut self.lean_mut().key_manager,
             block,
             single_message_aggregates,
         )
@@ -815,13 +1182,15 @@ impl BlockChainServer {
 
     /// Import a freshly built block locally, then publish it to gossip. On
     /// import failure, logs and counts it, and returns without publishing.
+    /// Lean-only: the block this builds and imports is always a lean
+    /// [`SignedBlock`].
     fn process_and_publish_block(
         &mut self,
         slot: u64,
         validator_id: u64,
         signed_block: SignedBlock,
     ) {
-        if let Err(err) = self.process_block(signed_block.clone()) {
+        if let Err(err) = self.process_block(SignedBeaconBlock::Lean(signed_block.clone())) {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
             return;
@@ -838,19 +1207,116 @@ impl BlockChainServer {
         info!(%slot, %validator_id, "Published block");
     }
 
-    /// Run block import, emit the resulting chain events, and refresh metrics.
-    fn process_block(&mut self, signed_block: SignedBlock) -> Result<(), StoreError> {
-        // `on_block` returns Ok early for an already-imported block, so gate
-        // the `block` event on whether this root is actually new.
-        let slot = signed_block.message.slot;
-        let block_root = signed_block.message.hash_tree_root();
+    /// Run block import, emit the resulting chain events, and refresh
+    /// metrics. Chain-generic: `signed_block`'s own variant selects which
+    /// chain's import call runs.
+    fn process_block(&mut self, signed_block: SignedBeaconBlock) -> Result<(), ImportError> {
+        // Gate the `block` event on whether this root is actually new, so a
+        // re-delivery does not announce the same block twice.
+        //
+        // Only lean's `store::on_block` returns early for an already-imported
+        // block. Beacon's `fork_choice::on_block` does not: it goes from
+        // cloning the parent state straight into `state_transition`, so a
+        // known root would pay the whole import again. `process_or_pend_block`
+        // is what keeps that from happening, by skipping a beacon block whose
+        // post-state the store already holds before ever reaching here.
+        let slot = signed_block.slot();
+        let block_root = signed_block.message_hash_tree_root();
         let is_new = !self
             .store
             .has_state(&block_root)
             .expect("DB read should succeed");
         let pre_import = ChainEventSnapshot::capture(&self.store);
 
-        store::on_block(&mut self.store, signed_block)?;
+        match signed_block {
+            SignedBeaconBlock::Lean(lean_block) => {
+                store::on_block(&mut self.store, lean_block)?;
+            }
+            // Already imported: skip the whole transition rather than redo
+            // it. Lean's `store::on_block` makes exactly this `has_state`
+            // check itself and returns `Ok` early; beacon's `on_block` has no
+            // such guard, so without this a re-delivered block pays a full
+            // state transition (two whole-state merkleizations) and a state
+            // write to reach the same store it already produced. Range sync
+            // and gossip overlap at the tip make that the common case, not a
+            // rare one.
+            _ if !is_new => {}
+            beacon_block => {
+                let config = self.store.config();
+                // Extracted before `beacon_block` moves into `fork_choice::on_block`
+                // below, which takes ownership of it.
+                let (attestations, slashings) = fork_choice::block_operations(&beacon_block);
+                fork_choice::on_block(
+                    &mut self.store,
+                    beacon_block,
+                    &config,
+                    &fork_choice::DataAvailability::NotRequired,
+                )?;
+
+                // The block is already in the store whatever the rest of this
+                // arm does with its body, so nothing below may turn into an
+                // `Err` that fails the import: that would make this function's
+                // caller (`run_import_cascade`) stop the pending-block cascade,
+                // leaving every held descendant stuck behind a block that in
+                // fact did import.
+                //
+                // `get_state(&block_root)` is a direct hit rather than a
+                // `fork_choice::block_state`-style lookup: `on_block` just
+                // wrote this block's post-state under `block_root`, and the
+                // committee source for a block's own attestations is that
+                // post-state, not each attestation's target checkpoint state.
+                // See `fork_choice::on_block_attestation`'s documentation for
+                // why the two name the same committees, and for what asking
+                // the checkpoint instead costs.
+                let block_state = self
+                    .store
+                    .get_state(&block_root)
+                    .expect("DB read should succeed");
+                match block_state {
+                    Some(block_state) => {
+                        // One `Table::LiveChain` scan for the whole body, not
+                        // one per attestation: the table carries a row per
+                        // block this node imported and is never pruned on
+                        // beacon, so the scan is the expensive part and every
+                        // attestation in the block asks the same question of
+                        // it.
+                        let index = self.store.block_index();
+                        for attestation in &attestations {
+                            let _ = fork_choice::on_block_attestation(
+                                &mut self.store,
+                                attestation,
+                                &block_state,
+                                &config,
+                                &index,
+                            )
+                            .inspect_err(|err| {
+                                trace!(%slot, ?err, "Ignoring an unusable attestation from a block")
+                            });
+                        }
+                    }
+                    // A checkpoint-synced follower hits this legitimately for
+                    // the first epochs after its anchor: an attestation may
+                    // name a target up to `SLOTS_PER_EPOCH` slots back, and a
+                    // target below the anchor was never fetched, so
+                    // `validate_on_attestation`'s "target.root in store.blocks"
+                    // check rejects it. Expected, not a defect, so this warns
+                    // once and skips the body rather than failing the import.
+                    None => {
+                        warn!(
+                            %slot,
+                            block_root = %ShortRoot(&block_root.0),
+                            "Skipping a block's attestations: its own post-state is unreachable"
+                        );
+                    }
+                }
+                for slashing in &slashings {
+                    let _ = fork_choice::on_attester_slashing(&mut self.store, slashing)
+                        .inspect_err(
+                            |err| trace!(%slot, ?err, "Ignoring an unusable slashing from a block"),
+                        );
+                }
+            }
+        }
 
         // `block` goes out first so subscribers see it ahead of the
         // justified/head/finalized moves its import triggers.
@@ -861,26 +1327,15 @@ impl BlockChainServer {
             });
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
-        // compute the wall-clock slot fresh for the head-recency gate.
-        let time_config = self.store.config().time_grid();
-        let wall_clock_slot = unix_now_ms().saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot;
-        pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
+        // read the wall-clock slot fresh for the head-recency gate.
+        pre_import.diff_and_emit(&self.store, &self.events, self.wall_clock_slot());
 
-        metrics::update_head_slot(self.store.head_slot());
-        let latest_justified_slot = self
-            .store
-            .latest_justified()
-            .expect("Error: Latest justified checkpoint does not exist")
-            .slot;
-        metrics::update_latest_justified_slot(latest_justified_slot);
-        let latest_finalized_slot = self
-            .store
-            .latest_finalized()
-            .expect("Error: Latest finalized checkpoint does not exist")
-            .slot;
-        metrics::update_latest_finalized_slot(latest_finalized_slot);
-        metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
+        self.refresh_chain_metrics();
+
+        // Lean-only: a beacon follower tracks no validator keys of its own.
+        if let ChainDuties::Lean(lean) = &self.duties {
+            metrics::update_validators_count(lean.key_manager.validator_ids().len() as u64);
+        }
 
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
@@ -888,14 +1343,37 @@ impl BlockChainServer {
         Ok(())
     }
 
-    /// Process a newly received block.
-    fn on_block(&mut self, signed_block: SignedBlock) {
+    /// Process a newly received block, whichever chain it belongs to.
+    ///
+    /// For beacon this is also where fork choice is re-run and the two clock
+    /// gauges are republished, because an import records no head of its own
+    /// (see [`Self::recompute_beacon_head`]) and the tick that used to be the
+    /// sole writer of both is starved by the very imports whose progress they
+    /// are meant to report. Once per arrival rather than once per block in the
+    /// cascade, matching what `Handler<NewBlock>` already does with the store
+    /// clock: a cascade's blocks are all processed at one instant.
+    fn on_block(&mut self, signed_block: SignedBeaconBlock) {
         let mut queue = VecDeque::new();
         queue.push_back(signed_block);
+        self.run_import_cascade(queue);
 
-        // A new block can trigger a cascade of pending blocks becoming processable.
-        // Here we process blocks iteratively, to avoid recursive calls that could
-        // cause a stack overflow.
+        if self.store.chain() == Chain::Beacon {
+            // `lean_current_slot` had the same single writer the head did, so
+            // both gauges went stale together on a catching-up follower and
+            // `lean_current_slot - lean_head_slot` was a difference between
+            // two stale numbers rather than the head lag every panel and
+            // alert reads it as. Published from the wall clock rather than
+            // the store clock, which only `on_tick` and an early arrival
+            // advance.
+            metrics::update_current_slot(self.wall_clock_slot());
+            self.recompute_beacon_head();
+        }
+    }
+
+    /// Drain `queue`, importing each block and enqueuing any pending children
+    /// its import unblocks, iteratively rather than recursively so a long
+    /// chain of arrivals cannot overflow the stack.
+    fn run_import_cascade(&mut self, mut queue: VecDeque<SignedBeaconBlock>) {
         while let Some(block) = queue.pop_front() {
             self.process_or_pend_block(block, &mut queue);
         }
@@ -903,9 +1381,109 @@ impl BlockChainServer {
         // Prune old states and blocks AFTER the entire cascade completes.
         // Running this mid-cascade would delete states that pending children
         // still need, causing re-processing loops when fallback pruning is active.
-        self.store
-            .prune_old_data()
-            .expect("DB pruning should succeed");
+        //
+        // Lean-only: `prune_old_data` prunes `BlockProof`, a table beacon
+        // never writes, and deciding whether there is anything to prune costs
+        // a whole-block decode (`Store::get_block_header`) on a beacon
+        // directory.
+        if self.store.chain() == Chain::Lean {
+            self.store
+                .prune_old_data()
+                .expect("DB pruning should succeed");
+        }
+    }
+
+    /// Re-deliver `block` to this actor once its own slot has started.
+    ///
+    /// Beacon's `on_block` requires a block's slot to already be in the past;
+    /// the specification says an early block's consideration "must be delayed
+    /// until they are in the past", not that the block should be dropped. A
+    /// single dropped early block wedged a live follower permanently on
+    /// 2026-09-03: every later block became an orphan of a root the node
+    /// would never obtain.
+    ///
+    /// The block rides in the message rather than through the DB, so the hold
+    /// costs one timer and leaves nothing behind to reconcile if this process
+    /// stops before the slot arrives. [`MAXIMUM_GOSSIP_CLOCK_DISPARITY`] is
+    /// what bounds how many such holds one peer can buy, and how long each
+    /// one lasts.
+    ///
+    /// Re-delivery goes through `NewBlock`, the same message the p2p layer
+    /// uses, tagged [`BlockSource::Deferred`] so that the arrival bookkeeping
+    /// its handler does for a genuine arrival is skipped for a block that
+    /// already arrived once.
+    ///
+    /// Beacon-only: lean absorbs an early block with a margin instead of a
+    /// wait, since `store::on_block` admits any block up to a whole slot
+    /// ahead. Beacon cannot copy the margin, as its own `on_block` carries
+    /// the specification's assertion and the fork-choice fixture suite tests
+    /// it.
+    fn defer_early_block(&self, block: SignedBeaconBlock, ctx: &Context<Self>) {
+        let delay = Duration::from_millis(self.ms_until_slot_start(block.slot()));
+        let redelivery = NewBlock {
+            block,
+            source: BlockSource::Deferred,
+        };
+        send_after(delay, ctx.clone(), redelivery);
+    }
+
+    /// Milliseconds from now until `slot` starts on the wall clock, zero once
+    /// it has.
+    ///
+    /// Goes through the `time_grid()` [`ChainConfig`], the same grid the tick
+    /// cadence and `propose_block`'s own slot-start read use, so "the slot has
+    /// started" means the same thing to a held block as it does to the tick
+    /// that will import it.
+    fn ms_until_slot_start(&self, slot: u64) -> u64 {
+        let time_config = self.store.config().time_grid();
+        let slot_start_ms = time_config
+            .genesis_time_ms()
+            .saturating_add(SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config));
+        slot_start_ms.saturating_sub(unix_now_ms())
+    }
+
+    /// The slot the wall clock is in right now.
+    ///
+    /// Distinct from the store clock, which advances only when something
+    /// advances it (`on_tick`, or an arrival whose slot has already started),
+    /// and from `on_tick`'s own `slot`, which is derived from the timestamp
+    /// that tick was scheduled for. The block path has neither, so anything
+    /// there that needs "now" reads it here.
+    ///
+    /// One grid for both chains: `slot_duration_ms` is authoritative on
+    /// either, since `Config::lean` takes it from the network config file
+    /// rather than leaving it a placeholder beside a compile-time constant.
+    fn wall_clock_slot(&self) -> u64 {
+        let time_config = self.store.config().time_grid();
+        unix_now_ms().saturating_sub(time_config.genesis_time_ms())
+            / time_config.milliseconds_per_slot
+    }
+
+    /// Re-run beacon fork choice and republish the head gauge.
+    ///
+    /// `fork_choice::on_block` does not compute a head, and `Store::beacon_head`
+    /// only reads back whatever the last [`fork_choice::get_head`] recorded, so
+    /// without this an import moves no head at all: it just adds a block and a
+    /// post-state. Until the block path called this too, [`Self::on_tick`] was
+    /// the only caller, and it is one message per slot in the same mailbox as
+    /// every arriving block. A follower catching up imports back-to-back and
+    /// never drains that mailbox, so the tick did not run, the head stayed
+    /// pinned at the checkpoint-sync anchor, and `lean_head_slot` sat flat for
+    /// the entire catch-up even while imports were landing every few seconds.
+    /// That is what "the head is not advancing" looked like on the dashboard.
+    ///
+    /// A failure here means fork choice could not find a head (for instance
+    /// every known block is unjustifiable), which is a condition to log and
+    /// wait out, not a reason to crash a follower.
+    fn recompute_beacon_head(&mut self) {
+        let config = self.store.config();
+        if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
+            warn!(%err, "Failed to compute beacon head");
+            return;
+        }
+        if let Some((head_slot, _)) = self.store.beacon_head() {
+            metrics::update_head_slot(head_slot);
+        }
     }
 
     /// Try to process a single block. If its parent state is missing, store it
@@ -913,13 +1491,13 @@ impl BlockChainServer {
     /// the caller to process next (iteratively, avoiding deep recursion).
     fn process_or_pend_block(
         &mut self,
-        signed_block: SignedBlock,
-        queue: &mut VecDeque<SignedBlock>,
+        signed_block: SignedBeaconBlock,
+        queue: &mut VecDeque<SignedBeaconBlock>,
     ) {
-        let slot = signed_block.message.slot;
-        let block_root = signed_block.message.hash_tree_root();
-        let parent_root = signed_block.message.parent_root;
-        let proposer = signed_block.message.proposer_index;
+        let slot = signed_block.slot();
+        let block_root = signed_block.message_hash_tree_root();
+        let parent_root = signed_block.parent_root();
+        let proposer = signed_block.proposer_index();
 
         // Never process blocks at or below the finalized slot — they are
         // already part of the canonical chain and cannot affect fork choice.
@@ -935,25 +1513,53 @@ impl BlockChainServer {
             return;
         }
 
-        // Reject blocks whose slot has not started locally, mirroring the
-        // attestation time check in `validate_attestation_data`. The disparity
-        // bound is in intervals, not slots: a whole-slot margin would let an
-        // adversary pre-publish next-slot blocks ahead of any honest proposer.
-        // Catching this early also avoids persisting bogus future blocks to
-        // RocksDB and triggering BlocksByRoot fan-out for fabricated parents.
-        let block_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
-        let store_time = self.store.intervals_since_genesis();
-        if block_start_interval > store_time + GOSSIP_DISPARITY_INTERVALS {
-            warn!(
+        // Beacon: a block whose post-state is already here needs no work.
+        // `fork_choice::on_block` does not short-circuit on a known root: it
+        // goes straight from cloning the parent state to `state_transition`,
+        // so a re-delivery pays the entire import a second time. On mainnet
+        // 2026-09-08 that was 37 of 116 imports, a third of the actor's import
+        // budget, spent recomputing post-states the store already held.
+        // Children are still collected: this root did import, so anything
+        // pending on it is ready whether or not this delivery is the one that
+        // imported it. Beacon-only, because lean's `store::on_block` has its
+        // own already-imported early return.
+        if self.store.chain() == Chain::Beacon
+            && self
+                .store
+                .has_state(&block_root)
+                .expect("DB read should succeed")
+        {
+            debug!(
                 %slot,
-                store_time,
-                proposer,
                 block_root = %ShortRoot(&block_root.0),
-                parent_root = %ShortRoot(&parent_root.0),
-                "Rejecting block: slot is too far in future"
+                "Skipping a beacon block already in the store"
             );
-            self.discard_pending_subtree(block_root);
+            self.collect_pending_children(block_root, queue);
             return;
+        }
+
+        // Lean rejects a block for a slot that has not started outright,
+        // mirroring the attestation time check in `validate_attestation_data`
+        // with the same whole-slot-margin reasoning: a wider bound would let
+        // an adversary pre-publish next-slot blocks ahead of any honest
+        // proposer. Beacon holds one instead, and does it at arrival rather
+        // than here (see `Handler<NewBlock>`), so nothing reaching this point
+        // on that chain is still early.
+        if self.store.chain() == Chain::Lean {
+            let block_start_interval = slot.saturating_mul(INTERVALS_PER_SLOT);
+            let store_time = self.store.intervals_since_genesis();
+            if block_start_interval > store_time + GOSSIP_DISPARITY_INTERVALS {
+                warn!(
+                    %slot,
+                    store_time,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    "Rejecting block: slot is too far in future"
+                );
+                self.discard_pending_subtree(block_root);
+                return;
+            }
         }
 
         // Check if parent state exists before attempting to process
@@ -988,15 +1594,13 @@ impl BlockChainServer {
             // Walk up through DB: if missing_root is already stored from a previous
             // session, the actual missing block is further up the chain.
             // Note: this loop always terminates — blocks reference parents by hash,
-            // so a cycle would require a hash collision.
-            while let Some(header) = self
-                .store
-                .get_block_header(&missing_root)
-                .expect("DB read should succeed")
-            {
+            // so a cycle would require a hash collision. `block_entry` reads just
+            // the two fields this walk needs and decodes per chain, unlike
+            // `get_block_header`, which is lean-only.
+            while let Some((_, ancestor_parent_root)) = self.store.block_entry(&missing_root) {
                 if self
                     .store
-                    .has_state(&header.parent_root)
+                    .has_state(&ancestor_parent_root)
                     .expect("DB read should succeed")
                 {
                     // Parent state available — enqueue for processing, cascade
@@ -1006,20 +1610,18 @@ impl BlockChainServer {
                         .get_signed_block(&missing_root)
                         .expect("header and parent state exist, so the full signed block must too")
                         .unwrap();
-                    // This cascade only ever runs against a lean store, so a
-                    // beacon block here would mean the chain tag lied.
-                    queue.push_back(fetched.expect_lean());
+                    queue.push_back(fetched);
                     return;
                 }
                 // Block exists but parent doesn't have state — register as pending
                 // so the cascade works when the true ancestor arrives
                 self.pending_blocks
-                    .entry(header.parent_root)
+                    .entry(ancestor_parent_root)
                     .or_default()
                     .insert(missing_root);
                 self.pending_block_parents
-                    .insert(missing_root, header.parent_root);
-                missing_root = header.parent_root;
+                    .insert(missing_root, ancestor_parent_root);
+                missing_root = ancestor_parent_root;
             }
 
             // Request the actual missing block from network
@@ -1030,7 +1632,19 @@ impl BlockChainServer {
         // Parent exists, proceed with processing. Clone the block so we
         // can run post-import reaggregation against its merged proof —
         // `process_block` consumes the original for the storage layer.
-        let block_for_reaggregate = signed_block.clone();
+        //
+        // Only when that pass will actually run: a beacon block carries no
+        // lean attestations to reaggregate, and a backfilling node discards
+        // the result rather than spamming gossip with it, so cloning either
+        // one would be a whole block body copied and dropped unread. Beacon
+        // bodies carry an execution payload, which makes that the largest
+        // single allocation on the import path.
+        let block_for_reaggregate = match &signed_block {
+            SignedBeaconBlock::Lean(lean_block) if self.sync_status.duties_allowed() => {
+                Some(lean_block.clone())
+            }
+            _ => None,
+        };
         match self.process_block(signed_block) {
             Ok(()) => {
                 info!(
@@ -1042,12 +1656,12 @@ impl BlockChainServer {
                 );
 
                 // Recover per-attestation single-message aggregates from the
-                // block's merged multi-message aggregate and fold them into the
-                // local pool. Only
-                // run when the chain is in sync — backfilling nodes must
-                // not spam gossip with rederived aggregates.
-                if self.sync_status.duties_allowed() {
-                    self.run_reaggregate_from_block(&block_for_reaggregate);
+                // block's merged multi-message aggregate and fold them into
+                // the local pool. `Some` only for a lean block imported while
+                // in sync, which is what selects this pass; see the clone
+                // above.
+                if let Some(ref lean_block) = block_for_reaggregate {
+                    self.run_reaggregate_from_block(lean_block);
                 }
 
                 // Enqueue any pending blocks that were waiting for this parent
@@ -1067,14 +1681,15 @@ impl BlockChainServer {
     }
 
     /// Run the post-import reaggregation pass and publish the resulting
-    /// aggregates when this node is in the aggregator role.
+    /// aggregates when this node is in the aggregator role. Lean-only: the
+    /// caller only invokes this for a [`SignedBeaconBlock::Lean`] import.
     fn run_reaggregate_from_block(&mut self, signed_block: &SignedBlock) {
         let aggregates = reaggregate::reaggregate_from_block(&mut self.store, signed_block);
         if aggregates.is_empty() {
             return;
         }
         let count = aggregates.len();
-        let is_aggregator = self.aggregator.is_enabled();
+        let is_aggregator = self.lean().aggregator.is_enabled();
         info!(
             count,
             is_aggregator, "Reaggregated block-borne attestations"
@@ -1092,8 +1707,13 @@ impl BlockChainServer {
         }
     }
 
+    /// Ask the network for a block this node is missing an ancestor of.
+    ///
+    /// Chain-agnostic, and deliberately so: `fetch_block` carries a root and
+    /// nothing else, and the p2p layer picks the protocol from the wire it
+    /// already speaks, so neither this method nor the actor protocol grows a
+    /// chain argument. Deduplication is the p2p layer's too, keyed on the root.
     fn request_missing_block(&mut self, block_root: H256) {
-        // Send request to P2P layer (deduplication handled by P2P module)
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
                 .fetch_block(block_root)
@@ -1106,7 +1726,11 @@ impl BlockChainServer {
 
     /// Move pending children of `parent_root` into the work queue for iterative
     /// processing. This replaces the old recursive `process_pending_children`.
-    fn collect_pending_children(&mut self, parent_root: H256, queue: &mut VecDeque<SignedBlock>) {
+    fn collect_pending_children(
+        &mut self,
+        parent_root: H256,
+        queue: &mut VecDeque<SignedBeaconBlock>,
+    ) {
         let Some(child_roots) = self.pending_blocks.remove(&parent_root) else {
             return;
         };
@@ -1126,14 +1750,11 @@ impl BlockChainServer {
                 );
                 continue;
             };
-            // This cascade only ever runs against a lean store, so a beacon
-            // block here would mean the chain tag lied.
-            let child_block = fetched.expect_lean();
 
-            let slot = child_block.message.slot;
+            let slot = fetched.slot();
             trace!(%parent_root, %slot, "Processing pending child block");
 
-            queue.push_back(child_block);
+            queue.push_back(fetched);
         }
     }
 
@@ -1151,11 +1772,12 @@ impl BlockChainServer {
         }
     }
 
+    /// Lean-only.
     fn on_gossip_attestation(&mut self, attestation: &SignedAttestation) {
         // Read fresh here too: a gossip event can arrive between ticks, and
         // if the admin API just toggled, the first gossip after the toggle
         // should already use the new value.
-        let is_aggregator = self.aggregator.is_enabled();
+        let is_aggregator = self.lean().aggregator.is_enabled();
         let accepted = store::on_gossip_attestation(&mut self.store, attestation, is_aggregator)
             .inspect_err(|err| warn!(%err, "Failed to process gossiped attestation"))
             .is_ok();
@@ -1190,8 +1812,15 @@ impl BlockChainServer {
         }
     }
 
+    /// Refresh the sync-status tracker and its two outputs (the
+    /// `lean_node_sync_status` metric and [`SyncStatusController`]).
+    ///
+    /// Reads the head through [`Self::head_slot`], which is where the
+    /// per-chain part of that lives (lean's `Store::head_slot` and beacon's
+    /// `Store::beacon_head` decode different tables); everything past that
+    /// point is chain-agnostic.
     fn update_sync_status(&mut self, current_slot: u64) {
-        let head_slot = self.store.head_slot();
+        let head_slot = self.head_slot();
         let max_seen_slot = self
             .store
             .max_live_chain_slot()
@@ -1202,6 +1831,19 @@ impl BlockChainServer {
             .update(current_slot, head_slot, max_seen_slot);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
+    }
+
+    /// Milliseconds until this actor's next tick, dispatched by chain: lean's
+    /// interval grid via [`ms_until_next_interval`], beacon's once-per-slot
+    /// cadence via [`ms_until_next_beacon_slot`].
+    fn ms_until_next_tick(&self, now_ms: u64) -> u64 {
+        let config = self.store.config();
+        match &self.duties {
+            ChainDuties::Lean(_) => ms_until_next_interval(now_ms, &config.time_grid()),
+            ChainDuties::Beacon => {
+                ms_until_next_beacon_slot(now_ms, config.genesis_time_ms(), config.slot_duration_ms)
+            }
+        }
     }
 
     /// Whether `slot` is close enough to the store clock for its arrival to be
@@ -1255,8 +1897,7 @@ impl BlockChainServer {
         let now_ms = unix_now_ms();
         self.on_tick(now_ms, ctx).await;
 
-        let time_config = self.store.config().time_grid();
-        let remaining_at_entry = ms_until_next_interval(now_ms, &time_config);
+        let remaining_at_entry = self.ms_until_next_tick(now_ms);
         let now_after_tick = unix_now_ms();
         let elapsed = now_after_tick.saturating_sub(now_ms);
 
@@ -1266,7 +1907,7 @@ impl BlockChainServer {
             0
         } else {
             // Schedule the next tick at the next interval boundary
-            ms_until_next_interval(now_after_tick, &time_config)
+            self.ms_until_next_tick(now_after_tick)
         };
         send_after(
             Duration::from_millis(ms_to_next_interval),
@@ -1279,9 +1920,13 @@ impl BlockChainServer {
     /// before the actor is fully stopped. We cancel the session's token and
     /// wait up to PRIOR_WORKER_JOIN_TIMEOUT for the worker's current
     /// `aggregate_job` call to finish (the proof itself cannot be interrupted).
+    /// Lean-only: a beacon follower never starts an aggregation session.
     #[stopped]
     async fn on_stopped(&mut self, _ctx: &Context<Self>) {
-        let Some(session) = self.current_aggregation.take() else {
+        let ChainDuties::Lean(lean) = &mut self.duties else {
+            return;
+        };
+        let Some(session) = lean.current_aggregation.take() else {
             return;
         };
         session.cancel.cancel();
@@ -1315,21 +1960,14 @@ impl Handler<InitP2P> for BlockChainServer {
 }
 
 impl Handler<NewBlock> for BlockChainServer {
-    async fn handle(&mut self, msg: NewBlock, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewBlock, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
-        // Gate both the event and the arrival metric on BlockSource::Gossip for
-        // two reasons: `ChainEvent::BlockGossip` is documented (events.rs) as "a
-        // block seen on gossip, before import", yet without this gate it also
-        // fired for req/resp sync blocks; and sync backfill delivers blocks many
-        // slots after they were due, which would swamp the arrival histogram
-        // with stale deltas that reflect catch-up speed, not gossip timeliness.
-        // `self.on_block(msg.block)` still runs for every source below: it is
-        // the import path and must not be gated.
+        // If message came from gossip, emit event and metric.
         if msg.source == BlockSource::Gossip {
-            let slot = msg.block.message.slot;
+            let slot = msg.block.slot();
             self.events.emit(ChainEvent::BlockGossip {
                 slot,
-                block: msg.block.message.hash_tree_root(),
+                block: msg.block.message_hash_tree_root(),
             });
             if self.is_arrival_observable(slot) {
                 metrics::observe_gossip_block_arrival(
@@ -1339,12 +1977,68 @@ impl Handler<NewBlock> for BlockChainServer {
                 );
             }
         }
+
+        // Beacon decides here, at arrival, what to do with a block whose
+        // slot has not started: hold it if it is early only by clock
+        // disparity, reject it otherwise. Arrival is the only place holding
+        // it is still possible, since by the time the import cascade has the
+        // block its caller is a loop with nowhere to put it back. See
+        // `Self::defer_early_block`. Lean makes its own future-slot decision
+        // inside that cascade, where rejecting is all it has to do.
+        if self.store.chain() == Chain::Beacon {
+            let slot = msg.block.slot();
+            let ms_early = self.ms_until_slot_start(slot);
+            if ms_early > 0 {
+                let block_root = msg.block.message_hash_tree_root();
+                if Duration::from_millis(ms_early) > MAXIMUM_GOSSIP_CLOCK_DISPARITY {
+                    warn!(
+                        %slot,
+                        ms_early,
+                        block_root = %ShortRoot(&block_root.0),
+                        "Rejecting block: its slot starts further ahead than clock disparity allows"
+                    );
+                    self.discard_pending_subtree(block_root);
+                    return;
+                }
+                info!(
+                    %slot,
+                    ms_early,
+                    block_root = %ShortRoot(&block_root.0),
+                    "Deferring block: its slot has not started yet"
+                );
+                self.defer_early_block(msg.block, ctx);
+                return;
+            }
+            // The slot has started on the wall clock. Make the store clock
+            // agree before importing, since that is the clock `on_block`
+            // asserts against and only the tick advances it: a tick still
+            // owed for this slot (it is armed for the same instant a held
+            // block is, and an import ahead of it can run long) would
+            // otherwise turn a perfectly good block into a rejected one.
+            // `on_tick` is idempotent through the store-clock guard in
+            // `begin_tick`, and the comparison here keeps sync backfill, whose
+            // blocks are never near the clock, from paying for the check at
+            // all.
+            let config = self.store.config();
+            if fork_choice::get_current_slot(&self.store, &config) < slot {
+                self.on_tick(unix_now_ms(), ctx).await;
+            }
+        }
+
+        // The import path itself is common to every source and both chains.
         self.on_block(msg.block);
     }
 }
 
 impl Handler<NewAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAttestation, ctx: &Context<Self>) {
+        // Lean-only. A beacon node subscribes to no attestation subnet, so
+        // nothing delivers this message there; fork choice learns its votes
+        // from block bodies inside `on_block` instead. `current_slot` below is
+        // lean-only regardless, since it reads the store clock in intervals.
+        let ChainDuties::Lean(_) = &self.duties else {
+            return;
+        };
         let arrival_ms = unix_now_ms();
         let data_slot = msg.attestation.data.slot;
         if self.is_arrival_observable(data_slot) {
@@ -1370,6 +2064,10 @@ impl Handler<NewAttestation> for BlockChainServer {
 
 impl Handler<NewAggregatedAttestation> for BlockChainServer {
     async fn handle(&mut self, msg: NewAggregatedAttestation, _ctx: &Context<Self>) {
+        // Lean-only: beacon gossip aggregates are out of scope for this actor.
+        let ChainDuties::Lean(_) = &self.duties else {
+            return;
+        };
         let arrival_ms = unix_now_ms();
         metrics::observe_gossip_aggregation_arrival(arrival_ms, &self.store.config().time_grid());
         self.on_gossip_aggregated_attestation(msg.attestation);
@@ -1379,15 +2077,25 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 // -------------------------------------------------------------------------
 // Aggregation message handlers (worker → actor, actor → self for deadline)
 // -------------------------------------------------------------------------
+//
+// All four are lean-only: a beacon follower never starts an aggregation
+// session, so none of these messages are ever sent to one in practice. Each
+// still opens with the `else { return }` guard rather than reaching for
+// `lean()`, because a handler is the actor's outer boundary: dropping a
+// message that does not apply to this chain is a real outcome there, while
+// below it the same situation is a dispatch bug. See `ChainDuties`.
 
 impl Handler<AggregateProduced> for BlockChainServer {
     async fn handle(&mut self, msg: AggregateProduced, _ctx: &Context<Self>) {
+        let ChainDuties::Lean(lean) = &self.duties else {
+            return;
+        };
         let arrival_ms = unix_now_ms();
 
         // Drop results from a prior session (or from an unexpected late worker).
         // Current session may be None if the actor already cleaned it up; accept
         // the message only when ids match.
-        let current = self.current_aggregation.as_ref().map(|s| s.session_id);
+        let current = lean.current_aggregation.as_ref().map(|s| s.session_id);
         if current != Some(msg.session_id) {
             trace!(
                 incoming_session_id = msg.session_id,
@@ -1434,17 +2142,23 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
 impl Handler<EarlyAggregationCheck> for BlockChainServer {
     async fn handle(&mut self, _msg: EarlyAggregationCheck, ctx: &Context<Self>) {
+        let ChainDuties::Lean(_) = &self.duties else {
+            return;
+        };
         self.maybe_start_early_aggregation(ctx).await;
     }
 }
 
 impl Handler<AggregationDone> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDone, _ctx: &Context<Self>) {
+        let ChainDuties::Lean(lean) = &self.duties else {
+            return;
+        };
         aggregation::finalize_aggregation_session(&self.store);
         metrics::observe_committee_signatures_aggregation(msg.total_elapsed);
 
         let aggregation_elapsed = msg.total_elapsed;
-        let early = self
+        let early = lean
             .current_aggregation
             .as_ref()
             .is_some_and(|s| s.session_id == msg.session_id && s.early);
@@ -1467,7 +2181,10 @@ impl Handler<AggregationDone> for BlockChainServer {
 
 impl Handler<AggregationDeadline> for BlockChainServer {
     async fn handle(&mut self, msg: AggregationDeadline, _ctx: &Context<Self>) {
-        if let Some(session) = &self.current_aggregation
+        let ChainDuties::Lean(lean) = &self.duties else {
+            return;
+        };
+        if let Some(session) = &lean.current_aggregation
             && session.session_id == msg.session_id
         {
             session.cancel.cancel();
@@ -1477,7 +2194,13 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::checkpoint::Checkpoint;
+    use ethlambda_types::state::State;
 
     const GENESIS_TIME: u64 = 1_000;
 
@@ -1574,5 +2297,152 @@ mod tests {
             aggregation_deadline(config.milliseconds_per_interval()),
             Duration::from_millis(1_600)
         );
+    }
+
+    // -----------------------------------------------------------------
+    // ms_until_next_interval / ms_until_next_beacon_slot
+    //
+    // Both helpers share one shape (elapsed-since-genesis modulo a
+    // cadence, with a special case before genesis); these mirror each
+    // other's cases so a regression in one grid shows up the same way
+    // as in the other.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn ms_until_next_interval_returns_a_whole_interval_exactly_on_a_boundary() {
+        // A sample taken right on an interval boundary must still schedule a
+        // full interval ahead. Regression guard: the beacon slice refactored
+        // this function's only caller (`ms_until_next_tick`) to dispatch by
+        // chain, and a boundary sample returning zero here would spin the
+        // tick loop instead of waiting out the interval.
+        let cfg = config(DEFAULT_MILLISECONDS_PER_SLOT);
+        assert_eq!(
+            ms_until_next_interval(cfg.genesis_time_ms(), &cfg),
+            cfg.milliseconds_per_interval()
+        );
+    }
+
+    #[test]
+    fn ms_until_next_interval_returns_the_remainder_mid_interval() {
+        let cfg = config(DEFAULT_MILLISECONDS_PER_SLOT);
+        let elapsed_into_interval = 300;
+        let now_ms = cfg.genesis_time_ms() + elapsed_into_interval;
+        assert_eq!(
+            ms_until_next_interval(now_ms, &cfg),
+            cfg.milliseconds_per_interval() - elapsed_into_interval
+        );
+    }
+
+    #[test]
+    fn ms_until_next_interval_waits_for_genesis_itself_when_called_early() {
+        let cfg = config(DEFAULT_MILLISECONDS_PER_SLOT);
+        let now_ms = cfg.genesis_time_ms() - 600;
+        assert_eq!(
+            ms_until_next_interval(now_ms, &cfg),
+            cfg.genesis_time_ms() - now_ms
+        );
+    }
+
+    #[test]
+    fn ms_until_next_beacon_slot_returns_a_whole_slot_exactly_on_a_boundary() {
+        // Beacon's counterpart to the interval case above: a boundary sample
+        // must schedule a whole slot ahead, since the beacon tick loop has no
+        // sub-slot grid to fall back on if this ever returned less.
+        let genesis_time_ms = 1_000;
+        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        assert_eq!(
+            ms_until_next_beacon_slot(genesis_time_ms, genesis_time_ms, slot_duration_ms),
+            slot_duration_ms
+        );
+    }
+
+    #[test]
+    fn ms_until_next_beacon_slot_returns_the_remainder_mid_slot() {
+        let genesis_time_ms = 1_000;
+        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        let elapsed_into_slot = 5_000;
+        let now_ms = genesis_time_ms + elapsed_into_slot;
+        assert_eq!(
+            ms_until_next_beacon_slot(now_ms, genesis_time_ms, slot_duration_ms),
+            slot_duration_ms - elapsed_into_slot
+        );
+    }
+
+    #[test]
+    fn ms_until_next_beacon_slot_waits_for_genesis_itself_when_called_early() {
+        let genesis_time_ms = 1_000;
+        let slot_duration_ms = Config::mainnet().slot_duration_ms;
+        let now_ms = 400;
+        assert_eq!(
+            ms_until_next_beacon_slot(now_ms, genesis_time_ms, slot_duration_ms),
+            genesis_time_ms - now_ms
+        );
+    }
+
+    /// A beacon store anchored at a zero root, with `genesis_time` (Unix
+    /// seconds) and both realized checkpoints at `finalized_slot`.
+    ///
+    /// No anchor state is written: its only caller asserts on the chain tag
+    /// `Store::init_beacon` sets, which is seeded before any state is.
+    fn beacon_store(genesis_time: u64, finalized_slot: u64) -> Store {
+        let backend = Arc::new(InMemoryBackend::default());
+        let anchor_root = H256::ZERO;
+        let anchor_checkpoint = Checkpoint {
+            root: anchor_root,
+            slot: finalized_slot,
+        };
+        Store::init_beacon(
+            backend,
+            genesis_time,
+            Config::mainnet(),
+            anchor_root,
+            anchor_checkpoint,
+        )
+    }
+
+    // -----------------------------------------------------------------
+    // spawn / spawn_beacon chain assertions
+    //
+    // Both panic on their very first line, before either constructor
+    // touches anything that would need a running actor context, so a
+    // plain #[test] (no tokio runtime) is enough to observe them.
+    // -----------------------------------------------------------------
+
+    #[test]
+    #[should_panic(expected = "BlockChain::spawn requires a lean store")]
+    fn spawn_panics_when_handed_a_beacon_store() {
+        // Guards against pairing a lean-shaped BlockChainConfig (validator
+        // keys, aggregator role, proposer policy) with a beacon store, which
+        // would corrupt the directory the moment any duty touched it.
+        let store = beacon_store(0, 0);
+        let config = BlockChainConfig {
+            aggregator: AggregatorController::new(false),
+            sync_status_controller: SyncStatusController::default(),
+            attestation_committee_count: 0,
+            gate_duties: true,
+            subscribed_subnets: HashSet::new(),
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: 0,
+            },
+        };
+
+        let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "BlockChain::spawn_beacon requires a beacon store")]
+    fn spawn_beacon_panics_when_handed_a_lean_store() {
+        // Mirror of the assertion above: a beacon follower's spawn path must
+        // never run against lean-shaped state either.
+        let backend = Arc::new(InMemoryBackend::default());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        let _ =
+            BlockChain::spawn_beacon(store, SyncStatusController::default(), EventBus::default());
     }
 }

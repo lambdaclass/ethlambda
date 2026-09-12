@@ -9,6 +9,7 @@ use ethlambda_network_api::BlockSource;
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
+    beacon::containers::SignedBeaconBlock,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
 };
@@ -121,7 +122,7 @@ async fn handle_lean_block(server: &mut P2PServer, payload: &[u8], compressed_le
     );
     if let Some(ref blockchain) = server.blockchain {
         let _ = blockchain
-            .new_block(signed_block, BlockSource::Gossip)
+            .new_block(SignedBeaconBlock::Lean(signed_block), BlockSource::Gossip)
             .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
     }
 }
@@ -171,12 +172,11 @@ async fn handle_lean_attestation(server: &mut P2PServer, payload: &[u8], compres
     }
 }
 
-/// Decode a beacon block and record that it arrived.
+/// Decode a beacon block and hand it to the beacon chain actor.
 ///
-/// Nothing is forwarded to the chain actor: driving `on_block` arrives with the
-/// anchor, since `on_block` rejects a block whose parent is not in the store and
-/// nothing has put one there. That is also why this shares no body with
-/// [`handle_lean_block`], whose reason for existing is to hand its block on.
+/// The anchor block puts a parent in the store before gossip starts, so
+/// `on_block` no longer rejects these for want of one: forward every decoded
+/// block the way [`handle_lean_block`] forwards its own.
 async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8]) {
     const KIND: &str = beacon_topics::BEACON_BLOCK;
     let Some(wire) = beacon_wire(server, KIND) else {
@@ -193,6 +193,11 @@ async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8]) {
                 bytes = payload.len(),
                 "Beacon block decoded"
             );
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain
+                    .new_block(block, BlockSource::Gossip)
+                    .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
+            }
         }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
@@ -201,8 +206,12 @@ async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8]) {
     }
 }
 
-/// Decode a beacon aggregate and record that it arrived. Forwards nothing, for
-/// the reason [`handle_beacon_block`] gives.
+/// Decode a beacon aggregate and record that it arrived. Forwards nothing:
+/// `beacon_aggregate_and_proof` is a global topic carrying roughly a thousand
+/// aggregates per slot on mainnet at about 30ms each in `on_attestation`, more
+/// work per slot than a slot lasts on a single-threaded actor, so fork choice
+/// learns its votes from block bodies inside `on_block` instead of from this
+/// topic.
 async fn handle_beacon_aggregate(server: &mut P2PServer, payload: &[u8]) {
     const KIND: &str = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
     let Some(wire) = beacon_wire(server, KIND) else {
@@ -230,8 +239,8 @@ async fn handle_beacon_aggregate(server: &mut P2PServer, payload: &[u8]) {
 }
 
 /// Decode one of the five beacon topics with nothing particular to report, and
-/// record that it arrived. Forwards nothing, for the reason
-/// [`handle_beacon_block`] gives.
+/// record that it arrived. Forwards nothing: none of these five has a
+/// consumer.
 async fn handle_beacon_other(server: &mut P2PServer, payload: &[u8], kind: &str) {
     let Some(wire) = beacon_wire(server, kind) else {
         return;

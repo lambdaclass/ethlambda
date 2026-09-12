@@ -127,9 +127,12 @@ fn init_benchmark_logging() -> eyre::Result<()> {
 /// assemble once the chain-specific half is done.
 struct RunningNode {
     p2p: P2P,
-    /// `None` on mainnet: that follower decodes gossip and imports nothing, so
-    /// there is no chain actor to drive, stop or join.
-    blockchain: Option<BlockChain>,
+    /// The chain actor, on both lean and mainnet: the beacon follower runs one
+    /// too, so there is always exactly one to stop and join. `run_node`
+    /// spawns and wires it before building this struct, which is what keeps
+    /// this a plain `BlockChain` rather than an `Option` describing a state
+    /// the node never reaches.
+    blockchain: BlockChain,
     /// The HTTP server task. Returns once `shutdown` is cancelled.
     http: tokio::task::JoinHandle<()>,
     /// Cancelled by [`wait_for_shutdown`] to stop `http`.
@@ -151,6 +154,22 @@ struct DiscoveryWireEntries {
     custody_group_count: Option<u64>,
 }
 
+/// What [`ChainSetup::chain`] hands `run_node` to spawn this chain's actor.
+///
+/// Lean carries validator keys and duty configuration because
+/// [`BlockChain::spawn`] needs both; beacon carries nothing, because
+/// [`BlockChain::spawn_beacon`] needs only the store, the sync-status
+/// controller and the event bus, and `run_node` already owns all three
+/// outside this struct.
+enum ChainActor {
+    /// The lean node's chain actor: its validator keys and duty configuration.
+    Lean(HashMap<u64, ValidatorKeyPair>, BlockChainConfig),
+    /// The beacon follower's chain actor. No keys and no duties, so nothing to
+    /// carry: what it needs is the store, the sync-status handle and the event
+    /// bus, which `run_node` already owns.
+    Beacon,
+}
+
 /// What one chain's own setup produces, and everything [`run_node`] needs from
 /// it to put a node on the wire.
 ///
@@ -167,17 +186,18 @@ struct ChainSetup {
     /// [`DiscoverySpawnConfig`] is operator-supplied and identical either way,
     /// so it is filled in once, below the match.
     discovery: DiscoveryWireEntries,
-    /// Backs the req/resp handlers on both chains. Lean's is the live chain
-    /// `BlockChain` drives; mainnet's is the checkpoint anchor
-    /// `fetch_initial_beacon_state` resumed from disk or checkpoint-synced.
-    /// Nothing on the mainnet path imports past that anchor, so its state
-    /// never advances once the node is running.
+    /// Backs the req/resp handlers on both chains. Both start from the
+    /// checkpoint anchor `fetch_initial_state`/`fetch_initial_beacon_state`
+    /// resumed from disk or checkpoint-synced, and both then have a
+    /// `BlockChain` actor (`spawn`/`spawn_beacon`) driving it forward: lean
+    /// through validator duties, mainnet as a duty-free follower running fork
+    /// choice on imported blocks.
     store: Store,
     /// PeerId to node name, for logs. Empty on mainnet, which has no roster.
     node_names: HashMap<PeerId, String>,
-    /// The validator keys and actor configuration, or `None` on mainnet, which
-    /// imports nothing and so has no chain actor.
-    chain: Option<(HashMap<u64, ValidatorKeyPair>, BlockChainConfig)>,
+    /// What to spawn this chain's actor with: lean's validator keys and duty
+    /// configuration, or beacon's `Beacon` marker.
+    chain: ChainActor,
 }
 
 /// Boot the node, on whichever chain [`Options::network`] names.
@@ -185,18 +205,21 @@ struct ChainSetup {
 /// One startup path, in the order it has to happen: validate the port, register
 /// the metrics, say what is running, raise the file-descriptor limit, resolve
 /// the node key, then the one `match` where the two chains differ, then the
-/// swarm, the discv5 server and the HTTP server, which are the same either way.
-/// Mainnet stops there. Lean carries on into the chain actor.
+/// swarm, the discv5 server and the HTTP server, then the chain actor, which are
+/// the same either way. Both chains end up with a spawned, wired-up
+/// `BlockChain`, so `wait_for_shutdown` stops and joins one on either network.
 ///
 /// `Network::Lean` runs the full consensus node: a `BlockChain` actor with
 /// validator duties, a RocksDB store, checkpoint sync and the `/lean/v0` API.
-/// `Network::Mainnet` is the wire and nothing above it: it derives mainnet's
-/// fork digest, joins discv5, subscribes to the global gossip topics and logs
-/// what it decodes. It keeps no chain, so it has no fork choice, only the
-/// checkpoint anchor `fetch_initial_beacon_state` resolves at startup; the
-/// `/lean/v0` API is served there too, off that anchored store, so that one
-/// HTTP call site serves both. Those endpoints answer for a chain that imports
-/// nothing past its anchor, and fixing that is its own change.
+/// `Network::Mainnet` runs a beacon follower: it derives mainnet's fork digest,
+/// joins discv5, subscribes to the global gossip topics, resolves the
+/// checkpoint anchor `fetch_initial_beacon_state` at startup, then hands the
+/// resulting store to a `BlockChain` actor spawned with `spawn_beacon`, which
+/// imports blocks through fork choice with no validator keys and no duties.
+/// The `/lean/v0` API is served off the store on both chains, so one HTTP call
+/// site serves both, but its endpoints still read metadata keys and state
+/// variants a beacon store does not carry, so they do not yet answer for a
+/// beacon directory; fixing that is its own change.
 //
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
@@ -417,13 +440,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 },
                 store,
                 node_names,
-                chain: Some((validator_keys, blockchain_config)),
+                chain: ChainActor::Lean(validator_keys, blockchain_config),
             }
         }
-        // The Ethereum Beacon Chain follower: the wire and nothing above it.
-        // Every network parameter is derived rather than configured, from the
-        // genesis state built into the binary: the fork digest depends on the
-        // epoch, which depends on genesis time. See `crate::beacon`.
+        // The Ethereum Beacon Chain follower: the wire plus a duty-free chain
+        // actor (`ChainActor::Beacon`, filled in below) that imports blocks
+        // through fork choice. Every network parameter is derived rather than
+        // configured, from the genesis state built into the binary: the fork
+        // digest depends on the epoch, which depends on genesis time. See
+        // `crate::beacon`.
         Network::Mainnet => {
             info!(
                 bootnodes = ?common.bootnodes,
@@ -459,8 +484,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 },
                 store,
                 node_names: HashMap::new(),
-                // Nothing is imported, so there is no chain actor.
-                chain: None,
+                // A beacon follower has no validator keys and no duties, but
+                // it does import blocks through fork choice, so it gets the
+                // `Beacon` chain actor below.
+                chain: ChainActor::Beacon,
             }
         }
     };
@@ -523,30 +550,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         .inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
-    let mut running_node = RunningNode {
-        p2p,
-        blockchain: None,
-        http,
-        shutdown,
+    let blockchain = match setup.chain {
+        ChainActor::Lean(validator_keys, config) => {
+            BlockChain::spawn(setup.store, validator_keys, config, events)
+        }
+        ChainActor::Beacon => BlockChain::spawn_beacon(setup.store, sync_status, events),
     };
 
-    let Some((validator_keys, blockchain_config)) = setup.chain else {
-        // Mainnet is the wire and nothing above it: no chain actor to spawn,
-        // wire up, stop or join.
-        wait_for_shutdown(running_node).await;
-        return Ok(());
-    };
-
-    let blockchain = BlockChain::spawn(setup.store, validator_keys, blockchain_config, events);
-
-    let p2p_ref = running_node.p2p.actor_ref();
-    let p2p = p2p_ref.to_block_chain_to_p2p_ref();
+    let p2p_ref = p2p.actor_ref();
+    let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
 
     // Wire actors together via protocol refs
     blockchain
         .actor_ref()
         .recipient::<InitP2P>()
-        .send(InitP2P { p2p })
+        .send(InitP2P {
+            p2p: p2p_to_block_chain,
+        })
         .inspect_err(|err| error!(%err, "Failed to send InitP2P — actors not wired"))?;
 
     p2p_ref
@@ -556,8 +576,13 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
-    running_node.blockchain = Some(blockchain);
-    wait_for_shutdown(running_node).await;
+    wait_for_shutdown(RunningNode {
+        p2p,
+        blockchain,
+        http,
+        shutdown,
+    })
+    .await;
     Ok(())
 }
 
@@ -592,21 +617,14 @@ async fn wait_for_shutdown(node: RunningNode) {
         std::process::exit(1);
     });
 
-    let blockchain_ref = node
-        .blockchain
-        .as_ref()
-        .map(|blockchain| blockchain.actor_ref().clone());
+    let blockchain_ref = node.blockchain.actor_ref().clone();
     let p2p_ref = node.p2p.actor_ref().clone();
 
-    if let Some(blockchain_ref) = &blockchain_ref {
-        blockchain_ref.context().stop();
-    }
+    blockchain_ref.context().stop();
     p2p_ref.context().stop();
     node.shutdown.cancel();
 
-    if let Some(blockchain_ref) = blockchain_ref {
-        blockchain_ref.join().await;
-    }
+    blockchain_ref.join().await;
     p2p_ref.join().await;
     let _ = node.http.await;
 

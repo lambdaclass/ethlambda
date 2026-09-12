@@ -294,11 +294,12 @@ actual_slot = finalized_slot + 1 + relative_index
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
-    Both serve from the checkpoint-anchored store, and `build_status` now advertises it
+    Both serve from the checkpoint-anchored store, and `build_status` advertises it
     (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
     have a reason to ask. Asking runs too: a peer's Status starts a range session paced by
-    `P2PServer::beacon_fetched_through` rather than the store's head. There is still no
-    importer, so fetched blocks are checked and dropped.
+    `P2PServer::beacon_fetched_through`, the highest slot handed to the chain actor, rather
+    than the store's head, which trails a delivered batch by the whole actor mailbox.
+    Fetched blocks reach the actor as `BlockSource::Sync`.
     Their chunks carry four `<context-bytes>` (the block's own epoch's fork digest), which is why
     `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
 
@@ -333,16 +334,17 @@ it must still precede key loading), `--node-key` resolution, reading
 
 It then branches **once**, on `network`, both arms inline, each evaluating to a
 `ChainSetup`: the wire configuration, the ENR entries that describe it, the
-`Store` the req/resp handlers answer from, the node-name roster, and an `Option`
-holding the validator keys and `BlockChainConfig`. The rest of the discv5
-configuration is the node key, the ports, the bootnodes and the peer target,
-which are operator input and identical either way, so `run_node` fills those in
-once below the match rather than having each arm repeat them.
+`Store` the req/resp handlers answer from, the node-name roster, and a
+`ChainActor` saying what to spawn this chain's actor with (lean's validator
+keys and `BlockChainConfig`, or beacon's `Beacon` marker). The rest of the
+discv5 configuration is the node key, the ports, the bootnodes and the peer
+target, which are operator input and identical either way, so `run_node` fills
+those in once below the match rather than having each arm repeat them.
 Everything after that match is shared again: one `build_swarm`, one
-`P2P::spawn`, one `start_rpc_server`. `ChainSetup.chain` being `None` is what
-ends the mainnet path, through a `let ... else` that returns into the shared
-`wait_for_shutdown`; lean falls through it into `BlockChain::spawn` and the
-`InitP2P`/`InitBlockChain` wiring.
+`P2P::spawn`, one `start_rpc_server`, and one chain actor, since `ChainActor`
+selects between `BlockChain::spawn` and `BlockChain::spawn_beacon` rather than
+between spawning one and not. The `InitP2P`/`InitBlockChain` wiring and
+`wait_for_shutdown` are then shared too.
 
 `ChainSetup` is a data bag, not an abstraction. The match that fills it stays
 inline, because moving it into a method would relocate the branch rather than
@@ -359,13 +361,13 @@ though: they read metadata keys and state variants a beacon directory never
 carries, so calling one of them, e.g. `GET /lean/v0/states/finalized`, panics
 that request rather than quietly answering for a chain that is not running.
 That panic is deliberate, not an accepted placeholder: failing loudly beats
-making up an answer for a chain this process never imports past its anchor.
+making up an answer in a lean shape for a chain that does not keep one.
 
-`RunningNode.blockchain` is an `Option` for the same reason: the mainnet
-follower decodes gossip and imports nothing, so it has no chain actor to stop or
-join. It is why mainnet gets the graceful shutdown, metrics bootstrap and
-fd-limit raise it previously lacked (it used to park on
-`std::future::pending()`).
+`RunningNode.blockchain` is a plain `BlockChain`, not an `Option`: the beacon
+follower runs a chain actor too, so there is always exactly one to stop and
+join, and `run_node` spawns and wires it before building the struct. Mainnet
+therefore gets the same graceful shutdown, metrics bootstrap and fd-limit raise
+lean does (it used to park on `std::future::pending()`).
 
 `docs/cli.md` has the step-by-step table.
 
@@ -415,11 +417,12 @@ when they are equal it merges all three routers onto a single listener, so point
 one port is supported and not a misconfiguration.
 
 Both sub-commands bind through one call to `start_rpc_server`, from one site in `run_node`, so
-both serve all three routers. `beacon` reaches it with a mix now: the real, DB-backed anchored
+both serve all three routers. `beacon` reaches it with real handles now: the DB-backed anchored
 `Store` its `P2PServer` already holds (checkpoint sync or resume gave it one, the same way `node`
-gets its own), alongside an `AggregatorController` seeded `false` and a default
-`SyncStatusController` and `EventBus`, which stay placeholders since this chain has no aggregator
-duty and imports nothing to report sync status on. The lean-shaped `/lean/v0/...` routes still
+gets its own), plus clones of the same `SyncStatusController` and `EventBus` its chain actor
+writes to, so the follower's own sync status and chain events are what these report. Only the
+`AggregatorController`, seeded `false`, stays a placeholder: this chain has no aggregator duty to
+toggle. The lean-shaped `/lean/v0/...` routes still
 don't answer for a `beacon` run, though: they read metadata keys and state variants a beacon
 directory never carries, so calling one panics that request rather than answering for a chain that
 is not running (see "One startup path for both chains" above). That is deliberate for now, to keep

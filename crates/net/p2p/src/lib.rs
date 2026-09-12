@@ -735,22 +735,8 @@ pub struct P2PServer {
     pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
-    /// Highest beacon slot taken off the wire, whether or not anything has
-    /// imported it.
-    ///
-    /// Range sync decides its next request from this rather than from the
-    /// store's own head, and the difference is not a nicety. On this branch
-    /// nothing imports at all, so the store's head never moves and a sync
-    /// driven off it would re-request the same range forever. Once there is an
-    /// importer the head still lags, because delivery is a message and import
-    /// is work: the store trails a delivered batch by the whole actor mailbox,
-    /// which on the live follower meant 11,213 blocks off the wire to import
-    /// 100, each duplicate paying a `hash_tree_root` before the store could
-    /// reject it. Advanced on arrival, the ratio was 1.7:1.
-    ///
-    /// Not persisted, and deliberately not in the store: it describes this
-    /// process's in-flight fetching, not chain history, and a restart should
-    /// start again from the anchor it actually resumes at.
+    /// Highest beacon slot handed to the chain actor, whether or not it has
+    /// been imported yet.
     pub(crate) beacon_fetched_through: u64,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,

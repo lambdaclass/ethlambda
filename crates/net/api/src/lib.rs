@@ -1,5 +1,6 @@
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
+    beacon::containers::SignedBeaconBlock,
     block::SignedBlock,
     primitives::H256,
 };
@@ -31,13 +32,27 @@ pub enum BlockSource {
     Gossip,
     /// Fetched via req/resp (`BlocksByRoot` / `BlocksByRange`).
     Sync,
+    /// Re-delivered by the chain actor to itself, for a block it received
+    /// before that block's own slot had started and held until it did.
+    ///
+    /// The p2p layer never sends this one: it is the only variant that says
+    /// the block is not arriving now but arriving again, which is what keeps
+    /// a held block out of the timeliness measurements its first arrival
+    /// already fed.
+    Deferred,
 }
 
 // --- Protocol: P2P -> BlockChain ---
 
 #[protocol]
 pub trait P2PToBlockChain: Send + Sync {
-    fn new_block(&self, block: SignedBlock, source: BlockSource) -> Result<(), ActorError>;
+    /// A block for whichever chain this node follows.
+    ///
+    /// [`SignedBeaconBlock`] rather than a lean [`SignedBlock`] because its
+    /// `Lean` variant carries one, and its `message:` accessors answer for that
+    /// variant too. That is what lets the actor's import cascade be written
+    /// once for both chains rather than twice.
+    fn new_block(&self, block: SignedBeaconBlock, source: BlockSource) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
         &self,

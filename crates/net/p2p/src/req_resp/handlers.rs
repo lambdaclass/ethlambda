@@ -507,18 +507,18 @@ async fn handle_blocks_by_root_response(
         return;
     };
 
-    // Reached only on a lean node, which is the only wire that has an actor to
-    // hand this to. A block of any other fork here means a peer answered a lean
-    // protocol with a beacon block; it is dropped with a log rather than
-    // silently, for the reason `lean_blocks` gives.
-    let SignedBeaconBlock::Lean(block) = block else {
+    // A non-lean block on a lean node means a peer answered a lean protocol
+    // with a beacon block; it is dropped with a log rather than silently, for
+    // the reason `lean_blocks` gives. A beacon node asked on its own protocol
+    // and forwards whatever fork came back.
+    if !server.wire.is_beacon() && !matches!(block, SignedBeaconBlock::Lean(_)) {
         debug!(
             slot = block.slot(),
             fork = %block.fork_name(),
             "Dropping a non-lean block from a lean block response"
         );
         return;
-    };
+    }
 
     let _ = blockchain
         .new_block(block, BlockSource::Sync)
@@ -555,7 +555,7 @@ async fn handle_lean_blocks_by_range_response(
         }
 
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(block, BlockSource::Sync) {
+        if let Err(err) = blockchain.new_block(SignedBeaconBlock::Lean(block), BlockSource::Sync) {
             error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
@@ -654,7 +654,6 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
             return false;
         }
     };
-
     let excluded = server.connected_peers.len() - pool.len();
 
     let sent = if server.wire.is_beacon() {
@@ -998,10 +997,14 @@ fn handle_goodbye(peer: PeerId, Goodbye { reason }: Goodbye) {
 /// when the peer is not ahead of `fetched_through`.
 ///
 /// Takes `fetched_through` rather than a `Store`, deliberately: this is
-/// `server.beacon_fetched_through`, not `server.store.head_slot()`. See that
-/// field's own doc comment on `P2PServer` for why the store's head is the
-/// wrong signal to drive this off. Bounded by [`MAX_SYNC_RANGE`], the same
-/// ceiling `handle_lean_status_response` bounds its own request span by.
+/// `server.beacon_fetched_through`, not `server.store.head_slot()`. Delivery
+/// to the chain actor is a message and import is work, so the store's own
+/// head lags a delivered batch by the whole actor mailbox. Driven off the
+/// store's head, the live follower kept re-requesting the part of the range
+/// still draining and pulled 11,213 blocks off the wire to import 100; see
+/// `beacon_fetched_through`'s own doc comment on `P2PServer`. Bounded by
+/// [`MAX_SYNC_RANGE`], the same ceiling `handle_lean_status_response` bounds
+/// its own request span by.
 fn beacon_sync_target(fetched_through: u64, peer_head_slot: u64) -> Option<std::ops::Range<u64>> {
     if peer_head_slot <= fetched_through {
         return None;
@@ -1281,13 +1284,7 @@ pub async fn request_beacon_block_by_root(
 }
 
 /// Take delivery of a range answer, checking it against what was asked for,
-/// and drive the range session on from it.
-///
-/// Nothing imports the result yet: this chain has no `BlockChain` actor, so a
-/// block that passes every check below is counted and dropped, exactly as a
-/// gossiped beacon block is. The checks run anyway, because they are what
-/// makes the answer trustworthy and they are what an importer would otherwise
-/// have to repeat.
+/// and forward whatever passes to the chain actor.
 ///
 /// The counterpart of [`handle_lean_blocks_by_range_response`]. The by-root
 /// answer has no counterpart here, because it needs none:
@@ -1311,29 +1308,47 @@ async fn handle_beacon_blocks_by_range_response(
         return;
     }
 
+    let Some(ref blockchain) = server.blockchain else {
+        // No actor to forward into. A range session makes no progress either
+        // way, so it is dropped rather than spun uselessly on further
+        // batches, matching handle_lean_blocks_by_range_response.
+        server.range_sync_state = None;
+        debug!(%peer, "No blockchain handler available");
+        return;
+    };
+
     let received = blocks.len();
     let mut accepted = 0usize;
-    let mut highest_accepted_slot: Option<u64> = None;
+    let mut highest_forwarded_slot: Option<u64> = None;
 
-    for block in &blocks {
+    for block in blocks {
         let slot = block.slot();
         if slot < start_slot || slot > end_slot {
             debug!(%peer, %slot, start_slot, end_slot, "Beacon block outside requested range");
             continue;
         }
 
-        highest_accepted_slot = Some(highest_accepted_slot.map_or(slot, |max: u64| max.max(slot)));
+        highest_forwarded_slot =
+            Some(highest_forwarded_slot.map_or(slot, |max: u64| max.max(slot)));
         accepted += 1;
+
+        // No block root in the failure log: reaching it means the actor
+        // mailbox send failed, which `%peer` and `%slot` already identify,
+        // and `message_hash_tree_root` is a whole-block merkleization
+        // (execution payload included) that would then be paid for every
+        // block on the sync path. [`handle_blocks_by_root_response`] computes
+        // one because it has an answer to check; a range batch does not.
+        let _ = blockchain.new_block(block, BlockSource::Sync).inspect_err(
+            |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
+        );
     }
 
-    // Nothing consumes these yet; see this function's doc comment. Logged rather
-    // than silently dropped so a fetch that is working is visible from outside.
     debug!(%peer, received, accepted, "Beacon blocks received");
 
-    // Highest slot that arrived and passed its checks, not the highest imported:
-    // see `beacon_fetched_through`'s own doc comment on `P2PServer` for why
-    // range sync must be driven off this rather than the store's head.
-    if let Some(highest) = highest_accepted_slot {
+    // Highest slot *handed to* the actor, not the highest imported: see
+    // `beacon_fetched_through`'s own doc comment on `P2PServer` for why range
+    // sync must be driven off this rather than the store's head.
+    if let Some(highest) = highest_forwarded_slot {
         server.beacon_fetched_through = server.beacon_fetched_through.max(highest);
     }
     if let Some(state) = &mut server.range_sync_state {
@@ -1420,13 +1435,12 @@ mod tests {
 
     #[test]
     fn beacon_sync_target_keys_off_fetched_through_not_store_head() {
-        // A batch already taken off the wire but not imported leaves the
-        // store's own head behind `fetched_through`; the sync target must
-        // still be computed from `fetched_through`. See
-        // `beacon_fetched_through`'s doc comment on `P2PServer` for why the
-        // store's head is the wrong signal to drive this off: on this branch
-        // it never moves at all, and on the live follower it is what pulled
-        // 11,213 blocks off the wire to import 100.
+        // A batch already handed to the chain actor but not yet imported
+        // leaves the store's own head behind `fetched_through`; the sync
+        // target must still be computed from `fetched_through`. See
+        // `beacon_sync_target`'s own doc comment for why the store's head is
+        // the wrong signal to drive this off: it is what pulled 11,213
+        // blocks off the wire to import 100 on the live follower.
         assert_eq!(beacon_sync_target(100, 150), Some(101..151));
         // A peer at or behind what has already been fetched has nothing to
         // offer, regardless of what the store's own (possibly much lower)

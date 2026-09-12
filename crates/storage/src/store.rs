@@ -1632,20 +1632,45 @@ impl Store {
 
     /// Insert a block as pending (parent state not yet available).
     ///
-    /// Stores block data in `BlockHeaders`/`BlockBodies`/`BlockProof`
-    /// **without** writing to `LiveChain`. This persists the heavy proof
-    /// data (~3KB+ per block) to disk while keeping the block invisible to
-    /// fork choice.
+    /// One method for both chains, mirroring [`insert_signed_block`](Self::insert_signed_block):
+    /// the lean arm stores block data in `BlockHeaders`/`BlockBodies`/`BlockProof`,
+    /// the beacon arm stores the whole signed block in a single `BlockHeaders`
+    /// row. Neither arm writes to `LiveChain`, which is the one and only
+    /// difference from `insert_signed_block`: that omission is exactly what
+    /// keeps a pending block invisible to fork choice until its parent
+    /// arrives and it is re-inserted as admitted. Lean's proof data
+    /// (~3KB+ per block) is persisted to disk in the meantime rather than
+    /// held in memory.
     ///
     /// When the block is later processed via [`insert_signed_block`](Self::insert_signed_block),
     /// the same keys are overwritten (idempotent) and a `LiveChain` entry is added.
+    ///
+    /// Unlike `insert_signed_block`, this never calls
+    /// `record_known_attestation_votes`: that call records votes carried by
+    /// blocks fork choice has actually admitted, and a pending block is not
+    /// admitted.
     pub fn insert_pending_block(
         &mut self,
         root: H256,
-        signed_block: SignedBlock,
+        block: SignedBeaconBlock,
     ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
-        write_signed_block(batch.as_mut(), &root, signed_block);
+
+        match block {
+            SignedBeaconBlock::Lean(signed_block) => {
+                write_signed_block(batch.as_mut(), &root, signed_block);
+            }
+            beacon_block => {
+                // The whole signed block, in one row, through the same
+                // `write_beacon_block` `insert_signed_block`'s beacon arm
+                // uses: no `BlockBodies` row (a beacon block has no
+                // header/body split) and no `BlockProof` row (its signature
+                // lives inside the block, not in a separate proof blob).
+                write_beacon_block(batch.as_mut(), &root, &beacon_block);
+            }
+        }
+
+        // One commit for both arms, so the write stays atomic.
         batch.commit().expect("commit");
         Ok(())
     }
@@ -1691,7 +1716,6 @@ impl Store {
             beacon_block => {
                 let slot = beacon_block.slot();
                 let parent_root = beacon_block.parent_root();
-                let root_bytes = root.to_ssz();
 
                 // The whole signed block, in one row. `BlockHeaders` holds a
                 // full lean `BlockHeader` on a lean directory and a whole
@@ -1705,10 +1729,7 @@ impl Store {
                 // beacon block has no such empty case and nothing reads a
                 // beacon header without its block, so a second row would only
                 // add a write and a way for the two to disagree.
-                let header_entries = vec![(root_bytes, encode_beacon_block_value(&beacon_block))];
-                batch
-                    .put_batch(Table::BlockHeaders, header_entries)
-                    .expect("put beacon block");
+                write_beacon_block(batch.as_mut(), &root, &beacon_block);
 
                 // `BlockRoots` is not written here, on either chain: it
                 // indexes the canonical branch, which import order does not
@@ -1862,6 +1883,38 @@ impl Store {
     /// Callers walking a chain of them should build [`Store::block_index`]
     /// once instead, which reads the same links out of `LiveChain`.
     pub fn block_entry(&self, root: &H256) -> Option<(u64, H256)> {
+        self.block_fields(root)
+            .map(|(slot, parent_root, _)| (slot, parent_root))
+    }
+
+    /// `root`'s slot and state root, without decoding its body on lean.
+    ///
+    /// The sibling of [`block_entry`](Self::block_entry), which answers the
+    /// parent-root question instead, and chain-generic for the same reason:
+    /// a lean directory keeps a [`BlockHeader`] in `Table::BlockHeaders` and a
+    /// beacon one the whole signed block, so the decode is what varies and the
+    /// caller does not have to know which chain it is on. On the beacon arm
+    /// this decodes the whole block to reach two fields.
+    ///
+    /// Both fields come out of one read, so a caller emitting them together
+    /// cannot pair a slot with a state root from a different block. That is
+    /// what the chain-event emission needs, and why it does not read them
+    /// through two accessors.
+    pub fn block_slot_and_state_root(&self, root: &H256) -> Option<(u64, H256)> {
+        self.block_fields(root)
+            .map(|(slot, _, state_root)| (slot, state_root))
+    }
+
+    /// `root`'s slot, parent root and state root: the one read and the one
+    /// per-chain decode that [`block_entry`](Self::block_entry) and
+    /// [`block_slot_and_state_root`](Self::block_slot_and_state_root) project
+    /// out of.
+    ///
+    /// One decode rather than one per accessor, so the `Table::BlockHeaders`
+    /// row shape is stated once and the two public accessors cannot disagree
+    /// about which block a row is. Returning all three costs nothing: every
+    /// field is already in hand once the row is decoded.
+    fn block_fields(&self, root: &H256) -> Option<(u64, H256, H256)> {
         let view = self.backend.begin_read().expect("read view");
         let bytes = view
             .get(Table::BlockHeaders, &root.to_ssz())
@@ -1869,11 +1922,11 @@ impl Store {
         Some(match self.chain {
             Chain::Lean => {
                 let header = BlockHeader::from_ssz_bytes(&bytes).expect("valid header");
-                (header.slot, header.parent_root)
+                (header.slot, header.parent_root, header.state_root)
             }
             Chain::Beacon => {
                 let block = decode_beacon_block_value(&bytes);
-                (block.slot(), block.parent_root())
+                (block.slot(), block.parent_root(), block.state_root())
             }
         })
     }
@@ -2856,6 +2909,21 @@ impl Store {
     }
 }
 
+/// Write a whole beacon signed block onto an existing batch, as one
+/// `BlockHeaders` row.
+///
+/// The beacon counterpart of [`write_signed_block`], and a function for the
+/// same reason: both `insert_signed_block` and `insert_pending_block` write
+/// this row, so the key encoding, the value encoding and the table are stated
+/// once. No `BlockBodies` row (a beacon block has no header/body split) and no
+/// `BlockProof` row (its signature lives inside the block).
+fn write_beacon_block(batch: &mut dyn StorageWriteBatch, root: &H256, block: &SignedBeaconBlock) {
+    let header_entries = vec![(root.to_ssz(), encode_beacon_block_value(block))];
+    batch
+        .put_batch(Table::BlockHeaders, header_entries)
+        .expect("put beacon block");
+}
+
 /// Write block header, body, and the merged proof blob onto an existing batch.
 ///
 /// Returns the deserialized [`Block`] so callers can access fields like
@@ -3150,6 +3218,119 @@ mod tests {
             SignedBeaconBlock::Lean(lean) => assert_eq!(lean.message.slot, signed.message.slot),
             other => panic!("expected a lean block, got {}", other.fork_name()),
         }
+    }
+
+    #[test]
+    fn block_slot_and_state_root_returns_a_lean_blocks_own_slot_and_state_root() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let anchor_root = store.head().expect("head root");
+
+        let block = signed_block(1, anchor_root);
+        let state_root = block.message.state_root;
+        let block_root = block.message.hash_tree_root();
+        store
+            .insert_signed_block(block_root, SignedBeaconBlock::Lean(block))
+            .expect("insert lean block");
+
+        assert_eq!(
+            store.block_slot_and_state_root(&block_root),
+            Some((1, state_root))
+        );
+    }
+
+    #[test]
+    fn block_slot_and_state_root_returns_a_beacon_blocks_own_slot_and_state_root() {
+        // Distinctive slot and state_root (not the zeroed defaults
+        // `beacon_test_block` uses), so a decode that silently returned the
+        // wrong field, or the wrong block, would not pass by coincidence.
+        use ethlambda_types::beacon::containers::phase0;
+
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let state_root = H256::from([7u8; 32]);
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 42,
+                proposer_index: 0,
+                parent_root: H256::from([1u8; 32]),
+                state_root,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: H256::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        });
+        let block_root = block.message_hash_tree_root();
+
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert beacon block");
+
+        assert_eq!(
+            store.block_slot_and_state_root(&block_root),
+            Some((42, state_root))
+        );
+    }
+
+    #[test]
+    fn block_slot_and_state_root_returns_none_for_an_absent_root() {
+        let store = Store::test_store();
+        assert_eq!(
+            store.block_slot_and_state_root(&H256::from([9u8; 32])),
+            None
+        );
+    }
+
+    #[test]
+    fn block_slot_and_state_root_agrees_with_block_entry_on_slot_for_a_lean_block() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let anchor_root = store.head().expect("head root");
+
+        let block = signed_block(1, anchor_root);
+        let block_root = block.message.hash_tree_root();
+        store
+            .insert_signed_block(block_root, SignedBeaconBlock::Lean(block))
+            .expect("insert lean block");
+
+        let (entry_slot, _) = store.block_entry(&block_root).expect("block entry");
+        let (read_slot, _) = store
+            .block_slot_and_state_root(&block_root)
+            .expect("block slot and state root");
+        // Both accessors read the same BlockHeaders row, so they must not
+        // disagree about which block it is.
+        assert_eq!(entry_slot, read_slot);
+    }
+
+    #[test]
+    fn block_slot_and_state_root_agrees_with_block_entry_on_slot_for_a_beacon_block() {
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let block = beacon_test_block(5, H256::from([1u8; 32]));
+        let block_root = block.message_hash_tree_root();
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert beacon block");
+
+        let (entry_slot, _) = store.block_entry(&block_root).expect("block entry");
+        let (read_slot, _) = store
+            .block_slot_and_state_root(&block_root)
+            .expect("block slot and state root");
+        assert_eq!(entry_slot, read_slot);
     }
 
     impl Store {
