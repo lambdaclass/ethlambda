@@ -129,6 +129,11 @@ fn apply_blocks(
 
     let engine = ExecutionEngine::valid();
 
+    // Cache the previous block's state root, as `sanity::apply_blocks` does and
+    // for the same reason; here it also covers advancing across a fork
+    // boundary.
+    let mut previous_state_root = None;
+
     for index in 0..meta.blocks_count {
         let fork = if index < first_post_fork_index {
             pre_fork
@@ -140,12 +145,24 @@ fn apply_blocks(
         let block = SignedBeaconBlock::from_ssz(fork, &bytes)
             .map_err(|err| format!("block {index} does not decode as {fork}: {err:?}"))?;
 
+        if let Some(root) = previous_state_root.take() {
+            state.latest_block_header_mut().state_root = root;
+        }
+
         stf::state_transition(state, &block, true, &config, &engine)
             .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+
+        previous_state_root = Some(block.state_root());
     }
 
     let boundary_slot = compute_start_slot_at_epoch(meta.fork_epoch);
     if state.slot() < boundary_slot {
+        // Only where something advances the state and consumes it; left set
+        // otherwise, the field would still be there when `check_transition`
+        // hashes it.
+        if let Some(root) = previous_state_root.take() {
+            state.latest_block_header_mut().state_root = root;
+        }
         stf::process_slots(state, boundary_slot, &config)
             .map_err(|err| format!("advancing to the fork boundary: {err:?}"))?;
     }

@@ -246,8 +246,14 @@ fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<
 /// applying it, so the header stored while processing that block cannot yet know
 /// it. It is left zero and filled in here, one slot later, which is the first
 /// moment the value exists.
+///
+/// A caller that already knows the root may perform that fixup early, writing
+/// it into the field itself; [`BeaconState::compute_state_root`] then hands it
+/// back instead of merkleizing a mainnet-sized registry a second time per
+/// import. The value is the one this would have computed, so the state comes
+/// out the same either way.
 pub fn process_slot(state: &mut BeaconState) -> Result<()> {
-    let previous_state_root = state.hash_tree_root();
+    let previous_state_root = state.compute_state_root();
     let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
     state.state_roots_mut()[position] = previous_state_root;
 

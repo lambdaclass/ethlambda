@@ -1476,6 +1476,7 @@ impl BlockChainServer {
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
     fn recompute_beacon_head(&mut self) {
+        let _timing = metrics::time_beacon_head_compute();
         let config = self.store.config();
         if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
             warn!(%err, "Failed to compute beacon head");

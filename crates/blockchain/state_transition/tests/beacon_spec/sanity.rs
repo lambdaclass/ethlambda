@@ -39,13 +39,26 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
     // engine that never objects keeps that variable out of the result.
     let engine = ExecutionEngine::valid();
 
+    // Cache the previous block's state root the way `fork_choice::on_block`
+    // does, so every multi-block case drives `BeaconState::compute_state_root`'s
+    // cached arm and the `post` comparison proves it changes nothing. Applied
+    // before the next block and never after the last, so what
+    // `check_transition` hashes is the specification's own state.
+    let mut previous_state_root = None;
+
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
         let block = SignedBeaconBlock::from_ssz(case.fork, &bytes)
             .map_err(|err| format!("block {index} does not decode: {err:?}"))?;
 
+        if let Some(root) = previous_state_root.take() {
+            state.latest_block_header_mut().state_root = root;
+        }
+
         stf::state_transition(state, &block, true, config, &engine)
             .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+
+        previous_state_root = Some(block.state_root());
     }
 
     Ok(())

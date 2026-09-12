@@ -321,6 +321,31 @@ impl BeaconState {
     pub fn hash_tree_root(&self) -> Root {
         dispatch_state_including_lean!(self, |state| state.hash_tree_root())
     }
+
+    /// This state's own merkle root, cached in `latest_block_header` if a
+    /// writer put it there and merkleized through
+    /// [`BeaconState::hash_tree_root`] otherwise.
+    ///
+    /// The cached field is the root of the state applying its block produced,
+    /// so it describes this state only while the state is still inside that
+    /// block's slot; one slot on it names the older one. The specification
+    /// fills it on the way out of that slot, so it never satisfies both halves
+    /// at once and every fixture state merkleizes here.
+    ///
+    /// The value reaches `state.state_roots`, a consensus input, so a wrong one
+    /// forks silently. Only a root this node computed, or checked against one
+    /// it computed, may be written: see `beacon::fork_choice::on_block` and
+    /// `get_forkchoice_store`, the two writers.
+    ///
+    /// Panics on [`BeaconState::Lean`], like every other beacon accessor here.
+    pub fn compute_state_root(&self) -> Root {
+        let header = self.latest_block_header();
+        if self.slot() == header.slot && !header.state_root.is_zero() {
+            header.state_root
+        } else {
+            self.hash_tree_root()
+        }
+    }
 }
 
 /// Generates read and write accessors for state fields that every fork shares.

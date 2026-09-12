@@ -54,16 +54,15 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    get_beacon_committee, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
-    get_committee_count_per_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
+    EpochCommittees, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, get_base_reward, has_flag};
+use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
 use crate::beacon::helpers::electra::{
-    compute_exit_epoch_and_update_churn, electra_state, get_attesting_indices,
-    get_committee_indices, get_consolidation_churn_limit, get_indexed_attestation,
-    get_max_effective_balance, get_pending_balance_to_withdraw,
-    has_compounding_withdrawal_credential, has_eth1_withdrawal_credential,
-    has_execution_withdrawal_credential,
+    compute_exit_epoch_and_update_churn, electra_state, get_committee_indices,
+    get_consolidation_churn_limit, get_indexed_attestation, get_max_effective_balance,
+    get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
+    has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
     initiate_validator_exit as electra_initiate_validator_exit, is_fully_withdrawable_validator,
     is_partially_withdrawable_validator, is_valid_indexed_attestation,
 };
@@ -687,13 +686,21 @@ pub fn process_attestation(
     // [Modified in Electra:EIP7549]
     verify(data.index == 0, "data.index == 0")?;
     let committee_indices = get_committee_indices(&attestation.committee_bits);
+    // One `EpochCommittees` for the whole loop below, rather than a fresh
+    // `get_committee_count_per_slot` and `get_beacon_committee` call (each an
+    // unconditional `O(registry size)` active-set scan) per named committee:
+    // `committee_bits` can name up to `MAX_COMMITTEES_PER_SLOT` committees in
+    // a single attestation, all drawn from this same `(state,
+    // data.target.epoch)` pair. See `EpochCommittees`'s own documentation for
+    // why sharing it here needs no cache-key matching to stay sound.
+    let committees = EpochCommittees::new(state, data.target.epoch);
     let mut committee_offset = 0usize;
     for committee_index in committee_indices {
         verify(
-            committee_index < get_committee_count_per_slot(state, data.target.epoch),
+            committee_index < committees.committees_per_slot(),
             "committee_index < get_committee_count_per_slot(state, data.target.epoch)",
         )?;
-        let committee = get_beacon_committee(state, data.slot, committee_index)?;
+        let committee = committees.committee(data.slot, committee_index)?;
         let committee_has_an_attester = (0..committee.len()).any(|position| {
             attestation
                 .aggregation_bits
@@ -722,9 +729,35 @@ pub fn process_attestation(
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies and add up the proposer's reward for granting them.
-    let attesting_indices = get_attesting_indices(state, attestation)?;
+    //
+    // Not a second `get_attesting_indices(state, attestation)` call: that
+    // would recompute exactly what `get_indexed_attestation` above already
+    // did (including its own `EpochCommittees`, another active-set scan) to
+    // fill `indexed_attestation.attesting_indices`, for the same attestation
+    // against the same unmutated `state`. `AttestingIndices` derefs to
+    // `&[ValidatorIndex]`, already sorted by `get_attesting_indices`, so this
+    // is the identical value the second call would have produced.
+    let attesting_indices = indexed_attestation.attesting_indices.to_vec();
     let current_epoch_target = data.target.epoch == current_epoch;
     let participation = epoch_participation(state, current_epoch_target, "process_attestation")?;
+
+    // Hoisted out of the loop below, where the specification writes
+    // `get_base_reward(state, index)` per attester per flag. That helper is
+    // `increments * get_base_reward_per_increment(state)`, and the second
+    // factor is `get_total_active_balance`, which scans the whole validator
+    // registry and allocates a `Vec` of the active set on every call, with no
+    // cache anywhere beneath it.
+    //
+    // The read phase does not mutate `state`, so the value is constant across
+    // the whole loop and this is the same arithmetic in a different order. At
+    // mainnet's ~1M validators it is also the difference between importing a
+    // block and not: an Electra block carries up to `MAX_ATTESTATIONS_ELECTRA`
+    // aggregates covering thousands of attesters each, so the unhoisted form
+    // ran tens of thousands of million-element scans per block and never
+    // finished one. That was measured on a live mainnet run: the chain actor
+    // sat at 98% CPU inside `get_active_validator_indices`, reached through
+    // exactly this line, and the node's clock stopped advancing.
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
@@ -745,9 +778,16 @@ pub fn process_attestation(
             }
             new_flags = add_flag(new_flags, flag_index);
             let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
-            let reward = get_base_reward(state, index)?.checked_mul(weight).ok_or(
-                Error::ArithmeticOverflow("get_base_reward(state, index) * weight"),
-            )?;
+            // `get_base_reward(state, index)` inlined against the hoisted
+            // per-increment value above, keeping the helper's own order of
+            // operations so the result is bit-identical.
+            let increments =
+                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let reward = (increments * base_reward_per_increment)
+                .checked_mul(weight)
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_base_reward(state, index) * weight",
+                ))?;
             proposer_reward_numerator = proposer_reward_numerator
                 .checked_add(reward)
                 .ok_or(Error::ArithmeticOverflow("proposer_reward_numerator"))?;

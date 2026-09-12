@@ -106,14 +106,105 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
     hash(&input)
 }
 
+/// How many committees a slot with `active_count` active validators splits
+/// into: at least one, so a small chain still produces committees, and at
+/// most `MAX_COMMITTEES_PER_SLOT`.
+///
+/// The half of [`get_committee_count_per_slot`] that does not need a state,
+/// split out so [`EpochCommittees::new`] can share one
+/// [`get_active_validator_indices`] scan between this and its own committee
+/// derivation, rather than [`get_committee_count_per_slot`] repeating the scan
+/// the caller already did to get `active_count` in the first place.
+fn committee_count_per_slot(active_count: u64) -> u64 {
+    let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
+    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+}
+
 /// How many committees each slot of `epoch` has.
 ///
 /// At least one, so a small chain still produces committees, and at most
 /// `MAX_COMMITTEES_PER_SLOT`.
 pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
-    let active = get_active_validator_indices(state, epoch).len() as u64;
-    let ideal = active / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
-    ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
+    committee_count_per_slot(get_active_validator_indices(state, epoch).len() as u64)
+}
+
+/// Everything [`get_beacon_committee`] needs for one `(state, epoch)` pair,
+/// computed once so that deriving every committee of that epoch does not
+/// repeat the active-set scan per committee.
+///
+/// Electra's `get_attesting_indices` calls [`get_beacon_committee`] once per
+/// committee bit set in one attestation, up to `MAX_COMMITTEES_PER_SLOT`
+/// times for each of up to `MAX_ATTESTATIONS_ELECTRA` attestations in a
+/// block, and `stf::electra::process_attestation` does the same again while
+/// validating the attestation's committee bits. Each of those calls scans the
+/// whole validator registry twice over: once in
+/// [`get_committee_count_per_slot`] and once for the committee itself.
+/// Building one `EpochCommittees` and slicing every committee a caller needs
+/// out of it turns those hundreds of scans back into the one their shared
+/// `(state, epoch)` pair actually costs.
+///
+/// # Why the active set is not memoized across calls
+///
+/// [`get_active_validator_indices`] reads `activation_epoch` and `exit_epoch`
+/// off every validator in `state.validators()`, so it is a function of the
+/// state's registry, not of `epoch` or `seed` alone. Two different states can
+/// share an epoch number, or even a seed (it comes from a RANDAO mix fixed
+/// before either state's fork point, so two sibling branches diverging
+/// afterward share it exactly) while disagreeing on which validators are
+/// active. That is precisely the situation fork choice holds concurrent
+/// states for, and precisely what the spec fixtures construct on purpose, so
+/// keying a cross-call cache on either value would risk serving one state's
+/// active set to a lookup for another. This therefore recomputes the active
+/// set every time one is built, which is sound by construction since it is a
+/// plain function of the exact `&BeaconState` the caller holds, and only
+/// avoids recomputing it *within* one `EpochCommittees`.
+///
+/// # Deviation from the branch this was ported from
+///
+/// `feat/mainnet-network` also memoizes the shuffle permutation itself, keyed
+/// on `(seed, index_count)`, which is sound because that pair is the entire
+/// input to the pure function computing it. That cache is not here yet, so
+/// [`Self::committee`] still pays one [`compute_committee`] shuffle per
+/// committee; only the registry scans are shared. Adding the shuffle cache is
+/// a drop-in change to this type's internals.
+pub struct EpochCommittees {
+    active_indices: Vec<ValidatorIndex>,
+    committees_per_slot: u64,
+    seed: Bytes32,
+}
+
+impl EpochCommittees {
+    /// Scans `state`'s active set for `epoch` once, and derives the committee
+    /// count and shuffle seed from it.
+    pub fn new(state: &BeaconState, epoch: Epoch) -> Self {
+        let active_indices = get_active_validator_indices(state, epoch);
+        let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
+        let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
+        Self {
+            active_indices,
+            committees_per_slot,
+            seed,
+        }
+    }
+
+    /// How many committees each slot of this epoch has. The same value
+    /// [`get_committee_count_per_slot`] would return, read off this type
+    /// instead of rescanning the registry for it.
+    pub fn committees_per_slot(&self) -> u64 {
+        self.committees_per_slot
+    }
+
+    /// The committee at `slot` (which must fall in this epoch) with `index`.
+    /// The same value [`get_beacon_committee`] would return, derived from the
+    /// already-scanned active set.
+    pub fn committee(&self, slot: Slot, index: CommitteeIndex) -> Result<Vec<ValidatorIndex>> {
+        compute_committee(
+            &self.active_indices,
+            self.seed,
+            (slot % preset::SLOTS_PER_EPOCH) * self.committees_per_slot + index,
+            self.committees_per_slot * preset::SLOTS_PER_EPOCH,
+        )
+    }
 }
 
 /// The committee at `slot` with index `index`.
@@ -121,22 +212,18 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// One epoch's active set is shuffled once and then split across every slot and
 /// committee of that epoch, so the committee index is a position within that
 /// single split rather than an independent draw.
+///
+/// Builds a fresh [`EpochCommittees`] per call, so a single lookup pays
+/// exactly what it always did: one active-set scan and one shuffle. A caller
+/// deriving more than one committee for the same `(state, epoch)` should build
+/// its own [`EpochCommittees`] once and call [`EpochCommittees::committee`]
+/// rather than calling this in a loop; see that type's documentation for why.
 pub fn get_beacon_committee(
     state: &BeaconState,
     slot: Slot,
     index: CommitteeIndex,
 ) -> Result<Vec<ValidatorIndex>> {
-    let epoch = compute_epoch_at_slot(slot);
-    let committees_per_slot = get_committee_count_per_slot(state, epoch);
-    let indices = get_active_validator_indices(state, epoch);
-    let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
-
-    compute_committee(
-        &indices,
-        seed,
-        (slot % preset::SLOTS_PER_EPOCH) * committees_per_slot + index,
-        committees_per_slot * preset::SLOTS_PER_EPOCH,
-    )
+    EpochCommittees::new(state, compute_epoch_at_slot(slot)).committee(slot, index)
 }
 
 /// The proposer for the state's current slot, dispatching on fork for the
