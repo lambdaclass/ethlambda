@@ -8,6 +8,7 @@ use leansig::{
     serialization::Serializable,
     signature::{SignatureScheme, SignatureSchemeSecretKey as _, SigningError},
 };
+use rand::{SeedableRng as _, rngs::StdRng};
 
 /// The XMSS signature scheme used for validator signatures.
 ///
@@ -88,6 +89,27 @@ impl ValidatorSecretKey {
         let sk = LeanSigSecretKey::from_bytes(bytes)
             .map_err(|e| SignatureParseError(format!("{e:?}")))?;
         Ok(Self { inner: sk })
+    }
+
+    /// Derive a key pair deterministically from `seed`, active for epochs
+    /// `activation_epoch..activation_epoch + num_active_epochs`.
+    ///
+    /// The seed fully determines the key, so this exists for tests and
+    /// benchmarks that need reproducible validators. Real validator keys must
+    /// come from a cryptographically secure RNG, never from this. Keygen cost
+    /// scales with `num_active_epochs`.
+    pub fn generate_from_seed(
+        seed: u64,
+        activation_epoch: usize,
+        num_active_epochs: usize,
+    ) -> (ValidatorPublicKey, Self) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let (pk, sk) = LeanSignatureScheme::key_gen(&mut rng, activation_epoch, num_active_epochs);
+        (ValidatorPublicKey { inner: pk }, Self { inner: sk })
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.inner.to_bytes()
     }
 
     /// Sign a message with this private key.
