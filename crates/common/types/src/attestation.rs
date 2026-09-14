@@ -152,6 +152,15 @@ pub fn bits_is_subset(a: &AggregationBits, b: &AggregationBits) -> bool {
     true
 }
 
+/// Returns `true` iff `a` and `b` mark exactly the same validators.
+///
+/// Set equality, not `==`: the same validator set can be carried at different
+/// bitlist lengths (one built from `max_id + 1`, another padded further), and
+/// `==` compares the encoding rather than the set.
+pub fn bits_same_set(a: &AggregationBits, b: &AggregationBits) -> bool {
+    bits_is_subset(a, b) && bits_is_subset(b, a)
+}
+
 /// Aggregated attestation with its signature proof, used for gossip on the aggregation topic.
 ///
 /// The `proof` carries a single-message multi-signer aggregate: the signed

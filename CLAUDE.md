@@ -19,7 +19,7 @@ crates/
     ├─ src/lib.rs           # BlockChain actor, tick events, validator duties
     ├─ src/store.rs         # Fork choice store, block/attestation processing
     ├─ src/block_builder.rs # Block assembly (pre-built at previous slot's interval 4)
-    ├─ src/aggregation.rs   # Interval-2 signature aggregation worker
+    ├─ src/aggregation.rs   # Always-on signature aggregation worker (own thread + Store clone)
     ├─ src/reaggregate.rs   # Re-aggregation of block-borne votes on import
     ├─ src/sync_status.rs   # Sync-gate tracker (suppresses duties while syncing)
     ├─ src/key_manager.rs   # Validator key management and signing
@@ -56,7 +56,7 @@ crates/
 ```
 Interval 0: Block published (at the slot boundary). The build+publish code path is merged into the previous slot's interval 4 (see below) and aligned to publish here; no attestation acceptance happens at interval 0.
 Interval 1: Attestation production (all validators, including proposer)
-Interval 2: Aggregation (aggregators create proofs from gossip signatures)
+Interval 2: Aggregate publication (aggregators gossip the aggregates their worker produced). Proving itself is NOT confined to this interval: the worker runs continuously, and the actor buffers each finished aggregate until this tick. One that finishes DURING interval 2 or 3 is gossiped on arrival instead, since the window is already open and buffering would hold it a full slot.
 Interval 3: Safe target update (fork choice)
 Interval 4: Accept accumulated attestations; build the NEXT slot's block and publish it aligned to that slot's interval 0 (build and publish merged into this tick)
 ```
@@ -71,6 +71,63 @@ Fork choice head update
 ```
 (Store buffer fields are `new_payloads`/`known_payloads`; the accessors are named
 `extract_latest_new_attestations`/`extract_latest_known_attestations`.)
+
+### Always-On Aggregation Worker (`aggregation.rs`)
+- One plain `std::thread` spawned in the actor's `#[started]` hook, joined in `#[stopped]`.
+  Not `spawn_blocking`: it lives for the process and awaits nothing, so a blocking-pool
+  thread would be parked permanently for nothing
+- Holds its own `Store` clone (same backend, same in-memory buffers), so it both re-reads
+  the pool itself rather than being handed a per-slot snapshot AND writes back what it
+  produces: `select_best_job` → prove → `store_aggregate` → `AggregateProduced` message →
+  repeat. Nothing eligible means a `WORKER_IDLE_POLL` sleep
+- The WORKER stores each aggregate (payload into the pool, gossip signatures out of it)
+  before announcing it, so the message carries no proof and the actor's mailbox never
+  holds one. The actor only **buffers** the gossip publication in `pending_aggregates`
+  until interval 2
+- That write races the actor, and is safe on two counts: `insert_new_aggregated_payload`
+  records fork-choice votes with a max-merge (`should_replace_vote`), which is
+  order-independent, and a concurrent promote MOVES votes new→known rather than dropping
+  them, so the worst interleaving defers a vote or its payload by one tick.
+  `delete_gossip_signatures` can only race a duplicate of a vote the proof already binds
+- `pending_aggregates` keys by attestation data root and stores PARTICIPANT SETS, not
+  proofs. The proof is already in the payload pool, and `Store::proof_for_participants`
+  fetches the named one back at publish time, so the buffer costs a bitfield per aggregate
+  instead of up to 512 KiB. A miss means the pool let the proof go (subsumed, pruned,
+  evicted) and there is nothing left to send
+- Naming a SPECIFIC proof is what makes that read-back safe. Do NOT change it to ask the
+  pool for the best proof under a data root: the pool also holds peers' proofs for the
+  same attestation data, `PayloadBuffer` keeps a peer's disjoint proof beside ours, and
+  any "pick the best" rule would publish theirs in place of ours and leave our subnet's
+  votes off the wire entirely
+- `PendingAggregate::push` mirrors `PayloadBuffer`'s subsumption rule on the participant
+  sets, so a re-proved group replaces the narrower name, disjoint sets both survive, and
+  the names kept are the ones that still resolve. `MAX_PENDING_AGGREGATES` bounds the rest
+- `JobPolicy` gates what the worker may take, by position in the slot: backlog
+  work early, a current-slot group once it holds `min_current_slot_group_sigs`, and inside
+  `EARLY_AGGREGATION_WINDOW` before interval 2 nothing but that group (a backlog job is a
+  recursive merge that would occupy the single prover across the boundary)
+- *Which* slot comes from `store.current_slot()`, the same clock `on_tick`'s idempotency
+  guard keys on; only the sub-interval position inside it comes from the wall clock
+  (`ms_into_slot`, clamped to that slot). Two independent clocks would let the worker and
+  the actor disagree about the current slot, and `select_best_job` buckets on exactly that
+- The actor parks the worker through a `PauseReason` bitset (`AtomicU8`), and the worker
+  takes no new job while any bit is set. `BlockBuild` is scoped, taken as an RAII
+  `PauseGuard` around `propose_block`, since both compete for the same single-threaded
+  leanVM prover. `Syncing` is level-driven from `duties_allowed()` on every tick via
+  `set_paused`, so a node that is behind does not prove a backlog against the prover its
+  block import needs, and `--disable-duty-sync-gate` keeps the worker running for free.
+  A proof already in flight is not interrupted — `aggregate_mixed` cannot be
+- One reason, one owner: a bitset (rather than a bool or a depth counter) makes setting
+  idempotent for the level-driven owner and stops a guard's drop from releasing someone
+  else's reason
+- Division of labor: the worker reads shared state that OTHER threads write (the
+  `AggregatorController`, which the RPC thread toggles); state the actor itself owns
+  reaches the worker as a `PauseReason`, so the policy is not re-derived in two places
+- The worker keeps NO memory of what it has already proved. It does not need one: it
+  stores each aggregate before its next selection round, so the pool that round re-reads
+  already accounts for it. A FAILED proof does leave the pool untouched and will be picked
+  again, which is accepted; the failure branch sleeps `WORKER_IDLE_POLL` so a proof that
+  fails cheaply cannot spin the thread
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots
@@ -353,7 +410,7 @@ incremental, and line-tables-only debuginfo, so rebuilds are much faster than
 ### Aggregator Flag Required for Finalization
 - At least one node **must** be started with `--is-aggregator` to finalize blocks
 - Without this flag, attestations pass signature verification and are logged as "Attestation processed", but the signature is never stored for aggregation (the `is_aggregator` gate in `on_gossip_attestation`, `store.rs`), so blocks are always built with `attestation_count=0`
-- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregate at interval 2 → promote to known → pack into blocks
+- The attestation pipeline: gossip → verify signature → store gossip signature (only if `is_aggregator`) → aggregation worker picks it up on its next selection round → publish at interval 2 → promote to known → pack into blocks
 - **Symptom**: `justified_slot=0` and `finalized_slot=0` indefinitely despite healthy block production and attestation gossip
 
 ### Runtime Aggregator Toggle (Hot-Standby Model)
