@@ -172,9 +172,15 @@ fn update_safe_target(store: &mut Store) {
 /// Return whether `ancestor` lies on `descendant`'s parent chain.
 ///
 /// `descendant_header` is the descendant's already-fetched header, so the walk
-/// starts from its parent without re-reading it. Walks parent links down to the
-/// ancestor's slot. Empty (skipped) slots on the path are traversed transparently
-/// since they carry no block. A block missing from the store yields `false`.
+/// never re-reads it. Empty (skipped) slots on the path are traversed
+/// transparently since they carry no block. A block missing from the store
+/// yields `false`.
+///
+/// The walk stops as soon as it reaches a block on the canonical chain: below
+/// that point the chain is a single path, so the canonical slot index answers
+/// the rest with one lookup. That bounds the cost by how deep the descendant's
+/// branch has forked rather than by the distance between the two checkpoints,
+/// which is what keeps validation cheap when finality is far behind the head.
 fn checkpoint_is_ancestor(
     store: &Store,
     ancestor: &Checkpoint,
@@ -187,22 +193,52 @@ fn checkpoint_is_ancestor(
         return ancestor.slot == descendant.slot && ancestor.root == descendant.root;
     }
 
-    // The descendant header is already in hand, so begin the walk at its parent.
-    let mut current_root = descendant_header.parent_root;
-    while let Some(current_header) = store
-        .get_block_header(&current_root)
-        .expect("parent block exists")
-    {
-        if current_header.slot == ancestor.slot {
+    // Resolve the ancestor against the canonical index once. `None` means the
+    // index has nothing to say about that slot, so the parent walk stays the only
+    // sound answer: a miss must never be read as "not an ancestor".
+    let ancestor_is_canonical = store
+        .canonical_root_at_slot(ancestor.slot)
+        .expect("canonical block root")
+        .map(|canonical| canonical == ancestor.root);
+
+    let mut current_root = descendant.root;
+    let mut current_slot = descendant.slot;
+    let mut current_parent = descendant_header.parent_root;
+    loop {
+        if current_slot == ancestor.slot {
             return current_root == ancestor.root;
         }
-        if current_header.slot < ancestor.slot {
+        if current_slot < ancestor.slot {
+            // Walked past the ancestor's slot without meeting it: this branch
+            // skips that slot, so the ancestor is not on it.
             return false;
         }
-        current_root = current_header.parent_root;
-    }
 
-    false
+        // Reaching a canonical block strictly above the ancestor's slot settles
+        // the rest: the chain below it is a single path, so the ancestor lies on
+        // it exactly when the index names the ancestor at its own slot. This must
+        // stay below the slot guards, since a canonical block at or below the
+        // ancestor's slot says nothing about whether this branch passes through
+        // the ancestor.
+        if let Some(is_canonical) = ancestor_is_canonical
+            && store
+                .canonical_root_at_slot(current_slot)
+                .expect("canonical block root")
+                == Some(current_root)
+        {
+            return is_canonical;
+        }
+
+        current_root = current_parent;
+        let Some(current_header) = store
+            .get_block_header(&current_root)
+            .expect("parent block exists")
+        else {
+            return false;
+        };
+        current_slot = current_header.slot;
+        current_parent = current_header.parent_root;
+    }
 }
 
 /// Validate incoming attestation before processing.
@@ -1509,6 +1545,165 @@ mod tests {
             store.latest_justified().expect("store has justified"),
             "source must not be the store's off-head global justified"
         );
+    }
+
+    /// Fetch a block's header for the ancestry helper, which takes the
+    /// descendant's header already in hand.
+    fn header_of(store: &Store, root: H256) -> BlockHeader {
+        store
+            .get_block_header(&root)
+            .expect("get_block_header should succeed")
+            .expect("test block header exists")
+    }
+
+    /// A vote sitting entirely on the canonical chain validates through the
+    /// canonical index rather than the parent walk.
+    #[test]
+    fn validate_attestation_accepts_canonical_vote_via_index() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        let b3 = H256([3u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        insert_test_block(&mut store, b3, 3, b2);
+        // Moving the head is what populates the canonical slot index.
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(b3))
+            .expect("update_checkpoints should succeed");
+        store
+            .set_time(3 * INTERVALS_PER_SLOT)
+            .expect("set_time should succeed");
+
+        let data = AttestationData {
+            slot: 3,
+            source: Checkpoint {
+                root: genesis,
+                slot: 0,
+            },
+            target: Checkpoint { root: b1, slot: 1 },
+            head: Checkpoint { root: b3, slot: 3 },
+        };
+
+        assert!(
+            validate_attestation_data(&store, &data).is_ok(),
+            "canonical vote must validate"
+        );
+    }
+
+    /// With the descendant on the canonical chain, an ancestor the index places
+    /// on a different branch is rejected without walking down to its slot.
+    #[test]
+    fn checkpoint_is_ancestor_rejects_off_chain_ancestor_via_index() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        let sibling_1 = H256([3u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        insert_test_block(&mut store, sibling_1, 1, genesis);
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(b2))
+            .expect("update_checkpoints should succeed");
+
+        // The index names b1 at slot 1, so sibling_1 cannot be on b2's chain.
+        assert!(!checkpoint_is_ancestor(
+            &store,
+            &Checkpoint {
+                root: sibling_1,
+                slot: 1
+            },
+            &Checkpoint { root: b2, slot: 2 },
+            &header_of(&store, b2),
+        ));
+    }
+
+    /// A branch that skips over the ancestor's slot entirely does not contain
+    /// the ancestor, even when the branch rejoins the canonical chain below it.
+    /// Answering from the index at that rejoin point would wrongly accept the
+    /// vote, so the slot guards have to settle the walk first.
+    #[test]
+    fn checkpoint_is_ancestor_rejects_ancestor_skipped_by_fork_branch() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        // Canonical: genesis(0) <- a(1) <- c(2). Fork: genesis(0) <- d(3),
+        // which jumps straight from slot 0 to slot 3 and never passes through a.
+        let a = H256([1u8; 32]);
+        let c = H256([2u8; 32]);
+        let d = H256([3u8; 32]);
+        insert_test_block(&mut store, a, 1, genesis);
+        insert_test_block(&mut store, c, 2, a);
+        insert_test_block(&mut store, d, 3, genesis);
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(c))
+            .expect("update_checkpoints should succeed");
+
+        assert!(!checkpoint_is_ancestor(
+            &store,
+            &Checkpoint { root: a, slot: 1 },
+            &Checkpoint { root: d, slot: 3 },
+            &header_of(&store, d),
+        ));
+    }
+
+    /// A slot the index cannot speak for falls back to the parent walk. Reading
+    /// that miss as "not an ancestor" would reject a perfectly good vote.
+    #[test]
+    fn checkpoint_is_ancestor_walks_when_slot_has_no_index_entry() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        let b3 = H256([3u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        insert_test_block(&mut store, b2, 2, b1);
+        insert_test_block(&mut store, b3, 3, b2);
+        // Without a checkpoint update the index holds nothing but the anchor.
+        assert_eq!(
+            store
+                .canonical_root_at_slot(1)
+                .expect("canonical block root"),
+            None
+        );
+
+        assert!(checkpoint_is_ancestor(
+            &store,
+            &Checkpoint { root: b1, slot: 1 },
+            &Checkpoint { root: b3, slot: 3 },
+            &header_of(&store, b3),
+        ));
+    }
+
+    /// A block imported but not yet selected by fork choice has no index entry
+    /// of its own, so the walk takes one step to its canonical parent and stops.
+    #[test]
+    fn checkpoint_is_ancestor_resolves_block_not_yet_selected_as_head() {
+        let mut store = new_test_store();
+        let genesis = store.head().expect("store head exists");
+
+        let b1 = H256([1u8; 32]);
+        let b2 = H256([2u8; 32]);
+        insert_test_block(&mut store, b1, 1, genesis);
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(b1))
+            .expect("update_checkpoints should succeed");
+        insert_test_block(&mut store, b2, 2, b1);
+
+        assert!(checkpoint_is_ancestor(
+            &store,
+            &Checkpoint {
+                root: genesis,
+                slot: 0
+            },
+            &Checkpoint { root: b2, slot: 2 },
+            &header_of(&store, b2),
+        ));
     }
 
     /// leanSpec #833: a vote whose head sits on a sibling fork of the target
