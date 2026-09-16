@@ -141,12 +141,24 @@ const KEY_PRESET: &[u8] = b"preset";
 const KEY_BEACON_UNREALIZED_JUSTIFIED: &[u8] = b"beacon_unrealized_justified";
 /// Key for the beacon store's unrealized finalized checkpoint.
 const KEY_BEACON_UNREALIZED_FINALIZED: &[u8] = b"beacon_unrealized_finalized";
+/// The slot this directory's chain begins at: the anchor block's own slot,
+/// whether that anchor is genesis or a checkpoint. Its value has type [`u64`]
+/// and it's SSZ-encoded.
+///
+/// Written once by each bootstrap path and never rewritten, like [`KEY_CONFIG`]
+/// and [`KEY_CHAIN`]. It is the store's only record of where it started:
+/// [`KEY_LATEST_FINALIZED`] is seeded to the anchor too, but moves with the
+/// chain, so after the first finalization nothing else on disk can answer this.
+const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// The on-disk format this build reads and writes.
 ///
 /// Bumped whenever a table's key or value layout changes. `from_db_state`
 /// refuses any other value rather than migrating: a lean devnet resyncs in
 /// minutes, and a wrong guess about an old layout corrupts silently.
-pub const DB_VERSION: u64 = 1;
+///
+/// 2 added [`KEY_ANCHOR_SLOT`], which [`Store::from_db_state`] requires and a
+/// version 1 directory does not carry.
+pub const DB_VERSION: u64 = 2;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -632,6 +644,26 @@ fn encode_block_root_key(slot: u64) -> Vec<u8> {
     slot.to_be_bytes().to_vec()
 }
 
+/// The length of every [`data_column_key`]: slot, root, column index.
+const DATA_COLUMN_KEY_LEN: usize = 8 + 32 + 8;
+
+/// The key one sidecar is stored under: slot, then block root, then column.
+///
+/// Extends [`encode_slot_root_key`]'s slot||root pair with the column index,
+/// so a block's sidecars share the same slot-major prefix `LiveChain` and
+/// `BlockProof` already use, and a prefix scan over just that pair (see
+/// [`data_column_block_prefix`]) recovers every column of one block.
+fn data_column_key(slot: u64, block_root: &H256, column_index: u64) -> Vec<u8> {
+    let mut key = encode_slot_root_key(slot, block_root);
+    key.extend_from_slice(&column_index.to_be_bytes());
+    key
+}
+
+/// The prefix every sidecar of one block shares: its slot||root pair.
+fn data_column_block_prefix(slot: u64, block_root: &H256) -> Vec<u8> {
+    encode_slot_root_key(slot, block_root)
+}
+
 /// Encodes a `States` value: the state's fork selector, then the variant's own
 /// SSZ.
 ///
@@ -733,6 +765,16 @@ pub struct Store {
     /// [`Store::config`] is: written once at bootstrap, so a per-`Store` copy
     /// cannot go stale.
     pub(crate) chain: Chain,
+    /// The slot this store's chain begins at, from [`KEY_ANCHOR_SLOT`]. Cached
+    /// for the same reason [`Store::chain`] is, and it is read on the
+    /// `data_column_sidecars_by_range` path, where a backend round trip per
+    /// request would buy nothing: the value cannot change while the process
+    /// runs.
+    ///
+    /// A node that bootstrapped from genesis has zero here; one that
+    /// checkpoint-synced has the checkpoint's slot. Nothing below it is
+    /// servable, because nothing below it was ever written.
+    anchor_slot: u64,
     new_payloads: Arc<Mutex<PayloadBuffer>>,
     known_payloads: Arc<Mutex<PayloadBuffer>>,
     /// Fork-choice votes, independent from bounded proof/signature buffers.
@@ -864,7 +906,7 @@ impl Store {
     /// [`Error::DbVersionMismatch`] when the directory was written by a build
     /// with a different on-disk format. There is no migration.
     pub fn from_db_state(backend: Arc<dyn StorageBackend>) -> Result<Option<Self>, Error> {
-        let (config, chain) = {
+        let (config, chain, anchor_slot) = {
             // Written by both `init_store` and `init_beacon`, so a backend
             // missing this has never held a chain of either kind.
             let view = backend.begin_read().expect("read view");
@@ -908,11 +950,29 @@ impl Store {
                 .and_then(Chain::from_selector)
                 .expect("a versioned directory always carries a chain tag");
 
-            (Config::from_ssz_bytes(&bytes).expect("valid config"), chain)
+            // Both bootstrap paths write this, and the version check above
+            // already turned away every directory written before they did, so
+            // an absent key here is not an old directory but a corrupt one.
+            let anchor_slot = view
+                .get(Table::Metadata, KEY_ANCHOR_SLOT)
+                .expect("get anchor slot")
+                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid anchor slot"))
+                .expect("a versioned directory always carries an anchor slot");
+
+            (
+                Config::from_ssz_bytes(&bytes).expect("valid config"),
+                chain,
+                anchor_slot,
+            )
         };
 
-        info!(?chain, "Loaded store from persisted DB state");
-        Ok(Some(Self::from_parts(backend, Arc::new(config), chain)))
+        info!(?chain, anchor_slot, "Loaded store from persisted DB state");
+        Ok(Some(Self::from_parts(
+            backend,
+            Arc::new(config),
+            chain,
+            anchor_slot,
+        )))
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -944,9 +1004,10 @@ impl Store {
 
         let anchor_block_root = anchor_state.latest_block_header.hash_tree_root();
 
+        let anchor_slot = anchor_state.latest_block_header.slot;
         let anchor_checkpoint = Checkpoint {
             root: anchor_block_root,
-            slot: anchor_state.latest_block_header.slot,
+            slot: anchor_slot,
         };
 
         // The runtime config a lean directory bootstraps with: built once here
@@ -975,6 +1036,7 @@ impl Store {
                 (KEY_SAFE_TARGET.to_vec(), anchor_block_root.to_ssz()),
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
+                (KEY_ANCHOR_SLOT.to_vec(), anchor_slot.to_ssz()),
             ];
             batch
                 .put_batch(Table::Metadata, metadata_entries)
@@ -1030,9 +1092,14 @@ impl Store {
             batch.commit().expect("commit");
         }
 
-        info!(%anchor_state_root, %anchor_block_root, "Initialized store");
+        info!(%anchor_state_root, %anchor_block_root, anchor_slot, "Initialized store");
 
-        Ok(Self::from_parts(backend, runtime_config, Chain::Lean))
+        Ok(Self::from_parts(
+            backend,
+            runtime_config,
+            Chain::Lean,
+            anchor_slot,
+        ))
     }
 
     /// Initialize an empty beacon-chain store.
@@ -1042,12 +1109,19 @@ impl Store {
     /// anchor block and state are written by the beacon fork choice's own
     /// `get_forkchoice_store`, which is where the specification's construction
     /// rules live and which needs beacon helpers this crate cannot call.
+    ///
+    /// `anchor_slot` is that caller's `anchor_state.slot()`, taken as its own
+    /// argument rather than read off `anchor_checkpoint`: the stored checkpoint
+    /// is epoch-denominated, so its slot is the epoch's *start*, which sits
+    /// below the anchor's own slot whenever the anchor is not itself a boundary
+    /// block.
     pub fn init_beacon(
         backend: Arc<dyn StorageBackend>,
         genesis_time: u64,
         config: Config,
         anchor_block_root: H256,
         anchor_checkpoint: Checkpoint,
+        anchor_slot: u64,
     ) -> Self {
         let runtime_config = Arc::new(Config {
             genesis_time,
@@ -1082,6 +1156,7 @@ impl Store {
                 KEY_BEACON_UNREALIZED_FINALIZED.to_vec(),
                 zero_checkpoint.to_ssz(),
             ),
+            (KEY_ANCHOR_SLOT.to_vec(), anchor_slot.to_ssz()),
         ];
 
         let mut batch = backend.begin_write().expect("write batch");
@@ -1090,20 +1165,31 @@ impl Store {
             .expect("put metadata");
         batch.commit().expect("commit");
 
-        info!(genesis_time, "Initialized beacon store");
+        info!(genesis_time, anchor_slot, "Initialized beacon store");
 
-        Self::from_parts(backend, runtime_config, Chain::Beacon)
+        Self::from_parts(backend, runtime_config, Chain::Beacon, anchor_slot)
     }
 
     /// Assembles a `Store` from the fields that vary across constructors,
     /// filling in the rest with fresh, empty buffers shared by every bootstrap
     /// path: [`Store::init_store`] (used by both [`Store::from_anchor_state`]
-    /// and [`Store::get_forkchoice_store`]) and [`Store::from_db_state`].
-    fn from_parts(backend: Arc<dyn StorageBackend>, config: Arc<Config>, chain: Chain) -> Self {
+    /// and [`Store::get_forkchoice_store`]), [`Store::init_beacon`] and
+    /// [`Store::from_db_state`].
+    ///
+    /// `anchor_slot` is the one field the resume path cannot derive, which is
+    /// why the two `init_*` paths persist it under [`KEY_ANCHOR_SLOT`] for
+    /// [`Store::from_db_state`] to read back.
+    fn from_parts(
+        backend: Arc<dyn StorageBackend>,
+        config: Arc<Config>,
+        chain: Chain,
+        anchor_slot: u64,
+    ) -> Self {
         Self {
             backend,
             config,
             chain,
+            anchor_slot,
             new_payloads: Arc::new(Mutex::new(PayloadBuffer::new(NEW_PAYLOAD_CAP))),
             known_payloads: Arc::new(Mutex::new(PayloadBuffer::new(AGGREGATED_PAYLOAD_CAP))),
             fork_choice: Default::default(),
@@ -1256,6 +1342,27 @@ impl Store {
     /// and cached, so this never reads the backend.
     pub fn chain(&self) -> Chain {
         self.chain
+    }
+
+    /// Refuse a lean-only accessor on a beacon store, naming the accessor.
+    ///
+    /// `Table::BlockHeaders` holds a different shape per chain: a lean
+    /// directory a [`BlockHeader`], a beacon one the whole signed block. An
+    /// accessor that decodes lean's own types out of it therefore answers
+    /// nothing on a beacon directory, and left unchecked it fails inside SSZ
+    /// with a length mismatch that names neither the accessor nor the caller.
+    ///
+    /// A P2P handler reached one through a peer's request on 2026-09-11 and
+    /// took the whole swarm actor down with exactly that error, so the check
+    /// is here rather than left to every call site to remember. Callers that
+    /// need these fields on either chain have
+    /// [`block_entry`](Self::block_entry) and
+    /// [`block_slot_and_state_root`](Self::block_slot_and_state_root), which
+    /// decode per chain.
+    #[cold]
+    #[track_caller]
+    fn lean_only(accessor: &str) -> ! {
+        panic!("{accessor} is lean-only and was called on a beacon store");
     }
 
     // ============ Head ============
@@ -1621,6 +1728,9 @@ impl Store {
 
     /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
+        if self.chain != Chain::Lean {
+            Self::lean_only("Store::get_block_header");
+        }
         let view = self.backend.begin_read().expect("read view");
         Ok(view
             .get(Table::BlockHeaders, &root.to_ssz())
@@ -1960,6 +2070,9 @@ impl Store {
     /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
     /// genesis block, which has no signature entry.
     pub fn get_block(&self, root: &H256) -> Result<Option<Block>, Error> {
+        if self.chain != Chain::Lean {
+            Self::lean_only("Store::get_block");
+        }
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
@@ -2747,6 +2860,9 @@ impl Store {
 
     /// Returns the slot of the current head block.
     pub fn head_slot(&self) -> u64 {
+        if self.chain != Chain::Lean {
+            Self::lean_only("Store::head_slot");
+        }
         self.get_block_header(&self.head().expect("head block exists"))
             .expect("head block exists")
             .unwrap()
@@ -2755,6 +2871,9 @@ impl Store {
 
     /// Returns the slot of the current safe target block.
     pub fn safe_target_slot(&self) -> u64 {
+        if self.chain != Chain::Lean {
+            Self::lean_only("Store::safe_target_slot");
+        }
         self.get_block_header(&self.safe_target().expect("safe target exists"))
             .expect("safe target exists")
             .unwrap()
@@ -2906,6 +3025,279 @@ impl Store {
             .unwrap()
             .unrealized_justifications
             .insert(root, checkpoint);
+    }
+
+    // ============ Data Columns ============
+    //
+    // Written on arrival (after verification), not at block import: the
+    // availability check needs a block's columns before that block imports,
+    // and a restart should keep what this node already paid to verify. See
+    // `Table::DataColumns`.
+
+    /// Store one verified sidecar.
+    ///
+    /// Takes the encoded bytes rather than the container: the caller has just
+    /// decoded them off the wire, and re-encoding a sidecar to store it would
+    /// pay a second SSZ pass on the hot gossip path for nothing.
+    ///
+    /// No earliest-slot bookkeeping rides along. The floor the by-range handler
+    /// refuses below is [`Store::anchor_slot`], which is where this directory's
+    /// chain begins and so is where custody could have begun; deriving it from
+    /// the sidecars actually written would make a hot-path read-decide-write
+    /// span out of a value that is fixed for the life of the directory.
+    ///
+    /// `&self` rather than `&mut self`, unlike most other writers in this
+    /// file, matching `set_metadata`: nothing here mutates a `Store` field
+    /// itself, only the shared backend behind it, so a shared reference
+    /// suffices no matter how many read-only clones exist elsewhere.
+    pub fn put_data_column_sidecar(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+        encoded: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.put_column_row(Table::DataColumns, slot, block_root, column_index, encoded)
+    }
+
+    /// Park a sidecar whose parent block has no post-state to check it against.
+    ///
+    /// The same key and the same encoded bytes as
+    /// [`Self::put_data_column_sidecar`], in `Table::PendingDataColumns`
+    /// instead. Nothing that decides data availability reads that table, which
+    /// is the whole point: this row has passed only the cheap structural
+    /// checks, and the expensive ones run when
+    /// [`Self::take_pending_data_column_sidecar`] hands it back.
+    pub fn put_pending_data_column_sidecar(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+        encoded: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.put_column_row(
+            Table::PendingDataColumns,
+            slot,
+            block_root,
+            column_index,
+            encoded,
+        )
+    }
+
+    /// Commit one sidecar row, under the same key in whichever of the two
+    /// column tables the caller named.
+    ///
+    /// Which table a sidecar belongs in is what separates the two writers
+    /// above; how a row is committed is not, and the availability gate's whole
+    /// safety rests on a parked row and a verified one being the same bytes
+    /// under the same key in different tables.
+    fn put_column_row(
+        &self,
+        table: Table,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+        encoded: Vec<u8>,
+    ) -> Result<(), Error> {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(data_column_key(slot, block_root, column_index), encoded)];
+        batch
+            .put_batch(table, entries)
+            .expect("put data column sidecar");
+        batch.commit().expect("commit");
+        Ok(())
+    }
+
+    /// Drop every parked row this directory holds.
+    ///
+    /// Called once at startup. The only index into `PendingDataColumns` is the
+    /// chain actor's in-memory `sidecars_awaiting_parent`, which does not
+    /// survive a restart, so every row written before one is unreachable by
+    /// construction — kept, unverified, and never read again. Nothing is lost
+    /// by dropping them: a parked sidecar had passed no check worth
+    /// preserving, and the block it belongs to will ask for its columns again.
+    pub fn clear_pending_data_column_sidecars(&self) -> Result<(), Error> {
+        // `delete_range` is half-open, and every key here is 48 bytes, so the
+        // upper bound is one byte longer and all ones: a shorter key sorts
+        // before its own extension, which is what makes this a strict bound on
+        // even an all-ones key rather than one that spares it.
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_range(
+                Table::PendingDataColumns,
+                &[0u8; DATA_COLUMN_KEY_LEN],
+                &[u8::MAX; DATA_COLUMN_KEY_LEN + 1],
+            )
+            .expect("clear parked data column sidecars");
+        batch.commit().expect("commit");
+        Ok(())
+    }
+
+    /// Read a parked sidecar back and drop its row in one step.
+    ///
+    /// Take rather than get: every caller is either about to verify the
+    /// sidecar, after which it belongs in `DataColumns` and not here, or about
+    /// to give up on it. Leaving the row behind for the caller to delete is
+    /// the shape that leaks one on every path that returns early.
+    pub fn take_pending_data_column_sidecar(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let key = data_column_key(slot, block_root, column_index);
+        let view = self.backend.begin_read().expect("read view");
+        let encoded = view.get(Table::PendingDataColumns, &key).expect("get");
+        drop(view);
+        if encoded.is_some() {
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::PendingDataColumns, vec![key])
+                .expect("delete pending data column sidecar");
+            batch.commit().expect("commit");
+        }
+        Ok(encoded)
+    }
+
+    /// Drop parked rows without reading them, for sidecars being given up on.
+    pub fn delete_pending_data_column_sidecars(
+        &self,
+        keys: impl IntoIterator<Item = (u64, H256, u64)>,
+    ) -> Result<(), Error> {
+        let keys: Vec<Vec<u8>> = keys
+            .into_iter()
+            .map(|(slot, block_root, column_index)| {
+                data_column_key(slot, &block_root, column_index)
+            })
+            .collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::PendingDataColumns, keys)
+            .expect("delete pending data column sidecars");
+        batch.commit().expect("commit");
+        Ok(())
+    }
+
+    /// One sidecar, or `None` if this node never custodied it.
+    pub fn get_data_column_sidecar(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        Ok(view
+            .get(
+                Table::DataColumns,
+                &data_column_key(slot, block_root, column_index),
+            )
+            .expect("get"))
+    }
+
+    /// Which columns of one block this node holds, ascending.
+    ///
+    /// What the availability check asks: it compares this against the columns
+    /// the node owes rather than fetching the sidecars themselves, so a block
+    /// missing one column costs no decoding at all.
+    ///
+    /// Sorted explicitly rather than trusted from the backend: both current
+    /// backends already return a prefix scan in lexicographic key order (see
+    /// `InMemoryBackend::prefix_iterator`), which for a fixed slot||root
+    /// prefix and a big-endian index is already ascending, but a future
+    /// backend need not repeat that guarantee.
+    pub fn data_column_indices_for(&self, slot: u64, block_root: &H256) -> Result<Vec<u64>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let prefix = data_column_block_prefix(slot, block_root);
+        let mut indices: Vec<u64> = view
+            .prefix_iterator(Table::DataColumns, &prefix)
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .map(|(key, _)| {
+                let index_bytes: [u8; 8] = key[key.len() - 8..]
+                    .try_into()
+                    .expect("a column key ends in an eight-byte index");
+                u64::from_be_bytes(index_bytes)
+            })
+            .collect();
+        indices.sort_unstable();
+        Ok(indices)
+    }
+
+    /// Every sidecar in `[start_slot, end_slot)` whose column is in `columns`,
+    /// restricted to each slot's canonical block, in slot then column order.
+    ///
+    /// What the by-range handler serves from. The specification asks a
+    /// response to be "consistent from a single chain within the context of
+    /// the request", but gossip import only requires a sidecar's block to
+    /// name a known, finalized-descendant parent, not a canonical one: a live
+    /// fork can leave both siblings' columns stored at one slot, and
+    /// `Table::DataColumns` is never pruned, so an orphaned sidecar would
+    /// otherwise sit there forever and leak into every future range answer
+    /// covering that slot. `Table::BlockRoots` is the canonical slot-to-root
+    /// index [`Self::get_signed_blocks_by_slot_range`] and the block-range
+    /// handler already key off, kept current by
+    /// [`Self::update_checkpoints`] on both chains; a slot with no entry
+    /// there has no canonical block; per the same "no block is returned for
+    /// an empty slot" rule the block-range handler applies, it contributes no
+    /// sidecars either.
+    ///
+    /// One [`StorageReadView::prefix_iterator`] call per slot rather than a
+    /// single range read, because [`StorageReadView`] offers only
+    /// exact-prefix iteration, with no range-iterator counterpart to
+    /// [`StorageWriteBatch::delete_range`]; a per-slot prefix is the closest
+    /// match this interface can express. The per-slot shape is right on its
+    /// own terms regardless, and should not change even if a range iterator
+    /// existed: this table is never pruned, so a whole-table scan would
+    /// degrade forever, while these indexed per-slot seeks stay bounded by
+    /// the requested range.
+    pub fn data_column_sidecars_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        columns: &[u64],
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let mut found = Vec::new();
+        for slot in start_slot..end_slot {
+            let Some(root_bytes) = view
+                .get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+            else {
+                continue;
+            };
+            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
+            let prefix = data_column_block_prefix(slot, &root);
+            let entries = view
+                .prefix_iterator(Table::DataColumns, &prefix)
+                .expect("iterator")
+                .filter_map(|res| res.ok());
+            for (key, value) in entries {
+                let index_bytes: [u8; 8] = key[key.len() - 8..]
+                    .try_into()
+                    .expect("a column key ends in an eight-byte index");
+                if columns.contains(&u64::from_be_bytes(index_bytes)) {
+                    found.push(value.to_vec());
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The slot this store's chain begins at.
+    ///
+    /// Zero for a directory bootstrapped from genesis, the checkpoint's slot
+    /// for one bootstrapped from a checkpoint. Fixed for the life of the
+    /// directory, which is what lets this be a field read rather than a
+    /// backend round trip; see [`KEY_ANCHOR_SLOT`].
+    ///
+    /// This is the honest floor for both the `Status` message's
+    /// `earliest_available_slot` and the `by_range` handlers: nothing below it
+    /// was ever written, so nothing below it can be served.
+    pub fn anchor_slot(&self) -> u64 {
+        self.anchor_slot
     }
 }
 
@@ -3171,6 +3563,7 @@ mod tests {
             Config::mainnet(),
             H256::ZERO,
             Checkpoint::default(),
+            0,
         )
     }
 
@@ -3341,6 +3734,7 @@ mod tests {
                 backend,
                 Arc::new(Config::lean(0, DEFAULT_MILLISECONDS_PER_SLOT)),
                 Chain::Lean,
+                0,
             )
         }
 
@@ -3351,6 +3745,7 @@ mod tests {
                 backend,
                 Arc::new(Config::lean(0, DEFAULT_MILLISECONDS_PER_SLOT)),
                 Chain::Lean,
+                0,
             )
         }
     }
@@ -5064,6 +5459,7 @@ mod tests {
             Config::mainnet(),
             anchor.root,
             Store::beacon_checkpoint_as_stored(anchor),
+            0,
         );
 
         let store = Store::from_db_state(backend).unwrap().unwrap();
@@ -5170,6 +5566,7 @@ mod tests {
             config,
             H256::ZERO,
             Checkpoint::default(),
+            0,
         );
 
         assert_eq!(store.chain(), Chain::Beacon);
@@ -5229,6 +5626,7 @@ mod tests {
             Config::mainnet(),
             anchor.root,
             Store::beacon_checkpoint_as_stored(anchor),
+            0,
         );
 
         assert_eq!(store.finalized_state_root().unwrap(), anchor.root);
@@ -5245,6 +5643,7 @@ mod tests {
             Config::mainnet(),
             H256::ZERO,
             Store::beacon_checkpoint_as_stored(BeaconCheckpoint::default()),
+            0,
         );
 
         assert!(matches!(
@@ -5267,6 +5666,7 @@ mod tests {
             Config::mainnet(),
             anchor_root,
             Checkpoint::default(),
+            0,
         );
         store
             .insert_signed_block(anchor_root, anchor)
@@ -5330,5 +5730,268 @@ mod tests {
 
         let reopened = beacon_test_store(backend);
         assert_eq!(reopened.unrealized_justification(&root), None);
+    }
+
+    // ============ Data Column Tests ============
+
+    fn sidecar_bytes(marker: u8) -> Vec<u8> {
+        vec![marker; 16]
+    }
+
+    #[test]
+    fn a_sidecar_round_trips_by_slot_root_and_index() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(1);
+        store
+            .put_data_column_sidecar(7, &root, 3, sidecar_bytes(0xab))
+            .unwrap();
+        assert_eq!(
+            store.get_data_column_sidecar(7, &root, 3).unwrap(),
+            Some(sidecar_bytes(0xab))
+        );
+        assert_eq!(store.get_data_column_sidecar(7, &root, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn a_parked_sidecar_is_invisible_to_the_verified_table() {
+        // The separation the availability gate rests on: `PendingDataColumns`
+        // holds rows nothing has verified, and `data_column_indices_for` is
+        // what decides whether a held block's custody set is complete.
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(1);
+        store
+            .put_pending_data_column_sidecar(7, &root, 3, sidecar_bytes(0xab))
+            .unwrap();
+
+        assert_eq!(
+            store.data_column_indices_for(7, &root).unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(store.get_data_column_sidecar(7, &root, 3).unwrap(), None);
+    }
+
+    #[test]
+    fn taking_a_parked_sidecar_hands_it_back_once() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(1);
+        store
+            .put_pending_data_column_sidecar(7, &root, 3, sidecar_bytes(0xab))
+            .unwrap();
+
+        assert_eq!(
+            store.take_pending_data_column_sidecar(7, &root, 3).unwrap(),
+            Some(sidecar_bytes(0xab))
+        );
+        assert_eq!(
+            store.take_pending_data_column_sidecar(7, &root, 3).unwrap(),
+            None,
+            "the row goes with the read, so a replayed key cannot be replayed twice"
+        );
+    }
+
+    #[test]
+    fn clearing_the_parked_table_spares_nothing_and_touches_no_other_table() {
+        // Run at startup, when the in-memory index into this table is gone.
+        // The bound has to cover an all-ones key too, which a `u64::MAX` slot
+        // prefix would sort before rather than delete.
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(1);
+        let extreme = H256::repeat_byte(0xff);
+        store
+            .put_pending_data_column_sidecar(0, &root, 0, sidecar_bytes(1))
+            .unwrap();
+        store
+            .put_pending_data_column_sidecar(u64::MAX, &extreme, u64::MAX, sidecar_bytes(2))
+            .unwrap();
+        store
+            .put_data_column_sidecar(7, &root, 3, sidecar_bytes(3))
+            .unwrap();
+
+        store.clear_pending_data_column_sidecars().unwrap();
+
+        assert_eq!(
+            store.take_pending_data_column_sidecar(0, &root, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .take_pending_data_column_sidecar(u64::MAX, &extreme, u64::MAX)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store.get_data_column_sidecar(7, &root, 3).unwrap(),
+            Some(sidecar_bytes(3)),
+            "the verified table is not what a restart throws away"
+        );
+    }
+
+    #[test]
+    fn the_indices_of_one_block_are_listed_in_order() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(2);
+        for index in [9, 1, 4] {
+            store
+                .put_data_column_sidecar(11, &root, index, sidecar_bytes(index as u8))
+                .unwrap();
+        }
+        // A sibling block at the same slot must not leak into the answer.
+        store
+            .put_data_column_sidecar(11, &H256::repeat_byte(3), 7, sidecar_bytes(7))
+            .unwrap();
+
+        assert_eq!(
+            store.data_column_indices_for(11, &root).unwrap(),
+            vec![1, 4, 9]
+        );
+    }
+
+    #[test]
+    fn the_anchor_slot_survives_a_resume_and_no_write_moves_it() {
+        // The whole reason this is persisted rather than derived: by the time a
+        // resumed store reads it back, `latest_finalized` has moved off the
+        // anchor, and storing sidecars must not be able to move it either.
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::init_beacon(
+            backend.clone(),
+            0,
+            Config::mainnet(),
+            H256::ZERO,
+            Checkpoint::default(),
+            4_096,
+        );
+        assert_eq!(store.anchor_slot(), 4_096);
+
+        let root = H256::repeat_byte(4);
+        for slot in [4_200, 4_100, 9_000] {
+            store
+                .put_data_column_sidecar(slot, &root, 0, sidecar_bytes(1))
+                .unwrap();
+        }
+        assert_eq!(store.anchor_slot(), 4_096);
+
+        let resumed = Store::from_db_state(backend).unwrap().unwrap();
+        assert_eq!(resumed.anchor_slot(), 4_096);
+    }
+
+    #[test]
+    fn a_genesis_bootstrapped_lean_store_anchors_at_zero() {
+        let store = Store::from_anchor_state(
+            Arc::new(InMemoryBackend::new()),
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        assert_eq!(store.anchor_slot(), 0);
+    }
+
+    /// A beacon store with a real anchor block behind its head, unlike
+    /// `beacon_test_store`'s bare zero-root stub: `update_checkpoints` walks
+    /// back from the old head to find the common ancestor with the new one,
+    /// and that walk needs a block entry for whatever root it starts from.
+    /// The data-column range tests below need to move the head, since
+    /// `data_column_sidecars_in_range` now reads `Table::BlockRoots` to learn
+    /// each slot's canonical root.
+    fn beacon_test_store_with_anchor() -> Store {
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        store
+            .insert_signed_block(H256::ZERO, beacon_test_block(0, H256::ZERO))
+            .expect("insert anchor block");
+        store
+    }
+
+    /// Inserts `block` and advances the store's head to its root, so the
+    /// slot it names reads back as canonical from `Table::BlockRoots`: what
+    /// `update_checkpoints` maintains on every head move, on both chains.
+    fn make_canonical(store: &mut Store, block: SignedBeaconBlock) -> H256 {
+        let root = block.message_hash_tree_root();
+        store.insert_signed_block(root, block).expect("insert");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("advance head");
+        root
+    }
+
+    #[test]
+    fn sidecars_are_scanned_in_slot_order_across_a_range() {
+        // A real linear chain, not three siblings of the anchor: advancing
+        // the head to `root_3` in one move is what makes slots 1, 2 and 3 all
+        // canonical at once, since `update_checkpoints` walks every
+        // intermediate ancestor on its way back to the common ancestor with
+        // the old head.
+        let mut store = beacon_test_store_with_anchor();
+        let block_1 = beacon_test_block(1, H256::ZERO);
+        let root_1 = block_1.message_hash_tree_root();
+        store.insert_signed_block(root_1, block_1).expect("insert");
+        let block_2 = beacon_test_block(2, root_1);
+        let root_2 = block_2.message_hash_tree_root();
+        store.insert_signed_block(root_2, block_2).expect("insert");
+        let root_3 = make_canonical(&mut store, beacon_test_block(3, root_2));
+
+        for (slot, root) in [(1, root_1), (2, root_2), (3, root_3)] {
+            store
+                .put_data_column_sidecar(slot, &root, 0, sidecar_bytes(slot as u8))
+                .unwrap();
+        }
+        let found = store.data_column_sidecars_in_range(1, 3, &[0]).unwrap();
+        assert_eq!(found.len(), 2, "the range is half open: [1, 3)");
+        assert_eq!(found[0], sidecar_bytes(1));
+        assert_eq!(found[1], sidecar_bytes(2));
+    }
+
+    #[test]
+    fn the_range_query_returns_exactly_the_requested_columns() {
+        // Every existing test before this one wrote and queried only column
+        // index 0, so an inverted or dropped column filter would have passed
+        // the whole suite regardless.
+        let mut store = beacon_test_store_with_anchor();
+        let root = make_canonical(&mut store, beacon_test_block(9, H256::ZERO));
+        for index in [0, 1, 2, 3] {
+            store
+                .put_data_column_sidecar(9, &root, index, sidecar_bytes(0x10 + index as u8))
+                .unwrap();
+        }
+
+        let found = store.data_column_sidecars_in_range(9, 10, &[1, 2]).unwrap();
+
+        // Columns 0 and 3 must not appear at all.
+        assert_eq!(found, vec![sidecar_bytes(0x11), sidecar_bytes(0x12)]);
+    }
+
+    #[test]
+    fn a_sibling_roots_columns_never_leak_into_a_range_answer() {
+        // Gossip import only requires a sidecar's block to name a known,
+        // finalized-descendant parent, not a canonical one, so a live fork
+        // can leave both siblings' columns stored at one slot. The
+        // specification asks a range response to be "consistent from a
+        // single chain within the context of the request": only the
+        // canonical root's columns may come back, even though this node
+        // holds both.
+        let mut store = beacon_test_store_with_anchor();
+        let canonical_root = make_canonical(&mut store, beacon_test_block(9, H256::ZERO));
+
+        let mut sibling = match beacon_test_block(9, H256::ZERO) {
+            SignedBeaconBlock::Phase0(block) => block,
+            other => panic!("expected phase0, got {}", other.fork_name()),
+        };
+        sibling.message.body.graffiti = H256::repeat_byte(0xee);
+        let sibling = SignedBeaconBlock::Phase0(sibling);
+        let sibling_root = sibling.message_hash_tree_root();
+        assert_ne!(
+            sibling_root, canonical_root,
+            "the fixture's premise changed"
+        );
+        store
+            .insert_signed_block(sibling_root, sibling)
+            .expect("insert sibling, never made canonical");
+
+        store
+            .put_data_column_sidecar(9, &canonical_root, 1, sidecar_bytes(0xaa))
+            .unwrap();
+        store
+            .put_data_column_sidecar(9, &sibling_root, 1, sidecar_bytes(0xbb))
+            .unwrap();
+
+        let found = store.data_column_sidecars_in_range(9, 10, &[1]).unwrap();
+        assert_eq!(found, vec![sidecar_bytes(0xaa)]);
     }
 }

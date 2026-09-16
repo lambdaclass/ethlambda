@@ -165,7 +165,7 @@ pub const FORK_DIGEST_CONTEXT_LEN: usize = 4;
 pub struct ChunkLimits {
     /// Whether a successful chunk carries a [`FORK_DIGEST_CONTEXT_LEN`]-byte
     /// `ForkDigest` before its payload. False on every lean protocol, true on
-    /// the two beacon block ones.
+    /// beacon's block and data-column-sidecar protocols.
     pub has_context: bool,
     /// The most chunks a peer may send before the answer is refused.
     ///

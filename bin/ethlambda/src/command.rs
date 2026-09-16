@@ -232,6 +232,50 @@ mod tests {
         }
     }
 
+    /// Parse `beacon` with the given extra flags and return the custody count.
+    fn beacon_custody_group_count(extra: &[&str]) -> Result<u64, clap::Error> {
+        let mut args = vec!["ethlambda", BEACON];
+        args.extend_from_slice(extra);
+        match try_parse_from(args.iter().map(OsString::from))? {
+            Command::Beacon(options) => Ok(options.mainnet.custody_group_count),
+            other => panic!("`beacon` must parse as Command::Beacon, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_custody_group_count_defaults_to_the_specifications_floor() {
+        // The default is what every node must custody anyway, so an operator
+        // who passes nothing advertises exactly what this node did before the
+        // flag existed.
+        assert_eq!(
+            beacon_custody_group_count(&[]).expect("no flag is a valid invocation"),
+            ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT
+        );
+    }
+
+    #[test]
+    fn a_supernodes_custody_group_count_is_accepted() {
+        assert_eq!(
+            beacon_custody_group_count(&["--custody-group-count", "128"])
+                .expect("the whole custody space is a valid choice"),
+            ethlambda_types::beacon::constants::NUMBER_OF_CUSTODY_GROUPS
+        );
+    }
+
+    #[test]
+    fn a_custody_group_count_outside_the_specifications_range_is_refused() {
+        // Below the floor this node would advertise less than the spec
+        // requires of it, and above the ceiling it would name custody groups
+        // that do not exist. Both are rejected at parse time rather than
+        // clamped, because silently serving a different set than the operator
+        // asked for is the failure that would be hardest to notice.
+        for bad in ["3", "0", "129"] {
+            let err = beacon_custody_group_count(&["--custody-group-count", bad])
+                .expect_err("a count outside the range must not start a node");
+            assert_eq!(err.kind(), ErrorKind::ValueValidation, "for {bad}");
+        }
+    }
+
     #[test]
     fn bare_invocation_asks_for_a_sub_command() {
         // Nothing to default: clap prints the top-level help, which lists the

@@ -1,15 +1,20 @@
 //! The request/response protocols `ethlambda beacon` registers.
 //!
 //! Registered by direction, following the same subscribe-only-what-you-consume
-//! rule the topics follow. The sidecar protocols are deliberately absent:
-//! nothing custodies a blob or a data column, and an unregistered protocol is
-//! refused at stream negotiation rather than answered with a lie.
+//! rule the topics follow. The two data column sidecar protocols are
+//! registered because this node custodies the columns its node id selects
+//! (`BeaconWire::custody_columns`) and can answer for them out of
+//! `Table::DataColumns`. The blob sidecar protocols stay absent: nothing here
+//! custodies a whole blob, only the erasure-coded columns fulu derives it
+//! into, and an unregistered protocol is still refused at stream negotiation
+//! rather than answered with a lie.
 //!
 //! Only version 2 of the two block protocols is registered. Version 1 is
 //! deprecated by the spec, which lets a client answer it with an empty list,
 //! and its chunks carry no `<context-bytes>`, so serving it would mean a second
 //! encoder for a shape no mainnet peer needs.
 
+use ethlambda_types::beacon::preset;
 use libp2p::StreamProtocol;
 use libp2p::request_response::ProtocolSupport;
 
@@ -22,6 +27,10 @@ pub const METADATA_V3: &str = "/eth2/beacon_chain/req/metadata/3/ssz_snappy";
 pub const GOODBYE_V1: &str = "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
 pub const BLOCKS_BY_RANGE_V2: &str = "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
 pub const BLOCKS_BY_ROOT_V2: &str = "/eth2/beacon_chain/req/beacon_blocks_by_root/2/ssz_snappy";
+pub const DATA_COLUMN_SIDECARS_BY_RANGE_V1: &str =
+    "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy";
+pub const DATA_COLUMN_SIDECARS_BY_ROOT_V1: &str =
+    "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
 
 /// `MAX_REQUEST_BLOCKS`: the ceiling phase0 put on either block request.
 ///
@@ -50,6 +59,15 @@ const _: () = assert!(
     "the ceiling requests are built to has to fit inside the one they are judged against"
 );
 
+/// `max_request_data_column_sidecars`: the ceiling on one request.
+///
+/// Every column of every block a peer may ask for at once. Answers are
+/// truncated to it rather than refused, the same way the block protocols treat
+/// a peer asking past the deneb ceiling.
+pub fn max_request_data_column_sidecars() -> u64 {
+    MAX_REQUEST_BLOCKS_DENEB * preset::NUMBER_OF_COLUMNS as u64
+}
+
 /// The protocols this node registers, with the direction it supports each in.
 ///
 /// `goodbye/1` is inbound only: this node logs the reason code a peer sends and
@@ -73,6 +91,14 @@ pub fn registrations() -> Vec<(StreamProtocol, ProtocolSupport)> {
             StreamProtocol::new(BLOCKS_BY_ROOT_V2),
             ProtocolSupport::Full,
         ),
+        (
+            StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_RANGE_V1),
+            ProtocolSupport::Full,
+        ),
+        (
+            StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_ROOT_V1),
+            ProtocolSupport::Full,
+        ),
     ]
 }
 
@@ -88,6 +114,8 @@ pub fn label(protocol: &str) -> Option<&'static str> {
         GOODBYE_V1 => Some("beacon_goodbye"),
         BLOCKS_BY_RANGE_V2 => Some("beacon_blocks_by_range_v2"),
         BLOCKS_BY_ROOT_V2 => Some("beacon_blocks_by_root_v2"),
+        DATA_COLUMN_SIDECARS_BY_RANGE_V1 => Some("beacon_data_column_sidecars_by_range"),
+        DATA_COLUMN_SIDECARS_BY_ROOT_V1 => Some("beacon_data_column_sidecars_by_root"),
         _ => None,
     }
 }
@@ -116,6 +144,26 @@ mod tests {
                 "{protocol} has no metric label"
             );
         }
+    }
+
+    #[test]
+    fn the_sidecar_protocol_ids_are_the_mainnet_strings() {
+        assert_eq!(
+            DATA_COLUMN_SIDECARS_BY_ROOT_V1,
+            "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy"
+        );
+        assert_eq!(
+            DATA_COLUMN_SIDECARS_BY_RANGE_V1,
+            "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_request_is_bounded_by_the_block_ceiling_times_the_columns() {
+        assert_eq!(
+            max_request_data_column_sidecars(),
+            MAX_REQUEST_BLOCKS_DENEB * ethlambda_types::beacon::preset::NUMBER_OF_COLUMNS as u64
+        );
     }
 
     #[test]

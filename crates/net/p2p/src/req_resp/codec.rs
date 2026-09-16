@@ -10,14 +10,18 @@ use super::{
     messages::{ErrorMessage, Request, Response, ResponseCode, ResponsePayload},
 };
 
-use crate::beacon::messages::{BeaconBlocksByRangeRequest, Goodbye, Ping};
+use crate::beacon::messages::{
+    BeaconBlocksByRangeRequest, DataColumnsByRangeRequest, DataColumnsByRootIdentifiers, Goodbye,
+    Ping,
+};
 use crate::beacon::{BeaconContext, encoding as beacon_encoding, protocols};
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots};
 use crate::lean::{encoding as lean_encoding, protocols as lean_protocols};
 use crate::metrics;
 
 /// Protocols whose response payload has one shape forever write no context
-/// bytes, which is every protocol here except the two beacon block ones.
+/// bytes, which is every protocol here except the two beacon block ones and
+/// the two beacon data column sidecar ones.
 const NO_CONTEXT: &[u8] = &[];
 
 /// Short label extracted from a libp2p protocol id, used as the `protocol`
@@ -35,12 +39,14 @@ fn protocol_label(protocol: &str) -> &'static str {
 /// | <encoded-payload>`, and this writes it in that order. `context` is empty
 /// on every lean protocol and on the beacon protocols whose payload shape does
 /// not depend on the fork; it is the four-byte `ForkDigest` on the two block
-/// protocols. Passing an empty slice emits nothing, which is exactly what
-/// "`<context-bytes>` is empty by default" means.
+/// protocols and the two data column sidecar protocols. Passing an empty slice
+/// emits nothing, which is exactly what "`<context-bytes>` is empty by
+/// default" means.
 ///
 /// The single-chunk response payloads differ only in how their body is encoded,
-/// so they all end here. The two block payloads write a chunk per block, which
-/// is why this is a helper rather than the tail of `write_response`.
+/// so they all end here. The block and data column sidecar payloads write a
+/// chunk per item, which is why this is a helper rather than the tail of
+/// `write_response`.
 pub(crate) async fn write_success_chunk<T>(
     io: &mut T,
     label: &'static str,
@@ -62,10 +68,11 @@ where
 /// The request/response codec, for whichever chain the node is on.
 ///
 /// One codec for both, mirroring the single [`Request`] and the single
-/// dispatch above it. It is stateless for lean and for six of beacon's seven
-/// protocols; the two block protocols are the exception, because a chunk's
-/// `<context-bytes>` are a function of the block's slot, the fork schedule and
-/// the chain, none of which the payload alone supplies.
+/// dispatch above it. It is stateless for lean and for most of beacon's
+/// protocols; the two block protocols and the two data column sidecar
+/// protocols are the exception, because a chunk's `<context-bytes>` are a
+/// function of the chunk's own slot, the fork schedule and the chain, none of
+/// which the payload alone supplies.
 ///
 /// Deliberately not `Default`. `request_response::Behaviour::new` would
 /// construct one through that impl, and a beacon node whose codec came out
@@ -94,13 +101,15 @@ impl Codec {
         }
     }
 
-    /// The beacon context, or the error a block chunk cannot be framed without.
+    /// The beacon context, or the error a block or sidecar chunk cannot be
+    /// framed without.
     ///
-    /// Unreachable in a correctly built node: the block protocols are only
-    /// registered on the beacon arm of [`crate::build_swarm`], which is the same
-    /// arm that supplies the context. Surfaced as an error rather than an
-    /// `expect` because it is reachable from a peer's stream, and a codec panic
-    /// takes the whole swarm down.
+    /// Unreachable in a correctly built node: the block and data column
+    /// sidecar protocols are only registered on the beacon arm of
+    /// [`crate::build_swarm`], which is the same arm that supplies the
+    /// context. Surfaced as an error rather than an `expect` because it is
+    /// reachable from a peer's stream, and a codec panic takes the whole swarm
+    /// down.
     fn beacon_context(&self, protocol: &str) -> io::Result<&BeaconContext> {
         self.beacon.as_deref().ok_or_else(|| {
             invalid(format!(
@@ -162,6 +171,18 @@ impl libp2p::request_response::Codec for Codec {
                 roots: RequestedBlockRoots::from_ssz_bytes(&payload)
                     .map_err(|err| invalid(format!("{err:?}")))?,
             })),
+            // The bare list again, this time of identifiers rather than
+            // roots; unwrapped into a plain `Vec` because nothing above the
+            // codec needs the SSZ bound once decode has already enforced it.
+            protocols::DATA_COLUMN_SIDECARS_BY_ROOT_V1 => {
+                let identifiers = DataColumnsByRootIdentifiers::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?;
+                Ok(Request::DataColumnsByRoot(identifiers.into_inner()))
+            }
+            protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1 => Ok(Request::DataColumnsByRange(
+                DataColumnsByRangeRequest::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?,
+            )),
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -217,6 +238,20 @@ impl libp2p::request_response::Codec for Codec {
                 .await?;
                 Ok(Response::success(ResponsePayload::Blocks(blocks)))
             }
+            protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1
+            | protocols::DATA_COLUMN_SIDECARS_BY_ROOT_V1 => {
+                let context = self.beacon_context(protocol.as_ref())?;
+                let sidecars = beacon_encoding::decode_data_column_sidecars_response(
+                    io,
+                    label,
+                    &context.config,
+                    context.genesis_validators_root,
+                )
+                .await?;
+                Ok(Response::success(ResponsePayload::DataColumnSidecars(
+                    sidecars,
+                )))
+            }
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -261,6 +296,16 @@ impl libp2p::request_response::Codec for Codec {
             // empty slice emits no bytes at all.
             Request::MetaData(_) => Vec::new(),
             Request::Goodbye(goodbye) => goodbye.to_ssz(),
+            // The bound is re-applied here rather than trusted from wherever
+            // the `Vec` was built: it is only enforced on the way in by
+            // `read_request`'s `DataColumnsByRootIdentifiers::from_ssz_bytes`,
+            // and nothing stops a caller building an oversized `Vec` directly.
+            Request::DataColumnsByRoot(identifiers) => {
+                DataColumnsByRootIdentifiers::try_from(identifiers.clone())
+                    .map_err(|err| invalid(format!("{err:?}")))?
+                    .to_ssz()
+            }
+            Request::DataColumnsByRange(request) => request.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -314,6 +359,17 @@ impl libp2p::request_response::Codec for Codec {
                 ResponsePayload::MetaData(metadata) => {
                     let encoded = beacon_encoding::encode_metadata(protocol.as_ref(), metadata)?;
                     write_success_chunk(io, label, NO_CONTEXT, encoded).await
+                }
+                ResponsePayload::DataColumnSidecars(sidecars) => {
+                    let context = self.beacon_context(protocol.as_ref())?;
+                    beacon_encoding::write_data_column_sidecars_response(
+                        io,
+                        label,
+                        &context.config,
+                        context.genesis_validators_root,
+                        sidecars,
+                    )
+                    .await
                 }
             },
             Response::Error { code, message } => {
@@ -378,11 +434,16 @@ where
 mod tests {
     use super::*;
     use crate::beacon::messages::{
-        AttnetsBits, BeaconMetaData, BeaconStatus, Goodbye, MetaDataV3, Ping, StatusV1,
-        SyncnetsBits,
+        AttnetsBits, BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, MetaDataV3,
+        Ping, StatusV1, SyncnetsBits,
     };
     use crate::beacon::protocols;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::fulu::{
+        self, ColumnIndices, DataColumnsByRootIdentifier,
+    };
+    use ethlambda_types::beacon::containers::shared;
+    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Root;
     use futures::io::Cursor;
     use libp2p::StreamProtocol;
@@ -528,5 +589,145 @@ mod tests {
         )
         .await;
         assert!(matches!(decoded, Request::Goodbye(Goodbye { reason: 128 })));
+    }
+
+    #[tokio::test]
+    async fn a_by_root_column_request_round_trips() {
+        let request = Request::DataColumnsByRoot(vec![DataColumnsByRootIdentifier {
+            block_root: Root::repeat_byte(1),
+            columns: ColumnIndices::try_from(vec![0, 3]).unwrap(),
+        }]);
+        let decoded = request_round_trip(protocols::DATA_COLUMN_SIDECARS_BY_ROOT_V1, request).await;
+        match decoded {
+            Request::DataColumnsByRoot(identifiers) => {
+                assert_eq!(identifiers.len(), 1);
+                assert_eq!(identifiers[0].columns.to_vec(), vec![0, 3]);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_by_range_column_request_round_trips() {
+        let request = Request::DataColumnsByRange(DataColumnsByRangeRequest {
+            start_slot: 10,
+            count: 5,
+            columns: ColumnIndices::try_from(vec![1, 2, 3]).unwrap(),
+        });
+        let decoded =
+            request_round_trip(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1, request).await;
+        match decoded {
+            Request::DataColumnsByRange(wire) => {
+                assert_eq!(wire.start_slot, 10);
+                assert_eq!(wire.count, 5);
+                assert_eq!(wire.columns.to_vec(), vec![1, 2, 3]);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    /// A minimal sidecar naming `slot` and `index`; every other field is its
+    /// type's default, since neither test below reads past what
+    /// `write_data_column_sidecars_response` and
+    /// `decode_data_column_sidecars_response` themselves touch: the slot
+    /// (for the per-item context digest) and the index (to tell sidecars
+    /// apart).
+    fn data_column_sidecar(slot: u64, index: u64) -> fulu::DataColumnSidecar {
+        fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: shared::SignedBeaconBlockHeader {
+                message: shared::BeaconBlockHeader {
+                    slot,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                Root::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        }
+    }
+
+    /// Exercises `write_data_column_sidecars_response` into
+    /// `decode_data_column_sidecars_response` directly, unlike
+    /// [`a_by_range_column_request_round_trips`] and
+    /// [`a_by_root_column_request_round_trips`] above, which only round-trip
+    /// the thin SSZ-derive request wrappers and never touch this pair.
+    ///
+    /// The two sidecars straddle mainnet's altair fork boundary on purpose,
+    /// so their digests actually differ: each chunk's `<context-bytes>` is
+    /// derived from *that sidecar's own* slot
+    /// (`write_data_column_sidecars_response`'s doc explains why — a
+    /// backfill answer labels each chunk with its own fork), so an
+    /// implementation that computed one digest for the whole response
+    /// (from, say, the first sidecar's epoch) would still round-trip a
+    /// batch that never crosses a fork boundary but fail this one.
+    #[tokio::test]
+    async fn a_data_column_sidecars_response_round_trips_with_a_per_item_context() {
+        let sidecar_a = data_column_sidecar(3, 0);
+        let post_altair_slot = Config::mainnet().altair_fork_epoch * preset::SLOTS_PER_EPOCH + 1;
+        let sidecar_b = data_column_sidecar(post_altair_slot, 7);
+
+        let decoded = response_round_trip(
+            protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1,
+            Response::success(ResponsePayload::DataColumnSidecars(vec![
+                sidecar_a.clone(),
+                sidecar_b.clone(),
+            ])),
+        )
+        .await;
+
+        match decoded {
+            Response::Success {
+                payload: ResponsePayload::DataColumnSidecars(sidecars),
+            } => {
+                assert_eq!(sidecars, vec![sidecar_a, sidecar_b]);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    /// A peer's `genesis_validators_root` differing from ours means every
+    /// digest it labels a chunk with is for the wrong chain, even though the
+    /// chunk decodes cleanly on its own. `decode_data_column_sidecars_response`
+    /// checks the digest against what *this* node's own root implies, so
+    /// reading the same bytes back through a codec built with a different
+    /// root must abort the stream rather than hand back a sidecar under the
+    /// wrong context — mirroring the block response's own fork-mismatch
+    /// check, which nothing here exercised before.
+    #[tokio::test]
+    async fn a_data_column_sidecars_response_aborts_on_a_fork_digest_mismatch() {
+        let sidecar = data_column_sidecar(3, 0);
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        codec()
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::DataColumnSidecars(vec![sidecar])),
+            )
+            .await
+            .expect("writes");
+
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let mut mismatched_gvr_codec = Codec::beacon(BeaconContext {
+            config: Config::mainnet(),
+            genesis_validators_root: Root::repeat_byte(0xee),
+        });
+        let result = mismatched_gvr_codec
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a fork digest mismatch must abort the stream rather than decode successfully"
+        );
     }
 }

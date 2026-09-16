@@ -335,3 +335,113 @@ pub fn inc_beacon_status_digest_mismatch() {
 pub fn set_beacon_fork_digest(digest: &str) {
     LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
 }
+
+static LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_data_column_fetch_failures_total",
+        "Data column sidecar lookups abandoned, by reason",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Count one `DataColumnsByRoot` lookup this node gave up on. `reason` is
+/// `"no_peers"` (nothing connected to ask) or `"max_retries"` (the retry
+/// ladder ran out).
+pub fn inc_data_column_fetch_failure(reason: &str) {
+    LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Test-only readback of [`inc_data_column_fetch_failure`]'s counter. The
+/// metric otherwise has no consumer inside the crate itself (Prometheus
+/// scrapes it), so this is the only way a test can observe that a failure was
+/// actually counted rather than merely that the code path returned.
+#[cfg(test)]
+pub(crate) fn data_column_fetch_failures_total(reason: &str) -> u64 {
+    LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .get()
+}
+
+// --- Peer composition and custody-column supply ---
+
+/// Connected peers split by which side opened the connection.
+///
+/// Separate from `lean_connected_peers`, which is labelled by node name and
+/// exists to answer "who are we talking to". This one answers "how did we get
+/// them", and the difference is operational: inbound supply is unbounded and
+/// unchosen, while an outbound peer is one this node picked and is the only
+/// kind it can aim at a column it needs. A node pinned at its inbound cap with
+/// zero outbound peers looks perfectly healthy on a total peer count and cannot
+/// steer its own custody coverage at all.
+static LEAN_PEERS_BY_DIRECTION: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_peers_by_direction",
+        "Connected peers by the direction the connection was opened in",
+        &["direction"]
+    )
+    .unwrap()
+});
+
+/// Established connections as libp2p itself counts them.
+///
+/// The connection limits are enforced against these, not against
+/// [`LEAN_PEERS_BY_DIRECTION`], so publishing both is what makes a leaked
+/// connection visible: one the swarm still charges against the cap but that no
+/// live peer is using would show up here and nowhere else. The two are not
+/// expected to be equal, since this counts connections and the other counts
+/// peers, and a peer may hold more than one; what matters is that the gap
+/// stays small and does not grow.
+static LEAN_SWARM_ESTABLISHED_CONNECTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_swarm_established_connections",
+        "Established connections as counted by the libp2p swarm, which is what \
+         the connection limits are enforced against",
+        &["direction"]
+    )
+    .unwrap()
+});
+
+/// Connected peers known to custody each column this node samples.
+static LEAN_CUSTODY_COLUMN_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_custody_column_peers",
+        "Connected peers known to custody each data column this node samples",
+        &["column"]
+    )
+    .unwrap()
+});
+
+/// Set the peers-by-direction gauges from a full re-count.
+pub fn set_peers_by_direction(inbound: usize, outbound: usize) {
+    LEAN_PEERS_BY_DIRECTION
+        .with_label_values(&["inbound"])
+        .set(inbound as i64);
+    LEAN_PEERS_BY_DIRECTION
+        .with_label_values(&["outbound"])
+        .set(outbound as i64);
+}
+
+/// Set the swarm's own established-connection gauges.
+pub fn set_swarm_established_connections(inbound: u32, outbound: u32) {
+    LEAN_SWARM_ESTABLISHED_CONNECTIONS
+        .with_label_values(&["inbound"])
+        .set(i64::from(inbound));
+    LEAN_SWARM_ESTABLISHED_CONNECTIONS
+        .with_label_values(&["outbound"])
+        .set(i64::from(outbound));
+}
+
+/// Set how many connected peers are known to custody `column`.
+///
+/// A peer counts only once it has answered `metadata/3` or arrived with a
+/// usable `cgc`, matching `P2PServer::peer_custody`. That makes this a floor on
+/// real supply rather than an estimate of it, which is the right direction for
+/// a gauge whose job is to show a column running dry.
+pub fn set_custody_column_peers(column: u64, peers: usize) {
+    LEAN_CUSTODY_COLUMN_PEERS
+        .with_label_values(&[&column.to_string()])
+        .set(peers as i64);
+}

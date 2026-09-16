@@ -156,6 +156,33 @@ which nothing ethlambda binds produces.
 |------|------|-------|-------------------------|--------|
 | `lean_peer_connections_by_transport_total` | Counter | Established peer connections by the transport that carried them | On connection established | direction=inbound,outbound<br>transport=quic,tcp,unknown |
 
+### Peer Supply
+
+Who this node is connected to, and whether those peers can serve what it needs.
+All three are set from a full re-count of the state that decides them rather
+than incremented and decremented per event: a gauge meant to reveal a leak must
+not be able to leak itself.
+
+`lean_peers_by_direction` read against `lean_swarm_established_connections` is
+that leak check. The first counts peers this node believes it holds; the second
+libp2p's own counters, which the connection limits in
+[discovery.md](./discovery.md) are enforced against. A persistent gap is a
+connection charged to the cap that no live peer is using.
+
+`lean_custody_column_peers` is the supply side of the data-availability gate: a
+fulu block is held until every column this node custodies arrives, so a column
+sitting at zero connected custodians is a stall waiting to happen, and it is
+invisible in a total peer count. Only the columns this node samples get a
+series, since publishing all 128 would bury the ones that can actually block an
+import. Read it beside `lean_blocks_held_for_columns`. Beacon-only; a lean node
+samples nothing and publishes no series here.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_peers_by_direction` | Gauge | Connected peers by the direction the connection was opened in | On every connection established and closed | direction=inbound,outbound |
+| `lean_swarm_established_connections` | Gauge | Established connections as libp2p itself counts them | On the swarm's own metric tick | direction=inbound,outbound |
+| `lean_custody_column_peers` | Gauge | Connected peers known to custody each data column this node samples | On every connection established and closed, and whenever a peer's custody is recorded from its `metadata/3` answer or its ENR `cgc` | column=`<index>` |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
@@ -184,6 +211,63 @@ In practice the distribution is bimodal and dominated by production rather than 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
+
+**On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
+other table's series either stays flat or is bounded by pruning; `data_columns`
+backs `Table::DataColumns`, the one table with no pruning rule (see
+[data_storage.md](./data_storage.md#datacolumns)), so this is the disk-growth
+trajectory for the whole node. Budget roughly 360 KB per slot across the
+columns this node custodies at the blob cap, nearer 1 GB per day at current
+mainnet blob counts, and size the disk against however long the node is meant
+to run before a pruner exists.
+
+### Data Column Sidecars (Fulu DAS)
+
+`ethlambda beacon` is a fulu data-availability-sampling custodian: it derives
+a slice of the column matrix from its own discv5 node id (see
+[beacon_wire.md](./beacon_wire.md#data-column-sidecars)), verifies what gossip
+and req/resp deliver for that slice, stores what verifies, serves it back to
+peers, and refuses to import a fulu block until every column it owes for that
+block is on hand. These are ethlambda-specific, not part of the leanMetrics
+spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On a gossiped or fetched sidecar clearing every check in `on_gossip_data_column` | | |
+| `lean_data_columns_rejected_total` | Counter | Sidecars the chain actor dropped, by reason | On each rejection in `on_gossip_data_column` | reason=malformed,finalized,future,finalized_ancestor,inclusion_proof,kzg,proposer | |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
+| `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
+| `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
+
+`lean_data_columns_rejected_total`'s reasons are the chain actor's own, one
+layer past gossip's cheaper checks. A malformed, wrong-subnet, stale, future,
+or duplicate sidecar is usually caught one layer down, in gossip, and shows up
+instead as `lean_beacon_gossip_messages_total{topic="data_column_sidecar",
+result=...}`; `reason="malformed"` on this counter therefore fires almost
+exclusively for a *fetched* sidecar, which skips gossip's checks entirely and
+reaches the chain actor first.
+
+**Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
+availability gate, and a healthy node returns it to zero within a slot or two
+of a hold: fetch or gossip should complete well inside the retry ladder
+`lean_data_column_fetch_failures_total` counts down. A gauge that sits above
+zero for several slots means either the fetch is failing — check whether
+`lean_data_column_fetch_failures_total`'s `no_peers` or `max_retries` reason
+is climbing — or no reachable peer actually serves the missing columns; short
+of that, only finality passing the held block's slot clears it, which can be
+minutes away.
+
+**Read `lean_sidecars_awaiting_parent` beside it.** A sidecar whose block's
+parent has no post-state yet is parked rather than dropped, and a held block is
+precisely a block with no post-state, so the two gauges rise together while the
+gate waits: held blocks on one, their children's columns on the other. Both
+returning to zero is a recovered hold. `lean_sidecars_awaiting_parent` climbing
+without coming back down while `lean_blocks_held_for_columns` stays above zero
+is the signature of a gate that is not recovering. The parked queue is
+uncapped, so that gauge is also the only warning that a peer is parking
+sidecars under parents it never means to supply: each one holds a
+`Table::PendingDataColumns` row until finality passes its slot.
 
 ### Attestation Aggregate Coverage
 

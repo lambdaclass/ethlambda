@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
-use ethrex_p2p::utils::public_key_from_signing_key;
+use ethrex_p2p::utils::{node_id, public_key_from_signing_key};
 use libssz::SszEncode;
 use secp256k1::SecretKey;
 
@@ -66,7 +66,7 @@ pub(crate) fn encode_attnets(subnets: &HashSet<u64>, committee_count: u64) -> Ve
 /// as unsubscribed. A longer one cannot be believed either, because `attnets` is
 /// self-reported and unauthenticated, so a hostile ENR could otherwise pack an
 /// oversized field that decodes to thousands of subnets and dominate
-/// [`rank_by_uncovered_subnets`](super::admission::rank_by_uncovered_subnets)
+/// [`rank_candidates`](super::admission::rank_candidates)
 /// forever. A subnet we have no committee for cannot be useful to us regardless.
 pub(crate) fn subnets_from_attnets(bits: &[u8], committee_count: u64) -> Vec<u64> {
     (0..committee_count)
@@ -75,6 +75,53 @@ pub(crate) fn subnets_from_attnets(bits: &[u8], committee_count: u64) -> Vec<u64
                 .is_some_and(|byte| byte & (1 << (subnet % 8)) != 0)
         })
         .collect()
+}
+
+/// The discv5 node id `node_key` derives, independent of any address or port.
+///
+/// `keccak256` of the uncompressed public key: exactly what
+/// `LocalEnrParams::local_node`'s `Node::node_id()` computes for the same
+/// key, since a peer derives our id the same way off the `secp256k1` entry we
+/// publish. Exposed standalone so startup can learn what this node's own id
+/// selects (its column custody) before an ENR or a swarm exists; it must stay
+/// exactly the discovery server's own computation; a divergence here would
+/// leave this node custodying one set while every peer expects another.
+pub fn node_id_from_secret_key(node_key: &[u8]) -> Result<[u8; 32], DiscoveryError> {
+    let signer = SecretKey::from_slice(node_key).map_err(DiscoveryError::NodeKey)?;
+    Ok(node_id(&public_key_from_signing_key(&signer)).0)
+}
+
+/// The discv5 node id behind a libp2p [`PeerId`], or `None` when it cannot be
+/// recovered from the id alone.
+///
+/// A peer's custody set is a function of its node id and its advertised
+/// custody group count, and both sides have to compute the same one. The node
+/// id is available without asking anyone: libp2p stores a public key of 42
+/// bytes or fewer directly in the `PeerId`'s multihash rather than hashing it,
+/// and a secp256k1 key is well inside that, so the key can be read back out
+/// and put through the same `keccak256(uncompressed)` that
+/// [`node_id_from_secret_key`] applies to our own.
+///
+/// `None` covers the two cases where that does not hold: a `PeerId` carrying a
+/// real (hashed) multihash rather than an identity one, and a peer whose key
+/// is not secp256k1. Neither can appear on a mainnet beacon peer, whose
+/// identity the ENR's `secp256k1` entry defines, so a `None` here is a peer
+/// whose custody simply stays unknown rather than an error worth failing on.
+pub(crate) fn node_id_from_peer_id(peer_id: &libp2p::PeerId) -> Option<[u8; 32]> {
+    const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
+
+    let multihash = peer_id.as_ref();
+    if multihash.code() != IDENTITY_MULTIHASH_CODE {
+        return None;
+    }
+    let public_key = libp2p::identity::PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
+    let compressed = public_key.try_into_secp256k1().ok()?.to_bytes();
+    let uncompressed = secp256k1::PublicKey::from_slice(&compressed)
+        .ok()?
+        .serialize_uncompressed();
+    // `serialize_uncompressed` leads with SEC1's 0x04 tag; the node id is over
+    // the 64 coordinate bytes alone.
+    Some(node_id(&ethrex_common::H512::from_slice(&uncompressed[1..])).0)
 }
 
 /// Everything needed to build this node's ENR.
@@ -102,9 +149,11 @@ pub(crate) struct LocalEnrParams {
     pub(crate) fork_id: EnrForkId,
     /// The `cgc` entry to publish, or `None` to omit it.
     ///
-    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire, even though nothing is
-    /// custodied yet: peers may reject a lower value outright, which would
-    /// defeat the mode. `None` on lean, which has no data-availability domain.
+    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire: it is the floor a peer
+    /// may demand, and this node's actual custody only ever meets or exceeds
+    /// it (`sampling_size` never samples fewer groups than that), so
+    /// advertising it never overstates what this node stores and serves.
+    /// `None` on lean, which has no data-availability domain.
     pub(crate) custody_group_count: Option<u64>,
 }
 
@@ -248,6 +297,67 @@ mod tests {
             custody_group_count: None,
         })
         .expect("ENR builds")
+    }
+
+    #[test]
+    fn node_id_from_secret_key_matches_the_discovery_servers_own_computation() {
+        // If this function ever computed a different id than `local_node`'s
+        // `Node::node_id()`, a node would custody one set of columns while
+        // every peer, reading the ENR `local_node` feeds the discovery
+        // server, computed a different set for it. Nothing else would catch
+        // that: the columns would simply go unserved.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let params = LocalEnrParams {
+            signer,
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        };
+        let expected = params.local_node().node_id().0;
+        assert_eq!(
+            node_id_from_secret_key(&signer.secret_bytes()).expect("a valid key"),
+            expected
+        );
+    }
+
+    #[test]
+    fn node_id_from_peer_id_agrees_with_the_key_it_was_built_from() {
+        // The two derivations have to land on the same id: this node computes
+        // its own custody from the secret key, and computes a *peer's* from
+        // the PeerId that key produces. A divergence would mean asking peers
+        // for the columns they are not the ones custodying, silently, with
+        // every request simply coming back empty.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let keypair = libp2p::identity::secp256k1::SecretKey::try_from_bytes(
+            &mut signer.secret_bytes().clone(),
+        )
+        .map(libp2p::identity::secp256k1::Keypair::from)
+        .expect("a valid key");
+        let peer_id = libp2p::identity::Keypair::from(keypair)
+            .public()
+            .to_peer_id();
+
+        assert_eq!(
+            node_id_from_peer_id(&peer_id),
+            Some(node_id_from_secret_key(&signer.secret_bytes()).expect("a valid key"))
+        );
+    }
+
+    #[test]
+    fn node_id_from_peer_id_declines_a_key_it_cannot_read() {
+        // An ed25519 identity is not a secp256k1 one, so no node id can be
+        // computed for it. This must stay a `None` rather than a wrong answer:
+        // the caller treats unknown custody as "ask someone else", which is
+        // safe, where a fabricated id would send requests nobody can answer.
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+
+        assert_eq!(node_id_from_peer_id(&peer_id), None);
     }
 
     #[test]

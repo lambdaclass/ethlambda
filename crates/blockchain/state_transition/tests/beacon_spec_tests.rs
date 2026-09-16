@@ -35,6 +35,8 @@ fn main() {
     trials.extend(beacon_spec::fixture_fork_trials());
     trials.extend(beacon_spec::bls::trials());
     trials.extend(beacon_spec::kzg::trials());
+    trials.extend(beacon_spec::merkle_proof::trials());
+    trials.extend(beacon_spec::networking::trials());
     trials.extend(beacon_spec::epoch_processing::trials());
     trials.extend(beacon_spec::fork::trials());
     trials.extend(beacon_spec::fork_choice::trials());

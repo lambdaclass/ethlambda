@@ -2019,6 +2019,7 @@ version = "0.1.0"
 dependencies = [
  "ethlambda-metrics",
  "ethlambda-network-api",
+ "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
  "ethrex-common",

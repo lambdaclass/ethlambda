@@ -20,7 +20,7 @@ gone: what limits a lean node to the peers it was handed is an empty
 | --- | --- | --- |
 | `--discovery.port` | `9000` (`DEFAULT_DISCOVERY_PORT`) | UDP port for the discv5 socket |
 | `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
-| `--discovery.target-peers` | `200` | Connected-peer count above which dialing stops |
+| `--discovery.target-peers` | `200` | Peers this node holds: the dial loop's cutoff, and on `beacon` the connection limits too |
 
 These are common flags with the same default on `node` and `beacon`. See [the
 CLI reference](./cli.md).
@@ -57,7 +57,7 @@ The layout follows the discovery domain of the beacon-chain
 | `secp256k1` | compressed public key from `--node-key` |
 | `eth2` | SSZ `ENRForkID`, 16 bytes |
 | `attnets` | subscribed attestation subnet bitfield |
-| `cgc` | custody group count, on `beacon` only; omitted on lean, which has no data-availability domain |
+| `cgc` | `--custody-group-count`, on `beacon` only; omitted on lean, which has no data-availability domain |
 
 `tcp` and `quic` share the same port number: TCP and UDP are separate
 namespaces, so `build_swarm` binds both without a collision. Advertising both
@@ -108,25 +108,58 @@ publishes a higher-`seq` ENR, so a node that adds a transport entry, or gains an
 address through discv5's IP voting, is reconsidered without a restart.
 
 A peer's dial list carries every address it advertises, `quic` and `tcp` both,
-in one dial attempt. libp2p races them: it starts up to `dial_concurrency_factor`
-handshakes at once and keeps whichever completes first, dropping the other. So a
-peer whose `quic` port does not answer still connects over `tcp` with no separate
-retry and no connect timeout waited out first.
+in one dial attempt, `quic` first. libp2p walks that list `dial_concurrency_factor`
+addresses at a time, and ethlambda pins the factor to one, so the `tcp` address is
+reached only after the QUIC attempt ahead of it has failed. A peer whose `quic`
+port does not answer still connects over `tcp` with no separate retry, but it
+waits out `libp2p_quic`'s handshake timeout first.
 
-The list order is not a preference, and nothing should be read into it: the
-default concurrency factor exceeds the two addresses a lean peer can offer, so
-both are always attempted. The cost of that is the thing to know, since it is
-paid on every dial rather than only on a failure: two sockets and two handshakes
-per peer, on both ends, until one wins.
+The list order is therefore a preference and should be read as one. It was a race
+until the mainnet follower was profiled: both handshakes started at once, TCP won
+most of them, and every TCP win is a connection carrying mplex, whose waker
+bookkeeping cost more CPU than the entire beacon state transition. QUIC multiplexes
+natively and reaches none of that code, so the cheaper transport is now asked for
+first instead of merely offered. A lean peer advertises `quic` alone and is
+unaffected either way.
 
 Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
 Dialing stops once `--discovery.target-peers` peers are connected, and resumes
-if that count drops. That is all the flag does: it is the dial loop's cutoff, and
-nothing in ethrex's peer table or discv5's own pacing enforces it (see
-[below](#discv5-lookups-run-at-the-startup-rate)).
+if that count drops. Nothing in ethrex's peer table or discv5's own pacing
+enforces it (see [below](#discv5-lookups-run-at-the-startup-rate)).
+
+On `beacon` the flag is more than the dial loop's cutoff: the swarm's connection
+limits are derived from it too, so what this node refuses and what it goes
+looking for are two readings of one number.
+
+| Derived from the target | At the default 200 |
+| --- | --- |
+| Ceiling on established connections | 200 |
+| Of those, the most inbound demand may hold (70%) | 140 |
+| The rest, reserved for peers this node dials | 60 |
+
+The reservation is what the dial loop chases as its second shortfall, alongside
+the plain "are we at target" one, so inbound saturation cannot suppress dialing:
+outbound peers are the only ones this node chooses, and so the only lever it has
+on which custody columns its peer set covers. Deriving both from one number is
+what keeps the loop from chasing slots the swarm would refuse, or stopping while
+slots it reserved sit empty. `--discovery.target-peers 0` therefore holds no
+peers at all, dialing none and admitting none.
+
+Lean is unaffected: it runs unlimited connections, so it has nothing to reserve
+against and paces on the total peer count alone.
+
+The loop opens one dial per tick and varies the tick instead of the batch, on
+ethrex's own easeInOutCubic curve, so this node's dialing, its discv5 lookups and
+ethrex's RLPx dialing all ramp the same way. A node with no peers dials at
+`MAX_DIAL_RATE_PER_SECOND`; the gap eases out to ethrex's `LOOKUP_INTERVAL_MS`
+as the table fills, and dialing ends outright at the target. A tick that opens no
+dial waits that same ceiling regardless of the curve, which is what keeps a
+network with fewer peers to offer than `--discovery.target-peers` — every lean
+devnet, against a default target of 200 — from holding the loop at its floor for
+the life of the process, re-drawing candidates it is already connected to.
 
 ## Bootnodes
 

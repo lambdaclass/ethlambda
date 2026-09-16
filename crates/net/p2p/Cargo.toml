@@ -14,6 +14,11 @@ ethlambda-network-api.workspace = true
 ethlambda-storage.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
+# For `verify_data_column_sidecar`, the one sidecar check cheap enough to run
+# in the gossip loop: pure structural validation, no KZG. `blst` and `c-kzg`
+# were already on this binary's dependency path through the chain actor; this
+# only widens which crate in it links them.
+ethlambda-state-transition.workspace = true
 
 spawned-concurrency.workspace = true
 

@@ -69,6 +69,7 @@
 //! [specs]: https://github.com/ethereum/consensus-specs
 
 pub mod bls;
+pub mod das;
 pub mod fork_choice;
 pub mod genesis;
 pub mod hash;

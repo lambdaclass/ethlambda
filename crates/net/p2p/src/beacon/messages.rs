@@ -1,15 +1,20 @@
 //! The beacon request/response payloads this node speaks.
 //!
-//! All fixed-size, so every one has an exact wire length. The tests assert
-//! those lengths, which is what catches a reordered or mistyped field: SSZ has
-//! no field names on the wire, so a swapped pair of same-width fields is
-//! otherwise invisible until a peer disagrees about our chain.
+//! Every payload through [`BeaconBlocksByRangeRequest`] is fixed-size, so each
+//! has an exact wire length. The tests assert those lengths, which is what
+//! catches a reordered or mistyped field: SSZ has no field names on the wire,
+//! so a swapped pair of same-width fields is otherwise invisible until a peer
+//! disagrees about our chain. The two data column sidecar request bodies below
+//! it are the exception: each carries a column list whose length the requester
+//! chooses, so there is no one wire length for a test to assert.
 
+use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRootIdentifier};
 use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root, Slot};
 use libssz_derive::{SszDecode, SszEncode};
-use libssz_types::SszBitvector;
+use libssz_types::{SszBitvector, SszList};
 
 use super::constants::{ATTESTATION_SUBNET_COUNT, SYNC_COMMITTEE_SUBNET_COUNT};
+use super::protocols::MAX_REQUEST_BLOCKS_DENEB;
 
 /// `attnets`: which attestation subnets a node serves.
 pub type AttnetsBits = SszBitvector<{ ATTESTATION_SUBNET_COUNT as usize }>;
@@ -145,6 +150,25 @@ pub struct BeaconBlocksByRangeRequest {
     /// Deprecated: must be 1. See the container's doc comment for why a field
     /// with one legal value is still carried.
     pub step: u64,
+}
+
+/// `DataColumnSidecarsByRoot` v1's request body: the identifiers asked for.
+///
+/// An SSZ list rather than a bare `Vec` on the wire, so its bound is part of
+/// the type rather than something a caller has to remember to check.
+/// [`MAX_REQUEST_BLOCKS_DENEB`] is the spec's own limit for this list, the
+/// same ceiling `BeaconBlocksByRange` and `BeaconBlocksByRoot` are served
+/// against: a request cannot sensibly name more blocks' worth of columns than
+/// either of those protocols would ever hand back in one answer.
+pub type DataColumnsByRootIdentifiers =
+    SszList<DataColumnsByRootIdentifier, { MAX_REQUEST_BLOCKS_DENEB as usize }>;
+
+/// `DataColumnSidecarsByRange` v1's request body.
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct DataColumnsByRangeRequest {
+    pub start_slot: Slot,
+    pub count: u64,
+    pub columns: ColumnIndices,
 }
 
 #[cfg(test)]

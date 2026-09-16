@@ -286,7 +286,7 @@ actual_slot = finalized_slot + 1 + relative_index
 ## Networking (libp2p)
 
 ### Protocols
-- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise + yamux) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP, and libp2p races both addresses within one dial (list order confers no preference; the default `dial_concurrency_factor` starts both handshakes)
+- **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise, then yamux or mplex) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP. Both addresses go into one dial, `quic` first, and `DIAL_ADDRESS_CONCURRENCY` pins `dial_concurrency_factor` to one, so the order is a real preference and TCP is tried only after the QUIC attempt fails. Mainnet beacon peers answer `na` to a yamux-only proposal, so TCP connections negotiate mplex (see the `muxers` module doc), which is expensive: preferring QUIC is how that cost is avoided where the peer allows it
   - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `CommonOptions::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
@@ -321,10 +321,11 @@ actual_slot = finalized_slot + 1 + relative_index
 
 `ethlambda node` and `ethlambda beacon` are the same entry point. Each parses
 into one `cli::Options { common, network }`, where `network` is
-`Network::Lean(LeanOptions)` or `Network::Mainnet`. The lean variant carries
-that chain's own flags, so a lean-only flag is unreachable on the mainnet path
-by construction rather than by an `Option` nobody unwraps; `Mainnet` is a unit
-variant, since every flag `beacon` takes is a common one.
+`Network::Lean(LeanOptions)` or `Network::Mainnet(MainnetOptions)`. Each variant
+carries that chain's own flags, so a flag one chain does not take is unreachable
+on the other's path by construction rather than by an `Option` nobody unwraps.
+`Mainnet` was a unit variant while every flag `beacon` took was a common one;
+`--custody-group-count` is the first that is not.
 
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
@@ -648,7 +649,7 @@ snapshot (`States`) + diff (`StateDiffs`) pairs; `BlockRoots` and `LiveChain`
 index by slot for range serving and fork choice. Attestations and gossip
 signatures are not persisted; they live in in-memory `Store` buffers consumed
 during the tick pipeline. See [`docs/data_storage.md`](docs/data_storage.md)
-for the full reference: what each of the eight tables holds and how it's
+for the full reference: what each of the ten tables holds and how it's
 keyed, the snapshot/diff reconstruction algorithm, the block-import write
 sequence, pruning rules, what never changes at runtime, and startup/restore
 behavior.
@@ -659,6 +660,11 @@ behavior.
   breaking that invariant would silently corrupt every reconstructed state.
 - `Metadata["config"]` is written once at bootstrap and never rewritten; it
   doubles as the DB's genesis-time fingerprint on resume.
+- `PendingDataColumns` holds *unverified* sidecars parked until their block's
+  parent has a post-state. `data_column_indices_for` reads `DataColumns` only,
+  which is what keeps a parked column from satisfying the availability gate.
+  Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
+  `start_actor` clears the whole table at startup.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

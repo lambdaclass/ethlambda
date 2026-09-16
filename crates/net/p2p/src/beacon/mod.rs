@@ -44,6 +44,10 @@ pub struct BeaconWire {
     /// Advertised in `Ping` responses and in `MetaData`. Never bumped today:
     /// nothing this node advertises changes at runtime.
     pub metadata_seq_number: u64,
+    /// The columns this node custodies, carried alongside `topics` so the
+    /// gossip handler and the request handlers can check what this node
+    /// promises to serve without recomputing it from the node id.
+    pub custody_columns: Vec<u64>,
 }
 
 impl BeaconWire {
@@ -74,8 +78,10 @@ pub struct BeaconContext {
 /// Beacon-chain networking constants.
 ///
 /// `ethlambda_types::beacon::config` deliberately carries no networking values
-/// (see its module doc), so subnet counts and the custody requirement live with
-/// the code that reads them.
+/// (see its module doc), so the two subnet counts below live with the code
+/// that reads them. `CUSTODY_REQUIREMENT` is the exception: das-core defines
+/// it because non-networking code (the future availability check) needs it
+/// too, so it lives in the types crate and is only re-exported here.
 pub mod constants {
     /// `ATTESTATION_SUBNET_COUNT`. The `attnets` bitfield is this wide even
     /// though this node subscribes to none of them.
@@ -84,9 +90,8 @@ pub mod constants {
     /// `SYNC_COMMITTEE_SUBNET_COUNT`. The width of `MetaData`'s `syncnets`.
     pub const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
 
-    /// `CUSTODY_REQUIREMENT`. Advertised in the `cgc` ENR entry and in
-    /// `MetaData` v3 even though nothing is custodied until data availability
-    /// lands: peers may reject a lower value outright, which would defeat the
-    /// mode.
-    pub const CUSTODY_REQUIREMENT: u64 = 4;
+    /// Re-exported rather than redefined: the subnet subscription, the `cgc`
+    /// ENR entry, the `MetaDataV3` field and the availability check must all
+    /// name one value, and das-core is where it is defined.
+    pub use ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT;
 }

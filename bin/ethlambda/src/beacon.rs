@@ -201,14 +201,36 @@ pub struct BeaconWireParams {
     pub fork_id: EnrForkId,
 }
 
+/// The discv5 node id for this process's `--node-key` bytes.
+///
+/// A thin pass-through, kept as its own function so `run_node`'s exact
+/// composition — resolve the key, derive the id, feed it to [`wire_params`] —
+/// is unit-testable here; `run_node` itself needs a live swarm to drive and a
+/// test cannot call it directly.
+pub fn beacon_node_id(node_key: &[u8]) -> eyre::Result<[u8; 32]> {
+    Ok(ethlambda_p2p::discovery::enr::node_id_from_secret_key(
+        node_key,
+    )?)
+}
+
 /// Derive mainnet's wire parameters from the built-in genesis state.
 ///
 /// This is the whole of what startup needs before it can build a swarm, and it
-/// touches no network: every value here is a function of the genesis state and
-/// the wall clock. The anchor state itself belongs to the anchor-and-follow
-/// work, and must be checked against the genesis values used here when it
-/// lands.
-pub fn wire_params() -> eyre::Result<BeaconWireParams> {
+/// touches no network: every value here is a function of the genesis state,
+/// the wall clock, and `node_id`, which the caller must have derived via
+/// [`beacon_node_id`], since a peer computes our custody set off the identity
+/// we publish. The anchor state itself belongs to the anchor-and-follow work,
+/// and must be checked against the genesis values used here when it lands.
+///
+/// `node_key_supplied` carries no key material, only whether `node_id` came
+/// from a persisted `--node-key` or one generated fresh for this run: this
+/// function has no other way to tell the two apart, and that is exactly what
+/// the startup warning below needs to know.
+pub fn wire_params(
+    node_id: [u8; 32],
+    node_key_supplied: bool,
+    custody_group_count: u64,
+) -> eyre::Result<BeaconWireParams> {
     let chain = Config::mainnet();
     let genesis = mainnet_genesis().wrap_err("failed to read the built-in mainnet genesis")?;
 
@@ -242,12 +264,51 @@ pub fn wire_params() -> eyre::Result<BeaconWireParams> {
         None => info!("No fork or blob-schedule boundary is scheduled"),
     }
 
-    // Say plainly what is advertised but not served, so a running node never
-    // implies more than it does.
+    // The node id is the discv5 one, so what this node custodies here is what
+    // any peer computes for it from its ENR. A node without a persistent
+    // --node-key gets a new identity and therefore a new custody set on every
+    // restart, which is why startup warns about it right below.
+    //
+    // `sampling_size` is the larger of the advertised count and
+    // `SAMPLES_PER_SLOT`, so the default advertisement still custodies
+    // `SAMPLES_PER_SLOT` columns and the two only converge once
+    // `--custody-group-count` is raised past that floor.
+    let sampling = ethlambda_state_transition::beacon::das::sampling_size(custody_group_count);
+    let custody_columns =
+        ethlambda_state_transition::beacon::das::custody_columns(node_id, sampling)
+            .expect("the sampling size is within NUMBER_OF_CUSTODY_GROUPS");
+    info!(
+        custody_group_count,
+        sampling,
+        columns = ?custody_columns,
+        "Custodying data columns"
+    );
+
+    // The columns above are stored under this identity and served to peers
+    // who compute the same set from it. An ephemeral identity makes both
+    // sides of that agreement stale on the next restart: the sidecars already
+    // on disk belong to a node id nobody, including this node, will select
+    // again, and the fresh id this run advertises has nothing custodied for
+    // it yet. Placed next to the custody log line above so an operator reads
+    // the two together rather than finding this warning buried in startup
+    // noise.
+    if !node_key_supplied {
+        warn!(
+            "No --node-key supplied: this node's custody columns are a function of its \
+             discv5 node id, so a fresh identity on every restart means the columns already \
+             stored on disk belong to a different custody set than the one this run \
+             advertises and serves. Pass --node-key with a persisted key file to keep one \
+             identity, and therefore one custody set, across restarts."
+        );
+    }
+
+    // Say plainly what is still advertised without being backed by behavior,
+    // so a running node never implies more than it does. Storing and serving
+    // the custodied columns logged above is no longer in that gap; attestation
+    // and sync committee subnet subscription, and publishing, still are.
     warn!(
-        "Advertising cgc={} while custodying nothing, subscribing to no attestation, \
-         sync committee or data column subnet, and publishing nothing",
-        ethlambda_p2p::beacon::constants::CUSTODY_REQUIREMENT
+        "Advertising cgc={custody_group_count} while subscribing to no attestation or \
+         sync committee subnet, and publishing nothing"
     );
 
     Ok(BeaconWireParams {
@@ -256,6 +317,7 @@ pub fn wire_params() -> eyre::Result<BeaconWireParams> {
             config: chain,
             genesis_time: genesis.genesis_time,
             genesis_validators_root: genesis.genesis_validators_root,
+            custody_columns,
         },
         fork_id,
     })
@@ -265,6 +327,7 @@ pub fn wire_params() -> eyre::Result<BeaconWireParams> {
 mod tests {
     use super::*;
     use ethlambda_p2p::parse_enrs;
+    use ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT;
 
     /// Mainnet's genesis, 2020-12-01 12:00:23 UTC.
     const MAINNET_GENESIS_TIME: u64 = 1_606_824_023;
@@ -345,11 +408,41 @@ mod tests {
     /// a test could not call it at all.
     #[test]
     fn the_wire_parameters_are_derived_offline() {
-        let params = wire_params().expect("no network is needed");
+        let params =
+            wire_params([0x11; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
         assert_eq!(params.wire.genesis_time, MAINNET_GENESIS_TIME);
         // The digest is whatever fork the wall clock lands in, so it is not
         // pinned here; that it agrees with the ENR entry is the invariant.
         assert_eq!(params.wire.fork_digest, params.fork_id.fork_digest);
+    }
+
+    /// Two node ids sampling the same size select different columns: this is
+    /// what makes the network's total custody wide rather than every node
+    /// serving the same slice.
+    #[test]
+    fn the_custody_columns_are_a_function_of_the_node_id() {
+        let sampling = ethlambda_state_transition::beacon::das::sampling_size(
+            ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+        );
+
+        let a = wire_params([0x11; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        assert_eq!(a.wire.custody_columns.len(), sampling as usize);
+
+        let b = wire_params([0x22; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        assert_ne!(a.wire.custody_columns, b.wire.custody_columns);
+    }
+
+    /// `run_node` cannot be driven from a test, but its two-line composition
+    /// (resolve the key, derive the id, feed it to `wire_params`) can be, via
+    /// `beacon_node_id`.
+    #[test]
+    fn beacon_node_id_feeds_wire_params_a_valid_identity() {
+        let node_id = beacon_node_id(&[0x33; 32]).expect("a well-formed key");
+        let params = wire_params(node_id, true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let sampling = ethlambda_state_transition::beacon::das::sampling_size(
+            ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+        );
+        assert_eq!(params.wire.custody_columns.len(), sampling as usize);
     }
 
     #[test]

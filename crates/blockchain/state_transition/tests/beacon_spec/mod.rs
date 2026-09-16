@@ -35,6 +35,8 @@ pub mod fork_choice;
 pub mod genesis;
 pub mod harness;
 pub mod kzg;
+pub mod merkle_proof;
+pub mod networking;
 pub mod operations;
 pub mod rewards;
 pub mod sanity;

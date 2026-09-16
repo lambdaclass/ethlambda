@@ -99,12 +99,7 @@ pub(crate) enum Network {
     /// The lean consensus chain this repo implements: `ethlambda node`.
     Lean(Box<LeanOptions>),
     /// The Ethereum Beacon Chain: `ethlambda beacon`.
-    ///
-    /// Carries nothing: every flag this chain takes is now a common one. The
-    /// variant stays a variant rather than a bool because the anchor work adds
-    /// beacon-only flags, and because `match` arms on it read as the two
-    /// chains rather than as a condition.
-    Mainnet,
+    Mainnet(MainnetOptions),
 }
 
 /// Everything [`crate::run_node`] needs, for either chain.
@@ -132,7 +127,7 @@ impl From<BeaconOptions> for Options {
     fn from(options: BeaconOptions) -> Self {
         Options {
             common: options.common,
-            network: Network::Mainnet,
+            network: Network::Mainnet(options.mainnet),
         }
     }
 }
@@ -150,15 +145,49 @@ pub(crate) struct NodeOptions {
     pub(crate) lean: LeanOptions,
 }
 
-/// The `beacon` sub-command's argv.
+/// The `beacon` sub-command's argv: the common flags plus this chain's own.
 ///
-/// Only the common flags: this chain has no flag of its own left. Kept as a
-/// named `Args` struct so clap still renders a `beacon`-specific help page,
-/// and so the anchor work has somewhere to put its flags.
+/// Mirrors [`NodeOptions`], which is the point: a flag that means nothing to
+/// the other chain lives in that chain's struct, so neither `run_node` arm has
+/// to unwrap an `Option` the tag already promised was there.
 #[derive(Debug, clap::Args)]
 pub(crate) struct BeaconOptions {
     #[command(flatten)]
     pub(crate) common: CommonOptions,
+    #[command(flatten)]
+    pub(crate) mainnet: MainnetOptions,
+}
+
+/// Flags only the beacon chain takes.
+#[derive(Debug, clap::Args)]
+pub(crate) struct MainnetOptions {
+    /// How many custody groups this node custodies, advertised as the ENR's
+    /// `cgc` and used to size its own custody set.
+    ///
+    /// Raising it makes this node useful to more peers and costs it storage and
+    /// bandwidth in proportion: a node at `NUMBER_OF_CUSTODY_GROUPS` is a
+    /// supernode, custodying every column. Lowering it is not possible below
+    /// `CUSTODY_REQUIREMENT`, which the specification makes the floor every
+    /// node must meet.
+    ///
+    /// Note this is not the number of columns custodied. That is
+    /// `sampling_size`, the larger of this and `SAMPLES_PER_SLOT`, so the
+    /// default of `CUSTODY_REQUIREMENT` still custodies `SAMPLES_PER_SLOT`
+    /// columns; the two only coincide once this is raised past that floor.
+    ///
+    /// Changing it changes which columns this node custodies, so sidecars
+    /// already on disk belong to the old set. Nothing is corrupted by that,
+    /// but the node serves a set it has not finished filling until it has
+    /// backfilled the difference.
+    #[arg(
+        long = "custody-group-count",
+        default_value_t = ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+        value_parser = clap::value_parser!(u64).range(
+            ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT
+                ..=ethlambda_types::beacon::constants::NUMBER_OF_CUSTODY_GROUPS
+        ),
+    )]
+    pub(crate) custody_group_count: u64,
 }
 
 /// Flags only the lean chain takes.
@@ -262,12 +291,18 @@ pub(crate) struct DiscoveryConfig {
     /// discv5's PONG-based IP voting may still replace it at runtime.
     #[arg(long = "discovery.advertise-ip")]
     pub(crate) advertise_ip: Option<IpAddr>,
-    /// Connected-peer count above which discovery stops dialing.
+    /// How many peers this node holds.
     ///
-    /// Governs the dial loop only, not discv5's own lookup pacing. The loop
-    /// keeps ticking either way and resumes dialing as soon as the connected
-    /// count drops back below this, so 0 means "discover and serve, never
-    /// dial".
+    /// The dial loop stops above it and resumes as soon as the connected count
+    /// drops back below, and on `beacon` it is also what the swarm's own
+    /// connection limits are derived from: the ceiling itself, the share of it
+    /// inbound demand may hold, and the rest, reserved for peers this node
+    /// dials. One number, so a reservation the swarm does not keep is never one
+    /// the dial loop chases. See `beacon::swarm::max_connections`.
+    ///
+    /// 0 therefore means "hold no peers", dialing none and admitting none, not
+    /// "serve without dialing". Discv5's own lookup pacing is unaffected either
+    /// way: the loop keeps ticking and the crawl keeps running.
     #[arg(long = "discovery.target-peers", default_value_t = DEFAULT_DISCOVERY_TARGET_PEERS)]
     pub(crate) target_peers: usize,
 }

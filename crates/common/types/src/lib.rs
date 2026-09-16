@@ -9,6 +9,7 @@ pub mod enr;
 pub mod genesis;
 pub mod primitives;
 pub mod state;
+pub mod time;
 
 /// Display helper for truncated root hashes (8 hex chars)
 pub struct ShortRoot<'a>(pub &'a [u8; 32]);

@@ -1,8 +1,11 @@
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::fulu::{DataColumnSidecar, DataColumnsByRootIdentifier};
 use libssz_types::SszList;
 
-use crate::beacon::messages::{BeaconMetaData, BeaconStatus, Goodbye, Ping};
+use crate::beacon::messages::{
+    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
+};
 use crate::lean::messages::{BlocksByRootRequest, Status};
 
 /// A contiguous slot window, as either chain's `blocks_by_range` asks for it.
@@ -79,6 +82,13 @@ pub enum Request {
     /// not carry the protocol id. The codec does, so it records it here.
     MetaData(&'static str),
     Goodbye(Goodbye),
+    /// The identifiers asked for. A plain `Vec` here, unlike
+    /// [`crate::beacon::messages::DataColumnsByRootIdentifiers`], which is
+    /// what carries the wire's SSZ list bound; nothing above the codec needs
+    /// to re-check a bound the wire type already enforces on decode and the
+    /// codec already enforces on encode.
+    DataColumnsByRoot(Vec<DataColumnsByRootIdentifier>),
+    DataColumnsByRange(DataColumnsByRangeRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -169,6 +179,13 @@ impl std::fmt::Display for Response {
                 };
                 write!(f, "Success(MetaData v{version} seq_number={seq_number})")
             }
+            Self::Success {
+                payload: ResponsePayload::DataColumnSidecars(sidecars),
+            } => {
+                // Count only, never the sidecars themselves: one sidecar's
+                // `Debug` alone runs to tens of kilobytes of cell bytes.
+                write!(f, "Success(DataColumnSidecars count={})", sidecars.len())
+            }
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
                 write!(f, "Error({code:?}: {message})")
@@ -249,6 +266,12 @@ pub enum ResponsePayload {
     Status(BeaconStatus),
     Pong(Ping),
     MetaData(BeaconMetaData),
+    /// The sidecars answering either column protocol.
+    ///
+    /// One variant for both, mirroring how `Blocks` covers all four block
+    /// protocols: which one produced the answer is known from the outbound
+    /// request id, and the chunk framing is the same either way.
+    DataColumnSidecars(Vec<DataColumnSidecar>),
 }
 
 /// Error message type for non-success responses.

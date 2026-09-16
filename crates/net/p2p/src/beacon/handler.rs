@@ -52,10 +52,12 @@ pub fn build_status(store: &Store, wire: &BeaconWire, version: StatusVersion) ->
         match store.beacon_head() {
             Some((head_slot, head_root)) => {
                 let finalized = store.beacon_finalized_checkpoint();
-                let earliest_available_slot = store
-                    .latest_finalized()
-                    .expect("finalized checkpoint exists")
-                    .slot;
+                // Where this directory's chain begins, not where it has
+                // finalized to: the two coincide only until the first
+                // finalization, after which the finalized slot climbs away
+                // from the anchor and would understate, by a growing margin,
+                // the range this node can still serve.
+                let earliest_available_slot = store.anchor_slot();
                 (
                     finalized.root,
                     finalized.epoch,
@@ -108,9 +110,11 @@ impl StatusVersion {
 ///
 /// `attnets` and `syncnets` are all-zero because this node subscribes to no
 /// subnet, which is exactly what it serves. `custody_group_count` is
-/// `CUSTODY_REQUIREMENT` rather than zero because peers may reject a lower
-/// value outright; it is the widest gap between what this node advertises and
-/// what it serves, and startup logs it.
+/// `CUSTODY_REQUIREMENT`, the floor a peer may demand, not this node's actual
+/// custody: `sampling_size` raises what it actually stores and serves
+/// (`BeaconWire::custody_columns`) to cover at least `SAMPLES_PER_SLOT`
+/// groups, so `cgc` can only understate this node's real coverage, never
+/// overstate it.
 pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaData> {
     let seq_number = wire.metadata_seq_number;
     match protocol {
@@ -155,6 +159,27 @@ pub async fn send_status(server: &P2PServer, peer_id: PeerId, wire_status: Beaco
         .await;
 }
 
+/// Ask `peer_id` for its `MetaData`, to learn the columns it custodies.
+///
+/// Version 3 specifically, because `custody_group_count` is the field this is
+/// for and only v3 carries it. A peer that does not speak v3 refuses the
+/// stream, which costs one failed request and leaves its custody unknown —
+/// handled, and strictly better than the alternative of never asking.
+///
+/// Sent once per connection, right behind `Status`: the count changes only
+/// when a peer changes its own validator load, and a stale entry aims requests
+/// no worse than the random choice it replaced.
+pub async fn request_metadata(server: &P2PServer, peer_id: PeerId) {
+    server
+        .swarm_handle
+        .send_request(
+            peer_id,
+            Request::MetaData(protocols::METADATA_V3),
+            libp2p::StreamProtocol::new(protocols::METADATA_V3),
+        )
+        .await;
+}
+
 /// Re-open a refused handshake on the other `Status` version.
 ///
 /// A peer that supports neither version was never going to talk to us, and one
@@ -184,11 +209,12 @@ mod tests {
     fn wire() -> BeaconWire {
         BeaconWire {
             fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
-            topics: topics::BeaconTopics::new([0x8c, 0x9f, 0x62, 0xfe]),
+            topics: topics::BeaconTopics::new([0x8c, 0x9f, 0x62, 0xfe], &[]),
             config: Config::mainnet(),
             genesis_time: 1_606_824_023,
             genesis_validators_root: Root::ZERO,
             metadata_seq_number: 0,
+            custody_columns: Vec::new(),
         }
     }
 
@@ -203,6 +229,7 @@ mod tests {
             Config::mainnet(),
             Root::ZERO,
             Checkpoint::default(),
+            0,
         )
     }
 
@@ -242,6 +269,7 @@ mod tests {
                 root: anchor_root,
                 slot: anchor_slot,
             },
+            anchor_slot,
         );
         store
             .insert_signed_block(anchor_root, block)

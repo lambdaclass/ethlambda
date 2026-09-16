@@ -13,6 +13,13 @@
 //! does not have that ambiguity; `to_le_bytes`/`from_le_bytes` (used
 //! throughout this crate and by the SSZ codec) already commit to little-endian
 //! in the function name, so there is no value for this constant to hold.
+//!
+//! A handful of values breaks the "Constants heading" rule the other way:
+//! the das-core and p2p-interface custody settings below live here even
+//! though their `.md` files list them under a "Configs" heading, because they
+//! are identical across both shipped configs and a `Config` field would
+//! perturb the persisted encoding; see [`NUMBER_OF_CUSTODY_GROUPS`]'s own
+//! comment for the detail.
 
 use crate::beacon::primitives::{DomainType, Epoch, Gwei, Slot};
 
@@ -248,6 +255,62 @@ pub const WITHDRAWAL_REQUEST_TYPE: u8 = 0x01;
 /// request.
 pub const CONSOLIDATION_REQUEST_TYPE: u8 = 0x02;
 
+// ---------------------------------------------------------------------------
+// Custody (fulu, das-core)
+// ---------------------------------------------------------------------------
+
+/// How many custody groups the columns of the extended data matrix are divided
+/// into.
+///
+/// Equal to `preset::NUMBER_OF_COLUMNS`, so one group is one column. That
+/// equality is not assumed anywhere: `compute_columns_for_custody_group`
+/// divides the two, and stays correct if a future network separates them.
+///
+/// A `configs/*.yaml` value in the specification, but identical across both
+/// shipped configs, so it is a constant here. Making it a `Config` field would
+/// change the SSZ encoding persisted under `Metadata[KEY_CONFIG]`, which forces
+/// `DB_VERSION` up and refuses every existing data directory on the next start.
+pub const NUMBER_OF_CUSTODY_GROUPS: u64 = 128;
+
+/// How many gossip subnets carry data column sidecars: the modulus in
+/// `column_index % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, which assigns a column
+/// to its gossip topic. See [`NUMBER_OF_CUSTODY_GROUPS`] for why this is a
+/// constant.
+pub const DATA_COLUMN_SIDECAR_SUBNET_COUNT: u64 = 128;
+
+/// The floor on how many custody groups a node samples each slot, whatever it
+/// custodies. A node's sampling size is the larger of this and its own custody
+/// group count, so a minimal-custody node still samples this many.
+pub const SAMPLES_PER_SLOT: u64 = 8;
+
+/// The custody group count an honest node advertises and serves at minimum.
+/// Peers may reject a peer advertising less.
+pub const CUSTODY_REQUIREMENT: u64 = 4;
+
+/// The epoch depth beyond which a node MAY refuse to serve data column
+/// sidecars, on the grounds that it may have pruned anything older. This node
+/// has no pruner, so the refusal never applies: it serves everything it has
+/// ever custodied, regardless of age.
+pub const MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: u64 = 4096;
+
+// ---------------------------------------------------------------------------
+// Gossip validation (phase0, p2p-interface)
+// ---------------------------------------------------------------------------
+
+/// How far ahead of a node's own clock a gossiped message's slot may sit and
+/// still be accepted rather than rejected outright, in milliseconds.
+///
+/// A `configs/*.yaml` value in the specification, identical across both
+/// shipped configs, so it is a constant here for the same reason
+/// [`NUMBER_OF_CUSTODY_GROUPS`] is: a `Config` field would perturb the
+/// persisted encoding under `Metadata[KEY_CONFIG]`.
+///
+/// Milliseconds rather than [`core::time::Duration`], matching every other
+/// value in this module: a caller that wants a `Duration` wraps this one
+/// value at its own call site rather than this module carrying a type its
+/// neighbours have no use for.
+pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: u64 = 500;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,5 +351,36 @@ mod tests {
             ];
             assert_eq!(masked, [0, 0, 0, 0]);
         }
+    }
+
+    #[test]
+    fn custody_settings_match_both_shipped_configs() {
+        // Identical in configs/mainnet.yaml and configs/minimal.yaml, which is
+        // why these are constants rather than Config fields: a Config field
+        // would change the SSZ encoding persisted under Metadata["config"] and
+        // force every existing data directory through a DB_VERSION bump.
+        assert_eq!(NUMBER_OF_CUSTODY_GROUPS, 128);
+        assert_eq!(DATA_COLUMN_SIDECAR_SUBNET_COUNT, 128);
+        assert_eq!(SAMPLES_PER_SLOT, 8);
+        assert_eq!(CUSTODY_REQUIREMENT, 4);
+        assert_eq!(MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS, 4096);
+    }
+
+    #[test]
+    fn gossip_clock_disparity_matches_both_shipped_configs() {
+        // Same precedent as the custody settings above: identical in
+        // configs/mainnet.yaml and configs/minimal.yaml.
+        assert_eq!(MAXIMUM_GOSSIP_CLOCK_DISPARITY, 500);
+    }
+
+    #[test]
+    fn number_of_columns_is_a_multiple_of_custody_groups() {
+        // `compute_columns_for_custody_group` divides these two to map a
+        // custody group onto its columns; the mapping is only well-formed if
+        // the division is exact.
+        assert_eq!(
+            crate::beacon::preset::NUMBER_OF_COLUMNS as u64 % NUMBER_OF_CUSTODY_GROUPS,
+            0
+        );
     }
 }

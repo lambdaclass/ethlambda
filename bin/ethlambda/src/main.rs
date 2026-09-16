@@ -157,17 +157,19 @@ struct DiscoveryWireEntries {
 /// What [`ChainSetup::chain`] hands `run_node` to spawn this chain's actor.
 ///
 /// Lean carries validator keys and duty configuration because
-/// [`BlockChain::spawn`] needs both; beacon carries nothing, because
-/// [`BlockChain::spawn_beacon`] needs only the store, the sync-status
-/// controller and the event bus, and `run_node` already owns all three
-/// outside this struct.
+/// [`BlockChain::spawn`] needs both; beacon carries its custody columns and
+/// the data-availability enforcement flag, the two values
+/// [`BlockChain::spawn_beacon`] needs beyond the store, the sync-status
+/// controller and the event bus that `run_node` already owns outside this
+/// struct.
 enum ChainActor {
     /// The lean node's chain actor: its validator keys and duty configuration.
     Lean(HashMap<u64, ValidatorKeyPair>, BlockChainConfig),
-    /// The beacon follower's chain actor. No keys and no duties, so nothing to
-    /// carry: what it needs is the store, the sync-status handle and the event
-    /// bus, which `run_node` already owns.
-    Beacon,
+    /// The beacon follower's chain actor. No validator keys and no validator
+    /// duties, but it does need the columns this node samples, which
+    /// `BlockChain::spawn_beacon` uses to decide when a fulu block has its
+    /// data.
+    Beacon { custody_columns: Vec<u64> },
 }
 
 /// What one chain's own setup produces, and everything [`run_node`] needs from
@@ -196,7 +198,7 @@ struct ChainSetup {
     /// PeerId to node name, for logs. Empty on mainnet, which has no roster.
     node_names: HashMap<PeerId, String>,
     /// What to spawn this chain's actor with: lean's validator keys and duty
-    /// configuration, or beacon's `Beacon` marker.
+    /// configuration, or beacon's custody columns and data-availability flag.
     chain: ChainActor,
 }
 
@@ -303,7 +305,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // admin endpoints can flip it at runtime.
     let aggregator = AggregatorController::new(match &network {
         Network::Lean(lean) => lean.is_aggregator,
-        Network::Mainnet => false,
+        Network::Mainnet(_) => false,
     });
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
@@ -449,7 +451,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // configured, from the genesis state built into the binary: the fork
         // digest depends on the epoch, which depends on genesis time. See
         // `crate::beacon`.
-        Network::Mainnet => {
+        Network::Mainnet(mainnet) => {
             info!(
                 bootnodes = ?common.bootnodes,
                 gossipsub_port = common.gossipsub_port,
@@ -460,7 +462,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 "Resolved mainnet configuration"
             );
 
-            let params = beacon::wire_params()?;
+            // The node id is the discovery one, so what this node custodies is
+            // what any peer computes for it from its ENR: `spawn_discovery`
+            // derives its own copy from the same `node_p2p_key` bytes below, by
+            // the same computation, so the two cannot disagree about this
+            // node's identity.
+            let node_id = beacon::beacon_node_id(&node_p2p_key)?;
+            let params = beacon::wire_params(
+                node_id,
+                common.node_key.is_some(),
+                mainnet.custody_group_count,
+            )?;
+
+            // Cloned ahead of the move into `WireConfig::Beacon` below: the
+            // chain actor needs its own copy to gate fulu import on, the same
+            // columns the wire config uses to size custody group
+            // advertisements and req/resp serving.
+            let custody_columns = params.wire.custody_columns.clone();
 
             // The anchored beacon store. `P2PServer` holds it for the lean
             // handlers, and the two beacon block handlers read it too: it is
@@ -478,16 +496,14 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     attestation_committee_count:
                         ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
                     fork_id: params.fork_id,
-                    custody_group_count: Some(
-                        ethlambda_p2p::beacon::constants::CUSTODY_REQUIREMENT,
-                    ),
+                    custody_group_count: Some(mainnet.custody_group_count),
                 },
                 store,
                 node_names: HashMap::new(),
                 // A beacon follower has no validator keys and no duties, but
                 // it does import blocks through fork choice, so it gets the
                 // `Beacon` chain actor below.
-                chain: ChainActor::Beacon,
+                chain: ChainActor::Beacon { custody_columns },
             }
         }
     };
@@ -515,6 +531,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         node_key: node_p2p_key,
         bootnodes,
         listening_socket: p2p_socket,
+        // The same number `discovery` above carries to the dial loop: on beacon
+        // the connection limits are derived from it, so the swarm refuses what
+        // the loop has stopped asking for.
+        target_peers: common.discovery.target_peers,
         wire: setup.wire,
     })
     .wrap_err("failed to build swarm")?;
@@ -554,7 +574,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
         }
-        ChainActor::Beacon => BlockChain::spawn_beacon(setup.store, sync_status, events),
+        ChainActor::Beacon { custody_columns } => {
+            BlockChain::spawn_beacon(setup.store, sync_status, events, custody_columns)
+        }
     };
 
     let p2p_ref = p2p.actor_ref();
@@ -647,7 +669,7 @@ fn default_bootnodes(network: &Network) -> Vec<String> {
             );
             Vec::new()
         }
-        Network::Mainnet => beacon::MAINNET_BOOTNODES
+        Network::Mainnet(_) => beacon::MAINNET_BOOTNODES
             .iter()
             .map(|enr| enr.to_string())
             .collect(),
@@ -974,10 +996,13 @@ fn read_hex_file_bytes(path: impl AsRef<Path>) -> eyre::Result<Vec<u8>> {
 /// not otherwise establish; keeping it in memory only is the conservative
 /// choice, so a generated identity does not survive a restart.
 ///
-/// The warning matters more on `node` than on `beacon`. `beacon` is a
-/// read-only follower with no validator identity to protect, but a lean node
-/// that silently changes PeerId every restart loses its place in every peer's
-/// scoring and in any ENR its neighbours cached.
+/// The warning below is about `PeerId`/ENR churn, which costs a lean node its
+/// place in every peer's scoring and in any ENR its neighbours cached.
+/// `beacon` has no validator identity to protect, but it is not exempt
+/// either: its custody columns are a function of this same node id, so an
+/// unstable identity there means a different custody set on every restart.
+/// `beacon::wire_params` carries its own, more specific warning about that;
+/// see it for why `beacon` needs a second one.
 fn resolve_node_key(node_key_path: Option<&Path>) -> eyre::Result<Vec<u8>> {
     match node_key_path {
         Some(path) => read_hex_file_bytes(path)
@@ -1563,6 +1588,7 @@ validators:
             Config::mainnet(),
             anchor.root,
             Store::beacon_checkpoint_as_stored(anchor),
+            0,
         );
 
         let genesis = test_genesis(now_secs());
@@ -1769,7 +1795,10 @@ validators:
         assert!(default_bootnodes(&Options::from(node).network).is_empty());
 
         assert_eq!(
-            default_bootnodes(&Network::Mainnet).len(),
+            default_bootnodes(&Network::Mainnet(crate::cli::MainnetOptions {
+                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+            }))
+            .len(),
             beacon::MAINNET_BOOTNODES.len()
         );
     }

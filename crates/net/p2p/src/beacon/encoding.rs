@@ -26,12 +26,16 @@
 //! `compute_fork_digest(genesis_validators_root, epoch)` at that epoch. It is
 //! computed per chunk rather than looked up in a per-fork table, because from
 //! fulu on the digest also moves at every blob-schedule boundary, so a fork
-//! name alone does not determine it.
+//! name alone does not determine it. The two data column sidecar protocols
+//! share this exact rule, keyed off `signed_block_header.message.slot` rather
+//! than a block's own slot, since a sidecar carries a header rather than a
+//! full block.
 
 use std::io;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::fulu::DataColumnSidecar;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::Root;
@@ -222,6 +226,102 @@ where
             )));
         }
         Ok(block)
+    })
+    .await
+}
+
+/// Write a data column sidecar response: one result code, one `ForkDigest` and
+/// one payload per sidecar.
+///
+/// The counterpart of [`write_blocks_response`] for the two column protocols,
+/// and the same shape apart from what is being encoded. Each sidecar is
+/// encoded before its code byte goes out, so an oversized one is skipped
+/// rather than leaving a SUCCESS byte on the wire with no payload behind it.
+/// An empty response is a stream that just ends, which is the honest answer
+/// for a request this node holds nothing for.
+pub async fn write_data_column_sidecars_response<T>(
+    io: &mut T,
+    label: &'static str,
+    config: &Config,
+    genesis_validators_root: Root,
+    sidecars: &[DataColumnSidecar],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    for sidecar in sidecars {
+        let encoded = sidecar.to_ssz();
+        if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+            warn!(
+                index = sidecar.index,
+                size = encoded.len(),
+                "Skipping oversized data column sidecar in response"
+            );
+            continue;
+        }
+        // The sidecar's own epoch, taken from the header it carries rather
+        // than the one this node runs on, so a backfill labels each chunk
+        // with its own fork.
+        let epoch = sidecar.signed_block_header.message.slot / preset::SLOTS_PER_EPOCH;
+        let digest = compute_fork_digest(config, genesis_validators_root, epoch);
+        write_success_chunk(io, label, &digest, encoded).await?;
+    }
+    Ok(())
+}
+
+/// Read a data column sidecar response: one `DataColumnSidecar` per chunk,
+/// until the peer closes.
+///
+/// The counterpart of [`decode_blocks_response`]. Only fulu defines this
+/// container, so there is no fork ladder to select a decoder from the way a
+/// block chunk's slot selects one; [`super::decode::decode_data_column_sidecar`]
+/// decodes unconditionally. The context bytes are still checked against the
+/// digest the sidecar's own slot implies, for the same reason a block chunk's
+/// are: it catches a peer whose `genesis_validators_root` or fork schedule
+/// differs from ours, which a signature failure would otherwise be the only
+/// way to notice.
+///
+/// A mismatch ends the stream rather than skipping the chunk, matching
+/// [`decode_blocks_response`]: a peer that disagrees about a historical digest
+/// after having agreed about the current one during the handshake is not
+/// running our schedule, and nothing else it sent is worth keeping.
+pub async fn decode_data_column_sidecars_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+    config: &Config,
+    genesis_validators_root: Root,
+) -> io::Result<Vec<DataColumnSidecar>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let limits = ChunkLimits {
+        has_context: true,
+        // The widest a single request can legitimately ask for, on either
+        // column protocol; see `protocols::max_request_data_column_sidecars`.
+        max_chunks: protocols::max_request_data_column_sidecars() as usize,
+    };
+    read_chunked_response(io, protocol_label, limits, |context, payload| {
+        let sidecar = decode::decode_data_column_sidecar(payload)
+            .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
+        let slot = sidecar.signed_block_header.message.slot;
+        let epoch = slot / preset::SLOTS_PER_EPOCH;
+        let expected = compute_fork_digest(config, genesis_validators_root, epoch);
+        if context != expected {
+            warn!(
+                slot,
+                index = sidecar.index,
+                peer_context = %hex::encode(context),
+                our_context = %hex::encode(expected),
+                "Data column sidecar chunk names another fork digest"
+            );
+            return Err(invalid(format!(
+                "data column sidecar chunk context {} does not match {} for slot {}",
+                hex::encode(context),
+                hex::encode(expected),
+                slot,
+            )));
+        }
+        Ok(sidecar)
     })
     .await
 }

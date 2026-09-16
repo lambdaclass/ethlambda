@@ -1,20 +1,33 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
+use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, FetchRequest, InitP2P};
+use ethlambda_state_transition::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
+use ethlambda_state_transition::beacon::helpers::accessors::{
+    get_beacon_proposer_index, get_domain,
+};
+use ethlambda_state_transition::beacon::helpers::misc::compute_signing_root;
+use ethlambda_state_transition::beacon::{bls, stf};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Chain, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::SignedBeaconBlock,
+    beacon::{
+        config::Config,
+        constants,
+        containers::{BeaconState, SignedBeaconBlock, fulu},
+        preset,
+    },
     block::SignedBlock,
     chain_config::ChainConfig,
-    primitives::H256,
+    primitives::{H256, HashTreeRoot as _},
+    time::unix_now_ms,
 };
+use libssz::{SszDecode as _, SszEncode as _};
 
 use crate::aggregation::{
     AggregateProduced, AggregationDeadline, AggregationDone, AggregationSession,
@@ -26,7 +39,9 @@ use crate::sync_status::SyncStatusTracker;
 use spawned_concurrency::actor;
 use spawned_concurrency::error::ActorError;
 use spawned_concurrency::protocol;
-use spawned_concurrency::tasks::{Actor, ActorRef, ActorStart, Context, Handler, send_after};
+use spawned_concurrency::tasks::{
+    Actor, ActorRef, ActorStart, Backend, Context, Handler, send_after,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
@@ -99,7 +114,26 @@ pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 /// flood target: a hold keeps the whole block in memory until its slot
 /// starts, so holding anything merely "in the future" would let one peer
 /// spend this node's memory on blocks for slots years away.
-pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration = Duration::from_millis(500);
+///
+/// Wraps [`ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY`]
+/// as a `Duration`, rather than defining the number here: the p2p crate's own
+/// data-column gossip check needs the same value, and a `Duration` is no more
+/// use to it than a bare millisecond count is to anything in this module that
+/// converts one to the other anyway.
+pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration =
+    Duration::from_millis(ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY);
+
+/// Where a parked data column sidecar was put.
+///
+/// The three fields are exactly `Table::PendingDataColumns`'s key, so reading
+/// the sidecar back needs nothing else. `slot` is also what the finality sweep
+/// compares against.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ParkedColumn {
+    slot: u64,
+    block_root: H256,
+    index: u64,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
@@ -181,14 +215,6 @@ fn ms_until_next_beacon_slot(now_ms: u64, genesis_time_ms: u64, slot_duration_ms
     ms_until_next_boundary(now_ms, genesis_time_ms, slot_duration_ms)
 }
 
-/// Current UNIX timestamp in milliseconds.
-fn unix_now_ms() -> u64 {
-    SystemTime::UNIX_EPOCH
-        .elapsed()
-        .expect("already past the unix epoch")
-        .as_millis() as u64
-}
-
 impl BlockChain {
     /// Spawn the blockchain actor for the lean chain.
     ///
@@ -251,6 +277,7 @@ impl BlockChain {
             sync_status_controller,
             events,
             ChainDuties::Lean(Box::new(lean)),
+            Vec::new(),
         )
     }
 
@@ -269,10 +296,15 @@ impl BlockChain {
     /// Asserts `store.chain() == Chain::Beacon`, the mirror image of
     /// [`Self::spawn`]'s assertion, for the same reason: a mismatch here is a
     /// programming error, not a condition to recover from.
+    ///
+    /// `custody_columns` feeds the data-availability gate in `process_block`.
+    /// It is computed once at startup from this node's id (see
+    /// `das::custody_columns`).
     pub fn spawn_beacon(
         store: Store,
         sync_status_controller: SyncStatusController,
         events: EventBus,
+        custody_columns: Vec<u64>,
     ) -> BlockChain {
         assert_eq!(
             store.chain(),
@@ -288,6 +320,7 @@ impl BlockChain {
             sync_status_controller,
             events,
             ChainDuties::Beacon,
+            custody_columns,
         )
     }
 
@@ -298,27 +331,44 @@ impl BlockChain {
     /// already past (`unwrap_or_default` on a negative duration). That is the
     /// contract both chains' tick loops are entered through, which is why it
     /// is stated in one place rather than per chain.
+    ///
+    /// `custody_columns` is meaningless on [`ChainDuties::Lean`] (lean
+    /// carries no `DataAvailability::Columns` evidence to gate on), so
+    /// [`BlockChain::spawn`] passes an empty vector.
     fn start_actor(
         store: Store,
         sync_status: SyncStatusTracker,
         sync_status_controller: SyncStatusController,
         events: EventBus,
         duties: ChainDuties,
+        custody_columns: Vec<u64>,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
+
+        // `sidecars_awaiting_parent` starts empty below, and it is the only
+        // index into `Table::PendingDataColumns`. Anything a previous run
+        // parked there is unreachable from here on, so it goes now rather than
+        // sitting unverified and unread until the directory is deleted.
+        let _ = store
+            .clear_pending_data_column_sidecars()
+            .inspect_err(|err| error!(%err, "Failed to clear parked data column sidecars"));
 
         let handle = BlockChainServer {
             store,
             p2p: None,
             pending_blocks: HashMap::new(),
             pending_block_parents: HashMap::new(),
+            blocks_awaiting_columns: HashMap::new(),
+            sidecars_awaiting_parent: HashMap::new(),
+            custody_columns,
             last_tick_instant: None,
             sync_status,
             sync_status_controller,
             events,
             duties,
         }
-        .start();
+        // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
+        .start_with_backend(Backend::Thread);
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -353,6 +403,51 @@ pub struct BlockChainServer {
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+
+    /// Beacon blocks admitted past the parent check (see
+    /// [`Self::process_or_pend_block`]) but held from fork choice because a
+    /// column this node custodies for them had not yet arrived, keyed by root
+    /// with the block's own slot cached alongside so
+    /// [`Self::release_block_if_columns_complete`] can re-check presence
+    /// without decoding the block back out of storage first. A separate map
+    /// from `pending_blocks` above: a held block already has a known parent,
+    /// which is the one thing that map tracks the absence of. Always empty on
+    /// lean, which carries no `DataAvailability::Columns` evidence to gate on.
+    blocks_awaiting_columns: HashMap<H256, u64>,
+
+    /// Sidecars whose block's parent this node cannot yet transition from,
+    /// keyed by that parent's root and replayed when it gains a post-state.
+    ///
+    /// The specification's gossip rule for a sidecar whose parent is not
+    /// usable is `[IGNORE]`, and it says so with an explicit licence to come
+    /// back to it: "MAY be queued for processing once the parent block is
+    /// retrieved". Dropping instead is what deadlocks a follower running the
+    /// availability gate, because the gate manufactures exactly this
+    /// condition: a held block never reaches `on_block`, so it never writes a
+    /// post-state, so every sidecar of every *child* of it fails the parent
+    /// lookup. Held block and un-arrived parent are indistinguishable here and
+    /// both are temporary, so both queue.
+    ///
+    /// Only the keys live here. The sidecar's own bytes go straight into
+    /// `Table::PendingDataColumns` and are read back on replay, because a
+    /// sidecar carries a cell per blob and a queue of them is the one
+    /// structure on this actor whose size a peer gets to choose.
+    ///
+    /// Uncapped, and swept only by
+    /// [`Self::evict_sidecars_awaiting_parent_at_or_below_finality`], on the
+    /// same schedule held blocks are. A peer naming parents this node will
+    /// never have can therefore grow it until finality reclaims the slots;
+    /// see [`Self::queue_sidecar_awaiting_parent`]. Always empty on lean.
+    ///
+    /// A set per parent, so "the same column is never parked twice" is the
+    /// container's own rule rather than a scan every arrival pays for. Order
+    /// is not one: a replay checks and stores each sidecar on its own, and a
+    /// held block is released by its last column arriving, whichever that is.
+    sidecars_awaiting_parent: HashMap<H256, HashSet<ParkedColumn>>,
+
+    /// The columns this node samples, computed once at startup from its node
+    /// id (see `das::custody_columns`). Empty on lean.
+    custody_columns: Vec<u64>,
 
     /// Last tick instant for measuring interval duration.
     last_tick_instant: Option<Instant>,
@@ -490,6 +585,191 @@ enum ImportError {
     Beacon(#[from] BeaconError),
 }
 
+/// What [`BlockChainServer::process_block`] did with the block it was given.
+///
+/// The distinction exists for [`BlockChainServer::process_or_pend_block`]:
+/// only [`ImportOutcome::Imported`] means a post-state now exists under
+/// `block_root`, so only it may unblock anything pending on that root.
+/// `process_block` used to return a bare `Ok(())` for a held block too, which
+/// made its caller call `collect_pending_children` as if the hold had
+/// produced a state to build on. A child block naming a held block as parent
+/// would then have its ancestor walk find the held block's row in
+/// `BlockHeaders` (written by `hold_block_for_columns`'s own
+/// `insert_pending_block`) and re-enqueue it into the very cascade the child
+/// arrived on; reprocessing re-held it, which called
+/// `collect_pending_children` again, which re-enqueued the same child again —
+/// forever, inside `run_import_cascade`'s synchronous loop, with no yield
+/// point and a duplicate column fetch to peers on every turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportOutcome {
+    /// A post-state now exists under the block's root, whether this call
+    /// wrote it or it already had one. Safe to unblock anything pending on
+    /// this root.
+    Imported,
+    /// The block is persisted (readable back by root) but carries no
+    /// post-state: a fulu block whose custody columns have not all arrived.
+    /// Nothing is unblocked; [`BlockChainServer::release_block_if_columns_complete`]
+    /// is what eventually re-imports it and reaches `collect_pending_children`
+    /// for real.
+    Held,
+}
+
+/// The availability evidence for `block`, or `None` if a column this node
+/// custodies has not arrived yet.
+///
+/// `None` is not "unavailable": it means the question cannot be answered yet,
+/// which is why the caller holds the block rather than rejecting it. A partial
+/// set must never be passed on as evidence, because
+/// `is_data_available_columns` is vacuously true over an empty list and would
+/// import a block whose data nobody has.
+///
+/// Only fulu blocks reach the column shape. A deneb or electra block carrying
+/// blobs would need the blob-and-proof shape, which this node has no source
+/// for, so it is admitted with a log rather than held forever against a
+/// pipeline that does not exist.
+///
+/// `ethlambda_storage::Table::DataColumns` is never pruned today (see its own
+/// doc comment), which is what lets the sidecar-collecting `.expect()`s below
+/// assume a column confirmed present a moment ago by `custody_columns_present`
+/// is still there to decode; a future pruner has to keep that window safe too.
+/// Whether a block at `block_slot` still falls inside the window this node may
+/// insist on data availability for.
+///
+/// The boundary is the specification's own
+/// `max(current_epoch - MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS,
+/// FULU_FORK_EPOCH)`: the epoch range peers "MUST support serving requests of
+/// data columns on". Below it a peer "MAY respond with error code
+/// `3: ResourceUnavailable` or not include the data column sidecar in the
+/// response", so a block there can be unavailable through no fault of anyone,
+/// and holding it would stall the chain against data the network is entitled to
+/// have dropped. Above it, refusing to import without the columns is the point.
+///
+/// Pre-fulu blocks are never gated: the column matrix does not exist for them,
+/// and their own blob shape has no pipeline here (see [`data_availability_for`]).
+///
+/// Mirrors lighthouse's `da_check_required_for_epoch`, which asks the same
+/// question of the same boundary.
+fn da_check_required_for_slot(block_slot: u64, current_slot: u64, config: &Config) -> bool {
+    let block_epoch = block_slot / preset::SLOTS_PER_EPOCH;
+    let current_epoch = current_slot / preset::SLOTS_PER_EPOCH;
+    let boundary = current_epoch
+        .saturating_sub(constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS)
+        .max(config.fulu_fork_epoch);
+    block_epoch >= boundary
+}
+
+fn data_availability_for(
+    store: &Store,
+    block: &SignedBeaconBlock,
+    custody_columns: &[u64],
+) -> Option<fork_choice::DataAvailability> {
+    match block {
+        SignedBeaconBlock::Deneb(inner) => {
+            if !inner.message.body.blob_kzg_commitments.is_empty() {
+                warn_no_blob_pipeline(block);
+            }
+            Some(fork_choice::DataAvailability::NotRequired)
+        }
+        SignedBeaconBlock::Electra(inner) => {
+            if !inner.message.body.blob_kzg_commitments.is_empty() {
+                warn_no_blob_pipeline(block);
+            }
+            Some(fork_choice::DataAvailability::NotRequired)
+        }
+        SignedBeaconBlock::Fulu(inner) => {
+            if inner.message.body.blob_kzg_commitments.is_empty() {
+                return Some(fork_choice::DataAvailability::NotRequired);
+            }
+
+            // Defensive: `das::custody_columns` never returns an empty set, so
+            // this is unreachable through the current wiring, but nothing
+            // enforces that at the type level. Falling through with an empty
+            // slice would make the presence check below vacuously true and
+            // the resulting `Columns(vec![])` vacuously available to
+            // `is_data_available_columns`, together admitting any
+            // commitments with no column ever checked — exactly what this
+            // gate exists to prevent.
+            if custody_columns.is_empty() {
+                error!(
+                    block_root = %ShortRoot(&block.message_hash_tree_root().0),
+                    "Refusing to treat a fulu block as available: this node's \
+                     custody set is empty while the data-availability gate is on"
+                );
+                return None;
+            }
+
+            let slot = block.slot();
+            let block_root = block.message_hash_tree_root();
+
+            // Presence first, over the full set: a column this node has not
+            // yet verified must not even be looked up, since silently
+            // dropping the missing ones would hand back a shorter-but-still-
+            // non-empty list that reads as complete evidence to the caller.
+            if !custody_columns_present(store, slot, &block_root, custody_columns) {
+                return None;
+            }
+
+            let sidecars = custody_columns
+                .iter()
+                .map(|&index| {
+                    let encoded = store
+                        .get_data_column_sidecar(slot, &block_root, index)
+                        .expect("DB read should succeed")
+                        .expect("presence just confirmed above");
+                    fulu::DataColumnSidecar::from_ssz_bytes(&encoded)
+                        .expect("a sidecar this node verified before storing decodes")
+                })
+                .collect();
+
+            Some(fork_choice::DataAvailability::Columns(sidecars))
+        }
+        _ => Some(fork_choice::DataAvailability::NotRequired),
+    }
+}
+
+/// Whether every column in `custody_columns` is present for `block_root` at
+/// `slot`, without reading any of them back.
+///
+/// Shared by [`data_availability_for`] and
+/// [`BlockChainServer::release_block_if_columns_complete`], which both need
+/// the same "is the set complete" question answered before paying for a read:
+/// the former before collecting evidence, the latter before deciding whether
+/// a held block is worth fetching back out of storage at all.
+fn custody_columns_present(
+    store: &Store,
+    slot: u64,
+    block_root: &H256,
+    custody_columns: &[u64],
+) -> bool {
+    let present = store
+        .data_column_indices_for(slot, block_root)
+        .expect("DB read should succeed");
+    custody_columns.iter().all(|index| present.contains(index))
+}
+
+/// Warns that `block` is being admitted with no availability check: this node
+/// has no blob-and-proof pipeline to source `DataAvailability::Blobs`
+/// evidence from for a deneb or electra block, and holding such a block
+/// forever against a source that will never fill in would be worse than
+/// admitting it unchecked.
+///
+/// Logged on every occurrence, with the fork and the block root, rather than
+/// on the first one only: the held side of this gate is fully observable
+/// (`lean_blocks_held_for_columns` plus `hold_block_for_columns`'s own log
+/// line), and this is the admitted-without-checking side of the same gate, so
+/// an operator needs to be able to tell how often it fires and for which block
+/// just as much.
+fn warn_no_blob_pipeline(block: &SignedBeaconBlock) {
+    let fork = block.fork_name().as_str();
+    let block_root = block.message_hash_tree_root();
+    warn!(
+        fork,
+        block_root = %ShortRoot(&block_root.0),
+        "Admitting a block carrying blobs with no availability check: this node \
+         has no blob-and-proof pipeline"
+    );
+}
+
 impl BlockChainServer {
     async fn on_tick(&mut self, timestamp_ms: u64, ctx: &Context<Self>) {
         let time_config = self.store.config().time_grid();
@@ -607,6 +887,13 @@ impl BlockChainServer {
         // `slot` above is already derived from `timestamp_ms` (the wall clock
         // at tick time), so it doubles as the wall-clock slot for the gate.
         pre_tick.diff_and_emit(&self.store, &self.events, slot);
+
+        // The other of the two places (with a genuine `process_block` import)
+        // beacon finality can move; see the method's own documentation for
+        // why nothing else evicts a held block nobody redelivers.
+        self.evict_held_blocks_at_or_below_finality();
+        self.evict_sidecars_awaiting_parent_at_or_below_finality();
+        self.redrive_held_blocks();
 
         // Per-interval duties for this tick. Lean-only, so this is where a
         // beacon follower's tick ends: it has no validator duties (see
@@ -1210,7 +1497,10 @@ impl BlockChainServer {
     /// Run block import, emit the resulting chain events, and refresh
     /// metrics. Chain-generic: `signed_block`'s own variant selects which
     /// chain's import call runs.
-    fn process_block(&mut self, signed_block: SignedBeaconBlock) -> Result<(), ImportError> {
+    fn process_block(
+        &mut self,
+        signed_block: SignedBeaconBlock,
+    ) -> Result<ImportOutcome, ImportError> {
         // Gate the `block` event on whether this root is actually new, so a
         // re-delivery does not announce the same block twice.
         //
@@ -1228,9 +1518,10 @@ impl BlockChainServer {
             .expect("DB read should succeed");
         let pre_import = ChainEventSnapshot::capture(&self.store);
 
-        match signed_block {
+        let outcome = match signed_block {
             SignedBeaconBlock::Lean(lean_block) => {
                 store::on_block(&mut self.store, lean_block)?;
+                ImportOutcome::Imported
             }
             // Already imported: skip the whole transition rather than redo
             // it. Lean's `store::on_block` makes exactly this `has_state`
@@ -1240,18 +1531,42 @@ impl BlockChainServer {
             // write to reach the same store it already produced. Range sync
             // and gossip overlap at the tip make that the common case, not a
             // rare one.
-            _ if !is_new => {}
+            _ if !is_new => ImportOutcome::Imported,
             beacon_block => {
                 let config = self.store.config();
                 // Extracted before `beacon_block` moves into `fork_choice::on_block`
                 // below, which takes ownership of it.
                 let (attestations, slashings) = fork_choice::block_operations(&beacon_block);
-                fork_choice::on_block(
-                    &mut self.store,
-                    beacon_block,
+
+                // Gate on this node's own custody columns before `on_block`
+                // ever runs `state_transition`: an unavailable block is not
+                // worth transitioning. `None` holds rather than rejects,
+                // since the columns may simply not have arrived yet; see
+                // `data_availability_for`'s own documentation for why a
+                // partial set must never reach `on_block` as evidence.
+                //
+                // Only inside the availability boundary, though: below it no
+                // peer is obliged to answer for a column at all, so gating
+                // there would hold a block against data the network has
+                // legitimately forgotten. See `da_check_required_for_slot`.
+                let within_da_window = da_check_required_for_slot(
+                    beacon_block.slot(),
+                    fork_choice::get_current_slot(&self.store, &config),
                     &config,
-                    &fork_choice::DataAvailability::NotRequired,
-                )?;
+                );
+                let evidence = if within_da_window {
+                    match data_availability_for(&self.store, &beacon_block, &self.custody_columns) {
+                        Some(evidence) => evidence,
+                        None => {
+                            self.hold_block_for_columns(beacon_block);
+                            return Ok(ImportOutcome::Held);
+                        }
+                    }
+                } else {
+                    fork_choice::DataAvailability::NotRequired
+                };
+
+                fork_choice::on_block(&mut self.store, beacon_block, &config, &evidence)?;
 
                 // The block is already in the store whatever the rest of this
                 // arm does with its body, so nothing below may turn into an
@@ -1315,8 +1630,10 @@ impl BlockChainServer {
                             |err| trace!(%slot, ?err, "Ignoring an unusable slashing from a block"),
                         );
                 }
+
+                ImportOutcome::Imported
             }
-        }
+        };
 
         // `block` goes out first so subscribers see it ahead of the
         // justified/head/finalized moves its import triggers.
@@ -1330,6 +1647,12 @@ impl BlockChainServer {
         // read the wall-clock slot fresh for the head-recency gate.
         pre_import.diff_and_emit(&self.store, &self.events, self.wall_clock_slot());
 
+        // A genuine import is one of the two places (with `on_tick`) beacon
+        // finality can move, and finality is the only thing that evicts a
+        // held block nobody redelivers; see the method's own documentation.
+        self.evict_held_blocks_at_or_below_finality();
+        self.evict_sidecars_awaiting_parent_at_or_below_finality();
+
         self.refresh_chain_metrics();
 
         // Lean-only: a beacon follower tracks no validator keys of its own.
@@ -1340,7 +1663,7 @@ impl BlockChainServer {
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
-        Ok(())
+        Ok(outcome)
     }
 
     /// Process a newly received block, whichever chain it belongs to.
@@ -1647,7 +1970,7 @@ impl BlockChainServer {
             _ => None,
         };
         match self.process_block(signed_block) {
-            Ok(()) => {
+            Ok(ImportOutcome::Imported) => {
                 info!(
                     %slot,
                     proposer,
@@ -1667,6 +1990,29 @@ impl BlockChainServer {
 
                 // Enqueue any pending blocks that were waiting for this parent
                 self.collect_pending_children(block_root, queue);
+
+                // This root now has a post-state, which is the one thing every
+                // sidecar parked under it was waiting for.
+                self.drain_sidecars_awaiting_parent(block_root);
+            }
+            // A hold writes no post-state, so nothing pending on this root is
+            // actually unblocked yet. Calling `collect_pending_children` here
+            // regardless — as a bare `Ok(())` from `process_block` used to
+            // make this arm do — would re-queue a child whose own ancestor
+            // walk (see the "Block parent missing" branch above) re-fetches
+            // this very block from `BlockHeaders` and re-enqueues it too,
+            // which re-holds it and reaches this same arm again: an infinite
+            // cycle on this function's own queue, with no yield point, on
+            // every fan-out delivery of one of this block's children.
+            // `release_block_if_columns_complete` is what reaches
+            // `collect_pending_children` for real, once this root actually
+            // has a post-state to unblock anything with.
+            Ok(ImportOutcome::Held) => {
+                debug!(
+                    %slot,
+                    block_root = %ShortRoot(&block_root.0),
+                    "Block held pending its custody columns; nothing pending on it is unblocked yet"
+                );
             }
             Err(err) => {
                 warn!(
@@ -1710,18 +2056,44 @@ impl BlockChainServer {
 
     /// Ask the network for a block this node is missing an ancestor of.
     ///
-    /// Chain-agnostic, and deliberately so: `fetch_block` carries a root and
-    /// nothing else, and the p2p layer picks the protocol from the wire it
-    /// already speaks, so neither this method nor the actor protocol grows a
-    /// chain argument. Deduplication is the p2p layer's too, keyed on the root.
+    /// Chain-agnostic, and deliberately so: the request carries a root and
+    /// what is missing under it, and the p2p layer picks the protocol from the
+    /// wire it already speaks, so neither this method nor the actor protocol
+    /// grows a chain argument. Deduplication is the p2p layer's too, keyed on
+    /// the root.
     fn request_missing_block(&mut self, block_root: H256) {
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
-                .fetch_block(block_root)
+                .fetch_block(FetchRequest {
+                    block_root,
+                    needs_block: true,
+                    // Nothing to name: a block this node has never seen has
+                    // told it nothing about what it committed to.
+                    columns: Vec::new(),
+                })
                 .inspect(|_| info!(%block_root, "Requested missing block from network"))
                 .inspect_err(
                     |err| error!(%block_root, %err, "Failed to send FetchBlock message to P2P"),
                 );
+        }
+    }
+
+    /// Ask the network for the custody columns of a block this node already has.
+    ///
+    /// The partner of [`Self::request_missing_block`], and the reason
+    /// `needs_block` is a field of its own rather than "the column list is
+    /// empty": the block is in this node's DB, so asking for it again would put
+    /// a redundant by-root lookup on the wire behind every column request.
+    fn request_missing_columns(&self, block_root: H256, missing: Vec<u64>) {
+        if let Some(ref p2p) = self.p2p {
+            let request = FetchRequest {
+                block_root,
+                needs_block: false,
+                columns: missing,
+            };
+            let _ = p2p.fetch_block(request).inspect_err(
+                |err| error!(%block_root, %err, "Failed to request a held block's missing data columns"),
+            );
         }
     }
 
@@ -1759,17 +2131,126 @@ impl BlockChainServer {
         }
     }
 
+    /// Keep `block` until every column this node custodies for it has arrived,
+    /// and ask peers for the ones that have not.
+    ///
+    /// The same shape as a block held for a missing parent: the block itself is
+    /// already in the DB, so only its root is remembered here, and the map is
+    /// cleared by the finality eviction the pending path already performs.
+    /// There is no timer on the block. Neither das-core nor lighthouse puts one
+    /// there: das-core leaves the timing question open, and lighthouse prunes
+    /// its pending components at `max(finalized_epoch + 1, the availability
+    /// boundary)` instead.
+    fn hold_block_for_columns(&mut self, block: SignedBeaconBlock) {
+        let slot = block.slot();
+        let block_root = block.message_hash_tree_root();
+
+        let present = self
+            .store
+            .data_column_indices_for(slot, &block_root)
+            .expect("DB read should succeed");
+        let missing: Vec<u64> = self
+            .custody_columns
+            .iter()
+            .copied()
+            .filter(|index| !present.contains(index))
+            .collect();
+
+        info!(
+            %slot,
+            block_root = %ShortRoot(&block_root.0),
+            missing = ?missing,
+            "Holding block: its custody columns have not all arrived yet"
+        );
+
+        // Written the same way a parent-missing block is (see
+        // `process_or_pend_block`): no `LiveChain` entry, so it stays
+        // invisible to fork choice until it is re-admitted, but readable back
+        // by root once its columns land.
+        self.store
+            .insert_pending_block(block_root, block)
+            .expect("DB insert should succeed");
+
+        self.blocks_awaiting_columns.insert(block_root, slot);
+        metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
+
+        // The block itself is in the DB by now: this very method just wrote it.
+        self.request_missing_columns(block_root, missing);
+    }
+
     /// Recursively discard a block and all its pending descendants.
     ///
     /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
     /// children that would otherwise remain stuck in the pending maps indefinitely.
     fn discard_pending_subtree(&mut self, block_root: H256) {
+        // A block held for its custody columns already had a known parent
+        // when it was held (see `hold_block_for_columns`), so it carries no
+        // entry of its own in `pending_blocks` and would not be reached by
+        // the early return below. This has to run unconditionally, ahead of
+        // that guard, so both of this function's callers reach it: a
+        // redelivery of this exact root finding it at or below the finalized
+        // slot (see `process_or_pend_block`), and the periodic sweep in
+        // `evict_held_blocks_at_or_below_finality`, which calls this directly
+        // on a root with no redelivery in sight.
+        if self.blocks_awaiting_columns.remove(&block_root).is_some() {
+            metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
+        }
+
         let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
             return;
         };
         for child_root in child_roots {
             self.pending_block_parents.remove(&child_root);
             self.discard_pending_subtree(child_root);
+        }
+    }
+
+    /// Drop every held block whose slot is now at or below the finalized
+    /// slot, via [`Self::discard_pending_subtree`] so any pending children
+    /// still waiting on one as their parent are cleaned up too, not just the
+    /// hold itself.
+    ///
+    /// Needed because nothing else evicts a withheld hold. A block missing
+    /// its parent needs a genuine gap in this node's own chain to end up
+    /// pending; a block held for its columns needs only a claim, since
+    /// nothing about a block's signature or contents is checked before the
+    /// gate can hold it (`data_availability_for` runs on the bare
+    /// `blob_kzg_commitments` field ahead of `fork_choice::on_block`'s own
+    /// verification). A peer can therefore name any known, unfinalized parent,
+    /// claim commitments, and simply never answer the resulting
+    /// `FetchRequest`, pinning the claimed block in this node's memory
+    /// and in its `BlockHeaders`/`BlockBodies` rows (written by
+    /// `hold_block_for_columns`'s `insert_pending_block`) for as long as it
+    /// likes, at no cost to itself. Calling this after every tick and every
+    /// import — the two places beacon finality can move — bounds that by the
+    /// unfinalized window rather than by this node's uptime.
+    ///
+    /// A no-op whenever nothing is held, which is always true on lean.
+    fn evict_held_blocks_at_or_below_finality(&mut self) {
+        if self.blocks_awaiting_columns.is_empty() {
+            return;
+        }
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+        let stale: Vec<H256> = self
+            .blocks_awaiting_columns
+            .iter()
+            .filter(|&(_, &slot)| slot <= finalized_slot)
+            .map(|(&root, _)| root)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        info!(
+            finalized_slot,
+            count = stale.len(),
+            "Evicting held blocks that finality has superseded"
+        );
+        for root in stale {
+            self.discard_pending_subtree(root);
         }
     }
 
@@ -1811,6 +2292,532 @@ impl BlockChainServer {
             self.events
                 .emit(ChainEvent::Aggregate { participants, data });
         }
+    }
+
+    /// Verify a sidecar against the chain and keep it, whether it arrived on
+    /// gossip or in answer to a fetch.
+    ///
+    /// Gossip's own cheap checks (decode, subnet match, structural validity,
+    /// seen-dedup) already ran in the p2p actor before a gossiped sidecar
+    /// reaches here. A fetched one skips straight to this method with none of
+    /// them, so the structural check is repeated first, rather than trusted
+    /// from the gossip path alone: c-kzg fails outright rather than returning
+    /// false on a length-mismatched batch, so skipping it would not have let
+    /// a bad sidecar through, but it would let a peer answering a fetch force
+    /// a full KZG batch on garbage that gossip rejects for free. Everything
+    /// after it needs the store: the parent must be known and its chain must
+    /// actually descend from the finalized checkpoint (not merely sit at a
+    /// slot above it — a state can stay cached for a block on a losing fork
+    /// long after finality passed it), the sidecar's slot must not be so far
+    /// ahead that advancing to it would be unbounded work, the header must be
+    /// signed by the slot's expected proposer, and the sidecar's commitments
+    /// must be the ones that block committed to. Only then is the KZG batch
+    /// worth paying for.
+    ///
+    /// A rejected sidecar is dropped silently apart from a metric: neither
+    /// the gossip nor the fetch path can score the peer.
+    ///
+    /// Beacon-only: a lean node subscribes to no column subnet, so nothing
+    /// ever delivers this message there (see `Handler<NewDataColumnSidecars>`).
+    ///
+    /// `encoded` is the SSZ this sidecar was decoded from, when the caller
+    /// still has it. Only the replay path does: it just read those bytes back
+    /// out of `Table::PendingDataColumns`, and a sidecar carries a cell per
+    /// blob, so re-deriving them here to write the identical row into
+    /// `Table::DataColumns` would pay a full second SSZ pass for nothing — the
+    /// same waste [`Store::put_data_column_sidecar`] takes bytes rather than a
+    /// container to avoid.
+    fn on_gossip_data_column(
+        &mut self,
+        sidecar: fulu::DataColumnSidecar,
+        encoded: Option<Vec<u8>>,
+    ) {
+        let header = sidecar.signed_block_header.message.clone();
+        let config = self.store.config();
+
+        if !fork_choice::verify_data_column_sidecar(&sidecar, &config) {
+            metrics::inc_data_column_rejected("malformed");
+            return;
+        }
+
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+        if header.slot <= finalized_slot {
+            metrics::inc_data_column_rejected("finalized");
+            return;
+        }
+
+        // Bounds `process_slots`, inside the proposer check below, to at most
+        // the unfinalized window: without this, a header naming a slot far
+        // beyond anything this chain has reached would make that call advance
+        // one slot at a time towards it, on the single-threaded actor that
+        // also runs every tick and every other import. `fork_choice::on_block`
+        // asserts the same inequality before its own `state_transition` call,
+        // for the same reason.
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        if header.slot > current_slot {
+            metrics::inc_data_column_rejected("future");
+            return;
+        }
+
+        // Already stored, so nothing past this point would change anything —
+        // and everything past this point is the expensive part: a full
+        // post-state read for the proposer check, the inclusion proof, the KZG
+        // batch and a signature verification.
+        //
+        // Not a rare case. The p2p layer asks for a span's columns alongside
+        // every `BeaconBlocksByRange` batch it plans, and consecutive batches
+        // plus a peer answering an overlapping span re-deliver sidecars this
+        // node already has, so during a backfill drain most arrivals are
+        // duplicates. Paying full verification for each of those is paid on
+        // the same single-threaded actor that runs the imports the backfill is
+        // waiting on, which is the one place it cannot be afforded.
+        let block_root = header.hash_tree_root();
+        let stored = self
+            .store
+            .data_column_indices_for(header.slot, &block_root)
+            .expect("DB read should succeed");
+        if stored.contains(&sidecar.index) {
+            return;
+        }
+
+        // The proposer check below needs the parent's post-state to advance
+        // from. Not having one is a "not yet", never a "no": the parent may
+        // still be in flight, or — the case the availability gate creates on
+        // every held block — already in the store but withheld from
+        // `on_block`, which is what writes the post-state. Queue the sidecar
+        // against that parent instead of dropping it, exactly as the
+        // specification's `[IGNORE] ... MAY be queued for processing once the
+        // parent block is retrieved` allows, and replay it from
+        // `drain_sidecars_awaiting_parent` when the parent imports.
+        //
+        // Deliberately ahead of the inclusion-proof and KZG checks below, so a
+        // replay pays for them once rather than once per attempt.
+        let Ok(Some(parent_state)) = self.store.get_state(&header.parent_root) else {
+            self.queue_sidecar_awaiting_parent(block_root, sidecar);
+            return;
+        };
+
+        if !self.parent_is_on_the_finalized_chain(header.parent_root) {
+            metrics::inc_data_column_rejected("finalized_ancestor");
+            return;
+        }
+
+        if !fork_choice::verify_data_column_sidecar_inclusion_proof(&sidecar) {
+            metrics::inc_data_column_rejected("inclusion_proof");
+            return;
+        }
+
+        let kzg_result = {
+            let _timing = metrics::time_data_column_kzg_verify();
+            fork_choice::verify_data_column_sidecar_kzg_proofs(&sidecar)
+        };
+        match kzg_result {
+            Ok(true) => {}
+            Ok(false) => {
+                metrics::inc_data_column_rejected("kzg");
+                return;
+            }
+            Err(err) => {
+                trace!(?err, "Dropping a sidecar whose cells did not parse");
+                metrics::inc_data_column_rejected("kzg");
+                return;
+            }
+        }
+
+        if !self.header_is_signed_by_the_expected_proposer(&sidecar, &parent_state, &config) {
+            metrics::inc_data_column_rejected("proposer");
+            return;
+        }
+
+        let encoded = encoded.unwrap_or_else(|| sidecar.to_ssz());
+        if let Err(err) =
+            self.store
+                .put_data_column_sidecar(header.slot, &block_root, sidecar.index, encoded)
+        {
+            error!(%err, "Failed to store a data column sidecar");
+            return;
+        }
+        metrics::inc_data_column_stored();
+
+        // A held block may now be complete.
+        self.release_block_if_columns_complete(block_root);
+    }
+
+    /// Whether `parent_root`'s chain actually descends from the finalized
+    /// checkpoint, not merely sits at a slot above it: `get_checkpoint_block`
+    /// walks its ancestry to the finalized epoch's boundary, and the result
+    /// must be the finalized root itself, not just any root that happens to
+    /// resolve. A state can stay cached for a block on a losing fork long
+    /// after finality passed it, which is exactly the case a slot-only
+    /// comparison would miss. Mirrors `fork_choice::on_block`'s own check,
+    /// over the same block index.
+    ///
+    /// A method of its own, separate from `on_gossip_data_column`'s other
+    /// inline checks, so a test can drive it against a hand-built block index
+    /// without needing a sidecar that also clears the inclusion proof, the
+    /// KZG batch and the proposer signature — the three checks after this one
+    /// in the real pipeline, none of which this check's own correctness has
+    /// anything to do with.
+    fn parent_is_on_the_finalized_chain(&self, parent_root: H256) -> bool {
+        let finalized_checkpoint = self.store.beacon_finalized_checkpoint();
+        let block_index = self.store.block_index();
+        matches!(
+            fork_choice::get_checkpoint_block(&block_index, parent_root, finalized_checkpoint.epoch),
+            Ok(root) if root == finalized_checkpoint.root
+        )
+    }
+
+    /// Whether `sidecar`'s header names the slot's expected proposer and
+    /// carries their signature.
+    ///
+    /// Mirrors `stf::verify_block_signature`, adapted to a bare header: a
+    /// sidecar carries no block body, only the header the block committed to,
+    /// so the signing root is taken over that header's own root rather than a
+    /// whole block's. Reuses the same primitives that check does
+    /// (`get_domain`, `compute_signing_root`, `bls::verify`) rather than a
+    /// second copy of the BLS call, since no publicly reachable function
+    /// verifies a bare header's signature: the block path always has a whole
+    /// block to check, and the proposer-slashing path checks two headers it
+    /// already has a validator for.
+    ///
+    /// `parent_state` is cloned and advanced with `process_slots` rather than
+    /// mutated in place, the same way `compute_pulled_up_tip` clones out of
+    /// the store's `Arc` before running a throwaway transition: the store's
+    /// own cached entry for the parent must be left exactly as it was.
+    fn header_is_signed_by_the_expected_proposer(
+        &self,
+        sidecar: &fulu::DataColumnSidecar,
+        parent_state: &BeaconState,
+        config: &Config,
+    ) -> bool {
+        let header = &sidecar.signed_block_header.message;
+        let mut state = parent_state.clone();
+        if stf::process_slots(&mut state, header.slot, config).is_err() {
+            return false;
+        }
+
+        let Ok(expected_proposer) = get_beacon_proposer_index(&state) else {
+            return false;
+        };
+        if header.proposer_index != expected_proposer {
+            return false;
+        }
+
+        let Ok(proposer) = state.validator(header.proposer_index) else {
+            return false;
+        };
+        let domain = get_domain(&state, DOMAIN_BEACON_PROPOSER, None);
+        let signing_root = compute_signing_root(header.hash_tree_root(), domain);
+        bls::verify(
+            &proposer.pubkey,
+            signing_root,
+            &sidecar.signed_block_header.signature,
+        )
+    }
+
+    /// Park `sidecar` against the parent root it could not be checked against.
+    ///
+    /// Counted as `queued_for_parent` rather than as a rejection: nothing about
+    /// the sidecar has been judged yet, and conflating the two is what made the
+    /// deadlock invisible in the metrics (every column read as
+    /// `rejected{reason="unknown_parent"}` while the real fault was upstream).
+    ///
+    /// Nothing is refused here. The queue used to hold whole sidecars and so
+    /// carried a count cap, which a follower behind the tip hit constantly:
+    /// it receives gossip for the tip continuously, so the queue filled with
+    /// sidecars for blocks it would not reach for minutes and then refused
+    /// the ones for the block it was about to import. Measured on the eth-4
+    /// follower a hundred slots behind, the queue sat pinned at its cap and
+    /// dropped 2,561 sidecars in ten minutes while the chain ground through
+    /// by-root lookups for slots whose columns gossip had already delivered
+    /// and this function had thrown away. Evicting the furthest-ahead entry
+    /// instead of the newest fixed which sidecar was lost, not that one was.
+    ///
+    /// The cap is gone now that the sidecars live in
+    /// `Table::PendingDataColumns` and only their keys are held here, so what
+    /// grows is disk rather than this actor's memory.
+    /// [`Self::evict_sidecars_awaiting_parent_at_or_below_finality`] is what
+    /// bounds it, which bounds how *long* an entry lives but not how fast
+    /// they arrive: `on_gossip_data_column` does not require `parent_root` to
+    /// name a block this node knows, and the p2p layer's `seen_data_columns`
+    /// dedups on the header's own slot, proposer and index, all three of
+    /// which a fabricated header chooses freely. A peer willing to make them
+    /// up can therefore park rows as fast as gossip carries them, until
+    /// finality catches up.
+    fn queue_sidecar_awaiting_parent(
+        &mut self,
+        block_root: H256,
+        sidecar: fulu::DataColumnSidecar,
+    ) {
+        let header = &sidecar.signed_block_header.message;
+        let parent_root = header.parent_root;
+        let parked = ParkedColumn {
+            slot: header.slot,
+            block_root,
+            index: sidecar.index,
+        };
+
+        // A re-delivery of something already parked. The by-root and by-range
+        // fetch paths have no `seen_data_columns` between them and the actor,
+        // so this is ordinary, and without the check the same column would take
+        // a second slot in the queue and leave a stale key behind after the
+        // first replay took its row. Asked before the write rather than left to
+        // the set below, because the write is what costs.
+        if self
+            .sidecars_awaiting_parent
+            .get(&parent_root)
+            .is_some_and(|parked_columns| parked_columns.contains(&parked))
+        {
+            return;
+        }
+
+        // The bytes go to disk before the key goes in the map, so a failed
+        // write leaves no key pointing at a row that is not there.
+        if let Err(err) = self.store.put_pending_data_column_sidecar(
+            parked.slot,
+            &parked.block_root,
+            parked.index,
+            sidecar.to_ssz(),
+        ) {
+            error!(%err, "Failed to park a data column sidecar");
+            return;
+        }
+
+        trace!(
+            slot = parked.slot,
+            column = parked.index,
+            parent_root = %ShortRoot(&parent_root.0),
+            "Queueing a data column sidecar until its parent has a post-state"
+        );
+        self.sidecars_awaiting_parent
+            .entry(parent_root)
+            .or_default()
+            .insert(parked);
+        self.publish_sidecars_awaiting_parent();
+    }
+
+    /// Republish how many sidecars are parked, from the map that decides it.
+    fn publish_sidecars_awaiting_parent(&self) {
+        let total: usize = self
+            .sidecars_awaiting_parent
+            .values()
+            .map(HashSet::len)
+            .sum();
+        metrics::set_sidecars_awaiting_parent(total as u64);
+    }
+
+    /// Replay every sidecar parked against `block_root` now that it has a
+    /// post-state to be checked against.
+    ///
+    /// Called from the one arm that means "this root now has a post-state".
+    /// The replay re-enters [`Self::on_gossip_data_column`], which may itself
+    /// release a held block and import it — reaching this function again for
+    /// *that* root. The recursion is bounded by the chain: each level consumes
+    /// one root's queue and no root regains one, since a root that has a
+    /// post-state never queues against itself again.
+    fn drain_sidecars_awaiting_parent(&mut self, block_root: H256) {
+        let Some(parked_columns) = self.sidecars_awaiting_parent.remove(&block_root) else {
+            return;
+        };
+        debug!(
+            parent_root = %ShortRoot(&block_root.0),
+            count = parked_columns.len(),
+            "Replaying data column sidecars whose parent just imported"
+        );
+        self.publish_sidecars_awaiting_parent();
+
+        for parked in parked_columns {
+            // Taken, not read: the row has served its purpose either way. A
+            // replay that passes writes the sidecar to `DataColumns`, and one
+            // that fails a check has judged it, so neither leaves anything
+            // worth keeping here.
+            let encoded = match self.store.take_pending_data_column_sidecar(
+                parked.slot,
+                &parked.block_root,
+                parked.index,
+            ) {
+                Ok(Some(encoded)) => encoded,
+                Ok(None) => {
+                    error!(
+                        slot = parked.slot,
+                        column = parked.index,
+                        block_root = %ShortRoot(&parked.block_root.0),
+                        "A parked data column sidecar has no row to replay from"
+                    );
+                    continue;
+                }
+                Err(err) => {
+                    error!(%err, "Failed to read back a parked data column sidecar");
+                    continue;
+                }
+            };
+            let Ok(sidecar) = fulu::DataColumnSidecar::from_ssz_bytes(&encoded) else {
+                error!(
+                    slot = parked.slot,
+                    column = parked.index,
+                    "A parked data column sidecar did not decode"
+                );
+                continue;
+            };
+            // Handed back the bytes it was decoded from: a replay that passes
+            // every check writes this same row into `Table::DataColumns`, and
+            // re-encoding it there would be a second full SSZ pass over a
+            // sidecar carrying a cell per blob.
+            self.on_gossip_data_column(sidecar, Some(encoded));
+        }
+    }
+
+    /// Drop parked sidecars whose block finality has superseded.
+    ///
+    /// The counterpart of [`Self::evict_held_blocks_at_or_below_finality`] and
+    /// run beside it, for the same reason: a parent root that never arrives
+    /// would otherwise pin its children's sidecars for this node's whole
+    /// uptime. A sidecar at or below the finalized slot can never be needed
+    /// again, since `on_gossip_data_column` would reject it outright now.
+    fn evict_sidecars_awaiting_parent_at_or_below_finality(&mut self) {
+        if self.sidecars_awaiting_parent.is_empty() {
+            return;
+        }
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+
+        let mut dropped: Vec<ParkedColumn> = Vec::new();
+        self.sidecars_awaiting_parent.retain(|_, parked_columns| {
+            parked_columns.retain(|parked| {
+                let keep = parked.slot > finalized_slot;
+                if !keep {
+                    dropped.push(*parked);
+                }
+                keep
+            });
+            !parked_columns.is_empty()
+        });
+
+        if !dropped.is_empty() {
+            info!(
+                finalized_slot,
+                count = dropped.len(),
+                "Evicting parked data column sidecars that finality has superseded"
+            );
+            // The rows go with the keys, so a key dropped from the map never
+            // leaves its bytes on disk with nothing left to read them.
+            let keys = dropped
+                .iter()
+                .map(|parked| (parked.slot, parked.block_root, parked.index));
+            let _ = self
+                .store
+                .delete_pending_data_column_sidecars(keys)
+                .inspect_err(|err| error!(%err, "Failed to drop parked data column sidecars"));
+            self.publish_sidecars_awaiting_parent();
+        }
+    }
+
+    /// Once a slot, revisit every held block: release the ones whose columns
+    /// have quietly completed, and re-ask for whatever the rest are still
+    /// missing.
+    ///
+    /// [`Self::hold_block_for_columns`] asks once, when the block is first
+    /// held, and the only other thing that revisits a hold is a sidecar for
+    /// that exact block arriving on gossip. A block whose missing columns no
+    /// connected peer custodies gets neither: every peer answers
+    /// `DataColumnsByRoot` with an empty list, the lookup spends its retry
+    /// ladder against the peer set in a few seconds, and the hold is then left
+    /// with nothing that will ever disturb it again while the chain stops
+    /// behind it.
+    ///
+    /// Seen following mainnet with the gate on: every connected peer
+    /// advertised the minimum `custody_group_count`, so a dozen peers between
+    /// them custodied a small fraction of the columns, and two of the eight
+    /// this node samples were not among them. Peers churn constantly, and one
+    /// that connects a minute later may custody exactly the column that was
+    /// missing, so an ask that fails now is worth repeating. A slot is the
+    /// cadence blocks arrive at, and the held set is normally empty and
+    /// bounded by finality when it is not, so repeating it costs one store
+    /// read per held block per slot.
+    ///
+    /// A no-op whenever nothing is held, which is always true on lean.
+    fn redrive_held_blocks(&mut self) {
+        if self.blocks_awaiting_columns.is_empty() {
+            return;
+        }
+
+        // Collected up front: releasing re-enters the import path, which
+        // mutates the very map this would otherwise be iterating.
+        let held: Vec<(H256, u64)> = self
+            .blocks_awaiting_columns
+            .iter()
+            .map(|(&block_root, &slot)| (block_root, slot))
+            .collect();
+
+        for (block_root, slot) in held {
+            let present = self
+                .store
+                .data_column_indices_for(slot, &block_root)
+                .expect("DB read should succeed");
+            let missing: Vec<u64> = self
+                .custody_columns
+                .iter()
+                .copied()
+                .filter(|index| !present.contains(index))
+                .collect();
+
+            // Complete and still held: whatever completed it did not reach
+            // `release_block_if_columns_complete`. Release it here rather than
+            // leave a block waiting on columns this node already has.
+            if missing.is_empty() {
+                self.release_block_if_columns_complete(block_root);
+                continue;
+            }
+
+            self.request_missing_columns(block_root, missing);
+        }
+    }
+
+    /// Re-import a held block once its last missing column lands.
+    fn release_block_if_columns_complete(&mut self, block_root: H256) {
+        let Some(&slot) = self.blocks_awaiting_columns.get(&block_root) else {
+            return;
+        };
+
+        // Cheap presence check before paying for a DB read and decode of the
+        // whole block: most sidecar arrivals are not the last column of a
+        // held block, and this is the same check `data_availability_for`'s
+        // fulu arm makes.
+        if !custody_columns_present(&self.store, slot, &block_root, &self.custody_columns) {
+            return;
+        }
+
+        self.blocks_awaiting_columns.remove(&block_root);
+        metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
+
+        let Ok(Some(block)) = self.store.get_signed_block(&block_root) else {
+            error!(
+                block_root = %ShortRoot(&block_root.0),
+                "A held block vanished from the store before its columns completed"
+            );
+            return;
+        };
+
+        info!(
+            %slot,
+            block_root = %ShortRoot(&block_root.0),
+            "Held block's custody columns are complete; re-importing"
+        );
+        // The same path a new block takes (`Handler<NewBlock>` ends with this
+        // same call): iterative, not recursive, so a released block's own
+        // pending children still cascade through `run_import_cascade`'s loop
+        // rather than growing the stack. Both of this method's callers,
+        // `on_gossip_data_column` and `redrive_held_blocks`, sit under a
+        // top-level message handler and neither is reached from inside that
+        // loop, so this cannot re-enter it either.
+        self.on_block(block);
     }
 
     /// Refresh the sync-status tracker and its two outputs (the
@@ -1950,7 +2957,7 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    NewAggregatedAttestation, NewAttestation, NewBlock,
+    NewAggregatedAttestation, NewAttestation, NewBlock, NewDataColumnSidecars,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -2072,6 +3079,14 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
         let arrival_ms = unix_now_ms();
         metrics::observe_gossip_aggregation_arrival(arrival_ms, &self.store.config().time_grid());
         self.on_gossip_aggregated_attestation(msg.attestation);
+    }
+}
+
+impl Handler<NewDataColumnSidecars> for BlockChainServer {
+    async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
+        for sidecar in msg.sidecars {
+            self.on_gossip_data_column(sidecar, None);
+        }
     }
 }
 
@@ -2198,8 +3213,12 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use ethlambda_state_transition::beacon::fork_choice::seconds_to_milliseconds;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::{deneb, electra, phase0, shared};
+    use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::state::State;
 
@@ -2386,6 +3405,26 @@ mod tests {
     /// No anchor state is written: its only caller asserts on the chain tag
     /// `Store::init_beacon` sets, which is seeded before any state is.
     fn beacon_store(genesis_time: u64, finalized_slot: u64) -> Store {
+        beacon_store_with_config(genesis_time, finalized_slot, Config::mainnet())
+    }
+
+    /// A beacon store whose fulu activation is genesis, so a fulu-shaped block
+    /// at a single-digit slot is a coherent fixture rather than one sitting
+    /// thousands of epochs before its own fork.
+    ///
+    /// Needed by anything exercising the availability gate: that gate stops at
+    /// the fulu fork (see `da_check_required_for_slot`), so under
+    /// [`Config::mainnet`]'s real schedule a slot-2 block is simply not a
+    /// block the gate has any business holding.
+    fn beacon_store_fulu_at_genesis(genesis_time: u64, finalized_slot: u64) -> Store {
+        beacon_store_with_config(
+            genesis_time,
+            finalized_slot,
+            Config::mainnet().with_fork_epoch(ForkName::Fulu, 0),
+        )
+    }
+
+    fn beacon_store_with_config(genesis_time: u64, finalized_slot: u64, config: Config) -> Store {
         let backend = Arc::new(InMemoryBackend::default());
         let anchor_root = H256::ZERO;
         let anchor_checkpoint = Checkpoint {
@@ -2395,9 +3434,10 @@ mod tests {
         Store::init_beacon(
             backend,
             genesis_time,
-            Config::mainnet(),
+            config,
             anchor_root,
             anchor_checkpoint,
+            finalized_slot,
         )
     }
 
@@ -2443,7 +3483,1085 @@ mod tests {
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
 
-        let _ =
-            BlockChain::spawn_beacon(store, SyncStatusController::default(), EventBus::default());
+        let _ = BlockChain::spawn_beacon(
+            store,
+            SyncStatusController::default(),
+            EventBus::default(),
+            Vec::new(),
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // on_gossip_data_column reject paths
+    //
+    // Both call the method directly on a plain `BlockChainServer`, built the
+    // way `start_actor` builds one but never spawned: there is no mailbox to
+    // drive, and the checks under test run before anything here would need
+    // one.
+    // -----------------------------------------------------------------
+
+    fn beacon_server(store: Store) -> BlockChainServer {
+        BlockChainServer {
+            store,
+            p2p: None,
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            blocks_awaiting_columns: HashMap::new(),
+            sidecars_awaiting_parent: HashMap::new(),
+            custody_columns: Vec::new(),
+            last_tick_instant: None,
+            sync_status: SyncStatusTracker::new(false),
+            sync_status_controller: SyncStatusController::default(),
+            events: EventBus::default(),
+            duties: ChainDuties::Beacon,
+        }
+    }
+
+    /// A sidecar naming `slot` and `parent_root`, structurally valid enough to
+    /// clear `verify_data_column_sidecar` (one commitment, one proof, one
+    /// column cell, all the same length) so the reject paths under test are
+    /// reached at all now that check runs first; every other field is its
+    /// type's default, since none of those paths reads past the header.
+    fn sidecar_at(slot: u64, parent_root: H256) -> fulu::DataColumnSidecar {
+        let cell: fulu::Cell = libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL])
+            .expect("exact cell size");
+        fulu::DataColumnSidecar {
+            index: 0,
+            column: vec![cell].try_into().expect("within the per-block limit"),
+            kzg_commitments: vec![ethlambda_types::beacon::primitives::KzgCommitment::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            kzg_proofs: vec![ethlambda_types::beacon::primitives::KzgProof::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            signed_block_header: shared::SignedBeaconBlockHeader {
+                message: shared::BeaconBlockHeader {
+                    slot,
+                    parent_root,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            },
+            // `SszVector` carries its length in the type, so unlike the
+            // `SszList` fields above there is no length-zero default for it.
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        }
+    }
+
+    /// A phase0 block good for nothing but its `(slot, parent_root)` pair:
+    /// what `Store::insert_signed_block` writes into `LiveChain`, which is
+    /// all `get_checkpoint_block`'s ancestry walk ever reads. The fork is
+    /// irrelevant to that walk, so the cheapest shape to build stands in.
+    fn bare_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+        SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: H256::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// A structurally minimal phase0 state, good for nothing but existing.
+    /// The finalized-ancestor check under test never reads a state's
+    /// contents, only whether `Store::get_state` finds one at all, so this
+    /// only needs to satisfy the type checker and `Store::insert_state`.
+    ///
+    /// `latest_block_header.parent_root` is set to a root nothing else in a
+    /// test ever writes, so `Store::block_entry` reports it unknown and
+    /// `insert_state` takes that as "first state on record" and stores a
+    /// plain snapshot, rather than trying to diff against a parent state
+    /// this helper never creates.
+    fn bare_state() -> BeaconState {
+        let block_roots = vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            .try_into()
+            .expect("exactly the preset length");
+        let state_roots = vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+            .try_into()
+            .expect("exactly the preset length");
+        let randao_mixes = vec![H256::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+            .try_into()
+            .expect("exactly the preset length");
+        let slashings = vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+            .try_into()
+            .expect("exactly the preset length");
+        BeaconState::Phase0(phase0::BeaconState {
+            genesis_time: 0,
+            genesis_validators_root: H256::ZERO,
+            slot: 0,
+            fork: Default::default(),
+            latest_block_header: shared::BeaconBlockHeader {
+                parent_root: H256::repeat_byte(0xee),
+                ..Default::default()
+            },
+            block_roots,
+            state_roots,
+            historical_roots: Default::default(),
+            eth1_data: Default::default(),
+            eth1_data_votes: Default::default(),
+            eth1_deposit_index: 0,
+            validators: Default::default(),
+            balances: Default::default(),
+            randao_mixes,
+            slashings,
+            previous_epoch_attestations: Default::default(),
+            current_epoch_attestations: Default::default(),
+            justification_bits: Default::default(),
+            previous_justified_checkpoint: Default::default(),
+            current_justified_checkpoint: Default::default(),
+            finalized_checkpoint: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_data_column_sidecar_naming_a_parent_off_the_finalized_chain_is_dropped() {
+        // Two blocks hung off two different, unrelated roots: `rogue_child`'s
+        // own parent (`rogue_root`) resolves cleanly to slot 0 during the
+        // ancestry walk, so `get_checkpoint_block` returns `Ok(rogue_root)`
+        // rather than an error — and `rogue_root` is not the finalized root,
+        // which is `beacon_store`'s anchor (`H256::ZERO`). That distinction is
+        // the point: a bug that accepted any `Ok(_)` result, rather than
+        // checking it names the finalized root specifically, would pass this
+        // test's "unknown parent" sibling but not this one.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        let rogue_root = H256::repeat_byte(0xa0);
+        let rogue_child = H256::repeat_byte(0xa1);
+        store
+            .insert_signed_block(rogue_root, bare_block(0, H256::repeat_byte(0xff)))
+            .expect("insert");
+        store
+            .insert_signed_block(rogue_child, bare_block(10, rogue_root))
+            .expect("insert");
+        store
+            .insert_state(rogue_child, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 11 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+
+        let mut server = beacon_server(store);
+        let sidecar = sidecar_at(11, rogue_child);
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(11, &block_root)
+                .unwrap(),
+            Vec::<u64>::new()
+        );
+    }
+
+    // The end-to-end test above shows the sidecar never gets stored, but it
+    // cannot tell *why*: the inclusion proof, KZG batch and proposer checks
+    // that run after `parent_is_on_the_finalized_chain` would reject this
+    // particular sidecar on their own regardless, since it carries no real
+    // commitments or signature. A bug that made the check under test always
+    // return `true` would still pass that test. These two drive the method
+    // directly, with no sidecar involved, so they catch exactly that bug.
+
+    #[test]
+    fn a_root_off_the_finalized_chain_is_not_on_it() {
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        let rogue_root = H256::repeat_byte(0xa0);
+        let rogue_child = H256::repeat_byte(0xa1);
+        store
+            .insert_signed_block(rogue_root, bare_block(0, H256::repeat_byte(0xff)))
+            .expect("insert");
+        store
+            .insert_signed_block(rogue_child, bare_block(10, rogue_root))
+            .expect("insert");
+        let server = beacon_server(store);
+
+        assert!(!server.parent_is_on_the_finalized_chain(rogue_child));
+    }
+
+    #[test]
+    fn the_finalized_root_itself_is_on_the_finalized_chain() {
+        // `beacon_store` seeds the anchor as the finalized checkpoint but,
+        // unlike the real bootstrap path (`fork_choice`'s own
+        // `get_forkchoice_store`), writes no block for it, so the block index
+        // needs one here or `get_ancestor` has nothing to look up at all. The
+        // parent named is never read: block 0's own slot already satisfies
+        // the walk's stopping condition before it would be.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        let server = beacon_server(store);
+
+        // The ancestry walk starts already at the target slot and returns
+        // immediately without a single hop, the case `a_root_off...` above
+        // does not exercise at all.
+        assert!(server.parent_is_on_the_finalized_chain(H256::ZERO));
+    }
+
+    #[test]
+    fn a_data_column_sidecar_at_or_below_the_finalized_slot_is_dropped() {
+        let store = beacon_store(GENESIS_TIME, 100);
+        let mut server = beacon_server(store);
+        let sidecar = sidecar_at(100, H256::repeat_byte(1));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(100, &block_root)
+                .unwrap(),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn a_data_column_sidecar_from_a_future_slot_is_dropped() {
+        // `store.time` starts at zero (see `Store::init_beacon`), which reads
+        // as slot zero on beacon, so any positive slot is "future" here
+        // without needing to advance it. This is the check that keeps a
+        // maliciously large `header.slot` from driving `process_slots`, in
+        // the proposer check further down `on_gossip_data_column`, one slot
+        // at a time towards it on the actor's own thread.
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        let sidecar = sidecar_at(5, H256::repeat_byte(1));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(5, &block_root)
+                .unwrap(),
+            Vec::<u64>::new()
+        );
+    }
+
+    #[test]
+    fn the_availability_gate_stops_at_the_window_peers_must_serve() {
+        let config = Config::mainnet();
+        let fulu_start = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+        // Far enough past fulu that the retention window, not the fork, is
+        // what sets the boundary.
+        let current_epoch =
+            config.fulu_fork_epoch + constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS + 100;
+        let current_slot = current_epoch * preset::SLOTS_PER_EPOCH;
+        let boundary_epoch =
+            current_epoch - constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS;
+
+        // Inside the window: peers MUST be able to serve these, so insisting
+        // is fair.
+        assert!(da_check_required_for_slot(
+            current_slot,
+            current_slot,
+            &config
+        ));
+        assert!(da_check_required_for_slot(
+            boundary_epoch * preset::SLOTS_PER_EPOCH,
+            current_slot,
+            &config
+        ));
+
+        // One epoch below it a peer MAY answer ResourceUnavailable, so holding
+        // a block there would stall the chain against data the network is
+        // entitled to have dropped.
+        assert!(!da_check_required_for_slot(
+            (boundary_epoch - 1) * preset::SLOTS_PER_EPOCH,
+            current_slot,
+            &config
+        ));
+
+        // Before fulu there is no column matrix to be available at all, and
+        // the boundary must not walk below the fork even when the retention
+        // window reaches past it.
+        let just_after_fork = fulu_start + preset::SLOTS_PER_EPOCH;
+        assert!(da_check_required_for_slot(
+            just_after_fork,
+            just_after_fork,
+            &config
+        ));
+        assert!(!da_check_required_for_slot(
+            fulu_start - 1,
+            just_after_fork,
+            &config
+        ));
+    }
+
+    #[test]
+    fn a_sidecar_this_node_already_holds_costs_nothing_to_receive_again() {
+        // The p2p layer pulls each range batch's columns alongside its
+        // blocks, and consecutive batches overlap, so during a drain most
+        // arrivals are already in the store. They must
+        // stop at the cheap presence check, before the full post-state read
+        // that the proposer check needs, or they starve the imports the drain
+        // is waiting on. Parking is the observable proxy for "went further":
+        // this sidecar's parent has no state, so an arrival that got past the
+        // presence check would be parked.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let sidecar = sidecar_at(10, H256::repeat_byte(9));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+        server
+            .store
+            .put_data_column_sidecar(10, &block_root, sidecar.index, sidecar.to_ssz())
+            .unwrap();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert!(
+            server.sidecars_awaiting_parent.is_empty(),
+            "a sidecar already in the store must not be parked, verified or stored again"
+        );
+    }
+
+    #[test]
+    fn a_data_column_sidecar_naming_a_parent_with_no_state_is_parked_not_dropped() {
+        // `beacon_store` writes no anchor state (see its own doc comment), so
+        // any parent root at all is unknown here, including the anchor's own.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        // `store.time` starts at zero, which reads as slot zero on beacon
+        // (`get_slots_since_genesis` saturates instead of going negative), so
+        // slot 10 would otherwise be rejected as a future slot before the
+        // parent check under test ever ran.
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let parent_root = H256::repeat_byte(9);
+        let sidecar = sidecar_at(10, parent_root);
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        // Not stored: it has not been checked, so it has not been accepted.
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(10, &block_root)
+                .unwrap(),
+            Vec::<u64>::new()
+        );
+        // But kept, under the parent it is waiting on. Dropping it here is
+        // what deadlocks a follower running the availability gate: a held
+        // block writes no post-state, so every sidecar of every child of it
+        // lands in exactly this branch.
+        assert_eq!(
+            server
+                .sidecars_awaiting_parent
+                .get(&parent_root)
+                .map(HashSet::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_parked_sidecar_is_replayed_once_its_parent_gains_a_post_state() {
+        // The deadlock this closes, in miniature: while the parent has no
+        // post-state every sidecar under it parks, and if parking were the end
+        // of the story the queue would only ever grow. What breaks the cycle
+        // is that gaining a post-state releases them.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let parent_root = H256::repeat_byte(9);
+
+        server.on_gossip_data_column(sidecar_at(10, parent_root), None);
+        assert!(server.sidecars_awaiting_parent.contains_key(&parent_root));
+
+        // What an import writes, and the only thing the parent check reads.
+        server
+            .store
+            .insert_state(parent_root, bare_state())
+            .expect("insert");
+        server.drain_sidecars_awaiting_parent(parent_root);
+
+        // Gone from the queue, and not re-parked: the replay got past the
+        // check that had stopped it. Whether it then passes the inclusion
+        // proof and KZG batch is not this function's business — a placeholder
+        // sidecar fails those by construction — but it was re-judged rather
+        // than dropped, which is the whole contract.
+        assert!(!server.sidecars_awaiting_parent.contains_key(&parent_root));
+    }
+
+    #[test]
+    fn a_parked_sidecar_holds_its_bytes_on_disk_and_not_in_the_queue() {
+        // The queue's size is chosen by whoever is gossiping, so what it holds
+        // per entry is the thing that has to stay small: a key, not a cell per
+        // blob.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let parent_root = H256::repeat_byte(9);
+        let sidecar = sidecar_at(10, parent_root);
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server.sidecars_awaiting_parent.get(&parent_root),
+            Some(&HashSet::from([ParkedColumn {
+                slot: 10,
+                block_root,
+                index: 0,
+            }]))
+        );
+        assert!(
+            server
+                .store
+                .take_pending_data_column_sidecar(10, &block_root, 0)
+                .expect("DB read should succeed")
+                .is_some(),
+            "the sidecar's bytes belong in PendingDataColumns"
+        );
+    }
+
+    #[test]
+    fn a_parked_sidecar_does_not_satisfy_the_availability_gate() {
+        // Why the parked rows get a table of their own. Nothing has judged a
+        // parked sidecar's inclusion proof, its KZG batch or its proposer
+        // signature, so a peer that could get one counted as custodied would
+        // be able to release a held block with a column it invented.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let sidecar = sidecar_at(10, H256::repeat_byte(9));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(10, &block_root)
+                .expect("DB read should succeed"),
+            Vec::<u64>::new(),
+            "an unverified sidecar must be invisible to data_column_indices_for"
+        );
+    }
+
+    #[test]
+    fn a_sidecar_parked_twice_takes_one_slot_in_the_queue() {
+        // The by-root and by-range fetch paths have no `seen_data_columns`
+        // between them and this actor, so a re-delivery while the parent is
+        // still stateless is ordinary. A second entry would leave a key with
+        // no row behind it once the first replay took it.
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        let parent_root = H256::repeat_byte(9);
+
+        server.on_gossip_data_column(sidecar_at(10, parent_root), None);
+        server.on_gossip_data_column(sidecar_at(10, parent_root), None);
+
+        assert_eq!(
+            server
+                .sidecars_awaiting_parent
+                .get(&parent_root)
+                .map(HashSet::len),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parked_sidecars_are_dropped_once_finality_passes_their_slot() {
+        // Populated directly rather than through `on_gossip_data_column`: a
+        // sidecar at or below the finalized slot is refused by that function's
+        // own earlier check, so the only way to observe the sweep is to park
+        // one behind its back. The finalized slot is fixed at init, so the
+        // store carries it rather than the test moving it.
+        let mut server = beacon_server(beacon_store(GENESIS_TIME, 10));
+        let superseded = H256::repeat_byte(1);
+        let still_wanted = H256::repeat_byte(2);
+        let parked_at = |slot: u64| ParkedColumn {
+            slot,
+            block_root: H256::repeat_byte(9),
+            index: 0,
+        };
+        server
+            .sidecars_awaiting_parent
+            .insert(superseded, HashSet::from([parked_at(10)]));
+        server
+            .sidecars_awaiting_parent
+            .insert(still_wanted, HashSet::from([parked_at(20)]));
+
+        server.evict_sidecars_awaiting_parent_at_or_below_finality();
+
+        // A parent root that never arrives would otherwise pin its children's
+        // sidecars for this node's whole uptime; one still above finality is
+        // a parent that may yet show up.
+        assert!(!server.sidecars_awaiting_parent.contains_key(&superseded));
+        assert!(server.sidecars_awaiting_parent.contains_key(&still_wanted));
+    }
+
+    #[test]
+    fn a_structurally_malformed_sidecar_is_dropped_before_any_store_lookup() {
+        // What a fetched sidecar used to skip: `on_gossip_data_column` now
+        // runs `verify_data_column_sidecar` itself, so a peer answering a
+        // fetch with garbage cannot force the expensive checks (parent
+        // lookup, finalized-ancestor walk, KZG batch) the way it could
+        // before this ran here too. Zero commitments is what the check
+        // itself calls out as invalid ("a sidecar for zero blobs"), so
+        // clearing the field `sidecar_at` otherwise populates is enough to
+        // trigger it, on a store and slot that would otherwise clear every
+        // check after it.
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        let mut sidecar = sidecar_at(10, H256::ZERO);
+        sidecar.kzg_commitments = Default::default();
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        let before = metrics::data_column_rejected_total("malformed");
+        server.on_gossip_data_column(sidecar, None);
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(10, &block_root)
+                .unwrap(),
+            Vec::<u64>::new()
+        );
+        assert_eq!(metrics::data_column_rejected_total("malformed"), before + 1);
+    }
+
+    // -----------------------------------------------------------------
+    // data_availability_for / hold_block_for_columns /
+    // release_block_if_columns_complete
+    //
+    // Neither the KZG proofs nor the signature are checked by the function
+    // under test in any of these, so `fulu_block_with_commitments` and
+    // `sidecar_for` build structurally minimal values: present or absent in
+    // the store is all that matters here.
+    // -----------------------------------------------------------------
+
+    /// The columns this node is pretending to custody in these three tests.
+    const CUSTODY: [u64; 2] = [0, 1];
+
+    /// A fulu block at `slot`, naming `parent_root`, whose body carries
+    /// `commitment_count` blob commitments; everything else is a
+    /// structurally minimal placeholder. Neither the KZG proofs nor the
+    /// signature are checked by `data_availability_for`, the function every
+    /// caller of this helper is exercising, so nothing here needs to be real:
+    /// only structurally present, so `message_hash_tree_root` and `to_ssz`
+    /// succeed.
+    fn fulu_block(parent_root: H256, slot: u64, commitment_count: usize) -> SignedBeaconBlock {
+        let payload = deneb::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: H256::ZERO,
+            receipts_root: H256::ZERO,
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("exactly the preset length"),
+            prev_randao: H256::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        };
+        let body = electra::BeaconBlockBody {
+            randao_reveal: Default::default(),
+            eth1_data: Default::default(),
+            graffiti: H256::ZERO,
+            proposer_slashings: Default::default(),
+            attester_slashings: Default::default(),
+            attestations: Default::default(),
+            deposits: Default::default(),
+            voluntary_exits: Default::default(),
+            sync_aggregate: Default::default(),
+            execution_payload: payload,
+            bls_to_execution_changes: Default::default(),
+            blob_kzg_commitments: vec![Default::default(); commitment_count]
+                .try_into()
+                .expect("commitment_count stays well within MAX_BLOB_COMMITMENTS_PER_BLOCK here"),
+            execution_requests: electra::ExecutionRequests {
+                deposits: Default::default(),
+                withdrawals: Default::default(),
+                consolidations: Default::default(),
+            },
+        };
+        SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// A fulu block whose body carries `commitment_count` blob commitments,
+    /// off a zero parent root, at one past `store`'s finalized slot —
+    /// matching what would actually reach `data_availability_for` in
+    /// `process_block` off a zero-rooted anchor. See [`fulu_block`] for what
+    /// the rest of the block looks like.
+    fn fulu_block_with_commitments(store: &Store, commitment_count: usize) -> SignedBeaconBlock {
+        let slot = store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot
+            + 1;
+        fulu_block(H256::ZERO, slot, commitment_count)
+    }
+
+    /// A sidecar naming `block`'s own header at `index`; every other field is
+    /// its type's default, the same minimalism `sidecar_at` uses above.
+    fn sidecar_for(block: &SignedBeaconBlock, index: u64) -> fulu::DataColumnSidecar {
+        fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: shared::SignedBeaconBlockHeader {
+                message: shared::BeaconBlockHeader {
+                    slot: block.slot(),
+                    proposer_index: block.proposer_index(),
+                    parent_root: block.parent_root(),
+                    state_root: block.state_root(),
+                    body_root: H256::ZERO,
+                },
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        }
+    }
+
+    #[test]
+    fn a_block_with_no_commitments_needs_no_columns() {
+        let store = beacon_store(0, 0);
+        let block = fulu_block_with_commitments(&store, 0);
+        assert!(matches!(
+            data_availability_for(&store, &block, &CUSTODY).unwrap(),
+            fork_choice::DataAvailability::NotRequired
+        ));
+    }
+
+    #[test]
+    fn a_block_missing_one_custody_column_is_not_available() {
+        let store = beacon_store(0, 0);
+        let block = fulu_block_with_commitments(&store, 2);
+        let root = block.message_hash_tree_root();
+        store
+            .put_data_column_sidecar(block.slot(), &root, 0, vec![1])
+            .unwrap();
+        // Column 1 is custodied and absent, so the question cannot be answered
+        // yet. `None` must not collapse into an empty Columns list: that list
+        // is vacuously available and would import a block nobody has data for.
+        assert!(data_availability_for(&store, &block, &CUSTODY).is_none());
+    }
+
+    #[test]
+    fn a_block_with_every_custody_column_is_available() {
+        let store = beacon_store(0, 0);
+        let block = fulu_block_with_commitments(&store, 2);
+        let root = block.message_hash_tree_root();
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&block, index);
+            store
+                .put_data_column_sidecar(block.slot(), &root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        assert!(matches!(
+            data_availability_for(&store, &block, &CUSTODY).unwrap(),
+            fork_choice::DataAvailability::Columns(sidecars) if sidecars.len() == 2
+        ));
+    }
+
+    #[test]
+    fn holding_a_block_persists_it_and_records_its_root() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let root = block.message_hash_tree_root();
+        let slot = block.slot();
+
+        server.hold_block_for_columns(block);
+
+        assert_eq!(server.blocks_awaiting_columns.get(&root), Some(&slot));
+        assert!(server.store.get_signed_block(&root).unwrap().is_some());
+    }
+
+    #[test]
+    fn releasing_before_every_custody_column_arrives_is_a_no_op() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block);
+
+        // Only one of the two custody columns has arrived.
+        server
+            .store
+            .put_data_column_sidecar(slot, &root, 0, vec![1])
+            .unwrap();
+
+        server.release_block_if_columns_complete(root);
+
+        assert!(server.blocks_awaiting_columns.contains_key(&root));
+    }
+
+    #[test]
+    fn releasing_once_every_custody_column_arrives_clears_the_hold() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block.clone());
+
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&block, index);
+            server
+                .store
+                .put_data_column_sidecar(slot, &root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+
+        server.release_block_if_columns_complete(root);
+
+        assert!(!server.blocks_awaiting_columns.contains_key(&root));
+    }
+
+    // -----------------------------------------------------------------
+    // End-to-end: a held block's fan-out must not livelock the cascade
+    //
+    // Regression coverage for the defect a bare `Ok(())` from `process_block`
+    // used to hide: `process_or_pend_block` treated a hold exactly like an
+    // import, called `collect_pending_children` on it, and a child block
+    // naming the still-held block as parent turned that into an unbounded
+    // cycle on `run_import_cascade`'s own synchronous queue (re-fetch the
+    // held block from `BlockHeaders` → re-hold it → re-collect the same
+    // child → repeat), with no yield point, spinning the actor at full CPU
+    // and starving every tick and gossip message behind it.
+    //
+    // This test drives the real entry point (`on_block`, what
+    // `Handler<NewBlock>` calls) end to end rather than the lower-level
+    // methods the tests above call directly, so it is the one that actually
+    // exercises `process_or_pend_block`'s handling of `process_block`'s
+    // return value — nothing else in this file does.
+    //
+    // It does not assert that either block ends up with a post-state.
+    // `fork_choice::on_block`'s state transition needs a real BLS-signed
+    // RANDAO reveal against a real proposer, a real sync-committee
+    // aggregate, and a KZG batch over the sidecars this test stores — none
+    // of which a structurally-minimal block or a placeholder sidecar can
+    // satisfy, and building ones that could means reproducing the
+    // spec-fixture machinery `ethlambda-state-transition`'s own test suite
+    // uses, in a crate this task does not own. What this gate owns, and what
+    // this test asserts instead, is that a held block's fan-out is bounded:
+    // the cascade always terminates, the held block is never double-counted,
+    // and the release path clears the hold regardless of what the resulting
+    // import attempt does with it.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_childs_fan_out_does_not_livelock_a_held_parent() {
+        // Fulu at genesis: the gate under test only applies inside the
+        // availability window, which starts at the fulu fork, and this
+        // fixture's blocks live at single-digit slots.
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        // `get_ancestor`'s finalized-chain walk (inside `fork_choice::on_block`,
+        // reached once the parent's columns are present) needs a block at the
+        // zero root to walk from, the same reason
+        // `the_finalized_root_itself_is_on_the_finalized_chain` needs one.
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let parent = fulu_block_with_commitments(&server.store, 2);
+        let parent_root = parent.message_hash_tree_root();
+
+        // First arrival: no columns yet, so the parent must be held, not
+        // imported.
+        server.on_block(parent.clone());
+        assert!(
+            !server.store.has_state(&parent_root).unwrap(),
+            "a held block must not have a post-state"
+        );
+        assert!(server.blocks_awaiting_columns.contains_key(&parent_root));
+
+        // A child names the still-held block as its parent, in a later,
+        // separate `on_block` call — exactly the fan-out the defect this
+        // guards against needs. Under the bug this reproduces, this call
+        // never returns.
+        let child = fulu_block(parent_root, parent.slot() + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        server.on_block(child);
+
+        // Reaching this line at all is most of the proof: the cascade
+        // terminated. What it terminated *into* matters too — the parent
+        // still held (not re-held into some duplicated bookkeeping) and the
+        // child parked behind it exactly once, the same shape a genuinely
+        // missing parent leaves.
+        assert!(!server.store.has_state(&parent_root).unwrap());
+        assert!(server.blocks_awaiting_columns.contains_key(&parent_root));
+        assert_eq!(
+            server.pending_blocks.get(&parent_root),
+            Some(&HashSet::from([child_root]))
+        );
+
+        // The parent's custody columns land and it releases for real.
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&parent, index);
+            server
+                .store
+                .put_data_column_sidecar(parent.slot(), &parent_root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        server.release_block_if_columns_complete(parent_root);
+
+        // The hold clears unconditionally, before the resulting re-import
+        // attempt runs (see `release_block_if_columns_complete`'s own
+        // ordering) — so this holds whether or not that attempt itself
+        // succeeds, and it does not hang either way.
+        assert!(!server.blocks_awaiting_columns.contains_key(&parent_root));
+    }
+
+    // -----------------------------------------------------------------
+    // The test above proves the cascade cannot livelock; it does not prove
+    // the fix's whole point, that a released parent actually unblocks what
+    // was waiting on it. It cannot: `fork_choice::on_block` requires a real
+    // BLS-signed RANDAO reveal and proposer signature, which a
+    // structurally-fake block never has, so its own release attempt takes
+    // the `Err` arm and never reaches `collect_pending_children`.
+    //
+    // Building a block that clears real verification needs a genuinely
+    // signed fulu state: a validator with a real BLS keypair whose
+    // effective balance and activation make it the deterministic proposer,
+    // a RANDAO reveal and proposer signature computed over that state's own
+    // domains, a `state_root` matching the actual resulting post-state, and
+    // a sync aggregate set to the zero-participant identity-point
+    // convention rather than left at its all-zero default. `crate::beacon::bls`
+    // cannot even produce half of that today: it wraps `blst`'s
+    // verification functions only (`verify`, `aggregate_verify`, ...), with
+    // no `sign`, and `fulu::BeaconState` alone carries sync committees,
+    // deposit/exit/consolidation churn queues, and a participation registry
+    // beyond what a hand-built state can fake its way past. That is exactly
+    // the spec-fixture machinery this crate does not own; `ethlambda-blockchain`
+    // depends on `ethlambda-test-fixtures` only to *deserialize* downloaded
+    // leanSpec vectors, not to synthesize new ones, and no such vector
+    // targets this implementation-specific regression.
+    //
+    // What the test below instead exercises is the nearest reachable case:
+    // `process_or_pend_block`'s *other* early return, the "beacon block
+    // already in the store" branch just above the `process_block` call, for
+    // a root whose post-state exists by the time `on_block` re-delivers it
+    // (the same shape a redelivery racing an independent import would
+    // leave). That branch calls `collect_pending_children` directly without
+    // ever constructing an `ImportOutcome` — a different line than the
+    // fix's own `Ok(ImportOutcome::Imported)` arm, but the same promise: a
+    // root with a post-state must not leave its parked children behind. It
+    // is real production code, not a fake, and seeding the state this way
+    // is indistinguishable to it from that state having arrived by any
+    // other route.
+    //
+    // It is not a regression guard for the `Held`/`Imported` distinction
+    // itself: reverting that distinction alone would not make this test
+    // fail, since the parent here never reaches `process_block` to begin
+    // with. `_ if !is_new` — `process_block`'s own no-crypto route to
+    // `Ok(ImportOutcome::Imported)` — is unreachable from `on_block` for the
+    // same reason: `process_or_pend_block`'s guard intercepts a root whose
+    // state already exists before `process_block` is ever called, so
+    // `process_block` only ever sees `is_new == true` through this caller.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn releasing_a_parent_whose_post_state_already_exists_drains_its_parked_child() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let parent = fulu_block_with_commitments(&server.store, 2);
+        let parent_root = parent.message_hash_tree_root();
+        let slot = parent.slot();
+        server.hold_block_for_columns(parent.clone());
+
+        // A child parked behind the still-held parent, seeded directly in
+        // the same shape `process_or_pend_block`'s "parent missing" branch
+        // leaves one in: readable back by root, and recorded in both
+        // pending maps. `a_childs_fan_out_does_not_livelock_a_held_parent`
+        // above already proves a child arriving that way lands here; this
+        // test starts from that end state to isolate the release side alone.
+        let child = fulu_block(parent_root, slot + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        server
+            .store
+            .insert_pending_block(child_root, child)
+            .expect("insert");
+        server
+            .pending_blocks
+            .insert(parent_root, HashSet::from([child_root]));
+        server.pending_block_parents.insert(child_root, parent_root);
+
+        // Every custody column arrives.
+        for index in CUSTODY {
+            let sidecar = sidecar_for(&parent, index);
+            server
+                .store
+                .put_data_column_sidecar(slot, &parent_root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+
+        // The parent's post-state exists before release runs, standing in
+        // for whatever independent path put it there; `bare_state` needs no
+        // parent of its own to diff against (see its own doc), so this
+        // writes a plain snapshot under `parent_root` with no further setup.
+        server
+            .store
+            .insert_state(parent_root, bare_state())
+            .expect("insert");
+
+        server.release_block_if_columns_complete(parent_root);
+
+        // `collect_pending_children` ran: the child is gone from both
+        // pending maps, whatever its own (real, crypto-checked) re-import
+        // attempt then did with it.
+        assert!(!server.pending_blocks.contains_key(&parent_root));
+        assert!(!server.pending_block_parents.contains_key(&child_root));
+    }
+
+    #[test]
+    fn a_tick_releases_a_held_block_whose_columns_landed_without_waking_it() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let block_root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block);
+
+        // Every custody column is written straight to the store, the way a
+        // fetched sidecar that never reached `release_block_if_columns_complete`
+        // would leave it: the hold is satisfied and nothing knows.
+        for index in CUSTODY {
+            let sidecar = sidecar_for(
+                &server.store.get_signed_block(&block_root).unwrap().unwrap(),
+                index,
+            );
+            server
+                .store
+                .put_data_column_sidecar(slot, &block_root, index, sidecar.to_ssz())
+                .unwrap();
+        }
+        // Same stand-in as `releasing_a_parent_whose_post_state_already_exists_
+        // drains_its_parked_child`: a post-state under this root sends the
+        // re-import down `process_or_pend_block`'s already-in-store branch
+        // rather than through crypto a hand-built block cannot pass.
+        server
+            .store
+            .insert_state(block_root, bare_state())
+            .expect("insert");
+
+        server.redrive_held_blocks();
+
+        assert!(
+            !server.blocks_awaiting_columns.contains_key(&block_root),
+            "a block whose columns are all present must not stay held"
+        );
+    }
+
+    #[test]
+    fn a_tick_leaves_a_block_held_while_a_column_is_still_missing() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let block_root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block);
+
+        // All but one column. The re-drive re-asks for the last one; what it
+        // must not do is decide the block is available without it.
+        for index in &CUSTODY[..CUSTODY.len() - 1] {
+            let sidecar = sidecar_for(
+                &server.store.get_signed_block(&block_root).unwrap().unwrap(),
+                *index,
+            );
+            server
+                .store
+                .put_data_column_sidecar(slot, &block_root, *index, sidecar.to_ssz())
+                .unwrap();
+        }
+
+        server.redrive_held_blocks();
+
+        assert!(
+            server.blocks_awaiting_columns.contains_key(&block_root),
+            "one missing column is still a missing column"
+        );
     }
 }

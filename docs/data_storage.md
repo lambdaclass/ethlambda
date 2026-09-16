@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the eight tables holds, and which data is in-memory only.
+what each of the ten tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -103,33 +103,36 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
    │   │ StateDiffs          │         │   attestations)      │    │
    │   │ Metadata            │         │ gossip_signatures    │    │
    │   │ LiveChain           │         │  (raw XMSS sigs      │    │
-   │   └─────────────────────┘         │   awaiting           │    │
-   │                                   │   aggregation)       │    │
-   │   Survives restarts.              │ state_cache (LRU)    │    │
+   │   │ DataColumns         │         │   awaiting           │    │
+   │   │ PendingDataColumns  │         │   aggregation)       │    │
+   │   └─────────────────────┘         │ state_cache (LRU)    │    │
    │                                   └──────────────────────┘    │
-   │                                                               │
-   │                                   Lost on restart.            │
+   │   Survives restarts, except                                   │
+   │   PendingDataColumns, which       Lost on restart.            │
+   │   is cleared at startup.                                      │
    └───────────────────────────────────────────────────────────────┘
 ```
 
 ## The Tables
 
-The eight variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The ten variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
-| Table              | Key         | Value                                     | Pruned?                          |
-| ------------------ | ----------- | ----------------------------------------- | --------------------------------- |
-| `BlockHeaders`     | root        | `BlockHeader`, or a whole beacon block    | never                            |
-| `BlockBodies`      | root        | `BlockBody` (lean only)                   | never                            |
-| `BlockProof`       | slot ‖ root | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
-| `BlockRoots`       | slot        | block root (`H256`)                       | never                            |
-| `States`           | root        | full `State` snapshot                     | never                            |
-| `StateDiffs`       | root        | `StateDiff`                               | never                            |
-| `Metadata`         | string      | SSZ scalars                               | never                            |
-| `LiveChain`        | slot ‖ root | `parent_root`                             | yes: below finalized             |
+| Table              | Key                        | Value                                     | Pruned?                          |
+| ------------------ | --------------------------- | ----------------------------------------- | --------------------------------- |
+| `BlockHeaders`     | root                        | `BlockHeader`, or a whole beacon block    | never                            |
+| `BlockBodies`      | root                        | `BlockBody` (lean only)                   | never                            |
+| `BlockProof`       | slot ‖ root                 | aggregate proof (`MultiMessageAggregate`) | yes: finalized older than ~1 day |
+| `BlockRoots`       | slot                        | block root (`H256`)                       | never                            |
+| `States`           | root                        | full `State` snapshot                     | never                            |
+| `StateDiffs`       | root                        | `StateDiff`                               | never                            |
+| `Metadata`         | string                      | SSZ scalars                               | never                            |
+| `LiveChain`        | slot ‖ root                 | `parent_root`                             | yes: below finalized             |
+| `DataColumns`      | slot ‖ root ‖ column_index  | `DataColumnSidecar` (SSZ-encoded)         | no (see [DataColumns](#datacolumns) below) |
+| `PendingDataColumns` | slot ‖ root ‖ column_index | `DataColumnSidecar` (SSZ-encoded), unverified | yes: on replay, below finalized, and wholly at startup |
 
 ### Key encoding
 
-Three key layouts are used:
+Four key layouts are used:
 
 - **Root-keyed** tables use the 32-byte SSZ encoding of the block root
   (`root.to_ssz()`).
@@ -138,6 +141,13 @@ Three key layouts are used:
   32-byte root. Big-endian means lexicographic key order equals numeric slot
   order, so pruning can iterate from the start of the table and stop at the
   first key past its cutoff instead of scanning everything.
+- **Slot-prefixed, then column** (`DataColumns`) extends the same
+  `slot ‖ root` prefix with an 8-byte big-endian `column_index`, via
+  `data_column_key`. A block's own sidecars therefore share one lexicographic
+  run under their `slot ‖ root`, so a prefix scan over just that pair (what
+  `data_column_indices_for` and the by-range handler both do; see
+  [DataColumns](#datacolumns)) recovers every column of one block without
+  touching any other block's.
 - **Slot-only** (`BlockRoots`) uses `encode_block_root_key`: just the 8-byte
   big-endian slot, since the value already holds the root. This table is
   never pruned, so the ordering buys nothing here; it is kept only for
@@ -242,6 +252,7 @@ different checkpoints.
 | `time`                         | `u64`        | both   | The store clock, as a **UNIX timestamp in milliseconds**      |
 | `config`                       | `Config`     | both   | The node's runtime configuration                              |
 | `head`                         | `H256`       | both   | Current fork choice head                                      |
+| `anchor_slot`                  | `u64`        | both   | The slot this directory's chain begins at                     |
 | `safe_target`                  | `H256`       | lean   | Current safe target (see [lmd_ghost.md](lmd_ghost.md))        |
 | `latest_justified`             | `Checkpoint` | both   | Latest justified checkpoint                                   |
 | `latest_finalized`             | `Checkpoint` | both   | Latest finalized checkpoint                                   |
@@ -331,8 +342,23 @@ because a second row denominated in `slot ‖ root` would be a value that could
 drift from the first.
 
 `init_beacon` writes the two beacon-only keys plus `db_version`, `chain`,
-`preset`, `config`, `time`, `head`, `latest_justified` and `latest_finalized`
-in one atomic batch. A directory's finalized state root, whichever chain it
+`preset`, `config`, `time`, `head`, `anchor_slot`, `latest_justified` and
+`latest_finalized` in one atomic batch.
+
+`anchor_slot` is the odd one among these: every other row is either a format
+tag or something a later writer moves, while this one is written once at
+bootstrap and never again, like `config` and `chain`. It has to be persisted
+rather than derived because it is the store's only record of where its chain
+starts. `latest_finalized` is seeded to the anchor as well, but climbs away
+from it at the first finalization, so after that nothing else on disk can
+answer the question. Both bootstrap paths take it from the anchor block's own
+slot — `anchor_state.latest_block_header.slot` on lean, `anchor_state.slot()`
+on beacon — rather than from the anchor checkpoint, whose beacon form is
+epoch-denominated and would name the epoch's start slot instead. `from_db_state`
+reads it back into a `Store` field, so `Store::anchor_slot()` costs no backend
+round trip; the `Status` message's `earliest_available_slot` and the
+`data_column_sidecars_by_range/1` floor are both that one value, which is what
+keeps a refusal from contradicting an advertisement. A directory's finalized state root, whichever chain it
 holds, is read through `Store::finalized_state_root`. That needs no
 chain-specific branch: both chains keep their finalized checkpoint in
 `latest_finalized`, and the epoch-to-slot conversion above touches only the
@@ -361,6 +387,90 @@ Presence in `LiveChain` is what makes a block _visible to fork choice_:
 while the block waits for its parent. When the block is later processed,
 `insert_signed_block` overwrites the same keys (idempotent) and adds the
 `LiveChain` entry.
+
+### DataColumns
+
+`slot ‖ root ‖ column_index → DataColumnSidecar` (SSZ-encoded). Beacon only:
+this is where a fulu data-availability-sampling follower keeps the column
+sidecars its own node id assigned it custody of, so it can verify a block's
+availability and answer `data_column_sidecars_by_{root,range}/1` for peers;
+see [beacon_wire.md](./beacon_wire.md#data-column-sidecars) for the wire side
+and how a node's custody set is selected.
+
+Keyed slot-first, ahead of the root, for the same reason `BlockProof` is: it
+gives a by-range answer a prefix scan per slot instead of a full-table scan,
+and gives a future pruner a scan that stops early once it passes its cutoff.
+Every writer and reader already has the slot in hand — an arriving sidecar
+carries `signed_block_header.message.slot`, and the availability check and the
+held-block release path both start from the block itself — so the slot prefix
+costs nothing to supply.
+
+Sidecars are written on arrival, once `on_gossip_data_column` has verified
+one, rather than at block import. That ordering is what lets the availability
+gate read a block's columns before the block itself is allowed to import (a
+column has to exist first for the gate to find it), and what lets a restart
+keep every sidecar this node already paid a KZG batch to verify rather than
+re-fetching and re-verifying them. One consequence: a sidecar is stored for
+any block whose header, parent and proposer check out, whether or not that
+block ever actually imports — an equivocation or an orphaned fork's sidecars
+land here too, since gossip only requires a known, unfinalized parent, not a
+canonical one. `data_column_sidecars_in_range` (the by-range handler's source)
+compensates by restricting each slot's answer to that slot's canonical root
+via `BlockRoots`, so a losing sibling's columns are stored but never served.
+
+`DataColumns` is the one table in the enum with **no pruning rule at all**,
+not even the finalized-window pruning `LiveChain` and `BlockProof` get: every
+sidecar this node has ever custodied is kept forever, by design, until a
+pruner is written (`MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS` is the
+epoch depth spec gives a future one permission to prune below). That makes it
+the one table whose size a long-running node must actually watch rather than
+assume bounded: at the blob cap this is roughly 360 KB per slot across the
+columns this node custodies, nearer 1 GB per day at current mainnet blob
+counts. `lean_table_bytes{table="data_columns"}` (see [metrics.md](./metrics.md))
+is that growth made visible; watch it, and size the disk against however long
+the node runs unattended before a pruner exists.
+
+### PendingDataColumns
+
+Same key and same encoding as `DataColumns`, holding sidecars that have **not
+been verified yet**. A sidecar lands here when its block's parent has no
+post-state for `on_gossip_data_column` to check the proposer against: the
+parent may still be in flight, or it may be a block the availability gate is
+itself holding. The specification's gossip rule for that case is `[IGNORE]`
+with an explicit licence to come back to it, so the sidecar is parked rather
+than dropped, and replayed when the parent gains a post-state.
+
+Two tables rather than one, and that is the whole point of this one. A parked
+sidecar has passed only the cheap structural checks — not its inclusion proof,
+not its KZG batch, not its proposer signature, which are held back so a replay
+pays for them once rather than once per attempt. `data_column_indices_for`
+reads `DataColumns` and nothing else, and that read is what the data
+availability gate believes; an unverified row there would let a peer satisfy
+the gate with a column nothing ever judged. A row moves from here to
+`DataColumns` only by passing every check on replay.
+
+The chain actor keeps one key per parked row in memory
+(`sidecars_awaiting_parent`, keyed by the parent root it waits on) and the
+bytes here, because a sidecar carries a cell per blob and the queue's size is
+chosen by whichever peer is gossiping.
+
+Nothing caps that queue. The finality sweep that evicts held blocks also
+deletes the rows of parked sidecars at or below the finalized slot, and that is
+the only thing reclaiming them, so it bounds how *long* a row lives but not how
+fast rows arrive. `on_gossip_data_column` does not require a sidecar's
+`parent_root` to name a block this node knows, and the p2p layer's
+`seen_data_columns` dedups on the header's own slot, proposer and index, all
+three of which a fabricated header chooses freely, so a peer willing to make
+them up can park rows as fast as gossip carries them. Watch
+`lean_sidecars_awaiting_parent`: it is the only signal that this is happening,
+and unlike `DataColumns` these rows were written on a peer's say-so.
+
+That in-memory map is also the *only* index into this table, and it does not
+survive a restart, so `start_actor` clears the table outright before building
+an empty one. Nothing is lost: a parked sidecar had passed no check worth
+preserving, and the block it belongs to asks for its columns again. Without
+that, every crash would leave every row it had parked unreadable, kept until
+the directory was deleted.
 
 ## State Storage: Snapshots + Diffs
 
@@ -499,10 +609,17 @@ processed):
   not needed for fork choice, reorg safety, or re-aggregation once outside
   the window.
 
-**Never pruned:** `BlockHeaders`, `BlockBodies`, `BlockRoots`, `States`,
-`StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot index, and
-the snapshot+diff chain are the full historical record; only the proof blobs
-and the (non-finalized) fork choice index are disposable.
+**Never pruned, by design:** `BlockHeaders`, `BlockBodies`, `BlockRoots`,
+`States`, `StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot
+index, and the snapshot+diff chain are the full historical record; only the
+proof blobs and the (non-finalized) fork choice index are disposable.
+
+**Not pruned yet, unlike the six above:** `DataColumns`. It is not part of the
+historical-record set above; it simply has no pruning rule written for it,
+which is a gap rather than a decision — see [DataColumns](#datacolumns) for
+what bounds it in the meantime (`lean_table_bytes{table="data_columns"}`) and
+where a future pruner is meant to land
+(`MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS`).
 
 ## In-Memory Only (Lost on Restart)
 
@@ -530,7 +647,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eight tables survives.
+network. Everything persisted in the ten tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
 
 ## Startup and Restore
 
@@ -559,8 +676,8 @@ reading is zero there.
 entries are written by its caller instead, through the same `insert_state` and
 `insert_signed_block` an ordinary block import uses.
 
-`from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`
-and `config` from `Metadata`, returning `None` for an empty DB. A format
+`from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
+`config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
 mismatch is still fatal, failing with `Error::DbVersionMismatch` or
 `Error::PresetMismatch` rather than reading on, but `from_db_state` no longer
 judges the network or the chain: it hands back whichever chain the directory

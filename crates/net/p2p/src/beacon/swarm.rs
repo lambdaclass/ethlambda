@@ -28,47 +28,117 @@ pub fn seen_ttl(config: &Config) -> Duration {
 /// silently excluded from the mesh.
 pub const IDENTIFY_PROTOCOL_VERSION: &str = "eth2/1.0.0";
 
+/// The share of the peer target inbound demand is allowed to hold, as a
+/// percentage.
+///
+/// The remainder is reserved for connections this node opens itself. Without a
+/// reservation, inbound demand takes every slot and discovery can never dial a
+/// peer of its own choosing: the eclipse-adjacent case libp2p's own
+/// documentation warns about for a total-only limit, and the thing that costs
+/// us the ability to seek out peers serving the columns we need.
+///
+/// 70 rather than the 90 a 20-slot reservation worked out to, measured on the
+/// mainnet follower: it sat at 178 inbound peers and **zero** outbound ones for
+/// two days, while every block waited minutes on custody columns no connected
+/// peer held. A reservation only helps if the dial loop is still trying to fill
+/// it, so the other half of that fix is in
+/// [`crate::discovery::dial::dial_tick`], which now paces itself on the
+/// outbound shortfall rather than the total peer count.
+pub const MAX_INBOUND_CONNECTION_PERCENT: u32 = 70;
+
+// A share at or above 100 leaves no outbound reservation at all. Exactly 100 is
+// the case worth refusing by name: it derives a zero reservation, which every
+// other line here then treats as "nothing to reserve" rather than as the
+// misconfiguration it is. Zero is refused for the mirror-image reason: it would
+// admit no inbound peer at all.
+const _: () = assert!(
+    MAX_INBOUND_CONNECTION_PERCENT > 0 && MAX_INBOUND_CONNECTION_PERCENT < 100,
+    "the inbound share has to leave a non-empty outbound reservation"
+);
+
 /// Ceiling on connections the beacon swarm keeps established at once.
 ///
-/// Mainnet dials us far faster than we dial it: a 22-hour run accepted 12,521
-/// inbound connections against 235 successful outbound dials, and settled at
-/// 371 held peers. Every one of them feeds the same gossip decode path, which
-/// competes with block import for the single core that decides how fast the
-/// head advances. Left uncapped the peer count is set by how popular we are,
-/// not by what we can afford, so it is bounded here by policy.
-pub const MAX_CONNECTIONS: u32 = 200;
-
-/// How many of [`MAX_CONNECTIONS`] stay reserved for connections we
-/// open ourselves.
+/// `--discovery.target-peers`, which is the whole of it: the number of peers
+/// an operator asks for is the number this node keeps, so the dial loop's
+/// cutoff and the swarm's own refusal are one number rather than two that can
+/// disagree. A flat ceiling of its own is what let the outbound reservation
+/// below be a fixed 60 slots no matter what the operator asked for, so a
+/// target of 50 kept dialing to 60 outbound peers and a target of 0, meaning
+/// "do not dial", still had a 60-peer shortfall to chase.
 ///
-/// Without a reservation, inbound demand takes every slot and discovery can
-/// never dial a peer of its own choosing. That is the eclipse-adjacent case
-/// libp2p's own documentation warns about for a total-only limit, and it also
-/// costs us the ability to seek out peers that serve the ranges we need.
-pub const MAX_OUTBOUND_CONNECTIONS: u32 = 20;
+/// Bounded at all because mainnet dials us far faster than we dial it: a
+/// 22-hour run accepted 12,521 inbound connections against 235 successful
+/// outbound dials, and settled at 371 held peers. Every one of them feeds the
+/// same gossip decode path, which competes with block import for the single
+/// core that decides how fast the head advances. Left uncapped the peer count
+/// is set by how popular we are, not by what we can afford.
+///
+/// Counts *connections*, while the target counts peers, and
+/// [`MAX_CONNECTIONS_PER_PEER`] lets one peer hold two. A peer on both
+/// transports therefore spends two of these, which is the pre-existing reason
+/// this ceiling is a bound on the peer count and not an equality.
+pub fn max_connections(target_peers: usize) -> u32 {
+    u32::try_from(target_peers).unwrap_or(u32::MAX)
+}
+
+/// How much of [`max_connections`] inbound demand may hold.
+///
+/// Rounds down, which is the safe direction: inbound gets slightly less than
+/// its nominal share rather than more, and the remainder falls to the
+/// reservation. See [`MAX_INBOUND_CONNECTION_PERCENT`].
+pub fn max_inbound_connections(target_peers: usize) -> u32 {
+    // In `u64` so the share is exact rather than saturating: the product
+    // overflows `u32` from a ceiling of about 61 million upward, and a
+    // saturated product would silently stop being a percentage.
+    let ceiling = u64::from(max_connections(target_peers));
+    (ceiling * u64::from(MAX_INBOUND_CONNECTION_PERCENT) / 100) as u32
+}
+
+/// How much of [`max_connections`] stays reserved for connections we open
+/// ourselves, which is also the shortfall the dial loop chases.
+///
+/// The remainder rather than its own percentage, so the two allowances add up
+/// to the ceiling by construction at every target, including the ones where
+/// the division above rounds.
+pub fn max_outbound_connections(target_peers: usize) -> u32 {
+    max_connections(target_peers) - max_inbound_connections(target_peers)
+}
 
 /// Connections a single peer may hold. Two rather than one because the swarm
 /// listens on both QUIC and TCP, so a remote is free to establish over each.
 pub const MAX_CONNECTIONS_PER_PEER: u32 = 2;
 
-// The inbound allowance below is the ceiling minus the outbound reservation, so
-// a reservation at or above the ceiling underflows. Release builds wrap that to
-// roughly four billion and silently remove the cap, which is exactly the
-// regression a runtime test would be least likely to catch, so it is refused at
-// compile time instead.
-const _: () = assert!(
-    MAX_OUTBOUND_CONNECTIONS < MAX_CONNECTIONS,
-    "the outbound reservation has to fit inside the connection ceiling"
-);
+/// Outbound dials allowed in flight at once.
+///
+/// [`max_connections`] and its two halves bound only *established*
+/// connections, and a dial that never establishes is never counted by them.
+/// That gap did not matter while the loop dialed 1.6 times a second; at
+/// [`crate::discovery::MAX_DIAL_RATE_PER_SECOND`] it does, because 96% of
+/// outbound dials to mainnet never establish and the ones that fail by timing
+/// out hold a socket for seconds first. Unbounded, the in-flight set is the
+/// dial rate times however long the slowest peer takes to not answer.
+///
+/// Four seconds of dialing at full rate, which is far above what a healthy
+/// node has outstanding and still a hard ceiling on the file descriptors this
+/// can consume. Denials past it cost a candidate, so it is deliberately not
+/// tight enough to be reached in normal operation.
+pub const MAX_PENDING_OUTBOUND_CONNECTIONS: u32 =
+    crate::discovery::MAX_DIAL_RATE_PER_SECOND as u32 * 4;
 
 /// Connection limits for the beacon network, where inbound supply is
-/// effectively unbounded. See [`MAX_CONNECTIONS`].
-pub fn connection_limits() -> libp2p::connection_limits::Behaviour {
+/// effectively unbounded. See [`max_connections`].
+///
+/// Derived from the same `target_peers` the dial loop reads, so what this node
+/// refuses and what it goes looking for are two readings of one number. A
+/// target of 0 therefore holds no peers rather than serving from a ceiling
+/// nobody asked for.
+pub fn connection_limits(target_peers: usize) -> libp2p::connection_limits::Behaviour {
     let limits = libp2p::connection_limits::ConnectionLimits::default()
-        .with_max_established(Some(MAX_CONNECTIONS))
-        .with_max_established_incoming(Some(MAX_CONNECTIONS - MAX_OUTBOUND_CONNECTIONS))
-        .with_max_established_outgoing(Some(MAX_OUTBOUND_CONNECTIONS))
-        .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER));
+        .with_max_established(Some(max_connections(target_peers)))
+        .with_max_established_incoming(Some(max_inbound_connections(target_peers)))
+        .with_max_established_outgoing(Some(max_outbound_connections(target_peers)))
+        .with_max_established_per_peer(Some(MAX_CONNECTIONS_PER_PEER))
+        .with_max_pending_outgoing(Some(MAX_PENDING_OUTBOUND_CONNECTIONS));
     libp2p::connection_limits::Behaviour::new(limits)
 }
 
@@ -85,11 +155,59 @@ pub struct BeaconWireConfig {
     /// The chain the digests are bound to. See
     /// [`BeaconWire::genesis_validators_root`](crate::beacon::BeaconWire).
     pub genesis_validators_root: Root,
+    /// The columns this node custodies, computed once at startup from the
+    /// node id. Both the subnet subscription and the availability check read
+    /// this, so the node cannot subscribe to one set and require another.
+    pub custody_columns: Vec<u64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The numbers the default target has always produced, now derived from it
+    /// rather than written down beside it.
+    #[test]
+    fn inbound_is_capped_at_its_share_and_the_rest_is_reserved() {
+        assert_eq!(max_connections(200), 200);
+        assert_eq!(max_inbound_connections(200), 140);
+        assert_eq!(max_outbound_connections(200), 60);
+    }
+
+    /// The property the reservation rests on, at every target rather than at
+    /// the default alone: inbound may never hold more than its configured
+    /// share, and whatever the division rounds off falls to the reservation
+    /// rather than going missing.
+    #[test]
+    fn the_two_allowances_add_up_and_rounding_favours_the_reservation() {
+        // 7 and 13 are the interesting ones: neither is a multiple of 100, so
+        // the share rounds, which is where an allowance could quietly grow.
+        for target in [0usize, 1, 7, 13, 50, 199, 200, 1_000] {
+            let inbound = max_inbound_connections(target);
+            let outbound = max_outbound_connections(target);
+            assert_eq!(
+                inbound + outbound,
+                max_connections(target),
+                "the two allowances have to add up to the ceiling at target {target}"
+            );
+            assert!(
+                u64::from(inbound) * 100
+                    <= u64::from(max_connections(target))
+                        * u64::from(MAX_INBOUND_CONNECTION_PERCENT),
+                "inbound may never hold more than its configured share at target {target}"
+            );
+        }
+    }
+
+    /// `--discovery.target-peers 0` holds no peers at all, which is the whole
+    /// of what the flag now means: the dial loop has a zero reservation to
+    /// chase and the swarm refuses inbound demand it was never asked to carry.
+    #[test]
+    fn a_zero_target_reserves_nothing_and_admits_nothing() {
+        assert_eq!(max_connections(0), 0);
+        assert_eq!(max_inbound_connections(0), 0);
+        assert_eq!(max_outbound_connections(0), 0);
+    }
 
     /// Real mainnet bootnode ENRs, two `tcp`-dialable and two seed-only.
     ///
@@ -117,7 +235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_beacon_swarm_subscribes_to_seven_topics_and_dials_bootnodes_over_tcp() {
+    async fn a_beacon_swarm_subscribes_to_its_custody_columns_and_dials_bootnodes_over_tcp() {
         // Port 0 asks the OS for a free port, so this cannot collide with a
         // running node or a sibling test.
         // Four real mainnet bootnode ENRs rather than the whole published
@@ -135,21 +253,35 @@ mod tests {
             .filter(|b| b.tcp_port.is_some())
             .count();
         assert_eq!(tcp_dialable_count, 2, "the fixture's premise changed");
+        // Two arbitrary columns, standing in for whatever a real node id would
+        // select: `build_swarm` must subscribe exactly these, not the custody
+        // count's-worth of *something*.
+        let custody_columns = vec![3u64, 9];
         let built = crate::build_swarm(crate::SwarmConfig {
             node_key: vec![1u8; 32],
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             bootnodes: mainnet_bootnodes,
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
             wire: crate::WireConfig::Beacon(Box::new(BeaconWireConfig {
                 fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
                 config: Config::mainnet(),
                 genesis_time: 1_606_824_023,
                 genesis_validators_root: Root::ZERO,
+                custody_columns: custody_columns.clone(),
             })),
         })
         .expect("swarm builds");
 
         let wire = built.wire.beacon().expect("a beacon wire");
-        assert_eq!(wire.topics.topics.len(), 7);
+        assert_eq!(
+            wire.topics.topics.len(),
+            crate::beacon::topics::SUBSCRIBED_TOPIC_KINDS.len() + custody_columns.len()
+        );
+        assert_eq!(wire.topics.column_topics.len(), custody_columns.len());
+        for column in &custody_columns {
+            assert!(wire.topics.column_topics.contains_key(column));
+        }
+        assert_eq!(wire.custody_columns, custody_columns);
         assert_eq!(wire.fork_digest, [0x8c, 0x9f, 0x62, 0xfe]);
         // No published mainnet bootnode advertises `quic`, but the ones that
         // advertise `tcp` are now dialable, which is the point of adding the

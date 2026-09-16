@@ -5,6 +5,10 @@
 //! by the container's layout, and slot maps to epoch maps to [`ForkName`]. The
 //! other four topics carry containers whose shape has not changed since the
 //! fork that introduced them, so they decode with no fork lookup at all.
+//! `data_column_sidecar_{subnet_id}`, the one family among the subscribed
+//! topics rather than a fixed name, decodes with no lookup either, for a
+//! different reason: fulu is the only fork that defines the container, so
+//! there is no ladder to begin with (see [`decode_data_column_sidecar`]).
 //!
 //! | Topic | Fork-dependent |
 //! |---|---|
@@ -14,10 +18,11 @@
 //! | `voluntary_exit`, `proposer_slashing` | No |
 //! | `bls_to_execution_change` | No, capella onward |
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
+//! | `data_column_sidecar_{subnet_id}` | No, fulu only |
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    SignedBeaconBlock, altair, capella, electra, phase0, shared,
+    SignedBeaconBlock, altair, capella, electra, fulu, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -214,6 +219,15 @@ pub fn decode_block(config: &Config, bytes: &[u8]) -> Result<SignedBeaconBlock, 
     SignedBeaconBlock::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
 }
 
+/// Decode a data column sidecar off a subnet topic.
+///
+/// Takes no `Config` and no fork, unlike [`decode_block`]: only fulu defines
+/// this container, so there is no fork ladder to choose from. A sidecar whose
+/// slot predates fulu is rejected later, by the checks that know the schedule.
+pub fn decode_data_column_sidecar(bytes: &[u8]) -> Result<fulu::DataColumnSidecar, DecodeError> {
+    fulu::DataColumnSidecar::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
 pub fn decode_aggregate_and_proof(
     config: &Config,
@@ -390,6 +404,29 @@ mod tests {
         let decoded =
             decode_gossip(&config, topics::PROPOSER_SLASHING, &slashing.to_ssz()).expect("decodes");
         assert_eq!(decoded, BeaconGossip::ProposerSlashing(Box::new(slashing)));
+    }
+
+    #[test]
+    fn a_sidecar_decodes_and_a_truncated_one_does_not() {
+        let sidecar = fulu::DataColumnSidecar {
+            index: 3,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            // `SszVector` has no blanket `Default`, unlike the `SszList`
+            // fields above: a vector's whole point is a length fixed at the
+            // type level, so there is no length-zero default to fall back on.
+            kzg_commitments_inclusion_proof: vec![
+                Root::default();
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        };
+        let bytes = sidecar.to_ssz();
+        assert_eq!(decode_data_column_sidecar(&bytes).unwrap().index, 3);
+        assert!(decode_data_column_sidecar(&bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]

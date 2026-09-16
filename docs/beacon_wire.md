@@ -8,7 +8,9 @@ startup order.
 It follows, from its checkpoint anchor to the tip: a chain actor imports what
 gossip announces and what range sync fetches, and the two block protocols serve
 other peers from the same store. It publishes nothing, and it does not read the
-aggregate topic, so fork choice learns its votes from block bodies.
+aggregate topic, so fork choice learns its votes from block bodies. It also
+custodies and serves a slice of the fulu data column matrix, sized and
+selected by its own node id; see [Data column sidecars](#data-column-sidecars).
 
 ## Running it
 
@@ -51,7 +53,8 @@ to; restart it to pick up the new digest.
 
 ## Gossip
 
-Seven topics, `/eth2/{digest}/{name}/ssz_snappy`:
+Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus the data column
+subnets described below:
 
 | Topic | Decoded as |
 | --- | --- |
@@ -63,16 +66,36 @@ Seven topics, `/eth2/{digest}/{name}/ssz_snappy`:
 | `bls_to_execution_change` | `SignedBLSToExecutionChange` |
 | `sync_committee_contribution_and_proof` | `SignedContributionAndProof` |
 
-No subnet family is subscribed: not `beacon_attestation_{0..63}`, not
-`sync_committee_{0..3}`, not `data_column_sidecar_{0..127}`, not
-`blob_sidecar_{subnet_id}`. That is 7 subscriptions rather than 203, and it
-drops roughly 30k BLS verifications per epoch. Each family arrives with the work
-that reads it.
+Two subnet families stay unsubscribed: `beacon_attestation_{0..63}` and
+`sync_committee_{0..3}`. That still drops roughly 30k BLS verifications per
+epoch; each arrives with the work that reads it. `blob_sidecar_{subnet_id}`
+stays absent too, permanently: it is deneb's format for blobs, deprecated at
+fulu in favor of the column matrix below.
 
-Blocks and aggregate attestations are logged at `info`, one line each; the other
-five topics are counted and logged at `debug`, since nothing distinguishes one
-voluntary exit from the next at a glance. Nothing is published: nothing this
-node can produce today would be signature-valid.
+`data_column_sidecar_{0..127}` is no longer in that absent list. This node
+subscribes to `sampling_size(CUSTODY_REQUIREMENT)` of them — the sampling size
+floored by `SAMPLES_PER_SLOT` above `CUSTODY_REQUIREMENT` itself — chosen by
+`custody_columns(node_id, …)`, a public function of this node's own discv5
+node id (`das-core.md`), so any peer can compute the same set without asking.
+`NUMBER_OF_CUSTODY_GROUPS` and `DATA_COLUMN_SIDECAR_SUBNET_COUNT` are equal
+today, so a column is its own subnet with no reduction. That makes this
+node's total subscription count the seven global topics plus its sampling
+size, still far short of a full subscription to every attestation,
+sync-committee and data-column subnet, and narrower still than
+`NUMBER_OF_CUSTODY_GROUPS` columns of custody, which is what a supernode
+would carry alone. A sidecar decodes as
+`fulu::DataColumnSidecar`; see [Data column sidecars](#data-column-sidecars)
+for the checks it passes before this node keeps or forwards it.
+
+Blocks and aggregate attestations are logged at `info`, one line each; the
+other five global topics are counted and logged at `debug`, since nothing
+distinguishes one voluntary exit from the next at a glance. Data column
+sidecars get their own handler ahead of that shared path, with subnet-match,
+finalized, future-slot and per-`(slot, proposer, index)` dedup checks a
+generic gossip topic has no need of; a sidecar that clears them is counted the
+same way and forwarded to the chain actor for the checks that need a state.
+Nothing is published on any topic, columns included: nothing this node can
+produce today would be signature-valid.
 
 ## Request/response
 
@@ -84,11 +107,17 @@ node can produce today would be signature-valid.
 | `goodbye/1` | inbound; the reason code is logged and the stream closed |
 | `beacon_blocks_by_range/2` | both |
 | `beacon_blocks_by_root/2` | both |
+| `data_column_sidecars_by_root/1` | both |
+| `data_column_sidecars_by_range/1` | both |
 
-The sidecar protocols are not registered, so a peer asking for one gets a
-stream-negotiation refusal rather than an answer this node cannot back up.
-Nothing custodies a blob or a data column, and a registered protocol with no
-implementation behind it is an untested encoder peers can reach.
+The two data column sidecar protocols are registered because this node
+custodies the columns its node id selects and can answer for them out of
+`Table::DataColumns` (see [data_storage.md](./data_storage.md)); see
+[Data column sidecars](#data-column-sidecars) for what each serves and asks
+for. The blob sidecar protocols stay absent: nothing here custodies a whole
+blob, only the erasure-coded columns fulu derives it into, and a registered
+protocol with no implementation behind it is an untested encoder peers can
+reach.
 
 Only version 2 of the two block protocols is registered. Version 1 is deprecated
 by the spec, which lets a client answer it with an empty list, and its chunks
@@ -187,9 +216,95 @@ fails. A mismatch ends the stream, logged at `warn` with both digests: the one w
 reach it in good faith is a blob schedule of ours that has fallen behind the
 network's.
 
+### Data column sidecars
+
+Both protocols are registered `Full`, since with the columns on disk this node
+can serve every slot it has custodied:
+
+| Protocol | Served from |
+| --- | --- |
+| `data_column_sidecars_by_root/1` | a point lookup per identifier: the slot is recovered from `BlockHeaders` off the named root, then each requested column is read straight out of `Table::DataColumns` |
+| `data_column_sidecars_by_range/1` | a prefix scan over the slot range, restricted to each slot's canonical root (`BlockRoots`) and filtered to the requested columns |
+
+Restricting the range answer to the canonical root matters because
+`Table::DataColumns` is never pruned and gossip only asks that a sidecar's
+block name a known, finalized-descendant parent, not a canonical one: a live
+fork can leave both siblings' columns stored at the same slot, and an
+unscoped scan would leak the losing side into every future range answer
+covering it.
+
+Both per-item lookups are lenient the way the block protocols are: a column
+this node never custodied, or a root it holds no header for, is left out of
+the answer rather than turned into an error, since the spec's own words are
+"Clients MUST respond with at least one sidecar, if they have it." A
+`data_column_sidecars_by_range/1` request starting before `Store::anchor_slot`
+gets `RESOURCE_UNAVAILABLE` instead of a merely-empty answer, the same
+distinction the block-range handler draws and for the same reason: an empty
+window this node's canonical chain skipped is normal, but a window below where
+this node's chain begins cannot be served from any point onward. That floor is
+the same value `Status` advertises as `earliest_available_slot`, so the refusal
+and the advertisement cannot disagree.
+`max_request_data_column_sidecars()` (`MAX_REQUEST_BLOCKS_DENEB *
+NUMBER_OF_COLUMNS`) bounds what one request may ask for; an answer over that
+is truncated, not refused, matching how the block protocols treat a peer
+built to an older, wider ceiling.
+
+*Asking* happens on two paths, bulk and per block.
+
+The bulk one rides with range sync: every `BeaconBlocksByRange` batch sends a
+`data_column_sidecars_by_range/1` for the same slot span, covering this node's
+whole custody set. The spec names this protocol for exactly that —
+"`DataColumnSidecarsByRange` is primarily used to sync data columns that may
+have been missed on gossip and to sync within the
+`MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS` window" — and it is what keeps a
+follower backfilling from a checkpoint anchor from needing the per-block path
+at all: the columns are normally already stored by the time their block reaches
+the availability gate. Nothing waits on the answer, so a short, empty or
+refused one costs nothing and is not retried; the per-block path is the
+backstop.
+
+The per-block one is `hold_block_for_columns`, called when a
+fulu block carrying commitments arrives short of the columns this node
+custodies for it. Import holds the block — it stays out of fork choice, but
+its header, body and proof are already written, the same way a block missing
+its parent is held — and sends `data_column_sidecars_by_root/1` for exactly
+the missing columns, with
+`MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`, a
+peer that has already failed this lookup excluded until the whole pool is
+exhausted. A lookup that runs out of peers or
+retries stops asking rather than retrying forever; see
+`lean_data_column_fetch_failures_total` in [metrics.md](./metrics.md). The
+block is released the moment its last missing column arrives, and dropped
+along with any pending descendants once finality passes its slot, whichever
+comes first — nothing else times out a hold, so a peer that claims commitments
+and never answers pins the block only until finality clears it, not
+indefinitely.
+
+Both asking paths aim per column rather than per peer. A peer's custody set is
+a public function of its node id and its advertised custody group count, so
+this node computes it and sends each column to someone who actually holds it —
+the spec's own observation that "due to the deterministic custody functions, a
+node knows exactly what a peer should be able to respond to". The count comes
+from `metadata/3`, requested once per connection right behind `Status`, and is
+seeded from the ENR `cgc` for a peer this node dialed; a peer that has supplied
+neither is not assumed to custody anything, and the by-root path falls back to
+asking one at random for whatever no known custodian covers. At mainnet's
+`CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so this is the difference
+between a request that can be answered and one that usually cannot.
+
+What this node deliberately does not do with its own slice of the matrix: it
+does not run `compute_matrix` or `recover_matrix` to reconstruct the rest of a
+block's data from it, since reconstruction needs half of
+`NUMBER_OF_CUSTODY_GROUPS` and this node never holds more than its own
+sampling size; and it does not cross-seed, forwarding a
+verified column to a peer that never asked for it — every sidecar this node
+sends leaves in direct answer to a `data_column_sidecars_by_{root,range}`
+request, never as an unsolicited push.
+
 ### What is not wired yet
 
-Serving both protocols is live, off the checkpoint-anchored store. A request
+Serving both protocols is live, off the checkpoint-anchored store, and so is
+asking on both. A request
 that reaches a node whose data directory is *not* a beacon one is refused with
 `RESOURCE_UNAVAILABLE`, the spec's own code for a peer "unable to reply to block
 requests", where `INVALID_REQUEST` would blame the asker for a request that was
@@ -241,9 +356,13 @@ Two of these advertise less, or more, than they look like:
 
 - `attnets` all-unset is exactly what a node subscribing to no attestation
   subnet serves. It costs only that subnet-gap-filling peers rank us lower.
-- `cgc` advertises the custody requirement while this node custodies and serves
-  nothing, because peers may reject a lower value outright. This is the widest
-  gap between what is advertised and what is served, and startup warns about it.
+- `cgc` advertises `CUSTODY_REQUIREMENT`, the floor below which peers may
+  reject a record outright, not `sampling_size(CUSTODY_REQUIREMENT)`, the
+  larger number of columns this node actually custodies, stores and serves
+  (see [Data column sidecars](#data-column-sidecars)). That undersells rather
+  than oversells: a request for more than `cgc`'s worth of columns still
+  succeeds, since this node holds every column its own node id assigned it at
+  the sampling size, not merely `cgc`'s worth.
 
 The `tcp` entry is what makes us discoverable in return: lighthouse's discovery
 predicate requires `enr.tcp4().is_some() || enr.tcp6().is_some()` and applies it
@@ -257,7 +376,13 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 
-The `lean_` prefix is the repo-wide convention and applies here too.
+The `lean_` prefix is the repo-wide convention and applies here too. Data
+column sidecar metrics (`lean_data_columns_stored_total`,
+`lean_data_columns_rejected_total`, `lean_data_column_kzg_verify_seconds`,
+`lean_data_column_fetch_failures_total`, `lean_blocks_held_for_columns`) and
+the disk-growth gauge for
+`Table::DataColumns` (`lean_table_bytes{table="data_columns"}`) are documented
+in full in [metrics.md](./metrics.md) rather than repeated here.
 
 `ethlambda beacon` serves these on `--metrics-port`, alongside `/health` and
 the `/debug/pprof` heap-profiling routes, through the same `start_rpc_server`
@@ -285,15 +410,23 @@ Within 5 seconds:
 ```
 Derived the mainnet wire parameters  genesis_time=1606824023 genesis_validators_root=0x4b363db9… epoch=… fork=fulu fork_digest=8c9f62fe
 No fork or blob-schedule boundary is scheduled
-Advertising cgc=4 while custodying nothing, …
-Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=7
+Custodying data columns  columns=[…]
+Advertising cgc=4 while subscribing to no attestation or sync committee subnet, and publishing nothing
+Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=15 columns=8
 HTTP server listening  addr=127.0.0.1:5054
 Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
 Local ENR  enr=enr:-…
 ```
 
-`seeds=17` proves the built-in list parsed; a lower number means a bootnode ENR
-was skipped with a warning. `topics=7` proves the subscription set.
+The `Advertising cgc=…` line names what is still true: this node subscribes to
+no attestation or sync-committee subnet and publishes nothing of its own.
+Storing and serving the columns it custodies (see [Data column
+sidecars](#data-column-sidecars)) is no longer part of that gap.
+
+`seeds=17` proves the built-in list parsed; a lower number means a bootnode
+ENR was skipped with a warning. `topics=15` proves the subscription set: the 7
+global topics plus the 8 column subnets this run's (randomly generated) node
+id selected; `columns=8` is the same sampling size confirmed directly.
 
 Within 30 seconds:
 

@@ -10,17 +10,22 @@
 //! a handler, never the path to it; encoding lives further down still, in
 //! `crate::lean::encoding` and `crate::beacon::encoding`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ethlambda_network_api::BlockSource;
 use ethlambda_storage::{Chain, Store};
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use spawned_concurrency::tasks::{Context, send_after};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
+use ethlambda_state_transition::beacon::das;
+use ethlambda_types::beacon::constants;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::fulu::{
+    ColumnIndices, DataColumnSidecar, DataColumnsByRootIdentifier,
+};
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
@@ -30,13 +35,19 @@ use super::{
     messages::{ResponseCode, error_message},
 };
 use crate::beacon::BeaconWire;
+use crate::beacon::decode::decode_data_column_sidecar;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
-use crate::beacon::messages::{BeaconStatus, Goodbye, Ping};
+use crate::beacon::messages::{
+    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
+};
 use crate::beacon::protocols::{
     BLOCKS_BY_RANGE_V2 as BEACON_BLOCKS_BY_RANGE_PROTOCOL,
     BLOCKS_BY_ROOT_V2 as BEACON_BLOCKS_BY_ROOT_PROTOCOL,
+    DATA_COLUMN_SIDECARS_BY_RANGE_V1 as DATA_COLUMN_SIDECARS_BY_RANGE_PROTOCOL,
+    DATA_COLUMN_SIDECARS_BY_ROOT_V1 as DATA_COLUMN_SIDECARS_BY_ROOT_PROTOCOL,
     MAX_REQUEST_BLOCKS as MAX_BEACON_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB,
 };
+use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::{
     BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
@@ -45,7 +56,8 @@ use crate::lean::protocols::{
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingRequest, PendingRequestKind, RangeSyncState, metrics, p2p_protocol,
+    PendingColumnRequest, PendingRequest, PendingRequestKind, RangeSyncState,
+    UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
 };
 use libp2p::request_response::ResponseChannel;
 
@@ -123,6 +135,33 @@ pub async fn handle_req_resp_message(
                         // is waiting for.
                         handle_goodbye(peer, goodbye);
                     }
+                    // Beacon-only, like the four request arms above: lean
+                    // custodies no data columns, so there is no lean-side
+                    // handler to branch to the way `BlocksByRoot`/`BlocksByRange`
+                    // do.
+                    Request::DataColumnsByRoot(identifiers) => {
+                        trace!(
+                            kind = "data_column_sidecars_by_root_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_data_column_sidecars_by_root_request(
+                            server,
+                            peer,
+                            identifiers,
+                            channel,
+                        )
+                        .await;
+                    }
+                    Request::DataColumnsByRange(request) => {
+                        trace!(
+                            kind = "data_column_sidecars_by_range_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_data_column_sidecars_by_range_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -147,12 +186,70 @@ pub async fn handle_req_resp_message(
                             trace!(kind = "beacon_pong", peer_count, "P2P message received");
                             handle_pong(peer, ping);
                         }
-                        ResponsePayload::MetaData(_) => {
+                        ResponsePayload::MetaData(metadata) => {
                             trace!(
                                 kind = "beacon_metadata_response",
                                 peer_count, "P2P message received"
                             );
-                            handle_metadata_response(peer);
+                            handle_metadata_response(server, peer, metadata);
+                        }
+                        ResponsePayload::DataColumnSidecars(sidecars) => {
+                            trace!(
+                                kind = "data_column_sidecars_response",
+                                peer_count, "P2P message received"
+                            );
+                            // Two senders produce this payload: a `Columns`
+                            // by-root lookup for one held block, and a
+                            // `ColumnRange` prefetch riding alongside a range
+                            // sync batch. Removed here, like `Blocks` removes
+                            // its own entry, rather than left for a later
+                            // event: this response is the terminal outcome for
+                            // the id either way.
+                            match server.outbound_requests.remove(&request_id) {
+                                Some(PendingRequestKind::Columns(block_root)) => {
+                                    handle_data_column_sidecars_response(
+                                        server, peer, block_root, sidecars, ctx,
+                                    )
+                                    .await;
+                                }
+                                Some(PendingRequestKind::ColumnRange {
+                                    start_slot,
+                                    end_slot,
+                                }) => {
+                                    handle_data_column_sidecars_range_response(
+                                        server, peer, start_slot, end_slot, sidecars,
+                                    )
+                                    .await;
+                                }
+                                // Unreachable by construction: a request_id's
+                                // protocol is fixed at send time, and only the
+                                // two column kinds are ever sent on this
+                                // protocol, so the codec could not have
+                                // produced this payload for a `Root`/`Range`
+                                // id. Not re-inserted: the exchange this id
+                                // named is already over, and putting a `Root`
+                                // or `Range` entry back here would strand it
+                                // exactly the way #608 fixed, since no further
+                                // event will ever name this id again.
+                                Some(
+                                    PendingRequestKind::Root(_) | PendingRequestKind::Range { .. },
+                                ) => {
+                                    error!(
+                                        %peer,
+                                        ?request_id,
+                                        count = sidecars.len(),
+                                        "Data column sidecars response answered a non-column request id"
+                                    );
+                                }
+                                None => {
+                                    debug!(
+                                        %peer,
+                                        ?request_id,
+                                        count = sidecars.len(),
+                                        "Received data column sidecars response for unknown request_id"
+                                    );
+                                }
+                            }
                         }
                         ResponsePayload::Blocks(blocks) => {
                             trace!(kind = "blocks_response", peer_count, "P2P message received");
@@ -188,6 +285,18 @@ pub async fn handle_req_resp_message(
                                         .await;
                                     }
                                 }
+                                // Unreachable: a column request negotiates the
+                                // data column protocol, which answers with
+                                // `DataColumnSidecars`, never with `Blocks`.
+                                Some(
+                                    PendingRequestKind::Columns(_)
+                                    | PendingRequestKind::ColumnRange { .. },
+                                ) => {
+                                    error!(
+                                        %peer,
+                                        "Blocks response answered a data column request id"
+                                    );
+                                }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
                                 }
@@ -209,6 +318,18 @@ pub async fn handle_req_resp_message(
                                 // forever and deduplicates every later fetch.
                                 handle_fetch_failure(server, root, peer, ctx).await;
                             }
+                            Some(PendingRequestKind::Columns(block_root)) => {
+                                // Same reasoning as the `Root` arm above: an
+                                // error response is the whole exchange, so
+                                // this is the only place that can retire it.
+                                handle_column_fetch_failure(server, block_root, peer, ctx).await;
+                            }
+                            // Nothing to retire: a range prefetch has no
+                            // pending entry and nothing waits on it. A peer
+                            // refusing the range (ResourceUnavailable, say)
+                            // just means these columns come from gossip or
+                            // from the by-root path instead.
+                            Some(PendingRequestKind::ColumnRange { .. }) => {}
                             None => {}
                         }
                     }
@@ -240,10 +361,31 @@ pub async fn handle_req_resp_message(
                         "BlocksByRange request failed; retry is disabled"
                     );
                 }
-                // Only the handshake is untracked, and only one failure of it
-                // is worth acting on: a peer that has dropped `status/1`
-                // refuses the stream outright, and without a handshake it never
-                // enters the sync peer set at all.
+                Some(PendingRequestKind::Columns(block_root)) => {
+                    handle_column_fetch_failure(server, block_root, peer, ctx).await;
+                }
+                // Nothing waits on a range prefetch, so a failure is only
+                // worth a line: the blocks it rode alongside have their own
+                // failure path, and any column this would have delivered is
+                // still reachable by root once a block is held for it.
+                Some(PendingRequestKind::ColumnRange {
+                    start_slot,
+                    end_slot,
+                }) => {
+                    debug!(
+                        %peer,
+                        start_slot,
+                        end_slot,
+                        "DataColumnsByRange request failed; columns fall back to the by-root path"
+                    );
+                }
+                // The handshake is the only *tracked* request kind absent
+                // here: every other outcome for a `Root`, `Range` or `Columns`
+                // id is handled above, so reaching `None` means either the
+                // untracked handshake or an id this process never recorded.
+                // Only the former is worth acting on: a peer that has dropped
+                // `status/1` refuses the stream outright, and without a
+                // handshake it never enters the sync peer set at all.
                 None => {
                     if matches!(
                         error,
@@ -623,12 +765,12 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         .get(&root)
         .map(|p| &p.failed_peers);
     let pool: Vec<_> = if failed.is_none_or(|f| f.is_empty()) {
-        server.connected_peers.iter().copied().collect()
+        server.connected_peers.keys().copied().collect()
     } else {
         let failed = failed.unwrap();
         server
             .connected_peers
-            .iter()
+            .keys()
             .copied()
             .filter(|p| !failed.contains(p))
             .collect()
@@ -642,7 +784,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         if let Some(pending) = server.pending_root_requests.get_mut(&root) {
             pending.failed_peers.clear();
         }
-        server.connected_peers.iter().copied().collect()
+        server.connected_peers.keys().copied().collect()
     } else {
         pool
     };
@@ -706,6 +848,241 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
             attempts: 1,
             failed_peers: HashSet::new(),
         });
+
+    true
+}
+
+/// Record what columns `peer` custodies, given the custody group count it
+/// advertised.
+///
+/// Both inputs are public: the count comes from the peer's `metadata/3` answer
+/// or its ENR `cgc`, and the node id is recovered from the `PeerId` itself.
+/// `custody_columns` is the same function the peer ran to decide what to keep,
+/// so this reproduces its answer rather than approximating it.
+///
+/// An out-of-range count or an unreadable node id leaves no entry at all,
+/// which reads as "unknown" and not as "custodies nothing" — see
+/// [`columns_custodied_by`].
+pub(crate) fn record_peer_custody(server: &mut P2PServer, peer: PeerId, custody_group_count: u64) {
+    if !(constants::CUSTODY_REQUIREMENT..=constants::NUMBER_OF_CUSTODY_GROUPS)
+        .contains(&custody_group_count)
+    {
+        debug!(%peer, custody_group_count, "Ignoring an out-of-range custody group count");
+        return;
+    }
+    let Some(node_id) = node_id_from_peer_id(&peer) else {
+        debug!(%peer, "Cannot recover a node id for this peer; its custody stays unknown");
+        return;
+    };
+    match das::custody_columns(node_id, custody_group_count) {
+        Ok(columns) => {
+            trace!(%peer, custody_group_count, count = columns.len(), "Recorded peer custody");
+            server.peer_custody.insert(peer, columns);
+            // Republished here rather than only on connection events: this is
+            // where a peer's custody actually becomes known, and for the
+            // `metadata/3` path that is after it connected.
+            server.refresh_custody_column_metrics();
+        }
+        Err(err) => debug!(%peer, custody_group_count, ?err, "Cannot compute this peer's custody"),
+    }
+}
+
+/// The peers known to custody `column`, among those currently connected.
+///
+/// A peer with no entry is omitted rather than assumed: its custody is unknown,
+/// and [`fetch_data_columns_from_peer`] falls back to the whole connected set
+/// when this comes back empty, so an unknown peer is still reachable — just not
+/// preferred over one we know holds the column.
+pub(crate) fn columns_custodied_by(server: &P2PServer, column: u64) -> Vec<PeerId> {
+    server
+        .connected_peers
+        .keys()
+        .filter(|peer| {
+            server
+                .peer_custody
+                .get(*peer)
+                .is_some_and(|columns| columns.contains(&column))
+        })
+        .copied()
+        .collect()
+}
+
+/// Split `columns` across the peers that custody them, so each request goes
+/// somewhere it can actually be answered.
+///
+/// Returns one entry per chosen peer with the columns that peer holds, plus the
+/// columns no connected peer is known to custody. Mirrors lighthouse's
+/// `select_columns_by_range_peers_to_request`: pick per column, prefer the peer
+/// carrying the fewest of this lookup's columns so one peer is not asked for
+/// everything, and report the gap rather than papering over it.
+fn group_columns_by_custody_peer(
+    server: &P2PServer,
+    columns: &[u64],
+    exclude: &HashSet<PeerId>,
+) -> (HashMap<PeerId, Vec<u64>>, Vec<u64>) {
+    let mut by_peer: HashMap<PeerId, Vec<u64>> = HashMap::new();
+    let mut uncovered = Vec::new();
+
+    for &column in columns {
+        let candidates: Vec<PeerId> = columns_custodied_by(server, column)
+            .into_iter()
+            .filter(|peer| !exclude.contains(peer))
+            .collect();
+        // `min_by_key` over the load already assigned in this same call, with
+        // the peer id breaking ties so the choice is deterministic for a given
+        // peer set rather than dependent on HashSet iteration order.
+        let chosen = candidates
+            .iter()
+            .min_by_key(|peer| (by_peer.get(*peer).map_or(0, Vec::len), **peer));
+        match chosen {
+            Some(&peer) => by_peer.entry(peer).or_default().push(column),
+            None => uncovered.push(column),
+        }
+    }
+
+    (by_peer, uncovered)
+}
+
+/// Ask a connected peer for specific columns of `block_root`, mirroring
+/// [`fetch_block_from_peer`]'s peer selection, dedup and retry bookkeeping
+/// against `pending_column_requests` rather than `pending_root_requests`.
+///
+/// Beacon-only, unconditionally: unlike [`fetch_block_from_peer`], which has
+/// to dispatch on `server.wire` because both chains serve a block-shaped
+/// request, `DataColumnsByRoot` has no lean counterpart, so there is no wire
+/// to branch on. `fetch_missing_columns` in `lib.rs` calls this directly for
+/// the same reason.
+pub async fn fetch_data_columns_from_peer(
+    server: &mut P2PServer,
+    block_root: H256,
+    columns: Vec<u64>,
+) -> bool {
+    if server.connected_peers.is_empty() {
+        debug!(%block_root, "Cannot fetch data columns: no connected peers");
+        metrics::inc_data_column_fetch_failure("no_peers");
+        return false;
+    }
+
+    // Same pool-narrowing-then-fallback shape as `fetch_block_from_peer`.
+    let failed = server
+        .pending_column_requests
+        .get(&block_root)
+        .map(|p| &p.failed_peers);
+    let pool: Vec<_> = if failed.is_none_or(|f| f.is_empty()) {
+        server.connected_peers.keys().copied().collect()
+    } else {
+        let failed = failed.unwrap();
+        server
+            .connected_peers
+            .keys()
+            .copied()
+            .filter(|p| !failed.contains(p))
+            .collect()
+    };
+
+    let pool = if pool.is_empty() {
+        debug!(%block_root, "All peers failed for this lookup, retrying with full peer set");
+        if let Some(pending) = server.pending_column_requests.get_mut(&block_root) {
+            pending.failed_peers.clear();
+        }
+        server.connected_peers.keys().copied().collect()
+    } else {
+        pool
+    };
+    let excluded = server.connected_peers.len() - pool.len();
+
+    // Aim each column at a peer that custodies it. Whatever no connected peer
+    // is known to custody falls back to one random peer from the pool, which
+    // is all this function could ever do before: it may hold the column and
+    // simply not have told us its count yet.
+    let exclude: HashSet<PeerId> = server
+        .connected_peers
+        .keys()
+        .filter(|peer| !pool.contains(peer))
+        .copied()
+        .collect();
+    let (mut by_peer, uncovered) = group_columns_by_custody_peer(server, &columns, &exclude);
+
+    if !uncovered.is_empty() {
+        match pool.choose(&mut rand::thread_rng()) {
+            Some(&peer) => {
+                debug!(
+                    %block_root,
+                    %peer,
+                    count = uncovered.len(),
+                    "No connected peer is known to custody these columns; asking one at random"
+                );
+                by_peer.entry(peer).or_default().extend(uncovered);
+            }
+            None => {
+                debug!(%block_root, "Failed to select random peer");
+                return false;
+            }
+        }
+    }
+
+    let mut sent_count = 0usize;
+    for (peer, columns) in by_peer {
+        let count = columns.len();
+        let column_indices = match ColumnIndices::try_from(columns) {
+            Ok(indices) => indices,
+            Err(err) => {
+                // A caller asking for more than one block's worth of columns is a
+                // programming error on the chain-actor side, not a peer or wire
+                // fault, so this does not retry.
+                error!(%block_root, ?err, "Too many columns requested in one DataColumnsByRoot lookup");
+                return false;
+            }
+        };
+        let identifier = DataColumnsByRootIdentifier {
+            block_root,
+            columns: column_indices,
+        };
+
+        trace!(%peer, %block_root, excluded, count, "Sending DataColumnsByRoot request for missing columns");
+        let Some(request_id) = server
+            .swarm_handle
+            .send_request(
+                peer,
+                Request::DataColumnsByRoot(vec![identifier]),
+                libp2p::StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_ROOT_PROTOCOL),
+            )
+            .await
+        else {
+            debug!(%block_root, %peer, "Failed to send DataColumnsByRoot request (swarm adapter closed)");
+            continue;
+        };
+        server
+            .outbound_requests
+            .insert(request_id, PendingRequestKind::Columns(block_root));
+        sent_count += 1;
+    }
+
+    if sent_count == 0 {
+        return false;
+    }
+
+    // `or_insert` rather than unconditional insert: a retry re-enters here
+    // with the same root already tracked, and must not reset `attempts` back
+    // to a fresh lookup's value.
+    let pending =
+        server
+            .pending_column_requests
+            .entry(block_root)
+            .or_insert(PendingColumnRequest {
+                columns,
+                attempts: 1,
+                failed_peers: HashSet::new(),
+                in_flight: 0,
+                last_asked: Instant::now(),
+            });
+    // Set rather than added to: every request from the previous round has
+    // already reported back, since this round only starts once the last one
+    // did (see `PendingColumnRequest::in_flight`).
+    pending.in_flight = sent_count;
+    // Each round's own timestamp, not the lookup's first: a ladder still
+    // working through the peer set is alive, however long it has been running.
+    pending.last_asked = Instant::now();
 
     true
 }
@@ -814,6 +1191,13 @@ async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
         return false;
     }
 
+    // Pull the columns for the same span alongside the blocks, so they are
+    // already stored when each block reaches the availability gate rather than
+    // chased one root at a time after it has been held. Not gated on success:
+    // a batch with no column peers still syncs its blocks, and the by-root
+    // path remains behind every one that turns out to be missing.
+    request_beacon_data_columns_by_range(server, batch.start, planned).await;
+
     if let Some(state) = &mut server.range_sync_state {
         state.in_flight = true;
     }
@@ -868,6 +1252,105 @@ async fn handle_fetch_failure(
     pending.attempts += 1;
 
     send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+}
+
+/// Retire one failed attempt at fetching `block_root`'s missing columns.
+///
+/// Mirrors [`handle_fetch_failure`]'s funnel and invariant: every path that
+/// ends an attempt must come through here, or `block_root` stays in
+/// `pending_column_requests` and `fetch_missing_columns` folds every later
+/// call into it rather than starting a second lookup, for the life of the
+/// process.
+///
+/// `MAX_FETCH_RETRIES` attempts, each bounded by the request-response layer's
+/// own per-request timeout and spaced by the doubling backoff below, is the
+/// whole bound on how long a lookup persists; see the comment above that
+/// constant's definition. A held block is reclaimed by finality on its own
+/// schedule regardless, and the ladder stays well inside that window.
+async fn handle_column_fetch_failure(
+    server: &mut P2PServer,
+    block_root: H256,
+    peer: PeerId,
+    ctx: &Context<P2PServer>,
+) {
+    let Some(pending) = server.pending_column_requests.get_mut(&block_root) else {
+        return;
+    };
+
+    match retire_column_attempt(pending, peer) {
+        ColumnAttemptOutcome::RoundIncomplete { in_flight } => {
+            trace!(
+                %block_root,
+                %peer,
+                in_flight,
+                "One peer of this column lookup failed; waiting for the rest of the round"
+            );
+        }
+        ColumnAttemptOutcome::GiveUp { attempts } => {
+            error!(%block_root, %peer, attempts,
+                   "Data column fetch failed after max retries, giving up");
+            server.pending_column_requests.remove(&block_root);
+            metrics::inc_data_column_fetch_failure("max_retries");
+        }
+        ColumnAttemptOutcome::Retry { attempts, backoff } => {
+            debug!(%block_root, %peer, attempts, ?backoff, "Data column fetch failed, scheduling retry");
+            send_after(
+                backoff,
+                ctx.clone(),
+                p2p_protocol::RetryDataColumnFetch { block_root },
+            );
+        }
+    }
+}
+
+/// What a failed request means for the lookup it belonged to.
+#[derive(Debug, PartialEq, Eq)]
+enum ColumnAttemptOutcome {
+    /// Other requests from this same attempt are still open, so the attempt
+    /// has no outcome yet.
+    RoundIncomplete { in_flight: usize },
+    /// The ladder is exhausted; the caller retires the lookup.
+    GiveUp { attempts: u32 },
+    /// The attempt is spent and another is due after `backoff`.
+    Retry { attempts: u32, backoff: Duration },
+}
+
+/// Charge `peer`'s failure against `pending` and say what follows.
+///
+/// Split out from [`handle_column_fetch_failure`] so the round arithmetic can
+/// be tested without an actor context: everything the decision depends on is in
+/// `pending`, and everything it causes (the store mutation, the metric, the
+/// timer) is the caller's.
+///
+/// One attempt is one round, however many peers it was split across. While any
+/// request of the round is still open, a sibling's failure is not the attempt's
+/// outcome: the round may still be answered, and treating each failure as its
+/// own attempt would burn the ladder several times faster *and* schedule one
+/// fan-out per failure, which squares with every retry.
+fn retire_column_attempt(pending: &mut PendingColumnRequest, peer: PeerId) -> ColumnAttemptOutcome {
+    pending.failed_peers.insert(peer);
+    pending.in_flight = pending.in_flight.saturating_sub(1);
+
+    if pending.in_flight > 0 {
+        return ColumnAttemptOutcome::RoundIncomplete {
+            in_flight: pending.in_flight,
+        };
+    }
+
+    if pending.attempts >= MAX_FETCH_RETRIES {
+        return ColumnAttemptOutcome::GiveUp {
+            attempts: pending.attempts,
+        };
+    }
+
+    let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
+    let attempts = pending.attempts;
+    pending.attempts += 1;
+
+    ColumnAttemptOutcome::Retry {
+        attempts,
+        backoff: Duration::from_millis(backoff_ms),
+    }
 }
 
 /// The beacon wire, or a refusal sent on `channel`.
@@ -1079,21 +1562,32 @@ fn handle_pong(peer: PeerId, ping: Ping) {
 }
 
 /// Record a peer's metadata. Nothing is driven off one yet.
-fn handle_metadata_response(peer: PeerId) {
+/// Take delivery of a peer's `MetaData`, and learn its custody from it.
+///
+/// Only v3 carries `custody_group_count`; v1 and v2 predate data availability
+/// sampling and say nothing about it, so a peer answering in those versions
+/// keeps whatever its ENR seeded and is otherwise treated as unknown. That is
+/// the same graceful handling lighthouse gives a metadata/v2 peer.
+fn handle_metadata_response(server: &mut P2PServer, peer: PeerId, metadata: BeaconMetaData) {
     debug!(%peer, "Peer metadata received");
+    if let BeaconMetaData::V3(v3) = metadata {
+        record_peer_custody(server, peer, v3.custody_group_count);
+    }
 }
 
-/// The beacon store this node can serve blocks out of, or a refusal.
+/// The beacon store this node can serve blocks and data column sidecars out
+/// of, or a refusal.
 ///
-/// Two things have to hold before a block request can be answered: this process
-/// speaks the beacon wire at all, and the data directory behind it actually
-/// holds a beacon chain. The anchor makes the second true for an ordinary
-/// `ethlambda beacon` run, so this is a guard against a lean directory rather
-/// than the common path. It is a refusal rather than an empty answer because
-/// the difference matters to the peer: `RESOURCE_UNAVAILABLE` is the spec's own
-/// code for a peer "unable to reply to block requests", where an empty stream
-/// claims we looked and had nothing, and `INVALID_REQUEST` would blame the
-/// asker for a request that was fine.
+/// Two things have to hold before a block or data column sidecar request can
+/// be answered: this process speaks the beacon wire at all, and the data
+/// directory behind it actually holds a beacon chain. The anchor makes the
+/// second true for an ordinary `ethlambda beacon` run, so this is a guard
+/// against a lean directory rather than the common path. It is a refusal
+/// rather than an empty answer because the difference matters to the peer:
+/// `RESOURCE_UNAVAILABLE` is the spec's own code for a peer "unable to reply
+/// to block requests" (data column sidecar requests name the same code for
+/// the same reason), where an empty stream claims we looked and had nothing,
+/// and `INVALID_REQUEST` would blame the asker for a request that was fine.
 fn beacon_block_store_or_refuse(
     server: &mut P2PServer,
     peer: PeerId,
@@ -1216,6 +1710,181 @@ async fn handle_beacon_blocks_by_root_request(
     respond(server, channel, ResponsePayload::Blocks(blocks));
 }
 
+/// Answer `data_column_sidecars_by_root/1` with whichever of the named
+/// sidecars this node custodies.
+///
+/// The counterpart of [`handle_beacon_blocks_by_root_request`], and the same
+/// per-item leniency: a column this node never custodied is left out rather
+/// than answered with an error, since a peer asking for it has no way to know
+/// which of a custody set actually arrived here. The spec's own words for
+/// this are "Clients MUST respond with at least one sidecar, if they have
+/// it." An identifier naming a root this node holds no header for is skipped
+/// whole, for the same reason a missing root is skipped on the block path.
+async fn handle_data_column_sidecars_by_root_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    identifiers: Vec<DataColumnsByRootIdentifier>,
+    channel: ResponseChannel<Response>,
+) {
+    let Some(channel) = beacon_block_store_or_refuse(server, peer, channel) else {
+        return;
+    };
+
+    let requested: usize = identifiers
+        .iter()
+        .map(|identifier| identifier.columns.len())
+        .sum();
+    let mut sidecars = Vec::new();
+    for identifier in &identifiers {
+        // The store keys a sidecar by slot, root and column, but the wire
+        // names only the root: the slot has to be recovered from whatever
+        // this node holds under that root before the columns can be looked
+        // up at all. A root with no block is not this node's to answer for.
+        //
+        // Through `block_entry`, which decodes per chain, and not
+        // `Store::get_block_header`, which is lean-only: this handler only
+        // ever runs on a beacon store, and that table holds the whole signed
+        // block there, so the lean accessor reads a whole block as a fixed-size
+        // header and panics the P2P actor. A peer's request must not be able
+        // to do that.
+        let Some((slot, _)) = server.store.block_entry(&identifier.block_root) else {
+            continue;
+        };
+        for &column in identifier.columns.iter() {
+            let Ok(Some(encoded)) =
+                server
+                    .store
+                    .get_data_column_sidecar(slot, &identifier.block_root, column)
+            else {
+                continue;
+            };
+            match decode_data_column_sidecar(&encoded) {
+                Ok(sidecar) => sidecars.push(sidecar),
+                Err(err) => error!(
+                    %peer,
+                    slot,
+                    column,
+                    %err,
+                    "Stored data column sidecar failed to decode"
+                ),
+            }
+        }
+    }
+
+    trace!(
+        %peer,
+        requested,
+        found = sidecars.len(),
+        "Responding to DataColumnSidecarsByRoot request"
+    );
+
+    respond(
+        server,
+        channel,
+        ResponsePayload::DataColumnSidecars(sidecars),
+    );
+}
+
+/// Answer `data_column_sidecars_by_range/1` from the slot window this node
+/// has custodied.
+///
+/// The counterpart of [`handle_beacon_blocks_by_range_request`]: the same
+/// `count` clamp to [`MAX_REQUEST_BLOCKS_DENEB`], which keeps the answer
+/// within `max_request_data_column_sidecars()` sidecars regardless of
+/// how many columns were asked for. What differs is the floor. A window this
+/// node's canonical chain simply skipped is an empty answer, business as
+/// usual; a `start_slot` before [`ethlambda_storage::Store::anchor_slot`]
+/// cannot be served from any point in the response onward, since this node's
+/// chain does not reach back that far at all. `RESOURCE_UNAVAILABLE` is the
+/// code the specification names for exactly that peer, and the honest answer
+/// for a node that started custodying at a checkpoint rather than at genesis.
+///
+/// The floor is where this directory's chain begins rather than the lowest
+/// slot a sidecar was actually written at, so it matches the
+/// `earliest_available_slot` this node advertises in `Status`. The two differ
+/// only in the window between the anchor and the first column this node
+/// custodied, where a request is answered with an empty list rather than
+/// refused; a node that range-synced has already backfilled columns alongside
+/// blocks across that window, so it is narrow in practice and never claims
+/// data the node does not hold.
+async fn handle_data_column_sidecars_by_range_request(
+    server: &mut P2PServer,
+    peer: PeerId,
+    request: DataColumnsByRangeRequest,
+    channel: ResponseChannel<Response>,
+) {
+    let Some(channel) = beacon_block_store_or_refuse(server, peer, channel) else {
+        return;
+    };
+
+    if request.count == 0 {
+        refuse(
+            server,
+            channel,
+            ResponseCode::INVALID_REQUEST,
+            "invalid DataColumnSidecarsByRange request",
+        );
+        return;
+    }
+
+    let earliest = server.store.anchor_slot();
+    if request.start_slot < earliest {
+        debug!(
+            %peer,
+            start_slot = request.start_slot,
+            earliest,
+            "DataColumnSidecarsByRange request starts before what this node has custodied"
+        );
+        refuse(
+            server,
+            channel,
+            ResponseCode::RESOURCE_UNAVAILABLE,
+            "requested range starts before this node's earliest custodied slot",
+        );
+        return;
+    }
+
+    let count = request.count.min(MAX_REQUEST_BLOCKS_DENEB);
+    let end_slot = request.start_slot.saturating_add(count);
+    let columns = request.columns.to_vec();
+    let sidecars: Vec<_> = server
+        .store
+        .data_column_sidecars_in_range(request.start_slot, end_slot, &columns)
+        .inspect_err(|err| {
+            warn!(
+                start_slot = request.start_slot,
+                end_slot,
+                ?err,
+                "Failed to get data column sidecars by slot range"
+            )
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|encoded| {
+            decode_data_column_sidecar(&encoded)
+                .inspect_err(
+                    |err| error!(%peer, %err, "Stored data column sidecar failed to decode"),
+                )
+                .ok()
+        })
+        .collect();
+
+    trace!(
+        %peer,
+        start_slot = request.start_slot,
+        count = request.count,
+        served = count,
+        found = sidecars.len(),
+        "Responding to DataColumnSidecarsByRange request"
+    );
+
+    respond(
+        server,
+        channel,
+        ResponsePayload::DataColumnSidecars(sidecars),
+    );
+}
+
 /// Ask `peer` for the beacon blocks in `[start_slot, start_slot + count)`.
 ///
 /// Returns the request id, so a caller can pair the answer with what it asked
@@ -1252,6 +1921,141 @@ pub async fn request_beacon_blocks_by_range(
     Some(request_id)
 }
 
+/// Ask the peers that custody them for this node's columns over a slot range.
+///
+/// The companion of [`request_beacon_blocks_by_range`], sent for the same span
+/// at the same time. The specification names this protocol for exactly this:
+/// "`DataColumnSidecarsByRange` is primarily used to sync data columns that may
+/// have been missed on gossip and to sync within the
+/// `MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS` window", which is what a
+/// follower backfilling from a checkpoint anchor is doing.
+///
+/// Without it the only source of a historical column was the by-root lookup a
+/// block triggers *after* it has already arrived and been held, one block at a
+/// time, against a peer chosen without regard to custody. Prefetching here
+/// means the columns are usually already stored by the time their block is
+/// checked, so the gate passes on the first try and the by-root path is left
+/// for the genuine gaps.
+///
+/// Best effort by construction: it sends what it can, and the return value says
+/// only whether anything went out. A range sync batch does not depend on this
+/// succeeding, because a missing column still has the by-root path behind it.
+/// Up to `limit` connected peers this node has recorded no custody for.
+///
+/// A peer lands here until its `metadata/3` answer or its ENR `cgc` has been
+/// read, and some peers never leave: one answering `metadata/3` on a version
+/// this node's codec rejects supplies nothing either way. "No opinion" is not
+/// "custodies nothing", so these are the peers worth a speculative ask when no
+/// known custodian covers a column — and the only ones, since a peer that has
+/// said what it keeps has already answered the question.
+fn peers_of_unknown_custody(server: &P2PServer, limit: usize) -> Vec<PeerId> {
+    server
+        .connected_peers
+        .keys()
+        .filter(|peer| !server.peer_custody.contains_key(peer))
+        .copied()
+        .take(limit)
+        .collect()
+}
+
+/// Ask for this node's custody columns across a span of slots.
+///
+/// Sent by [`request_next_beacon_range_batch`] alongside every
+/// `BeaconBlocksByRange` it plans, over the same span, so a synced block's
+/// columns are already stored when it reaches the availability gate rather
+/// than chased one root at a time after it has been held. Not driven from
+/// outside this crate: a caller there has a block root, not a span, and the
+/// span worth asking for is the one this crate is already syncing.
+pub(crate) async fn request_beacon_data_columns_by_range(
+    server: &mut P2PServer,
+    start_slot: u64,
+    count: u64,
+) -> bool {
+    let Some(wire) = server.wire.beacon() else {
+        return false;
+    };
+    let columns = wire.custody_columns.clone();
+    // The same ceiling `request_beacon_blocks_by_range` applies to its own
+    // count, so the two requests cover exactly one span and this one cannot
+    // ask for columns of slots whose blocks were never requested.
+    let count = count.min(MAX_REQUEST_BLOCKS_DENEB);
+    if columns.is_empty() || count == 0 {
+        return false;
+    }
+
+    // No exclusions: unlike a by-root retry, this has no failed-peer history to
+    // avoid, and a peer that cannot answer simply returns nothing.
+    let (mut by_peer, uncovered) = group_columns_by_custody_peer(server, &columns, &HashSet::new());
+    if !uncovered.is_empty() {
+        // "Uncovered" means no peer is *known* to custody these, and custody is
+        // only known once a peer's `metadata/3` answer or its ENR `cgc` has
+        // been recorded. A peer that has told us neither is not a peer that
+        // lacks the column; it is a peer this node cannot aim at yet, and on
+        // mainnet there is always a handful of those — freshly connected, or
+        // answering `metadata/3` on a version this node rejects.
+        //
+        // So the uncovered columns go to a couple of them, which is the same
+        // bet `fetch_data_columns_from_peer` makes for the same reason. Not to
+        // a peer already known to custody something else: that one has told us
+        // what it keeps, and asking it for what it does not keep really is
+        // waste. Bounded rather than broadcast, since a range request is
+        // megabytes of answer when it does land.
+        let unknown = peers_of_unknown_custody(server, UNKNOWN_CUSTODY_RANGE_PEERS);
+        debug!(
+            start_slot,
+            count,
+            uncovered = uncovered.len(),
+            asked = unknown.len(),
+            "No connected peer is known to custody some of this node's columns for the range"
+        );
+        for peer in unknown {
+            by_peer
+                .entry(peer)
+                .or_default()
+                .extend(uncovered.iter().copied());
+        }
+    }
+
+    let end_slot = start_slot.saturating_add(count - 1);
+    let mut sent = false;
+    for (peer, columns) in by_peer {
+        let Ok(column_indices) = ColumnIndices::try_from(columns) else {
+            // This node's own custody set is bounded by NUMBER_OF_COLUMNS, so
+            // a subset of it cannot overflow the request's list.
+            error!("This node's custody set does not fit one DataColumnsByRange request");
+            continue;
+        };
+        let request = DataColumnsByRangeRequest {
+            start_slot,
+            count,
+            columns: column_indices,
+        };
+        trace!(%peer, start_slot, count, "Sending DataColumnsByRange request");
+        let Some(request_id) = server
+            .swarm_handle
+            .send_request(
+                peer,
+                Request::DataColumnsByRange(request),
+                libp2p::StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_RANGE_PROTOCOL),
+            )
+            .await
+        else {
+            debug!(%peer, "Failed to send DataColumnsByRange request (swarm adapter closed)");
+            continue;
+        };
+        server.outbound_requests.insert(
+            request_id,
+            PendingRequestKind::ColumnRange {
+                start_slot,
+                end_slot,
+            },
+        );
+        sent = true;
+    }
+
+    sent
+}
+
 /// Ask `peer` for one beacon block by root.
 ///
 /// One root per request rather than a batch, matching
@@ -1281,6 +2085,121 @@ pub async fn request_beacon_block_by_root(
         .outbound_requests
         .insert(request_id, PendingRequestKind::Root(root));
     Some(request_id)
+}
+
+/// Take delivery of a `DataColumnsByRoot` response and forward every sidecar
+/// it carried to the chain actor through `new_data_column_sidecars`, exactly
+/// the path a gossiped sidecar takes. The specification requires a sidecar
+/// obtained by any other means to be treated as if it had arrived on gossip;
+/// routing every fetched sidecar into the same entry point, with the same
+/// full verification (structural validity, inclusion proof, KZG batch,
+/// proposer, header signature) running on the far side, is what makes that
+/// true rather than merely intended. Structural validity runs there rather
+/// than here: gossip's own copy of that check stays where it is too, ahead
+/// of the mailbox hop it saves, but the fetch path has no such hop to save
+/// and gains nothing from a second copy of the check.
+///
+/// Unlike a block-by-root answer, which names exactly one document that
+/// either matches the requested root or doesn't, the specification permits a
+/// peer to return fewer sidecars than were asked for ("Clients MUST respond
+/// with at least one sidecar, if they have it" — not with every one), so a
+/// non-empty answer is treated as this lookup's success regardless of
+/// whether it is the full requested set. Whatever is still missing is the
+/// next task's concern: it is driven by a fresh `fetch_block` call naming
+/// what is still missing once the held block is re-checked, not by this
+/// function retrying for the remainder. Zero sidecars is the one case that is
+/// not success: it means this peer had none of what was asked, and is charged
+/// as a failed attempt the same way an empty `BlocksByRoot` answer is, backed
+/// off and retried against another peer.
+/// Take delivery of a `DataColumnsByRange` prefetch and forward what it carries.
+///
+/// No failure handling, unlike the by-root path: nothing is waiting on this
+/// answer. An empty or short response means those columns simply arrive later
+/// (or by root, when a block turns out to need one), not that an attempt was
+/// spent. Retrying here would re-request a whole range over a single gap.
+///
+/// A sidecar outside the requested span is dropped on its own rather than
+/// failing the batch, the same way a block outside its range is: the rest of
+/// the answer may still be what was asked for. Every other check is the chain
+/// actor's, which runs the same `on_gossip_data_column` a gossiped sidecar
+/// passes through.
+async fn handle_data_column_sidecars_range_response(
+    server: &mut P2PServer,
+    peer: PeerId,
+    start_slot: u64,
+    end_slot: u64,
+    sidecars: Vec<DataColumnSidecar>,
+) {
+    let received = sidecars.len();
+    trace!(%peer, start_slot, end_slot, received, "Received DataColumnsByRange response");
+
+    let Some(ref blockchain) = server.blockchain else {
+        debug!(%peer, "No blockchain handler available");
+        return;
+    };
+
+    let in_range: Vec<DataColumnSidecar> = sidecars
+        .into_iter()
+        .filter(|sidecar| {
+            let slot = sidecar.signed_block_header.message.slot;
+            let keep = slot >= start_slot && slot <= end_slot;
+            if !keep {
+                debug!(%peer, slot, start_slot, end_slot, "Dropping an out-of-range data column sidecar");
+            }
+            keep
+        })
+        .collect();
+    if in_range.is_empty() {
+        return;
+    }
+
+    // One message for the whole batch. A range answer is the largest batch
+    // this node ever takes delivery of, and it arrives precisely when the
+    // chain actor is busiest draining a backlog, so a message per sidecar
+    // would put that many mailbox hops between the answer and the imports
+    // waiting on it.
+    let count = in_range.len();
+    if let Err(err) = blockchain.new_data_column_sidecars(in_range) {
+        error!(
+            %err, %peer, start_slot, end_slot, count,
+            "Failed to forward ranged data column sidecars to blockchain"
+        );
+    }
+}
+
+async fn handle_data_column_sidecars_response(
+    server: &mut P2PServer,
+    peer: PeerId,
+    block_root: H256,
+    sidecars: Vec<DataColumnSidecar>,
+    ctx: &Context<P2PServer>,
+) {
+    let received = sidecars.len();
+    trace!(%peer, %block_root, received, "Received DataColumnsByRoot response");
+
+    if sidecars.is_empty() {
+        debug!(%peer, %block_root, "DataColumnsByRoot response carried no sidecars");
+        handle_column_fetch_failure(server, block_root, peer, ctx).await;
+        return;
+    }
+
+    // The lookup is done, whether or not every requested column arrived; see
+    // this function's own doc comment for why a partial answer still retires
+    // the entry rather than triggering a same-lookup retry for the rest.
+    server.pending_column_requests.remove(&block_root);
+
+    let Some(ref blockchain) = server.blockchain else {
+        debug!(%peer, %block_root, "No blockchain handler available");
+        return;
+    };
+
+    let count = sidecars.len();
+    if let Err(err) = blockchain.new_data_column_sidecars(sidecars) {
+        error!(
+            %err, %peer, %block_root, count,
+            "Failed to forward fetched data column sidecars to blockchain"
+        );
+    }
 }
 
 /// Take delivery of a range answer, checking it against what was asked for,
@@ -1364,13 +2283,291 @@ async fn handle_beacon_blocks_by_range_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ConnectionDirection;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
+    use ethlambda_types::enr::EnrForkId;
     use ethlambda_types::{
         block::{Block, BlockBody, MultiMessageAggregate},
         state::State,
     };
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
+
+    /// A real, unconnected `P2PServer`: a loopback swarm bound to an
+    /// OS-assigned port, discv5 the same way, and no bootnodes or peers. Ports
+    /// `0` throughout, so this cannot collide with a running node or a
+    /// sibling test.
+    ///
+    /// This is the smallest server `fetch_data_columns_from_peer` can run
+    /// against: unlike `handle_fetch_failure` and its beacon counterpart,
+    /// which also take a live actor `Context` (and which the crate has never
+    /// had a harness for; see 64a6bce9), the fetch path only touches
+    /// `&mut P2PServer`, so building one real server is the whole cost of
+    /// testing it.
+    async fn unconnected_server() -> P2PServer {
+        let built = crate::build_swarm(crate::SwarmConfig {
+            node_key: vec![3u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            wire: crate::WireConfig::Lean(crate::LeanWireConfig {
+                validator_ids: Vec::new(),
+                attestation_committee_count: 1,
+                subscription_subnets: HashSet::new(),
+                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+            }),
+        })
+        .expect("swarm builds");
+
+        let (_swarm_stream, swarm_handle) =
+            crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+
+        let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
+            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
+                .secret_bytes()
+                .to_vec(),
+            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 0,
+            p2p_port: 0,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 1,
+            bootnodes: Vec::new(),
+            advertise_ip: None,
+            target_peers: 0,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        })
+        .await
+        .expect("discovery spawns");
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        P2PServer {
+            swarm_handle,
+            store,
+            blockchain: None,
+            wire: built.wire,
+            connected_peers: HashMap::new(),
+            peer_custody: HashMap::new(),
+            pending_root_requests: HashMap::new(),
+            pending_column_requests: HashMap::new(),
+            outbound_requests: HashMap::new(),
+            range_sync_state: None,
+            beacon_fetched_through: 0,
+            bootnode_addrs: HashMap::new(),
+            node_names: HashMap::new(),
+            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            seen_data_columns: HashSet::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_data_columns_with_no_peers_is_dropped_and_counted() {
+        let mut server = unconnected_server().await;
+        let block_root = H256::repeat_byte(0xAB);
+
+        let before = metrics::data_column_fetch_failures_total("no_peers");
+
+        // Must not panic despite there being nobody to ask, and must not
+        // leave a `pending_column_requests` entry behind: nothing will ever
+        // answer a request that was never sent, so an entry here would be
+        // stuck forever, deduplicating away every future retry.
+        let sent = fetch_data_columns_from_peer(&mut server, block_root, vec![1, 2, 3]).await;
+
+        assert!(!sent, "no connected peers means nothing can be sent");
+        assert!(
+            server.pending_column_requests.is_empty(),
+            "a send that never happened must not be tracked as pending"
+        );
+        assert_eq!(
+            metrics::data_column_fetch_failures_total("no_peers"),
+            before + 1,
+            "the no-peers path must count itself as a failed attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn columns_are_grouped_onto_the_peers_that_custody_them() {
+        let mut server = unconnected_server().await;
+        let holder_of_1 = PeerId::random();
+        let holder_of_2 = PeerId::random();
+        let holder_of_both = PeerId::random();
+        for peer in [holder_of_1, holder_of_2, holder_of_both] {
+            server
+                .connected_peers
+                .insert(peer, ConnectionDirection::Inbound);
+        }
+        server.peer_custody.insert(holder_of_1, vec![1]);
+        server.peer_custody.insert(holder_of_2, vec![2]);
+        server.peer_custody.insert(holder_of_both, vec![1, 2]);
+
+        let (by_peer, uncovered) = group_columns_by_custody_peer(&server, &[1, 2], &HashSet::new());
+
+        // Column 3 is nobody's, so it is reported rather than pinned on a peer
+        // that would answer empty.
+        let (_, uncovered_3) = group_columns_by_custody_peer(&server, &[3], &HashSet::new());
+        assert_eq!(uncovered_3, vec![3]);
+
+        assert!(uncovered.is_empty());
+        // Every column went somewhere that holds it.
+        for (peer, columns) in &by_peer {
+            let custody = &server.peer_custody[peer];
+            assert!(columns.iter().all(|column| custody.contains(column)));
+        }
+        let total: usize = by_peer.values().map(Vec::len).sum();
+        assert_eq!(total, 2);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_custody_is_unknown_is_never_assumed_to_hold_a_column() {
+        let mut server = unconnected_server().await;
+        let unknown = PeerId::random();
+        server
+            .connected_peers
+            .insert(unknown, ConnectionDirection::Inbound);
+
+        // Absent must read as "no opinion", not "custodies nothing" and not
+        // "custodies everything": the caller has its own random fallback for
+        // this, and silently treating unknown as a holder would put us back to
+        // asking arbitrary peers for specific columns.
+        let (by_peer, uncovered) = group_columns_by_custody_peer(&server, &[7], &HashSet::new());
+
+        assert!(by_peer.is_empty());
+        assert_eq!(uncovered, vec![7]);
+    }
+
+    #[tokio::test]
+    async fn a_range_prefetch_falls_back_only_to_peers_that_have_said_nothing() {
+        // The follower stalled on mainnet with a block whose columns no known
+        // custodian held: the by-root path asks someone anyway, the range path
+        // asked no one, and the columns only arrived when the peer set churned.
+        // A peer that has told us what it keeps has answered the question; one
+        // that has told us nothing has not, and is the only worthwhile guess.
+        let mut server = unconnected_server().await;
+        let silent = PeerId::random();
+        let known = PeerId::random();
+        server
+            .connected_peers
+            .insert(silent, ConnectionDirection::Inbound);
+        server
+            .connected_peers
+            .insert(known, ConnectionDirection::Inbound);
+        server.peer_custody.insert(known, vec![4]);
+
+        assert_eq!(peers_of_unknown_custody(&server, 2), vec![silent]);
+    }
+
+    #[tokio::test]
+    async fn the_unknown_custody_fallback_asks_no_more_peers_than_it_is_allowed() {
+        let mut server = unconnected_server().await;
+        for _ in 0..5 {
+            server
+                .connected_peers
+                .insert(PeerId::random(), ConnectionDirection::Inbound);
+        }
+
+        // A range answer is megabytes when it lands, so the speculative ask is
+        // a couple of peers, not every peer that has said nothing.
+        assert_eq!(peers_of_unknown_custody(&server, 2).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_excluded_peer_is_not_chosen_even_when_it_custodies_the_column() {
+        let mut server = unconnected_server().await;
+        let failed = PeerId::random();
+        server
+            .connected_peers
+            .insert(failed, ConnectionDirection::Inbound);
+        server.peer_custody.insert(failed, vec![4]);
+
+        // The exclusion set is how a retry avoids the peer that just failed;
+        // custody must not override it, or a retry would loop on one peer.
+        let (by_peer, uncovered) =
+            group_columns_by_custody_peer(&server, &[4], &HashSet::from([failed]));
+
+        assert!(by_peer.is_empty());
+        assert_eq!(uncovered, vec![4]);
+    }
+
+    #[test]
+    fn a_split_lookup_spends_one_attempt_however_many_peers_it_used() {
+        // Three requests open for one root, the shape custody-aware splitting
+        // produces. Before `in_flight`, each failure was its own attempt and
+        // scheduled its own fan-out, so one unanswered lookup against eight
+        // custodians became eight retries, then sixty-four.
+        let mut pending = PendingColumnRequest {
+            columns: vec![1, 2, 3],
+            attempts: 1,
+            failed_peers: HashSet::new(),
+            in_flight: 3,
+            last_asked: Instant::now(),
+        };
+
+        assert_eq!(
+            retire_column_attempt(&mut pending, PeerId::random()),
+            ColumnAttemptOutcome::RoundIncomplete { in_flight: 2 }
+        );
+        assert_eq!(
+            retire_column_attempt(&mut pending, PeerId::random()),
+            ColumnAttemptOutcome::RoundIncomplete { in_flight: 1 }
+        );
+        assert_eq!(pending.attempts, 1, "the round's attempt is not spent yet");
+
+        // Only the last failure of the round is the attempt's outcome, and it
+        // schedules exactly one retry.
+        assert_eq!(
+            retire_column_attempt(&mut pending, PeerId::random()),
+            ColumnAttemptOutcome::Retry {
+                attempts: 1,
+                backoff: Duration::from_millis(INITIAL_BACKOFF_MS),
+            }
+        );
+        assert_eq!(pending.attempts, 2);
+    }
+
+    #[test]
+    fn a_column_lookup_gives_up_once_the_ladder_is_exhausted() {
+        let mut pending = PendingColumnRequest {
+            columns: vec![1],
+            attempts: MAX_FETCH_RETRIES,
+            failed_peers: HashSet::new(),
+            in_flight: 1,
+            last_asked: Instant::now(),
+        };
+
+        assert_eq!(
+            retire_column_attempt(&mut pending, PeerId::random()),
+            ColumnAttemptOutcome::GiveUp {
+                attempts: MAX_FETCH_RETRIES
+            }
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_custody_group_count_records_nothing() {
+        // A count outside CUSTODY_REQUIREMENT..=NUMBER_OF_CUSTODY_GROUPS
+        // describes no custody set the spec defines. Recording a guess would
+        // aim requests at a peer that never agreed to hold those columns.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let mut server = runtime.block_on(unconnected_server());
+        let peer = PeerId::random();
+
+        record_peer_custody(&mut server, peer, 0);
+        assert!(!server.peer_custody.contains_key(&peer));
+
+        record_peer_custody(&mut server, peer, constants::NUMBER_OF_CUSTODY_GROUPS + 1);
+        assert!(!server.peer_custody.contains_key(&peer));
+    }
 
     fn signed_block(slot: u64, parent_root: H256) -> SignedBlock {
         SignedBlock {

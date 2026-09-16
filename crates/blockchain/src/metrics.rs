@@ -812,6 +812,74 @@ static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
         .unwrap()
     });
 
+// --- Data Column Sidecars ---
+
+/// Why `on_gossip_data_column` dropped a sidecar.
+///
+/// Gossip's own cheap checks (decode, subnet match, structural validity,
+/// seen-dedup) already ran in the p2p actor before a gossiped sidecar reaches
+/// this counter, so `"malformed"` fires almost exclusively for a fetched
+/// sidecar, which skips straight to the chain actor with none of them. Every
+/// other reason here is one only the store or fork choice can answer. Seeded
+/// at zero so a reason this node never fires is still visible on a
+/// dashboard.
+const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
+    "malformed",
+    "finalized",
+    "future",
+    "finalized_ancestor",
+    "inclusion_proof",
+    "kzg",
+    "proposer",
+];
+
+static LEAN_DATA_COLUMNS_REJECTED_TOTAL: std::sync::LazyLock<IntCounterVec> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_data_columns_rejected_total",
+            "Gossiped data column sidecars the chain actor dropped, by reason",
+            &["reason"]
+        )
+        .unwrap()
+    });
+
+static LEAN_DATA_COLUMNS_STORED_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_data_columns_stored_total",
+            "Data column sidecars verified and written to the store"
+        )
+        .unwrap()
+    });
+
+static LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_data_column_kzg_verify_seconds",
+            "Time spent batch-verifying one sidecar's cells against its own commitments",
+            vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCKS_HELD_FOR_COLUMNS: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_blocks_held_for_columns",
+            "Blocks held from fork choice pending their custody columns"
+        )
+        .unwrap()
+    });
+
+static LEAN_SIDECARS_AWAITING_PARENT: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_sidecars_awaiting_parent",
+            "Data column sidecars parked until their block's parent has a post-state"
+        )
+        .unwrap()
+    });
+
 // --- Initialization ---
 
 /// Register all metrics with the Prometheus registry so they appear in `/metrics` from startup.
@@ -915,6 +983,15 @@ pub fn init() {
     for &reason in AGGREGATOR_SKIP_REASONS {
         LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
     }
+    // Data column sidecars: same zero-seeding treatment as the aggregator
+    // skip counter above.
+    std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_REJECTED_TOTAL);
+    for &reason in DATA_COLUMN_REJECT_REASONS {
+        LEAN_DATA_COLUMNS_REJECTED_TOTAL.with_label_values(&[reason]);
+    }
+    std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_STORED_TOTAL);
+    std::sync::LazyLock::force(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS);
+    LEAN_BLOCKS_HELD_FOR_COLUMNS.set(0);
 }
 
 // --- Public API ---
@@ -1212,4 +1289,56 @@ pub fn set_node_sync_status(status: SyncStatus) {
             .with_label_values(&[label])
             .set(i64::from(*label == active));
     }
+}
+
+/// Record why `on_gossip_data_column` dropped a sidecar. `reason` must be one
+/// of [`DATA_COLUMN_REJECT_REASONS`].
+pub fn inc_data_column_rejected(reason: &'static str) {
+    LEAN_DATA_COLUMNS_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Test-only readback of [`inc_data_column_rejected`]'s counter, mirroring
+/// `ethlambda-p2p`'s own `data_column_fetch_failures_total`: the only way a
+/// test can tell which reason actually fired, rather than merely that the
+/// sidecar was dropped for *some* reason.
+#[cfg(test)]
+pub(crate) fn data_column_rejected_total(reason: &str) -> u64 {
+    LEAN_DATA_COLUMNS_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .get()
+}
+
+/// Increment the sidecars written to the store.
+pub fn inc_data_column_stored() {
+    LEAN_DATA_COLUMNS_STORED_TOTAL.inc();
+}
+
+/// Start timing a sidecar's KZG cell-proof batch. Records duration when the
+/// guard is dropped.
+pub fn time_data_column_kzg_verify() -> TimingGuard {
+    TimingGuard::new(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS)
+}
+
+/// Mirror `blocks_awaiting_columns.len()`: called on both insertion and
+/// removal so the gauge is always exact rather than incremented and
+/// decremented independently of the map it reports on.
+pub fn set_blocks_held_for_columns(count: u64) {
+    LEAN_BLOCKS_HELD_FOR_COLUMNS.set(count as i64);
+}
+
+/// Sidecars currently parked against a parent root with no post-state.
+///
+/// Reads as the queue depth of the recovery path the availability gate depends
+/// on: a follower keeping up sits at zero, a brief non-zero is a late parent,
+/// and a value that climbs and does not come back down means parents are not
+/// arriving at all.
+///
+/// Nothing caps the queue, so this is also the only warning that a peer is
+/// parking sidecars under parents it never intends to supply: each one holds a
+/// `Table::PendingDataColumns` row until finality passes its slot. Worth an
+/// alert at a level an honest late parent never reaches.
+pub fn set_sidecars_awaiting_parent(count: u64) {
+    LEAN_SIDECARS_AWAITING_PARENT.set(count as i64);
 }

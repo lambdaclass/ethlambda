@@ -166,7 +166,9 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
-use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
+use crate::beacon::helpers::misc::{
+    compute_epoch_at_slot, compute_start_slot_at_epoch, is_valid_merkle_branch,
+};
 use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::beacon::kzg;
 use crate::beacon::lean_boundary::lean_block_unreachable;
@@ -640,12 +642,16 @@ pub fn get_forkchoice_store(
     // checkpoint at once, so `init_beacon` seeds all three rows, the same way
     // `init_store` does on a lean directory. That is what lets
     // `update_checkpoints` below read a head to move *from*.
+    // `anchor_state.slot()`, not the checkpoint's: the stored checkpoint is
+    // epoch-denominated, so an anchor taken mid-epoch would record its epoch's
+    // start slot and advertise a floor below anything this directory holds.
     let mut store = Store::init_beacon(
         backend,
         anchor_state.genesis_time(),
         config.clone(),
         anchor_root,
         Store::beacon_checkpoint_as_stored(justified_checkpoint),
+        anchor_state.slot(),
     );
     // The store's row is milliseconds; `time` above is the specification's
     // seconds, computed with its own overflow check just as the specification
@@ -1600,6 +1606,47 @@ pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &fulu::DataColumnSidecar) 
     )
 }
 
+/// Where `blob_kzg_commitments` sits among `BeaconBlockBody`'s fields, as an
+/// index into the leaves of the body's merkle tree.
+///
+/// Fulu's body's field count rounds up to two to the
+/// `KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH`th power leaves, and this is a
+/// position within them rather than a generalized index; the fixture suite
+/// states the generalized index, which is this plus the leaf offset. Nothing
+/// derives it from the container, because nothing here can: SSZ field order is
+/// declaration order, and a field added to the body would move this silently.
+/// `the_commitments_subtree_index_is_the_bodys_own_position` only pins this
+/// constant against the fixture's stated generalized index, so it is a typo
+/// guard, not a schema-change guard: it never touches `BeaconBlockBody`. What
+/// actually catches a field shifting this position is the `merkle_proof`
+/// fixtures' end-to-end check, which decodes a real `BeaconBlockBody`,
+/// recomputes its `hash_tree_root()`, and drives it through
+/// `verify_data_column_sidecar_inclusion_proof`.
+pub const BLOB_KZG_COMMITMENTS_SUBTREE_INDEX: u64 = 11;
+
+/// The specification's `verify_data_column_sidecar_inclusion_proof`
+/// (`specs/fulu/p2p-interface.md`): the commitments a sidecar carries are the
+/// ones the block it names actually committed to.
+///
+/// The third of the sidecar checks, and the one that ties a sidecar to a
+/// block. Without it a peer could pair a valid column with any block header it
+/// liked, and the KZG check would still pass, since that only compares cells
+/// against the commitments in the same sidecar.
+///
+/// Every sidecar of one block proves the same list against the same body root,
+/// so a caller checking many sidecars of one block may cache the result on
+/// `(kzg_commitments, kzg_commitments_inclusion_proof, signed_block_header)`;
+/// the specification says as much. Nothing caches it yet.
+pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSidecar) -> bool {
+    is_valid_merkle_branch(
+        sidecar.kzg_commitments.hash_tree_root(),
+        &sidecar.kzg_commitments_inclusion_proof,
+        preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH as u64,
+        BLOB_KZG_COMMITMENTS_SUBTREE_INDEX,
+        sidecar.signed_block_header.message.body_root,
+    )
+}
+
 /// The specification's `is_data_available` for fulu
 /// (`specs/fulu/fork-choice.md`): every column sidecar sampled for this
 /// block must be individually valid.
@@ -2208,6 +2255,7 @@ mod tests {
             Config::active(),
             root,
             Store::beacon_checkpoint_as_stored(anchor),
+            0,
         )
     }
 
@@ -2630,5 +2678,23 @@ mod tests {
         );
 
         assert!(store.is_err());
+    }
+
+    #[test]
+    fn the_commitments_subtree_index_is_the_bodys_own_position() {
+        // The generalized index the fixture states, minus the offset of a tree
+        // with KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH levels. This only keeps
+        // the constant and the fixture's generalized index from drifting
+        // apart; it never touches BeaconBlockBody, so a field added there
+        // that silently shifts the real position would pass this unchanged.
+        // The merkle_proof fixtures' end-to-end check, which decodes a real
+        // body, recomputes its hash_tree_root(), and drives it through
+        // verify_data_column_sidecar_inclusion_proof, is what catches that.
+        let depth = preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH as u32;
+        assert_eq!(
+            BLOB_KZG_COMMITMENTS_SUBTREE_INDEX + 2u64.pow(depth),
+            27,
+            "the fixture's generalized index for blob_kzg_commitments"
+        );
     }
 }

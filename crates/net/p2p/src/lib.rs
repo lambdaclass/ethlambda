@@ -28,13 +28,15 @@ pub mod muxers {
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    fmt,
     net::{IpAddr, SocketAddr},
+    num::NonZeroU8,
     ops::Range,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ethlambda_network_api::{
-    InitBlockChain, P2PToBlockChainRef,
+    FetchRequest, InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
         FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
     },
@@ -64,9 +66,8 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DISCOVERY_DIAL_INTERVAL, DISCOVERY_STARVED_DIAL_INTERVAL, DiscoveryError,
-        DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_tick, forget_discovered_peer},
+        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
+        dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
@@ -79,7 +80,10 @@ use crate::{
         BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
         STATUS_V1 as STATUS_PROTOCOL_V1,
     },
-    req_resp::{Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request, build_status, fetch_block_from_peer},
+    req_resp::{
+        Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request, build_status, fetch_block_from_peer,
+        fetch_data_columns_from_peer, handlers::columns_custodied_by,
+    },
     swarm_adapter::SwarmHandle,
 };
 
@@ -104,10 +108,79 @@ pub use libp2p::PeerId;
 pub use req_resp::{request_beacon_block_by_root, request_beacon_blocks_by_range};
 
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+//
+// This ladder, not a separate wall-clock budget, is what actually bounds how
+// long a lookup persists: `MAX_FETCH_RETRIES` attempts, each capped by the
+// request-response layer's own per-request timeout, with a doubling backoff
+// between them. A held block is evicted by finality on its own schedule
+// regardless, so the ladder only needs to stay well inside that window, which
+// it comfortably does. A `COLUMN_LOOKUP_MAX_DURATION` used to sit alongside
+// this, copied from Lighthouse without checking it against these timings: it
+// was long enough that the attempts ladder above always ran out first, so it
+// could never fire, while its own doc claimed it was what stopped the asking.
 const MAX_FETCH_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
+
+/// How long an entry in `pending_column_requests` may go without a new request
+/// before a fresh [`FetchRequest`] for that root starts its own lookup
+/// instead of folding into it.
+///
+/// The entry exists to deduplicate: while a lookup is running, a second ask
+/// for the same root merges its columns rather than opening a parallel ladder.
+/// That is only correct while the lookup it defers to is actually alive. An
+/// entry whose round never reported back leaves the root deduplicated against
+/// a lookup that will never ask anything again, and the chain actor's
+/// per-slot re-drive of a held block would then be swallowed silently, which
+/// is precisely the case the re-drive exists for.
+///
+/// Comfortably longer than a full ladder (`MAX_FETCH_RETRIES` attempts whose
+/// backoffs sum to a few seconds, plus each attempt's round trips) and shorter
+/// than a mainnet slot, so a re-drive arriving on the next tick finds either a
+/// live lookup or no entry at all.
+const STALE_COLUMN_LOOKUP: Duration = Duration::from_secs(8);
+
+/// How many peers of unknown custody one `DataColumnsByRange` prefetch may
+/// speculatively ask for the columns no known custodian covers.
+///
+/// A peer's custody is only known once its `metadata/3` answer or its ENR
+/// `cgc` has been recorded, and there is always a handful of connected peers
+/// that have supplied neither. Those are worth asking; peers that *have* told
+/// us what they keep, and do not keep this column, are not. Two rather than
+/// all of them, because a range answer is megabytes when it lands.
+const UNKNOWN_CUSTODY_RANGE_PEERS: usize = 2;
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
+
+/// How many of one peer's addresses a dial attempt starts at once.
+///
+/// One, so that libp2p walks [`dial_addrs`] in order rather than racing it, and
+/// the QUIC address that list puts first is genuinely tried first. Under
+/// libp2p's default factor both transports start together and TCP wins most of
+/// the races, which is not a free choice between two equal wires: a TCP
+/// connection to a mainnet beacon peer negotiates mplex (see [`muxers`]), and
+/// `libp2p_mplex`'s waker bookkeeping was the single largest symbol in a
+/// profile of the mainnet follower, ahead of the whole state transition. QUIC
+/// carries its own multiplexing and reaches none of that code.
+///
+/// The cost is the one the race existed to avoid, now bounded rather than
+/// removed: a peer advertising a `quic` port nothing answers waits out
+/// `libp2p_quic`'s handshake timeout before its `tcp` address is tried. A peer
+/// whose ENR carries no `quic` entry pays nothing, because TCP is then the only
+/// address in the list, and neither does lean, whose records advertise `quic`
+/// alone.
+const DIAL_ADDRESS_CONCURRENCY: NonZeroU8 = NonZeroU8::new(1).expect("1 > 0");
+
+/// How often `seen_data_columns` is pruned down to the finalized boundary.
+///
+/// Its own clock rather than a ride on the discovery tick, which is where it
+/// used to sit. That tick is no longer a steady heartbeat: it is paced by
+/// [`crate::discovery::dial::dial_interval`] and runs as often as
+/// [`crate::discovery::MAX_DIAL_RATE_PER_SECOND`] while the node is short of
+/// peers. Pruning costs a store read plus a scan of the whole set, so
+/// inheriting that cadence would have put both on the p2p actor's single
+/// thread hundreds of times a second, to re-derive a boundary that moves once
+/// an epoch.
+const SEEN_COLUMN_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 
 pub(crate) struct PendingRequest {
@@ -115,9 +188,53 @@ pub(crate) struct PendingRequest {
     pub(crate) failed_peers: HashSet<PeerId>,
 }
 
+/// A block-root fetch's counterpart for a column lookup: the same
+/// attempt/failed-peer bookkeeping [`PendingRequest`] carries, plus what
+/// [`PendingRequest`] never needed to. `columns` is the request body a retry
+/// resends, since (unlike a block-root fetch, whose body is the root already
+/// keying this map) a column request also names which columns.
+pub(crate) struct PendingColumnRequest {
+    pub(crate) columns: Vec<u64>,
+    pub(crate) attempts: u32,
+    pub(crate) failed_peers: HashSet<PeerId>,
+    /// Requests sent for this root and not yet answered or failed.
+    ///
+    /// One attempt now fans out across the peers that custody the columns, so
+    /// a single lookup can have several requests open at once. Without this
+    /// count each of their failures would schedule its own retry, and each
+    /// retry would fan out again: one unanswered lookup against eight
+    /// custodians becomes eight retries, then sixty-four. A retry is scheduled
+    /// only when the last outstanding request of the round reports back, so an
+    /// attempt still costs exactly one retry however wide it was.
+    pub(crate) in_flight: usize,
+    /// When this lookup last put requests on the wire, for
+    /// [`STALE_COLUMN_LOOKUP`] to measure against.
+    pub(crate) last_asked: Instant,
+}
+
 pub(crate) enum PendingRequestKind {
     Root(H256),
-    Range { start_slot: u64, end_slot: u64 },
+    Range {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
+    /// only the root: the columns, attempts and failed-peer set live in
+    /// `pending_column_requests`, keyed the same way, so this is enough to
+    /// route the response and nothing this map needs to duplicate.
+    Columns(H256),
+    /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
+    /// slots the matching `BlocksByRange` asked for.
+    ///
+    /// Carries no per-root bookkeeping, unlike [`Self::Columns`]: this is not
+    /// a lookup for one block's missing columns but a bulk prefetch, so a
+    /// short or empty answer is not a failure to retry. The blocks it is
+    /// paired with arrive on their own request, and any column still missing
+    /// when a block is held still gets the by-root path.
+    ColumnRange {
+        start_slot: u64,
+        end_slot: u64,
+    },
 }
 
 pub(crate) struct RangeSyncState {
@@ -223,6 +340,14 @@ pub struct SwarmConfig {
     pub node_key: Vec<u8>,
     pub bootnodes: Vec<Bootnode>,
     pub listening_socket: SocketAddr,
+    /// How many peers this node is asking for, from
+    /// `--discovery.target-peers`. The same number
+    /// [`DiscoverySpawnConfig::target_peers`] carries to the dial loop, because
+    /// the beacon connection limits are derived from it: what this node refuses
+    /// and what it goes looking for have to be two readings of one number, or a
+    /// reservation the swarm does not keep is one the dial loop chases forever.
+    /// Ignored on lean, which runs [`unlimited_connections`].
+    pub target_peers: usize,
     /// Which network's wire to build. Decides the gossip topics, the req/resp
     /// protocol set, the gossipsub `seen_ttl`, the identify protocol version and
     /// the connection limits, and so decides the [`Wire`] the built swarm
@@ -435,6 +560,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         node_key,
         bootnodes,
         listening_socket,
+        target_peers,
         wire,
     } = config;
 
@@ -468,7 +594,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             beacon::swarm::seen_ttl(&beacon.config),
             beacon::protocols::registrations(),
             beacon::swarm::IDENTIFY_PROTOCOL_VERSION,
-            beacon::swarm::connection_limits(),
+            beacon::swarm::connection_limits(target_peers),
             Codec::beacon(beacon::BeaconContext {
                 config: beacon.config.clone(),
                 genesis_validators_root: beacon.genesis_validators_root,
@@ -518,6 +644,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .with_swarm_config(|c| {
             // Disable idle connection timeout
             c.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+                // Address order is a preference, not a race. See
+                // `DIAL_ADDRESS_CONCURRENCY`.
+                .with_dial_concurrency_factor(DIAL_ADDRESS_CONCURRENCY)
         })
         .build();
     let local_peer_id = *swarm.local_peer_id();
@@ -615,7 +744,18 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             })
         }
         WireConfig::Beacon(beacon) => {
-            let topics = beacon::topics::BeaconTopics::new(beacon.fork_digest);
+            // The custody set is columns, not subnets: a column's subnet is
+            // `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed rather than
+            // assumed so a network that ever separates the two counts still
+            // subscribes to the right topic.
+            let column_subnets: Vec<u64> = beacon
+                .custody_columns
+                .iter()
+                .map(|column| {
+                    column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
+                })
+                .collect();
+            let topics = beacon::topics::BeaconTopics::new(beacon.fork_digest, &column_subnets);
             for topic in &topics.topics {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
                 info!(topic = %topic, "Subscribed to beacon topic");
@@ -625,6 +765,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 socket = %listening_socket,
                 fork_digest = %hex::encode(beacon.fork_digest),
                 topics = topics.topics.len(),
+                columns = beacon.custody_columns.len(),
                 "Beacon P2P node started"
             );
 
@@ -635,6 +776,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 genesis_time: beacon.genesis_time,
                 genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
+                custody_columns: beacon.custody_columns,
             }))
         }
     };
@@ -689,20 +831,28 @@ impl P2P {
             store,
             blockchain: None,
             wire: built.wire,
-            connected_peers: HashSet::new(),
+            connected_peers: HashMap::new(),
+            peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
             beacon_fetched_through,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: DiscoveryState::new(discovery, built.local_peer_id),
+            seen_data_columns: HashSet::new(),
         };
         let handle = server.start();
         send_after(
-            DISCOVERY_DIAL_INTERVAL,
+            DIAL_INTERVAL_AT_ZERO_PEERS,
             handle.context(),
             p2p_protocol::DiscoverPeers,
+        );
+        send_after(
+            SEEN_COLUMN_PRUNE_INTERVAL,
+            handle.context(),
+            p2p_protocol::PruneSeenColumns,
         );
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
@@ -730,8 +880,36 @@ pub struct P2PServer {
 
     pub(crate) wire: Wire,
 
-    pub(crate) connected_peers: HashSet<PeerId>,
+    /// Every peer holding at least one established connection, and which side
+    /// opened the first one.
+    ///
+    /// Keyed by peer rather than connection: a peer may hold up to
+    /// [`beacon::swarm::MAX_CONNECTIONS_PER_PEER`] of them, and every consumer
+    /// here asks "can I talk to this peer", not "over how many sockets". The
+    /// direction is the first connection's, which is the one that decides
+    /// whether this peer was our choice or the network's.
+    pub(crate) connected_peers: HashMap<PeerId, ConnectionDirection>,
+    /// The columns each peer custodies, as computed from its own node id and
+    /// its advertised custody group count.
+    ///
+    /// Deterministic on both sides, which is the whole point: the spec notes
+    /// that "due to the deterministic custody functions, a node knows exactly
+    /// what a peer should be able to respond to", so a column request can be
+    /// aimed at a peer that actually holds it instead of scattered at random.
+    /// At mainnet's `CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so
+    /// asking an arbitrary one for a specific column nearly always comes back
+    /// empty.
+    ///
+    /// Absent for any peer that has not answered `metadata/3` and arrived with
+    /// no usable `cgc`; [`columns_custodied_by`] treats absent as "no opinion",
+    /// never as "custodies nothing".
+    pub(crate) peer_custody: HashMap<PeerId, Vec<u64>>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
+    /// One entry per block root with an in-flight or backed-off
+    /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
+    /// the block path: `fetch_missing_columns` dedupes against it, and
+    /// `handle_column_fetch_failure` is the only place an entry is retired.
+    pub(crate) pending_column_requests: HashMap<H256, PendingColumnRequest>,
     pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
@@ -742,6 +920,17 @@ pub struct P2PServer {
     node_names: HashMap<PeerId, String>,
 
     pub(crate) discovery: DiscoveryState,
+
+    /// The (slot, proposer, column) tuples already forwarded this session.
+    ///
+    /// Bounded two ways: `handle_beacon_data_column`'s own clock-disparity
+    /// check keeps a tuple naming a fabricated far-future slot from ever
+    /// being inserted (finality will never reach such a slot, so pruning
+    /// alone could never reclaim it), and `prune_seen_data_columns` drops
+    /// every entry at or below the finalized slot once real finality does
+    /// reach it. Not a TTL: the gossip rule is per block, and a block below
+    /// finality can no longer produce a sidecar worth forwarding.
+    pub(crate) seen_data_columns: HashSet<(u64, u64, u64)>,
 }
 
 impl P2PServer {
@@ -750,6 +939,79 @@ impl P2PServer {
             .and_then(|p| self.node_names.get(p))
             .map(String::as_str)
             .unwrap_or("unknown")
+    }
+
+    /// Republish the peer gauges from the state that actually decides them.
+    ///
+    /// Set from a full re-count rather than incremented and decremented per
+    /// event, because a gauge kept by arithmetic is only ever as right as the
+    /// least reliable event that touches it: one missed decrement and it is
+    /// wrong until restart, in the direction that hides a problem. These are
+    /// the gauges used to tell whether connections leak, so they must not be
+    /// able to leak themselves.
+    ///
+    /// Cheap enough to call on every connect and disconnect: the work is
+    /// proportional to the peer count, which is bounded by
+    /// [`beacon::swarm::max_connections`]. The swarm's own connection counters
+    /// are the other half of the leak question, and the swarm lives in
+    /// [`swarm_adapter`]'s task rather than here, so those are published from
+    /// its metric tick instead.
+    pub(crate) fn refresh_peer_metrics(&self) {
+        let (mut inbound, mut outbound) = (0, 0);
+        for direction in self.connected_peers.values() {
+            match direction {
+                ConnectionDirection::Inbound => inbound += 1,
+                ConnectionDirection::Outbound => outbound += 1,
+            }
+        }
+        metrics::set_peers_by_direction(inbound, outbound);
+        self.refresh_custody_column_metrics();
+    }
+
+    /// Publish, per column this node samples, how many connected peers are
+    /// known to custody it.
+    ///
+    /// This is the supply side of the data-availability gate: a block is held
+    /// until every sampled column arrives, so a column sitting at zero peers is
+    /// a stall waiting to happen, and it is invisible in a total peer count.
+    ///
+    /// Only the columns this node samples get a series. Publishing all 128
+    /// would bury the eight that can actually block an import, and the custody
+    /// set is fixed for the life of the node, so the label set is stable.
+    ///
+    /// Counted through [`columns_custodied_by`], the same answer the fetch path
+    /// picks its peers with, so the gauge cannot say a column has custodians
+    /// that a lookup for it would not find.
+    ///
+    /// Called from every writer of either input, which is both ends of a
+    /// connection and [`req_resp::handlers::record_peer_custody`]. The last of
+    /// those is the one that matters: a peer's custody arrives with its
+    /// `metadata/3` answer, *after* it connects, so a gauge refreshed on
+    /// connection events alone would read every column at the zero it had
+    /// before the peer said anything — which is the exact reading this gauge
+    /// was added to mean "a stall waiting to happen".
+    pub(crate) fn refresh_custody_column_metrics(&self) {
+        let Some(wire) = self.wire.beacon() else {
+            return;
+        };
+        for column in wire.custody_columns.iter().copied() {
+            metrics::set_custody_column_peers(column, columns_custodied_by(self, column).len());
+        }
+    }
+
+    /// Drop every `seen_data_columns` entry at or below the finalized slot.
+    ///
+    /// Called on [`SEEN_COLUMN_PRUNE_INTERVAL`], regardless of peer churn: a stable, well-connected node might open no
+    /// new connections for a long time, and the set must not depend on how
+    /// often peers happen to churn to actually shrink.
+    pub(crate) fn prune_seen_data_columns(&mut self) {
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+        self.seen_data_columns
+            .retain(|&(slot, _, _)| slot > finalized_slot);
     }
 }
 
@@ -760,9 +1022,13 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn prune_seen_columns(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -789,6 +1055,29 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_retry_data_column_fetch(
+        &mut self,
+        msg: p2p_protocol::RetryDataColumnFetch,
+        _ctx: &Context<Self>,
+    ) {
+        let block_root = msg.block_root;
+        // Same "might have completed during backoff" guard as
+        // `handle_retry_block_fetch`, and the same reason for it: the reissued
+        // request must ask for what is still missing, which
+        // `pending_column_requests` is the only place that remembers.
+        let Some(pending) = self.pending_column_requests.get(&block_root) else {
+            trace!(%block_root, "Data column fetch completed during backoff, skipping retry");
+            return;
+        };
+        let columns = pending.columns.clone();
+
+        if !fetch_data_columns_from_peer(self, block_root, columns).await {
+            tracing::error!(%block_root, "Failed to retry data column fetch, giving up");
+            self.pending_column_requests.remove(&block_root);
+        }
+    }
+
+    #[send_handler]
     async fn handle_retry_peer_redial(
         &mut self,
         msg: p2p_protocol::RetryPeerRedial,
@@ -797,7 +1086,7 @@ impl P2PServer {
         let peer_id = msg.peer_id;
 
         // Skip if already reconnected
-        if self.connected_peers.contains(&peer_id) {
+        if self.connected_peers.contains_key(&peer_id) {
             trace!(%peer_id, "Bootnode reconnected during redial delay, skipping");
             return;
         }
@@ -815,17 +1104,38 @@ impl P2PServer {
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        // Reschedule first, so an early return never stops the loop. A node
-        // with no peers retries on the shorter interval: see
-        // `DISCOVERY_STARVED_DIAL_INTERVAL` for why zero peers is a failure to
-        // work through rather than a state to wait out.
-        let interval = if self.connected_peers.is_empty() {
-            DISCOVERY_STARVED_DIAL_INTERVAL
+        let dialed = dial_tick(self).await;
+        // Rescheduled on every path out of the tick, so nothing above can stop
+        // the loop. The gap is a function of how full the peer table is rather
+        // than a flat heartbeat: near `MAX_DIAL_RATE_PER_SECOND` while short of
+        // peers, easing off as they arrive. See `dial::dial_interval`.
+        //
+        // Unless the tick dialed nothing, which the curve cannot tell on its
+        // own: it reads a shortfall against `target_peers`, and a network with
+        // fewer peers than that to offer leaves that shortfall open forever.
+        // Pacing on it alone would hold the loop at its floor for the life of
+        // the process, re-drawing a candidate pool of peers it is already
+        // connected to. One dial opened puts it straight back on the curve.
+        let interval = if dialed {
+            dial_interval(dial_progress(self))
         } else {
-            DISCOVERY_DIAL_INTERVAL
+            DIAL_INTERVAL_AT_TARGET
         };
         send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
-        dial_tick(self).await;
+    }
+
+    #[send_handler]
+    async fn handle_prune_seen_columns(
+        &mut self,
+        _msg: p2p_protocol::PruneSeenColumns,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            SEEN_COLUMN_PRUNE_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::PruneSeenColumns,
+        );
+        self.prune_seen_data_columns();
     }
 }
 
@@ -858,14 +1168,74 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
 
 impl Handler<FetchBlock> for P2PServer {
     async fn handle(&mut self, msg: FetchBlock, _ctx: &Context<Self>) {
-        let root = msg.root;
-        // Deduplicate - if already pending, ignore
-        if self.pending_root_requests.contains_key(&root) {
-            trace!(%root, "Block fetch already in progress, ignoring duplicate");
+        fetch_missing(self, msg.request).await;
+    }
+}
+
+/// Ask for whatever a [`FetchRequest`] says is missing.
+///
+/// Both halves are by-root lookups with their own dedup and retry ladder, and
+/// a request may name either or both. There is no by-range arm here: a caller
+/// on the chain side has a root, not a span, and the span worth asking for is
+/// the one this crate is already syncing, so
+/// [`req_resp::request_beacon_data_columns_by_range`] rides every
+/// `BeaconBlocksByRange` batch instead of waiting to be asked.
+async fn fetch_missing(server: &mut P2PServer, request: FetchRequest) {
+    let FetchRequest {
+        block_root,
+        needs_block,
+        columns,
+    } = request;
+    if needs_block {
+        fetch_missing_block(server, block_root).await;
+    }
+    if !columns.is_empty() {
+        fetch_missing_columns(server, block_root, columns).await;
+    }
+}
+
+/// The by-root block half of a [`FetchRequest`].
+async fn fetch_missing_block(server: &mut P2PServer, root: H256) {
+    // Deduplicate - if already pending, ignore
+    if server.pending_root_requests.contains_key(&root) {
+        trace!(%root, "Block fetch already in progress, ignoring duplicate");
+        return;
+    }
+    fetch_block_from_peer(server, root).await;
+}
+
+/// The by-root column half of a [`FetchRequest`].
+async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns: Vec<u64>) {
+    // Same one-lookup-per-root rule as the block half, but merged rather
+    // than dropped: the availability gate may re-ask for a root already
+    // in flight with a wider column set than the first ask named, as
+    // columns trickle in, and dropping the difference would rest on an
+    // unenforced invariant that a re-ask is always a subset of what is
+    // already pending. A column added this way misses the request
+    // already on the wire, which cannot be widened after it was sent;
+    // it rides the next event for this root instead — a retry of this
+    // lookup, which resends whatever `columns` now holds, or, once this
+    // lookup resolves and the entry is gone, a fresh `FetchRequest`
+    // from a caller that rechecks what is still missing.
+    //
+    // "In flight" has to mean it, though: an entry whose round never
+    // reported back would otherwise deduplicate this root against a lookup
+    // that will never ask anything again. Past `STALE_COLUMN_LOOKUP` the
+    // entry is dropped and this ask starts a lookup of its own.
+    if let Some(pending) = server.pending_column_requests.get_mut(&block_root) {
+        if pending.last_asked.elapsed() < STALE_COLUMN_LOOKUP {
+            for column in columns {
+                if !pending.columns.contains(&column) {
+                    trace!(%block_root, column, "Merging a new column into an in-flight data column fetch");
+                    pending.columns.push(column);
+                }
+            }
             return;
         }
-        fetch_block_from_peer(self, root).await;
+        debug!(%block_root, "Replacing a data column lookup that stopped asking");
+        server.pending_column_requests.remove(&block_root);
     }
+    fetch_data_columns_from_peer(server, block_root, columns).await;
 }
 
 // --- Manual Handler for swarm events ---
@@ -897,20 +1267,21 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
-            let direction = connection_direction(&endpoint);
+            let direction = ConnectionDirection::from(&endpoint);
             // Read off the connection's own address rather than which one we
             // dialed: with both QUIC and TCP offered, libp2p races every
             // address in a dial and may connect over either. This is what
             // answers "did the TCP fallback actually help", as a metric because
             // the trace field alone is invisible at default verbosity.
             let transport = transport_label(endpoint.get_remote_address());
-            metrics::inc_peer_connection_transport(direction, transport);
+            metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
-                server.connected_peers.insert(peer_id);
+                server.connected_peers.insert(peer_id, direction);
+                server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
                     server.resolve_node_name(Some(&peer_id)),
-                    direction,
+                    direction.as_str(),
                     "success",
                 );
                 // Compute the beacon status and its log fields first, so no
@@ -936,6 +1307,10 @@ async fn handle_swarm_event(
                             "Peer connected"
                         );
                         beacon::handler::send_status(server, peer_id, status).await;
+                        // Behind the handshake rather than in place of it: this
+                        // is what tells us which columns the peer custodies, and
+                        // an inbound peer has no ENR here to read a `cgc` from.
+                        beacon::handler::request_metadata(server, peer_id).await;
                     }
                     None => {
                         let our_status = build_status(&server.store);
@@ -971,7 +1346,7 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
-            let direction = connection_direction(&endpoint);
+            let closed_direction = ConnectionDirection::from(&endpoint);
             let reason = match cause {
                 None => "remote_close",
                 Some(err) => {
@@ -990,12 +1365,23 @@ async fn handle_swarm_event(
                 }
             };
             if num_established == 0 {
-                server.connected_peers.remove(&peer_id);
+                // Report the direction this peer was *counted* under, not the
+                // one the last socket happened to carry. A peer may hold both
+                // an inbound and an outbound connection, and whichever closes
+                // last decides `closed_direction`; attributing the disconnect
+                // to that would let the per-direction connect and disconnect
+                // counters drift apart, and those counters are exactly what a
+                // "peers held" figure gets derived from.
+                let direction = server
+                    .connected_peers
+                    .remove(&peer_id)
+                    .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
+                server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
                     server.resolve_node_name(Some(&peer_id)),
-                    direction,
+                    direction.as_str(),
                     reason,
                 );
 
@@ -1017,7 +1403,7 @@ async fn handle_swarm_event(
                     trace!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
                 }
             } else {
-                trace!(%peer_id, %direction, %reason, "Peer connection closed but other connections remain");
+                trace!(%peer_id, direction = %closed_direction, %reason, "Peer connection closed but other connections remain");
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1041,13 +1427,13 @@ async fn handle_swarm_event(
                 // fail here (the bootnode redial path is one way), and dropping
                 // a live peer's `attnets` would make `covered_subnets`
                 // under-count subnets we do in fact cover.
-                if !server.connected_peers.contains(&pid) {
+                if !server.connected_peers.contains_key(&pid) {
                     forget_discovered_peer(server, &pid);
                 }
 
                 // Schedule redial if this was a bootnode
                 if server.bootnode_addrs.contains_key(&pid)
-                    && !server.connected_peers.contains(&pid)
+                    && !server.connected_peers.contains_key(&pid)
                 {
                     send_after(
                         Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
@@ -1260,12 +1646,13 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 /// Empty when neither is, which is a discv5-only seed: it can still answer
 /// FINDNODE, but there is nothing for the swarm to dial.
 ///
-/// The order is not a preference. libp2p pushes up to `dial_concurrency_factor`
-/// of these into one `FuturesUnordered` and takes whichever handshake finishes
-/// first; the default factor is larger than this list can ever be, so both
-/// transports are always attempted and the position here decides nothing. That
-/// race is the point: a peer advertising a `quic` port nothing answers still
-/// connects over `tcp` without waiting out a connect timeout first.
+/// The order *is* the preference, and `quic` leads it. libp2p starts
+/// `dial_concurrency_factor` of these at a time, which
+/// [`DIAL_ADDRESS_CONCURRENCY`] pins to one, so a peer's `tcp` address is
+/// reached only once the QUIC attempt ahead of it has failed. Under the default
+/// factor both went into one `FuturesUnordered` and the faster handshake won,
+/// which sounds neutral and is not: TCP won most of those races and every win
+/// was another mplex connection.
 ///
 /// Shared by both dial paths, so a change to what counts as dialable cannot
 /// apply to static bootnodes and discovered peers differently: static bootnodes
@@ -1372,11 +1759,50 @@ pub(crate) fn tcp_multiaddr(ip: IpAddr, tcp_port: u16, peer_id: PeerId) -> Multi
         .expect("a freshly built multiaddr carries no p2p component")
 }
 
-fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
-    if endpoint.is_dialer() {
-        "outbound"
-    } else {
-        "inbound"
+/// Which side opened a connection.
+///
+/// Carried per peer rather than derived where needed, because the two are not
+/// interchangeable and only one of them is ours to choose. Inbound supply on
+/// mainnet is effectively unbounded and arrives with no say in who it is; an
+/// outbound peer is one this node picked, which is the only lever it has on its
+/// own custody-column coverage. Mixing the two into a single count is what lets
+/// inbound demand quietly crowd the dial loop out of its own reservation, so the
+/// direction is kept alongside the peer. See
+/// [`beacon::swarm::connection_limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConnectionDirection {
+    /// The remote dialed us.
+    Inbound,
+    /// We dialed the remote.
+    Outbound,
+}
+
+impl ConnectionDirection {
+    /// The label this direction carries in metrics and logs.
+    ///
+    /// The two strings are leanMetrics-specified label values on
+    /// `lean_peer_connection_events_total`, so they are fixed, not cosmetic.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&libp2p::core::ConnectedPoint> for ConnectionDirection {
+    fn from(endpoint: &libp2p::core::ConnectedPoint) -> Self {
+        if endpoint.is_dialer() {
+            Self::Outbound
+        } else {
+            Self::Inbound
+        }
     }
 }
 
@@ -1444,6 +1870,7 @@ mod tests {
                 node_key: vec![node_key_byte; 32],
                 bootnodes: Vec::new(),
                 listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
                 wire: WireConfig::Lean(LeanWireConfig {
                     validator_ids: Vec::new(),
                     attestation_committee_count: 1,
@@ -1564,6 +1991,7 @@ mod tests {
             node_key: vec![7u8; 32],
             bootnodes,
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
             wire: WireConfig::Lean(LeanWireConfig {
                 validator_ids: Vec::new(),
                 attestation_committee_count: 1,
@@ -1900,6 +2328,28 @@ mod tests {
         assert_eq!(bootnodes[1].tcp_port, None);
         let seed_only = PeerId::from_public_key(&bootnodes[1].public_key);
         assert!(bootnode_dial_addrs(&bootnodes[1], seed_only).is_empty());
+    }
+
+    #[test]
+    fn a_peer_advertising_both_transports_is_dialed_over_quic_first() {
+        // Position in this list used to decide nothing, because libp2p raced
+        // every address at once. `DIAL_ADDRESS_CONCURRENCY` made it decide
+        // which transport the peer is reached over whenever it answers on
+        // both, so the order is asserted rather than left to read like
+        // incidental construction order.
+        let peer_id = random_peer();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        let addrs = dial_addrs(ip, Some(9000), Some(9001), peer_id);
+
+        assert_eq!(
+            addrs,
+            vec![
+                quic_multiaddr(ip, 9000, peer_id),
+                tcp_multiaddr(ip, 9001, peer_id),
+            ],
+            "quic has to come first, or the reservation is the wrong way round"
+        );
     }
 
     #[test]

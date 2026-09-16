@@ -15,7 +15,7 @@
 //! So the dial loop filters nothing: every contact it draws has already passed,
 //! and all it does is turn the record into something dialable
 //! ([`LeanFilter::dial_target`]) and rank what it got
-//! ([`rank_by_uncovered_subnets`]).
+//! ([`rank_candidates`]).
 
 use std::collections::HashSet;
 
@@ -25,9 +25,12 @@ use libp2p::{Multiaddr, PeerId};
 use libssz::SszDecode;
 use tracing::debug;
 
+use ethlambda_state_transition::beacon::das;
+use ethlambda_types::beacon::constants;
+
 use super::enr::{
-    ATTNETS_ENR_KEY, ETH2_ENR_KEY, EnrForkId, read_ip, read_public_key, read_quic_port,
-    read_tcp_port, subnets_from_attnets,
+    ATTNETS_ENR_KEY, CGC_ENR_KEY, ETH2_ENR_KEY, EnrForkId, node_id_from_peer_id, read_ip,
+    read_public_key, read_quic_port, read_tcp_port, subnets_from_attnets,
 };
 use crate::dial_addrs;
 
@@ -41,6 +44,14 @@ pub(crate) struct DiscoveredPeer {
     pub(crate) addrs: Vec<Multiaddr>,
     /// Attestation subnets the peer advertises in `attnets`.
     pub(crate) subnets: Vec<u64>,
+    /// The `cgc` entry the peer advertises, if any and if in range.
+    ///
+    /// A discovery-time hint, not the authority: the record may predate the
+    /// peer's current count, and a peer reached inbound never produces one at
+    /// all. `metadata/3` is what settles it (see
+    /// `P2PServer::record_peer_custody`), and this only fills the gap until
+    /// that answer arrives. Lighthouse splits the two the same way.
+    pub(crate) custody_group_count: Option<u64>,
 }
 
 /// Why a discovered peer was turned away.
@@ -168,27 +179,83 @@ fn admit(
         .map(|bits| subnets_from_attnets(&bits, attestation_committee_count))
         .unwrap_or_default();
 
+    // Out-of-range counts are discarded rather than clamped: a count outside
+    // `CUSTODY_REQUIREMENT..=NUMBER_OF_CUSTODY_GROUPS` describes no custody
+    // set the specification defines, and guessing one would send requests to a
+    // peer that never agreed to hold those columns. Unknown is the honest
+    // answer, and the caller already handles it. Same range check lighthouse's
+    // `Enr::custody_group_count` applies.
+    let custody_group_count = pairs.extra_int::<u64>(CGC_ENR_KEY).filter(|count| {
+        (constants::CUSTODY_REQUIREMENT..=constants::NUMBER_OF_CUSTODY_GROUPS).contains(count)
+    });
+
     Ok(DiscoveredPeer {
         peer_id,
         addrs: dial_addrs(ip, quic_port, tcp_port, peer_id),
         subnets,
+        custody_group_count,
     })
 }
 
-/// Order candidates so those covering the most currently-uncovered attestation
-/// subnets are dialed first.
+impl DiscoveredPeer {
+    /// How many of `wanted` this record's advertised `custody_group_count`
+    /// puts it in custody of.
+    ///
+    /// Zero for a record carrying no `cgc`, and zero for one whose peer id the
+    /// node id cannot be recovered from: an unknown custody set covers
+    /// nothing, which is the same way an unknown `attnets` is treated.
+    fn custody_coverage(&self, wanted: &HashSet<u64>) -> usize {
+        let Some(count) = self.custody_group_count else {
+            return 0;
+        };
+        let Some(node_id) = node_id_from_peer_id(&self.peer_id) else {
+            return 0;
+        };
+        let Ok(columns) = das::custody_columns(node_id, count) else {
+            return 0;
+        };
+        columns
+            .iter()
+            .filter(|column| wanted.contains(column))
+            .count()
+    }
+}
+
+/// Order candidates so the ones filling this node's gaps are dialed first:
+/// custody columns it samples and no connected peer holds, then attestation
+/// subnets no connected peer covers.
 ///
-/// A candidate advertising no subnets scores zero and sorts last, but is never
-/// dropped: with few peers, any peer is better than none.
-pub(crate) fn rank_by_uncovered_subnets(candidates: &mut [DiscoveredPeer], covered: &HashSet<u64>) {
+/// Custody outranks subnets because the two shortfalls do not cost the same. A
+/// column no connected peer custodies cannot be fetched by root at all, since
+/// every peer answers `DataColumnsByRoot` for a column it does not hold with
+/// an empty list, and the availability gate then stops the chain on the first
+/// block that needs it. An uncovered attestation subnet only narrows what this
+/// node sees of the mesh. The ordering also puts a supernode, which custodies
+/// every column, ahead of everything else while any column is uncovered, which
+/// is the fastest way out of that state.
+///
+/// A candidate advertising neither scores zero on both and sorts last, but is
+/// never dropped: with few peers, any peer is better than none.
+pub(crate) fn rank_candidates(
+    candidates: &mut [DiscoveredPeer],
+    covered_subnets: &HashSet<u64>,
+    wanted_columns: &HashSet<u64>,
+) {
     candidates.sort_by_key(|candidate| {
-        std::cmp::Reverse(
-            candidate
-                .subnets
-                .iter()
-                .filter(|subnet| !covered.contains(subnet))
-                .count(),
-        )
+        // Skipped rather than computed and discarded when nothing is wanted,
+        // which is every lean node and every beacon node whose peers already
+        // cover it: `custody_coverage` runs the custody shuffle per candidate.
+        let columns = if wanted_columns.is_empty() {
+            0
+        } else {
+            candidate.custody_coverage(wanted_columns)
+        };
+        let subnets = candidate
+            .subnets
+            .iter()
+            .filter(|subnet| !covered_subnets.contains(subnet))
+            .count();
+        (std::cmp::Reverse(columns), std::cmp::Reverse(subnets))
     });
 }
 
@@ -278,6 +345,7 @@ mod tests {
                 peer_id: PeerId::random(),
                 addrs: vec![Multiaddr::empty()],
                 subnets,
+                custody_group_count: None,
             }
         }
     }
@@ -542,7 +610,7 @@ mod tests {
             "no admitted peer may advertise a subnet outside the local committee"
         );
 
-        rank_by_uncovered_subnets(&mut admitted, &HashSet::new());
+        rank_candidates(&mut admitted, &HashSet::new(), &HashSet::new());
         assert_eq!(
             admitted[0].subnets,
             vec![3],
@@ -559,9 +627,59 @@ mod tests {
             DiscoveredPeer::for_test(vec![2]),
             DiscoveredPeer::for_test(vec![2, 3]),
         ];
-        rank_by_uncovered_subnets(&mut candidates, &HashSet::from([0u64, 1]));
+        rank_candidates(&mut candidates, &HashSet::from([0u64, 1]), &HashSet::new());
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(order, vec![vec![2, 3], vec![2], vec![0]]);
+    }
+
+    /// A candidate whose peer id is a real secp256k1 key, so the node id
+    /// behind it can be recovered and its custody set computed. `PeerId::random`
+    /// is not that: it is an arbitrary multihash, which is exactly the case
+    /// `custody_coverage` scores as covering nothing.
+    fn custodian(custody_group_count: u64) -> DiscoveredPeer {
+        let secret = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let keypair = libp2p::identity::secp256k1::SecretKey::try_from_bytes(
+            &mut secret.secret_bytes().clone(),
+        )
+        .map(libp2p::identity::secp256k1::Keypair::from)
+        .expect("a valid key");
+        DiscoveredPeer {
+            peer_id: libp2p::identity::Keypair::from(keypair)
+                .public()
+                .to_peer_id(),
+            addrs: vec![Multiaddr::empty()],
+            subnets: vec![],
+            custody_group_count: Some(custody_group_count),
+        }
+    }
+
+    #[test]
+    fn a_peer_custodying_a_wanted_column_outranks_a_better_connected_one() {
+        // A supernode custodies every column, so it covers whatever is wanted.
+        let supernode = custodian(constants::NUMBER_OF_CUSTODY_GROUPS);
+        let well_subnetted = DiscoveredPeer::for_test(vec![0, 1, 2, 3]);
+
+        let mut candidates = vec![well_subnetted.clone(), supernode.clone()];
+        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::from([97u64]));
+        assert_eq!(
+            candidates[0].peer_id, supernode.peer_id,
+            "a column no peer holds stops the chain; an uncovered subnet only narrows the view"
+        );
+
+        // With every column covered, subnet coverage decides again.
+        let mut candidates = vec![supernode.clone(), well_subnetted.clone()];
+        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
+        assert_eq!(candidates[0].peer_id, well_subnetted.peer_id);
+    }
+
+    #[test]
+    fn a_peer_that_named_no_custody_count_is_never_credited_with_a_column() {
+        // The ENR carried no `cgc`, so nothing is known about what this peer
+        // keeps. Guessing would aim lookups at a peer that answers empty.
+        let mut unknown = custodian(constants::NUMBER_OF_CUSTODY_GROUPS);
+        unknown.custody_group_count = None;
+
+        assert_eq!(unknown.custody_coverage(&HashSet::from([97u64])), 0);
     }
 
     #[test]
@@ -570,7 +688,7 @@ mod tests {
             DiscoveredPeer::for_test(vec![]),
             DiscoveredPeer::for_test(vec![7]),
         ];
-        rank_by_uncovered_subnets(&mut candidates, &HashSet::new());
+        rank_candidates(&mut candidates, &HashSet::new(), &HashSet::new());
         let order: Vec<_> = candidates.iter().map(|c| c.subnets.clone()).collect();
         assert_eq!(
             order,

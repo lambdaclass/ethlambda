@@ -97,8 +97,28 @@ from a normal build.
 
 ## `beacon` flags
 
-None of its own: every flag this chain takes is a common one. Two of them mean
-something specific here.
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | How many custody groups this node custodies, advertised as the ENR's `cgc` |
+
+Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
+128), enforced at parse time rather than clamped: serving a different set than
+the operator asked for is the failure hardest to notice.
+
+**It is not the number of columns custodied.** That is `sampling_size`, the
+larger of this and `SAMPLES_PER_SLOT`, so the default still custodies 8 columns
+and the two only converge once the flag is raised past 8. A node at 128 is a
+supernode, custodying every column; raising the value costs storage and
+bandwidth in proportion and makes this node useful to more peers, which on a
+network where a `cgc=4` peer holds 4 of 128 columns is what decides whether a
+lookup finds a custodian at all.
+
+Changing it changes which columns this node custodies, since the custody set is
+a function of the node id *and* the count. Sidecars already on disk belong to
+the old set: nothing is corrupted, but the node advertises a set it has not
+finished filling until it backfills the difference.
+
+Two common flags also mean something specific here.
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,

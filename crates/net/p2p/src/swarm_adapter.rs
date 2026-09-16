@@ -215,6 +215,20 @@ async fn swarm_loop(
                     swarm.behaviour().gossipsub.all_mesh_peers(),
                     &node_names,
                 );
+                // Published from here because this task owns the swarm, and on
+                // a timer rather than per connection event so the figure cannot
+                // drift when an event is missed: these are the counters the
+                // connection limits are actually enforced against, so they are
+                // worth reading from the source on a schedule rather than
+                // reconstructing. Compared against `lean_peers_by_direction`, a
+                // persistent gap is a connection charged to the cap that no
+                // live peer is using.
+                let info = swarm.network_info();
+                let counters = info.connection_counters();
+                metrics::set_swarm_established_connections(
+                    counters.num_established_incoming(),
+                    counters.num_established_outgoing(),
+                );
             }
         }
     }
