@@ -72,7 +72,7 @@ pub struct TestSignedBlock {
 /// Merged multi-message aggregate proof container for `SignedBlock.proof`
 /// (leanSpec PR #799).
 ///
-/// The multi-signature container nests the raw lean-multisig wire one level
+/// The multi-signature container nests the raw leanVM wire one level
 /// deep: `{ "proof": { "data": "0x..." } }`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -136,7 +136,7 @@ impl TestSignedBlock {
     /// Materialize a `SignedBlock` preserving the fixture-supplied merged
     /// multi-message aggregate proof bytes verbatim.
     ///
-    /// The container carries the raw lean-multisig wire in the
+    /// The container carries the raw leanVM wire in the
     /// `MultiMessageAggregate` stored by `SignedBlock.proof`.
     ///
     /// NOTE: these fixtures use the leanSpec #799 layout (proposer folded into

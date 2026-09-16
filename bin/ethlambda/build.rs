@@ -6,7 +6,7 @@ use vergen_git2::{Emitter, Git2Builder, RustcBuilder};
 /// leanVM owns the whole crypto stack (it internalized XMSS), and every crate
 /// ethlambda takes from it resolves to one revision, so this single pin
 /// identifies the crypto the binary was built against.
-const LEANVM_PACKAGE: &str = "lean-multisig";
+const LEANVM_PACKAGE: &str = "leanvm";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let git2 = Git2Builder::default().branch(true).sha(true).build()?;

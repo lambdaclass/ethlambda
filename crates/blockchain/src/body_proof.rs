@@ -16,14 +16,15 @@
 
 use std::collections::{HashSet, VecDeque};
 
+use ethlambda_crypto::SignerSet;
 use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_state_transition::attestation_data_matches_chain;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     attestation::validator_indices,
     block::{
-        Block, BlockBody, BlockBodyProof, ByteList512KiB, MultiMessageAggregate,
-        MultiMessageAggregateError, SingleMessageAggregate,
+        AggregatedAttestations, Block, BlockBody, BlockBodyProof, ByteList512KiB,
+        MultiMessageAggregate, MultiMessageAggregateError, SingleMessageAggregate,
     },
     primitives::{H256, HashTreeRoot as _},
     state::{State, Validator},
@@ -81,7 +82,7 @@ pub(crate) fn build_body_proof(
         return None;
     }
 
-    let proof = merge_attestation_aggregates(&head_state.validators, &aggregates)
+    let proof = merge_attestation_aggregates(&head_state.validators, &attestations, &aggregates)
         .inspect_err(|err| warn!(%slot, %err, "Failed to build a body proof aggregate"))
         .ok()?;
 
@@ -99,12 +100,23 @@ pub(crate) fn build_body_proof(
 /// what lets this run before the block exists.
 fn merge_attestation_aggregates(
     validators: &[Validator],
+    attestations: &AggregatedAttestations,
     aggregates: &[SingleMessageAggregate],
 ) -> Result<MultiMessageAggregate, BodyProofError> {
-    let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-        Vec::with_capacity(aggregates.len());
+    // `select_and_compact` returns the two lists in the same order, so index i
+    // of each names one claim. Checked rather than assumed: zipping lists of
+    // different lengths would bind the proof to fewer claims than the body
+    // declares, which only surfaces at import.
+    if attestations.len() != aggregates.len() {
+        return Err(BodyProofError::AggregateCountMismatch {
+            aggregates: aggregates.len(),
+            attestations: attestations.len(),
+        });
+    }
 
-    for aggregate in aggregates {
+    let mut merge_inputs: Vec<(SignerSet, ByteList512KiB)> = Vec::with_capacity(aggregates.len());
+
+    for (attestation, aggregate) in attestations.iter().zip(aggregates) {
         let mut pubkeys = Vec::new();
         for vid in aggregate.participant_indices() {
             let validator = validators
@@ -114,7 +126,10 @@ fn merge_attestation_aggregates(
                 .map_err(|_| BodyProofError::PubkeyDecoding(vid))?;
             pubkeys.push(pubkey);
         }
-        merge_inputs.push((pubkeys, aggregate.proof.clone()));
+        let slot = u32::try_from(attestation.data.slot)
+            .map_err(|_| BodyProofError::SlotOutOfRange(attestation.data.slot))?;
+        let claim = SignerSet::new(attestation.data.hash_tree_root(), slot, pubkeys);
+        merge_inputs.push((claim, aggregate.proof.clone()));
     }
 
     let merged = ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs)
@@ -131,6 +146,13 @@ pub(crate) enum BodyProofError {
     ParticipantOutOfRange(u64),
     #[error("could not decode the attestation pubkey of validator {0}")]
     PubkeyDecoding(u64),
+    #[error("attestation slot {0} does not fit the XMSS epoch width")]
+    SlotOutOfRange(u64),
+    #[error("proof list holds {aggregates} entries but the body declares {attestations}")]
+    AggregateCountMismatch {
+        aggregates: usize,
+        attestations: usize,
+    },
     #[error("could not merge the attestation Type-1s into a Type-2: {0}")]
     Merge(String),
     #[error("merged attestation proof does not fit the block proof: {0}")]
@@ -380,9 +402,7 @@ fn verify_body_proof(head_state: &State, body_proof: &BlockBodyProof) -> Result<
     let validators = &head_state.validators;
     let num_validators = validators.len() as u64;
 
-    let mut pubkeys_per_component: Vec<Vec<ValidatorPublicKey>> =
-        Vec::with_capacity(attestations.len());
-    let mut expected_bindings: Vec<(H256, u32)> = Vec::with_capacity(attestations.len());
+    let mut components: Vec<SignerSet> = Vec::with_capacity(attestations.len());
 
     for attestation in attestations.iter() {
         let mut pubkeys = Vec::new();
@@ -398,19 +418,18 @@ fn verify_body_proof(head_state: &State, body_proof: &BlockBodyProof) -> Result<
                 .map_err(|_| StoreError::PubkeyDecodingFailed(vid))?;
             pubkeys.push(pubkey);
         }
-        pubkeys_per_component.push(pubkeys);
         let slot = u32::try_from(attestation.data.slot)
             .map_err(|_| StoreError::SlotOutOfRange(attestation.data.slot))?;
-        expected_bindings.push((attestation.data.hash_tree_root(), slot));
+        components.push(SignerSet::new(
+            attestation.data.hash_tree_root(),
+            slot,
+            pubkeys,
+        ));
     }
 
     let _timing = metrics::time_pq_sig_aggregated_signatures_verification();
-    ethlambda_crypto::verify_type_2_signature(
-        body_proof.proof.proof_bytes(),
-        pubkeys_per_component,
-        &expected_bindings,
-    )
-    .map_err(StoreError::BlockProofVerificationFailed)
+    ethlambda_crypto::verify_type_2_signature(body_proof.proof.proof_bytes(), &components)
+        .map_err(StoreError::BlockProofVerificationFailed)
 }
 
 /// Bounded, newest-first buffer of proposal candidates.
