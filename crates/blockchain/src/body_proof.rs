@@ -350,12 +350,20 @@ fn body_votes_on_chain(body: &BlockBody, chain_view: &[H256]) -> bool {
 ///
 /// Uses the block builder's projection so the count means the same thing it
 /// does during selection: per target root, voters the running set does not
-/// already hold.
+/// already hold. Entries whose target is already justified are skipped: the
+/// state transition drops a justified target's `justifications` entry, so
+/// `score_entry` would otherwise see no prior voters at all and count the
+/// entry's entire coverage as new. Shares `ProjectedState::target_already_justified`
+/// with `entry_passes_filters` (`block_builder.rs`) rather than reimplementing the
+/// predicate, so the two cannot drift.
 fn count_new_voters(head_state: &State, body: &BlockBody, validator_count: usize) -> usize {
     let mut projected = block_builder::ProjectedState::from_head_state(head_state);
     let mut total = 0usize;
 
     for attestation in body.attestations.iter() {
+        if projected.target_already_justified(&attestation.data) {
+            continue;
+        }
         let coverage: HashSet<u64> = validator_indices(&attestation.aggregation_bits).collect();
         let Some((score, new_voters)) =
             projected.score_entry(&attestation.data, &coverage, validator_count)
@@ -498,7 +506,17 @@ mod tests {
     /// root. Deriving it the same way the transition does is the only way a
     /// fixture parent root matches.
     fn head_root() -> H256 {
-        let mut state = head_state();
+        head_root_of(&head_state())
+    }
+
+    /// Like [`head_root`], but for a state that was modified from the plain
+    /// fixture (e.g. to mark a slot already justified). The header's
+    /// `state_root` embeds a hash of the whole state, so a different
+    /// `justified_slots` yields a different root; every test that mutates
+    /// `head_state()` must re-derive the parent root through here rather than
+    /// reusing [`head_root`].
+    fn head_root_of(state: &State) -> H256 {
+        let mut state = state.clone();
         ethlambda_state_transition::process_slots(&mut state, BLOCK_SLOT)
             .expect("advancing one slot works");
         state.latest_block_header.hash_tree_root()
@@ -639,6 +657,102 @@ mod tests {
         let chosen = choose(&candidates);
 
         assert!(!chosen.adopted);
+    }
+
+    /// A body whose only vote targets a slot the state already justified must
+    /// score `new_voters == 0` (the state transition's `is_valid_vote` would
+    /// skip that same vote via `continue`, and the justified target's
+    /// `current_votes` entry is gone, so without the fix the whole
+    /// aggregation bitfield would be miscounted as new) and must therefore
+    /// lose the tie to the empty body.
+    #[test]
+    fn choose_body_ignores_a_candidate_whose_target_is_already_justified() {
+        let mut state = head_state();
+        let finalized_slot = state.latest_finalized.slot;
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut state.justified_slots,
+            finalized_slot,
+            HEAD_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut state.justified_slots,
+            finalized_slot,
+            HEAD_SLOT,
+        );
+        let parent_root = head_root_of(&state);
+
+        let vote = AggregatedAttestation {
+            aggregation_bits: bits(&[0, 1]),
+            data: AttestationData {
+                slot: HEAD_SLOT,
+                head: Checkpoint {
+                    root: parent_root,
+                    slot: HEAD_SLOT,
+                },
+                target: Checkpoint {
+                    root: parent_root,
+                    slot: HEAD_SLOT,
+                },
+                source: Checkpoint {
+                    root: genesis_root(),
+                    slot: 0,
+                },
+            },
+        };
+
+        let body = BlockBody {
+            attestations: vec![vote.clone()].try_into().unwrap(),
+        };
+        assert_eq!(
+            count_new_voters(&state, &body, NUM_VALIDATORS),
+            0,
+            "a target the state already justified must not be credited as new"
+        );
+
+        let mut candidates = BodyProofBuffer::default();
+        candidates.push_local(candidate(vec![vote]));
+
+        let chosen = choose_body(&state, BLOCK_SLOT, PROPOSER, parent_root, &candidates)
+            .expect("sealing an empty body always works");
+
+        assert!(
+            !chosen.adopted,
+            "a candidate whose only vote targets an already-justified slot must not beat the empty body"
+        );
+    }
+
+    /// A target slot outside the projection's tracked `justified_slots`
+    /// window (the common case for anything between the head and the
+    /// candidate block) has no bit to read at all: `is_slot_justified`
+    /// returns `JustifiedSlotOutOfRange` there, which the deliberate
+    /// `.unwrap_or(false)` in `target_already_justified` must read as "not
+    /// justified" rather than propagate or treat as justified. Getting this
+    /// wrong would make every fresh target look stale.
+    #[test]
+    fn target_already_justified_treats_an_untracked_slot_as_not_justified() {
+        let state = head_state();
+        let projected = block_builder::ProjectedState::from_head_state(&state);
+
+        let att_data = AttestationData {
+            slot: HEAD_SLOT,
+            head: Checkpoint {
+                root: head_root(),
+                slot: HEAD_SLOT,
+            },
+            target: Checkpoint {
+                root: head_root(),
+                slot: HEAD_SLOT,
+            },
+            source: Checkpoint {
+                root: genesis_root(),
+                slot: 0,
+            },
+        };
+
+        assert!(
+            !projected.target_already_justified(&att_data),
+            "an untracked target slot must stay eligible, not read as justified"
+        );
     }
 
     #[test]
