@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d1711995.js";
+            window.path_to_searchindex_js = "searchindex-ea462a73.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a5d5bf8e.js"></script>
@@ -340,6 +340,44 @@ which is how a node that only saw a vote inside a block gets its fork-choice wei
 Aggregators go one step further and republish those aggregates on gossip. Each split runs a
 fresh SNARK, so <code>reaggregate.rs</code> caps how many it does per block, and the actor skips the
 whole path while the node is catching up.</p>
+<h3 id="subnet-windowed-aggregation"><a class="header" href="#subnet-windowed-aggregation">Subnet-windowed aggregation</a></h3>
+<p>Two aggregators handed the same pool of existing proofs would otherwise pick the same two
+children every session, since the greedy selection in <code>aggregation.rs</code> is deterministic: all
+that duplicated leanVM proving buys nothing once one of them publishes. Each aggregator instead
+scores that pool through a window: a contiguous run of subnets starting at its duty subnet, the
+first value of <code>--aggregate-subnet-ids</code> (or the lowest subnet it subscribes to, if that flag is
+unset). A proof outside the window still counts if it partly overlaps, but earns credit only
+for its in-window share, so aggregators with different windows tend to land on different
+children without anyone being excluded from merging.</p>
+<p>The width is derived, not chosen: wide enough to hold two proofs at the reach of the
+aggregator’s <em>anchor</em>, capped at the committee count, so it only widens once a data root’s
+proof has actually climbed. The anchor is the largest-coverage proof in the candidate’s pool
+that touches the aggregator’s own duty subnet. Picking it by coverage rather than by reach
+keeps a sparse proof, one validator in each of many subnets, from setting the width for
+everybody; requiring it to touch the duty subnet means “no anchor” says “no peer has covered
+my subnet”, which is exactly when this node’s raw signatures are irreplaceable, and the
+narrowest window then leaves it aggregating those instead of merging other aggregators’
+proofs. The price is that two aggregators reading one lopsided pool can derive different
+widths, so their windows nest rather than tile; that costs a round of climbing, not
+correctness.</p>
+<p>A window can still decline a merge the unwindowed pool would have allowed, when the proof pool
+is sparse relative to the window’s contiguous span (a strided aggregator placement is the
+common cause); selection then retries once with the full committee set, so the feature can
+only improve on the pre-window selection, never regress below it.</p>
+<p><code>--skip-redundant-aggregation</code> trades that safety net away on purpose. With it set, an
+aggregator sits out any candidate whose derived width it does not own in the current slot
+(<code>duty_subnet % width == slot % width</code>), and the freed job goes to the next-best attestation
+data rather than to a narrower merge of the same one. Ownership rotates with the slot, so
+every duty subnet gets a turn, and the narrowest width is owned by everyone, so a candidate
+with no anchor on this node’s subnet is never skipped. The full-width fallback is disabled
+under the flag: every width below the committee count has several owners, so retrying there
+would rebuild exactly the duplication the flag buys away.</p>
+<p>The rotation guarantees an owner at every width only when every subnet below the committee
+count has an aggregator holding it as its duty subnet, so treat that as a precondition for
+the flag. On a sparser placement a width can have no owner in a given slot even with every
+configured node healthy: with duty subnets {0, 2} at committee count 4, nothing owns width 4
+in an odd slot, and with the fallback off that merge level is dropped for the slot. Leave the
+flag unset on a placement that does not cover every subnet.</p>
 <h3 id="sync-gate"><a class="header" href="#sync-gate">Sync gate</a></h3>
 <p><code>sync_status.rs</code> tracks how far the local head lags the slot clock. Past the threshold the
 node reports itself syncing and stops attesting and proposing, since a head derived from a
@@ -2109,6 +2147,9 @@ phases it contains.</p>
 <tbody>
 <tr><td><code>lean_attestation_committee_count</code></td><td>Gauge</td><td>Number of attestation committees</td><td>On node start</td><td></td><td>✅</td></tr>
 <tr><td><code>lean_attestation_committee_subnet</code></td><td>Gauge</td><td>Node’s attestation committee subnet</td><td>On node start</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_aggregation_window_width</code></td><td>Histogram</td><td>Width in subnets of the subnet window derived for one aggregation candidate</td><td>On each aggregation candidate</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_aggregation_skipped_redundant_total</code></td><td>Counter</td><td>Candidates this aggregator sat out because the redundancy-skipping rotation gave their level to another duty subnet</td><td>On each skipped aggregation candidate</td><td></td><td>✅</td></tr>
+<tr><td><code>lean_aggregation_window_fallback_total</code></td><td>Counter</td><td>Merges the subnet window would have dropped, recovered by retrying selection at the full committee set</td><td>On each aggregation candidate the full-width retry recovers</td><td></td><td>✅</td></tr>
 <tr><td><code>lean_connected_peers</code></td><td>Gauge</td><td>Number of connected peers</td><td>On scrape</td><td>client=ethlambda,grandine,lantern,lighthouse,qlean,ream,zeam</td><td>✅(*)</td></tr>
 <tr><td><code>lean_gossip_mesh_peers</code></td><td>Gauge</td><td>Number of peers in the gossipsub mesh</td><td>On scrape</td><td>client=<code>&lt;name&gt;_&lt;N&gt;</code>,unknown (ex. zeam_0)</td><td>✅(*)</td></tr>
 <tr><td><code>lean_peer_connection_events_total</code></td><td>Counter</td><td>Total number of peer connection events</td><td>On peer connection</td><td>direction=inbound,outbound<br>result=success,timeout,error</td><td>✅</td></tr>
@@ -2116,6 +2157,9 @@ phases it contains.</p>
 </tbody>
 </table>
 </div>
+<blockquote>
+<p>All three are emitted only by aggregators, once per candidate <code>AttestationData</code> per interval-2 session. <code>lean_aggregation_window_width</code> has buckets 1, 2, 4, 8, 16, 32, 64 and climbs from 1 as the aggregator’s anchor proof climbs the reduction tree; it is capped at <code>lean_attestation_committee_count</code>, so samples pinned there mean the window no longer restricts selection. Compare against that gauge rather than reading the buckets alone: at a committee count that is not a power of two, two different widths can share a bucket. A width stuck at 1 while the network is aggregating means the pool holds nothing on this node’s duty subnet, so it is only aggregating its own raw signatures; check the duty subnet against the aggregator placement. <code>lean_aggregation_skipped_redundant_total</code> only increments with <code>--skip-redundant-aggregation</code>, once per candidate handed to another duty subnet; read it against <code>lean_aggregation_window_width_count</code> for the share of candidates sat out. <code>lean_aggregation_window_fallback_total</code> counts recoveries, not attempts: it increments only when a windowed selection produced no viable job and the full-committee-width retry did. Candidates that are non-viable whatever the window, a lone raw signature or a group with a single proof, never reach the retry and never increment it, so a sparse (strided) aggregator placement across subnets is the only expected cause and the counter should stay at or near zero on a well-tiled deployment. It stays flat entirely under <code>--skip-redundant-aggregation</code>, which disables the fallback.</p>
+</blockquote>
 <h2 id="custom-metrics-non-leanmetrics"><a class="header" href="#custom-metrics-non-leanmetrics">Custom Metrics (non-leanMetrics)</a></h2>
 <p>The metrics below are not part of the <a href="https://github.com/leanEthereum/leanMetrics/blob/2719baad8351c9ad5eaf3c8621f33fcec20a1dc7/metrics.md">leanMetrics specification</a>. They are ethlambda-specific observability around on-wire message sizes and post-quantum aggregated proof sizes.</p>
 <h3 id="pq-signature-sizes"><a class="header" href="#pq-signature-sizes">PQ Signature Sizes</a></h3>
