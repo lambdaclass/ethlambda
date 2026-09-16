@@ -542,16 +542,7 @@ impl ProjectedState {
         if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
             return Err("target_not_after_source");
         }
-        // An untracked target slot (commonly the head block's own slot) is not yet
-        // justified, so it stays eligible. Same reasoning as the source check above.
-        if !is_genesis_self_vote
-            && justified_slots_ops::is_slot_justified(
-                &self.justified_slots,
-                self.finalized_slot,
-                att_data.target.slot,
-            )
-            .unwrap_or(false)
-        {
+        if self.target_already_justified(att_data) {
             return Err("target_already_justified");
         }
         if !is_genesis_self_vote
@@ -560,6 +551,30 @@ impl ProjectedState {
             return Err("target_not_justifiable");
         }
         Ok(())
+    }
+
+    /// Whether `att_data`'s target is already justified in this projection.
+    ///
+    /// Shared by `entry_passes_filters` (selection) and `body_proof::count_new_voters`
+    /// (scoring an already-sealed candidate) so the two cannot drift: a target the
+    /// state transition has already justified is dropped from `justifications` on
+    /// justification (`state_transition::lib`), so `current_votes` holds no prior-voter
+    /// entry for it and `score_entry` would otherwise count its entire coverage as new.
+    ///
+    /// An untracked target slot (commonly the head block's own slot, or any slot past
+    /// the head-seeded window's edge) is not yet justified as far as this projection
+    /// knows, so it stays eligible: `is_slot_justified` returning `None` reads as
+    /// "not justified", not "unknown". Exempt: the genesis self-vote (source == target
+    /// == slot 0), which fork-choice bootstrapping needs even though its target is
+    /// trivially "justified".
+    pub(crate) fn target_already_justified(&self, att_data: &AttestationData) -> bool {
+        !is_genesis_self_vote(att_data)
+            && justified_slots_ops::is_slot_justified(
+                &self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            )
+            .unwrap_or(false)
     }
 }
 
