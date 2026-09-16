@@ -217,6 +217,12 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         attestation_committee_count,
         "Loaded attestation committee count"
     );
+    // Checked here rather than in clap: the committee count is only known once
+    // the CLI flag and the validator config have both been consulted.
+    validate_aggregate_subnet_ids(
+        options.aggregate_subnet_ids.as_deref(),
+        attestation_committee_count,
+    )?;
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
     let bootnodes = read_bootnodes(&bootnodes_path)?;
@@ -840,6 +846,33 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
+/// Reject an `--aggregate-subnet-ids` value that names no subnet.
+///
+/// The flag feeds two consumers that read an out-of-range value differently:
+/// the P2P swarm subscribes to the raw id (`attestation_subscription_subnets`
+/// passes it through), while the aggregation window reduces it modulo the
+/// committee count. `--attestation-committee-count 4 --aggregate-subnet-ids 5`
+/// therefore subscribes to a topic no validator publishes on and aggregates as
+/// duty subnet 1, which the node does not listen to, with the startup log
+/// showing 5 either way. Refusing to start is the only reading of that
+/// configuration that cannot silently mean something else.
+fn validate_aggregate_subnet_ids(
+    assigned_subnet_ids: Option<&[u64]>,
+    attestation_committee_count: u64,
+) -> eyre::Result<()> {
+    let out_of_range = assigned_subnet_ids
+        .unwrap_or_default()
+        .iter()
+        .find(|&&id| id >= attestation_committee_count);
+    match out_of_range {
+        None => Ok(()),
+        Some(id) => Err(eyre::eyre!(
+            "--aggregate-subnet-ids value {id} is not a subnet: ids must be below \
+             attestation_committee_count ({attestation_committee_count})"
+        )),
+    }
+}
+
 /// The subnet this node is responsible for when scoring recursive aggregation.
 ///
 /// Operators assign it explicitly via --aggregate-subnet-ids so co-located
@@ -899,6 +932,44 @@ mod tests {
             resolve_aggregation_duty_subnet(Some(&[]), &HashSet::from([4u64])),
             4
         );
+    }
+
+    /// An id at or above the committee count names a topic no validator
+    /// publishes on, and would be reduced to a different subnet by the
+    /// aggregation window, so the node refuses it rather than running with
+    /// its subscriptions and its duty subnet disagreeing.
+    #[test]
+    fn an_out_of_range_aggregate_subnet_id_is_rejected() {
+        let err = validate_aggregate_subnet_ids(Some(&[5]), 4)
+            .expect_err("subnet 5 does not exist at committee count 4");
+        let message = err.to_string();
+        assert!(message.contains('5'), "names the offending id: {message}");
+        assert!(message.contains('4'), "names the bound: {message}");
+    }
+
+    /// The check covers every id, not just the first: only the first becomes
+    /// the duty subnet, but all of them become gossip subscriptions.
+    #[test]
+    fn an_out_of_range_aggregate_subnet_id_is_rejected_past_the_first() {
+        assert!(validate_aggregate_subnet_ids(Some(&[0, 9]), 4).is_err());
+    }
+
+    /// The bound is exclusive: subnets run 0..committee_count.
+    #[test]
+    fn in_range_aggregate_subnet_ids_are_accepted() {
+        assert!(validate_aggregate_subnet_ids(Some(&[0, 3]), 4).is_ok());
+        assert!(
+            validate_aggregate_subnet_ids(Some(&[0]), 1).is_ok(),
+            "subnet 0 is the only subnet at a committee count of 1"
+        );
+    }
+
+    /// Nothing assigned is nothing to validate; the duty subnet is then
+    /// derived from subscriptions, which are already in range by construction.
+    #[test]
+    fn an_unset_or_empty_assignment_passes_validation() {
+        assert!(validate_aggregate_subnet_ids(None, 4).is_ok());
+        assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet

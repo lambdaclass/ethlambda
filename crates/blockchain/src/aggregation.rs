@@ -240,11 +240,13 @@ fn window_for_candidate(
     current_slot: u64,
     config: AggregationWindowConfig,
 ) -> Option<SubnetWindow> {
-    // Reduce before both the anchor search and the ownership test, not just
-    // inside `SubnetWindow::new`: an out-of-range duty subnet matches no
-    // validator's subnet, so it would find no anchor at all, and at a width
-    // that does not divide the committee count it would rotate on different
-    // slots from its reduced twin.
+    // The node binary rejects an out-of-range `--aggregate-subnet-ids` value at
+    // startup, so this should be a no-op in production. It stays because
+    // `AggregationWindowConfig` is public and `SubnetWindow::new` reduces
+    // `start` regardless: reducing only there would leave the ownership test
+    // running on the raw value, so an out-of-range duty subnet would rotate on
+    // different slots from its reduced twin, and would find no anchor at all
+    // since it matches no validator's subnet.
     let duty_subnet = if config.committee_count == 0 {
         0
     } else {

@@ -83,6 +83,8 @@ pub(crate) struct NodeOptions {
     pub(crate) attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    /// Every ID must be below --attestation-committee-count; the node refuses to
+    /// start otherwise, since a higher ID names a topic no validator publishes on.
     ///
     /// The first ID is also this node's aggregation duty subnet: where its
     /// aggregation window starts, and what --skip-redundant-aggregation
