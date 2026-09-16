@@ -582,19 +582,12 @@ fn select_best_job(
             );
             continue;
         }
-        let (new_proofs, known_proofs) = store.existing_proofs_for_data(&data_root);
-        let Some(window) =
-            metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)
-        else {
-            continue;
-        };
-        if let Some(job) = resolve_job_with_window_fallback(
+        if let Some(job) = build_candidate(
+            store,
             hashed.clone(),
             validator_sigs,
-            &new_proofs,
-            &known_proofs,
             validators,
-            &window,
+            current_slot,
             window_config,
         ) {
             candidates.insert(data_root, job);
@@ -610,22 +603,10 @@ fn select_best_job(
         if store.proof_count_for_data(data_root) < 2 {
             continue;
         }
-        let (new_proofs, known_proofs) = store.existing_proofs_for_data(data_root);
-        let Some(window) =
-            metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)
-        else {
-            continue;
-        };
         let hashed = HashedAttestationData::new(att_data.clone());
-        if let Some(job) = resolve_job_with_window_fallback(
-            hashed,
-            &[],
-            &new_proofs,
-            &known_proofs,
-            validators,
-            &window,
-            window_config,
-        ) {
+        if let Some(job) =
+            build_candidate(store, hashed, &[], validators, current_slot, window_config)
+        {
             candidates.insert(*data_root, job);
         }
     }
@@ -719,6 +700,39 @@ fn min_current_slot_group_sigs(
         .sum();
     let min_sigs = (2 * expected_votes).div_ceil(3) as usize;
     (min_sigs > 0).then_some(min_sigs)
+}
+
+/// Resolve one candidate `AttestationData` into an [`AggregationJob`]: read
+/// its proof pool from the store, derive the window that pool implies (see
+/// [`window_for_candidate`]), and build the aggregation material through it.
+///
+/// The only store-touching step of the up-front pass, shared by both
+/// candidate sources: gossip groups pass their signatures, payload-only
+/// groups pass none.
+///
+/// `None` when the window hands this candidate to another duty subnet under
+/// `--skip-redundant-aggregation`, or when the resulting material is not
+/// viable even after the full-window fallback.
+fn build_candidate(
+    store: &Store,
+    hashed: HashedAttestationData,
+    validator_sigs: &[(u64, ValidatorSignature)],
+    validators: &[Validator],
+    current_slot: u64,
+    window_config: AggregationWindowConfig,
+) -> Option<AggregationJob> {
+    let (new_proofs, known_proofs) = store.existing_proofs_for_data(&hashed.root());
+    let window =
+        metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)?;
+    resolve_job_with_window_fallback(
+        hashed,
+        validator_sigs,
+        &new_proofs,
+        &known_proofs,
+        validators,
+        &window,
+        window_config,
+    )
 }
 
 /// The policy in force `ms_into_slot` into the slot.
@@ -860,8 +874,7 @@ fn resolve_job_with_window_fallback(
         return primary;
     }
     metrics::inc_aggregation_window_fallback();
-    let committee_count = config.committee_count;
-    let full = SubnetWindow::new(0, committee_count.max(1), committee_count);
+    let full = SubnetWindow::full(config.committee_count);
     resolve_job(
         hashed,
         validator_sigs,
@@ -959,7 +972,7 @@ fn resolve_job(
 /// can't be fully resolved (passing fewer pubkeys than the proof expects would
 /// produce an invalid aggregate).
 fn resolve_child_pubkeys(
-    child_proofs: &[SingleMessageAggregate],
+    child_proofs: &[&SingleMessageAggregate],
     validators: &[Validator],
 ) -> (Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)>, Vec<u64>) {
     let mut children = Vec::with_capacity(child_proofs.len());
@@ -1157,33 +1170,17 @@ impl SubnetWindow {
         self.contains_subnet(vid % self.committee_count)
     }
 
+    /// The window that admits every subnet, i.e. no restriction at all. The
+    /// unwindowed selection the fallback in
+    /// [`resolve_job_with_window_fallback`] retries at.
+    pub(crate) fn full(committee_count: u64) -> Self {
+        Self::new(0, committee_count, committee_count)
+    }
+
     /// The window's width in subnets, for metrics reporting.
     pub(crate) fn width(&self) -> u64 {
         self.width
     }
-}
-
-/// The number of distinct subnets `bits` reaches into.
-///
-/// A proof's reach is how far up the reduction tree it has climbed: raw
-/// per-subnet aggregates have reach 1, a merge of two of them has reach 2.
-pub(crate) fn subnet_reach(bits: &AggregationBits, committee_count: u64) -> u64 {
-    if committee_count == 0 {
-        return 0;
-    }
-    // Stop as soon as every subnet has been seen rather than scanning the rest
-    // of a wide proof's set bits: `committee_count` is CLI-supplied with no
-    // upper bound, so a `Vec<bool>` presence table sized by it is not safe,
-    // but the early exit alone turns a saturated pool from a full scan into a
-    // handful of insertions.
-    let mut seen: HashSet<u64> = HashSet::new();
-    for vid in validator_indices(bits) {
-        seen.insert(vid % committee_count);
-        if seen.len() as u64 == committee_count {
-            break;
-        }
-    }
-    seen.len() as u64
 }
 
 /// The window width for an anchor proof of reach `anchor_reach`.
@@ -1239,6 +1236,13 @@ fn anchor_reach(
 /// `(coverage, reach)` for a proof that touches `duty_subnet`, or `None` when
 /// it does not. The ordering of this pair is the anchor ranking.
 ///
+/// Coverage is the proof's participant count; reach is the number of distinct
+/// subnets it spans, i.e. how far up the reduction tree it has climbed, so a
+/// raw per-subnet aggregate has reach 1 and a merge of two of them has reach
+/// 2. Both fall out of one pass over the bits, which is what the scan costs:
+/// `validator_indices` walks every index up to the bitfield's length, not
+/// just the set ones, so a second pass would double the per-proof cost.
+///
 /// A committee count of 0 means no subnet structure, so every non-empty proof
 /// is an anchor and reach is 0 throughout; [`window_width`] floors the width
 /// either way.
@@ -1247,17 +1251,18 @@ fn anchor_key(
     duty_subnet: u64,
     committee_count: u64,
 ) -> Option<(usize, u64)> {
+    if committee_count == 0 {
+        let coverage = validator_indices(bits).count();
+        return (coverage > 0).then_some((coverage, 0));
+    }
     let mut coverage = 0usize;
-    let mut touches_duty = false;
+    let mut subnets: HashSet<u64> = HashSet::new();
     for vid in validator_indices(bits) {
         coverage += 1;
-        if committee_count == 0 || vid % committee_count == duty_subnet {
-            touches_duty = true;
-        }
+        subnets.insert(vid % committee_count);
     }
-    // `subnet_reach` walks the bits a second time, but only for the proofs
-    // that are anchor candidates at all.
-    touches_duty.then(|| (coverage, subnet_reach(bits, committee_count)))
+    let reach = subnets.len() as u64;
+    subnets.contains(&duty_subnet).then_some((coverage, reach))
 }
 
 /// Whether `duty_subnet` owns the width-`width` tiling of the committee set
@@ -1309,13 +1314,19 @@ const MAX_AGGREGATION_CHILDREN: usize = 2;
 /// the window it sits on.
 ///
 /// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
-fn select_proofs_greedily(
-    new_proofs: &[SingleMessageAggregate],
-    known_proofs: &[SingleMessageAggregate],
+///
+/// Hands back borrows of the input proofs rather than clones: a proof carries
+/// its `ByteList512KiB` bytes, and [`resolve_child_pubkeys`] clones those once
+/// for the children it accepts. Selection itself has no reason to pay for a
+/// second copy, least of all on the path where
+/// [`resolve_job_with_window_fallback`] runs the whole selection twice.
+fn select_proofs_greedily<'a>(
+    new_proofs: &'a [SingleMessageAggregate],
+    known_proofs: &'a [SingleMessageAggregate],
     seed_covered: HashSet<u64>,
     window: &SubnetWindow,
-) -> (Vec<SingleMessageAggregate>, HashSet<u64>) {
-    let mut selected: Vec<SingleMessageAggregate> = Vec::new();
+) -> (Vec<&'a SingleMessageAggregate>, HashSet<u64>) {
+    let mut selected: Vec<&'a SingleMessageAggregate> = Vec::new();
     let mut covered: HashSet<u64> = seed_covered;
 
     for proof_set in [new_proofs, known_proofs] {
@@ -1342,7 +1353,7 @@ fn select_proofs_greedily(
                 .filter(|vid| !covered.contains(vid))
                 .collect();
 
-            selected.push(remaining.swap_remove(best_idx).clone());
+            selected.push(remaining.swap_remove(best_idx));
             covered.extend(new_coverage);
         }
 
@@ -1750,20 +1761,21 @@ mod tests {
     // ---- subnet windows ----
 
     /// Reach counts distinct subnets, not validators: two validators in the
-    /// same subnet contribute one.
+    /// same subnet contribute one. Coverage counts validators, so the two
+    /// halves of the anchor key move independently.
     #[test]
     fn reach_counts_distinct_subnets() {
         // C = 4, so subnet(vid) = vid % 4.
         assert_eq!(
-            subnet_reach(&make_bits(&[0, 4, 8]), 4),
-            1,
-            "all in subnet 0"
+            anchor_key(&make_bits(&[0, 4, 8]), 0, 4),
+            Some((3, 1)),
+            "three validators, all in subnet 0"
         );
-        assert_eq!(subnet_reach(&make_bits(&[0, 1]), 4), 2);
-        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2, 3]), 4), 4);
+        assert_eq!(anchor_key(&make_bits(&[0, 1]), 0, 4), Some((2, 2)));
+        assert_eq!(anchor_key(&make_bits(&[0, 1, 2, 3]), 0, 4), Some((4, 4)));
         assert_eq!(
-            subnet_reach(&make_bits(&[3, 4]), 4),
-            2,
+            anchor_key(&make_bits(&[3, 4]), 3, 4),
+            Some((2, 2)),
             "wraps across the top"
         );
     }
@@ -1772,7 +1784,7 @@ mod tests {
     /// has reach 1.
     #[test]
     fn reach_is_one_for_a_single_committee() {
-        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2, 3]), 1), 1);
+        assert_eq!(anchor_key(&make_bits(&[0, 1, 2, 3]), 0, 1), Some((4, 1)));
     }
 
     /// Width is just wide enough to hold two proofs of the pool's current best
@@ -1962,7 +1974,7 @@ mod tests {
     /// is vacuous.
     #[test]
     fn subnet_window_is_vacuous_for_a_single_committee() {
-        let w = SubnetWindow::new(0, 1, 1);
+        let w = SubnetWindow::full(1);
         for vid in 0..10 {
             assert!(w.contains_validator(vid));
         }
@@ -1980,7 +1992,11 @@ mod tests {
         assert!(w.contains_validator(0));
         assert!(w.contains_validator(u64::MAX));
 
-        assert_eq!(subnet_reach(&make_bits(&[0, 1, 2]), 0), 0);
+        assert_eq!(
+            anchor_key(&make_bits(&[0, 1, 2]), 7, 0),
+            Some((3, 0)),
+            "every non-empty proof anchors, at no reach"
+        );
         assert_eq!(window_width(0, 0), 1);
         assert_eq!(window_width(5, 0), 1);
     }
@@ -2014,10 +2030,10 @@ mod tests {
     fn select_proofs_greedily_full_window_picks_by_total_coverage() {
         let small = SingleMessageAggregate::empty(make_bits(&[0]));
         let large = SingleMessageAggregate::empty(make_bits(&[1, 2, 3]));
-        let window = SubnetWindow::new(0, 4, 4);
+        let window = SubnetWindow::full(4);
 
-        let (selected, covered) =
-            select_proofs_greedily(&[small, large], &[], HashSet::new(), &window);
+        let pool = [small, large];
+        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
 
         assert_eq!(selected.len(), 2);
         assert_eq!(
@@ -2036,7 +2052,8 @@ mod tests {
         let outside = SingleMessageAggregate::empty(make_bits(&[2, 6]));
         let window = SubnetWindow::new(0, 2, 4);
 
-        let (selected, covered) = select_proofs_greedily(&[outside], &[], HashSet::new(), &window);
+        let pool = [outside];
+        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
 
         assert!(selected.is_empty(), "nothing in the window to gain");
         assert!(covered.is_empty());
@@ -2053,8 +2070,8 @@ mod tests {
         let straddling = SingleMessageAggregate::empty(make_bits(&[1, 2]));
         let window = SubnetWindow::new(0, 2, 4);
 
-        let (selected, covered) =
-            select_proofs_greedily(&[straddling], &[], HashSet::new(), &window);
+        let pool = [straddling];
+        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
 
         assert_eq!(selected.len(), 1, "picked for its in-window half");
         assert_eq!(
@@ -2075,8 +2092,8 @@ mod tests {
         let narrow = SingleMessageAggregate::empty(make_bits(&[4, 5]));
         let window = SubnetWindow::new(0, 2, 4);
 
-        let (selected, _covered) =
-            select_proofs_greedily(&[wide, narrow], &[], HashSet::new(), &window);
+        let pool = [wide, narrow];
+        let (selected, _covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
 
         assert_eq!(
             selected.len(),
@@ -2100,8 +2117,8 @@ mod tests {
         let proof = SingleMessageAggregate::empty(make_bits(&[0, 2]));
         let window = SubnetWindow::new(0, 2, 4);
 
-        let (selected, _covered) =
-            select_proofs_greedily(&[proof], &[], HashSet::from([0]), &window);
+        let pool = [proof];
+        let (selected, _covered) = select_proofs_greedily(&pool, &[], HashSet::from([0]), &window);
 
         assert!(selected.is_empty());
     }
@@ -2117,8 +2134,10 @@ mod tests {
         let known_inside = SingleMessageAggregate::empty(make_bits(&[0, 1]));
         let window = SubnetWindow::new(0, 2, 4);
 
+        let new_pool = [new_outside];
+        let known_pool = [known_inside];
         let (selected, covered) =
-            select_proofs_greedily(&[new_outside], &[known_inside], HashSet::new(), &window);
+            select_proofs_greedily(&new_pool, &known_pool, HashSet::new(), &window);
 
         assert_eq!(selected.len(), 1);
         assert_eq!(
