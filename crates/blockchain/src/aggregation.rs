@@ -229,11 +229,23 @@ pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 /// aggregator's window to the full committee set.
 ///
 /// Only one session runs per slot (see [`snapshot_aggregation_inputs`]), and
-/// this candidate's own pool is still empty at that point: a produced
+/// this candidate's own pool is normally still empty at that point: a produced
 /// aggregate is held until the interval-2 boundary before publication, so
 /// nothing from this slot has landed yet. A current-slot candidate therefore
-/// always derives the narrowest width; the pool only has something to reach
-/// into once a data root has stayed live past its own slot.
+/// derives the narrowest width in practice; the pool only has something to
+/// reach into once a data root has stayed live past its own slot.
+///
+/// That is a timing expectation, not an invariant this code enforces. A peer's
+/// aggregate for the current slot can land before this node takes its
+/// snapshot, under clock skew or when the peer's session started early via
+/// [`EarlyAggregationCheck`], and the current-slot candidate then has an
+/// anchor and a width of 2. Under `--skip-redundant-aggregation` that is not
+/// free: every duty subnet that does not own width 2 this slot sits the
+/// candidate out, so its raw signatures miss the next block. On the intended
+/// topology, distinct duty subnets with distinct subscriptions, a round-one
+/// peer proof never touches this node's subnet, so it finds no anchor there
+/// and the assumption holds anyway. Overlapping subscriptions are where it
+/// fails.
 fn window_for_candidate(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
