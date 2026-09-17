@@ -8,11 +8,13 @@ on:
       - main
     paths:
       - "docs/**"
+      - "theme/**"
       - "book.toml"
       - ".github/workflows/pr-main_mdbook.yml"
   pull_request:
     paths:
       - "docs/**"
+      - "theme/**"
       - "book.toml"
       - ".github/workflows/pr-main_mdbook.yml"
   workflow_dispatch:
