@@ -405,7 +405,14 @@ pub fn snapshot_aggregation_inputs(
         head_state.historical_block_hashes.iter().copied().collect();
     extended_historical_block_hashes.push(store.head().expect("head read works"));
 
-    let mut projected = block_builder::ProjectedState::from_head_state(&head_state);
+    // Seed the head votes too, not just the justification projection. Since a
+    // vote for an already-justified target is no longer filtered out, its only
+    // remaining value is the fork-choice weight it carries; without this the
+    // worker would score every such group at zero on both axes and prove none
+    // of them, leaving the pool empty exactly on the slots where every pooled
+    // vote names a settled target — which is the case this is meant to cover.
+    let mut projected = block_builder::ProjectedState::from_head_state(&head_state)
+        .with_head_votes(store.extract_latest_known_attestations());
 
     let mut jobs: Vec<AggregationJob> = Vec::with_capacity(max_jobs.min(groups_considered));
     for _round in 0..max_jobs {
@@ -2202,12 +2209,20 @@ mod tests {
         );
     }
 
-    /// A group whose target is already justified (here: at or behind the
-    /// finalized boundary) can never justify or finalize anything further and
-    /// must never become a job, even with enough raw sigs to otherwise be
-    /// viable.
+    /// A group whose target sits at or behind the finalized boundary must
+    /// never become a job, even with enough raw sigs to otherwise be viable:
+    /// it can neither justify nor finalize anything, and a finalized target is
+    /// settled for good, so its votes carry no fork-choice signal worth proving
+    /// either.
+    ///
+    /// The rejection comes from `target_not_justifiable`
+    /// (`slot_is_justifiable_after` is false below the finalized slot), not
+    /// from the target being justified: a justified target *above* the
+    /// finalized boundary is deliberately still eligible, scored on its head
+    /// votes alone. See
+    /// `snapshot_aggregates_a_justified_target_for_its_head_votes`.
     #[test]
-    fn snapshot_skips_group_whose_target_is_already_justified() {
+    fn snapshot_skips_group_whose_target_is_at_or_behind_finalized() {
         const NUM_VALIDATORS: usize = 10;
         const HEAD_SLOT: u64 = 20;
         const FINALIZED_SLOT: u64 = 10;
@@ -2244,7 +2259,68 @@ mod tests {
         assert!(
             snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
                 .is_none(),
-            "a group targeting an already-justified slot must never become a job"
+            "a group targeting a finalized slot must never become a job"
+        );
+    }
+
+    /// The counterpart: a target that is justified but still above the
+    /// finalized boundary DOES become a job, on the strength of its head votes
+    /// alone.
+    ///
+    /// This is the case that used to be filtered out wholesale. On a chain
+    /// whose justifiable rungs sit several slots apart, every pooled vote names
+    /// a settled target for slots at a time; dropping them all left the
+    /// aggregators with nothing to prove and the next proposer with no
+    /// candidate body to adopt.
+    #[test]
+    fn snapshot_aggregates_a_justified_target_for_its_head_votes() {
+        const NUM_VALIDATORS: usize = 10;
+        const HEAD_SLOT: u64 = 20;
+        const FINALIZED_SLOT: u64 = 10;
+        const TARGET_SLOT: u64 = 12; // above finalized, and marked justified
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
+
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let hashed = HashedAttestationData::new(att_data);
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed, 1, dummy_sig());
+
+        assert!(
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_some(),
+            "a justified target above the finalized boundary must still be proved for its head votes"
         );
     }
 
