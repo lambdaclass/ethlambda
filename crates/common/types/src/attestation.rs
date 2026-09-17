@@ -35,6 +35,26 @@ pub struct AttestationData {
     pub source: Checkpoint,
 }
 
+impl AttestationData {
+    /// Whether this vote supersedes `other` as a validator's latest message.
+    ///
+    /// The LMD-GHOST latest-message rule: the later slot wins, and a tie is
+    /// broken by data root. Breaking the tie on a total order rather than on
+    /// arrival matters because the latest-vote map is written from more than
+    /// one place (block import, gossip payload insertion, the aggregation
+    /// worker), so an order-dependent rule would let two nodes that saw the
+    /// same votes in different orders disagree about the head.
+    ///
+    /// Lives here rather than beside fork choice because the vote map is
+    /// maintained in the storage layer, which does not depend on the fork
+    /// choice crate; `ethlambda-types` is what storage, blockchain and fork
+    /// choice all share.
+    pub fn supersedes(&self, other: &AttestationData) -> bool {
+        self.slot > other.slot
+            || (self.slot == other.slot && self.hash_tree_root() > other.hash_tree_root())
+    }
+}
+
 /// Validator attestation bundled with its signature.
 ///
 /// <div class="warning">
@@ -196,6 +216,52 @@ impl From<AttestationData> for HashedAttestationData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn att_data(slot: u64, head_root: u8) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint {
+                slot,
+                root: H256([head_root; 32]),
+            },
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
+
+    #[test]
+    fn supersedes_prefers_the_later_slot() {
+        let earlier = att_data(4, 1);
+        let later = att_data(5, 1);
+
+        assert!(later.supersedes(&earlier));
+        assert!(!earlier.supersedes(&later));
+    }
+
+    #[test]
+    fn supersedes_is_irreflexive() {
+        let vote = att_data(4, 1);
+
+        assert!(
+            !vote.supersedes(&vote),
+            "a vote does not replace an identical one, or record_vote would clone every duplicate"
+        );
+    }
+
+    /// Same slot: the data root decides, so two nodes that saw the same votes
+    /// in different orders still agree on which one is a validator's latest.
+    #[test]
+    fn supersedes_breaks_a_slot_tie_on_data_root_and_is_antisymmetric() {
+        let a = att_data(4, 1);
+        let b = att_data(4, 2);
+
+        assert_ne!(a.hash_tree_root(), b.hash_tree_root());
+        assert_eq!(
+            a.supersedes(&b),
+            !b.supersedes(&a),
+            "exactly one of the two must win the tie"
+        );
+    }
 
     /// Build an `AggregationBits` of `len` bits with the indices in `set` flipped on.
     fn bits(len: usize, set: &[usize]) -> AggregationBits {

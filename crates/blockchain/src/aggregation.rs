@@ -797,7 +797,10 @@ fn pick_best_candidate(
             continue;
         }
 
-        let Some((score, _new_voters)) =
+        // Head votes are not scored here: the worker's projection leaves
+        // `head_votes` at `None`, so `new_head_voters` is always empty and the
+        // zero-new-voters skip below keeps its original meaning.
+        let Some((score, _new_voters, _new_head_voters)) =
             projected.score_entry(att_data, &candidate.coverage(), validator_count)
         else {
             trace_skipped_candidate("zero_new_voters", att_data, data_root);
@@ -1055,7 +1058,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
 ///
 /// - `insert_new_aggregated_payload` records the fork-choice votes before it
 ///   pushes the payload, and it records them with a max-merge
-///   (`should_replace_vote`) that gives the same map whatever order concurrent
+///   (`AttestationData::supersedes`) that gives the same map whatever order concurrent
 ///   writers arrive in. A promote landing in the middle moves votes from `new`
 ///   to `known` rather than dropping them, so the worst interleaving leaves the
 ///   vote or the payload to be promoted one tick later. Neither is lost.
@@ -2413,6 +2416,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_votes: None,
         };
 
         let (picked_root, score) = pick_best_candidate(
@@ -2505,6 +2509,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_votes: None,
         };
 
         // Round 1: A (6 new voters) outranks B (2 new voters); both Build tier.
