@@ -405,15 +405,16 @@ fn body_votes_on_chain(body: &BlockBody, chain_view: &[H256]) -> bool {
 /// do during selection: per target root, voters the running set does not
 /// already hold, and per validator, whether the vote would become their latest.
 ///
-/// An entry whose target is already justified is skipped on the justification
-/// axis only: the state transition drops a justified target's `justifications`
-/// entry, so `score_entry` would otherwise see no prior voters at all and count
-/// the entry's entire coverage as new. Its head votes are unaffected by that
-/// and are still counted, which is the whole point of tracking two axes: a body
-/// whose targets have all settled can still be the freshest fork-choice weight
-/// anyone has. Shares `ProjectedState::target_already_justified` with
-/// `entry_passes_filters` (`block_builder.rs`) rather than reimplementing the
-/// predicate, so the two cannot drift.
+/// Delegates entirely to `score_entry`, including its handling of a target the
+/// state transition has already justified: that target contributes no
+/// justification voters (its `justifications` entry was dropped on
+/// justification, so scoring it naively would credit the entire coverage as
+/// new) while its head votes still count. Not reimplemented here, so the
+/// proposer's verdict on an already-sealed candidate and the selector's verdict
+/// on a pool entry cannot drift.
+///
+/// Two axes rather than one because a body whose targets have all settled can
+/// still be the freshest fork-choice weight anyone has.
 fn count_body_voters(
     head_state: &State,
     body: &BlockBody,
@@ -426,13 +427,6 @@ fn count_body_voters(
 
     for attestation in body.attestations.iter() {
         let coverage: HashSet<u64> = validator_indices(&attestation.aggregation_bits).collect();
-
-        if projected.target_already_justified(&attestation.data) {
-            let new_head_voters = projected.new_head_voters(&attestation.data, &coverage);
-            counts.new_head_voters += new_head_voters.len();
-            projected.advance_head_votes(&attestation.data, new_head_voters);
-            continue;
-        }
 
         let Some((score, new_voters, new_head_voters)) =
             projected.score_entry(&attestation.data, &coverage, validator_count)

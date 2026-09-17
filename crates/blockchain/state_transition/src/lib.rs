@@ -970,6 +970,78 @@ mod tests {
         );
     }
 
+    /// A vote whose target is already justified must be SKIPPED, not rejected:
+    /// `is_valid_vote` returns `Ok(false)` and the loop does `continue`, so the
+    /// block carrying it still applies cleanly.
+    ///
+    /// The block builder relies on this. It deliberately packs such votes,
+    /// because they carry no justification value but still move LMD-GHOST
+    /// (`insert_signed_block` records every attestation a block carries as a
+    /// fork-choice vote, whatever this function decides). If the transition
+    /// ever started erroring here instead, every proposer packing a settled
+    /// target would produce blocks the network rejects.
+    #[test]
+    fn process_attestations_skips_an_already_justified_target_without_rejecting_the_block() {
+        const NUM_VALIDATORS: usize = 4;
+        let r1 = H256([1u8; 32]);
+        let r2 = H256([2u8; 32]);
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, 0, 1);
+        justified_slots_ops::set_justified(&mut justified_slots, 0, 1);
+
+        let mut state = State {
+            config: StateConfig { genesis_time: 0 },
+            slot: 3,
+            latest_block_header: BlockHeader {
+                slot: 2,
+                proposer_index: 0,
+                parent_root: r1,
+                state_root: H256::ZERO,
+                body_root: BlockBody::default().hash_tree_root(),
+            },
+            latest_justified: Checkpoint { slot: 1, root: r1 },
+            latest_finalized: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+            historical_block_hashes: SszList::try_from(vec![H256::ZERO, r1, r2]).unwrap(),
+            justified_slots,
+            validators: SszList::try_from(make_validators(NUM_VALIDATORS)).unwrap(),
+            justifications_roots: SszList::try_from(vec![]).unwrap(),
+            justifications_validators: JustificationValidators::new(),
+        };
+
+        // Target slot 1 is already justified above; source is genesis.
+        let vote = AggregatedAttestation {
+            aggregation_bits: make_bits(&[0, 1, 2], NUM_VALIDATORS),
+            data: AttestationData {
+                slot: 2,
+                head: Checkpoint { slot: 1, root: r1 },
+                target: Checkpoint { slot: 1, root: r1 },
+                source: Checkpoint {
+                    slot: 0,
+                    root: H256::ZERO,
+                },
+            },
+        };
+
+        let before = state.latest_justified;
+        let atts: AggregatedAttestations = vec![vote].try_into().unwrap();
+
+        process_attestations(&mut state, &atts)
+            .expect("an already-justified target is skipped, not an error");
+
+        assert_eq!(
+            state.latest_justified, before,
+            "the skipped vote must not move justification"
+        );
+        assert!(
+            state.justifications_roots.is_empty(),
+            "the skipped vote must not open a tally for a settled target"
+        );
+    }
+
     /// leanSpec #1178: `process_attestations` on a state with no validators is
     /// rejected with a typed error. Belt-and-suspenders: the header stage already
     /// rejects an empty registry first in the normal flow, but the flat-vote
