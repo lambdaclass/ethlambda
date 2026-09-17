@@ -14,13 +14,13 @@
 //! from gossip, and [`choose_body`] is how the slot's proposer picks one — or
 //! decides an empty body is worth more.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_state_transition::attestation_data_matches_chain;
 use ethlambda_storage::Store;
 use ethlambda_types::{
-    attestation::validator_indices,
+    attestation::{AttestationData, validator_indices},
     block::{
         Block, BlockBody, BlockBodyProof, ByteList512KiB, MultiMessageAggregate,
         MultiMessageAggregateError, SingleMessageAggregate,
@@ -65,16 +65,16 @@ pub(crate) fn build_body_proof(
     let aggregated_payloads = store.known_aggregated_payloads();
     let known_block_roots = store.get_block_roots().expect("block roots read works");
 
-    let (attestations, aggregates) = block_builder::select_and_compact(
-        &head_state,
-        slot,
-        parent_root,
-        &known_block_roots,
-        &aggregated_payloads,
-        config,
-    )
-    .inspect_err(|err| warn!(%slot, %err, "Failed to select attestations for a body proof"))
-    .ok()?;
+    let inputs = block_builder::ProposalInputs {
+        known_block_roots: &known_block_roots,
+        aggregated_payloads: &aggregated_payloads,
+        latest_head_votes: store.extract_latest_known_attestations(),
+    };
+
+    let (attestations, aggregates) =
+        block_builder::select_and_compact(&head_state, slot, parent_root, inputs, config)
+            .inspect_err(|err| warn!(%slot, %err, "Failed to select attestations for a body proof"))
+            .ok()?;
 
     if aggregates.is_empty() {
         trace!(%slot, "No attestations to build a body proof from");
@@ -183,16 +183,42 @@ pub(crate) struct ChosenBody {
 /// that the pre-state did not already have, then — all else equal — the
 /// smaller body.
 ///
-/// The new-voter term is what keeps a stale candidate out: its attestations
-/// are already reflected in the state, so it adds nothing and loses to the
-/// empty body it ties on checkpoints.
+/// The two voter terms are what keep a stale candidate out: its attestations
+/// are already reflected in the state and its votes are no validator's latest,
+/// so it adds nothing on either axis and loses to the empty body it ties on
+/// checkpoints.
+///
+/// `new_head_voters` sits directly after `new_voters`, matching
+/// `EntryScore::ordering_key`: it breaks a tie on justification value and never
+/// outranks it. Ordering the two this way is also what makes the body worth
+/// carrying at all when every target has settled — a body that justifies
+/// nothing but moves validators' latest head still beats an empty block.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct BodyValue {
     finalized_slot: u64,
     justified_slot: u64,
     new_voters: usize,
+    new_head_voters: usize,
     /// Negated so that fewer attestations sorts higher.
     fewer_attestations: isize,
+}
+
+/// What a candidate body adds on top of the head state, on the two axes a
+/// proposer cares about. Produced by [`count_body_voters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BodyVoters {
+    /// Validators the body adds toward justifying some target.
+    new_voters: usize,
+    /// Validators whose latest head vote the body would move.
+    new_head_voters: usize,
+}
+
+impl BodyVoters {
+    /// Whether the body adds nothing on either axis, and so is not worth
+    /// carrying or keeping buffered.
+    fn is_scoreless(&self) -> bool {
+        self.new_voters == 0 && self.new_head_voters == 0
+    }
 }
 
 /// Choose the body for a block at `slot` from the buffered candidates,
@@ -223,6 +249,7 @@ pub(crate) fn choose_body(
     proposer_index: u64,
     parent_root: H256,
     candidates: &BodyProofBuffer,
+    latest_head_votes: &HashMap<u64, AttestationData>,
 ) -> Result<ChosenBody, StoreError> {
     metrics::observe_body_proof_candidates(candidates.len());
 
@@ -239,6 +266,7 @@ pub(crate) fn choose_body(
         finalized_slot: empty_post.finalized.slot,
         justified_slot: empty_post.justified.slot,
         new_voters: 0,
+        new_head_voters: 0,
         fewer_attestations: 0,
     };
 
@@ -257,7 +285,7 @@ pub(crate) fn choose_body(
             metrics::inc_body_proof_rejected("off_chain_vote");
             continue;
         }
-        let new_voters = count_new_voters(head_state, &body, validator_count);
+        let voters = count_body_voters(head_state, &body, validator_count, latest_head_votes);
         let sealed = block_builder::seal_block(head_state, slot, proposer_index, parent_root, body);
         let (block, post) = match sealed {
             Ok(sealed) => sealed,
@@ -272,14 +300,16 @@ pub(crate) fn choose_body(
         let value = BodyValue {
             finalized_slot: post.finalized.slot,
             justified_slot: post.justified.slot,
-            new_voters,
+            new_voters: voters.new_voters,
+            new_head_voters: voters.new_head_voters,
             fewer_attestations: -(attestation_count as isize),
         };
         if value <= empty_value {
             trace!(
                 %slot,
                 attestation_count,
-                new_voters,
+                new_voters = voters.new_voters,
+                new_head_voters = voters.new_head_voters,
                 "Candidate body proof is worth no more than an empty body"
             );
             continue;
@@ -302,6 +332,7 @@ pub(crate) fn choose_body(
             %slot,
             attestation_count = block.body.attestations.len(),
             new_voters = value.new_voters,
+            new_head_voters = value.new_head_voters,
             justified_slot = value.justified_slot,
             finalized_slot = value.finalized_slot,
             from_gossip = !candidate.verified,
@@ -348,33 +379,51 @@ fn body_votes_on_chain(body: &BlockBody, chain_view: &[H256]) -> bool {
 
 /// Count the validators a body's attestations add on top of `head_state`.
 ///
-/// Uses the block builder's projection so the count means the same thing it
-/// does during selection: per target root, voters the running set does not
-/// already hold. Entries whose target is already justified are skipped: the
-/// state transition drops a justified target's `justifications` entry, so
-/// `score_entry` would otherwise see no prior voters at all and count the
-/// entry's entire coverage as new. Shares `ProjectedState::target_already_justified`
-/// with `entry_passes_filters` (`block_builder.rs`) rather than reimplementing the
+/// Uses the block builder's projection so the counts mean the same thing they
+/// do during selection: per target root, voters the running set does not
+/// already hold, and per validator, whether the vote would become their latest.
+///
+/// An entry whose target is already justified is skipped on the justification
+/// axis only: the state transition drops a justified target's `justifications`
+/// entry, so `score_entry` would otherwise see no prior voters at all and count
+/// the entry's entire coverage as new. Its head votes are unaffected by that
+/// and are still counted, which is the whole point of tracking two axes: a body
+/// whose targets have all settled can still be the freshest fork-choice weight
+/// anyone has. Shares `ProjectedState::target_already_justified` with
+/// `entry_passes_filters` (`block_builder.rs`) rather than reimplementing the
 /// predicate, so the two cannot drift.
-fn count_new_voters(head_state: &State, body: &BlockBody, validator_count: usize) -> usize {
-    let mut projected = block_builder::ProjectedState::from_head_state(head_state);
-    let mut total = 0usize;
+fn count_body_voters(
+    head_state: &State,
+    body: &BlockBody,
+    validator_count: usize,
+    latest_head_votes: &HashMap<u64, AttestationData>,
+) -> BodyVoters {
+    let mut projected = block_builder::ProjectedState::from_head_state(head_state)
+        .with_head_votes(latest_head_votes.clone());
+    let mut counts = BodyVoters::default();
 
     for attestation in body.attestations.iter() {
+        let coverage: HashSet<u64> = validator_indices(&attestation.aggregation_bits).collect();
+
         if projected.target_already_justified(&attestation.data) {
+            let new_head_voters = projected.new_head_voters(&attestation.data, &coverage);
+            counts.new_head_voters += new_head_voters.len();
+            projected.advance_head_votes(&attestation.data, new_head_voters);
             continue;
         }
-        let coverage: HashSet<u64> = validator_indices(&attestation.aggregation_bits).collect();
-        let Some((score, new_voters)) =
+
+        let Some((score, new_voters, new_head_voters)) =
             projected.score_entry(&attestation.data, &coverage, validator_count)
         else {
             continue;
         };
-        total += new_voters.len();
+        counts.new_voters += new_voters.len();
+        counts.new_head_voters += new_head_voters.len();
         projected.advance(score.tier, &attestation.data, new_voters);
+        projected.advance_head_votes(&attestation.data, new_head_voters);
     }
 
-    total
+    counts
 }
 
 /// Verify a candidate's aggregate against the body it claims to bind: one
@@ -457,17 +506,49 @@ impl BodyProofBuffer {
         }
     }
 
+    /// Drop every candidate that adds nothing on top of `head_state`: no voter
+    /// toward justifying a target, and no validator's latest head vote either.
+    /// Returns how many were dropped.
+    ///
+    /// Run after a block is imported, which is exactly when a candidate can
+    /// become worthless: importing a block folds its attestations into the
+    /// state and records them as latest votes (`record_known_attestation_votes`),
+    /// so a candidate carrying that same body now scores zero on both axes,
+    /// while one carrying genuinely newer votes survives.
+    ///
+    /// Age is deliberately not the criterion. The merge that produces a
+    /// candidate takes seconds, so candidates routinely arrive a slot late and
+    /// a slot-old candidate may still hold the newest votes anyone has. What
+    /// matters is whether it still adds something, which is what this measures.
+    ///
+    /// Without this the ring never empties, and a permanently full ring has two
+    /// costs: the proposer re-scores dead entries every slot, and
+    /// `PROPOSAL_CANDIDATE_GRACE` never fires, since it waits only on an empty
+    /// buffer.
+    pub(crate) fn prune_scoreless(
+        &mut self,
+        head_state: &State,
+        latest_head_votes: &HashMap<u64, AttestationData>,
+    ) -> usize {
+        let validator_count = head_state.validators.len();
+        let before = self.candidates.len();
+        self.candidates.retain(|candidate| {
+            !count_body_voters(
+                head_state,
+                &candidate.body_proof.block_body,
+                validator_count,
+                latest_head_votes,
+            )
+            .is_scoreless()
+        });
+        before - self.candidates.len()
+    }
+
     /// Candidates newest first.
     ///
-    /// Nothing is aged out by slot, and the buffer is never cleared on a tick.
-    /// Two reasons. A clear at an interval boundary races the batch it is
-    /// making room for, since our own worker's candidate can land either side
-    /// of it. And a candidate is not worthless for being a slot or two old:
-    /// the merge that produces one takes seconds, so candidates routinely
-    /// arrive a slot late, and while the blocks in between were empty their
-    /// votes are still the newest anyone has. What a stale candidate cannot do
-    /// is win: it adds no voters the state lacks, so `choose_body` scores it
-    /// below an empty body. The ring bound is what keeps this finite.
+    /// Nothing is aged out by slot: see [`BodyProofBuffer::prune_scoreless`]
+    /// for why value, not age, is what decides. The ring bound keeps this
+    /// finite between prunes.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &BodyProofCandidate> {
         self.candidates.iter()
     }
@@ -607,8 +688,59 @@ mod tests {
     }
 
     fn choose(candidates: &BodyProofBuffer) -> ChosenBody {
-        choose_body(&head_state(), BLOCK_SLOT, PROPOSER, head_root(), candidates)
-            .expect("sealing an empty body always works")
+        choose_body(
+            &head_state(),
+            BLOCK_SLOT,
+            PROPOSER,
+            head_root(),
+            candidates,
+            &HashMap::new(),
+        )
+        .expect("sealing an empty body always works")
+    }
+
+    /// Fork choice's latest-vote map, holding `data` for each of `voters`.
+    fn latest_votes(voters: &[u64], data: &AttestationData) -> HashMap<u64, AttestationData> {
+        voters.iter().map(|v| (*v, data.clone())).collect()
+    }
+
+    /// A state that already justified [`HEAD_SLOT`], its re-derived parent
+    /// root, and a vote targeting that settled slot.
+    fn already_justified_fixture() -> (State, H256, AggregatedAttestation) {
+        let mut state = head_state();
+        let finalized_slot = state.latest_finalized.slot;
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut state.justified_slots,
+            finalized_slot,
+            HEAD_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut state.justified_slots,
+            finalized_slot,
+            HEAD_SLOT,
+        );
+        let parent_root = head_root_of(&state);
+
+        let vote = AggregatedAttestation {
+            aggregation_bits: bits(&[0, 1]),
+            data: AttestationData {
+                slot: HEAD_SLOT,
+                head: Checkpoint {
+                    root: parent_root,
+                    slot: HEAD_SLOT,
+                },
+                target: Checkpoint {
+                    root: parent_root,
+                    slot: HEAD_SLOT,
+                },
+                source: Checkpoint {
+                    root: genesis_root(),
+                    slot: 0,
+                },
+            },
+        };
+
+        (state, parent_root, vote)
     }
 
     #[test]
@@ -660,65 +792,125 @@ mod tests {
     }
 
     /// A body whose only vote targets a slot the state already justified must
-    /// score `new_voters == 0` (the state transition's `is_valid_vote` would
+    /// score `new_voters == 0`: the state transition's `is_valid_vote` would
     /// skip that same vote via `continue`, and the justified target's
-    /// `current_votes` entry is gone, so without the fix the whole
-    /// aggregation bitfield would be miscounted as new) and must therefore
-    /// lose the tie to the empty body.
+    /// `current_votes` entry is gone, so without that guard the whole
+    /// aggregation bitfield would be miscounted as new.
+    ///
+    /// Only the justification axis is pinned here. What those votes are still
+    /// worth as fork-choice weight is the next two tests' question.
     #[test]
-    fn choose_body_ignores_a_candidate_whose_target_is_already_justified() {
-        let mut state = head_state();
-        let finalized_slot = state.latest_finalized.slot;
-        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
-            &mut state.justified_slots,
-            finalized_slot,
-            HEAD_SLOT,
-        );
-        ethlambda_state_transition::justified_slots_ops::set_justified(
-            &mut state.justified_slots,
-            finalized_slot,
-            HEAD_SLOT,
-        );
-        let parent_root = head_root_of(&state);
-
-        let vote = AggregatedAttestation {
-            aggregation_bits: bits(&[0, 1]),
-            data: AttestationData {
-                slot: HEAD_SLOT,
-                head: Checkpoint {
-                    root: parent_root,
-                    slot: HEAD_SLOT,
-                },
-                target: Checkpoint {
-                    root: parent_root,
-                    slot: HEAD_SLOT,
-                },
-                source: Checkpoint {
-                    root: genesis_root(),
-                    slot: 0,
-                },
-            },
-        };
-
+    fn already_justified_target_scores_no_new_justification_voters() {
+        let (state, _parent_root, vote) = already_justified_fixture();
         let body = BlockBody {
             attestations: vec![vote.clone()].try_into().unwrap(),
         };
-        assert_eq!(
-            count_new_voters(&state, &body, NUM_VALIDATORS),
-            0,
-            "a target the state already justified must not be credited as new"
+
+        let voters = count_body_voters(
+            &state,
+            &body,
+            NUM_VALIDATORS,
+            &latest_votes(&[0, 1], &vote.data),
         );
 
+        assert_eq!(
+            voters.new_voters, 0,
+            "a target the state already justified must not be credited as new"
+        );
+    }
+
+    /// The same body is still worth adopting while its votes are validators'
+    /// newest: the target has settled, but the head votes have not been seen.
+    /// This is the case that would otherwise leave the slot empty even though
+    /// the body carried the freshest fork-choice weight on the network.
+    #[test]
+    fn choose_body_adopts_an_already_justified_target_for_its_head_votes() {
+        let (state, parent_root, vote) = already_justified_fixture();
         let mut candidates = BodyProofBuffer::default();
         candidates.push_local(candidate(vec![vote]));
 
-        let chosen = choose_body(&state, BLOCK_SLOT, PROPOSER, parent_root, &candidates)
-            .expect("sealing an empty body always works");
+        let chosen = choose_body(
+            &state,
+            BLOCK_SLOT,
+            PROPOSER,
+            parent_root,
+            &candidates,
+            &HashMap::new(),
+        )
+        .expect("sealing an empty body always works");
+
+        assert!(
+            chosen.adopted,
+            "a settled target does not make the head votes worthless"
+        );
+    }
+
+    /// Once fork choice already holds those very votes — which is what a block
+    /// import does — the body adds nothing on either axis and loses to empty.
+    #[test]
+    fn choose_body_ignores_a_candidate_stale_on_both_axes() {
+        let (state, parent_root, vote) = already_justified_fixture();
+        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let mut candidates = BodyProofBuffer::default();
+        candidates.push_local(candidate(vec![vote]));
+
+        let chosen = choose_body(
+            &state,
+            BLOCK_SLOT,
+            PROPOSER,
+            parent_root,
+            &candidates,
+            &already_seen,
+        )
+        .expect("sealing an empty body always works");
 
         assert!(
             !chosen.adopted,
-            "a candidate whose only vote targets an already-justified slot must not beat the empty body"
+            "a candidate adding neither voters nor head votes must not beat the empty body"
         );
+    }
+
+    #[test]
+    fn prune_scoreless_drops_a_candidate_that_adds_nothing() {
+        let (state, _parent_root, vote) = already_justified_fixture();
+        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let mut buffer = BodyProofBuffer::default();
+        buffer.push_local(candidate(vec![vote]));
+
+        assert_eq!(buffer.prune_scoreless(&state, &already_seen), 1);
+        assert_eq!(buffer.len(), 0, "the ring must empty out, not stay full");
+    }
+
+    #[test]
+    fn prune_scoreless_keeps_a_candidate_whose_head_votes_are_new() {
+        let (state, _parent_root, vote) = already_justified_fixture();
+        let mut buffer = BodyProofBuffer::default();
+        buffer.push_local(candidate(vec![vote]));
+
+        assert_eq!(
+            buffer.prune_scoreless(&state, &HashMap::new()),
+            0,
+            "votes fork choice has not seen are still worth keeping"
+        );
+        assert_eq!(buffer.len(), 1);
+    }
+
+    /// The whole ring clears when every candidate has gone stale, which is what
+    /// lets `PROPOSAL_CANDIDATE_GRACE` fire again.
+    #[test]
+    fn prune_scoreless_empties_a_full_ring_of_stale_candidates() {
+        let (state, _parent_root, vote) = already_justified_fixture();
+        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let mut buffer = BodyProofBuffer::default();
+        for _ in 0..MAX_BODY_PROOF_CANDIDATES {
+            buffer.push_local(candidate(vec![vote.clone()]));
+        }
+        assert_eq!(buffer.len(), MAX_BODY_PROOF_CANDIDATES);
+
+        let dropped = buffer.prune_scoreless(&state, &already_seen);
+
+        assert_eq!(dropped, MAX_BODY_PROOF_CANDIDATES);
+        assert_eq!(buffer.len(), 0);
     }
 
     /// A target slot outside the projection's tracked `justified_slots`

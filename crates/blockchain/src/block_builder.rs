@@ -78,14 +78,8 @@ pub(crate) fn build_block(
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
 
-    let (attestations, aggregated_signatures) = select_and_compact(
-        head_state,
-        slot,
-        parent_root,
-        known_block_roots,
-        aggregated_payloads,
-        config,
-    )?;
+    let (attestations, aggregated_signatures) =
+        select_and_compact(head_state, slot, parent_root, inputs, config)?;
 
     let (final_block, post_checkpoints) = seal_block(
         head_state,
@@ -164,8 +158,7 @@ pub(crate) fn select_and_compact(
     head_state: &State,
     slot: u64,
     parent_root: H256,
-    known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    inputs: ProposalInputs<'_>,
     config: ProposerConfig,
 ) -> Result<(AggregatedAttestations, Vec<SingleMessageAggregate>), StoreError> {
     let select_start = Instant::now();
@@ -501,7 +494,11 @@ impl ProjectedState {
     ///
     /// A validator with no recorded vote counts as new: fork choice holds
     /// nothing for it, so this entry is the first weight it contributes.
-    fn new_head_voters(&self, att_data: &AttestationData, coverage: &HashSet<u64>) -> HashSet<u64> {
+    pub(crate) fn new_head_voters(
+        &self,
+        att_data: &AttestationData,
+        coverage: &HashSet<u64>,
+    ) -> HashSet<u64> {
         let Some(head_votes) = self.head_votes.as_ref() else {
             return HashSet::new();
         };

@@ -932,7 +932,16 @@ pub(crate) fn produce_block_from_candidates(
         });
     }
 
-    body_proof::choose_body(&head_state, slot, validator_index, head_root, candidates)
+    let latest_head_votes = store.extract_latest_known_attestations();
+
+    body_proof::choose_body(
+        &head_state,
+        slot,
+        validator_index,
+        head_root,
+        candidates,
+        &latest_head_votes,
+    )
 }
 
 /// Produce a block and per-aggregated-attestation signature payloads for the target slot.

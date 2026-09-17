@@ -869,7 +869,7 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
 ///
 /// - `insert_new_aggregated_payload` records the fork-choice votes before it
 ///   pushes the payload, and it records them with a max-merge
-///   (`should_replace_vote`) that gives the same map whatever order concurrent
+///   (`AttestationData::supersedes`) that gives the same map whatever order concurrent
 ///   writers arrive in. A promote landing in the middle moves votes from `new`
 ///   to `known` rather than dropping them, so the worst interleaving leaves the
 ///   vote or the payload to be promoted one tick later. Neither is lost.

@@ -339,8 +339,9 @@ pub struct BlockChainServer {
     aggregation_worker: Option<AggregationWorker>,
 
     /// Candidate bodies the proposer may adopt for the upcoming slot: what our
-    /// own worker built plus what arrived on gossip. Cleared once a proposal
-    /// has been assembled, since a body carries one slot's votes.
+    /// own worker built plus what arrived on gossip. Pruned after each block
+    /// import of whatever that block made worthless, rather than cleared on a
+    /// tick: see [`body_proof::BodyProofBuffer::prune_scoreless`].
     body_proof_candidates: BodyProofBuffer,
 
     /// Candidate body proofs the worker produced and we have not gossiped yet.
@@ -1048,10 +1049,46 @@ impl BlockChainServer {
         metrics::update_latest_finalized_slot(latest_finalized_slot);
         metrics::update_validators_count(self.key_manager.validator_ids().len() as u64);
 
+        self.prune_scoreless_body_proofs();
+
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
         Ok(())
+    }
+
+    /// Drop buffered candidate bodies that the block just imported made
+    /// worthless.
+    ///
+    /// Sits here rather than in `on_block` because the proposer's own block
+    /// reaches the store through `process_and_publish_block`, which never
+    /// enters the `on_block` cascade; this is the one point every successful
+    /// import passes through.
+    ///
+    /// Skipped while syncing: a node that is behind proposes nothing, so its
+    /// candidate buffer is not worth maintaining, and this keeps the scan off
+    /// the per-block backfill path.
+    fn prune_scoreless_body_proofs(&mut self) {
+        if !self.sync_status.duties_allowed() || self.body_proof_candidates.len() == 0 {
+            return;
+        }
+
+        let head_root = self.store.head().expect("head read works");
+        let Ok(Some(head_state)) = self.store.get_state(&head_root) else {
+            return;
+        };
+        let latest_head_votes = self.store.extract_latest_known_attestations();
+
+        let dropped = self
+            .body_proof_candidates
+            .prune_scoreless(&head_state, &latest_head_votes);
+        if dropped > 0 {
+            info!(
+                dropped,
+                remaining = self.body_proof_candidates.len(),
+                "Pruned candidate body proofs that add nothing to our state"
+            );
+        }
     }
 
     /// Process a newly received block.
