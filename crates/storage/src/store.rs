@@ -1512,12 +1512,6 @@ impl Store {
 
     // ============ Attestation Extraction ============
 
-    fn should_replace_vote(existing: &AttestationData, candidate: &AttestationData) -> bool {
-        candidate.slot > existing.slot
-            || (candidate.slot == existing.slot
-                && candidate.hash_tree_root() > existing.hash_tree_root())
-    }
-
     fn record_vote(
         votes: &mut HashMap<u64, AttestationData>,
         validator_id: u64,
@@ -1525,7 +1519,7 @@ impl Store {
     ) {
         let should_replace = votes
             .get(&validator_id)
-            .is_none_or(|existing| Self::should_replace_vote(existing, data));
+            .is_none_or(|existing| data.supersedes(existing));
         if should_replace {
             votes.insert(validator_id, data.clone());
         }

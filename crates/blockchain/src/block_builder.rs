@@ -98,8 +98,7 @@ pub(crate) fn build_block(
     slot: u64,
     proposer_index: u64,
     parent_root: H256,
-    known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    inputs: ProposalInputs<'_>,
     config: ProposerConfig,
 ) -> Result<(Block, Vec<SingleMessageAggregate>, PostBlockCheckpoints), StoreError> {
     info!(slot, proposer_index, "Building block");
@@ -109,8 +108,7 @@ pub(crate) fn build_block(
         head_state,
         slot,
         parent_root,
-        known_block_roots,
-        aggregated_payloads,
+        inputs,
         config.max_attestations_per_block,
     );
     metrics::observe_block_proposal_phase("select_payloads", select_start.elapsed());
@@ -183,10 +181,15 @@ fn select_attestations(
     head_state: &State,
     slot: u64,
     parent_root: H256,
-    known_block_roots: &HashSet<H256>,
-    aggregated_payloads: &HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    inputs: ProposalInputs<'_>,
     max_attestations_per_block: usize,
 ) -> Vec<(AggregatedAttestation, SingleMessageAggregate)> {
+    let ProposalInputs {
+        known_block_roots,
+        aggregated_payloads,
+        latest_head_votes,
+    } = inputs;
+
     let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
     if aggregated_payloads.is_empty() {
         return selected;
@@ -213,14 +216,15 @@ fn select_attestations(
     // Running per-target-root voter set, seeded from state and updated
     // incrementally as entries are selected. Mirrors the role of Eth2
     // participation flags in Prysm/Lighthouse-style packing.
-    let mut projected = ProjectedState::from_head_state(head_state);
+    let mut projected =
+        ProjectedState::from_head_state(head_state).with_head_votes(latest_head_votes);
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
     // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
     // (`on_block` rejects more), so the proposer-side limit never exceeds it.
     let max_rounds = max_attestations_per_block.min(MAX_ATTESTATIONS_DATA);
     for _round in 0..max_rounds {
-        let Some((data_root, score, new_voters)) =
+        let Some((data_root, score, new_voters, new_head_voters)) =
             pick_best_candidate(&chain, &processed_data_roots, &projected)
         else {
             trace!(
@@ -241,6 +245,7 @@ fn select_attestations(
         trace!(
             tier = ?score.tier,
             new_voters = score.new_voters,
+            new_head_voters = score.new_head_voters,
             target_slot = score.target_slot,
             target_root = %ShortRoot(&target_root.0),
             data_root = %ShortRoot(&data_root.0),
@@ -249,6 +254,7 @@ fn select_attestations(
         );
 
         projected.advance(score.tier, att_data, new_voters);
+        projected.advance_head_votes(att_data, new_head_voters);
     }
 
     selected
@@ -257,16 +263,17 @@ fn select_attestations(
 /// Scan candidate attestation entries and pick the highest-scoring one.
 ///
 /// Skips entries already processed, those failing `entry_passes_filters`
-/// (logging the reason), and those with zero new voters. Among remaining
-/// entries, returns `(data_root, score, new_voters)` for the entry with the
+/// (logging the reason), and those adding neither a justification voter nor a
+/// head vote. Among remaining entries, returns
+/// `(data_root, score, new_voters, new_head_voters)` for the entry with the
 /// best `EntryScore::ordering_key` (lower is better). Caller re-indexes
 /// `chain.aggregated_payloads[&data_root]` for `att_data` and `proofs`.
 fn pick_best_candidate(
     chain: &ChainContext<'_>,
     processed_data_roots: &HashSet<H256>,
     projected: &ProjectedState,
-) -> Option<(H256, EntryScore, HashSet<u64>)> {
-    let mut best: Option<(H256, EntryScore, HashSet<u64>)> = None;
+) -> Option<(H256, EntryScore, HashSet<u64>, HashSet<u64>)> {
+    let mut best: Option<(H256, EntryScore, HashSet<u64>, HashSet<u64>)> = None;
     let mut best_key: Option<OrderingKey> = None;
 
     for (data_root, (att_data, proofs)) in chain.aggregated_payloads {
@@ -286,7 +293,7 @@ fn pick_best_candidate(
             .iter()
             .flat_map(|proof| proof.participant_indices())
             .collect();
-        let Some((score, new_voters)) =
+        let Some((score, new_voters, new_head_voters)) =
             projected.score_entry(att_data, &coverage, chain.validator_count)
         else {
             trace_skipped_attestation("zero_new_voters", att_data, data_root);
@@ -295,12 +302,32 @@ fn pick_best_candidate(
 
         let candidate_key = score.ordering_key(*data_root);
         if best_key.as_ref().is_none_or(|k| candidate_key < *k) {
-            best = Some((*data_root, score, new_voters));
+            best = Some((*data_root, score, new_voters, new_head_voters));
             best_key = Some(candidate_key);
         }
     }
 
     best
+}
+
+/// What a proposer builds a block out of: the attestation pool plus the two
+/// pieces of node-local state used to filter and score it.
+///
+/// Grouped rather than passed as loose parameters because they travel together
+/// through every entry point here and are all sourced from the same `Store`
+/// read in `produce_block_with_signatures`.
+pub(crate) struct ProposalInputs<'a> {
+    /// Roots this node holds a block for. A vote naming an unknown head is not
+    /// packable, since the state transition could not resolve it.
+    pub(crate) known_block_roots: &'a HashSet<H256>,
+    /// The attestation pool: `data_root -> (data, proofs)`.
+    pub(crate) aggregated_payloads:
+        &'a HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
+    /// Per-validator latest head votes, as fork choice currently holds them.
+    ///
+    /// Owned because `Store::extract_latest_known_attestations` already returns
+    /// a clone, and the projection mutates it as entries are selected.
+    pub(crate) latest_head_votes: HashMap<u64, AttestationData>,
 }
 
 /// Static inputs to the attestation selection scan: the candidate pool and
@@ -327,6 +354,17 @@ pub(crate) struct ProjectedState {
     pub(crate) justified_slots: JustifiedSlots,
     pub(crate) finalized_slot: u64,
     pub(crate) current_votes: HashMap<H256, HashSet<u64>>,
+    /// Each validator's latest head vote as fork choice currently holds it,
+    /// advanced as entries are selected so a validator is not credited twice
+    /// across rounds.
+    ///
+    /// `None` turns head-vote scoring off entirely, which is not the same as
+    /// seeding an empty map: with no recorded vote every validator in an
+    /// entry's coverage reads as newly covered, so an empty map would score
+    /// every entry as maximally valuable and defeat the zero-value skip. The
+    /// aggregation worker leaves this `None` — it picks which group to prove,
+    /// not what a block carries, so head-vote value is not its question.
+    pub(crate) head_votes: Option<HashMap<u64, AttestationData>>,
 }
 
 impl ProjectedState {
@@ -338,7 +376,20 @@ impl ProjectedState {
             justified_slots: head_state.justified_slots.clone(),
             finalized_slot: head_state.latest_finalized.slot,
             current_votes: build_running_votes(head_state),
+            head_votes: None,
         }
+    }
+
+    /// Seed the per-validator latest head votes, so scoring can value an
+    /// entry for the fork-choice weight it adds and not only for the
+    /// justification voters it brings.
+    ///
+    /// Takes the map by value: `Store::extract_latest_known_attestations`
+    /// already hands out an owned clone, so there is nothing to gain by
+    /// borrowing it and the projection then owns what it mutates.
+    pub(crate) fn with_head_votes(mut self, head_votes: HashMap<u64, AttestationData>) -> Self {
+        self.head_votes = Some(head_votes);
+        self
     }
 
     /// Fold a selected entry into the projection: record its voters under the
@@ -383,15 +434,61 @@ impl ProjectedState {
         }
     }
 
+    /// Fold a selected entry's head votes into the projection, so the next
+    /// round does not credit the same validator for the same head again.
+    ///
+    /// Separate from [`ProjectedState::advance`] because that one is handed the
+    /// entry's *marginal justification* voters, which is a strictly smaller set
+    /// than the coverage whose head votes this entry carries. Folding head
+    /// votes there would silently under-credit them.
+    pub(crate) fn advance_head_votes(
+        &mut self,
+        att_data: &AttestationData,
+        new_head_voters: impl IntoIterator<Item = u64>,
+    ) {
+        let Some(head_votes) = self.head_votes.as_mut() else {
+            return;
+        };
+        for validator_id in new_head_voters {
+            head_votes.insert(validator_id, att_data.clone());
+        }
+    }
+
+    /// The subset of `coverage` whose latest head vote this entry would
+    /// replace, per the LMD-GHOST latest-message rule
+    /// ([`AttestationData::supersedes`]).
+    ///
+    /// A validator with no recorded vote counts as new: fork choice holds
+    /// nothing for it, so this entry is the first weight it contributes.
+    fn new_head_voters(&self, att_data: &AttestationData, coverage: &HashSet<u64>) -> HashSet<u64> {
+        let Some(head_votes) = self.head_votes.as_ref() else {
+            return HashSet::new();
+        };
+        coverage
+            .iter()
+            .copied()
+            .filter(|vid| {
+                head_votes
+                    .get(vid)
+                    .is_none_or(|existing| att_data.supersedes(existing))
+            })
+            .collect()
+    }
+
     /// Score a candidate entry from its realized validator `coverage` against
     /// this projection.
     ///
-    /// Returns `None` if `coverage` contributes zero validators relative to the
-    /// running voter set for `att_data.target.root` (no marginal value, drop).
-    /// On `Some`, the returned `HashSet` is the subset of `coverage` that is new
-    /// (caller uses it to `advance` the projection without re-scanning
-    /// `coverage`). A genesis self-vote cannot justify or finalize and is always
-    /// scored as tier 3.
+    /// Returns `None` only if the entry is worthless on *both* axes: it adds no
+    /// justification voter for `att_data.target.root` and no validator's head
+    /// vote either. An entry that adds head votes alone is kept, at
+    /// [`Tier::Build`], because its fork-choice weight is real even when its
+    /// target is already carried: dropping it is how a slot whose votes all
+    /// name a settled target ends up proposing nothing at all.
+    ///
+    /// On `Some`, the returned sets are the subsets of `coverage` that are new
+    /// on each axis, so the caller can `advance` and `advance_head_votes` the
+    /// projection without re-scanning `coverage`. A genesis self-vote cannot
+    /// justify or finalize and is always scored as tier 3.
     ///
     /// The caller resolves `coverage` and passes it in: block building unions a
     /// data's proof participants (see `pick_best_candidate`); committee-signature
@@ -403,7 +500,7 @@ impl ProjectedState {
         att_data: &AttestationData,
         coverage: &HashSet<u64>,
         validator_count: usize,
-    ) -> Option<(EntryScore, HashSet<u64>)> {
+    ) -> Option<(EntryScore, HashSet<u64>, HashSet<u64>)> {
         let prior_voters = self.current_votes.get(&att_data.target.root);
         let prior_count = prior_voters.map_or(0, HashSet::len);
 
@@ -412,7 +509,8 @@ impl ProjectedState {
             .copied()
             .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
             .collect();
-        if new_voters.is_empty() {
+        let new_head_voters = self.new_head_voters(att_data, coverage);
+        if new_voters.is_empty() && new_head_voters.is_empty() {
             return None;
         }
 
@@ -430,7 +528,10 @@ impl ProjectedState {
             && (att_data.source.slot + 1..att_data.target.slot)
                 .all(|s| !slot_is_justifiable_after(s, self.finalized_slot));
 
-        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 {
+        // An entry that adds no justification voter cannot move the target past
+        // the threshold, whatever `prior_count` already sits at, so it stays at
+        // `Build` regardless of `crosses_2_3` — it is here for its head votes.
+        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 || new_voters.is_empty() {
             Tier::Build
         } else if finalizes {
             Tier::Finalize
@@ -441,10 +542,11 @@ impl ProjectedState {
         let score = EntryScore {
             tier,
             new_voters: new_voters.len(),
+            new_head_voters: new_head_voters.len(),
             target_slot: att_data.target.slot,
             att_slot: att_data.slot,
         };
-        Some((score, new_voters))
+        Some((score, new_voters, new_head_voters))
     }
 
     /// Validate a candidate entry against the projection and the given chain
@@ -531,8 +633,8 @@ pub(crate) enum Tier {
 
 /// Tiered score for a candidate `AttestationData` entry during block building.
 ///
-/// Lower `tier` wins. Entries with zero new voters relative to the running
-/// per-target-root voter set are dropped (returned as `None`).
+/// Lower `tier` wins. Entries that add neither a justification voter nor a
+/// head vote are dropped (returned as `None`).
 ///
 /// The within-tier ordering is tier-dependent (leanSpec PR #1149):
 ///
@@ -544,11 +646,17 @@ pub(crate) enum Tier {
 ///   coverage leads: more `new_voters`, then larger `target_slot`, then larger
 ///   `att_slot`.
 ///
+/// `new_head_voters` sits immediately after `new_voters` in both tiers, so it
+/// breaks a tie on justification value and never outranks it. Two entries that
+/// bring the same justification voters are not equivalent: the one whose votes
+/// also move more validators' latest head is worth more to fork choice.
+///
 /// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryScore {
     pub(crate) tier: Tier,
     pub(crate) new_voters: usize,
+    pub(crate) new_head_voters: usize,
     /// Read only inside [`EntryScore::ordering_key`]; kept private.
     target_slot: u64,
     /// Read only inside [`EntryScore::ordering_key`]; kept private.
@@ -556,22 +664,31 @@ pub(crate) struct EntryScore {
 }
 
 /// Total order over candidate entries; the smallest value is the best pick.
-/// `tier` leads, then three tier-dependent `Reverse`-encoded priorities, then
+/// `tier` leads, then four tier-dependent `Reverse`-encoded priorities, then
 /// `data_root` as the deterministic tiebreak. See [`EntryScore::ordering_key`].
-pub(crate) type OrderingKey = (Tier, Reverse<u64>, Reverse<u64>, Reverse<u64>, H256);
+pub(crate) type OrderingKey = (
+    Tier,
+    Reverse<u64>,
+    Reverse<u64>,
+    Reverse<u64>,
+    Reverse<u64>,
+    H256,
+);
 
 impl EntryScore {
     /// Sort key where the smallest tuple is the best candidate. `tier` always
-    /// leads; the remaining three slots carry tier-dependent priorities (see
+    /// leads; the remaining four slots carry tier-dependent priorities (see
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
     pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
         let more_new_voters = Reverse(self.new_voters as u64);
+        let more_new_head_voters = Reverse(self.new_head_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
         match self.tier {
             Tier::Build => (
                 self.tier,
                 more_new_voters,
+                more_new_head_voters,
                 newer_target,
                 newer_att,
                 data_root,
@@ -581,6 +698,7 @@ impl EntryScore {
                 newer_target,
                 newer_att,
                 more_new_voters,
+                more_new_head_voters,
                 data_root,
             ),
         }
@@ -1056,9 +1174,10 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: FINALIZED_SLOT,
             current_votes: HashMap::new(),
+            head_votes: None,
         };
 
-        let (score, _) = projected
+        let (score, _, _) = projected
             .score_entry(&att_data, &coverage, NUM_VALIDATORS)
             .expect("entry contributes new voters");
 
@@ -1066,6 +1185,187 @@ mod tests {
             score.tier,
             Tier::Justify,
             "source at the finalized boundary must justify, not finalize"
+        );
+    }
+
+    /// An entry scored against a projection whose head votes were never seeded
+    /// must report zero new head voters.
+    ///
+    /// This is the guard for the aggregation worker, which shares this scorer
+    /// but leaves `head_votes` at `None`. Seeding an empty map instead would
+    /// make every validator in coverage read as newly covered, so every entry
+    /// would score as valuable and `score_entry` would stop returning `None` —
+    /// silently disabling the worker's zero-value skip.
+    #[test]
+    fn head_vote_scoring_is_off_when_the_map_is_not_seeded() {
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::from([(H256::ZERO, HashSet::from([0, 1, 2]))]),
+            head_votes: None,
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+
+        assert!(
+            projected
+                .score_entry(&make_att_data(5), &coverage, 4)
+                .is_none(),
+            "an unseeded projection must fall back to justification-only scoring"
+        );
+    }
+
+    /// A vote whose target is fully covered still carries fork-choice weight,
+    /// so it is kept at `Build` rather than dropped.
+    #[test]
+    fn score_entry_keeps_an_entry_that_only_adds_head_votes() {
+        let att_data = AttestationData {
+            slot: 9,
+            head: Checkpoint {
+                slot: 8,
+                root: H256([8u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 6,
+                root: H256([6u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+
+        // Every voter already counted toward this target, so there is no
+        // justification value left; their recorded head vote is older.
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::from([(att_data.target.root, coverage.clone())]),
+            head_votes: Some(HashMap::from([
+                (0, make_att_data(4)),
+                (1, make_att_data(4)),
+                (2, make_att_data(4)),
+            ])),
+        };
+
+        let (score, new_voters, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, 4)
+            .expect("an entry that only moves heads is still worth carrying");
+
+        assert!(
+            new_voters.is_empty(),
+            "the target was already fully covered"
+        );
+        assert_eq!(new_head_voters.len(), 3);
+        assert_eq!(score.new_head_voters, 3);
+        assert_eq!(
+            score.tier,
+            Tier::Build,
+            "an entry adding no justification voter cannot justify, whatever \
+             the prior count"
+        );
+    }
+
+    /// Worthless on both axes: already counted for the target, and every voter
+    /// already holds a newer head vote.
+    #[test]
+    fn score_entry_drops_an_entry_that_adds_neither_voters_nor_head_votes() {
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::from([(H256::ZERO, coverage.clone())]),
+            head_votes: Some(HashMap::from([
+                (0, make_att_data(9)),
+                (1, make_att_data(9)),
+                (2, make_att_data(9)),
+            ])),
+        };
+
+        assert!(
+            projected
+                .score_entry(&make_att_data(5), &coverage, 4)
+                .is_none(),
+            "a vote older than what fork choice already holds adds nothing"
+        );
+    }
+
+    /// Credited head votes do not count twice across selection rounds, and a
+    /// genuinely newer vote still does.
+    #[test]
+    fn advance_head_votes_prevents_double_counting_across_rounds() {
+        let mut projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_votes: Some(HashMap::new()),
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1]);
+        let first = make_att_data(5);
+
+        let credited = projected.new_head_voters(&first, &coverage);
+        assert_eq!(
+            credited.len(),
+            2,
+            "no recorded vote means every voter is new"
+        );
+
+        projected.advance_head_votes(&first, credited);
+        assert!(
+            projected.new_head_voters(&first, &coverage).is_empty(),
+            "the same entry must not be credited a second time"
+        );
+        assert_eq!(
+            projected
+                .new_head_voters(&make_att_data(6), &coverage)
+                .len(),
+            2,
+            "a later slot still supersedes what this block already credited"
+        );
+    }
+
+    /// Head votes break a tie on justification voters, and never outrank them.
+    #[test]
+    fn head_votes_break_a_tie_on_justification_voters() {
+        let root = H256::ZERO;
+        let base = EntryScore {
+            tier: Tier::Build,
+            new_voters: 3,
+            new_head_voters: 1,
+            target_slot: 5,
+            att_slot: 7,
+        };
+        let more_head = EntryScore {
+            new_head_voters: 2,
+            ..base
+        };
+        let more_voters = EntryScore {
+            new_voters: 4,
+            new_head_voters: 0,
+            ..base
+        };
+
+        assert!(
+            more_head.ordering_key(root) < base.ordering_key(root),
+            "with justification voters tied, more head votes must win"
+        );
+        assert!(
+            more_voters.ordering_key(root) < more_head.ordering_key(root),
+            "head votes must not outrank justification voters"
+        );
+
+        // Same rule in the Justify arm, where new_voters sits later in the key.
+        let justify = EntryScore {
+            tier: Tier::Justify,
+            ..base
+        };
+        let justify_more_head = EntryScore {
+            new_head_voters: 2,
+            ..justify
+        };
+        assert!(
+            justify_more_head.ordering_key(root) < justify.ordering_key(root),
+            "the Justify arm must break its new_voters tie on head votes too"
         );
     }
 
@@ -1191,8 +1491,11 @@ mod tests {
             slot,
             proposer_index,
             parent_root,
-            &known_block_roots,
-            &aggregated_payloads,
+            ProposalInputs {
+                known_block_roots: &known_block_roots,
+                aggregated_payloads: &aggregated_payloads,
+                latest_head_votes: HashMap::new(),
+            },
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
@@ -1337,8 +1640,11 @@ mod tests {
                 slot,
                 proposer_index,
                 parent_root,
-                &known_block_roots,
-                &aggregated_payloads,
+                ProposalInputs {
+                    known_block_roots: &known_block_roots,
+                    aggregated_payloads: &aggregated_payloads,
+                    latest_head_votes: HashMap::new(),
+                },
                 ProposerConfig {
                     enable_proposer_aggregation: false,
                     max_attestations_per_block: limit,
@@ -1463,8 +1769,11 @@ mod tests {
             slot,
             proposer_index,
             parent_root,
-            &known_block_roots,
-            &aggregated_payloads,
+            ProposalInputs {
+                known_block_roots: &known_block_roots,
+                aggregated_payloads: &aggregated_payloads,
+                latest_head_votes: HashMap::new(),
+            },
             ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
@@ -1769,8 +2078,11 @@ mod tests {
             slot,
             proposer_index,
             parent_root,
-            &known_block_roots,
-            &aggregated_payloads,
+            ProposalInputs {
+                known_block_roots: &known_block_roots,
+                aggregated_payloads: &aggregated_payloads,
+                latest_head_votes: HashMap::new(),
+            },
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,
@@ -1905,8 +2217,11 @@ mod tests {
             slot,
             proposer_index,
             parent_root,
-            &known_block_roots,
-            &aggregated_payloads,
+            ProposalInputs {
+                known_block_roots: &known_block_roots,
+                aggregated_payloads: &aggregated_payloads,
+                latest_head_votes: HashMap::new(),
+            },
             ProposerConfig {
                 enable_proposer_aggregation: true,
                 max_attestations_per_block: MAX_ATTESTATIONS_DATA,

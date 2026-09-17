@@ -523,7 +523,10 @@ fn pick_best_candidate(
             continue;
         }
 
-        let Some((score, _new_voters)) =
+        // Head votes are not scored here: the worker's projection leaves
+        // `head_votes` at `None`, so `new_head_voters` is always empty and the
+        // zero-new-voters skip below keeps its original meaning.
+        let Some((score, _new_voters, _new_head_voters)) =
             projected.score_entry(att_data, &candidate.coverage(), validator_count)
         else {
             trace_skipped_candidate("zero_new_voters", att_data, data_root);
@@ -2016,6 +2019,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_votes: None,
         };
 
         let (picked_root, score) = pick_best_candidate(
@@ -2108,6 +2112,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_votes: None,
         };
 
         // Round 1: A (6 new voters) outranks B (2 new voters); both Build tier.
