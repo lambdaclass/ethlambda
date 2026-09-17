@@ -394,10 +394,16 @@ pub(crate) struct ProjectedState {
     ///
     /// `None` turns head-vote scoring off entirely, which is not the same as
     /// seeding an empty map: with no recorded vote every validator in an
-    /// entry's coverage reads as newly covered, so an empty map would score
-    /// every entry as maximally valuable and defeat the zero-value skip. The
-    /// aggregation worker leaves this `None` — it picks which group to prove,
-    /// not what a block carries, so head-vote value is not its question.
+    /// entry's coverage reads as newly covered, so an empty map scores every
+    /// entry as maximally valuable. That is the right answer when the map is
+    /// genuinely empty (fork choice holds nothing, so every vote is the first
+    /// weight its validator contributes) and the wrong one as a stand-in for
+    /// "not scoring head votes here", which is what `None` is for.
+    ///
+    /// Both production callers seed it. It stays optional because the scoring
+    /// tests construct projections directly, and because a caller that only
+    /// wants justification scoring should have to say so rather than pass an
+    /// empty map and get the opposite.
     pub(crate) head_votes: Option<HashMap<u64, AttestationData>>,
 }
 
@@ -513,6 +519,34 @@ impl ProjectedState {
             .collect()
     }
 
+    /// Whether `att_data`'s target is already justified in this projection.
+    ///
+    /// Shared by `score_entry` (selection) and `body_proof::count_body_voters`
+    /// (scoring an already-sealed candidate) so the two cannot drift: a target the
+    /// state transition has already justified is dropped from `justifications` on
+    /// justification (`state_transition::lib`), so `current_votes` holds no prior-voter
+    /// entry for it and scoring would otherwise count its entire coverage as new.
+    ///
+    /// Note this is NOT a filter. `entry_passes_filters` deliberately admits a
+    /// settled target, since its votes still carry fork-choice weight; what this
+    /// predicate decides is that they carry no justification value.
+    ///
+    /// An untracked target slot (commonly the head block's own slot, or any slot past
+    /// the head-seeded window's edge) is not yet justified as far as this projection
+    /// knows, so it stays eligible: `is_slot_justified` returning `None` reads as
+    /// "not justified", not "unknown". Exempt: the genesis self-vote (source == target
+    /// == slot 0), which fork-choice bootstrapping needs even though its target is
+    /// trivially "justified".
+    pub(crate) fn target_already_justified(&self, att_data: &AttestationData) -> bool {
+        !is_genesis_self_vote(att_data)
+            && justified_slots_ops::is_slot_justified(
+                &self.justified_slots,
+                self.finalized_slot,
+                att_data.target.slot,
+            )
+            .unwrap_or(false)
+    }
+
     /// Score a candidate entry from its realized validator `coverage` against
     /// this projection.
     ///
@@ -539,14 +573,30 @@ impl ProjectedState {
         coverage: &HashSet<u64>,
         validator_count: usize,
     ) -> Option<(EntryScore, HashSet<u64>, HashSet<u64>)> {
-        let prior_voters = self.current_votes.get(&att_data.target.root);
-        let prior_count = prior_voters.map_or(0, HashSet::len);
+        // A settled target contributes no justification voters, whatever its
+        // coverage. Scoring it normally would credit the whole bitfield as new:
+        // the state transition drops a justified target's `justifications`
+        // entry, so `current_votes` holds no prior voters for it and every
+        // participant would read as marginal. The entry survives on its head
+        // votes alone, at `Build` tier.
+        let target_settled = self.target_already_justified(att_data);
 
-        let new_voters: HashSet<u64> = coverage
-            .iter()
-            .copied()
-            .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
-            .collect();
+        let prior_voters = self.current_votes.get(&att_data.target.root);
+        let prior_count = if target_settled {
+            0
+        } else {
+            prior_voters.map_or(0, HashSet::len)
+        };
+
+        let new_voters: HashSet<u64> = if target_settled {
+            HashSet::new()
+        } else {
+            coverage
+                .iter()
+                .copied()
+                .filter(|vid| prior_voters.is_none_or(|prior| !prior.contains(vid)))
+                .collect()
+        };
         let new_head_voters = self.new_head_voters(att_data, coverage);
         if new_voters.is_empty() && new_head_voters.is_empty() {
             return None;
@@ -590,15 +640,19 @@ impl ProjectedState {
     /// Validate a candidate entry against the projection and the given chain
     /// view.
     ///
-    /// Mirrors `state_transition::is_valid_vote`: the entry's head must be
-    /// known, its source must be justified, its (source, target) must match
-    /// the candidate-block chain view, `target.slot > source.slot`, target
-    /// must not already be justified, and target must be a justifiable slot
-    /// relative to the projected finalized slot. The genesis self-vote
-    /// (source == target == slot 0) is exempt from the `target.slot >
-    /// source.slot` and `target_already_justified` checks since fork-choice
-    /// bootstrapping needs it; STF will silently drop it, but it carries
-    /// fork-choice signal.
+    /// Narrower than `state_transition::is_valid_vote`: the entry's head must
+    /// be known, its source must be justified, its (source, target) must match
+    /// the candidate-block chain view, `target.slot > source.slot`, and target
+    /// must be a justifiable slot relative to the projected finalized slot.
+    ///
+    /// Deliberately does NOT reject an already-justified target, though
+    /// `is_valid_vote` skips one: that vote still carries fork-choice weight,
+    /// so it is scored rather than filtered (see the note at that check, and
+    /// [`ProjectedState::score_entry`]).
+    ///
+    /// The genesis self-vote (source == target == slot 0) is exempt from the
+    /// `target.slot > source.slot` check since fork-choice bootstrapping needs
+    /// it; STF will silently drop it, but it carries fork-choice signal.
     pub(crate) fn entry_passes_filters(
         &self,
         att_data: &AttestationData,
@@ -630,39 +684,27 @@ impl ProjectedState {
         if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
             return Err("target_not_after_source");
         }
-        if self.target_already_justified(att_data) {
-            return Err("target_already_justified");
-        }
+        // An already-justified target is deliberately NOT rejected here.
+        //
+        // The state transition skips such a vote without rejecting the block
+        // (`is_valid_vote` returns `Ok(false)` and `process_attestations` does
+        // `continue`), while `insert_signed_block` records every attestation a
+        // block carries as a fork-choice vote regardless of that verdict. So
+        // the vote is worthless for justification and still valuable for
+        // LMD-GHOST. That is a question of value, not validity, and it is
+        // answered in `score_entry`, which zeroes the justification axis for a
+        // settled target and keeps its head-vote value.
+        //
+        // Rejecting it here is what left a slot whose votes all name a settled
+        // target with nothing to propose: on devnet-5 the justifiable rungs sit
+        // 3 slots apart, so two slots in every three had every pooled entry
+        // dropped at this line and built no candidate body at all.
         if !is_genesis_self_vote
             && !slot_is_justifiable_after(att_data.target.slot, self.finalized_slot)
         {
             return Err("target_not_justifiable");
         }
         Ok(())
-    }
-
-    /// Whether `att_data`'s target is already justified in this projection.
-    ///
-    /// Shared by `entry_passes_filters` (selection) and `body_proof::count_new_voters`
-    /// (scoring an already-sealed candidate) so the two cannot drift: a target the
-    /// state transition has already justified is dropped from `justifications` on
-    /// justification (`state_transition::lib`), so `current_votes` holds no prior-voter
-    /// entry for it and `score_entry` would otherwise count its entire coverage as new.
-    ///
-    /// An untracked target slot (commonly the head block's own slot, or any slot past
-    /// the head-seeded window's edge) is not yet justified as far as this projection
-    /// knows, so it stays eligible: `is_slot_justified` returning `None` reads as
-    /// "not justified", not "unknown". Exempt: the genesis self-vote (source == target
-    /// == slot 0), which fork-choice bootstrapping needs even though its target is
-    /// trivially "justified".
-    pub(crate) fn target_already_justified(&self, att_data: &AttestationData) -> bool {
-        !is_genesis_self_vote(att_data)
-            && justified_slots_ops::is_slot_justified(
-                &self.justified_slots,
-                self.finalized_slot,
-                att_data.target.slot,
-            )
-            .unwrap_or(false)
     }
 }
 
@@ -1151,11 +1193,11 @@ mod tests {
     /// An entry scored against a projection whose head votes were never seeded
     /// must report zero new head voters.
     ///
-    /// This is the guard for the aggregation worker, which shares this scorer
-    /// but leaves `head_votes` at `None`. Seeding an empty map instead would
-    /// make every validator in coverage read as newly covered, so every entry
-    /// would score as valuable and `score_entry` would stop returning `None` —
-    /// silently disabling the worker's zero-value skip.
+    /// `None` must mean "do not score head votes", not "an empty map": with no
+    /// recorded vote every validator in coverage reads as newly covered, so an
+    /// empty map scores every entry as maximally valuable and `score_entry`
+    /// stops returning `None`. A caller wanting justification-only scoring has
+    /// to be able to say so without accidentally getting the opposite.
     #[test]
     fn head_vote_scoring_is_off_when_the_map_is_not_seeded() {
         let projected = ProjectedState {
@@ -1281,6 +1323,114 @@ mod tests {
                 .len(),
             2,
             "a later slot still supersedes what this block already credited"
+        );
+    }
+
+    /// A settled target is no longer filtered out, and is scored with its
+    /// justification axis zeroed: its coverage must NOT be credited as new
+    /// voters just because the state transition dropped its `justifications`
+    /// entry on justification.
+    #[test]
+    fn score_entry_zeroes_the_justification_axis_for_a_settled_target() {
+        const FINALIZED_SLOT: u64 = 0;
+        const TARGET_SLOT: u64 = 3;
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, FINALIZED_SLOT, TARGET_SLOT);
+        justified_slots_ops::set_justified(&mut justified_slots, FINALIZED_SLOT, TARGET_SLOT);
+
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint {
+                slot: 4,
+                root: H256([4u8; 32]),
+            },
+            target: Checkpoint {
+                slot: TARGET_SLOT,
+                root: H256([3u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 1,
+                root: H256([1u8; 32]),
+            },
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2, 3]);
+
+        let projected = ProjectedState {
+            justified_slots,
+            finalized_slot: FINALIZED_SLOT,
+            // Empty, exactly as it is after the transition drops a justified
+            // target's tally. Without the settled-target guard the whole
+            // coverage would read as new.
+            current_votes: HashMap::new(),
+            head_votes: Some(HashMap::new()),
+        };
+
+        let (score, new_voters, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, 4)
+            .expect("head votes keep the entry alive");
+
+        assert!(
+            new_voters.is_empty(),
+            "a settled target must credit no justification voters"
+        );
+        assert_eq!(score.new_voters, 0);
+        assert_eq!(new_head_voters.len(), 4, "its head votes are still new");
+        assert_eq!(
+            score.tier,
+            Tier::Build,
+            "it cannot justify, so it must not be tiered as if it could"
+        );
+    }
+
+    /// The filter must let a settled target through, since the state transition
+    /// skips such a vote without rejecting the block while still recording it
+    /// as a fork-choice vote. Rejecting it here is what left slots whose votes
+    /// all named a settled target with no candidate body at all.
+    #[test]
+    fn entry_passes_filters_admits_an_already_justified_target() {
+        const FINALIZED_SLOT: u64 = 0;
+        const TARGET_SLOT: u64 = 2;
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, FINALIZED_SLOT, TARGET_SLOT);
+        justified_slots_ops::set_justified(&mut justified_slots, FINALIZED_SLOT, TARGET_SLOT);
+        // Source at slot 1 must read as justified for the filter to get past it.
+        justified_slots_ops::set_justified(&mut justified_slots, FINALIZED_SLOT, 1);
+
+        let roots: Vec<H256> = (0..4u8).map(|i| H256([i + 1; 32])).collect();
+        let att_data = AttestationData {
+            slot: 3,
+            head: Checkpoint {
+                slot: TARGET_SLOT,
+                root: roots[TARGET_SLOT as usize],
+            },
+            target: Checkpoint {
+                slot: TARGET_SLOT,
+                root: roots[TARGET_SLOT as usize],
+            },
+            source: Checkpoint {
+                slot: 1,
+                root: roots[1],
+            },
+        };
+
+        let projected = ProjectedState {
+            justified_slots,
+            finalized_slot: FINALIZED_SLOT,
+            current_votes: HashMap::new(),
+            head_votes: None,
+        };
+        let known: HashSet<H256> = roots.iter().copied().collect();
+
+        assert!(
+            projected.target_already_justified(&att_data),
+            "fixture must actually have a settled target"
+        );
+        assert_eq!(
+            projected.entry_passes_filters(&att_data, &known, &roots),
+            Ok(()),
+            "a settled target is a scoring question, not a validity one"
         );
     }
 
