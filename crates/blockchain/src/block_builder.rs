@@ -16,7 +16,7 @@ use std::{
 };
 
 use ethlambda_crypto::{
-    AggregationError, aggregate_proofs, aggregate_signatures, merge_type_1s_into_type_2,
+    AggregationError, SignerSet, aggregate_proofs, aggregate_signatures, merge_type_1s_into_type_2,
     signature::{SignatureParseError, ValidatorPublicKey, ValidatorSignature},
 };
 use ethlambda_state_transition::{
@@ -918,6 +918,13 @@ pub enum SealError {
     ProposerSignature(SignatureParseError),
     #[error("failed to resolve participant pubkeys: {0}")]
     Participants(#[from] StoreError),
+    #[error("proof list holds {aggregates} entries but the block body declares {attestations}")]
+    AggregateCountMismatch {
+        aggregates: usize,
+        attestations: usize,
+    },
+    #[error("attestation slot {0} out of range")]
+    AttestationSlotOutOfRange(u64),
     #[error("failed to wrap proposer signature as single-message aggregate: {0}")]
     Wrap(AggregationError),
     #[error("failed to merge single-message aggregates into a multi-message aggregate: {0}")]
@@ -934,9 +941,9 @@ pub enum SealError {
 /// `single_message_aggregates` are the proofs `build_block` returned alongside
 /// `block`, in the same order as `block.body.attestations`; they are consumed
 /// so their proof bytes move into the merge instead of being copied.
-/// Per-component participants are rederived at verify time from those
-/// attestations' `aggregation_bits` plus `block.proposer_index`, so nothing
-/// else needs persisting.
+/// Per-component claims (message, slot and participants) are rederived at
+/// verify time from `block.body.attestations[i]` plus `block.proposer_index`,
+/// so nothing else needs persisting.
 ///
 /// Each step is observed on the block-proposal phase histogram under
 /// [`metrics::BLOCK_PROPOSAL_SEAL_PHASES`].
@@ -977,12 +984,33 @@ pub fn seal_block(
     .map_err(SealError::Wrap)?;
     metrics::observe_block_proposal_phase("wrap_proposer", wrap_start.elapsed());
 
-    let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len() + 1);
-    for sma in single_message_aggregates {
-        let pubkeys = resolve_attestation_pubkeys(validators, &sma)?;
-        merge_inputs.push((pubkeys, sma.proof));
+    // Each merge input pairs the proof bytes with the claim its Type-1 binds:
+    // the message, the slot, and the participants' keys. Nothing of that is on
+    // the wire, so `single_message_aggregates` being ordered to match
+    // `block.body.attestations` is what recovers the claim for each proof.
+    // Checked rather than assumed: zipping two lists of different lengths would
+    // build a proof covering fewer claims than the body declares, which only
+    // surfaces at import.
+    let attestations = &block.body.attestations;
+    if single_message_aggregates.len() != attestations.len() {
+        return Err(SealError::AggregateCountMismatch {
+            aggregates: single_message_aggregates.len(),
+            attestations: attestations.len(),
+        });
     }
-    merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
+
+    let mut merge_inputs = Vec::with_capacity(single_message_aggregates.len() + 1);
+    for (attestation, sma) in attestations.iter().zip(single_message_aggregates) {
+        let pubkeys = resolve_attestation_pubkeys(validators, &sma)?;
+        let attestation_slot = u32::try_from(attestation.data.slot)
+            .map_err(|_| SealError::AttestationSlotOutOfRange(attestation.data.slot))?;
+        let claim = SignerSet::new(attestation.data.hash_tree_root(), attestation_slot, pubkeys);
+        merge_inputs.push((claim, sma.proof));
+    }
+    merge_inputs.push((
+        SignerSet::new(block_root, slot, vec![proposer_pubkey]),
+        proposer_proof_bytes,
+    ));
 
     let merge_start = Instant::now();
     let merged_bytes = merge_type_1s_into_type_2(merge_inputs).map_err(SealError::Merge)?;
@@ -1095,8 +1123,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1209,7 +1237,7 @@ mod tests {
         );
 
         // Substitute a worst-case-size proof to model what `propose_block`
-        // would attach. The actual SNARK can't be built without lean-multisig,
+        // would attach. The actual SNARK can't be built without leanVM,
         // but the size cap (`ByteList512KiB`) bounds the worst case.
         let _ = signatures;
         let proof = MultiMessageAggregate::new(
@@ -1255,8 +1283,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1384,8 +1412,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1688,8 +1716,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();
@@ -1815,8 +1843,8 @@ mod tests {
 
         let validators: Vec<_> = (0..NUM_VALIDATORS)
             .map(|i| ethlambda_types::state::Validator {
-                attestation_pubkey: [i as u8; 52],
-                proposal_pubkey: [i as u8; 52],
+                attestation_pubkey: [i as u8; 32],
+                proposal_pubkey: [i as u8; 32],
                 index: i as u64,
             })
             .collect();

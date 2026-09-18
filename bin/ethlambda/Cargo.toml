@@ -59,6 +59,8 @@ libc.workspace = true
 # tests would otherwise wait out the real retry backoff. Dev-only, so the
 # feature never reaches the shipped binary.
 tokio = { workspace = true, features = ["test-util"] }
+# Keygen writes a directory of key files and the benchmark corpus writes a
+# key set, so their tests need a throwaway directory.
 tempfile = "3"
 
 [build-dependencies]
