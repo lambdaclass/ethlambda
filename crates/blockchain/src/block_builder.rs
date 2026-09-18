@@ -508,8 +508,9 @@ impl ProjectedState {
     /// replace, per the LMD-GHOST latest-message rule
     /// ([`AttestationData::supersedes`]).
     ///
-    /// A validator with no recorded vote counts as new: fork choice holds
-    /// nothing for it, so this entry is the first weight it contributes.
+    /// Measured against the votes the CHAIN already carries, so a validator
+    /// with no entry counts as new: no block has carried a vote for it, so this
+    /// entry is the first weight it would contribute on chain.
     pub(crate) fn new_head_voters(
         &self,
         att_data: &AttestationData,

@@ -40,10 +40,12 @@ impl AttestationData {
     ///
     /// The LMD-GHOST latest-message rule: the later slot wins, and a tie is
     /// broken by data root. Breaking the tie on a total order rather than on
-    /// arrival matters because the latest-vote map is written from more than
+    /// arrival matters because the seen-votes map is written from more than
     /// one place (block import, gossip payload insertion, the aggregation
     /// worker), so an order-dependent rule would let two nodes that saw the
-    /// same votes in different orders disagree about the head.
+    /// same votes in different orders disagree about the head. The on-chain
+    /// vote map is the exception, written only on block import, and relies on
+    /// the same total order to stay independent of import interleaving.
     ///
     /// Lives here rather than beside fork choice because the vote map is
     /// maintained in the storage layer, which does not depend on the fork
