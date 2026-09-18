@@ -2741,7 +2741,7 @@ mod tests {
         );
 
         assert!(
-            select_best_job(&store, 999, JobPolicy::Open).is_some(),
+            select_best_job(&store, 999, JobPolicy::Open, vacuous_window_config()).is_some(),
             "a vote the chain does not carry is still worth proving, however \
              many times this node has already seen it"
         );
@@ -2835,7 +2835,7 @@ mod tests {
         );
 
         assert!(
-            select_best_job(&store, 999, JobPolicy::Open).is_none(),
+            select_best_job(&store, 999, JobPolicy::Open, vacuous_window_config()).is_none(),
             "the chain already carries this vote, so it adds nothing on either axis"
         );
     }
