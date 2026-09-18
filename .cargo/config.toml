@@ -2,14 +2,6 @@
 # multiply. Both entries below have to enable it, or the prover falls back to
 # scalar bit-twiddling: `+pclmulqdq` on x86, and on aarch64 the `aes` feature,
 # which is what LLVM gates PMULL behind.
-#
-# The aarch64 entry is not symmetry for its own sake. `aarch64-unknown-linux-gnu`
-# defaults to `neon` alone, while `aarch64-apple-darwin` defaults to a CPU that
-# already has `aes`, so a Linux container on an Apple-silicon host was the one
-# build with no carryless multiply. Measured on an M4 Max, one aggregation proof
-# went from ~30 s without this to well under a second with it, which is the
-# difference between a local devnet that cannot fill a slot and one that can.
-
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
     "-Ctarget-cpu=x86-64-v3",
