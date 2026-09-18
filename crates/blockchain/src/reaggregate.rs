@@ -15,7 +15,11 @@
 //! 1. Only deconstructing when the chain is in sync — backfilling nodes
 //!    must not flood gossip with rederived aggregates.
 //! 2. Skipping attestations whose target is at or behind the store's
-//!    justified checkpoint — they carry no fork-choice value.
+//!    justified checkpoint. Note this is NOT because such a vote is worthless:
+//!    selection deliberately packs one for the LMD-GHOST weight it carries.
+//!    It is because the vote is already ON CHAIN, in the very block being
+//!    imported, so splitting it back into the pool would let it be repacked
+//!    indefinitely while paying a SNARK for each round.
 //! 3. Skipping attestations whose participants are already a subset of the
 //!    local union for that data — nothing to recover.
 //! 4. Capping the number of splits per imported block at

@@ -1099,7 +1099,10 @@ impl BlockChainServer {
         let Ok(Some(head_state)) = self.store.get_state(&head_root) else {
             return;
         };
-        let latest_head_votes = self.store.extract_latest_known_attestations();
+        // Must be the same baseline selection uses. Against the seen-votes
+        // map every candidate scores zero on both axes, so this would drop the
+        // whole ring on precisely the slots the head-vote axis exists to serve.
+        let latest_head_votes = self.store.extract_on_chain_votes();
 
         let dropped = self
             .body_proof_candidates
