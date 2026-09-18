@@ -175,7 +175,7 @@ fn default_valid() -> bool {
 /// See the module documentation for the one field of the format this leaves
 /// out, and why.
 #[derive(serde::Deserialize)]
-struct Checks {
+pub(super) struct Checks {
     time: Option<u64>,
     genesis_time: Option<u64>,
     head: Option<HeadCheck>,
@@ -256,7 +256,7 @@ fn decode<T: SszDecode>(case: &Case, name: &str) -> Result<T, String> {
 /// decoding straight into one. `ForkName::Fulu` decodes as
 /// [`electra::SignedBeaconBlock`], matching how [`SignedBeaconBlock::Fulu`]
 /// wraps that same type rather than a `fulu`-specific one.
-fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, String> {
+pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, String> {
     match case.fork {
         ForkName::Phase0 => Ok(SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: decode(case, "anchor_block")?,
@@ -294,7 +294,7 @@ fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, String> {
 /// file is already a signed block of the case's own fork, so this is a
 /// direct decode through the fork-generic decoder, unlike
 /// [`decode_anchor_block`].
-fn decode_signed_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
+pub(super) fn decode_signed_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
     SignedBeaconBlock::from_ssz(case.fork, &case.ssz_bytes(name))
         .map_err(|err| format!("decoding {name}: {err:?}"))
 }
@@ -418,7 +418,13 @@ fn apply_block(
     let (attestations, attester_slashings) = fork_choice::block_operations(&signed_block);
 
     match (
-        fork_choice::on_block(store, signed_block, config, &blob_evidence),
+        fork_choice::on_block(
+            store,
+            signed_block,
+            config,
+            &blob_evidence,
+            &fork_choice::PayloadValidity::NotRequired,
+        ),
         expect_valid,
     ) {
         (Ok(()), false) => {
@@ -645,7 +651,11 @@ fn check_should_override_forkchoice_update(
 }
 
 /// Applies one `checks` step: every field the fixture sets must match.
-fn apply_checks(store: &mut Store, checks: &Checks, config: &Config) -> Result<(), String> {
+pub(super) fn apply_checks(
+    store: &mut Store,
+    checks: &Checks,
+    config: &Config,
+) -> Result<(), String> {
     if let Some(expected) = checks.time {
         // The fixture's `time` is the specification's seconds; the store keeps
         // one millisecond row for both chains, so the caller converts.

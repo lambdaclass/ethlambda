@@ -45,6 +45,7 @@ fn main() {
     trials.extend(beacon_spec::sanity::trials());
     trials.extend(beacon_spec::shuffling::trials());
     trials.extend(beacon_spec::ssz_static::trials());
+    trials.extend(beacon_spec::sync::trials());
     trials.extend(beacon_spec::transition::trials());
 
     // The release ships genesis fixtures for the minimal preset only, so the

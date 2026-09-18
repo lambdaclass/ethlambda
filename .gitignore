@@ -52,3 +52,7 @@ devnet.env
 
 # Filled-in copy of the multi-server-devnet server inventory (names hosts/ips)
 devnet.inventory
+
+# macOS Finder metadata. Added after one was committed by accident: this repo is
+# developed on macOS, and a stray one is pure noise in a diff.
+.DS_Store

@@ -1921,6 +1921,7 @@ dependencies = [
  "clap",
  "ethlambda-blockchain",
  "ethlambda-crypto",
+ "ethlambda-engine",
  "ethlambda-metrics",
  "ethlambda-network-api",
  "ethlambda-p2p",
@@ -1956,6 +1957,7 @@ version = "0.1.0"
 dependencies = [
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-engine",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
  "ethlambda-network-api",
@@ -1988,6 +1990,23 @@ dependencies = [
  "leansig_wrapper",
  "rand 0.10.1",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ethlambda-engine"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ethlambda-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

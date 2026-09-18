@@ -100,6 +100,9 @@ from a normal build.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--custody-group-count` | `CUSTODY_REQUIREMENT` (4) | How many custody groups this node custodies, advertised as the ENR's `cgc` |
+| `--execution-endpoint` | none | Base URL of the execution client's Engine API endpoint, e.g. `http://127.0.0.1:8551`. Must be given together with `--execution-jwt-secret` |
+| `--execution-jwt-secret` | none | File holding the 32-byte hex JWT secret shared with the execution client |
+| `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone |
 
 Accepted range is `CUSTODY_REQUIREMENT` to `NUMBER_OF_CUSTODY_GROUPS` (4 to
 128), enforced at parse time rather than clamped: serving a different set than
@@ -117,6 +120,13 @@ Changing it changes which columns this node custodies, since the custody set is
 a function of the node id *and* the count. Sidecars already on disk belong to
 the old set: nothing is corrupted, but the node advertises a set it has not
 finished filling until it backfills the difference.
+
+With neither execution flag, the follower contacts no execution client and
+imports blocks without validating their payloads, which is what it did before
+those flags existed. Supplying one without the other is refused at startup: an
+Engine API endpoint always requires authentication. See
+[the execution layer pairing](./beacon_engine.md) for what each verdict does and
+for the limitations that go with the retry ladder.
 
 Two common flags also mean something specific here.
 

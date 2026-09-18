@@ -83,14 +83,19 @@
 //!
 //! [`stf::state_transition`] takes an [`stf::ExecutionEngine`] from bellatrix
 //! on, for the one call a real client would route to its execution layer.
-//! [`on_block`] always passes [`stf::ExecutionEngine::valid`]: no released
-//! `fork_choice` fixture, at any fork or preset, ships an `execution.yaml` or
-//! an `on_payload_info` step, so there is nothing yet for a caller to supply
-//! a different answer for. `on_payload_info` is also a standing registry
-//! keyed by block hash and updated over the course of a case, not a single
-//! value fixed at construction time, so when a fixture exercising it does
-//! arrive, threading it through will need more than a parameter on this
-//! function.
+//! [`on_block`] derives that engine from the [`PayloadValidity`] its caller
+//! hands it: an `INVALIDATED` verdict makes `verify_and_notify_new_payload`
+//! answer false and the transition fail from inside
+//! `process_execution_payload`, which is where the specification puts that
+//! failure; every other verdict answers true.
+//!
+//! No released `fork_choice` fixture, at any fork or preset, ships an
+//! `execution.yaml` or an `on_payload_info` step, so that whole suite passes
+//! [`PayloadValidity::NotRequired`] and behaves exactly as it did before the
+//! verdict existed. The suite that does exercise a standing registry keyed by
+//! execution block hash is `sync/optimistic`, which keeps it on the store
+//! rather than in a parameter, because it is updated over the course of a case
+//! rather than fixed at construction time.
 //!
 //! # [`Attestation`] and [`AttesterSlashing`]: a second fork-generic enum
 //!
@@ -154,6 +159,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend};
+use ethlambda_types::ShortRoot;
+use tracing::{error, warn};
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
@@ -174,18 +181,22 @@ use crate::beacon::kzg;
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    Epoch, Gwei, HashTreeRoot as _, KzgCommitment, KzgProof, Root, Slot, ValidatorIndex,
+    Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _, KzgCommitment, KzgProof, Root, Slot,
+    ValidatorIndex,
 };
 use crate::beacon::stf;
 
 // ---------------------------------------------------------------------------
-// LatestMessage, PowBlock
+// LatestMessage, PowBlock, PayloadStatusV1
 // ---------------------------------------------------------------------------
 
-// Both live in `ethlambda-types` rather than here, because `ethlambda-storage`
-// persists them and cannot depend on this crate. Re-exported at the paths they
-// had when they were defined here, so [`Store`] and its callers are unchanged.
-pub use ethlambda_types::beacon::fork_choice::{LatestMessage, PowBlock};
+// All of these live in `ethlambda-types` rather than here, because
+// `ethlambda-storage` persists them and cannot depend on this crate.
+// Re-exported at the paths they had when they were defined here, so [`Store`]
+// and its callers are unchanged.
+pub use ethlambda_types::beacon::fork_choice::{
+    LatestMessage, PayloadStatusEnum, PayloadStatusV1, PowBlock,
+};
 
 // ---------------------------------------------------------------------------
 // Attestation, AttesterSlashing
@@ -482,6 +493,296 @@ pub enum DataAvailability {
     },
     /// Fulu's shape: the column sidecars sampled for this block.
     Columns(Vec<fulu::DataColumnSidecar>),
+}
+
+/// What an execution client said about the payload of the block being imported
+/// right now.
+///
+/// A parameter on [`on_block`] rather than a `Store` field, for the same reason
+/// [`DataAvailability`] is one: it is evidence about this one block, not a
+/// registry looked up by some other hash later. The fixture-seeded registry
+/// keyed by execution block hash is the other half of that split and does live
+/// on the store, next to [`PowBlock`].
+///
+/// [`Validated`](Self::Validated) and [`NotRequired`](Self::NotRequired) both
+/// let a block in, and the difference is what gets recorded, not whether the
+/// import succeeds: a `NotRequired` block was never the subject of a question,
+/// so answering it "valid" would be a claim nobody made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadValidity {
+    /// Nothing to ask: the block predates bellatrix and carries no payload, or
+    /// no execution client is configured. Today's behaviour before any engine
+    /// existed, and what every `fork_choice` fixture case still gets.
+    NotRequired,
+    /// `VALID`. The block and every ancestor leave `optimistic_roots`.
+    Validated,
+    /// `SYNCING` or `ACCEPTED`, `optimistic-sync.md`'s `NOT_VALIDATED` alias.
+    /// The block is imported and joins `optimistic_roots`.
+    Optimistic,
+    /// `INVALID` or `INVALID_BLOCK_HASH`, its `INVALIDATED` alias. The import
+    /// fails, and `latest_valid_hash` decides how much of the branch dies with
+    /// it. `None` is the specification's `null`.
+    Invalidated {
+        latest_valid_hash: Option<ExecutionBlockHash>,
+    },
+}
+
+/// Reads an execution client's status as the verdict [`on_block`] takes.
+///
+/// One function for both sources of a status: the real client's JSON-RPC answer
+/// and the fixture runner's seeded registry. Keeping the mapping here rather
+/// than at each call site is what lets the `sync/optimistic` suite prove the
+/// production reading of `optimistic-sync.md`'s two aliases rather than a
+/// test's own copy of it.
+pub fn payload_validity(status: &PayloadStatusV1) -> PayloadValidity {
+    if status.status.is_invalidated() {
+        return PayloadValidity::Invalidated {
+            latest_valid_hash: status.latest_valid_hash,
+        };
+    }
+    if status.status.is_not_validated() {
+        return PayloadValidity::Optimistic;
+    }
+    PayloadValidity::Validated
+}
+
+/// The block an `INVALID` verdict actually condemns, per `optimistic-sync.md`'s
+/// `latestValidHash` table.
+///
+/// | `latest_valid_hash` | result |
+/// |---|---|
+/// | an execution hash found on this chain | the child of the block carrying it |
+/// | all zeroes | the deepest indexed ancestor carrying a payload |
+/// | `None`, or a hash not on this chain | `block_root` itself |
+///
+/// Walked up the rejected block's own ancestry rather than looked up in an index
+/// over every block, because the specification scopes it that way: "the *child*
+/// of a block with `body.execution_payload.block_hash == latestValidHash` **in
+/// the chain containing the block with payload in question**". Two branches can
+/// share a parent whose payload is the last valid one, and only the branch that
+/// was rejected may die.
+///
+/// `parent_root` is a parameter rather than read out of `index`, because
+/// `block_root` is not in `index`: an `INVALID` verdict arrives before the block
+/// is imported, so the store has no row for it. That also makes the `None` and
+/// unfindable cases self-enforcing: they answer `block_root`, and
+/// [`invalidate_subtree`] on an unindexed root removes nothing, which is exactly
+/// "only the block in question dies" for a block that never joined the tree.
+///
+/// The unfindable case is the specification's own instruction, not a
+/// convenience: "When `latestValidHash` is a meaningful execution block hash but
+/// consensus engine cannot find a block satisfying
+/// `body.execution_payload.block_hash == latestValidHash`, consensus engine
+/// SHOULD behave the same as if `latestValidHash` was `null`." A
+/// checkpoint-synced follower meets this whenever the named block is below its
+/// anchor.
+pub fn resolve_invalid_block(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    block_root: Root,
+    parent_root: Root,
+    latest_valid_hash: Option<ExecutionBlockHash>,
+) -> Root {
+    let Some(latest_valid_hash) = latest_valid_hash else {
+        return block_root;
+    };
+
+    // All zeroes: every payload-carrying block on this chain is condemned, so
+    // the answer is the earliest ancestor this store still indexes that carries
+    // one. The walk moves toward genesis, so each step reaches a *shallower*
+    // block, and the last one it can reach is the whole branch's root.
+    if latest_valid_hash.is_zero() {
+        let mut earliest_execution_block = block_root;
+        let mut cursor = parent_root;
+        while store.beacon_el_block_hash(cursor).is_some() {
+            earliest_execution_block = cursor;
+            let Some((_slot, parent)) = index.get(&cursor).copied() else {
+                break;
+            };
+            cursor = parent;
+        }
+        return earliest_execution_block;
+    }
+
+    // Walk up from the parent, carrying the block we came from. The first
+    // ancestor whose own payload hash matches is the last valid block, so the
+    // child we arrived from is the first invalid one.
+    let mut child = block_root;
+    let mut cursor = parent_root;
+    loop {
+        if store.beacon_el_block_hash(cursor) == Some(latest_valid_hash) {
+            return child;
+        }
+        let Some((_slot, parent)) = index.get(&cursor).copied() else {
+            // Ran off the top of what this store indexes without finding it.
+            return block_root;
+        };
+        child = cursor;
+        cursor = parent;
+    }
+}
+
+/// Removes `invalid_root` and every descendant from fork choice, returning how
+/// many blocks were removed.
+///
+/// Removes nothing, and returns `0`, for a root at or below finality: see the
+/// finality floor in the body for why that verdict is refused rather than
+/// obeyed.
+///
+/// `optimistic-sync.md`: "a block deemed `INVALIDATED` at any point MUST NOT be
+/// included in the canonical chain and the weights from those `INVALIDATED`
+/// blocks MUST NOT be applied to any `VALID` or `NOT_VALIDATED` ancestors."
+/// Deleting the `LiveChain` rows satisfies both halves at once, because
+/// `Store::block_index` is the only source fork choice reads:
+/// [`compute_weights`] folds a subtree total only into parents it finds in that
+/// index and gates the proposer-boost walk on the same membership, so a vote
+/// naming a removed root seeds an entry that is never folded anywhere;
+/// [`filter_block_tree`] and [`get_head`] are index-derived too.
+///
+/// One index scan builds the whole child map rather than rescanning per level:
+/// the descendants of one root are a tiny fraction of the tree, but finding
+/// them at all means knowing every block's parent.
+///
+/// # A dangling vote this can create
+///
+/// Unlike `Store::promote_beacon_anchor`, which only ever prunes below a
+/// finality horizon, this removes rows from the *live* window, so a validator
+/// whose freshest vote named a branch the execution layer has since rejected
+/// keeps pointing at a root no longer in the index, until it attests again.
+///
+/// [`compute_weights`] already drops such a vote rather than raising, so
+/// [`get_head`] is unaffected. [`get_weight`] deliberately does not: it is the
+/// specification's own version, and
+/// `tests::a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing` pins
+/// that divergence on purpose. Nothing on this node's paths calls it today
+/// ([`get_proposer_head`] and [`should_override_forkchoice_update`] have no
+/// callers outside this file), but wiring up a beacon proposer duty would make
+/// it reachable, and it should get `compute_weights`' treatment first.
+pub fn invalidate_subtree(store: &mut Store, invalid_root: Root) -> usize {
+    let index = store.block_index();
+
+    // A condemned root at or below finality means the execution client and this
+    // node disagree about finalized history, which is an operator emergency, not
+    // something to resolve by emptying fork choice. Obeying it would delete every
+    // `LiveChain` row from the finalized block upward, after which [`get_head`]
+    // fails its "block_root in store.blocks" check on every call and the node
+    // only logs that it cannot compute a head until its database is rebuilt.
+    //
+    // Reachable without any disagreement about a *specific* block: EIP-3675 lets
+    // an execution client answer `INVALID` with `latestValidHash = 0x00..0`,
+    // meaning every payload on this chain is invalid, and
+    // [`resolve_invalid_block`]'s zero branch then walks to the earliest ancestor
+    // whose hash this store still caches, which the cache's own finality bound
+    // keeps down to the finalized block.
+    let finalized = store.beacon_finalized_checkpoint();
+    let finalized_slot = compute_start_slot_at_epoch(finalized.epoch);
+    let at_or_below_finality = index
+        .get(&invalid_root)
+        .is_some_and(|(slot, _parent)| *slot <= finalized_slot);
+    if invalid_root == finalized.root || at_or_below_finality {
+        error!(
+            condemned = %ShortRoot(&invalid_root.0),
+            finalized_slot,
+            finalized_root = %ShortRoot(&finalized.root.0),
+            "The execution client condemned a finalized block; refusing to invalidate. \
+             The execution and consensus layers disagree about finalized history and \
+             this node needs operator attention"
+        );
+        return 0;
+    }
+
+    let mut children: HashMap<Root, Vec<Root>> = HashMap::new();
+    for (&root, &(_slot, parent_root)) in &index {
+        children.entry(parent_root).or_default().push(root);
+    }
+
+    let mut doomed: Vec<(Slot, Root)> = Vec::new();
+    let mut stack = vec![invalid_root];
+    while let Some(root) = stack.pop() {
+        let Some(&(slot, _parent_root)) = index.get(&root) else {
+            continue;
+        };
+        doomed.push((slot, root));
+        if let Some(kids) = children.get(&root) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+
+    if doomed.is_empty() {
+        return 0;
+    }
+
+    for (_slot, root) in &doomed {
+        // No longer merely unvalidated: it is refused. `optimistic_roots` holds
+        // only blocks still awaiting an answer.
+        store.remove_beacon_optimistic_root(*root);
+    }
+    store.delete_live_chain_entries(&doomed);
+    doomed.len()
+}
+
+/// Clears `root` and every optimistic ancestor from `optimistic_roots`.
+///
+/// `optimistic-sync.md`: "when a block transitions from `NOT_VALIDATED` to
+/// `VALID`, all *ancestors* of the block MUST also transition". One walk up the
+/// index clears the whole prefix, stopping at the first ancestor that is not
+/// optimistic, because everything above it was already cleared when that one
+/// was.
+///
+/// Reached from two places, which is why it is a function rather than an inline
+/// walk: [`on_block`], when `engine_newPayloadV4` answers `VALID`, and the
+/// actor's `forkchoiceUpdated` handler, which is how a block imported on
+/// `SYNCING` eventually becomes validated.
+pub fn mark_validated(store: &mut Store, root: Root) {
+    store.remove_beacon_optimistic_root(root);
+
+    // With a healthy execution client nothing is optimistic, and the walk below
+    // would exit on its own first iteration. Ask that before paying for
+    // `block_index`, which is an uncached prefix scan of the whole `LiveChain`
+    // table (never pruned on beacon) plus a map build, on a path that runs once
+    // per imported block and once per `forkchoiceUpdated`.
+    if !store.has_beacon_optimistic_roots() {
+        return;
+    }
+
+    let index = store.block_index();
+    let mut cursor = root;
+    while let Some((_slot, parent)) = index.get(&cursor).copied() {
+        if !store.is_beacon_optimistic(parent) {
+            break;
+        }
+        store.remove_beacon_optimistic_root(parent);
+        cursor = parent;
+    }
+}
+
+/// Whether a block may be imported before its payload has been validated.
+///
+/// `optimistic-sync.md`'s function of the same name. Two ways to qualify:
+///
+/// 1. The parent already has execution enabled. Any descendant of a merge block
+///    is fair game, since the poisoning attack the horizon guards against needs
+///    a *transition* block with a junk parent hash.
+/// 2. The block is at least `safe_slots` behind the wall clock, so an honest
+///    chain has had time to justify around any poison.
+///
+/// Reads `is_execution_block(parent)` off the cached execution hash rather than
+/// decoding the parent block: the cache is populated at import for exactly the
+/// blocks that have one, so its absence is the answer.
+///
+/// `safe_slots` is a parameter rather than the constant read directly, because
+/// the specification requires the value to be operator-configurable.
+pub fn is_optimistic_candidate_block(
+    store: &Store,
+    current_slot: Slot,
+    block_slot: Slot,
+    parent_root: Root,
+    safe_slots: u64,
+) -> bool {
+    if store.beacon_el_block_hash(parent_root).is_some() {
+        return true;
+    }
+    block_slot.saturating_add(safe_slots) <= current_slot
 }
 
 // ---------------------------------------------------------------------------
@@ -1954,11 +2255,18 @@ pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
 /// needs one. A pre-deneb block, or one with no blob commitments, never
 /// reads it; [`DataAvailability::NotRequired`] is the right value to pass in
 /// that case.
+///
+/// `payload_validity` is this module's second such addition: what an execution
+/// client said about this block's payload, or [`PayloadValidity::NotRequired`]
+/// when there was nothing to ask. See its own documentation, and the module
+/// documentation's "`on_block`'s execution engine", for how it reaches
+/// [`stf::state_transition`] and what it records.
 pub fn on_block(
     store: &mut Store,
     signed_block: SignedBeaconBlock,
     config: &Config,
     blob_evidence: &DataAvailability,
+    payload_validity: &PayloadValidity,
 ) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
@@ -2029,15 +2337,63 @@ pub fn on_block(
         _ => {}
     }
 
-    // Check the block is valid and compute the post-state. See the module
-    // documentation for why this always passes `ExecutionEngine::valid`.
-    stf::state_transition(
-        &mut state,
-        &signed_block,
-        true,
-        config,
-        &stf::ExecutionEngine::valid(),
-    )?;
+    // Check the block is valid and compute the post-state. The engine's answer
+    // is read the way the specification reads it: an `INVALIDATED` verdict makes
+    // `verify_and_notify_new_payload` return false, and everything else makes it
+    // return true. Running the transition even when the verdict is already
+    // `Invalidated` is deliberate. It costs a merkleization on a path that
+    // should never run, and it buys the failure arriving from inside
+    // `process_execution_payload`, which is where the specification puts it and
+    // where a reviewer checks this code against it.
+    let engine = match payload_validity {
+        PayloadValidity::Invalidated { .. } => stf::ExecutionEngine::invalid(),
+        PayloadValidity::NotRequired | PayloadValidity::Validated | PayloadValidity::Optimistic => {
+            stf::ExecutionEngine::valid()
+        }
+    };
+    let transition = stf::state_transition(&mut state, &signed_block, true, config, &engine);
+
+    // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
+    // in the canonical chain. That is stated here, on the verdict, rather than
+    // left to `transition` having failed, because the transition only fails for
+    // forks whose `process_execution_payload` consults the `ExecutionEngine` at
+    // all: bellatrix gates that step on `is_execution_enabled`, and phase0 and
+    // altair have no such step. A condemned block on one of those would
+    // otherwise transition cleanly and be imported with nothing recorded.
+    //
+    // The transition still runs above, and its own error is still what this
+    // returns when there is one. That is what keeps the failure arriving from
+    // inside `process_execution_payload`, where the specification puts it and
+    // where a reviewer checks this code against it, and what keeps the
+    // `sync/optimistic` fixture exercising that path rather than this guard.
+    //
+    // The invalidation must land even though the import fails. The
+    // `sync/optimistic` fixture's last step carries `valid: false` for the
+    // rejected block while still requiring its whole branch to disappear, so it
+    // cannot be deferred to a success path that never runs.
+    if let PayloadValidity::Invalidated { latest_valid_hash } = payload_validity {
+        let index = store.block_index();
+        // `block_root` is not in `index`: this block never imported, which is
+        // why `resolve_invalid_block` takes `parent_root` separately and starts
+        // the walk there. The `None` and unfindable cases answer `block_root`,
+        // and invalidating an unindexed root removes nothing, which is exactly
+        // "only the block in question dies" for a block that never joined the
+        // tree.
+        let condemned =
+            resolve_invalid_block(store, &index, block_root, parent_root, *latest_valid_hash);
+        let removed = invalidate_subtree(store, condemned);
+        warn!(
+            block_root = %ShortRoot(&block_root.0),
+            condemned = %ShortRoot(&condemned.0),
+            removed,
+            "Execution layer rejected a payload; invalidated its branch"
+        );
+        return Err(transition.err().unwrap_or(Error::SpecAssert(
+            "the execution layer rejected this block's payload",
+        )));
+    }
+
+    transition?;
 
     // Cache the state root in the latest block header. Sound because the
     // `true` above means `state_transition` checked it against the root it
@@ -2073,10 +2429,38 @@ pub fn on_block(
     // Add new block to the store, and the new state for this block to the
     // store. `block_slot` is copied out first since `signed_block` moves next.
     let block_slot = signed_block.slot();
+    let signed_block_el_hash = signed_block.execution_block_hash();
     store
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
     store.insert_state(block_root, state).expect("insert");
+
+    // Cache this block's own execution hash for `forkchoiceUpdated` and for the
+    // `latestValidHash` walk, and record whether the execution layer has
+    // actually vouched for it yet.
+    //
+    // A zero hash is not cached, because the presence of an entry is what
+    // [`is_optimistic_candidate_block`] reads as the specification's
+    // `is_execution_block`, and that predicate is "the payload is not the
+    // fork's own empty one", not "the container has a payload field". A
+    // pre-merge bellatrix block carries a payload field whose every byte is
+    // zero (see `stf::bellatrix::default_execution_payload`), and caching that
+    // would make its children look like descendants of a merge block and skip
+    // the age horizon that exists precisely to guard the merge transition.
+    // Testing the block hash alone is enough: it is a keccak digest in a real
+    // payload and zero in the empty one.
+    if let Some(el_block_hash) = signed_block_el_hash
+        && !el_block_hash.is_zero()
+    {
+        store.insert_beacon_el_block_hash(block_root, block_slot, el_block_hash);
+    }
+    match payload_validity {
+        PayloadValidity::Optimistic => {
+            store.insert_beacon_optimistic_root(block_root, block_slot);
+        }
+        PayloadValidity::Validated => mark_validated(store, block_root),
+        PayloadValidity::NotRequired | PayloadValidity::Invalidated { .. } => {}
+    }
 
     // Add block timeliness to the store.
     let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
@@ -2696,5 +3080,283 @@ mod tests {
             27,
             "the fixture's generalized index for blob_kzg_commitments"
         );
+    }
+
+    #[test]
+    fn a_valid_status_becomes_a_validated_verdict() {
+        let status = PayloadStatusV1 {
+            status: PayloadStatusEnum::Valid,
+            latest_valid_hash: Some(ExecutionBlockHash::repeat_byte(1)),
+            validation_error: None,
+        };
+        assert_eq!(payload_validity(&status), PayloadValidity::Validated);
+    }
+
+    #[test]
+    fn the_not_validated_statuses_become_an_optimistic_verdict() {
+        for status in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            let status = PayloadStatusV1 {
+                status,
+                latest_valid_hash: None,
+                validation_error: None,
+            };
+            assert_eq!(payload_validity(&status), PayloadValidity::Optimistic);
+        }
+    }
+
+    #[test]
+    fn the_invalidated_statuses_carry_their_latest_valid_hash_through() {
+        for status in [
+            PayloadStatusEnum::Invalid,
+            PayloadStatusEnum::InvalidBlockHash,
+        ] {
+            let status = PayloadStatusV1 {
+                status,
+                latest_valid_hash: Some(ExecutionBlockHash::repeat_byte(9)),
+                validation_error: Some("invalid".to_string()),
+            };
+            assert_eq!(
+                payload_validity(&status),
+                PayloadValidity::Invalidated {
+                    latest_valid_hash: Some(ExecutionBlockHash::repeat_byte(9)),
+                }
+            );
+        }
+    }
+
+    const BLOCK_0: Root = Root::repeat_byte(10);
+    const CHAIN_A0: Root = Root::repeat_byte(11);
+    const CHAIN_B0: Root = Root::repeat_byte(20);
+    const CHAIN_B1: Root = Root::repeat_byte(21);
+    /// The rejected block: never indexed, parented on `CHAIN_B1`.
+    const CHAIN_B2: Root = Root::repeat_byte(22);
+
+    /// The fixture's own topology, minus the block that gets rejected:
+    ///
+    /// ```text
+    /// block_0 (el 0xb0) -- a0 (el 0xa0)
+    ///                   \- b0 (el 0xc0) -- b1 (el 0xc1)
+    /// ```
+    ///
+    /// The rejected block, `b2`, is deliberately absent: an `INVALID` verdict
+    /// arrives before its block is ever indexed.
+    fn store_with_two_branches() -> Store {
+        let mut store = empty_store();
+        // (beacon root, slot, parent root, execution hash)
+        let rows = [
+            (
+                BLOCK_0,
+                1u64,
+                Root::ZERO,
+                ExecutionBlockHash::repeat_byte(0xb0),
+            ),
+            (CHAIN_A0, 2, BLOCK_0, ExecutionBlockHash::repeat_byte(0xa0)),
+            (CHAIN_B0, 2, BLOCK_0, ExecutionBlockHash::repeat_byte(0xc0)),
+            (CHAIN_B1, 3, CHAIN_B0, ExecutionBlockHash::repeat_byte(0xc1)),
+        ];
+        for (root, slot, parent, el_hash) in rows {
+            store.insert_live_chain_entry(slot, root, parent);
+            store.insert_beacon_el_block_hash(root, slot, el_hash);
+        }
+        store
+    }
+
+    #[test]
+    fn a_named_latest_valid_hash_condemns_the_child_of_the_last_valid_block() {
+        let store = store_with_two_branches();
+        let index = store.block_index();
+
+        // b2 is rejected and block_0's payload is the last valid one. Walking
+        // up b2's own chain, the child of block_0 is b0, so b0 and everything
+        // under it is condemned.
+        let condemned = resolve_invalid_block(
+            &store,
+            &index,
+            CHAIN_B2,
+            CHAIN_B1,
+            Some(ExecutionBlockHash::repeat_byte(0xb0)),
+        );
+
+        assert_eq!(condemned, CHAIN_B0);
+    }
+
+    #[test]
+    fn the_walk_stays_on_the_rejected_blocks_own_branch() {
+        let store = store_with_two_branches();
+        let index = store.block_index();
+
+        // a0 is also a child of block_0, and must never be the answer for a
+        // block on chain b.
+        let condemned = resolve_invalid_block(
+            &store,
+            &index,
+            CHAIN_B2,
+            CHAIN_B1,
+            Some(ExecutionBlockHash::repeat_byte(0xb0)),
+        );
+
+        assert_ne!(condemned, CHAIN_A0);
+    }
+
+    #[test]
+    fn a_null_latest_valid_hash_condemns_only_the_block_in_question() {
+        let store = store_with_two_branches();
+        let index = store.block_index();
+
+        let condemned = resolve_invalid_block(&store, &index, CHAIN_B2, CHAIN_B1, None);
+
+        assert_eq!(condemned, CHAIN_B2);
+    }
+
+    #[test]
+    fn an_unfindable_latest_valid_hash_behaves_as_null() {
+        let store = store_with_two_branches();
+        let index = store.block_index();
+
+        let condemned = resolve_invalid_block(
+            &store,
+            &index,
+            CHAIN_B2,
+            CHAIN_B1,
+            Some(ExecutionBlockHash::repeat_byte(0xee)),
+        );
+
+        assert_eq!(condemned, CHAIN_B2);
+    }
+
+    #[test]
+    fn a_zero_latest_valid_hash_condemns_the_whole_execution_branch() {
+        let store = store_with_two_branches();
+        let index = store.block_index();
+
+        // Every block on this chain carries a payload, so the deepest indexed
+        // ancestor is block_0 itself.
+        let condemned = resolve_invalid_block(&store, &index, CHAIN_B2, CHAIN_B1, Some(Root::ZERO));
+
+        assert_eq!(condemned, BLOCK_0);
+    }
+
+    #[test]
+    fn invalidating_a_subtree_removes_it_and_leaves_its_sibling_branch() {
+        let mut store = store_with_two_branches();
+        store.insert_beacon_optimistic_root(CHAIN_B0, 2);
+        store.insert_beacon_optimistic_root(CHAIN_B1, 3);
+
+        let removed = invalidate_subtree(&mut store, CHAIN_B0);
+
+        assert_eq!(removed, 2);
+
+        let index = store.block_index();
+        // Chain b is gone.
+        assert!(!index.contains_key(&CHAIN_B0));
+        assert!(!index.contains_key(&CHAIN_B1));
+        // block_0 and chain a survive.
+        assert!(index.contains_key(&BLOCK_0));
+        assert!(index.contains_key(&CHAIN_A0));
+        // And the invalidated roots are no longer merely optimistic.
+        assert!(!store.is_beacon_optimistic(CHAIN_B0));
+        assert!(!store.is_beacon_optimistic(CHAIN_B1));
+    }
+
+    #[test]
+    fn invalidating_a_leaf_removes_only_that_leaf() {
+        let mut store = store_with_two_branches();
+
+        let removed = invalidate_subtree(&mut store, CHAIN_B1);
+
+        assert_eq!(removed, 1);
+        let index = store.block_index();
+        assert!(!index.contains_key(&CHAIN_B1));
+        assert!(index.contains_key(&CHAIN_B0));
+    }
+
+    #[test]
+    fn invalidating_a_root_the_index_never_held_removes_nothing() {
+        let mut store = store_with_two_branches();
+
+        // The `None`/unfindable `latestValidHash` case condemns the rejected
+        // block itself, which never imported and so has no row.
+        let removed = invalidate_subtree(&mut store, CHAIN_B2);
+
+        assert_eq!(removed, 0);
+        assert_eq!(store.block_index().len(), 4);
+    }
+
+    /// The checkpoint root is the last block at *or before* its epoch
+    /// boundary, so a skipped boundary slot leaves the finalized block above
+    /// the slot its own checkpoint is stored as. The slot comparison alone
+    /// would miss it, which is why the floor names the root too.
+    #[test]
+    fn invalidating_the_finalized_block_itself_is_refused() {
+        // Anchored at b0: the finalized checkpoint's root, in the genesis
+        // epoch, while its block sits at slot 2.
+        let mut store = store_anchored_at(CHAIN_B0);
+        store.insert_live_chain_entry(2, CHAIN_B0, BLOCK_0);
+        store.insert_live_chain_entry(3, CHAIN_B1, CHAIN_B0);
+
+        let removed = invalidate_subtree(&mut store, CHAIN_B0);
+
+        assert_eq!(
+            removed, 0,
+            "obeying this would delete every row from finality upward and \
+             leave `get_head` nothing to compute a head from"
+        );
+        let index = store.block_index();
+        assert!(index.contains_key(&CHAIN_B0));
+        assert!(index.contains_key(&CHAIN_B1));
+
+        // Not a blanket refusal: an unfinalized descendant still goes.
+        assert_eq!(invalidate_subtree(&mut store, CHAIN_B1), 1);
+    }
+
+    /// An all-zero `latestValidHash` condemns every payload on the chain, and
+    /// [`resolve_invalid_block`]'s walk for it stops only where the execution
+    /// hash cache does, which finality bounds. So the ancestor it answers can
+    /// be finalized history even when no block was named directly.
+    #[test]
+    fn invalidating_a_block_below_the_finalized_slot_is_refused() {
+        let mut store = store_with_two_branches();
+        let finalized = Checkpoint {
+            epoch: 1,
+            root: CHAIN_B1,
+        };
+        update_checkpoints(&mut store, finalized, finalized);
+
+        // Every row in the fixture is below the epoch-1 start slot.
+        let removed = invalidate_subtree(&mut store, CHAIN_B0);
+
+        assert_eq!(removed, 0);
+        assert_eq!(store.block_index().len(), 4);
+    }
+
+    #[test]
+    fn a_child_of_an_execution_block_is_always_an_optimistic_candidate() {
+        let store = store_with_two_branches();
+
+        // block_0 carries a payload, so its child may be imported
+        // optimistically whatever the clock says.
+        assert!(is_optimistic_candidate_block(
+            &store,
+            /* current_slot */ 2,
+            /* block_slot */ 2,
+            /* parent_root */ BLOCK_0,
+            constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+        ));
+    }
+
+    #[test]
+    fn a_block_on_a_payloadless_parent_needs_the_age_horizon() {
+        let store = empty_store();
+        let parent = Root::repeat_byte(77);
+        let safe_slots = constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY;
+
+        // No cached execution hash for the parent: pre-merge, so only age
+        // qualifies it.
+        assert!(!is_optimistic_candidate_block(
+            &store, 100, 90, parent, safe_slots
+        ));
+        assert!(is_optimistic_candidate_block(
+            &store, 300, 90, parent, safe_slots
+        ));
     }
 }

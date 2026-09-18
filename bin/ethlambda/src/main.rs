@@ -40,6 +40,8 @@ use command::Command;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
+use ethlambda_engine::types::ClientVersionV1;
+use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
@@ -169,7 +171,13 @@ enum ChainActor {
     /// duties, but it does need the columns this node samples, which
     /// `BlockChain::spawn_beacon` uses to decide when a fulu block has its
     /// data.
-    Beacon { custody_columns: Vec<u64> },
+    Beacon {
+        custody_columns: Vec<u64>,
+        /// The execution client to validate payloads against, `None` when
+        /// `--execution-endpoint` was not given.
+        engine: Option<EngineClient>,
+        safe_slots_to_import_optimistically: u64,
+    },
 }
 
 /// What one chain's own setup produces, and everything [`run_node`] needs from
@@ -305,7 +313,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // admin endpoints can flip it at runtime.
     let aggregator = AggregatorController::new(match &network {
         Network::Lean(lean) => lean.is_aggregator,
-        Network::Mainnet(_) => false,
+        Network::Mainnet { .. } => false,
     });
 
     // Shared, runtime-readable sync status. The blockchain actor writes it each
@@ -451,7 +459,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // configured, from the genesis state built into the binary: the fork
         // digest depends on the epoch, which depends on genesis time. See
         // `crate::beacon`.
-        Network::Mainnet(mainnet) => {
+        Network::Mainnet { mainnet, execution } => {
             info!(
                 bootnodes = ?common.bootnodes,
                 gossipsub_port = common.gossipsub_port,
@@ -487,6 +495,54 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 .await
                 .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
+            let engine = match &execution {
+                None => {
+                    info!(
+                        "No execution client configured; beacon blocks import without \
+                         payload validation"
+                    );
+                    None
+                }
+                Some(options) => {
+                    let secret = JwtSecret::from_file(&options.jwt_secret)
+                        .map_err(|err| eyre::eyre!("reading --execution-jwt-secret: {err}"))?;
+                    let client = EngineClient::new(options.endpoint.clone(), secret)
+                        .map_err(|err| eyre::eyre!("building the engine client: {err}"))?;
+                    info!(endpoint = %options.endpoint, "Execution client configured");
+
+                    let ours = ClientVersionV1 {
+                        // `identification.md` reserves two-letter codes per
+                        // client; none is assigned to ethlambda, and `XX` is
+                        // what the document names for a client without one.
+                        code: "XX".to_string(),
+                        name: "ethlambda".to_string(),
+                        version: version::CLIENT_VERSION.to_string(),
+                        // `identification.md` types `commit` as DATA, 4 bytes,
+                        // and geth decodes it into `hexutil.Bytes`, which
+                        // rejects a bare hex string with "hex string without
+                        // 0x prefix". So the prefix is not cosmetic: without
+                        // it `engine_getClientVersionV1` comes back an RPC
+                        // error and the handshake below never identifies
+                        // anything. `get` rather than a slice or `take(8)`,
+                        // since `VERGEN_GIT_SHA` is not guaranteed to be eight
+                        // or more characters in every build configuration.
+                        commit: format!(
+                            "0x{}",
+                            env!("VERGEN_GIT_SHA").get(..8).unwrap_or("00000000")
+                        ),
+                    };
+                    // A handshake failure is not a reason to refuse to run: the
+                    // execution client may simply be starting up, and every
+                    // call that matters has its own retry ladder.
+                    let _ = client
+                        .handshake(&ours)
+                        .await
+                        .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
+
+                    Some(client)
+                }
+            };
+
             ChainSetup {
                 wire: WireConfig::Beacon(Box::new(params.wire)),
                 discovery: DiscoveryWireEntries {
@@ -503,7 +559,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 // A beacon follower has no validator keys and no duties, but
                 // it does import blocks through fork choice, so it gets the
                 // `Beacon` chain actor below.
-                chain: ChainActor::Beacon { custody_columns },
+                chain: ChainActor::Beacon {
+                    custody_columns,
+                    engine,
+                    safe_slots_to_import_optimistically: mainnet
+                        .safe_slots_to_import_optimistically,
+                },
             }
         }
     };
@@ -574,9 +635,18 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
         }
-        ChainActor::Beacon { custody_columns } => {
-            BlockChain::spawn_beacon(setup.store, sync_status, events, custody_columns)
-        }
+        ChainActor::Beacon {
+            custody_columns,
+            engine,
+            safe_slots_to_import_optimistically,
+        } => BlockChain::spawn_beacon(
+            setup.store,
+            sync_status,
+            events,
+            custody_columns,
+            engine,
+            safe_slots_to_import_optimistically,
+        ),
     };
 
     let p2p_ref = p2p.actor_ref();
@@ -669,7 +739,7 @@ fn default_bootnodes(network: &Network) -> Vec<String> {
             );
             Vec::new()
         }
-        Network::Mainnet(_) => beacon::MAINNET_BOOTNODES
+        Network::Mainnet { .. } => beacon::MAINNET_BOOTNODES
             .iter()
             .map(|enr| enr.to_string())
             .collect(),
@@ -1795,9 +1865,14 @@ validators:
         assert!(default_bootnodes(&Options::from(node).network).is_empty());
 
         assert_eq!(
-            default_bootnodes(&Network::Mainnet(crate::cli::MainnetOptions {
-                custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
-            }))
+            default_bootnodes(&Network::Mainnet {
+                mainnet: crate::cli::MainnetOptions {
+                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
+                    safe_slots_to_import_optimistically:
+                        ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
+                },
+                execution: None,
+            })
             .len(),
             beacon::MAINNET_BOOTNODES.len()
         );

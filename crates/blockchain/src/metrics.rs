@@ -1342,3 +1342,41 @@ pub fn set_blocks_held_for_columns(count: u64) {
 pub fn set_sidecars_awaiting_parent(count: u64) {
     LEAN_SIDECARS_AWAITING_PARENT.set(count as i64);
 }
+
+/// Blocks not imported because no execution client verdict was obtained.
+///
+/// A non-zero rate here means the follower is dropping blocks it cannot ask
+/// about, and its head will park behind the first one. Nothing re-drives a
+/// given-up call, so this is the metric that says the follower has stopped
+/// following rather than merely slowed down.
+pub fn inc_engine_no_verdict() {
+    static LEAN_ENGINE_NO_VERDICT_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_engine_no_verdict_total",
+                "Blocks not imported because the execution client gave no verdict"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
+}
+
+/// Blocks not imported because the execution client has not validated them and
+/// they do not qualify for an optimistic import.
+///
+/// Distinct from [`inc_engine_no_verdict`]: there the execution client never
+/// answered, here it answered `SYNCING` or `ACCEPTED` for a block that
+/// `is_optimistic_candidate_block` refuses. A sustained rate means the
+/// execution client is behind and the blocks reaching this node are too recent
+/// to import on age alone.
+pub fn inc_engine_not_optimistic_candidate() {
+    static LEAN_ENGINE_NOT_OPTIMISTIC_CANDIDATE_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_engine_not_optimistic_candidate_total",
+                "Blocks not imported because they are not optimistic candidates"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NOT_OPTIMISTIC_CANDIDATE_TOTAL.inc();
+}

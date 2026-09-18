@@ -42,6 +42,7 @@ pub mod rewards;
 pub mod sanity;
 pub mod shuffling;
 pub mod ssz_static;
+pub mod sync;
 pub mod transition;
 
 use std::collections::BTreeSet;

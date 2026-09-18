@@ -44,6 +44,8 @@
 
 use std::collections::HashSet;
 
+use libssz::SszEncode as _;
+
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
@@ -1531,10 +1533,10 @@ pub fn process_consolidation_request(
 /// rather than restructured, including not computing anything from
 /// `body.execution_requests`: see [`super::deneb::process_execution_payload`]'s
 /// own documentation for why the versioned-hashes list (and, from electra
-/// on, the execution-requests list `get_execution_requests_list` would
-/// build) is dead weight in this module specifically, since
-/// [`ExecutionEngine`] collapses the whole `verify_and_notify_new_payload`
-/// interface to one boolean and never inspects either.
+/// on, the execution-requests list [`get_execution_requests_list`] builds)
+/// is dead weight in this module specifically, since [`ExecutionEngine`]
+/// collapses the whole `verify_and_notify_new_payload` interface to one
+/// boolean and never inspects either.
 pub fn process_execution_payload(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -1605,6 +1607,55 @@ pub fn process_execution_payload(
     *block_mut(state, "process_execution_payload")?.latest_execution_payload_header_mut() = header;
 
     Ok(())
+}
+
+/// The EIP-7685 encoding of a block's execution requests.
+///
+/// Each non-empty list becomes its request type byte followed by that list's own
+/// SSZ serialization, ordered by type byte ascending. An empty list is excluded
+/// outright rather than encoded as a bare type byte, which is what the
+/// specification means by "Elements with empty `request_data` MUST be excluded",
+/// and what `engine_newPayloadV4` rejects as invalid params if you get it wrong.
+///
+/// This is the fourth parameter of `engine_newPayloadV4`, and it also feeds the
+/// execution client's own block-hash validation: prague folds a commitment over
+/// this list into the payload's `block_hash`, so a list assembled in the wrong
+/// order makes a perfectly good block come back `INVALID`.
+///
+/// Nothing inside this module calls it. [`ExecutionEngine`] collapses the whole
+/// `verify_and_notify_new_payload` interface to one boolean and never inspects a
+/// request list; the caller that needs one is the engine client, which assembles
+/// its `newPayload` request in `ethlambda-blockchain`.
+pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec<Vec<u8>> {
+    let mut list = Vec::new();
+
+    let mut push = |request_type: u8, is_empty: bool, encoded: Vec<u8>| {
+        if is_empty {
+            return;
+        }
+        let mut element = Vec::with_capacity(1 + encoded.len());
+        element.push(request_type);
+        element.extend_from_slice(&encoded);
+        list.push(element);
+    };
+
+    push(
+        constants::DEPOSIT_REQUEST_TYPE,
+        requests.deposits.is_empty(),
+        requests.deposits.to_ssz(),
+    );
+    push(
+        constants::WITHDRAWAL_REQUEST_TYPE,
+        requests.withdrawals.is_empty(),
+        requests.withdrawals.to_ssz(),
+    );
+    push(
+        constants::CONSOLIDATION_REQUEST_TYPE,
+        requests.consolidations.is_empty(),
+        requests.consolidations.to_ssz(),
+    );
+
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -2221,5 +2272,51 @@ mod tests {
             get_expected_withdrawals(&state).unwrap();
         assert!(withdrawals.is_empty());
         assert_eq!(processed_partial_withdrawals_count, 2);
+    }
+
+    #[test]
+    fn an_empty_requests_container_yields_an_empty_list() {
+        let requests = electra::ExecutionRequests {
+            deposits: Default::default(),
+            withdrawals: Default::default(),
+            consolidations: Default::default(),
+        };
+        assert!(get_execution_requests_list(&requests).is_empty());
+    }
+
+    #[test]
+    fn each_present_kind_is_prefixed_with_its_type_byte_and_ordered() {
+        let mut requests = electra::ExecutionRequests {
+            deposits: Default::default(),
+            withdrawals: Default::default(),
+            consolidations: Default::default(),
+        };
+        requests
+            .withdrawals
+            .push(electra::WithdrawalRequest {
+                source_address: ExecutionAddress::ZERO,
+                validator_pubkey: BlsPubkey::default(),
+                amount: 0,
+            })
+            .expect("one withdrawal request fits");
+        requests
+            .consolidations
+            .push(electra::ConsolidationRequest {
+                source_address: ExecutionAddress::ZERO,
+                source_pubkey: BlsPubkey::default(),
+                target_pubkey: BlsPubkey::default(),
+            })
+            .expect("one consolidation request fits");
+
+        let list = get_execution_requests_list(&requests);
+
+        // Deposits are empty, so they are excluded entirely rather than
+        // appearing as a bare type byte.
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0][0], constants::WITHDRAWAL_REQUEST_TYPE);
+        assert_eq!(list[1][0], constants::CONSOLIDATION_REQUEST_TYPE);
+        // Each element is longer than its type byte alone.
+        assert!(list[0].len() > 1);
+        assert!(list[1].len() > 1);
     }
 }

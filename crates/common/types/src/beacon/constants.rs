@@ -205,6 +205,20 @@ pub const INTERVALS_PER_SLOT: u64 = 3;
 /// share into a millisecond offset into the slot.
 pub const BASIS_POINTS: u64 = 10_000;
 
+/// How far behind the wall clock a block must be before it may be imported
+/// optimistically on age alone.
+///
+/// `optimistic-sync.md`'s constant of the same name. The specification requires
+/// it to be operator-configurable, which is what
+/// `--safe-slots-to-import-optimistically` is for; this is the default that
+/// flag seeds.
+///
+/// It only ever gates a *merge transition* block, since any descendant of one
+/// satisfies `is_optimistic_candidate_block`'s first condition instead. A
+/// checkpoint-synced mainnet follower anchors far past the merge and never
+/// meets one.
+pub const SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY: u64 = 128;
+
 // ---------------------------------------------------------------------------
 // Blob (deneb)
 // ---------------------------------------------------------------------------

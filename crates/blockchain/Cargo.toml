@@ -12,6 +12,7 @@ autotests = false
 
 [dependencies]
 ethlambda-network-api.workspace = true
+ethlambda-engine.workspace = true
 ethlambda-storage.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-fork-choice.workspace = true

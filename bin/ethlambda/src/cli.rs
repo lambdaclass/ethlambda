@@ -1,6 +1,7 @@
 //! Command-line interface for the ethlambda binary.
 
 use ethlambda_p2p::discovery::DEFAULT_DISCOVERY_TARGET_PEERS;
+use ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
@@ -99,7 +100,25 @@ pub(crate) enum Network {
     /// The lean consensus chain this repo implements: `ethlambda node`.
     Lean(Box<LeanOptions>),
     /// The Ethereum Beacon Chain: `ethlambda beacon`.
-    Mainnet(MainnetOptions),
+    ///
+    /// Carries this chain's own flags and `execution`, the execution client
+    /// its payloads are validated against. Everything else it needs is a
+    /// common flag.
+    Mainnet {
+        mainnet: MainnetOptions,
+        execution: Option<ExecutionOptions>,
+    },
+}
+
+/// The execution client pairing, present only when both flags were supplied.
+///
+/// A struct rather than two `Option`s on the variant, so "endpoint without
+/// secret" cannot be represented past this point: `From<BeaconOptions>` is
+/// where the pair is checked, once.
+#[derive(Debug)]
+pub(crate) struct ExecutionOptions {
+    pub(crate) endpoint: String,
+    pub(crate) jwt_secret: PathBuf,
 }
 
 /// Everything [`crate::run_node`] needs, for either chain.
@@ -125,9 +144,28 @@ impl From<NodeOptions> for Options {
 
 impl From<BeaconOptions> for Options {
     fn from(options: BeaconOptions) -> Self {
+        let execution = match (options.execution_endpoint, options.execution_jwt_secret) {
+            (Some(endpoint), Some(jwt_secret)) => Some(ExecutionOptions {
+                endpoint,
+                jwt_secret,
+            }),
+            (None, None) => None,
+            // Unreachable: `requires` on each of the two flags is what rules a
+            // half-configured Engine API out, so the parser answers a mismatch
+            // with a usage error long before this conversion runs.
+            // `cli::tests::execution_flags_come_as_a_pair` pins that.
+            _ => unreachable!(
+                "clap's `requires` rejects --execution-endpoint without \
+                 --execution-jwt-secret, and the reverse"
+            ),
+        };
+
         Options {
             common: options.common,
-            network: Network::Mainnet(options.mainnet),
+            network: Network::Mainnet {
+                mainnet: options.mainnet,
+                execution,
+            },
         }
     }
 }
@@ -149,13 +187,33 @@ pub(crate) struct NodeOptions {
 ///
 /// Mirrors [`NodeOptions`], which is the point: a flag that means nothing to
 /// the other chain lives in that chain's struct, so neither `run_node` arm has
-/// to unwrap an `Option` the tag already promised was there.
+/// to unwrap an `Option` the tag already promised was there. Beyond
+/// [`MainnetOptions`], it carries the execution client pairing
+/// (`--execution-endpoint` and `--execution-jwt-secret`, which are given
+/// together or not at all), whose checked form is what `Network::Mainnet`
+/// holds.
 #[derive(Debug, clap::Args)]
 pub(crate) struct BeaconOptions {
     #[command(flatten)]
     pub(crate) common: CommonOptions,
     #[command(flatten)]
     pub(crate) mainnet: MainnetOptions,
+
+    /// Base URL of the execution client's Engine API endpoint, e.g.
+    /// `http://127.0.0.1:8551`.
+    ///
+    /// Paired with `--execution-jwt-secret`: supplying one without the other is
+    /// a usage error, since an Engine API endpoint always requires
+    /// authentication. With neither, this node imports blocks without asking
+    /// any execution client about their payloads, which is what it did before
+    /// this flag existed.
+    #[arg(long, requires = "execution_jwt_secret")]
+    pub(crate) execution_endpoint: Option<String>,
+
+    /// File holding the 32-byte hex JWT secret shared with the execution
+    /// client.
+    #[arg(long, requires = "execution_endpoint")]
+    pub(crate) execution_jwt_secret: Option<PathBuf>,
 }
 
 /// Flags only the beacon chain takes.
@@ -188,6 +246,16 @@ pub(crate) struct MainnetOptions {
         ),
     )]
     pub(crate) custody_group_count: u64,
+
+    /// How far behind the wall clock a block must be before it may be imported
+    /// optimistically on age alone.
+    ///
+    /// `optimistic-sync.md` requires this to be operator-configurable, for
+    /// manual recovery from a poisoned fork choice store. It only ever gates a
+    /// merge transition block, which a mainnet follower anchored past the merge
+    /// never sees.
+    #[arg(long, default_value_t = SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY)]
+    pub(crate) safe_slots_to_import_optimistically: u64,
 }
 
 /// Flags only the lean chain takes.
@@ -748,6 +816,77 @@ mod tests {
         match try_parse_from(args).expect("beacon argv parses") {
             Command::Beacon(options) => options,
             other => panic!("the beacon argv must resolve to the beacon subcommand, got {other:?}"),
+        }
+    }
+
+    /// The invariant `From<BeaconOptions>`'s `unreachable!` rests on. Each
+    /// flag `requires` the other, so a half-configured Engine API is a usage
+    /// error out of the parser rather than a panic several frames later.
+    ///
+    /// Replaces `an_endpoint_without_a_secret_is_refused`, which pinned that
+    /// panic. Same invariant, checked one layer earlier and over both halves
+    /// rather than one.
+    #[test]
+    fn execution_flags_come_as_a_pair() {
+        for half in [
+            vec!["--execution-endpoint", "http://127.0.0.1:8551"],
+            vec!["--execution-jwt-secret", "jwt.hex"],
+        ] {
+            let mut args = beacon_args();
+            args.extend_from_slice(&half);
+            let err = try_parse_from(args).expect_err("one half alone must not parse");
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "a missing pair is a usage error, not a panic: {err}"
+            );
+        }
+
+        let mut args = beacon_args();
+        args.extend_from_slice(&[
+            "--execution-endpoint",
+            "http://127.0.0.1:8551",
+            "--execution-jwt-secret",
+            "jwt.hex",
+        ]);
+        let beacon = parse_beacon(args);
+        assert!(beacon.execution_endpoint.is_some());
+        assert!(beacon.execution_jwt_secret.is_some());
+    }
+
+    #[test]
+    fn the_execution_flags_are_absent_by_default() {
+        let beacon = parse_beacon(beacon_args());
+
+        assert!(beacon.execution_endpoint.is_none());
+        assert!(beacon.execution_jwt_secret.is_none());
+        assert_eq!(
+            beacon.mainnet.safe_slots_to_import_optimistically,
+            SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY
+        );
+    }
+
+    #[test]
+    fn both_execution_flags_together_pair_into_one_value() {
+        let mut args = beacon_args();
+        args.extend([
+            "--execution-endpoint",
+            "http://127.0.0.1:8551",
+            "--execution-jwt-secret",
+            "jwt.hex",
+        ]);
+
+        let options: Options = parse_beacon(args).into();
+
+        match options.network {
+            Network::Mainnet {
+                execution: Some(execution),
+                ..
+            } => {
+                assert_eq!(execution.endpoint, "http://127.0.0.1:8551");
+                assert_eq!(execution.jwt_secret, PathBuf::from("jwt.hex"));
+            }
+            other => panic!("expected a paired execution client, got {other:?}"),
         }
     }
 }

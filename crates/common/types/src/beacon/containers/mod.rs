@@ -55,8 +55,8 @@ use libssz::{SszDecode as _, SszEncode as _};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{
-    BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, Slot, ValidatorIndex,
-    WithdrawalIndex,
+    BlsSignature, Bytes32, Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _, Root, Slot,
+    ValidatorIndex, WithdrawalIndex,
 };
 use crate::beacon::{beacon_value_unreachable, lean_block_unreachable, lean_state_unreachable};
 
@@ -709,6 +709,30 @@ impl SignedBeaconBlock {
         }
     }
 
+    /// This block's own execution payload block hash, if it carries a payload.
+    ///
+    /// Written out by hand rather than through `signed_beacon_block_accessors!`,
+    /// which generates accessors only for fields every fork shares: phase0 and
+    /// altair predate the merge and have no payload at all, and lean is not a
+    /// Beacon Chain shape. Those three answer `None`, which is a real answer
+    /// rather than a failure — `is_execution_block` in the specification's
+    /// optimistic sync document asks exactly this question and expects `False`
+    /// for a pre-merge block.
+    ///
+    /// Named arms rather than a catch-all `_`, so a fork added to the enum
+    /// breaks this match instead of silently defaulting to "no payload".
+    pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
+        match self {
+            Self::Phase0(_) | Self::Altair(_) | Self::Lean(_) => None,
+            Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
+            Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
+            Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
+            Self::Electra(block) | Self::Fulu(block) => {
+                Some(block.message.body.execution_payload.block_hash)
+            }
+        }
+    }
+
     /// The fork whose rules apply to this block.
     ///
     /// Not the same question as "what shape is this value": `Fulu` and
@@ -843,6 +867,8 @@ signed_beacon_block_accessors!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::preset;
+    use crate::beacon::primitives::{ExecutionAddress, Uint256};
 
     /// Single-validator lean state. The pubkeys are placeholders; nothing here
     /// verifies a signature.
@@ -992,5 +1018,126 @@ mod tests {
     fn slot_from_ssz_rejects_a_buffer_too_short_to_hold_one() {
         let bytes = vec![0u8; 47];
         assert!(BeaconState::slot_from_ssz(&bytes).is_err());
+    }
+
+    // -- execution_block_hash --
+
+    /// An otherwise-empty phase0 block, built field by field: phase0's
+    /// containers derive `Debug, Clone, PartialEq, Eq, SszEncode, SszDecode,
+    /// HashTreeRoot` but not `Default`, unlike their sub-fields.
+    ///
+    /// Only phase0 is built here. `execution_block_hash`'s implementation
+    /// groups `Phase0`, `Altair` and `Lean` into one match arm
+    /// (`Self::Phase0(_) | Self::Altair(_) | Self::Lean(_) => None`), so an
+    /// Altair block would only prove something about the enum, not about the
+    /// method; Lean's `SignedBlock` does not derive `Default` either, which
+    /// would make it the most expensive of the three to build for no extra
+    /// coverage.
+    fn empty_phase0_signed_block() -> phase0::SignedBeaconBlock {
+        phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: Root::default(),
+                state_root: Root::default(),
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: BlsSignature::default(),
+                    eth1_data: Eth1Data::default(),
+                    graffiti: Bytes32::default(),
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: BlsSignature::default(),
+        }
+    }
+
+    /// An otherwise-empty electra-shaped block whose execution payload's own
+    /// `block_hash` is `block_hash`.
+    ///
+    /// Also stands in for a fulu block: [`SignedBeaconBlock::Fulu`] wraps
+    /// this same [`electra::SignedBeaconBlock`] type rather than a
+    /// fulu-specific one (see that variant's own doc), so this builder is
+    /// shared rather than duplicated.
+    fn empty_electra_signed_block(block_hash: ExecutionBlockHash) -> electra::SignedBeaconBlock {
+        electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot: 0,
+                proposer_index: 0,
+                parent_root: Root::default(),
+                state_root: Root::default(),
+                body: electra::BeaconBlockBody {
+                    randao_reveal: BlsSignature::default(),
+                    eth1_data: Eth1Data::default(),
+                    graffiti: Bytes32::default(),
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                    sync_aggregate: altair::SyncAggregate::default(),
+                    execution_payload: deneb::ExecutionPayload {
+                        parent_hash: ExecutionBlockHash::default(),
+                        fee_recipient: ExecutionAddress::default(),
+                        state_root: Bytes32::default(),
+                        receipts_root: Bytes32::default(),
+                        // A fixed-length vector rather than a list, so unlike
+                        // its neighbors it has no `Default`; sized by hand.
+                        logs_bloom: bellatrix::LogsBloom::try_from(vec![
+                            0u8;
+                            preset::BYTES_PER_LOGS_BLOOM
+                        ])
+                        .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+                        prev_randao: Bytes32::default(),
+                        block_number: 0,
+                        gas_limit: 0,
+                        gas_used: 0,
+                        timestamp: 0,
+                        extra_data: Default::default(),
+                        base_fee_per_gas: Uint256::default(),
+                        block_hash,
+                        transactions: Default::default(),
+                        withdrawals: Default::default(),
+                        blob_gas_used: 0,
+                        excess_blob_gas: 0,
+                    },
+                    bls_to_execution_changes: Default::default(),
+                    blob_kzg_commitments: Default::default(),
+                    execution_requests: electra::ExecutionRequests {
+                        deposits: Default::default(),
+                        withdrawals: Default::default(),
+                        consolidations: Default::default(),
+                    },
+                },
+            },
+            signature: BlsSignature::default(),
+        }
+    }
+
+    #[test]
+    fn execution_block_hash_is_none_before_the_merge() {
+        let block = SignedBeaconBlock::Phase0(empty_phase0_signed_block());
+        assert_eq!(block.execution_block_hash(), None);
+    }
+
+    #[test]
+    fn execution_block_hash_reads_the_electra_payloads_own_hash() {
+        let expected = ExecutionBlockHash::repeat_byte(7);
+        let block = SignedBeaconBlock::Electra(empty_electra_signed_block(expected));
+        assert_eq!(block.execution_block_hash(), Some(expected));
+    }
+
+    #[test]
+    fn execution_block_hash_reads_the_fulu_payloads_own_hash() {
+        // Kept separate from the electra test above: `Fulu` wraps
+        // `electra::SignedBeaconBlock` (an enum quirk explained on
+        // `SignedBeaconBlock::Fulu`'s own doc), so this pins that the *enum
+        // variant* reaches the right match arm, not just the wrapped struct.
+        let expected = ExecutionBlockHash::repeat_byte(7);
+        let block = SignedBeaconBlock::Fulu(empty_electra_signed_block(expected));
+        assert_eq!(block.execution_block_hash(), Some(expected));
     }
 }

@@ -17,8 +17,9 @@ use ethlambda_types::{
         config::Config,
         containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
         fork::ForkName,
-        fork_choice::{LatestMessage, PowBlock},
+        fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
         preset::{Preset, SLOTS_PER_EPOCH},
+        primitives::ExecutionBlockHash,
     },
     block::{
         Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
@@ -609,11 +610,20 @@ impl GossipSignatureBuffer {
 /// that a restarted node would simply make again, and
 /// `unrealized_justifications` is recomputed by replaying epoch processing on a
 /// copy of a block's post-state, which a node resuming from an anchor does
-/// anyway as it re-imports the unfinalized window.
+/// anyway as it re-imports the unfinalized window. `optimistic_roots` and
+/// `payload_statuses` are likewise answers an execution client can be asked
+/// for again, and `el_block_hashes` is a cache over data already decodable
+/// from the block itself.
 ///
-/// Nothing here is capped: the per-validator maps are bounded by the validator
-/// set, and the per-block ones (`block_timeliness`, `unrealized_justifications`)
-/// grow with the blocks this process has imported.
+/// Most of this is uncapped: the per-validator maps are bounded by the
+/// validator set, and the per-block ones (`block_timeliness`,
+/// `unrealized_justifications`) grow with the blocks this process has
+/// imported. Two are the exception, `el_block_hashes` and `optimistic_roots`,
+/// each pruned to the unfinalized window by its own `prune_*` method. Both
+/// fill on a path that runs for the whole life of the process and has no other
+/// way of emptying them: `forkchoiceUpdated` reads the first once per head
+/// move, and an execution client doing a long state sync answers
+/// `NOT_VALIDATED` to every block, which writes the second once per import.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
@@ -622,6 +632,34 @@ pub(crate) struct BeaconScratch {
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
+    /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
+    /// against the slot the unfinalized-window bound prunes them by.
+    ///
+    /// An entry leaves on a later `VALID` or `INVALIDATED` verdict, and, for
+    /// the ones that get neither, on finality. Bounded like `el_block_hashes`
+    /// and for the same kind of reason: an execution client stuck on `SYNCING`
+    /// answers `NOT_VALIDATED` to every block, and without
+    /// `prune_beacon_optimistic_roots` nothing would ever take those entries
+    /// back out.
+    ///
+    /// Nothing outside `fork_choice::mark_validated`'s own ancestor walk reads
+    /// [`Store::is_beacon_optimistic`] yet, so outside that walk this is
+    /// write-only. The readers it is waiting for are the ones that need to
+    /// answer "is my head optimistic?": the Beacon API's `execution_optimistic`
+    /// response field, and a sync status that distinguishes a head this node
+    /// has vouched for from one it has merely imported.
+    pub(crate) optimistic_roots: HashMap<H256, u64>,
+    /// Payload statuses keyed by execution block hash, standing in for a call
+    /// to an execution client exactly as `pow_blocks` does. Written only by
+    /// the `sync/optimistic` fixture runner's `on_payload_info` step; the
+    /// production path carries its verdict as an `on_block` parameter instead.
+    pub(crate) payload_statuses: HashMap<ExecutionBlockHash, PayloadStatusV1>,
+    /// Beacon root to `(slot, execution block hash)`. A cache, not a source of
+    /// truth: every entry is recoverable by decoding the block. Unlike its
+    /// neighbours it *is* bounded, by `prune_beacon_el_block_hashes`, because
+    /// forkchoiceUpdated reads it once per head move for the whole life of the
+    /// process.
+    pub(crate) el_block_hashes: HashMap<H256, (u64, ExecutionBlockHash)>,
 }
 
 /// Encode a LiveChain key (slot, root) to bytes.
@@ -1656,6 +1694,52 @@ impl Store {
             .expect("delete non-finalized chain entries");
         batch.commit().expect("commit");
         Ok(count)
+    }
+
+    /// Writes one live-chain index row.
+    ///
+    /// `insert_signed_block` writes these as part of a block's own batch; this
+    /// is the standalone form, for tests and for any caller that needs to put a
+    /// row back.
+    pub fn insert_live_chain_entry(&mut self, slot: u64, root: H256, parent_root: H256) {
+        let entries = vec![(encode_slot_root_key(slot, &root), parent_root.to_ssz())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::LiveChain, entries)
+            .expect("put live chain entry");
+        batch.commit().expect("commit");
+    }
+
+    /// Deletes the named live-chain index rows.
+    ///
+    /// Unlike [`prune_live_chain`](Self::prune_live_chain), which drops a whole
+    /// slot range below a horizon and is lean-only, this removes exactly the
+    /// `(slot, root)` pairs given. That is what invalidating an execution
+    /// payload needs: the roots to drop are a subtree, not a slot window, and
+    /// the blocks either side of them at the same slots must survive.
+    ///
+    /// Dropping the row is the whole of "remove this block from fork choice":
+    /// [`block_index`](Self::block_index) is the only source
+    /// `filter_block_tree`, `compute_weights` and `get_head` read, so a root
+    /// with no row contributes no weight to any ancestor and can never be
+    /// walked to.
+    ///
+    /// The block and its state stay in their own tables. Nothing reads them
+    /// once the index row is gone, and keeping them means an operator can still
+    /// inspect what was rejected.
+    pub fn delete_live_chain_entries(&mut self, entries: &[(u64, H256)]) {
+        if entries.is_empty() {
+            return;
+        }
+        let keys: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(slot, root)| encode_slot_root_key(*slot, root))
+            .collect();
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::LiveChain, keys)
+            .expect("delete live chain entries");
+        batch.commit().expect("commit");
     }
 
     /// Prune gossip signatures for slots <= finalized_slot.
@@ -3001,6 +3085,133 @@ impl Store {
             .insert(block.block_hash, block);
     }
 
+    /// Looks up an execution client's answer for a payload, by that payload's
+    /// own execution block hash.
+    pub fn beacon_payload_status(&self, block_hash: ExecutionBlockHash) -> Option<PayloadStatusV1> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_statuses
+            .get(&block_hash)
+            .cloned()
+    }
+
+    /// Records an execution client's answer for a payload. The fixture format
+    /// allows the same payload's status to be updated several times over a
+    /// case, so this overwrites rather than preserving a first answer.
+    pub fn insert_beacon_payload_status(
+        &mut self,
+        block_hash: ExecutionBlockHash,
+        status: PayloadStatusV1,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_statuses
+            .insert(block_hash, status);
+    }
+
+    /// Whether `root` was imported on a `NOT_VALIDATED` answer and has not
+    /// since been resolved.
+    pub fn is_beacon_optimistic(&self, root: H256) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .optimistic_roots
+            .contains_key(&root)
+    }
+
+    /// Whether this store holds any optimistic root at all.
+    ///
+    /// The cheap half of [`Store::is_beacon_optimistic`], for callers that
+    /// would otherwise pay for a `block_index` scan only to walk a set that is
+    /// empty. With a healthy execution client it always is.
+    pub fn has_beacon_optimistic_roots(&self) -> bool {
+        !self.beacon.lock().unwrap().optimistic_roots.is_empty()
+    }
+
+    /// Marks `root` as imported on a payload the execution layer has not
+    /// vouched for yet, against the slot the unfinalized-window bound prunes
+    /// it by.
+    pub fn insert_beacon_optimistic_root(&mut self, root: H256, slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .optimistic_roots
+            .insert(root, slot);
+    }
+
+    /// Clears `root`'s optimistic marker, once its payload has been resolved
+    /// either way.
+    pub fn remove_beacon_optimistic_root(&mut self, root: H256) {
+        self.beacon.lock().unwrap().optimistic_roots.remove(&root);
+    }
+
+    /// Drops optimistic roots strictly below `finalized_slot`.
+    ///
+    /// A root below finality can no longer be validated or invalidated in any
+    /// way this node acts on, so holding it only costs memory. Unlike
+    /// `el_block_hashes` this needs no exemption for the finalized checkpoint's
+    /// own root: nothing reads a finalized block's optimistic status, and
+    /// `mark_validated`'s walk stopping one block earlier is the same answer.
+    pub fn prune_beacon_optimistic_roots(&mut self, finalized_slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .optimistic_roots
+            .retain(|_root, slot| *slot >= finalized_slot);
+    }
+
+    /// The execution block hash cached for a beacon root at import.
+    pub fn beacon_el_block_hash(&self, root: H256) -> Option<ExecutionBlockHash> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .el_block_hashes
+            .get(&root)
+            .map(|(_slot, hash)| *hash)
+    }
+
+    /// Caches the execution block hash a beacon block carries, against the slot
+    /// the unfinalized-window bound prunes it by.
+    pub fn insert_beacon_el_block_hash(
+        &mut self,
+        root: H256,
+        slot: u64,
+        block_hash: ExecutionBlockHash,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .el_block_hashes
+            .insert(root, (slot, block_hash));
+    }
+
+    /// Drops cached hashes strictly below `finalized_slot`, always keeping
+    /// `keep`.
+    ///
+    /// Strictly below, not at or below: the justified and head blocks
+    /// `forkchoiceUpdated` reads are at or above that slot, so this bound keeps
+    /// every root the call reads but one.
+    ///
+    /// That one is `keep`, the finalized checkpoint's own root, whose hash the
+    /// same call sends as `finalized_block_hash`. The slot bound alone does not
+    /// reach it: `finalized_slot` comes from a checkpoint, and
+    /// [`Store::beacon_checkpoint_as_stored`] stores an epoch as its own start
+    /// slot, while the checkpoint root is the last block at *or before* that
+    /// boundary. A missed proposal at an epoch boundary therefore leaves the
+    /// finalized block below the bound, and dropping its hash makes every later
+    /// `forkchoiceUpdated` carry `finalized_block_hash = 0x00..0`, which stops
+    /// the execution client advancing its own finalized block for as long as
+    /// the process runs.
+    pub fn prune_beacon_el_block_hashes(&mut self, finalized_slot: u64, keep: H256) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .el_block_hashes
+            .retain(|root, (slot, _hash)| *slot >= finalized_slot || *root == keep);
+    }
+
     /// Returns `root`'s unrealized justification, if this store has computed
     /// one.
     ///
@@ -3361,6 +3572,9 @@ mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
     use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
+    // Only the tests name a status variant: the store itself stores and hands
+    // back whole `PayloadStatusV1` values without ever reading the tag.
+    use ethlambda_types::beacon::fork_choice::PayloadStatusEnum;
     use ethlambda_types::beacon::primitives::Uint256;
     use ethlambda_types::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
 
@@ -5557,6 +5771,117 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_status_is_looked_up_by_the_execution_block_hash() {
+        let mut store = Store::test_store();
+        let status = PayloadStatusV1 {
+            status: PayloadStatusEnum::Syncing,
+            latest_valid_hash: None,
+            validation_error: None,
+        };
+
+        store.insert_beacon_payload_status(ExecutionBlockHash::repeat_byte(4), status.clone());
+
+        assert_eq!(
+            store.beacon_payload_status(ExecutionBlockHash::repeat_byte(4)),
+            Some(status)
+        );
+        assert_eq!(
+            store.beacon_payload_status(ExecutionBlockHash::repeat_byte(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn optimistic_roots_round_trip_and_clear() {
+        let mut store = Store::test_store();
+        assert!(!store.is_beacon_optimistic(H256::repeat_byte(1)));
+        assert!(!store.has_beacon_optimistic_roots());
+
+        store.insert_beacon_optimistic_root(H256::repeat_byte(1), 7);
+        assert!(store.is_beacon_optimistic(H256::repeat_byte(1)));
+        assert!(store.has_beacon_optimistic_roots());
+
+        store.remove_beacon_optimistic_root(H256::repeat_byte(1));
+        assert!(!store.is_beacon_optimistic(H256::repeat_byte(1)));
+        assert!(!store.has_beacon_optimistic_roots());
+    }
+
+    /// The set fills once per import while an execution client is state
+    /// syncing, and neither `mark_validated` nor `invalidate_subtree` ever
+    /// sees those roots, so finality is the only thing that empties it.
+    #[test]
+    fn optimistic_roots_prune_strictly_below_the_finalized_slot() {
+        let mut store = Store::test_store();
+        let below = H256::repeat_byte(1);
+        let at = H256::repeat_byte(2);
+        let above = H256::repeat_byte(3);
+        store.insert_beacon_optimistic_root(below, 4);
+        store.insert_beacon_optimistic_root(at, 5);
+        store.insert_beacon_optimistic_root(above, 6);
+
+        store.prune_beacon_optimistic_roots(5);
+
+        assert!(!store.is_beacon_optimistic(below));
+        assert!(store.is_beacon_optimistic(at));
+        assert!(store.is_beacon_optimistic(above));
+    }
+
+    #[test]
+    fn el_block_hashes_prune_strictly_below_the_finalized_slot() {
+        let mut store = Store::test_store();
+        let below = H256::repeat_byte(1);
+        let at = H256::repeat_byte(2);
+        let above = H256::repeat_byte(3);
+        store.insert_beacon_el_block_hash(below, 4, ExecutionBlockHash::repeat_byte(0xa1));
+        store.insert_beacon_el_block_hash(at, 5, ExecutionBlockHash::repeat_byte(0xa2));
+        store.insert_beacon_el_block_hash(above, 6, ExecutionBlockHash::repeat_byte(0xa3));
+
+        store.prune_beacon_el_block_hashes(5, at);
+
+        // Slot 4 is gone; the finalized block itself (slot 5) is kept, because
+        // forkchoiceUpdated needs its hash for `finalized_block_hash`.
+        assert_eq!(store.beacon_el_block_hash(below), None);
+        assert_eq!(
+            store.beacon_el_block_hash(at),
+            Some(ExecutionBlockHash::repeat_byte(0xa2))
+        );
+        assert_eq!(
+            store.beacon_el_block_hash(above),
+            Some(ExecutionBlockHash::repeat_byte(0xa3))
+        );
+    }
+
+    /// A checkpoint names the last block at *or before* its epoch boundary, so
+    /// a missed proposal there puts the finalized block below the slot the
+    /// checkpoint is stored as. The slot bound alone would drop exactly the
+    /// hash `forkchoiceUpdated` sends as `finalized_block_hash`.
+    #[test]
+    fn el_block_hashes_keep_the_finalized_root_below_a_skipped_epoch_boundary() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let head = H256::repeat_byte(3);
+        // Slot 30 proposed, 31 skipped: the epoch that starts at 32 finalizes
+        // with its checkpoint root still sitting at slot 30.
+        store.insert_beacon_el_block_hash(finalized, 30, ExecutionBlockHash::repeat_byte(0xb1));
+        store.insert_beacon_el_block_hash(stale, 29, ExecutionBlockHash::repeat_byte(0xb2));
+        store.insert_beacon_el_block_hash(head, 33, ExecutionBlockHash::repeat_byte(0xb3));
+
+        store.prune_beacon_el_block_hashes(32, finalized);
+
+        assert_eq!(
+            store.beacon_el_block_hash(finalized),
+            Some(ExecutionBlockHash::repeat_byte(0xb1)),
+            "the finalized checkpoint's own hash must survive its epoch's prune"
+        );
+        assert_eq!(store.beacon_el_block_hash(stale), None);
+        assert_eq!(
+            store.beacon_el_block_hash(head),
+            Some(ExecutionBlockHash::repeat_byte(0xb3))
+        );
+    }
+
+    #[test]
     fn a_fresh_beacon_store_seeds_every_key_its_accessors_read() {
         let backend = Arc::new(InMemoryBackend::new());
         let config = Config::mainnet();
@@ -5993,5 +6318,22 @@ mod tests {
 
         let found = store.data_column_sidecars_in_range(9, 10, &[1]).unwrap();
         assert_eq!(found, vec![sidecar_bytes(0xaa)]);
+    }
+
+    #[test]
+    fn deleting_live_chain_entries_removes_exactly_those_roots() {
+        let mut store = Store::test_store();
+        let kept = H256::repeat_byte(1);
+        let removed = H256::repeat_byte(2);
+
+        store.insert_live_chain_entry(9, kept, H256::ZERO);
+        store.insert_live_chain_entry(9, removed, H256::ZERO);
+        assert_eq!(store.block_index().len(), 2);
+
+        store.delete_live_chain_entries(&[(9, removed)]);
+
+        let index = store.block_index();
+        assert!(index.contains_key(&kept));
+        assert!(!index.contains_key(&removed));
     }
 }

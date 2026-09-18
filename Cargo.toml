@@ -11,6 +11,7 @@ members = [
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
+    "crates/net/engine",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
@@ -71,6 +72,7 @@ ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
+ethlambda-engine = { path = "crates/net/engine" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
@@ -81,6 +83,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.117"
 serde_yaml_ng = "0.10"
 hex = "0.4"
+hmac = "0.12"
+base64 = "0.22"
 
 spawned-concurrency = "0.5.0"
 spawned-rt = "0.5.0"

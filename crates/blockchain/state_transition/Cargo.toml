@@ -42,10 +42,15 @@ tracing.workspace = true
 hex.workspace = true
 
 # For `beacon::genesis`, which fills in an `SszList` of validators. The beacon
-# containers and their derives live in `ethlambda-types`, so the encoder, the
-# derive macros and the merkleizer are reached through them rather than named
-# here; the spec-test harness declares its own for the containers it defines.
+# containers and their derives live in `ethlambda-types`, so the derive macros
+# and the merkleizer are reached through them rather than named here; the
+# spec-test harness declares its own for the containers it defines.
 libssz-types.workspace = true
+
+# For `SszEncode::to_ssz` on a bare `SszList`, which `get_execution_requests_list`
+# needs: the beacon containers' own `to_ssz` inherent methods cover whole states
+# and blocks, not one list field of a body.
+libssz.workspace = true
 
 # For `beacon::hash::hash`, that module's one SHA-256 entry point. The workspace
 # pins the `asm` feature; see the root manifest for what it buys and why

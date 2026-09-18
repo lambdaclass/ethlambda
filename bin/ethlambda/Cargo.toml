@@ -47,6 +47,7 @@ hex.workspace = true
 
 clap.workspace = true
 reqwest.workspace = true
+ethlambda-engine.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
 
