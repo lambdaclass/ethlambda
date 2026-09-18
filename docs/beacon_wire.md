@@ -20,22 +20,32 @@ ethlambda beacon \
   --gossipsub-port 9001
 ```
 
-No flag is required: `ethlambda beacon` on its own is a complete invocation.
+No flag is required, but that is only true for the built-in network:
+`ethlambda beacon` on its own follows mainnet, since `--network` defaults to
+`mainnet`. To follow another network, pass `--network` naming a directory of
+published files (`config.yaml` and `genesis.ssz`, see [`cli.md`](./cli.md)):
+
+```bash
+ethlambda beacon --network ./my-network --node-key ./node-key
+```
+
 `genesis_time` and `genesis_validators_root`, and therefore the fork digest,
-come from mainnet's genesis `BeaconState`, which is built into the binary as
-`bin/ethlambda/assets/mainnet/genesis.ssz` (`eth-clients/mainnet`'s file,
-byte for byte, decoded at startup in about 4 ms). Nothing about startup touches the
-network. discv5 is forced on and needs no flag either: published mainnet
+are derived from whichever genesis state the resolved network supplies: for
+the built-in `mainnet`, that state is built into the binary as
+`bin/ethlambda/assets/mainnet/genesis.ssz` (`eth-clients/mainnet`'s file, byte
+for byte, decoded at startup in about 4 ms); for a loaded network it is that
+directory's own `genesis.ssz`. Nothing about startup touches the network to
+get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.
 
 ## The fork digest
 
-Computed once at startup from the built-in genesis state, never hardcoded as a
-digest:
+Computed once at startup from the resolved network's genesis state, never
+hardcoded as a digest:
 
 ```
 epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
-fork_version = the mainnet schedule at epoch
+fork_version = the resolved network's fork schedule at epoch
 base         = compute_fork_data_root(fork_version, genesis_validators_root)
 digest       = base[..4]                                    if epoch <  FULU_FORK_EPOCH
              = xor(base, sha256(le64(bp.epoch) ++

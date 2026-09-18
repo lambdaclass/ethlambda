@@ -196,6 +196,48 @@ pub struct BeaconBlockBody {
         SszList<SignedBLSToExecutionChange, { preset::MAX_BLS_TO_EXECUTION_CHANGES }>,
 }
 
+impl BeaconBlockBody {
+    /// An empty body: no operations of any kind, and an all-zero execution
+    /// payload.
+    ///
+    /// Not `#[derive(Default)]`: `execution_payload.logs_bloom` is an
+    /// [`SszVector`](libssz_types::SszVector), and unlike a list, a vector can
+    /// never validly be empty, so libssz gives it no `Default` impl. Its
+    /// all-zero value is built explicitly at its exact length instead.
+    pub fn empty() -> Self {
+        Self {
+            randao_reveal: Default::default(),
+            eth1_data: Default::default(),
+            graffiti: Default::default(),
+            proposer_slashings: Default::default(),
+            attester_slashings: Default::default(),
+            attestations: Default::default(),
+            deposits: Default::default(),
+            voluntary_exits: Default::default(),
+            sync_aggregate: Default::default(),
+            execution_payload: ExecutionPayload {
+                parent_hash: ExecutionBlockHash::ZERO,
+                fee_recipient: ExecutionAddress::ZERO,
+                state_root: Bytes32::ZERO,
+                receipts_root: Bytes32::ZERO,
+                logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                    .expect("BYTES_PER_LOGS_BLOOM zeros fit LogsBloom's exact length"),
+                prev_randao: Bytes32::ZERO,
+                block_number: 0,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::ZERO,
+                block_hash: ExecutionBlockHash::ZERO,
+                transactions: Default::default(),
+                withdrawals: Default::default(),
+            },
+            bls_to_execution_changes: Default::default(),
+        }
+    }
+}
+
 /// A block.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BeaconBlock {
@@ -323,26 +365,6 @@ mod tests {
 
     use super::*;
 
-    fn empty_execution_payload() -> ExecutionPayload {
-        ExecutionPayload {
-            parent_hash: ExecutionBlockHash::ZERO,
-            fee_recipient: ExecutionAddress::ZERO,
-            state_root: Bytes32::ZERO,
-            receipts_root: Bytes32::ZERO,
-            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
-            prev_randao: Bytes32::ZERO,
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::ZERO,
-            block_hash: ExecutionBlockHash::ZERO,
-            transactions: Default::default(),
-            withdrawals: Default::default(),
-        }
-    }
-
     #[test]
     fn withdrawal_round_trips_through_ssz() {
         let withdrawal = Withdrawal {
@@ -397,19 +419,7 @@ mod tests {
         // An empty body is the common case for a skipped-operation slot, and it
         // exercises every offset in the encoding with zero-length payloads,
         // including the nested offsets inside `execution_payload`.
-        let body = BeaconBlockBody {
-            randao_reveal: BlsSignature::default(),
-            eth1_data: Eth1Data::default(),
-            graffiti: Bytes32::ZERO,
-            proposer_slashings: Default::default(),
-            attester_slashings: Default::default(),
-            attestations: Default::default(),
-            deposits: Default::default(),
-            voluntary_exits: Default::default(),
-            sync_aggregate: SyncAggregate::default(),
-            execution_payload: empty_execution_payload(),
-            bls_to_execution_changes: Default::default(),
-        };
+        let body = BeaconBlockBody::empty();
 
         let bytes = body.to_ssz();
         assert_eq!(BeaconBlockBody::from_ssz_bytes(&bytes).unwrap(), body);

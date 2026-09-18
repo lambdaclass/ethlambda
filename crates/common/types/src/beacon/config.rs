@@ -9,18 +9,25 @@
 //! could not have been a preset. Everything else in [`Config`] is here simply
 //! because the specification itself calls it configuration.
 //!
-//! # What is deliberately left out
+//! # What is left out
 //!
-//! - **Networking values** (gossip mesh parameters, request/response size
-//!   limits, subnet counts, `MAX_PAYLOAD_SIZE`, and so on): this crate
-//!   implements the state transition and fork choice, not the wire protocol,
-//!   so nothing here would ever read them.
-//! - **Deposit contract identity** (`DEPOSIT_CHAIN_ID`, `DEPOSIT_NETWORK_ID`,
-//!   `DEPOSIT_CONTRACT_ADDRESS`): these tell a validator client which Eth1
-//!   chain and contract to watch for deposits. The state transition only ever
-//!   processes deposits that are already included in a block (via
-//!   `Eth1Data` votes or, from electra onward, execution layer requests); it
-//!   never itself looks the deposit contract up.
+//! - **Forks this build cannot process.** `GLOAS_*`, `HEZE_*` and the timing
+//!   values that arrived with them, plus `GAS_LIMIT_SCHEDULE`, which is
+//!   gloas-era and is a list rather than a scalar. A fork version stored here
+//!   would give [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`]
+//!   has no variant for, so these are reported as unknown keys instead.
+//! - **`PRESET_BASE` and `CONFIG_NAME`.** Both are strings, and this struct is
+//!   SSZ-encoded into the database, so storing them would mean a bounded byte
+//!   list and a storage bound each. Neither needs persisting: the first is
+//!   read once at startup to check the compiled preset, the second is for
+//!   logging and the spec endpoint.
+//!
+//! Networking values and the deposit contract identity used to be left out too,
+//! on the grounds that the state transition never reads them. They are here now
+//! because they have a second reader: `/eth/v1/config/spec` must echo every key
+//! a `config.yaml` carries, and a key with no typed home would be reported as
+//! unknown on every startup of every valid configuration, which would bury a
+//! real typo among forty legitimate warnings.
 //!
 //! The genesis-section values are all included. `GENESIS_FORK_VERSION` is fork
 //! scheduling rather than genesis construction, since [`Config::fork_version`]
@@ -46,11 +53,14 @@ use crate::constants::INTERVALS_PER_SLOT;
 /// Modeled as a plain struct rather than a `(Epoch, u64)` tuple so that
 /// [`Config::max_blobs_per_block`]'s search reads as "find the entry", not
 /// "find the pair".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct BlobScheduleEntry {
     /// The first epoch this entry applies to.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub epoch: Epoch,
     /// The blob count limit from `epoch` onward.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub max_blobs_per_block: u64,
 }
 
@@ -69,19 +79,23 @@ pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 /// Construct one with [`Config::mainnet`], [`Config::minimal`], or
 /// [`Config::active`]; adjust a single fork's activation epoch with
 /// [`Config::with_fork_epoch`] for fixture-driven tests that need one.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE", default)]
 pub struct Config {
     // -- Genesis construction ---------------------------------------------
     /// How many active validators the chain needs before it may start.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub min_genesis_active_validator_count: u64,
     /// The earliest wall-clock time the chain may start at, whatever the Eth1
     /// deposit history says.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub min_genesis_time: u64,
     /// How long after the Eth1 block that satisfies the genesis conditions the
     /// chain actually starts.
     ///
     /// The delay exists so that validators who deposited just before the
     /// threshold was crossed still have time to get their nodes running.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub genesis_delay: u64,
     /// The wall-clock second the chain's slot 0 began, which every slot
     /// boundary is computed from.
@@ -93,6 +107,7 @@ pub struct Config {
     ///
     /// On a beacon chain this is read off the anchor state at bootstrap. On a
     /// lean chain it comes from the genesis config file.
+    #[serde(skip)]
     pub genesis_time: u64,
 
     // -- Fork scheduling --------------------------------------------------
@@ -101,38 +116,51 @@ pub struct Config {
     /// mixed into `compute_fork_data_root` when computing the genesis
     /// validators root's domain, alongside the all-zero genesis validators
     /// root, at chain start.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub genesis_fork_version: Version,
     /// The `Fork.current_version` an altair block or attestation signs under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub altair_fork_version: Version,
     /// The epoch altair activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled on this network.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub altair_fork_epoch: Epoch,
     /// The `Fork.current_version` a bellatrix block or attestation signs
     /// under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub bellatrix_fork_version: Version,
     /// The epoch bellatrix (the Merge) activates at, or
     /// [`constants::FAR_FUTURE_EPOCH`] if it is not scheduled.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub bellatrix_fork_epoch: Epoch,
     /// The `Fork.current_version` a capella block or attestation signs under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub capella_fork_version: Version,
     /// The epoch capella activates at, or [`constants::FAR_FUTURE_EPOCH`] if
     /// it is not scheduled.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub capella_fork_epoch: Epoch,
     /// The `Fork.current_version` a deneb block or attestation signs under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub deneb_fork_version: Version,
     /// The epoch deneb activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub deneb_fork_epoch: Epoch,
     /// The `Fork.current_version` an electra block or attestation signs
     /// under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub electra_fork_version: Version,
     /// The epoch electra activates at, or [`constants::FAR_FUTURE_EPOCH`] if
     /// it is not scheduled.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub electra_fork_epoch: Epoch,
     /// The `Fork.current_version` a fulu block or attestation signs under.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
     pub fulu_fork_version: Version,
     /// The epoch fulu activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub fulu_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
@@ -141,61 +169,77 @@ pub struct Config {
     /// but still how `compute_time_at_slot` and the fork choice store's
     /// `genesis_time`-to-slot arithmetic convert between a slot number and a
     /// wall-clock time.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub seconds_per_slot: u64,
     /// Milliseconds per slot. What the fork choice store's timeliness
     /// checks (`get_attestation_due_ms` and friends) actually divide the
     /// `*_due_bps` fields below by; equal to `seconds_per_slot * 1000` on
     /// every network this crate ships a constructor for, but tracked
     /// separately because the specification does.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub slot_duration_ms: u64,
     /// The assumed seconds per execution-layer block, used to convert
     /// [`Self::eth1_follow_distance`] (a block count) into a voting-period
     /// safety margin.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub seconds_per_eth1_block: u64,
     /// Epochs a validator must wait after its exit is processed before its
     /// balance becomes withdrawable.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub min_validator_withdrawability_delay: Epoch,
     /// Epochs a validator must be active before it is eligible to propose,
     /// perform voluntary exits, or (from electra) initiate a consolidation.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub shard_committee_period: Epoch,
     /// Execution-layer blocks a state's Eth1 vote must lag the execution
     /// chain's head by, so that every node's view of "current" Eth1 data
     /// agrees despite network latency and minor reorgs.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub eth1_follow_distance: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an attestation is
     /// due; read by the fork choice store's `get_attestation_due_ms`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub attestation_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an aggregate
     /// attestation is due; read by `get_aggregate_due_ms`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub aggregate_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] past which a proposer must
     /// no longer attempt a late-block reorg; read by
     /// `get_proposer_reorg_cutoff_ms`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub proposer_reorg_cutoff_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which a sync committee
     /// message is due (altair); read by `get_sync_message_due_ms`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub sync_message_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which a sync committee
     /// contribution is due (altair); read by `get_contribution_due_ms`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub contribution_due_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
     /// is offline (or the chain is leaking) without a timely target vote.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub inactivity_score_bias: u64,
     /// Score points subtracted from a validator's inactivity score for each
     /// epoch it casts a timely target vote while the chain is not leaking.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub inactivity_score_recovery_rate: u64,
     /// Effective balance floor below which a validator is force-exited at the
     /// next opportunity, regardless of its own wishes.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub ejection_balance: Gwei,
     /// The minimum validators allowed to enter the activation/exit queue in
     /// one epoch, regardless of the active validator set's size. Prevents the
     /// churn limit from collapsing to zero on a small validator set.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub min_per_epoch_churn_limit: u64,
     /// Active validators per unit of per-epoch activation/exit churn: the
     /// churn limit before electra is `active_validator_count /
     /// churn_limit_quotient`, floored at [`Self::min_per_epoch_churn_limit`].
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub churn_limit_quotient: u64,
     /// Deneb: an additional cap on the activation churn limit specifically
     /// (separate from the combined activation/exit limit above), so that
@@ -203,14 +247,17 @@ pub struct Config {
     /// Superseded by [`Self::max_per_epoch_activation_exit_churn_limit`] from
     /// electra onward, but the specification keeps both names rather than
     /// reusing one.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub max_per_epoch_activation_churn_limit: u64,
     /// Electra: the churn limit is now denominated in Gwei rather than a
     /// validator count (`get_balance_churn_limit`), and this is its floor,
     /// replacing [`Self::min_per_epoch_churn_limit`] from electra onward.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub min_per_epoch_churn_limit_electra: Gwei,
     /// Electra: the ceiling on the portion of the (Gwei-denominated) churn
     /// limit dedicated to activations and exits, as opposed to
     /// consolidations (`get_activation_exit_churn_limit`).
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub max_per_epoch_activation_exit_churn_limit: Gwei,
 
     // -- Fork choice ---------------------------------------------------------
@@ -218,17 +265,21 @@ pub struct Config {
     /// block proposed on time when comparing it against competitors for head.
     /// Deters "balancing" attacks that rely on splitting the vote right at a
     /// slot boundary.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub proposer_score_boost: u64,
     /// Percentage of committee weight the current head must be below the
     /// parent's competing child by for a proposer to consider reorging it out.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub reorg_head_weight_threshold: u64,
     /// Percentage of committee weight the parent block must exceed for a
     /// proposer to consider reorging its late child out.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub reorg_parent_weight_threshold: u64,
     /// How many epochs finality is allowed to lag before a proposer refuses to
     /// attempt a reorg at all, regardless of the weight thresholds above.
     /// Reorgs are a liveness optimization; this bounds how much they may risk
     /// finality progress to pursue it.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub reorg_max_epochs_since_finalization: Epoch,
 
     // -- Transition (bellatrix) -----------------------------------------------
@@ -236,6 +287,7 @@ pub struct Config {
     /// becomes a valid terminal block for the Merge transition.
     /// [`Uint256`]-sized because total difficulty accumulates over the
     /// entire PoW chain's history and long since overflowed 64 bits.
+    #[serde(deserialize_with = "deserialize_terminal_total_difficulty")]
     pub terminal_total_difficulty: Uint256,
     /// A specific PoW block hash that overrides [`Self::terminal_total_difficulty`]
     /// as the terminal block, if set to anything other than the zero hash.
@@ -246,24 +298,167 @@ pub struct Config {
     /// The epoch at or after which [`Self::terminal_block_hash`], if set, is
     /// honored. Guards against an old override value being replayed before
     /// the network is ready for it.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub terminal_block_hash_activation_epoch: Epoch,
 
     // -- Blob limits -----------------------------------------------------------
     /// Deneb's fixed cap on `blob_kzg_commitments` per block, in effect from
     /// deneb until electra raises it.
+    #[serde(
+        rename = "MAX_BLOBS_PER_BLOCK",
+        deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize"
+    )]
     pub max_blobs_per_block_deneb: u64,
     /// Electra's fixed cap on `blob_kzg_commitments` per block. Also the value
     /// [`Self::max_blobs_per_block`] falls back to for any epoch fulu's blob
     /// schedule does not (yet) cover, matching `get_blob_parameters`'s own
     /// fallback of `BlobParameters(ELECTRA_FORK_EPOCH,
     /// MAX_BLOBS_PER_BLOCK_ELECTRA)`.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
     pub max_blobs_per_block_electra: u64,
     /// Fulu's blob schedule (EIP7892): a possibly-empty list of `(epoch,
     /// limit)` entries, kept sorted ascending by epoch, that lets the blob
     /// count limit change again after electra without a new hard fork per
     /// change. Read through [`Config::max_blobs_per_block`] rather than
     /// directly.
+    #[serde(deserialize_with = "deserialize_blob_schedule")]
     pub blob_schedule: SszList<BlobScheduleEntry, MAX_BLOB_SCHEDULE_ENTRIES>,
+
+    // -- Networking --------------------------------------------------------
+    // These describe the wire rather than the state transition, so nothing in
+    // this crate reads them. They are here because a `config.yaml` carries
+    // them, `/eth/v1/config/spec` has to echo them, and a field with no typed
+    // home would otherwise be reported as an unknown key on every startup of
+    // every valid configuration.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub attestation_propagation_slot_range: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub attestation_subnet_count: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub attestation_subnet_extra_bits: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub blob_sidecar_subnet_count: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub blob_sidecar_subnet_count_electra: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub data_column_sidecar_subnet_count: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub epochs_per_subnet_subscription: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_payload_size: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_blocks: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_blocks_deneb: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_payloads: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub maximum_gossip_clock_disparity: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    pub message_domain_invalid_snappy: [u8; 4],
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    pub message_domain_valid_snappy: [u8; 4],
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub min_epochs_for_blob_sidecars_requests: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub min_epochs_for_data_column_sidecars_requests: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub subnets_per_node: u64,
+
+    // -- Deposit contract --------------------------------------------------
+    // Which Eth1 chain and contract a validator client watches for deposits.
+    // The state transition only processes deposits already in a block, so it
+    // never looks the contract up; `/eth/v1/config/deposit_contract` serves
+    // these.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub deposit_chain_id: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub deposit_network_id: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    pub deposit_contract_address: [u8; 20],
+
+    // -- PeerDAS custody ---------------------------------------------------
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub balance_per_additional_custody_group: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub custody_requirement: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub number_of_custody_groups: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub samples_per_slot: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub validator_custody_requirement: u64,
+
+    // -- Other runtime values ----------------------------------------------
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub consolidation_churn_limit_quotient: u64,
+
+    // -- Networking (added after an incomplete initial key list) -----------
+    // These five are additional keys mainnet's own published `config.yaml`
+    // carries; missed initially because the key list this struct was
+    // checked against came from a genesis generator's example rather than
+    // the published file itself.
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub attestation_subnet_prefix_bits: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_blob_sidecars: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_blob_sidecars_electra: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub max_request_data_column_sidecars: u64,
+    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    pub min_epochs_for_block_requests: u64,
+}
+
+/// Mainnet's values, which is what an absent key in a `config.yaml` falls back
+/// to.
+///
+/// Deserialization is deliberately permissive: no client surveyed rejects a
+/// configuration for a missing key, and a network that predates a field should
+/// still load. Mainnet is the right fallback because every other network is
+/// described as a deviation from it.
+impl Default for Config {
+    fn default() -> Self {
+        Self::mainnet()
+    }
+}
+
+/// Deserializes `TERMINAL_TOTAL_DIFFICULTY`.
+///
+/// The one integer field [`crate::beacon::serde_helpers::quoted_or_bare`]
+/// cannot cover: [`Uint256`] has no `FromStr` impl (only the inherent
+/// [`Uint256::from_dec_str`], kept because nothing on the shipping path parses
+/// one otherwise), so this reimplements `quoted_or_bare`'s "take the scalar as
+/// a string either way" trick against that inherent parser instead.
+fn deserialize_terminal_total_difficulty<'de, D>(deserializer: D) -> Result<Uint256, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+    Uint256::from_dec_str(text.trim()).map_err(serde::de::Error::custom)
+}
+
+/// Deserializes `BLOB_SCHEDULE`.
+///
+/// The YAML shape is a list of mappings (`{EPOCH, MAX_BLOBS_PER_BLOCK}`), not a
+/// scalar, so neither [`crate::beacon::serde_helpers::quoted_or_bare`] nor
+/// [`crate::beacon::serde_helpers::hex_array`] applies: this reads the list as
+/// a plain `Vec<BlobScheduleEntry>` (each entry deserializing its own two
+/// scalar fields through `quoted_or_bare`) and then converts it into the
+/// bounded [`SszList`], erroring clearly if the file names more entries than
+/// [`MAX_BLOB_SCHEDULE_ENTRIES`] allows.
+fn deserialize_blob_schedule<'de, D>(
+    deserializer: D,
+) -> Result<SszList<BlobScheduleEntry, MAX_BLOB_SCHEDULE_ENTRIES>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let entries = <Vec<BlobScheduleEntry> as serde::Deserialize>::deserialize(deserializer)?;
+    entries.try_into().map_err(|err| {
+        serde::de::Error::custom(format!(
+            "BLOB_SCHEDULE carries more than {MAX_BLOB_SCHEDULE_ENTRIES} entries: {err:?}"
+        ))
+    })
 }
 
 /// Mainnet's `TERMINAL_TOTAL_DIFFICULTY`.
@@ -358,6 +553,45 @@ impl Config {
             ]
             .try_into()
             .expect("mainnet blob schedule within bound"),
+
+            attestation_propagation_slot_range: 32,
+            attestation_subnet_count: 64,
+            attestation_subnet_extra_bits: 0,
+            blob_sidecar_subnet_count: 6,
+            blob_sidecar_subnet_count_electra: 9,
+            data_column_sidecar_subnet_count: 128,
+            epochs_per_subnet_subscription: 256,
+            max_payload_size: 10_485_760,
+            max_request_blocks: 1_024,
+            max_request_blocks_deneb: 128,
+            max_request_payloads: 128,
+            maximum_gossip_clock_disparity: 500,
+            message_domain_invalid_snappy: [0x00, 0x00, 0x00, 0x00],
+            message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
+            min_epochs_for_blob_sidecars_requests: 4_096,
+            min_epochs_for_data_column_sidecars_requests: 4_096,
+            subnets_per_node: 2,
+
+            deposit_chain_id: 1,
+            deposit_network_id: 1,
+            deposit_contract_address: [
+                0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c, 0xbb, 0x83, 0x9c, 0xbe,
+                0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa,
+            ],
+
+            balance_per_additional_custody_group: 32_000_000_000,
+            custody_requirement: 4,
+            number_of_custody_groups: 128,
+            samples_per_slot: 8,
+            validator_custody_requirement: 8,
+
+            consolidation_churn_limit_quotient: 65_536,
+
+            attestation_subnet_prefix_bits: 6,
+            max_request_blob_sidecars: 768,
+            max_request_blob_sidecars_electra: 1_152,
+            max_request_data_column_sidecars: 16_384,
+            min_epochs_for_block_requests: 33_024,
         }
     }
 
@@ -427,6 +661,45 @@ impl Config {
             max_blobs_per_block_deneb: 6,
             max_blobs_per_block_electra: 9,
             blob_schedule: SszList::new(),
+
+            attestation_propagation_slot_range: 32,
+            attestation_subnet_count: 64,
+            attestation_subnet_extra_bits: 0,
+            blob_sidecar_subnet_count: 6,
+            blob_sidecar_subnet_count_electra: 9,
+            data_column_sidecar_subnet_count: 128,
+            epochs_per_subnet_subscription: 256,
+            max_payload_size: 10_485_760,
+            max_request_blocks: 1_024,
+            max_request_blocks_deneb: 128,
+            max_request_payloads: 128,
+            maximum_gossip_clock_disparity: 500,
+            message_domain_invalid_snappy: [0x00, 0x00, 0x00, 0x00],
+            message_domain_valid_snappy: [0x01, 0x00, 0x00, 0x00],
+            min_epochs_for_blob_sidecars_requests: 4_096,
+            min_epochs_for_data_column_sidecars_requests: 4_096,
+            subnets_per_node: 2,
+
+            deposit_chain_id: 1,
+            deposit_network_id: 1,
+            deposit_contract_address: [
+                0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c, 0xbb, 0x83, 0x9c, 0xbe,
+                0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa,
+            ],
+
+            balance_per_additional_custody_group: 32_000_000_000,
+            custody_requirement: 4,
+            number_of_custody_groups: 128,
+            samples_per_slot: 8,
+            validator_custody_requirement: 8,
+
+            consolidation_churn_limit_quotient: 65_536,
+
+            attestation_subnet_prefix_bits: 6,
+            max_request_blob_sidecars: 768,
+            max_request_blob_sidecars_electra: 1_152,
+            max_request_data_column_sidecars: 16_384,
+            min_epochs_for_block_requests: 33_024,
         }
     }
 
@@ -776,5 +1049,200 @@ mod tests {
         assert_eq!(config.min_genesis_time, 1_606_824_000);
         assert_eq!(config.genesis_time, 1_606_824_023);
         assert_ne!(config.genesis_time, config.min_genesis_time);
+    }
+
+    #[test]
+    fn mainnets_own_config_file_parses_to_the_built_in_config() {
+        // The fork schedule, slot timing and churn values in eth-clients'
+        // published file must be exactly what `Config::mainnet` hardcodes. If
+        // they ever diverge, one of the two is wrong.
+        let text = include_str!(
+            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
+        );
+        let parsed: Config = serde_yaml_ng::from_str(text).expect("mainnet config.yaml parses");
+        let built_in = Config::mainnet();
+
+        assert_eq!(parsed.genesis_fork_version, built_in.genesis_fork_version);
+        assert_eq!(parsed.altair_fork_epoch, built_in.altair_fork_epoch);
+        assert_eq!(parsed.electra_fork_epoch, built_in.electra_fork_epoch);
+        assert_eq!(parsed.fulu_fork_epoch, built_in.fulu_fork_epoch);
+        assert_eq!(parsed.seconds_per_slot, built_in.seconds_per_slot);
+        assert_eq!(parsed.churn_limit_quotient, built_in.churn_limit_quotient);
+        assert_eq!(parsed.ejection_balance, built_in.ejection_balance);
+
+        // Every equality above holds for an empty document too, since
+        // `Config`'s serde default is `Config::mainnet()` itself: this is a
+        // drift check between our hardcoded values and eth-clients', not
+        // proof the file is read at all. Prove that separately by editing one
+        // line the file carries and checking the parsed value follows the
+        // edit rather than staying at the default.
+        let perturbed_text = text.replacen(
+            "CHURN_LIMIT_QUOTIENT: 65536",
+            "CHURN_LIMIT_QUOTIENT: 12345",
+            1,
+        );
+        assert_ne!(
+            perturbed_text, text,
+            "fixture no longer carries CHURN_LIMIT_QUOTIENT in the expected form"
+        );
+        let perturbed: Config = serde_yaml_ng::from_str(&perturbed_text).unwrap();
+        assert_eq!(perturbed.churn_limit_quotient, 12_345);
+    }
+
+    #[test]
+    fn genesis_time_does_not_come_from_the_config_file() {
+        // Whatever serde does for a skipped field under a container-level
+        // default, the one thing that must hold is that the file's own
+        // MIN_GENESIS_TIME never becomes genesis_time: mainnet's differ by 23
+        // seconds, and using the wrong one moves every slot boundary. A later
+        // task fills this from the genesis state.
+        let text = include_str!(
+            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
+        );
+        let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
+        assert_ne!(
+            parsed.genesis_time, 1_606_824_000,
+            "MIN_GENESIS_TIME leaked in"
+        );
+
+        // The assertion above holds for an empty document too: `genesis_time`
+        // is `#[serde(skip)]` and always takes the container default,
+        // regardless of what the file says. Prove this document is actually
+        // being parsed by perturbing MIN_GENESIS_TIME and checking it lands
+        // in `min_genesis_time` while `genesis_time` -- unreachable from any
+        // config key -- stays exactly where it started.
+        let perturbed_text = text.replacen(
+            "MIN_GENESIS_TIME: 1606824000",
+            "MIN_GENESIS_TIME: 999999999",
+            1,
+        );
+        assert_ne!(
+            perturbed_text, text,
+            "fixture no longer carries MIN_GENESIS_TIME in the expected form"
+        );
+        let perturbed: Config = serde_yaml_ng::from_str(&perturbed_text).unwrap();
+        assert_eq!(perturbed.min_genesis_time, 999_999_999);
+        assert_eq!(perturbed.genesis_time, parsed.genesis_time);
+    }
+
+    #[test]
+    fn the_networking_and_deposit_keys_come_from_the_file() {
+        let text = include_str!(
+            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
+        );
+        let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
+
+        assert_eq!(parsed.attestation_subnet_count, 64);
+        assert_eq!(parsed.subnets_per_node, 2);
+        assert_eq!(parsed.max_payload_size, 10_485_760);
+        assert_eq!(parsed.max_request_blocks, 1_024);
+        assert_eq!(parsed.max_request_blocks_deneb, 128);
+        assert_eq!(parsed.maximum_gossip_clock_disparity, 500);
+        assert_eq!(parsed.message_domain_valid_snappy, [0x01, 0x00, 0x00, 0x00]);
+        assert_eq!(
+            parsed.message_domain_invalid_snappy,
+            [0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(parsed.deposit_chain_id, 1);
+        assert_eq!(parsed.deposit_network_id, 1);
+        assert_eq!(
+            parsed.deposit_contract_address,
+            hex::decode("00000000219ab540356cBB839Cbe05303d7705Fa")
+                .unwrap()
+                .as_slice()
+        );
+        assert_eq!(parsed.custody_requirement, 4);
+        assert_eq!(parsed.number_of_custody_groups, 128);
+        assert_eq!(parsed.samples_per_slot, 8);
+        assert_eq!(parsed.validator_custody_requirement, 8);
+        assert_eq!(parsed.balance_per_additional_custody_group, 32_000_000_000);
+
+        // Every equality above holds for an empty document too, since each of
+        // these fields' serde default is mainnet's own value, which is
+        // exactly what the file carries. Prove the file is actually driving
+        // the parse: perturb one field from each group above (networking,
+        // deposit contract, custody) and check the parsed value follows the
+        // file rather than the default.
+        let networking_text = text.replacen(
+            "ATTESTATION_SUBNET_COUNT: 64",
+            "ATTESTATION_SUBNET_COUNT: 32",
+            1,
+        );
+        assert_ne!(
+            networking_text, text,
+            "fixture no longer carries ATTESTATION_SUBNET_COUNT in the expected form"
+        );
+        let networking: Config = serde_yaml_ng::from_str(&networking_text).unwrap();
+        assert_eq!(networking.attestation_subnet_count, 32);
+
+        let deposit_text = text.replacen("DEPOSIT_CHAIN_ID: 1", "DEPOSIT_CHAIN_ID: 7", 1);
+        assert_ne!(
+            deposit_text, text,
+            "fixture no longer carries DEPOSIT_CHAIN_ID in the expected form"
+        );
+        let deposit: Config = serde_yaml_ng::from_str(&deposit_text).unwrap();
+        assert_eq!(deposit.deposit_chain_id, 7);
+
+        let custody_text = text.replacen("CUSTODY_REQUIREMENT: 4", "CUSTODY_REQUIREMENT: 6", 1);
+        assert_ne!(
+            custody_text, text,
+            "fixture no longer carries CUSTODY_REQUIREMENT in the expected form"
+        );
+        let custody: Config = serde_yaml_ng::from_str(&custody_text).unwrap();
+        assert_eq!(custody.custody_requirement, 6);
+    }
+
+    #[test]
+    fn a_key_absent_from_the_file_falls_back_to_mainnet() {
+        // mainnet's own config.yaml carries no MAX_REQUEST_PAYLOADS. The default
+        // has to fill it rather than the parse failing.
+        let text = include_str!(
+            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
+        );
+        let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
+        assert_eq!(
+            parsed.max_request_payloads,
+            Config::mainnet().max_request_payloads
+        );
+
+        // The assertion above holds for an empty document too: there is
+        // nothing in the fixture for MAX_REQUEST_PAYLOADS to differ from.
+        // Prove this document is actually parsed, not silently treated as
+        // empty, by perturbing an unrelated key and checking it takes effect
+        // alongside the still-absent one's default.
+        let perturbed_text = text.replacen("SUBNETS_PER_NODE: 2", "SUBNETS_PER_NODE: 5", 1);
+        assert_ne!(
+            perturbed_text, text,
+            "fixture no longer carries SUBNETS_PER_NODE in the expected form"
+        );
+        let perturbed: Config = serde_yaml_ng::from_str(&perturbed_text).unwrap();
+        assert_eq!(perturbed.subnets_per_node, 5);
+        assert_eq!(
+            perturbed.max_request_payloads,
+            Config::mainnet().max_request_payloads,
+            "MAX_REQUEST_PAYLOADS is still absent; it must keep defaulting"
+        );
+    }
+
+    #[test]
+    fn the_blob_schedule_parses_from_the_file() {
+        let text = include_str!(
+            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
+        );
+        let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
+        assert_eq!(parsed.blob_schedule, Config::mainnet().blob_schedule);
+
+        // The equality above holds for an empty document too: `blob_schedule`'s
+        // serde default is mainnet's own schedule. Perturb one entry's limit
+        // and check the parsed schedule follows the file instead of staying
+        // at the default.
+        let perturbed_text = text.replacen("MAX_BLOBS_PER_BLOCK: 15", "MAX_BLOBS_PER_BLOCK: 99", 1);
+        assert_ne!(
+            perturbed_text, text,
+            "fixture no longer carries the first BLOB_SCHEDULE entry in the expected form"
+        );
+        let perturbed: Config = serde_yaml_ng::from_str(&perturbed_text).unwrap();
+        assert_eq!(perturbed.blob_schedule[0].max_blobs_per_block, 99);
+        assert_ne!(perturbed.blob_schedule, Config::mainnet().blob_schedule);
     }
 }

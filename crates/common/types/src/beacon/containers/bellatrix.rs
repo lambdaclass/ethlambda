@@ -161,6 +161,50 @@ pub struct BeaconBlockBody {
     pub execution_payload: ExecutionPayload,
 }
 
+impl BeaconBlockBody {
+    /// An empty body: no operations of any kind, and an all-zero execution
+    /// payload.
+    ///
+    /// Not `#[derive(Default)]`, unlike phase0's and altair's bodies (which
+    /// have no execution payload to build): `execution_payload.logs_bloom` is
+    /// an [`SszVector`], and unlike a list, a vector can never validly be
+    /// empty, so libssz gives it no `Default` impl. Its all-zero value is
+    /// built explicitly at its exact length instead, the same construction
+    /// `state_transition::beacon::upgrade`'s
+    /// `empty_bellatrix_execution_payload_header` uses for the header shape
+    /// of the same payload.
+    pub fn empty() -> Self {
+        Self {
+            randao_reveal: Default::default(),
+            eth1_data: Default::default(),
+            graffiti: Default::default(),
+            proposer_slashings: Default::default(),
+            attester_slashings: Default::default(),
+            attestations: Default::default(),
+            deposits: Default::default(),
+            voluntary_exits: Default::default(),
+            sync_aggregate: Default::default(),
+            execution_payload: ExecutionPayload {
+                parent_hash: ExecutionBlockHash::ZERO,
+                fee_recipient: ExecutionAddress::ZERO,
+                state_root: Bytes32::ZERO,
+                receipts_root: Bytes32::ZERO,
+                logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                    .expect("BYTES_PER_LOGS_BLOOM zeros fit LogsBloom's exact length"),
+                prev_randao: Bytes32::ZERO,
+                block_number: 0,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::ZERO,
+                block_hash: ExecutionBlockHash::ZERO,
+                transactions: Default::default(),
+            },
+        }
+    }
+}
+
 /// A block.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BeaconBlock {
@@ -294,28 +338,6 @@ mod tests {
 
     use super::*;
 
-    /// Builds an otherwise-empty payload with a correctly sized, all-zero
-    /// `logs_bloom`, since [`LogsBloom`] is a fixed-length vector rather than
-    /// a list and so has no `Default`.
-    fn empty_execution_payload() -> ExecutionPayload {
-        ExecutionPayload {
-            parent_hash: ExecutionBlockHash::ZERO,
-            fee_recipient: ExecutionAddress::ZERO,
-            state_root: Bytes32::ZERO,
-            receipts_root: Bytes32::ZERO,
-            logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM]).unwrap(),
-            prev_randao: Bytes32::ZERO,
-            block_number: 0,
-            gas_limit: 0,
-            gas_used: 0,
-            timestamp: 0,
-            extra_data: Default::default(),
-            base_fee_per_gas: Uint256::ZERO,
-            block_hash: ExecutionBlockHash::ZERO,
-            transactions: Default::default(),
-        }
-    }
-
     #[test]
     fn sync_committee_and_pow_block_are_fixed_size() {
         // A sync committee is unchanged from altair, and a pow block is three
@@ -340,7 +362,11 @@ mod tests {
 
     #[test]
     fn execution_payload_round_trips_while_empty() {
-        let payload = empty_execution_payload();
+        // `BeaconBlockBody::empty()` is the one place that builds an
+        // otherwise-empty payload with a correctly sized, all-zero
+        // `logs_bloom`, since `LogsBloom` is a fixed-length vector rather than
+        // a list and so has no `Default`.
+        let payload = BeaconBlockBody::empty().execution_payload;
 
         let bytes = payload.to_ssz();
         assert_eq!(ExecutionPayload::from_ssz_bytes(&bytes).unwrap(), payload);
@@ -352,18 +378,7 @@ mod tests {
         // exercises every offset in the encoding with zero-length payloads,
         // plus the fixed-size sync aggregate and the execution payload
         // bellatrix adds alongside them.
-        let body = BeaconBlockBody {
-            randao_reveal: BlsSignature::default(),
-            eth1_data: Eth1Data::default(),
-            graffiti: Bytes32::ZERO,
-            proposer_slashings: Default::default(),
-            attester_slashings: Default::default(),
-            attestations: Default::default(),
-            deposits: Default::default(),
-            voluntary_exits: Default::default(),
-            sync_aggregate: SyncAggregate::default(),
-            execution_payload: empty_execution_payload(),
-        };
+        let body = BeaconBlockBody::empty();
 
         let bytes = body.to_ssz();
         assert_eq!(BeaconBlockBody::from_ssz_bytes(&bytes).unwrap(), body);

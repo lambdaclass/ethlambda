@@ -4,6 +4,7 @@ mod checkpoint_sync;
 mod cli;
 mod command;
 mod fd_limit;
+mod network;
 mod version;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
@@ -52,7 +53,10 @@ use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
-    beacon::containers::SignedBeaconBlock,
+    beacon::containers::{
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, phase0,
+    },
+    beacon::fork::ForkName,
     genesis::{GenesisConfig, verify_state_genesis},
     state::{State, ValidatorPubkeyBytes},
 };
@@ -296,6 +300,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     let p2p_socket = SocketAddr::new(IpAddr::from([0, 0, 0, 0]), common.gossipsub_port);
 
+    // Resolved once, here, above the bootnode fallback below that reads it:
+    // `default_bootnodes` needs the loaded network's own bootnode list, and
+    // loading a directory decodes a multi-megabyte genesis state, so this must
+    // not run twice for one process. `network` is matched by reference so it
+    // is still available, below, to be matched by value into `ChainSetup`.
+    let network_source = match &network {
+        Network::Lean(_) => None,
+        Network::Mainnet { mainnet, .. } => {
+            let spec = network::NetworkSpec::parse(&mainnet.network)?;
+            Some(network::NetworkSource::resolve(&spec)?)
+        }
+    };
+
     // The `--bootnodes` file, read and parsed once. An absent flag is not an
     // empty list: `default_bootnodes` is what each chain falls back to.
     let bootnodes = parse_enrs(
@@ -304,7 +321,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             .as_deref()
             .map(read_bootnode_strings)
             .transpose()?
-            .unwrap_or_else(|| default_bootnodes(&network)),
+            .unwrap_or_else(|| default_bootnodes(network_source.as_ref())),
     );
 
     // Shared, runtime-mutable aggregator flag, seeded from the CLI flag only
@@ -460,14 +477,18 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // digest depends on the epoch, which depends on genesis time. See
         // `crate::beacon`.
         Network::Mainnet { mainnet, execution } => {
+            let source = network_source
+                .expect("network_source is Some whenever network is Network::Mainnet");
+
             info!(
+                network = %source.name(),
                 bootnodes = ?common.bootnodes,
                 gossipsub_port = common.gossipsub_port,
                 http_address = %common.http_address,
                 metrics_port = common.metrics_port,
                 discovery_port = common.discovery.port,
                 advertise_ip = ?common.discovery.advertise_ip,
-                "Resolved mainnet configuration"
+                "Resolved network configuration"
             );
 
             // The node id is the discovery one, so what this node custodies is
@@ -477,6 +498,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // node's identity.
             let node_id = beacon::beacon_node_id(&node_p2p_key)?;
             let params = beacon::wire_params(
+                &source,
                 node_id,
                 common.node_key.is_some(),
                 mainnet.custody_group_count,
@@ -491,9 +513,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // The anchored beacon store. `P2PServer` holds it for the lean
             // handlers, and the two beacon block handlers read it too: it is
             // what `beacon_blocks_by_{range,root}/2` are answered from.
-            let store = fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone())
-                .await
-                .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
+            let store =
+                fetch_initial_beacon_state(&clean_checkpoint_urls, backend.clone(), &source)
+                    .await
+                    .inspect_err(|err| error!(%err, "Failed to initialize state"))?;
 
             let engine = match &execution {
                 None => {
@@ -725,24 +748,21 @@ async fn wait_for_shutdown(node: RunningNode) {
 
 /// The ENRs to start from when `--bootnodes` was not given.
 ///
-/// Mainnet publishes a bootnode list, so an absent flag means "use it". A lean
-/// network's ENRs are per-deployment, so there is nothing to default to and an
-/// absent flag means this node reaches peers only through discv5. That case
-/// warns, because a node that then finds nobody is islanded and otherwise looks
-/// healthy.
-fn default_bootnodes(network: &Network) -> Vec<String> {
-    match network {
-        Network::Lean(_) => {
+/// A resolved network (built-in mainnet, or a loaded directory) publishes its
+/// own bootnode list, so an absent flag means "use it". A lean network's ENRs
+/// are per-deployment, so there is nothing to default to and an absent flag
+/// means this node reaches peers only through discv5. That case warns, because
+/// a node that then finds nobody is islanded and otherwise looks healthy.
+fn default_bootnodes(source: Option<&network::NetworkSource>) -> Vec<String> {
+    match source {
+        None => {
             warn!(
                 "No --bootnodes file supplied: starting with no bootnodes. This node can \
                  only find peers via discv5."
             );
             Vec::new()
         }
-        Network::Mainnet { .. } => beacon::MAINNET_BOOTNODES
-            .iter()
-            .map(|enr| enr.to_string())
-            .collect(),
+        Some(source) => source.bootnodes(),
     }
 }
 
@@ -1257,6 +1277,204 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
+/// Name the first configuration field that disagrees with the persisted one.
+///
+/// A changed fork epoch leaves genesis time and the validators root untouched,
+/// so `verify_state_genesis` cannot see it, while putting this node on a
+/// different chain from its peers at that epoch. Comparing the whole struct
+/// catches it, and naming the field is what makes the failure actionable:
+/// Lighthouse reports the same situation as an SSZ decode error whose own
+/// message admits it is guessing between a wrong network and a corrupt
+/// database.
+fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<String> {
+    macro_rules! compare {
+        ($($field:ident),+ $(,)?) => {
+            $(
+                if persisted.$field != supplied.$field {
+                    return Some(format!(
+                        "{}: directory has {:?}, config file says {:?}",
+                        stringify!($field), persisted.$field, supplied.$field
+                    ));
+                }
+            )+
+        };
+    }
+
+    // Every field of `Config`, named once, with no `..`: adding a field there
+    // is a compile error here until it is triaged into `compare!` below or
+    // bound to `_` with a comment saying why it is operator tuning rather
+    // than chain identity. This binds nothing useful (`compare!` reads
+    // `persisted`/`supplied` directly); it exists purely to force that
+    // choice.
+    let Config {
+        // Genesis construction: read only while building a genesis state
+        // from Eth1 deposit history, never again once one exists. Not chain
+        // identity for a directory that already has a state.
+        min_genesis_active_validator_count: _,
+        min_genesis_time: _,
+        genesis_delay: _,
+        // Comes from the genesis state, not the config file;
+        // `verify_state_genesis` already covers it.
+        genesis_time: _,
+
+        // Fork scheduling: compared below. Changes which fork a block signs
+        // under and when, so a mismatch here silently forks this node from
+        // its peers.
+        genesis_fork_version: _,
+        altair_fork_version: _,
+        altair_fork_epoch: _,
+        bellatrix_fork_version: _,
+        bellatrix_fork_epoch: _,
+        capella_fork_version: _,
+        capella_fork_epoch: _,
+        deneb_fork_version: _,
+        deneb_fork_epoch: _,
+        electra_fork_version: _,
+        electra_fork_epoch: _,
+        fulu_fork_version: _,
+        fulu_fork_epoch: _,
+
+        // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
+        // below) move every slot boundary. The rest are operator-visible
+        // timing preferences (reorg cutoffs, sync-message windows) that do
+        // not change which block is valid.
+        seconds_per_slot: _,
+        slot_duration_ms: _,
+        seconds_per_eth1_block: _,
+        // Compared below: bounds how many validators may enter the
+        // exit/activation queue and when a proposer/exiting validator is
+        // eligible, both state-transition rules.
+        min_validator_withdrawability_delay: _,
+        shard_committee_period: _,
+        eth1_follow_distance: _,
+        attestation_due_bps: _,
+        aggregate_due_bps: _,
+        proposer_reorg_cutoff_bps: _,
+        sync_message_due_bps: _,
+        contribution_due_bps: _,
+
+        // Validator cycle: compared below. Churn and inactivity-leak
+        // parameters change which exits, activations and inactivity scores a
+        // block may legally carry.
+        inactivity_score_bias: _,
+        inactivity_score_recovery_rate: _,
+        ejection_balance: _,
+        min_per_epoch_churn_limit: _,
+        churn_limit_quotient: _,
+        max_per_epoch_activation_churn_limit: _,
+        min_per_epoch_churn_limit_electra: _,
+        max_per_epoch_activation_exit_churn_limit: _,
+
+        // Fork choice: weighting/timing knobs a node applies to its own view
+        // of the chain. They change which head a node *prefers*, not which
+        // block is valid, so two nodes running different values still agree
+        // on validity.
+        proposer_score_boost: _,
+        reorg_head_weight_threshold: _,
+        reorg_parent_weight_threshold: _,
+        reorg_max_epochs_since_finalization: _,
+
+        // Transition (bellatrix): mainnet crossed this in 2022 and every
+        // shipped network leaves it at its default; not worth chain-identity
+        // treatment for the same reason the fork-choice group above is not.
+        terminal_total_difficulty: _,
+        terminal_block_hash: _,
+        terminal_block_hash_activation_epoch: _,
+
+        // Blob limits: compared below. Bound how many blobs a block may
+        // legally carry.
+        max_blobs_per_block_deneb: _,
+        max_blobs_per_block_electra: _,
+        blob_schedule: _,
+
+        // Networking: describe the wire, not the state transition. A
+        // config.yaml carries them only so `/eth/v1/config/spec` can echo
+        // them back; nothing here changes which block is valid.
+        attestation_propagation_slot_range: _,
+        attestation_subnet_count: _,
+        attestation_subnet_extra_bits: _,
+        blob_sidecar_subnet_count: _,
+        blob_sidecar_subnet_count_electra: _,
+        data_column_sidecar_subnet_count: _,
+        epochs_per_subnet_subscription: _,
+        max_payload_size: _,
+        max_request_blocks: _,
+        max_request_blocks_deneb: _,
+        max_request_payloads: _,
+        maximum_gossip_clock_disparity: _,
+        message_domain_invalid_snappy: _,
+        message_domain_valid_snappy: _,
+        min_epochs_for_blob_sidecars_requests: _,
+        min_epochs_for_data_column_sidecars_requests: _,
+        subnets_per_node: _,
+
+        // Deposit contract: compared below. Never read by the state
+        // transition itself (a deposit is processed from the block, not the
+        // contract), but kept as a network fingerprint: two networks sharing
+        // every consensus parameter while watching different Eth1 contracts
+        // are still different networks.
+        deposit_chain_id: _,
+        deposit_network_id: _,
+        deposit_contract_address: _,
+
+        // PeerDAS custody: describes what this node samples/custodies, an
+        // operator/wire choice, not a state-transition rule.
+        balance_per_additional_custody_group: _,
+        custody_requirement: _,
+        number_of_custody_groups: _,
+        samples_per_slot: _,
+        validator_custody_requirement: _,
+
+        // Compared below: electra's Gwei-denominated consolidation churn
+        // limit, alongside the other churn fields above.
+        consolidation_churn_limit_quotient: _,
+
+        // Networking (added after an incomplete initial key list): the same
+        // wire-description reasoning as the networking group above.
+        attestation_subnet_prefix_bits: _,
+        max_request_blob_sidecars: _,
+        max_request_blob_sidecars_electra: _,
+        max_request_data_column_sidecars: _,
+        min_epochs_for_block_requests: _,
+    } = persisted;
+
+    compare!(
+        genesis_fork_version,
+        altair_fork_version,
+        altair_fork_epoch,
+        bellatrix_fork_version,
+        bellatrix_fork_epoch,
+        capella_fork_version,
+        capella_fork_epoch,
+        deneb_fork_version,
+        deneb_fork_epoch,
+        electra_fork_version,
+        electra_fork_epoch,
+        fulu_fork_version,
+        fulu_fork_epoch,
+        seconds_per_slot,
+        slot_duration_ms,
+        min_validator_withdrawability_delay,
+        shard_committee_period,
+        inactivity_score_bias,
+        inactivity_score_recovery_rate,
+        ejection_balance,
+        min_per_epoch_churn_limit,
+        churn_limit_quotient,
+        max_per_epoch_activation_churn_limit,
+        min_per_epoch_churn_limit_electra,
+        max_per_epoch_activation_exit_churn_limit,
+        consolidation_churn_limit_quotient,
+        max_blobs_per_block_deneb,
+        max_blobs_per_block_electra,
+        blob_schedule,
+        deposit_chain_id,
+        deposit_network_id,
+        deposit_contract_address,
+    );
+    None
+}
+
 /// Fetch the initial state for a beacon node.
 ///
 /// The beacon twin of [`fetch_initial_state`], with the same precedence: a
@@ -1264,10 +1482,15 @@ async fn fetch_initial_state(
 /// directory that has fallen too far behind
 /// ([`MAX_RESUMABLE_DB_STATE_AGE`]).
 ///
-/// One row differs. Lean initializes from its genesis config when there is
-/// neither a DB nor a URL; beacon aborts. The mainnet genesis state is built
-/// into the binary, so anchoring there is possible, but this node imports
-/// nothing, so it would park at slot 0 while claiming to follow mainnet.
+/// One row differs, and only partly. Lean initializes from its genesis config
+/// when there is neither a DB nor a URL; beacon does the same for a
+/// [`network::NetworkSource::Loaded`] network, since a freshly started devnet
+/// has no checkpoint provider at slot 0 and this is the only way to join one.
+/// The built-in network still aborts: mainnet's genesis state is built into
+/// the binary, so anchoring there is possible, but this node imports nothing,
+/// so it would park at slot 0 while claiming to follow a chain that has been
+/// live since 2020. See [`genesis_anchor_block`] for the block this pairs with
+/// the genesis state to build that anchor.
 ///
 /// Staleness reuses [`MAX_RESUMABLE_DB_STATE_AGE`], which is expressed in
 /// slots: 90 minutes at beacon's 12-second slots against 30 at lean's four.
@@ -1276,10 +1499,10 @@ async fn fetch_initial_state(
 async fn fetch_initial_beacon_state(
     checkpoint_urls: &[String],
     backend: Arc<dyn StorageBackend>,
+    source: &network::NetworkSource,
 ) -> Result<Store, checkpoint_sync::CheckpointSyncError> {
-    let config = Config::mainnet();
-    let genesis = beacon::mainnet_genesis()
-        .expect("the built-in mainnet genesis decodes, checked at startup");
+    let config = source.config().clone();
+    let genesis = source.genesis();
 
     if let Some(store) = Store::from_db_state(backend.clone())? {
         if store.chain() != Chain::Beacon {
@@ -1307,6 +1530,11 @@ async fn fetch_initial_beacon_state(
             )
         })?;
 
+        if let Some(difference) = first_config_difference(&store.config(), &config) {
+            error!(%difference, "Persisted config disagrees with the network config");
+            return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
+        }
+
         let now = SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
@@ -1333,8 +1561,26 @@ async fn fetch_initial_beacon_state(
         warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
     }
 
+    // A loaded network carries its own genesis state, which is a legitimate
+    // anchor: a fresh devnet has no checkpoint provider at slot 0, so this is
+    // the only way to join one. The built-in network still refuses, because
+    // mainnet's genesis is 2020 and this follower would sit at slot 0 claiming
+    // to follow a live chain.
     if checkpoint_urls.is_empty() {
-        return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
+        let network::NetworkSource::Loaded(_) = source else {
+            return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
+        };
+
+        let state = source.genesis_state().clone();
+        let block = genesis_anchor_block(&state);
+        info!(
+            genesis_time = genesis.genesis_time,
+            fork = state.fork_name().as_str(),
+            "No checkpoint URL and no resumable directory: anchoring at this network's genesis"
+        );
+        return fork_choice::get_forkchoice_store(backend, state, block, &config)
+            .inspect_err(|err| error!(%err, "Failed to initialize store from the genesis state"))
+            .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch);
     }
 
     info!(?checkpoint_urls, "Starting beacon checkpoint sync");
@@ -1359,6 +1605,114 @@ async fn fetch_initial_beacon_state(
     fork_choice::get_forkchoice_store(backend, state, block, &config)
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
+}
+
+/// The block the specification pairs with a genesis anchor state.
+///
+/// `get_forkchoice_store` wants the block that produced the anchor state. At
+/// genesis no such block exists, so the specification substitutes an empty
+/// block carrying the genesis state root. The state's own
+/// `latest_block_header` already describes that block with a zeroed state
+/// root, so filling the root in and rebuilding the body is the whole
+/// construction.
+///
+/// The body has to be rebuilt rather than read off the state, because the
+/// state does not carry one: `latest_block_header.body_root` is only ever a
+/// merkle root, never the body itself. `state.fork_name()`'s empty body is
+/// what that root already commits to (see `BeaconBlockBody::empty` on each
+/// fork whose body cannot derive `Default`, in `ethlambda-types`), so
+/// rebuilding it here and letting `get_forkchoice_store` check the header
+/// hash is what proves this reconstruction matches what the state actually
+/// describes, rather than assuming it.
+fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
+    let header = state.latest_block_header();
+    let slot = header.slot;
+    let proposer_index = header.proposer_index;
+    let parent_root = header.parent_root;
+    let state_root = state.hash_tree_root();
+
+    match state.fork_name() {
+        ForkName::Phase0 => SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Altair => SignedBeaconBlock::Altair(altair::SignedBeaconBlock {
+            message: altair::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: altair::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Bellatrix => SignedBeaconBlock::Bellatrix(bellatrix::SignedBeaconBlock {
+            message: bellatrix::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: bellatrix::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Capella => SignedBeaconBlock::Capella(capella::SignedBeaconBlock {
+            message: capella::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: capella::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Deneb => SignedBeaconBlock::Deneb(deneb::SignedBeaconBlock {
+            message: deneb::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: deneb::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Electra => SignedBeaconBlock::Electra(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        // Fulu's block is byte-for-byte electra's; see `SignedBeaconBlock::Fulu`'s
+        // own doc comment for why it wraps `electra::SignedBeaconBlock` instead
+        // of a fork-specific type.
+        ForkName::Fulu => SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        // Never reached: this is only called on a network's own genesis
+        // state, and every `NetworkSource` decodes a beacon fork there
+        // (`NetworkDir::load` resolves the fork from `Config::fork_at_epoch`,
+        // which only ever names a `ForkName::ALL` member).
+        ForkName::Lean => {
+            unreachable!("a beacon network's genesis state is never ForkName::Lean")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1678,16 +2032,17 @@ validators:
         );
     }
 
-    /// Beacon has no genesis-sync path: with nothing on disk and no URL, there
-    /// is no anchor to start from and startup says so rather than parking a
-    /// node at slot 0 claiming to follow mainnet.
+    /// Beacon has no genesis-sync path on the built-in network: with nothing
+    /// on disk and no URL, there is no anchor to start from and startup says
+    /// so rather than parking a node at slot 0 claiming to follow mainnet.
     #[tokio::test]
     async fn beacon_without_a_db_or_a_url_aborts() {
         let backend = Arc::new(InMemoryBackend::default());
+        let source = network::NetworkSource::built_in_mainnet().unwrap();
 
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `expect_err`.
-        let Err(err) = fetch_initial_beacon_state(&[], backend).await else {
+        let Err(err) = fetch_initial_beacon_state(&[], backend, &source).await else {
             panic!("no anchor is available");
         };
 
@@ -1705,11 +2060,12 @@ validators:
         let genesis = test_genesis(now_secs());
         let backend = Arc::new(InMemoryBackend::default());
         seed_db(backend.clone(), &genesis);
+        let source = network::NetworkSource::built_in_mainnet().unwrap();
 
         let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `expect_err`.
-        let Err(err) = fetch_initial_beacon_state(&urls, backend).await else {
+        let Err(err) = fetch_initial_beacon_state(&urls, backend, &source).await else {
             panic!("a lean directory is not resumable as beacon");
         };
 
@@ -1720,6 +2076,184 @@ validators:
                 found: Chain::Lean,
             }
         ));
+    }
+
+    /// A fresh devnet has no checkpoint provider at slot 0, so a loaded
+    /// network anchors at its own `genesis.ssz` instead of refusing.
+    #[tokio::test]
+    async fn a_loaded_network_anchors_at_genesis_without_a_checkpoint_url() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = beacon::mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+
+        let loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = network::NetworkSource::Loaded(Box::new(loaded));
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        let store = fetch_initial_beacon_state(&[], backend, &source)
+            .await
+            .expect("a loaded network anchors at its own genesis");
+        assert_eq!(store.chain(), Chain::Beacon);
+        let (head_slot, _) = store
+            .beacon_head()
+            .expect("an anchored directory has a head");
+        assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
+    }
+
+    /// A changed fork epoch leaves genesis time and the validators root
+    /// untouched, so `verify_state_genesis` cannot see it, while putting this
+    /// node on a different chain from its peers from that epoch on. Resuming
+    /// must compare the persisted config too, and name the field that moved.
+    #[tokio::test]
+    async fn a_resume_with_an_edited_config_names_the_field_that_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = beacon::mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+
+        let loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = network::NetworkSource::Loaded(Box::new(loaded));
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // Anchor once, so the directory is resumable.
+        fetch_initial_beacon_state(&[], backend.clone(), &source)
+            .await
+            .expect("first run anchors");
+
+        // Now resume with one fork epoch moved. Genesis time and validators
+        // root are untouched, so the existing check cannot see this.
+        let mut edited = source.config().clone();
+        edited.electra_fork_epoch += 1;
+        let tampered = network::NetworkSource::BuiltInMainnet {
+            genesis_state: Box::new(source.genesis_state().clone()),
+            config: Box::new(edited),
+        };
+
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `unwrap_err`.
+        let Err(err) = fetch_initial_beacon_state(&[], backend, &tampered).await else {
+            panic!("an edited config must not be silently resumed");
+        };
+        let message = format!("{err}");
+        assert!(
+            message.contains("electra_fork_epoch"),
+            "the error should name the field that changed: {message}"
+        );
+    }
+
+    /// `churn_limit_quotient` is one of the state-transition fields the
+    /// original field list omitted entirely: a directory with a different
+    /// churn quotient from its config file accepted a different set of
+    /// exits/activations as valid on each side, silently. Representative of
+    /// the whole group `first_config_difference` was missing.
+    #[test]
+    fn a_changed_churn_limit_quotient_is_now_caught() {
+        let persisted = Config::mainnet();
+        let mut supplied = Config::mainnet();
+        supplied.churn_limit_quotient += 1;
+
+        let difference = first_config_difference(&persisted, &supplied)
+            .expect("a changed churn_limit_quotient must be caught");
+        assert!(
+            difference.contains("churn_limit_quotient"),
+            "the error should name the field that changed: {difference}"
+        );
+    }
+
+    /// Mainnet's genesis is in the binary, but this follower imports nothing,
+    /// so anchoring there would park it at slot 0 while claiming to follow a
+    /// live chain. That refusal is deliberate and must survive.
+    #[tokio::test]
+    async fn the_built_in_network_still_requires_a_checkpoint_url() {
+        let source = network::NetworkSource::built_in_mainnet().unwrap();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `unwrap_err`.
+        let Err(err) = fetch_initial_beacon_state(&[], backend, &source).await else {
+            panic!("the built-in network must not anchor at its own genesis");
+        };
+        assert!(
+            format!("{err}").contains("checkpoint"),
+            "the error should point at --checkpoint-sync-url: {err}"
+        );
+    }
+
+    /// Pins the one invariant `get_forkchoice_store` actually checks: the
+    /// anchor block's message must hash to the same root as the anchor
+    /// state's own `latest_block_header`, once that header's placeholder
+    /// zero `state_root` is filled in the same way `get_forkchoice_store`
+    /// fills it.
+    #[test]
+    fn a_genesis_anchor_block_hashes_to_the_states_own_header() {
+        let state = beacon::mainnet_genesis_state().unwrap();
+        let block = genesis_anchor_block(&state);
+
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
+    }
+
+    /// The same invariant, pinned at every fork: `BeaconBlockBody::empty()`
+    /// (or, pre-bellatrix, `Default`) is only exercised above through
+    /// mainnet's own genesis, which is phase0, so the four hand-written
+    /// `empty()` impls (bellatrix, capella, deneb, electra; fulu reuses
+    /// electra's block) had no coverage at all.
+    ///
+    /// Mainnet's genesis is the only real genesis state this binary carries,
+    /// and it is phase0, so a later fork's state is manufactured by chaining
+    /// the real `upgrade_state` functions. Those clone `latest_block_header`
+    /// verbatim (an upgrade is not a block import), so the header inherited
+    /// from genesis still names phase0's empty-body root; it is re-stamped
+    /// to each new fork's own empty body below, exactly as a genesis
+    /// generator targeting that fork directly would have to.
+    #[test]
+    fn a_genesis_anchor_block_hashes_to_the_states_own_header_at_every_fork() {
+        let config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+
+        for fork in ForkName::ALL {
+            if fork != ForkName::Phase0 {
+                state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
+                    &state, fork, &config,
+                )
+                .unwrap_or_else(|err| panic!("upgrade to {fork:?} failed: {err}"));
+            }
+
+            let empty_body_root = match fork {
+                ForkName::Phase0 => phase0::BeaconBlockBody::default().hash_tree_root(),
+                ForkName::Altair => altair::BeaconBlockBody::default().hash_tree_root(),
+                ForkName::Bellatrix => bellatrix::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Capella => capella::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Deneb => deneb::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Electra | ForkName::Fulu => {
+                    electra::BeaconBlockBody::empty().hash_tree_root()
+                }
+                ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
+            };
+            state.latest_block_header_mut().body_root = empty_body_root;
+
+            let block = genesis_anchor_block(&state);
+            let mut header = state.latest_block_header().clone();
+            header.state_root = state.hash_tree_root();
+
+            assert_eq!(
+                block.message_hash_tree_root(),
+                header.hash_tree_root(),
+                "invariant broke at fork {fork:?}"
+            );
+        }
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot
@@ -1862,18 +2396,12 @@ validators:
         let Command::Node(node) = try_parse_from(argv).expect("`node` parses") else {
             panic!("`node` must resolve to the node sub-command");
         };
-        assert!(default_bootnodes(&Options::from(node).network).is_empty());
+        assert!(matches!(Options::from(node).network, Network::Lean(_)));
+        assert!(default_bootnodes(None).is_empty());
 
+        let mainnet_source = network::NetworkSource::built_in_mainnet().unwrap();
         assert_eq!(
-            default_bootnodes(&Network::Mainnet {
-                mainnet: crate::cli::MainnetOptions {
-                    custody_group_count: ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
-                    safe_slots_to_import_optimistically:
-                        ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
-                },
-                execution: None,
-            })
-            .len(),
+            default_bootnodes(Some(&mainnet_source)).len(),
             beacon::MAINNET_BOOTNODES.len()
         );
     }

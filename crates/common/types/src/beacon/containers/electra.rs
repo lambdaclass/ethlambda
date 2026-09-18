@@ -43,6 +43,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitlist, SszBitvector, SszList};
 
 use super::altair::{SyncAggregate, SyncCommittee};
+use super::bellatrix::LogsBloom;
 use super::capella::SignedBLSToExecutionChange;
 use super::deneb::{ExecutionPayload, ExecutionPayloadHeader, KzgCommitments};
 use super::shared::{
@@ -53,8 +54,8 @@ use super::shared::{
 };
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionAddress, Gwei, Root, Slot,
-    ValidatorIndex, WithdrawalIndex,
+    BlsPubkey, BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
+    Gwei, Root, Slot, Uint256, ValidatorIndex, WithdrawalIndex,
 };
 
 // ---------------------------------------------------------------------------
@@ -240,7 +241,7 @@ pub struct ConsolidationRequest {
 
 /// The execution payload's envelope for every execution-layer-triggered
 /// request in this block, grouped by kind.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ExecutionRequests {
     pub deposits: SszList<DepositRequest, { preset::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD }>,
     pub withdrawals: SszList<WithdrawalRequest, { preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD }>,
@@ -333,6 +334,53 @@ pub struct BeaconBlockBody {
     /// requests carried by this block's payload. The one field electra adds
     /// to the body.
     pub execution_requests: ExecutionRequests,
+}
+
+impl BeaconBlockBody {
+    /// An empty body: no operations of any kind, and an all-zero execution
+    /// payload. Also what fulu's identically-shaped body uses, since
+    /// [`super::SignedBeaconBlock::Fulu`] wraps this same struct.
+    ///
+    /// Not `#[derive(Default)]`: `execution_payload.logs_bloom` is an
+    /// [`SszVector`](libssz_types::SszVector), and unlike a list, a vector can
+    /// never validly be empty, so libssz gives it no `Default` impl. Its
+    /// all-zero value is built explicitly at its exact length instead.
+    pub fn empty() -> Self {
+        Self {
+            randao_reveal: Default::default(),
+            eth1_data: Default::default(),
+            graffiti: Default::default(),
+            proposer_slashings: Default::default(),
+            attester_slashings: Default::default(),
+            attestations: Default::default(),
+            deposits: Default::default(),
+            voluntary_exits: Default::default(),
+            sync_aggregate: Default::default(),
+            execution_payload: ExecutionPayload {
+                parent_hash: ExecutionBlockHash::ZERO,
+                fee_recipient: ExecutionAddress::ZERO,
+                state_root: Bytes32::ZERO,
+                receipts_root: Bytes32::ZERO,
+                logs_bloom: LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                    .expect("BYTES_PER_LOGS_BLOOM zeros fit LogsBloom's exact length"),
+                prev_randao: Bytes32::ZERO,
+                block_number: 0,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::ZERO,
+                block_hash: ExecutionBlockHash::ZERO,
+                transactions: Default::default(),
+                withdrawals: Default::default(),
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+            },
+            bls_to_execution_changes: Default::default(),
+            blob_kzg_commitments: Default::default(),
+            execution_requests: Default::default(),
+        }
+    }
 }
 
 /// A block.

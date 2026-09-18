@@ -155,6 +155,17 @@ pub enum CheckpointSyncError {
         expected: ethlambda_storage::Chain,
         found: ethlambda_storage::Chain,
     },
+    /// The directory is for the right chain, but the network config supplied
+    /// this run disagrees with the one it was initialized with: most likely a
+    /// fork epoch was edited in place. A changed fork epoch leaves genesis
+    /// time and the validators root untouched, so it survives the checks
+    /// above, while putting this node on a different chain from its peers
+    /// from that epoch on.
+    #[error(
+        "this data directory was initialized with a different configuration ({difference}); \
+         delete it or point --data-dir elsewhere"
+    )]
+    ConfigChanged { difference: String },
     #[error("finalized slot cannot exceed state slot")]
     FinalizedExceedsStateSlot,
     #[error("justified slot cannot precede finalized slot")]
@@ -184,7 +195,15 @@ pub enum CheckpointSyncError {
     },
     #[error("peer served no block at the anchor slot {slot}")]
     AnchorBlockMissing { slot: u64 },
-    #[error("beacon checkpoint sync requires --checkpoint-sync-url: there is no genesis-sync path")]
+    // Only the built-in network reaches this: a `--network <dir>` network
+    // anchors at the directory's own `genesis.ssz`. Mainnet's genesis is 2020
+    // and this follower imports nothing at startup, so anchoring there would
+    // park it at slot 0 while claiming to follow a live chain.
+    #[error(
+        "the built-in network has no genesis-sync path, so a fresh data directory needs \
+         --checkpoint-sync-url; a network loaded with --network <dir> anchors at its own \
+         genesis.ssz instead"
+    )]
     BeaconGenesisSync,
     /// The buffer served for the finalized beacon state is too short to hold
     /// the slot at its fixed offset, so no fork could even be resolved before

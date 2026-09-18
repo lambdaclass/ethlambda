@@ -15,6 +15,7 @@ pub mod fork_choice;
 pub mod fork_digest;
 pub mod preset;
 pub mod primitives;
+pub mod serde_helpers;
 
 /// Panics, naming the beacon accessor a lean state reached.
 ///

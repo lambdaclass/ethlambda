@@ -356,6 +356,9 @@ impl RangeSyncState {
 /// behaviour are intentionally not handled: the registration alone is enough
 /// to satisfy probing peers. ream and zeam follow the same pattern.
 ///
+/// Not handling its events is *not* the same as it having no effect, which is
+/// why it is built with the address cache off. See [`build_swarm`].
+///
 /// The request/response side is a nested [`ReqResp`]: one
 /// `request_response::Behaviour` per protocol id rather than one shared
 /// behaviour registering every id. Its doc comment has why, and
@@ -633,10 +636,12 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
-        identify_version.to_owned(),
-        identity.public(),
-    ));
+    // Cache off, as lighthouse does: with it, identify pushes every `listenAddrs` a
+    // peer reports into the address book, loopback included, and `req_resp` dials those.
+    let identify = libp2p::identify::Behaviour::new(
+        libp2p::identify::Config::new(identify_version.to_owned(), identity.public())
+            .with_cache_size(0),
+    );
 
     let behavior = Behaviour {
         identify,

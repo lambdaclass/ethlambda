@@ -98,7 +98,8 @@ pub struct Genesis {
 /// sit in: a truncated or mis-encoded asset then fails here, loudly and at
 /// startup, instead of yielding two plausible numbers off a corrupt file. The
 /// state is also what the anchor work needs a source of, so it is returned
-/// whole rather than reduced to the pair [`mainnet_genesis`] takes from it.
+/// whole rather than reduced to the pair `mainnet_genesis` (below) takes from
+/// it.
 ///
 /// The fork is `Phase0` because this is *genesis*, not the current head: the
 /// state predates altair by definition, whatever fork the chain is on now.
@@ -114,11 +115,14 @@ pub fn mainnet_genesis_state() -> eyre::Result<BeaconState> {
         .wrap_err("the built-in mainnet genesis did not decode as a phase0 BeaconState")
 }
 
-/// The two values the wire parameters are derived from.
-///
-/// This is the whole of what startup needs from genesis. The anchor state
-/// itself belongs to the anchor-and-follow work, and must be checked against
-/// these two values when it lands.
+/// The two values the wire parameters used to be derived from, before
+/// `crate::network::NetworkSource::genesis` took over: that method reads the
+/// same pair off whichever network was resolved, mainnet included, so this is
+/// no longer on any startup path. Kept `#[cfg(test)]`: it is what
+/// `the_built_in_state_is_mainnets_genesis` (below) pins against the state
+/// directly, and a lighter fixture than building a whole `NetworkSource` for
+/// the handful of checkpoint-sync tests that only want these two fields.
+#[cfg(test)]
 pub fn mainnet_genesis() -> eyre::Result<Genesis> {
     let state = mainnet_genesis_state()?;
     Ok(Genesis {
@@ -213,26 +217,28 @@ pub fn beacon_node_id(node_key: &[u8]) -> eyre::Result<[u8; 32]> {
     )?)
 }
 
-/// Derive mainnet's wire parameters from the built-in genesis state.
+/// Derive a resolved network's wire parameters.
 ///
 /// This is the whole of what startup needs before it can build a swarm, and it
-/// touches no network: every value here is a function of the genesis state,
-/// the wall clock, and `node_id`, which the caller must have derived via
-/// [`beacon_node_id`], since a peer computes our custody set off the identity
-/// we publish. The anchor state itself belongs to the anchor-and-follow work,
-/// and must be checked against the genesis values used here when it lands.
+/// touches no network: every value here is a function of `source` (built-in
+/// mainnet or a loaded directory), the wall clock, and `node_id`, which the
+/// caller must have derived via [`beacon_node_id`], since a peer computes our
+/// custody set off the identity we publish. The anchor state itself belongs to
+/// the anchor-and-follow work, and must be checked against the genesis values
+/// used here when it lands.
 ///
 /// `node_key_supplied` carries no key material, only whether `node_id` came
 /// from a persisted `--node-key` or one generated fresh for this run: this
 /// function has no other way to tell the two apart, and that is exactly what
 /// the startup warning below needs to know.
 pub fn wire_params(
+    source: &crate::network::NetworkSource,
     node_id: [u8; 32],
     node_key_supplied: bool,
     custody_group_count: u64,
 ) -> eyre::Result<BeaconWireParams> {
-    let chain = Config::mainnet();
-    let genesis = mainnet_genesis().wrap_err("failed to read the built-in mainnet genesis")?;
+    let chain = source.config().clone();
+    let genesis = source.genesis();
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,12 +250,13 @@ pub fn wire_params(
     let digest_hex = hex::encode(fork_id.fork_digest);
 
     info!(
+        network = %source.name(),
         genesis_time = genesis.genesis_time,
         genesis_validators_root = %format!("0x{}", hex::encode(genesis.genesis_validators_root.0)),
         epoch,
         fork = fork.as_str(),
         fork_digest = %digest_hex,
-        "Derived the mainnet wire parameters"
+        "Derived the wire parameters for this network"
     );
     ethlambda_p2p::metrics::set_beacon_fork_digest(&digest_hex);
 
@@ -408,8 +415,9 @@ mod tests {
     /// a test could not call it at all.
     #[test]
     fn the_wire_parameters_are_derived_offline() {
-        let params =
-            wire_params([0x11; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
+        let params = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
+            .expect("no network is needed");
         assert_eq!(params.wire.genesis_time, MAINNET_GENESIS_TIME);
         // The digest is whatever fork the wall clock lands in, so it is not
         // pinned here; that it agrees with the ENR entry is the invariant.
@@ -425,10 +433,14 @@ mod tests {
             ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
         );
 
-        let a = wire_params([0x11; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
+
+        let a = wire_params(&source, [0x11; 32], true, CUSTODY_REQUIREMENT)
+            .expect("no network is needed");
         assert_eq!(a.wire.custody_columns.len(), sampling as usize);
 
-        let b = wire_params([0x22; 32], true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let b = wire_params(&source, [0x22; 32], true, CUSTODY_REQUIREMENT)
+            .expect("no network is needed");
         assert_ne!(a.wire.custody_columns, b.wire.custody_columns);
     }
 
@@ -438,7 +450,9 @@ mod tests {
     #[test]
     fn beacon_node_id_feeds_wire_params_a_valid_identity() {
         let node_id = beacon_node_id(&[0x33; 32]).expect("a well-formed key");
-        let params = wire_params(node_id, true, CUSTODY_REQUIREMENT).expect("no network is needed");
+        let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
+        let params =
+            wire_params(&source, node_id, true, CUSTODY_REQUIREMENT).expect("no network is needed");
         let sampling = ethlambda_state_transition::beacon::das::sampling_size(
             ethlambda_types::beacon::constants::CUSTODY_REQUIREMENT,
         );
@@ -505,5 +519,36 @@ mod tests {
         // A blob-parameter-only fork keeps fulu's version: it moves the digest
         // without introducing a new fork version, which is EIP-7892's point.
         assert_eq!(fork_id.next_fork_version, config.fulu_fork_version);
+    }
+
+    #[test]
+    fn the_built_in_network_derives_what_it_always_did() {
+        // The regression that matters: mainnet's wire parameters must not move
+        // when they start coming through NetworkSource.
+        let source = crate::network::NetworkSource::built_in_mainnet().unwrap();
+        let genesis = source.genesis();
+        assert_eq!(genesis.genesis_time, 1_606_824_023);
+        assert_eq!(source.config().seconds_per_slot, 12);
+        assert_eq!(source.bootnodes().len(), MAINNET_BOOTNODES.len());
+    }
+
+    #[test]
+    fn a_loaded_directory_supplies_its_own_config() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+            dir.path().join("config.yaml"),
+        )
+        .unwrap();
+        let state = mainnet_genesis_state().unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+
+        let loaded = crate::network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = crate::network::NetworkSource::Loaded(Box::new(loaded));
+        assert_eq!(source.config().seconds_per_slot, 6);
+        assert_eq!(source.config().deposit_chain_id, 3_151_908);
+        // The genesis state written above is mainnet's, so this is its time.
+        assert_eq!(source.genesis().genesis_time, 1_606_824_023);
     }
 }

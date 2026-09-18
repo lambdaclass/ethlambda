@@ -159,7 +159,12 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 ///
 /// 2 added [`KEY_ANCHOR_SLOT`], which [`Store::from_db_state`] requires and a
 /// version 1 directory does not carry.
-pub const DB_VERSION: u64 = 2;
+///
+/// 3 widened `Config` with the runtime keys a `config.yaml` carries: the struct
+/// is SSZ-encoded under [`KEY_CONFIG`], so a directory written by the previous
+/// version decodes into the wrong fields. There is no migration, by the same
+/// policy every previous change followed.
+pub const DB_VERSION: u64 = 3;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -4196,6 +4201,38 @@ mod tests {
                 expected: DB_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn a_directory_written_by_the_previous_format_is_refused() {
+        let backend = Arc::new(InMemoryBackend::new());
+
+        // A directory from the format one version back: only `KEY_CONFIG` and
+        // `KEY_DB_VERSION` need to be present to reach the check, since it
+        // runs before the preset and chain reads.
+        let mut batch = backend.begin_write().expect("write batch");
+        let entries = vec![
+            (KEY_CONFIG.to_vec(), Config::mainnet().to_ssz()),
+            (KEY_DB_VERSION.to_vec(), (DB_VERSION - 1).to_ssz()),
+        ];
+        batch
+            .put_batch(Table::Metadata, entries)
+            .expect("put metadata");
+        batch.commit().expect("commit");
+
+        // Matched rather than `expect_err`: that would need `Store: Debug`, and
+        // the store holds a `dyn StorageBackend` and buffers with no `Debug`.
+        let Err(err) = Store::from_db_state(backend) else {
+            panic!("a directory written by the previous format must not be reused");
+        };
+        assert!(
+            matches!(
+                err,
+                Error::DbVersionMismatch { found, expected }
+                if found == DB_VERSION - 1 && expected == DB_VERSION
+            ),
+            "got {err:?}"
+        );
     }
 
     // ============ Block Signature Pruning Tests ============

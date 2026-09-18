@@ -18,6 +18,7 @@ bin/ethlambda/              # Entry point, CLI, orchestration
   ├─ src/command.rs         # Sub-command dispatch + default-subcommand injection
   ├─ src/beacon.rs          # Mainnet wire params: built-in genesis, fork digest
   ├─ src/checkpoint_sync.rs # Checkpoint sync for both chains (lean's `/lean/v0/...`, beacon's Beacon API)
+  ├─ src/network/           # --network resolution: built-in name vs. directory of published files
   ├─ assets/mainnet/genesis.ssz  # Mainnet genesis BeaconState (eth-clients/mainnet's file)
   └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
@@ -321,16 +322,20 @@ actual_slot = finalized_slot + 1 + relative_index
 
 `ethlambda node` and `ethlambda beacon` are the same entry point. Each parses
 into one `cli::Options { common, network }`, where `network` is
-`Network::Lean(LeanOptions)` or `Network::Mainnet(MainnetOptions)`. Each variant
-carries that chain's own flags, so a flag one chain does not take is unreachable
-on the other's path by construction rather than by an `Option` nobody unwraps.
-`Mainnet` was a unit variant while every flag `beacon` took was a common one;
-`--custody-group-count` is the first that is not.
+`Network::Lean(LeanOptions)` or `Network::Mainnet { mainnet, execution }`. Each
+variant carries that chain's own flags, so a flag one chain does not take is
+unreachable on the other's path by construction rather than by an `Option`
+nobody unwraps. `MainnetOptions` holds the three flags `beacon` has of its own:
+`--custody-group-count`, `--safe-slots-to-import-optimistically`, and
+`--network` (default `mainnet`). The last is carried unresolved: `run_node` is
+where a bad value is reported.
 
 `run_node` owns everything that is not chain-specific, in order: the discv5
 port check, metrics registration, the banner and version log, the
 `RLIMIT_NOFILE` raise, the `HIVE_LEAN_TEST_DRIVER` early return (lean-only, and
-it must still precede key loading), `--node-key` resolution, reading
+it must still precede key loading), `--node-key` resolution, resolving
+`--network` into a `NetworkSource` (mainnet only; must precede the next step,
+since a loaded network's own bootnode list is part of its fallback), reading
 `--bootnodes`, and building the aggregator, sync-status and event handles.
 
 It then branches **once**, on `network`, both arms inline, each evaluating to a
@@ -374,11 +379,16 @@ lean does (it used to park on `std::future::pending()`).
 
 ### Mainnet's genesis is built into the binary
 
-`beacon`'s `genesis_time` and `genesis_validators_root`, which the fork digest
-keying every gossip topic, the ENR `eth2` entry and discv5 admission are
-computed from, come from `bin/ethlambda/assets/mainnet/genesis.ssz`. That is
+`beacon` takes a `--network` flag (built-in name, default `mainnet`, or a path
+to a directory of published network files) and resolves it into a
+`NetworkSource` before doing anything else; see `bin/ethlambda/src/network/`.
+`genesis_time` and `genesis_validators_root`, which the fork digest keying
+every gossip topic, the ENR `eth2` entry and discv5 admission are computed
+from, come from whichever genesis `BeaconState` that resolved network
+supplies. `mainnet` is the built-in arm, not the only source any more: its
+state comes from `bin/ethlambda/assets/mainnet/genesis.ssz`, which is
 `metadata/genesis.ssz` from `eth-clients/mainnet` byte for byte, the same repo
-`beacon::MAINNET_BOOTNODES` is copied from, so both of this chain's hardcoded
+`beacon::MAINNET_BOOTNODES` is copied from, so both of this arm's hardcoded
 values have one upstream; `beacon::tests::the_shipped_state_is_eth_clients_file`
 pins its SHA-256 so replacing it has to be deliberate.
 `beacon::mainnet_genesis_state` decodes it as a **phase0** `BeaconState`, whole
@@ -386,19 +396,26 @@ rather than reading the prefix those two fields sit in, so a corrupt asset fails
 loudly at startup rather than yielding two plausible numbers. 5.4 MB stored
 uncompressed and about 4 ms to decode: a deflated copy is under a third the
 size, but paying for it means a zip or gzip decoder in the dependency graph to
-read one build-time constant.
+read one build-time constant. A loaded network decodes its own `genesis.ssz`
+instead, at whatever fork its own schedule names for epoch 0, and its
+`config.yaml` is checked for a matching `PRESET_BASE` before anything else runs.
 
-Two consequences. `beacon` takes **no genesis** configuration: `genesis_time`
-and `genesis_validators_root` need nothing from the command line. And a build
-with `ethlambda-types/preset-minimal` on cannot decode this asset, because the
-minimal preset shortens the state's fixed-size vectors; nothing enables that
-feature for this binary, and failing is the right answer if anything does.
+Two consequences, on the built-in arm. `beacon` takes **no genesis**
+configuration of its own the way `node` does: `genesis_time` and
+`genesis_validators_root` need nothing from the command line beyond
+`--network`. And a build with `ethlambda-types/preset-minimal` on cannot decode
+this asset, because the minimal preset shortens the state's fixed-size
+vectors; nothing enables that feature for this binary, and failing is the
+right answer if anything does.
 
 `--checkpoint-sync-url` is no longer merely accepted-but-unused on `beacon`:
 the anchor work has landed, and this flag is now how `beacon` fetches its
-finalized `BeaconState` and anchor block from a standard Beacon API server,
-required on a fresh data directory since this chain has no genesis-sync path
-(see `docs/checkpoint_sync.md`).
+finalized `BeaconState` and anchor block from a standard Beacon API server.
+The full anchor precedence is a resumable data directory, then this URL, then,
+for a loaded network only, the resolved network's own `genesis.ssz`, then
+abort. The URL is therefore required on a fresh data directory only for the
+built-in `mainnet` network, since it alone has no genesis-sync path (see
+`docs/checkpoint_sync.md`).
 
 These genesis values used to come from a Beacon API's `/eth/v1/beacon/genesis`,
 which made a `beacon` run depend on a checkpoint provider being reachable. They
@@ -665,6 +682,10 @@ behavior.
   which is what keeps a parked column from satisfying the availability gate.
   Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
   `start_actor` clears the whole table at startup.
+- `DB_VERSION` is 3: `Config` gained the runtime keys a `config.yaml` supplies,
+  and it is SSZ-encoded under `KEY_CONFIG`, so a data directory written by the
+  previous version decodes into the wrong fields. `Store::from_db_state`
+  refuses any other version outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

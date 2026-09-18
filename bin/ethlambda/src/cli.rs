@@ -53,9 +53,11 @@ pub(crate) struct CommonOptions {
     /// Path to a bootnode list: ENRs, one per YAML entry.
     ///
     /// Optional on both sub-commands, but an absent file means different
-    /// things. `beacon` falls back to the built-in mainnet ENR list; `node`
-    /// has no built-in list for a lean network, so it starts with no bootnodes
-    /// and reaches peers only through discv5, if that is enabled.
+    /// things. `beacon` falls back to whatever `--network` resolved to: the
+    /// built-in mainnet ENR list, or a loaded directory's own
+    /// `bootstrap_nodes.yaml`/`.txt` (empty if the directory has neither).
+    /// `node` has no built-in list for a lean network, so it starts with no
+    /// bootnodes and reaches peers only through discv5, if that is enabled.
     #[arg(long)]
     pub(crate) bootnodes: Option<PathBuf>,
     /// Base URL(s) of the peer API servers to take a checkpoint from, e.g.
@@ -78,11 +80,16 @@ pub(crate) struct CommonOptions {
     ///
     /// On `beacon` this reads each peer's standard Beacon API,
     /// `/eth/v2/debug/beacon/states/finalized` and `/eth/v2/beacon/blocks/{slot}`,
-    /// with the same resumable-directory precedence `node` uses. Unlike
-    /// `node`, there is no genesis fallback: mainnet's genesis is built into
-    /// the binary, but this follower imports nothing, so anchoring there
-    /// would park it at slot 0 while claiming to follow a live chain. With
-    /// neither a resumable directory nor a URL, startup aborts.
+    /// with the same resumable-directory precedence `node` uses, plus one more
+    /// fallback below it. A network loaded with `--network` (a directory of
+    /// published files) anchors at its own `genesis.ssz` when there is
+    /// neither a resumable directory nor a URL, since a freshly started devnet
+    /// has no checkpoint provider at slot 0 and this is the only way to join
+    /// one. The built-in mainnet network still refuses that fallback: its
+    /// genesis is 2020, and this follower imports nothing at startup, so
+    /// anchoring there would park it at slot 0 while claiming to follow a live
+    /// chain. With neither a resumable directory, a URL, nor a loaded
+    /// network's genesis, startup aborts.
     #[arg(long, value_delimiter = ',')]
     pub(crate) checkpoint_sync_url: Vec<String>,
     #[command(flatten)]
@@ -256,6 +263,17 @@ pub(crate) struct MainnetOptions {
     /// never sees.
     #[arg(long, default_value_t = SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY)]
     pub(crate) safe_slots_to_import_optimistically: u64,
+
+    /// Which network to follow: a built-in name, or a path to a directory of
+    /// published network files.
+    ///
+    /// A value containing a slash is always read as a directory, so `mainnet`
+    /// names the built-in network and `./mainnet` names a directory. The
+    /// directory must hold `config.yaml` and `genesis.ssz`, and may hold
+    /// `bootstrap_nodes.yaml` or `bootstrap_nodes.txt`; this is the layout
+    /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
+    #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
+    pub(crate) network: String,
 }
 
 /// Flags only the lean chain takes.

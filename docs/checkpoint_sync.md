@@ -4,7 +4,7 @@
 
 Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.
 
-Both `ethlambda node` (the lean consensus chain) and `ethlambda beacon` (the Ethereum mainnet gossip follower) use it. The two paths share the retry loop and the URL fan-out, and now share the same fetch order, but talk to different endpoints and verify a different container shape; where they differ, this document says so.
+Both `ethlambda node` (the lean consensus chain) and `ethlambda beacon` (an Ethereum Beacon Chain gossip follower, mainnet by default, or another network via `--network`) use it. The two paths share the retry loop and the URL fan-out, and now share the same fetch order, but talk to different endpoints and verify a different container shape; where they differ, this document says so.
 
 ## Usage
 
@@ -32,13 +32,13 @@ State already on disk takes precedence over both checkpoint sync and genesis: if
 
 ### `ethlambda beacon`
 
-`beacon` takes no genesis config, validator registry, or bootnode file: mainnet's `genesis_time`, `genesis_validators_root`, and bootnode list are all built into the binary (see `CLAUDE.md`'s "Mainnet's genesis is built into the binary"). `--checkpoint-sync-url` is the only network input this chain's checkpoint sync needs:
+`beacon` takes no genesis config, validator registry, or bootnode file of its own: it takes `--network` instead, naming a built-in network or a directory of published network files (see [`cli.md`](cli.md)). `genesis_time`, `genesis_validators_root`, and the bootnode list all come from whichever network `--network` resolves to; for the built-in `mainnet` (the default), they are built into the binary (see `CLAUDE.md`'s "Mainnet's genesis is built into the binary").
 
 ```bash
-ethlambda beacon --checkpoint-sync-url <URL>
+ethlambda beacon --network <network> --checkpoint-sync-url <URL>
 ```
 
-The URL is **required** on a fresh data directory, unlike on `node`: there is no genesis-sync path for `beacon`. This follower imports nothing past its anchor, so anchoring at genesis would leave it parked at slot 0 while claiming to follow mainnet; with neither a resumable DB nor a URL, startup aborts with `CheckpointSyncError::BeaconGenesisSync` instead. A data directory already anchored from a previous run resumes exactly as `node`'s does, without a URL, subject to the same resume window (see [Restarts and Existing State](#restarts-and-existing-state)).
+The anchor precedence is, in order: a resumable data directory, then `--checkpoint-sync-url`, then, for a loaded network only, that directory's own `genesis.ssz`, then abort. The URL is therefore **required** on a fresh data directory only for the built-in network, unlike on `node`: this follower imports nothing past its anchor, so anchoring the built-in mainnet at genesis would leave it parked at slot 0 while claiming to follow a chain that has been live since 2020. A loaded network's own genesis state is a legitimate anchor instead, since a freshly started devnet has no checkpoint provider at slot 0 and this is the only way to join one. With neither a resumable DB, a URL, nor (for the built-in network) a genesis fallback, startup aborts with `CheckpointSyncError::BeaconGenesisSync`. A data directory already anchored from a previous run resumes exactly as `node`'s does, without a URL, subject to the same resume window (see [Restarts and Existing State](#restarts-and-existing-state)).
 
 ## Checkpoint Sources
 
@@ -81,7 +81,7 @@ This is the recommended option for production deployments since it reduces trust
 
 If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.
 
-After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins mainnet's gossip and logs what it decodes, without advancing its state past the anchor (see `docs/cli.md`, "What `ethlambda beacon` does today").
+After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins the resolved network's gossip and logs what it decodes, without advancing its state past the anchor (see `docs/cli.md`, "What `ethlambda beacon` does today").
 
 ## Restarts and Existing State
 
@@ -89,7 +89,7 @@ A node restarted against a populated data directory resumes from disk rather tha
 
 | State in data directory | `--checkpoint-sync-url` | `node` | `beacon` |
 | --- | --- | --- | --- |
-| None | omitted | Initialize from genesis | Abort: `CheckpointSyncError::BeaconGenesisSync` (no genesis-sync path) |
+| None | omitted | Initialize from genesis | Built-in network: abort, `CheckpointSyncError::BeaconGenesisSync` (no genesis-sync path). Loaded network: initialize from the directory's own `genesis.ssz` |
 | None | set | Checkpoint sync | Checkpoint sync |
 | Present, head within the resume window | either | Resume from disk (no download) | Resume from disk (no download) |
 | Present, head beyond the resume window | set | Checkpoint sync | Checkpoint sync |
@@ -102,7 +102,7 @@ Beyond that window, `node` prefers a checkpoint when one is offered, since catch
 
 When a checkpoint URL *is* set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional, on either chain: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for "resume whatever is on disk"; that path never exits.
 
-To deliberately discard existing state and start over, remove the data directory first. `node` then starts over from genesis or from a checkpoint, whichever `--checkpoint-sync-url` says; `beacon` needs the URL, since it has no genesis-sync path. Checkpoint sync itself writes its anchor state on top without clearing existing data.
+To deliberately discard existing state and start over, remove the data directory first. `node` then starts over from genesis or from a checkpoint, whichever `--checkpoint-sync-url` says; `beacon` does the same, except that a built-in-network run still needs the URL, since the built-in network alone has no genesis-sync path. Checkpoint sync itself writes its anchor state on top without clearing existing data.
 
 ### Foreign State
 
