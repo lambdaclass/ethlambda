@@ -511,6 +511,42 @@ impl ProjectedState {
     /// Measured against the votes the CHAIN already carries, so a validator
     /// with no entry counts as new: no block has carried a vote for it, so this
     /// entry is the first weight it would contribute on chain.
+    /// Whether applying this entry puts 2/3 of the validator set's latest head
+    /// votes on `att_data.head.root`.
+    ///
+    /// The head-side analogue of `crosses_2_3` for justification, and counted
+    /// the same way: over the projected POST-state, not the delta. A validator
+    /// counts when the entry moves it onto this head, or when it already names
+    /// this head and the entry does not move it elsewhere.
+    ///
+    /// `None` head votes means the axis is switched off, so no supermajority
+    /// can be claimed.
+    fn head_crosses_2_3(
+        &self,
+        att_data: &AttestationData,
+        new_head_voters: &HashSet<u64>,
+        validator_count: usize,
+    ) -> bool {
+        let Some(head_votes) = self.head_votes.as_ref() else {
+            return false;
+        };
+        let head_root = att_data.head.root;
+        // Everyone this entry moves lands on `head_root` by construction.
+        let retained = head_votes
+            .iter()
+            .filter(|(vid, vote)| vote.head.root == head_root && !new_head_voters.contains(vid))
+            .count();
+        let total = retained + new_head_voters.len();
+        3 * total >= 2 * validator_count
+    }
+
+    /// The subset of `coverage` whose latest head vote this entry would
+    /// replace, per the LMD-GHOST latest-message rule
+    /// ([`AttestationData::supersedes`]).
+    ///
+    /// Measured against the votes the CHAIN already carries, so a validator
+    /// with no entry counts as new: no block has carried a vote for it, so this
+    /// entry is the first weight it would contribute on chain.
     pub(crate) fn new_head_voters(
         &self,
         att_data: &AttestationData,
@@ -564,14 +600,16 @@ impl ProjectedState {
     /// Returns `None` only if the entry is worthless on *both* axes: it adds no
     /// justification voter for `att_data.target.root` and no validator's head
     /// vote either. An entry that adds head votes alone is kept, at
-    /// [`Tier::Build`], because its fork-choice weight is real even when its
-    /// target is already carried: dropping it is how a slot whose votes all
-    /// name a settled target ends up proposing nothing at all.
+    /// [`Tier::TargetAdvance`] if those votes carry the head past 2/3 and
+    /// [`Tier::Build`] otherwise, because its fork-choice weight is real even
+    /// when its target is already carried: dropping it is how a slot whose
+    /// votes all name a settled target ends up proposing nothing at all.
     ///
     /// On `Some`, the returned sets are the subsets of `coverage` that are new
     /// on each axis, so the caller can `advance` and `advance_head_votes` the
     /// projection without re-scanning `coverage`. A genesis self-vote cannot
-    /// justify or finalize and is always scored as tier 3.
+    /// justify or finalize, so it never reaches `Justify`/`Finalize`; it is
+    /// still eligible for `TargetAdvance` on its head weight.
     ///
     /// The caller resolves `coverage` and passes it in: block building unions a
     /// data's proof participants (see `pick_best_candidate`); committee-signature
@@ -628,14 +666,25 @@ impl ProjectedState {
                 .all(|s| !slot_is_justifiable_after(s, self.finalized_slot));
 
         // An entry that adds no justification voter cannot move the target past
-        // the threshold, whatever `prior_count` already sits at, so it stays at
-        // `Build` regardless of `crosses_2_3` — it is here for its head votes.
-        let tier = if is_genesis_self_vote(att_data) || !crosses_2_3 || new_voters.is_empty() {
-            Tier::Build
-        } else if finalizes {
+        // the threshold, whatever `prior_count` already sits at, so it cannot
+        // justify regardless of `crosses_2_3` — it is here for its head votes.
+        let justifies = !is_genesis_self_vote(att_data) && crosses_2_3 && !new_voters.is_empty();
+
+        // Same rule on the head axis, for the same reason: an entry that moves
+        // nobody's head vote did not bring the head anywhere, however much
+        // weight already sits there. Requiring a non-empty contribution is what
+        // keeps a settled entry from claiming a threshold it did not cross.
+        let advances_head = !new_head_voters.is_empty()
+            && self.head_crosses_2_3(att_data, &new_head_voters, validator_count);
+
+        let tier = if justifies && finalizes {
             Tier::Finalize
-        } else {
+        } else if justifies {
             Tier::Justify
+        } else if advances_head {
+            Tier::TargetAdvance
+        } else {
+            Tier::Build
         };
 
         let score = EntryScore {
@@ -733,8 +782,18 @@ pub(crate) enum Tier {
     Finalize = 1,
     /// Applying the entry crosses 2/3 on target but does not finalize.
     Justify = 2,
-    /// Adds marginal new voters toward target's 2/3 supermajority.
-    Build = 3,
+    /// Applying the entry brings 2/3 of validators' latest head votes onto the
+    /// entry's head root, without justifying anything.
+    ///
+    /// The LMD-GHOST analogue of `Justify`: it does not move the justification
+    /// checkpoint, but it settles the head, which is what a later target is
+    /// eventually chosen against. Ranks below `Justify` because finality beats
+    /// head weight, and above `Build` because crossing the threshold is worth
+    /// more than adding marginal weight below it.
+    TargetAdvance = 3,
+    /// Adds marginal new voters toward target's 2/3 supermajority, or head
+    /// weight below the head threshold.
+    Build = 4,
 }
 
 /// Tiered score for a candidate `AttestationData` entry during block building.
@@ -786,25 +845,49 @@ impl EntryScore {
     /// leads; the remaining four slots carry tier-dependent priorities (see
     /// the type-level docs), all encoded as `Reverse` so "larger is better".
     pub(crate) fn ordering_key(&self, data_root: H256) -> OrderingKey {
+        /// Filler for the `OrderingKey` slots a tier does not rank on. Any
+        /// constant works: identical across every entry in that tier, it can
+        /// never decide a comparison.
+        const ORDERING_UNUSED: Reverse<u64> = Reverse(0);
+
         let more_new_voters = Reverse(self.new_voters as u64);
         let more_new_head_voters = Reverse(self.new_head_voters as u64);
         let newer_target = Reverse(self.target_slot);
         let newer_att = Reverse(self.att_slot);
         match self.tier {
+            // Finality first: which checkpoint this moves, then how recent the
+            // vote is, and only then how much weight it carries. Head votes
+            // outrank justification voters here because by this point the
+            // target is already crossing 2/3, so the marginal justification
+            // voter is worth less than the head weight riding along with it.
+            Tier::Finalize | Tier::Justify => (
+                self.tier,
+                newer_target,
+                newer_att,
+                more_new_head_voters,
+                more_new_voters,
+                data_root,
+            ),
+            // The head is what this tier settles, and the target is not moving,
+            // so `newer_target` would be noise. Justification voters are not
+            // ranked at all: an entry here is chosen for head weight.
+            // `ORDERING_UNUSED` holds the two slots this tier does not rank on;
+            // being constant, it never discriminates.
+            Tier::TargetAdvance => (
+                self.tier,
+                newer_att,
+                more_new_head_voters,
+                ORDERING_UNUSED,
+                ORDERING_UNUSED,
+                data_root,
+            ),
+            // Below every threshold, so raw progress toward one leads.
             Tier::Build => (
                 self.tier,
                 more_new_voters,
                 more_new_head_voters,
                 newer_target,
                 newer_att,
-                data_root,
-            ),
-            Tier::Finalize | Tier::Justify => (
-                self.tier,
-                newer_target,
-                newer_att,
-                more_new_voters,
-                more_new_head_voters,
                 data_root,
             ),
         }
@@ -1271,11 +1354,15 @@ mod tests {
         );
         assert_eq!(new_head_voters.len(), 3);
         assert_eq!(score.new_head_voters, 3);
-        assert_eq!(
-            score.tier,
-            Tier::Build,
+        assert!(
+            score.tier > Tier::Justify,
             "an entry adding no justification voter cannot justify, whatever \
              the prior count"
+        );
+        assert_eq!(
+            score.tier,
+            Tier::TargetAdvance,
+            "3 of 4 validators moved onto this head crosses 2/3"
         );
     }
 
@@ -1387,10 +1474,14 @@ mod tests {
         );
         assert_eq!(score.new_voters, 0);
         assert_eq!(new_head_voters.len(), 4, "its head votes are still new");
+        assert!(
+            score.tier > Tier::Justify,
+            "it cannot justify, so it must not be tiered as if it could"
+        );
         assert_eq!(
             score.tier,
-            Tier::Build,
-            "it cannot justify, so it must not be tiered as if it could"
+            Tier::TargetAdvance,
+            "its head votes still carry the head past 2/3"
         );
     }
 
@@ -1443,6 +1534,191 @@ mod tests {
             Ok(()),
             "a settled target is a scoring question, not a validity one"
         );
+    }
+
+    /// Below the head threshold there is no `TargetAdvance`: the entry is
+    /// carrying weight, not settling anything.
+    #[test]
+    fn head_votes_below_two_thirds_stay_at_build() {
+        let att_data = make_att_data(5);
+        // 1 of 10 validators is nowhere near 2/3.
+        let coverage: HashSet<u64> = HashSet::from([0]);
+
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::from([(att_data.target.root, coverage.clone())]),
+            head_votes: Some(HashMap::from([(0, make_att_data(4))])),
+        };
+
+        let (score, _, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, 10)
+            .expect("it still moves a head vote");
+
+        assert_eq!(new_head_voters.len(), 1);
+        assert_eq!(score.tier, Tier::Build);
+    }
+
+    /// An entry that moves nobody's head vote must not claim `TargetAdvance`
+    /// off weight that was already there. Same rule the justification axis
+    /// applies, and for the same reason: the threshold has to be crossed BY
+    /// this entry.
+    #[test]
+    fn an_entry_that_moves_no_head_vote_cannot_claim_target_advance() {
+        // A real target, not `make_att_data`'s genesis self-vote, so the entry
+        // can actually reach `Justify`.
+        let att_data = AttestationData {
+            slot: 5,
+            head: Checkpoint {
+                slot: 4,
+                root: H256([4u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 1,
+                root: H256([1u8; 32]),
+            },
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+
+        // Everyone already voted for this exact data, so nothing moves, but the
+        // head is already at a supermajority.
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_votes: Some(HashMap::from([
+                (0, att_data.clone()),
+                (1, att_data.clone()),
+                (2, att_data.clone()),
+            ])),
+        };
+
+        let (score, _, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, 4)
+            .expect("it still adds justification voters");
+
+        assert!(new_head_voters.is_empty(), "no head vote moves");
+        assert_eq!(
+            score.tier,
+            Tier::Justify,
+            "it justifies on its own axis, and must not be credited for a head \
+             threshold it did not cross"
+        );
+    }
+
+    /// `TargetAdvance` ranks on recency first, then head weight. The target is
+    /// not moving at this tier, so `newer_target` is deliberately not consulted.
+    #[test]
+    fn target_advance_ranks_newer_attestation_over_more_head_votes() {
+        let newer_but_lighter = EntryScore {
+            tier: Tier::TargetAdvance,
+            new_voters: 0,
+            new_head_voters: 1,
+            target_slot: 2,
+            att_slot: 9,
+        };
+        let older_but_heavier = EntryScore {
+            tier: Tier::TargetAdvance,
+            new_voters: 0,
+            new_head_voters: 500,
+            target_slot: 7,
+            att_slot: 8,
+        };
+
+        assert!(
+            newer_but_lighter.ordering_key(H256([1u8; 32]))
+                < older_but_heavier.ordering_key(H256([2u8; 32])),
+            "a fresher attestation wins even against far more head weight"
+        );
+    }
+
+    /// Within `TargetAdvance`, equal attestation slots fall through to head
+    /// weight, and justification voters never enter the comparison.
+    #[test]
+    fn target_advance_breaks_an_attestation_slot_tie_on_head_votes_only() {
+        let heavier = EntryScore {
+            tier: Tier::TargetAdvance,
+            new_voters: 0,
+            new_head_voters: 9,
+            target_slot: 1,
+            att_slot: 8,
+        };
+        let lighter_but_more_justification_voters = EntryScore {
+            tier: Tier::TargetAdvance,
+            new_voters: 900,
+            new_head_voters: 8,
+            target_slot: 1,
+            att_slot: 8,
+        };
+
+        assert!(
+            heavier.ordering_key(H256([1u8; 32]))
+                < lighter_but_more_justification_voters.ordering_key(H256([2u8; 32])),
+            "head weight decides; justification voters are not ranked at this tier"
+        );
+    }
+
+    /// In the justify arm head votes now outrank justification voters, once
+    /// target and attestation slots tie.
+    #[test]
+    fn justify_ranks_head_votes_above_justification_voters() {
+        let more_head_votes = EntryScore {
+            tier: Tier::Justify,
+            new_voters: 1,
+            new_head_voters: 50,
+            target_slot: 4,
+            att_slot: 6,
+        };
+        let more_justification_voters = EntryScore {
+            tier: Tier::Justify,
+            new_voters: 900,
+            new_head_voters: 49,
+            target_slot: 4,
+            att_slot: 6,
+        };
+
+        assert!(
+            more_head_votes.ordering_key(H256([1u8; 32]))
+                < more_justification_voters.ordering_key(H256([2u8; 32])),
+            "past the 2/3 target threshold the marginal justification voter is \
+             worth less than head weight"
+        );
+    }
+
+    /// Tier still dominates every other term: a `Justify` entry with nothing
+    /// else going for it beats the best possible `TargetAdvance` entry, which
+    /// in turn beats the best possible `Build` entry.
+    #[test]
+    fn tier_dominates_every_other_ordering_term() {
+        let justify = EntryScore {
+            tier: Tier::Justify,
+            new_voters: 0,
+            new_head_voters: 0,
+            target_slot: 0,
+            att_slot: 0,
+        };
+        let target_advance = EntryScore {
+            tier: Tier::TargetAdvance,
+            new_voters: u32::MAX as usize,
+            new_head_voters: u32::MAX as usize,
+            target_slot: u64::MAX,
+            att_slot: u64::MAX,
+        };
+        let build = EntryScore {
+            tier: Tier::Build,
+            new_voters: u32::MAX as usize,
+            new_head_voters: u32::MAX as usize,
+            target_slot: u64::MAX,
+            att_slot: u64::MAX,
+        };
+        let root = H256([1u8; 32]);
+
+        assert!(justify.ordering_key(root) < target_advance.ordering_key(root));
+        assert!(target_advance.ordering_key(root) < build.ordering_key(root));
     }
 
     /// Head votes break a tie on justification voters, and never outrank them.
