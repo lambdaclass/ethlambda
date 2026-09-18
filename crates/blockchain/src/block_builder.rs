@@ -323,9 +323,13 @@ pub(crate) struct ProposalInputs<'a> {
     /// The attestation pool: `data_root -> (data, proofs)`.
     pub(crate) aggregated_payloads:
         &'a HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
-    /// Per-validator latest head votes, as fork choice currently holds them.
+    /// Per-validator latest head votes that the CHAIN already carries.
     ///
-    /// Owned because `Store::extract_latest_known_attestations` already returns
+    /// Deliberately not the votes fork choice holds: that map advances in
+    /// lockstep with the pool these entries come from, so every entry would
+    /// score zero new head voters. See `ForkChoiceState::on_chain_votes`.
+    ///
+    /// Owned because `Store::extract_on_chain_votes` already returns
     /// a clone, and the projection mutates it as entries are selected.
     pub(crate) latest_head_votes: HashMap<u64, AttestationData>,
 }
@@ -354,16 +358,22 @@ pub(crate) struct ProjectedState {
     pub(crate) justified_slots: JustifiedSlots,
     pub(crate) finalized_slot: u64,
     pub(crate) current_votes: HashMap<H256, HashSet<u64>>,
-    /// Each validator's latest head vote as fork choice currently holds it,
+    /// Each validator's latest head vote that the CHAIN already carries,
     /// advanced as entries are selected so a validator is not credited twice
     /// across rounds.
     ///
     /// `None` turns head-vote scoring off entirely, which is not the same as
     /// seeding an empty map: with no recorded vote every validator in an
     /// entry's coverage reads as newly covered, so an empty map scores every
-    /// entry as maximally valuable. That is the right answer when the map is
-    /// genuinely empty (fork choice holds nothing, so every vote is the first
-    /// weight its validator contributes) and the wrong one as a stand-in for
+    /// entry as maximally valuable.
+    ///
+    /// An empty map is a real state here, and it no longer means what it meant
+    /// when this was seeded from fork choice: a node that has just resumed
+    /// holds a full set of gossip-learned votes within a slot while it has
+    /// still seen no block, so `on_chain_votes` is empty and every entry scores
+    /// its whole coverage. That errs toward packing more rather than less, it
+    /// is capped by `max_attestations_per_block`, and it resolves on the first
+    /// import that carries attestations. What it must NOT be is a stand-in for
     /// "not scoring head votes here", which is what `None` is for.
     ///
     /// Both production callers seed it. It stays optional because the scoring
@@ -390,7 +400,7 @@ impl ProjectedState {
     /// entry for the fork-choice weight it adds and not only for the
     /// justification voters it brings.
     ///
-    /// Takes the map by value: `Store::extract_latest_known_attestations`
+    /// Takes the map by value: `Store::extract_on_chain_votes`
     /// already hands out an owned clone, so there is nothing to gain by
     /// borrowing it and the projection then owns what it mutates.
     pub(crate) fn with_head_votes(mut self, head_votes: HashMap<u64, AttestationData>) -> Self {

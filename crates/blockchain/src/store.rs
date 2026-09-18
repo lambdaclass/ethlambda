@@ -968,10 +968,14 @@ pub fn produce_block_with_signatures(
 
     let known_block_roots = store.get_block_roots().unwrap();
 
-    // The per-validator latest votes fork choice weighs, so selection can value
-    // an entry for the head weight it adds and not only for the justification
-    // voters it brings.
-    let latest_head_votes = store.extract_latest_known_attestations();
+    // The latest vote per validator the CHAIN already carries, so selection can
+    // value an entry for the head weight it would ADD and not only for the
+    // justification voters it brings.
+    //
+    // Deliberately not `extract_latest_known_attestations`: that map is written
+    // in lockstep with the aggregated-payload pool this block is built from, so
+    // every entry would score zero new head voters and the axis would be dead.
+    let latest_head_votes = store.extract_on_chain_votes();
 
     let inputs = ProposalInputs {
         known_block_roots: &known_block_roots,
