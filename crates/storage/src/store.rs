@@ -354,6 +354,32 @@ type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
 struct ForkChoiceState {
     known_votes: HashMap<u64, AttestationData>,
     new_votes: HashMap<u64, AttestationData>,
+    /// Latest vote per validator that a BLOCK has carried, as opposed to one
+    /// this node merely learned about.
+    ///
+    /// Maintained only from `insert_signed_block`, never from gossip or the
+    /// aggregation pool, which is the whole point: the vote maps and the
+    /// payload buffers advance in lockstep from the same data, at both stages.
+    /// [`Store::insert_new_aggregated_payload`] writes `new_votes` and
+    /// `new_payloads` in one call, and [`Store::promote_new_aggregated_payloads`]
+    /// then drains `new_votes` into `known_votes` and `new_payloads` into
+    /// `known_payloads`, also in one call. So `known_votes` and the pool that
+    /// `known_aggregated_payloads` serves are two views of the same set of
+    /// votes, and a candidate body built out of that pool can never carry a
+    /// vote newer than `known_votes`. Scoring a body's head-vote value against
+    /// `known_votes` therefore always yields zero and is the wrong question.
+    /// The one that matters when deciding what to PACK is whether the chain
+    /// already carries the vote, which is exactly what this map answers.
+    ///
+    /// Not fork-aware: a vote carried by a block on an abandoned branch still
+    /// counts as on-chain here. That only ever makes a vote look less novel
+    /// than it is, so the failure mode is packing slightly less rather than
+    /// double-counting, and keeping it fork-aware would cost an ancestor walk
+    /// per scoring call to save nothing at the scale we run at.
+    ///
+    /// Bounded by the validator-set size: one entry per validator, replaced in
+    /// place, so it needs no pruning as the chain advances.
+    on_chain_votes: HashMap<u64, AttestationData>,
 }
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
@@ -1512,12 +1538,25 @@ impl Store {
         }
     }
 
+    /// Record a block's attestations as fork-choice votes.
+    ///
+    /// Called from `insert_signed_block` only, so it doubles as the one place
+    /// that learns a vote is now ON CHAIN. Both maps are updated: `known_votes`
+    /// is what fork choice weighs, `on_chain_votes` is the baseline block
+    /// production scores a candidate body's head-vote value against. See
+    /// [`ForkChoiceState::on_chain_votes`] for why the two cannot be the same
+    /// map.
     fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
         let mut fork_choice = self.fork_choice.lock().unwrap();
         for attestation in attestations {
             for validator_id in validator_indices(&attestation.aggregation_bits) {
                 Self::record_vote(
                     &mut fork_choice.known_votes,
+                    validator_id,
+                    &attestation.data,
+                );
+                Self::record_vote(
+                    &mut fork_choice.on_chain_votes,
                     validator_id,
                     &attestation.data,
                 );
@@ -1528,6 +1567,18 @@ impl Store {
     /// Extract per-validator latest attestations from known fork-choice votes.
     pub fn extract_latest_known_attestations(&self) -> HashMap<u64, AttestationData> {
         self.fork_choice.lock().unwrap().known_votes.clone()
+    }
+
+    /// Extract the latest vote per validator that a block has already carried.
+    ///
+    /// The baseline for scoring how much fork-choice weight a candidate body
+    /// would ADD to the chain. Deliberately not
+    /// [`Self::extract_latest_known_attestations`]: that map is written in
+    /// lockstep with the aggregated-payload pool bodies are built from, so
+    /// scoring against it reports zero for every candidate. See
+    /// [`ForkChoiceState::on_chain_votes`].
+    pub fn extract_on_chain_votes(&self) -> HashMap<u64, AttestationData> {
+        self.fork_choice.lock().unwrap().on_chain_votes.clone()
     }
 
     /// Extract per-validator latest attestations from new (pending) payloads.
@@ -2134,6 +2185,108 @@ mod tests {
         let votes = store.extract_latest_known_attestations();
         assert_eq!(votes[&1], data);
         assert_eq!(votes[&3], data);
+    }
+
+    /// The pool and `known_votes` are written in lockstep, so a candidate body
+    /// built from the pool can never carry a vote newer than `known_votes`.
+    /// `on_chain_votes` must NOT move with them, or head-vote scoring reports
+    /// zero for every candidate and the whole axis is dead.
+    ///
+    /// This is the regression guard for exactly that: scoring a body's
+    /// head-vote value against `known_votes` looks reasonable and silently
+    /// always returns nothing.
+    #[test]
+    fn aggregated_payloads_move_known_votes_but_never_on_chain_votes() {
+        let mut store = Store::test_store();
+        let data = make_att_data_for_target(8, root(8));
+
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(data.clone()),
+            make_proof_for_validator(0),
+        );
+        store.promote_new_aggregated_payloads();
+
+        assert_eq!(
+            store.extract_latest_known_attestations()[&0],
+            data,
+            "the pool write must reach the fork-choice map"
+        );
+        assert!(
+            store.extract_on_chain_votes().is_empty(),
+            "no block has carried this vote, so it is not on chain"
+        );
+    }
+
+    /// The other half: a block import is what makes a vote on-chain, and it
+    /// must move BOTH maps.
+    #[test]
+    fn insert_signed_block_records_on_chain_votes() {
+        let mut store = Store::test_store();
+        let data = make_att_data_for_target(8, root(8));
+        let block = signed_block_with_attestations(
+            1,
+            H256::ZERO,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validators(&[1, 3]).participants,
+                data: data.clone(),
+            }],
+        );
+        let block_root = block.message.hash_tree_root();
+
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert signed block");
+
+        let on_chain = store.extract_on_chain_votes();
+        assert_eq!(on_chain[&1], data);
+        assert_eq!(on_chain[&3], data);
+        assert_eq!(
+            store.extract_latest_known_attestations()[&1],
+            data,
+            "a block import still feeds fork choice as before"
+        );
+    }
+
+    /// A pooled vote strictly newer than what the chain carries must read as
+    /// new against the on-chain baseline. This is the property the whole fix
+    /// turns on: if it fails, candidates score zero again.
+    #[test]
+    fn a_pooled_vote_newer_than_the_chain_supersedes_the_on_chain_baseline() {
+        let mut store = Store::test_store();
+        let on_chain_data = make_att_data_for_target(8, root(8));
+        let block = signed_block_with_attestations(
+            1,
+            H256::ZERO,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validator(0).participants,
+                data: on_chain_data.clone(),
+            }],
+        );
+        store
+            .insert_signed_block(block.message.hash_tree_root(), block)
+            .expect("insert signed block");
+
+        // A later attestation from the same validator, still only in the pool.
+        let fresher = make_att_data_for_target(9, root(9));
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(fresher.clone()),
+            make_proof_for_validator(0),
+        );
+        store.promote_new_aggregated_payloads();
+
+        let on_chain = store.extract_on_chain_votes();
+        assert_eq!(
+            on_chain[&0], on_chain_data,
+            "the pool must not advance the on-chain baseline"
+        );
+        assert!(
+            fresher.supersedes(&on_chain[&0]),
+            "the pooled vote must read as new against what the chain carries"
+        );
+        assert!(
+            !fresher.supersedes(&store.extract_latest_known_attestations()[&0]),
+            "and must read as NOT new against known_votes, which is the bug this fixes"
+        );
     }
 
     #[test]

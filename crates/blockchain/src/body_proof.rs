@@ -68,7 +68,10 @@ pub(crate) fn build_body_proof(
     let inputs = block_builder::ProposalInputs {
         known_block_roots: &known_block_roots,
         aggregated_payloads: &aggregated_payloads,
-        latest_head_votes: store.extract_latest_known_attestations(),
+        // What the CHAIN carries, not what this node has seen: the pool this
+        // body is built from and the seen-votes map advance together, so
+        // scoring against the latter reports zero for every candidate.
+        latest_head_votes: store.extract_on_chain_votes(),
     };
 
     let (attestations, aggregates) =
