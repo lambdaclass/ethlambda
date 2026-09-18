@@ -470,12 +470,6 @@ impl ProjectedState {
         }
     }
 
-    /// The subset of `coverage` whose latest head vote this entry would
-    /// replace, per the LMD-GHOST latest-message rule
-    /// ([`AttestationData::supersedes`]).
-    ///
-    /// A validator with no recorded vote counts as new: fork choice holds
-    /// nothing for it, so this entry is the first weight it contributes.
     /// Whether `att_data`'s target is already justified in this projection.
     ///
     /// An untracked target slot (commonly the head block's own slot, or any
@@ -494,6 +488,13 @@ impl ProjectedState {
             .unwrap_or(false)
     }
 
+    /// The subset of `coverage` whose latest head vote this entry would
+    /// replace, per the LMD-GHOST latest-message rule
+    /// ([`AttestationData::supersedes`]).
+    ///
+    /// Measured against the votes the CHAIN already carries, so a validator
+    /// with no entry counts as new: no block has carried a vote for it, so this
+    /// entry is the first weight it would contribute on chain.
     fn new_head_voters(&self, att_data: &AttestationData, coverage: &HashSet<u64>) -> HashSet<u64> {
         let Some(head_votes) = self.head_votes.as_ref() else {
             return HashSet::new();

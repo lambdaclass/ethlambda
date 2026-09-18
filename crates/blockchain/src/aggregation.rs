@@ -2359,6 +2359,100 @@ mod tests {
         );
     }
 
+    /// The suppression direction, which the other tests never exercise: once a
+    /// block HAS carried the vote, the group is worth nothing on either axis
+    /// and must not become a job.
+    ///
+    /// Without this, "always selects" and "correctly selects" look identical:
+    /// an empty on-chain baseline makes every group score its full coverage, so
+    /// a test that only ever asserts `is_some()` passes even if the baseline is
+    /// ignored outright.
+    #[test]
+    fn select_skips_a_group_whose_vote_the_chain_already_carries() {
+        const NUM_VALIDATORS: usize = 10;
+        const HEAD_SLOT: u64 = 20;
+        const FINALIZED_SLOT: u64 = 10;
+        const TARGET_SLOT: u64 = 12;
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
+
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let hashed = HashedAttestationData::new(att_data.clone());
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed, 1, dummy_sig());
+
+        // Now put this exact vote ON CHAIN for both participants.
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        bits.set(0, true).unwrap();
+        bits.set(1, true).unwrap();
+        let block = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: hashes[0],
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: vec![ethlambda_types::attestation::AggregatedAttestation {
+                        aggregation_bits: bits,
+                        data: att_data,
+                    }]
+                    .try_into()
+                    .unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let block_root = {
+            use ethlambda_types::primitives::HashTreeRoot as _;
+            block.message.hash_tree_root()
+        };
+        store
+            .insert_signed_block(block_root, block)
+            .expect("insert block carrying the vote");
+        assert_eq!(
+            store.extract_on_chain_votes().len(),
+            2,
+            "fixture must actually put the vote on chain"
+        );
+
+        assert!(
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_none(),
+            "the chain already carries this vote, so it adds nothing on either axis"
+        );
+    }
+
     /// The counterpart: a target that is justified but still above the
     /// finalized boundary DOES become a job, on the strength of its head votes
     /// alone.
