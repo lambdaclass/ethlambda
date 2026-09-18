@@ -185,10 +185,12 @@ impl ValidatorSecretKey {
     /// Sign a message at `slot`.
     ///
     /// The slot indexes the one-time XMSS leaf; never sign two different
-    /// messages at the same slot. leanVM draws the signature randomness itself,
-    /// so even re-signing the same message at one slot leaks key material.
+    /// messages at the same slot. leanVM derives the signature randomness from
+    /// the message and the key, so signing is deterministic: re-signing the
+    /// same message at one slot returns the same signature and is safe, while
+    /// a second, different message at that slot leaks key material.
     pub fn sign(&self, slot: u32, message: &H256) -> Result<ValidatorSignature, XmssSignError> {
-        let sig = xmss::sign(&mut leanvm::rand::rng(), &self.inner, &message.0, slot)?;
+        let sig = xmss::sign(&self.inner, &message.0, slot)?;
         Ok(ValidatorSignature { inner: sig })
     }
 
