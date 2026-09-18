@@ -47,11 +47,11 @@ use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, StreamProtocol,
+    Multiaddr,
     gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{Keypair, PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response::{self, OutboundRequestId},
+    request_response::OutboundRequestId,
     swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use sha2::Digest;
@@ -75,14 +75,10 @@ use crate::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_block,
     },
-    lean::protocols::{
-        BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
-        BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
-        STATUS_V1 as STATUS_PROTOCOL_V1,
-    },
+    lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
-        Codec, MAX_COMPRESSED_PAYLOAD_SIZE, Request, build_status, fetch_block_from_peer,
-        fetch_data_columns_from_peer, handlers::columns_custodied_by,
+        Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
+        fetch_block_from_peer, fetch_data_columns_from_peer, handlers::columns_custodied_by,
     },
     swarm_adapter::SwarmHandle,
 };
@@ -237,6 +233,55 @@ pub(crate) enum PendingRequestKind {
     },
 }
 
+/// Which single-protocol field of [`ReqResp`] an outbound request travels
+/// through.
+///
+/// Splitting one shared `request_response::Behaviour` into one per protocol
+/// (see [`ReqResp`]'s doc comment) gives each field its own
+/// `OutboundRequestId` sequence, starting at 1: two different protocols can
+/// now legitimately mint the same numeric id for two unrelated requests. A
+/// bare `OutboundRequestId` is therefore no longer a safe map key on its own,
+/// and every place that names one names this alongside it instead, forming
+/// [`ReqRespRequestId`].
+///
+/// One variant per field, sharing that field's name so the two stay easy to
+/// line up by eye; [`crate::swarm_adapter::execute_command`] matches
+/// exhaustively on this to choose which field actually sends, and
+/// [`handle_behaviour_event`] matches exhaustively on the derived
+/// `ReqRespEvent` to tag every inbound event with the variant that produced
+/// it. Public because [`request_beacon_block_by_root`] and
+/// [`request_beacon_blocks_by_range`] carry a [`ReqRespRequestId`] in their
+/// return type and are themselves public, for the reason their own doc
+/// comments give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReqRespProtocol {
+    LeanStatus,
+    LeanBlocksByRoot,
+    LeanBlocksByRange,
+    BeaconStatusV1,
+    BeaconStatusV2,
+    BeaconPing,
+    BeaconMetadataV1,
+    BeaconMetadataV2,
+    BeaconMetadataV3,
+    BeaconGoodbye,
+    BeaconBlocksByRange,
+    BeaconBlocksByRoot,
+    DataColumnSidecarsByRange,
+    DataColumnSidecarsByRoot,
+}
+
+/// An outbound request id, namespaced by the protocol it was sent on.
+///
+/// See [`ReqRespProtocol`] for why the protocol has to be carried alongside
+/// the id rather than trusted to be unique on its own now that each protocol
+/// has its own `Behaviour` field and so its own id sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReqRespRequestId {
+    pub protocol: ReqRespProtocol,
+    pub id: OutboundRequestId,
+}
+
 pub(crate) struct RangeSyncState {
     /// Remaining slots to request, with an exclusive end.
     pub(crate) current_range: Range<u64>,
@@ -302,19 +347,25 @@ impl RangeSyncState {
 
 // --- Swarm construction ---
 
-/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify, Gossipsub
-/// and Request-Response Behaviours.
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify,
+/// Gossipsub and the request/response protocols.
 ///
 /// `identify` is registered purely for interop: go-libp2p (gean) gates gossipsub
 /// GRAFT on the identify exchange completing, so a peer that doesn't respond to
 /// `/ipfs/id/1.0.0` is silently excluded from the mesh. Events from this
 /// behaviour are intentionally not handled: the registration alone is enough
 /// to satisfy probing peers. ream and zeam follow the same pattern.
+///
+/// The request/response side is a nested [`ReqResp`]: one
+/// `request_response::Behaviour` per protocol id rather than one shared
+/// behaviour registering every id. Its doc comment has why, and
+/// [`ReqRespProtocol`] names its fields for anything that has to pick one
+/// at runtime.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
     identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: request_response::Behaviour<Codec>,
+    req_resp: ReqResp,
     /// Refuses connections past the configured ceiling. A deny from any member
     /// behaviour denies the connection, so registering this is the whole
     /// mechanism; see [`beacon::swarm::connection_limits`] for the numbers and why the
@@ -533,22 +584,6 @@ pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config 
         .expect("invalid gossipsub config")
 }
 
-impl Behaviour {
-    pub(crate) fn new(
-        identify: libp2p::identify::Behaviour,
-        gossipsub: libp2p::gossipsub::Behaviour,
-        req_resp: request_response::Behaviour<Codec>,
-        connection_limits: libp2p::connection_limits::Behaviour,
-    ) -> Self {
-        Self {
-            identify,
-            gossipsub,
-            req_resp,
-            connection_limits,
-        }
-    }
-}
-
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
 ///
 /// One builder for both networks. Four things differ at the behaviour level and
@@ -568,23 +603,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     // block protocols frame their chunks against the fork schedule and the
     // chain, so whatever decides that the protocols are registered has to decide
     // that the context is there. See [`Codec`].
-    let (seen_ttl, protocols, identify_version, connection_limits, codec) = match &wire {
+    let (seen_ttl, identify_version, connection_limits, codec) = match &wire {
         WireConfig::Lean(lean) => (
             Duration::from_millis(lean.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS),
-            vec![
-                (
-                    StreamProtocol::new(STATUS_PROTOCOL_V1),
-                    request_response::ProtocolSupport::Full,
-                ),
-                (
-                    StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-                    request_response::ProtocolSupport::Full,
-                ),
-                (
-                    StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
-                    request_response::ProtocolSupport::Full,
-                ),
-            ],
             // Use the same `protocol_version` string as zeam
             "/ipfs/0.1.0",
             unlimited_connections(),
@@ -592,7 +613,6 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         ),
         WireConfig::Beacon(beacon) => (
             beacon::swarm::seen_ttl(&beacon.config),
-            beacon::protocols::registrations(),
             beacon::swarm::IDENTIFY_PROTOCOL_VERSION,
             beacon::swarm::connection_limits(target_peers),
             Codec::beacon(beacon::BeaconContext {
@@ -608,7 +628,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     )
     .expect("failed to initiate behaviour");
 
-    let req_resp = request_response::Behaviour::with_codec(codec, protocols, Default::default());
+    let req_resp = ReqResp::new(codec, &wire);
 
     let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
@@ -618,7 +638,12 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         identity.public(),
     ));
 
-    let behavior = Behaviour::new(identify, gossipsub, req_resp, connection_limits);
+    let behavior = Behaviour {
+        identify,
+        gossipsub,
+        req_resp,
+        connection_limits,
+    };
 
     // TODO: set peer scoring params
 
@@ -910,7 +935,7 @@ pub struct P2PServer {
     /// the block path: `fetch_missing_columns` dedupes against it, and
     /// `handle_column_fetch_failure` is the only place an entry is retired.
     pub(crate) pending_column_requests: HashMap<H256, PendingColumnRequest>,
-    pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
+    pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
     /// Highest beacon slot handed to the chain actor, whether or not it has
@@ -1252,14 +1277,8 @@ async fn handle_swarm_event(
     ctx: &Context<P2PServer>,
 ) {
     match event {
-        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
-            req_resp::handle_req_resp_message(server, req_resp_event, ctx).await;
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
-            message,
-            ..
-        })) => {
-            gossipsub::handle_gossip_message(server, message).await;
+        SwarmEvent::Behaviour(behaviour_event) => {
+            handle_behaviour_event(server, behaviour_event, ctx).await;
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -1330,7 +1349,7 @@ async fn handle_swarm_event(
                             .send_request(
                                 peer_id,
                                 Request::LeanStatus(our_status),
-                                libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                                ReqRespProtocol::LeanStatus,
                             )
                             .await;
                     }
@@ -1478,6 +1497,60 @@ async fn handle_swarm_event(
             trace!(?event, "Ignored swarm event");
         }
     }
+}
+
+/// Dispatch one [`BehaviourEvent`], tagging every req/resp field's event with
+/// the [`ReqRespProtocol`] variant that names it.
+///
+/// The tag is the whole of what each req/resp arm decides, so the match yields
+/// it as a value and the one call that consumes it sits below, rather than
+/// each arm repeating the call with a different constant.
+///
+/// Deliberately exhaustive, with no wildcard arm: `handle_swarm_event`'s own
+/// catch-all would otherwise silently swallow a `BehaviourEvent` variant this
+/// function forgot to name, for the same reason the fork's own `DialError`
+/// conversion is matched exhaustively (see `DialOutcome`'s `From` impl in
+/// `swarm_adapter.rs`). Adding a fifteenth [`ReqResp`] field forces this to
+/// grow an arm rather than falling through unnoticed.
+async fn handle_behaviour_event(
+    server: &mut P2PServer,
+    event: BehaviourEvent,
+    ctx: &Context<P2PServer>,
+) {
+    let (protocol, event) = match event {
+        // Registered for interop only; see `Behaviour`'s doc comment for why
+        // its events are never read.
+        BehaviourEvent::Identify(_) => return,
+        // A deny from this behaviour already denied the connection at the
+        // swarm level; nothing here needs to react to it a second time.
+        BehaviourEvent::ConnectionLimits(_) => return,
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. }) => {
+            return gossipsub::handle_gossip_message(server, message).await;
+        }
+        BehaviourEvent::Gossipsub(_) => return,
+        BehaviourEvent::ReqResp(event) => match event {
+            ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
+            ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
+            ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+            ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
+            ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+            ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
+            ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
+            ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
+            ReqRespEvent::BeaconMetadataV3(e) => (ReqRespProtocol::BeaconMetadataV3, e),
+            ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
+            ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
+            ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+            ReqRespEvent::DataColumnSidecarsByRange(e) => {
+                (ReqRespProtocol::DataColumnSidecarsByRange, e)
+            }
+            ReqRespEvent::DataColumnSidecarsByRoot(e) => {
+                (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+            }
+        },
+    };
+
+    req_resp::handle_req_resp_message(server, protocol, event, ctx).await;
 }
 
 // --- Node identity helpers ---
@@ -1924,6 +1997,282 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]
+    /// repeats its connect-and-fire cycle.
+    ///
+    /// The crossing this proves against is timing-dependent: which of two
+    /// substreams negotiates first depends on scheduling, not on send order
+    /// (see `Behaviour`'s doc comment), so one repetition proves nothing on
+    /// its own. A fresh connection per repetition, rather than reusing one
+    /// connection for every pair, is what gives each repetition its own
+    /// independent chance at the race.
+    const CROSSING_TEST_REPETITIONS: usize = 64;
+
+    /// Regression test for the defect this branch exists to fix: two
+    /// outbound requests, on two different protocols, fired back to back on
+    /// one connection — exactly [`beacon::handler::send_status`] then
+    /// [`beacon::handler::request_metadata`]'s real call pattern from
+    /// `ConnectionEstablished` below — must each reach the wire under their
+    /// own protocol's framing, never swapped.
+    ///
+    /// Before the per-protocol split, both requests travelled through one
+    /// shared `req_resp: request_response::Behaviour<Codec>` field via the fork's
+    /// `send_request_with_protocol`, which only narrows the *offered*
+    /// protocol per call; the outbound `Handler` still pairs a negotiated
+    /// substream with the *next unpaired* queued request
+    /// (`requested_outbound.pop_front()` in the pinned fork's
+    /// `protocols/request-response/src/handler.rs`), which is the send
+    /// order only when negotiation happens to complete in send order too.
+    /// When it doesn't, `write_request` is handed the wrong (protocol,
+    /// request) pair: a `Status` value written under the `metadata/3`
+    /// protocol is refused by `beacon_encoding::encode_status` (wrong
+    /// version), which fails the write locally, and a `MetaData` value
+    /// written under `status/1` encodes to an empty payload regardless of
+    /// protocol and reaches the peer, which then fails to decode it as a
+    /// real `Status` body. Either way, this test's answering side never
+    /// manages to echo the right payload back, and the `Some(true)`
+    /// assertions below fail.
+    ///
+    /// Splitting the shared field into one per protocol (this branch's
+    /// change) makes this structurally unreachable rather than merely less
+    /// likely: each protocol's own `Handler` has its own queue, with never
+    /// more than the one request this test ever puts on it, so there is no
+    /// shared FIFO left to reorder.
+    #[tokio::test]
+    async fn concurrent_beacon_requests_on_different_protocols_never_cross() {
+        use crate::beacon::messages::{BeaconMetaData, BeaconStatus, MetaDataV3, StatusV1};
+        use crate::beacon::protocols;
+        use crate::req_resp::{Response, ResponsePayload};
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::primitives::Root;
+        use libp2p::request_response::{self, ResponseChannel};
+
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
+                    fork_digest: [0x11, 0x22, 0x33, 0x44],
+                    config: Config::mainnet(),
+                    genesis_time: 0,
+                    genesis_validators_root: Root::ZERO,
+                    custody_columns: Vec::new(),
+                })),
+            })
+            .expect("swarm builds")
+        }
+
+        /// Every [`BehaviourEvent`] variant that carries a req/resp event,
+        /// tagged with the [`ReqRespProtocol`] that names it. A test-local
+        /// mirror of [`handle_behaviour_event`]'s own tagging match, kept
+        /// separate because that one needs a live `P2PServer` and this test
+        /// drives bare swarms.
+        fn tag_req_resp_event(
+            event: BehaviourEvent,
+        ) -> Option<(ReqRespProtocol, request_response::Event<Request, Response>)> {
+            let BehaviourEvent::ReqResp(event) = event else {
+                return None;
+            };
+            Some(match event {
+                ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
+                ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
+                ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+                ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
+                ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+                ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
+                ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
+                ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
+                ReqRespEvent::BeaconMetadataV3(e) => (ReqRespProtocol::BeaconMetadataV3, e),
+                ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
+                ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
+                ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+                ReqRespEvent::DataColumnSidecarsByRange(e) => {
+                    (ReqRespProtocol::DataColumnSidecarsByRange, e)
+                }
+                ReqRespEvent::DataColumnSidecarsByRoot(e) => {
+                    (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+                }
+            })
+        }
+
+        /// Answer whatever the listener actually decoded, so even a garbled,
+        /// crossed request gets *some* answer back rather than leaving the
+        /// dialer to time out. `send_response` is a passthrough to the
+        /// channel's own oneshot sender (see `execute_command`'s doc comment
+        /// on its `SendResponse` arm), so any field answers it identically.
+        fn answer(
+            swarm: &mut libp2p::Swarm<Behaviour>,
+            request: Request,
+            channel: ResponseChannel<Response>,
+        ) {
+            let response = match request {
+                Request::Status(status) => Response::success(ResponsePayload::Status(status)),
+                Request::MetaData(_) => {
+                    Response::success(ResponsePayload::MetaData(BeaconMetaData::V3(MetaDataV3 {
+                        seq_number: 0,
+                        attnets: Default::default(),
+                        syncnets: Default::default(),
+                        custody_group_count: 4,
+                    })))
+                }
+                // Neither protocol this test sends is ever requested by the
+                // peer here, so any other shape means the wire pairing has
+                // already scrambled the request into a third variant
+                // entirely; drop the channel rather than guess an answer.
+                _ => return,
+            };
+            let _ = swarm
+                .behaviour_mut()
+                .req_resp
+                .beacon_status_v1
+                .send_response(channel, response);
+        }
+
+        let mut crossings = 0usize;
+
+        for _ in 0..CROSSING_TEST_REPETITIONS {
+            let mut dialer = build(1);
+            let mut listener = build(2);
+
+            let listener_addr = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } =
+                    listener.swarm.select_next_some().await
+                    && address.iter().any(|p| matches!(p, Protocol::Tcp(_)))
+                {
+                    break address
+                        .with_p2p(listener.local_peer_id)
+                        .expect("adds a peer id");
+                }
+            };
+            dialer.swarm.dial(listener_addr).expect("dial is accepted");
+
+            let (mut dialer_connected, mut listener_connected) = (false, false);
+            while !(dialer_connected && listener_connected) {
+                tokio::select! {
+                    event = dialer.swarm.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            dialer_connected = true;
+                        }
+                    }
+                    event = listener.swarm.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            listener_connected = true;
+                        }
+                    }
+                }
+            }
+
+            // Fired back to back, with no `.await` of anything but the send
+            // call itself in between: the same pattern `ConnectionEstablished`
+            // uses for `send_status` then `request_metadata` in production.
+            let status = Request::Status(BeaconStatus::V1(StatusV1 {
+                fork_digest: [0x11, 0x22, 0x33, 0x44],
+                finalized_root: Root::ZERO,
+                finalized_epoch: 0,
+                head_root: Root::ZERO,
+                head_slot: 0,
+            }));
+            let status_id = ReqRespRequestId {
+                protocol: ReqRespProtocol::BeaconStatusV1,
+                id: dialer
+                    .swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .beacon_status_v1
+                    .send_request(&listener.local_peer_id, status),
+            };
+            let metadata_id = ReqRespRequestId {
+                protocol: ReqRespProtocol::BeaconMetadataV3,
+                id: dialer
+                    .swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .beacon_metadata_v3
+                    .send_request(
+                        &listener.local_peer_id,
+                        Request::MetaData(protocols::METADATA_V3),
+                    ),
+            };
+
+            let (mut status_correct, mut metadata_correct) = (None, None);
+            let drive = async {
+                loop {
+                    if status_correct.is_some() && metadata_correct.is_some() {
+                        return;
+                    }
+                    tokio::select! {
+                        event = dialer.swarm.select_next_some() => {
+                            let SwarmEvent::Behaviour(event) = event else { continue };
+                            let Some((protocol, event)) = tag_req_resp_event(event) else { continue };
+                            match event {
+                                request_response::Event::Message {
+                                    message: request_response::Message::Response { request_id, response },
+                                    ..
+                                } => {
+                                    let id = ReqRespRequestId { protocol, id: request_id };
+                                    // Correct means both "answered" and
+                                    // "answered with the payload shape this
+                                    // id's own request expects": a response
+                                    // that arrives but names the wrong
+                                    // payload is exactly what a crossed
+                                    // request looks like from here.
+                                    if id == status_id {
+                                        status_correct = Some(matches!(
+                                            response,
+                                            Response::Success {
+                                                payload: ResponsePayload::Status(_)
+                                            }
+                                        ));
+                                    } else if id == metadata_id {
+                                        metadata_correct = Some(matches!(
+                                            response,
+                                            Response::Success {
+                                                payload: ResponsePayload::MetaData(_)
+                                            }
+                                        ));
+                                    }
+                                }
+                                request_response::Event::OutboundFailure { request_id, .. } => {
+                                    let id = ReqRespRequestId { protocol, id: request_id };
+                                    if id == status_id {
+                                        status_correct = Some(false);
+                                    } else if id == metadata_id {
+                                        metadata_correct = Some(false);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        event = listener.swarm.select_next_some() => {
+                            if let SwarmEvent::Behaviour(event) = event
+                                && let Some((_, request_response::Event::Message {
+                                    message: request_response::Message::Request { request, channel, .. },
+                                    ..
+                                })) = tag_req_resp_event(event)
+                            {
+                                answer(&mut listener.swarm, request, channel);
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), drive)
+                .await
+                .expect("both requests must resolve within the timeout");
+
+            if status_correct != Some(true) || metadata_correct != Some(true) {
+                crossings += 1;
+            }
+        }
+
+        assert_eq!(
+            crossings, 0,
+            "{crossings}/{CROSSING_TEST_REPETITIONS} repetitions crossed protocols"
+        );
     }
 
     #[test]

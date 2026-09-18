@@ -132,6 +132,23 @@ impl libp2p::request_response::Codec for Codec {
     where
         T: AsyncRead + Unpin + Send,
     {
+        // MetaData's request body is empty on the wire by spec: no varint, no
+        // snappy frame, nothing to read at all. Every other protocol's body is
+        // a real SSZ field (possibly itself zero bytes, like an empty
+        // BlocksByRoot root list), which the spec still frames the normal way,
+        // so only this arm returns before `decode_payload` runs. Resolved to
+        // the `'static` constant so the variant can hold it.
+        let metadata_protocol = match protocol.as_ref() {
+            protocols::METADATA_V1 => Some(protocols::METADATA_V1),
+            protocols::METADATA_V2 => Some(protocols::METADATA_V2),
+            protocols::METADATA_V3 => Some(protocols::METADATA_V3),
+            _ => None,
+        };
+        if let Some(metadata_protocol) = metadata_protocol {
+            metrics::observe_reqresp_request_size(protocol_label(protocol.as_ref()), 0, 0);
+            return Ok(Request::MetaData(metadata_protocol));
+        }
+
         let decoded = decode_payload(io).await?;
         let payload = decoded.uncompressed;
         let label = protocol_label(protocol.as_ref());
@@ -149,10 +166,7 @@ impl libp2p::request_response::Codec for Codec {
             protocols::PING_V1 => Ok(Request::Ping(
                 Ping::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
             )),
-            // Resolved to the `'static` constant so the variant can hold it.
-            protocols::METADATA_V1 => Ok(Request::MetaData(protocols::METADATA_V1)),
-            protocols::METADATA_V2 => Ok(Request::MetaData(protocols::METADATA_V2)),
-            protocols::METADATA_V3 => Ok(Request::MetaData(protocols::METADATA_V3)),
+            // METADATA_V1/V2/V3 are handled above, before any bytes are read.
             protocols::GOODBYE_V1 => Ok(Request::Goodbye(
                 Goodbye::from_ssz_bytes(&payload).map_err(|err| invalid(format!("{err:?}")))?,
             )),
@@ -267,6 +281,20 @@ impl libp2p::request_response::Codec for Codec {
     {
         trace!(?req, "Writing request");
 
+        // MetaData has no request body at all by spec, unlike, say, an empty
+        // BlocksByRoot root list, which is still a real, if zero-length, SSZ
+        // field the spec frames the normal way. `write_payload` always writes
+        // a varint length and a snappy stream header even for an empty slice,
+        // so encoding this to `Vec::new()` and falling into the shared
+        // `write_payload` call below would put eleven bytes on the wire where
+        // the spec puts none. Returning here keeps this the only variant that
+        // skips it.
+        if let Request::MetaData(_) = &req {
+            let label = protocol_label(protocol.as_ref());
+            metrics::observe_reqresp_request_size(label, 0, 0);
+            return Ok(());
+        }
+
         // One arm per variant, each delegating to its own chain's module: this
         // is the whole of what the codec knows about either encoding. The two
         // block requests are the exception, because one variant is carried by
@@ -292,9 +320,8 @@ impl libp2p::request_response::Codec for Codec {
             // Versionless bodies, so there is nothing for the beacon module to
             // decide and they encode straight from the container.
             Request::Ping(ping) => ping.to_ssz(),
-            // The spec's MetaData request is empty, and `write_payload` of an
-            // empty slice emits no bytes at all.
-            Request::MetaData(_) => Vec::new(),
+            // Handled and returned from above, before this match is reached.
+            Request::MetaData(_) => unreachable!("Request::MetaData returns earlier in this fn"),
             Request::Goodbye(goodbye) => goodbye.to_ssz(),
             // The bound is re-applied here rather than trusted from wherever
             // the `Vec` was built: it is only enforced on the way in by
@@ -548,14 +575,57 @@ mod tests {
 
     #[tokio::test]
     async fn a_metadata_request_carries_no_payload() {
-        // The spec's MetaData request is empty. `write_payload` of an empty
-        // slice emits nothing at all, and `decode_payload` reads a zero-length
-        // varint back, so the two agree on an empty stream.
+        // The spec's MetaData request is empty: `write_request` returns before
+        // writing anything, and `read_request` returns before reading
+        // anything, so the two agree on an empty stream without either side
+        // touching `write_payload`/`decode_payload`. This round-trip alone
+        // would pass even with the old, wrong framing (a varint zero plus a
+        // bare snappy header), since both ends of one process agree with
+        // themselves either way; see `a_metadata_request_writes_zero_bytes_on_the_wire`
+        // below for the assertion that actually pins the wire bytes.
         let decoded = request_round_trip(
             protocols::METADATA_V3,
             Request::MetaData(protocols::METADATA_V3),
         )
         .await;
+        assert!(matches!(decoded, Request::MetaData(protocols::METADATA_V3)));
+    }
+
+    #[tokio::test]
+    async fn a_metadata_request_writes_zero_bytes_on_the_wire() {
+        // What the round-trip test above cannot catch: a peer sending the
+        // spec's empty body would see exactly zero bytes, not the eleven a
+        // varint-zero-plus-snappy-header framing used to put on the wire.
+        let stream_protocol = StreamProtocol::new(protocols::METADATA_V3);
+        let mut buffer = Cursor::new(Vec::new());
+        codec()
+            .write_request(
+                &stream_protocol,
+                &mut buffer,
+                Request::MetaData(protocols::METADATA_V3),
+            )
+            .await
+            .expect("writes");
+        assert!(
+            buffer.into_inner().is_empty(),
+            "a MetaData request must write zero bytes, not a varint+snappy header"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_request_does_not_block_on_a_truly_empty_metadata_stream() {
+        // The regression this whole fix is about: a peer that actually sends
+        // the spec's zero bytes must decode cleanly rather than hang
+        // `read_varint` waiting for a length byte that will never arrive.
+        // An empty buffer stands in for "the peer wrote nothing and closed",
+        // which is exactly what `read_request` must accept without reading
+        // past it.
+        let stream_protocol = StreamProtocol::new(protocols::METADATA_V3);
+        let mut buffer = Cursor::new(Vec::<u8>::new());
+        let decoded = codec()
+            .read_request(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads a truly empty MetaData body");
         assert!(matches!(decoded, Request::MetaData(protocols::METADATA_V3)));
     }
 

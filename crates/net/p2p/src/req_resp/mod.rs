@@ -1,8 +1,10 @@
+pub(crate) mod behaviour;
 pub(crate) mod codec;
 pub(crate) mod encoding;
 pub mod handlers;
 pub(crate) mod messages;
 
+pub(crate) use behaviour::{ReqResp, ReqRespEvent};
 pub use codec::Codec;
 pub use encoding::{MAX_COMPRESSED_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE};
 pub use handlers::{

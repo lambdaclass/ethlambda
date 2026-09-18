@@ -2,15 +2,18 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use libp2p::{
-    PeerId, StreamProtocol,
+    PeerId,
     futures::StreamExt,
-    request_response::{self, OutboundRequestId},
+    request_response,
     swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
 use tracing::{debug, error};
 
-use crate::{Behaviour, BehaviourEvent, metrics, req_resp::Request, req_resp::Response};
+use crate::{
+    Behaviour, BehaviourEvent, ReqRespProtocol, ReqRespRequestId, metrics, req_resp::Request,
+    req_resp::Response,
+};
 
 /// Interval between gossipsub mesh peer metric refreshes.
 const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
@@ -34,9 +37,9 @@ pub enum SwarmCommand {
     SendRequest {
         peer: PeerId,
         request: Request,
-        protocol: StreamProtocol,
-        /// Callback to report the assigned OutboundRequestId.
-        request_id_tx: Option<tokio::sync::oneshot::Sender<OutboundRequestId>>,
+        protocol: ReqRespProtocol,
+        /// Callback to report the assigned [`ReqRespRequestId`].
+        request_id_tx: Option<tokio::sync::oneshot::Sender<ReqRespRequestId>>,
     },
     SendResponse {
         channel: request_response::ResponseChannel<Response>,
@@ -138,14 +141,15 @@ impl SwarmHandle {
         rx.await.unwrap_or(DialOutcome::Unreachable)
     }
 
-    /// Send a request and return the assigned OutboundRequestId.
-    /// Must be called from an async context (actor handlers are async).
+    /// Send a request on `protocol`'s own field and return the assigned
+    /// [`ReqRespRequestId`]. Must be called from an async context (actor
+    /// handlers are async).
     pub async fn send_request(
         &self,
         peer: PeerId,
         request: Request,
-        protocol: StreamProtocol,
-    ) -> Option<OutboundRequestId> {
+        protocol: ReqRespProtocol,
+    ) -> Option<ReqRespRequestId> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .cmd_tx
@@ -263,18 +267,68 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
             protocol,
             request_id_tx,
         } => {
-            let request_id = swarm
-                .behaviour_mut()
-                .req_resp
-                .send_request_with_protocol(&peer, request, protocol);
+            // Upstream `send_request`, never the fork's own
+            // `send_request_with_protocol`: each field already offers exactly
+            // the one protocol `protocol` names, so pinning to it per call is
+            // no longer needed. Which field is exhaustive on purpose; see
+            // `ReqRespProtocol`'s doc comment.
+            let behaviour = &mut swarm.behaviour_mut().req_resp;
+            let id = match protocol {
+                ReqRespProtocol::LeanStatus => behaviour.lean_status.send_request(&peer, request),
+                ReqRespProtocol::LeanBlocksByRoot => {
+                    behaviour.lean_blocks_by_root.send_request(&peer, request)
+                }
+                ReqRespProtocol::LeanBlocksByRange => {
+                    behaviour.lean_blocks_by_range.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconStatusV1 => {
+                    behaviour.beacon_status_v1.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconStatusV2 => {
+                    behaviour.beacon_status_v2.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconPing => behaviour.beacon_ping.send_request(&peer, request),
+                ReqRespProtocol::BeaconMetadataV1 => {
+                    behaviour.beacon_metadata_v1.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconMetadataV2 => {
+                    behaviour.beacon_metadata_v2.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconMetadataV3 => {
+                    behaviour.beacon_metadata_v3.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconGoodbye => {
+                    behaviour.beacon_goodbye.send_request(&peer, request)
+                }
+                ReqRespProtocol::BeaconBlocksByRange => behaviour
+                    .beacon_blocks_by_range
+                    .send_request(&peer, request),
+                ReqRespProtocol::BeaconBlocksByRoot => {
+                    behaviour.beacon_blocks_by_root.send_request(&peer, request)
+                }
+                ReqRespProtocol::DataColumnSidecarsByRange => behaviour
+                    .data_column_sidecars_by_range
+                    .send_request(&peer, request),
+                ReqRespProtocol::DataColumnSidecarsByRoot => behaviour
+                    .data_column_sidecars_by_root
+                    .send_request(&peer, request),
+            };
             if let Some(tx) = request_id_tx {
-                let _ = tx.send(request_id);
+                let _ = tx.send(ReqRespRequestId { protocol, id });
             }
         }
         SwarmCommand::SendResponse { channel, response } => {
+            // `Behaviour::send_response` is a passthrough to the oneshot
+            // sender the `ResponseChannel` already carries
+            // (`ch.sender.send(rs)` in the pinned fork, untouched from
+            // upstream); it reads no state of the `Behaviour` instance it is
+            // called on, so any field answers identically. `lean_status` is
+            // picked as a stable, arbitrary anchor rather than routing this by
+            // protocol too.
             let _ = swarm
                 .behaviour_mut()
                 .req_resp
+                .lean_status
                 .send_response(channel, response)
                 .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
         }

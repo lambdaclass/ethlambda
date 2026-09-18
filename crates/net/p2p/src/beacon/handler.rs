@@ -18,6 +18,7 @@ use super::messages::{
 };
 use super::{BeaconWire, constants, protocols};
 use crate::P2PServer;
+use crate::ReqRespProtocol;
 use crate::req_resp::Request;
 
 /// The `Status` this node advertises, in the version the stream asked for.
@@ -146,16 +147,12 @@ pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaDat
 /// answers.
 pub async fn send_status(server: &P2PServer, peer_id: PeerId, wire_status: BeaconStatus) {
     let protocol = match StatusVersion::of(&wire_status) {
-        StatusVersion::V1 => protocols::STATUS_V1,
-        StatusVersion::V2 => protocols::STATUS_V2,
+        StatusVersion::V1 => ReqRespProtocol::BeaconStatusV1,
+        StatusVersion::V2 => ReqRespProtocol::BeaconStatusV2,
     };
     server
         .swarm_handle
-        .send_request(
-            peer_id,
-            Request::Status(wire_status),
-            libp2p::StreamProtocol::new(protocol),
-        )
+        .send_request(peer_id, Request::Status(wire_status), protocol)
         .await;
 }
 
@@ -175,7 +172,7 @@ pub async fn request_metadata(server: &P2PServer, peer_id: PeerId) {
         .send_request(
             peer_id,
             Request::MetaData(protocols::METADATA_V3),
-            libp2p::StreamProtocol::new(protocols::METADATA_V3),
+            ReqRespProtocol::BeaconMetadataV3,
         )
         .await;
 }

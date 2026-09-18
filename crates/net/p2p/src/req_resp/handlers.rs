@@ -41,28 +41,29 @@ use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
 };
 use crate::beacon::protocols::{
-    BLOCKS_BY_RANGE_V2 as BEACON_BLOCKS_BY_RANGE_PROTOCOL,
-    BLOCKS_BY_ROOT_V2 as BEACON_BLOCKS_BY_ROOT_PROTOCOL,
-    DATA_COLUMN_SIDECARS_BY_RANGE_V1 as DATA_COLUMN_SIDECARS_BY_RANGE_PROTOCOL,
-    DATA_COLUMN_SIDECARS_BY_ROOT_V1 as DATA_COLUMN_SIDECARS_BY_ROOT_PROTOCOL,
     MAX_REQUEST_BLOCKS as MAX_BEACON_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB,
 };
 use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
-use crate::lean::protocols::{
-    BLOCKS_BY_RANGE_V1 as BLOCKS_BY_RANGE_PROTOCOL_V1,
-    BLOCKS_BY_ROOT_V1 as BLOCKS_BY_ROOT_PROTOCOL_V1, MAX_REQUEST_BLOCKS,
-};
+use crate::lean::protocols::MAX_REQUEST_BLOCKS;
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
     BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingColumnRequest, PendingRequest, PendingRequestKind, RangeSyncState,
-    UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
+    PendingColumnRequest, PendingRequest, PendingRequestKind, RangeSyncState, ReqRespProtocol,
+    ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
 };
 use libp2p::request_response::ResponseChannel;
 
+/// `protocol` names which [`ReqResp`](super::ReqResp) field `event` came
+/// from, which is what turns the bare `OutboundRequestId` a
+/// [`request_response::Event::Message`] response or
+/// [`request_response::Event::OutboundFailure`] carries back into the
+/// composite [`ReqRespRequestId`] `server.outbound_requests` is actually keyed
+/// on; see [`ReqRespProtocol`]'s doc comment for why a bare id is no longer
+/// safe to look up on its own.
 pub async fn handle_req_resp_message(
     server: &mut P2PServer,
+    protocol: ReqRespProtocol,
     event: request_response::Event<Request, Response>,
     ctx: &Context<P2PServer>,
 ) {
@@ -168,6 +169,14 @@ pub async fn handle_req_resp_message(
                 request_id,
                 response,
             } => {
+                // See `handle_req_resp_message`'s own doc comment: `request_id`
+                // alone is not a safe `outbound_requests` key any more, so it
+                // is composited with the protocol this event's own field
+                // named before anything below looks it up.
+                let request_id = ReqRespRequestId {
+                    protocol,
+                    id: request_id,
+                };
                 let peer_count = server.connected_peers.len();
                 match response {
                     Response::Success { payload } => match payload {
@@ -342,6 +351,12 @@ pub async fn handle_req_resp_message(
             error,
             ..
         } => {
+            // Same compositing as the `Message::Response` arm above, and for
+            // the same reason.
+            let request_id = ReqRespRequestId {
+                protocol,
+                id: request_id,
+            };
             debug!(%peer, ?request_id, %error, "Outbound request failed");
 
             // Check if this was a block fetch request
@@ -752,7 +767,7 @@ pub fn build_status(store: &Store) -> Status {
 /// send is not: `Handler<FetchBlock>` in `lib.rs` calls this unconditionally,
 /// so a beacon node must not put a lean-framed `BlocksByRoot` request on its
 /// beacon streams, which is what asking via `Request::BlocksByRoot` +
-/// `BLOCKS_BY_ROOT_PROTOCOL_V1` unconditionally would do.
+/// [`ReqRespProtocol::LeanBlocksByRoot`] unconditionally would do.
 pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
     if server.connected_peers.is_empty() {
         debug!(%root, "Cannot fetch block: no connected peers");
@@ -818,7 +833,7 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
             .send_request(
                 peer,
                 Request::BlocksByRoot(request),
-                libp2p::StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
+                ReqRespProtocol::LeanBlocksByRoot,
             )
             .await
         else {
@@ -1045,7 +1060,7 @@ pub async fn fetch_data_columns_from_peer(
             .send_request(
                 peer,
                 Request::DataColumnsByRoot(vec![identifier]),
-                libp2p::StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_ROOT_PROTOCOL),
+                ReqRespProtocol::DataColumnSidecarsByRoot,
             )
             .await
         else {
@@ -1116,7 +1131,7 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
         .send_request(
             peer,
             Request::BlocksByRange(request),
-            libp2p::StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
+            ReqRespProtocol::LeanBlocksByRange,
         )
         .await
     else {
@@ -1896,7 +1911,7 @@ pub async fn request_beacon_blocks_by_range(
     peer: PeerId,
     start_slot: u64,
     count: u64,
-) -> Option<request_response::OutboundRequestId> {
+) -> Option<ReqRespRequestId> {
     let count = count.min(MAX_REQUEST_BLOCKS_DENEB);
     if count == 0 {
         return None;
@@ -1908,7 +1923,7 @@ pub async fn request_beacon_blocks_by_range(
         .send_request(
             peer,
             Request::BlocksByRange(request),
-            libp2p::StreamProtocol::new(BEACON_BLOCKS_BY_RANGE_PROTOCOL),
+            ReqRespProtocol::BeaconBlocksByRange,
         )
         .await?;
     server.outbound_requests.insert(
@@ -2036,7 +2051,7 @@ pub(crate) async fn request_beacon_data_columns_by_range(
             .send_request(
                 peer,
                 Request::DataColumnsByRange(request),
-                libp2p::StreamProtocol::new(DATA_COLUMN_SIDECARS_BY_RANGE_PROTOCOL),
+                ReqRespProtocol::DataColumnSidecarsByRange,
             )
             .await
         else {
@@ -2066,7 +2081,7 @@ pub async fn request_beacon_block_by_root(
     server: &mut P2PServer,
     peer: PeerId,
     root: H256,
-) -> Option<request_response::OutboundRequestId> {
+) -> Option<ReqRespRequestId> {
     let mut roots = RequestedBlockRoots::new();
     if let Err(err) = roots.push(root) {
         error!(%root, ?err, "Failed to create BeaconBlocksByRoot request");
@@ -2078,7 +2093,7 @@ pub async fn request_beacon_block_by_root(
         .send_request(
             peer,
             Request::BlocksByRoot(BlocksByRootRequest { roots }),
-            libp2p::StreamProtocol::new(BEACON_BLOCKS_BY_ROOT_PROTOCOL),
+            ReqRespProtocol::BeaconBlocksByRoot,
         )
         .await?;
     server
