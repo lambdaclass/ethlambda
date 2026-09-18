@@ -5,7 +5,9 @@
 //! branches on which chain the node follows. Handler names follow the same
 //! convention as there, lean prefixed and beacon bare.
 
-use ethlambda_network_api::BlockSource;
+use std::time::Instant;
+
+use ethlambda_network_api::{BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_types::{
     ShortRoot,
@@ -44,6 +46,10 @@ use crate::{P2PServer, metrics};
 /// One match, with both chains' topics at the same level. Only the SSZ container
 /// behind the decompressed bytes differs, and that is a handler's business.
 pub async fn handle_gossip_message(server: &mut P2PServer, message: Message) {
+    // Taken before anything is done with the payload, so the decode a block
+    // pays for is inside the span rather than before it. Only the two block
+    // handlers use it; the others are not on a path whose timing is reported.
+    let wire_at = Instant::now();
     let Some(kind) = topic_kind(message.topic.as_str()) else {
         trace!(topic = %message.topic, "Gossip on an unparseable topic");
         return;
@@ -60,12 +66,12 @@ pub async fn handle_gossip_message(server: &mut P2PServer, message: Message) {
     };
 
     match kind {
-        BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len).await,
+        BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
             handle_lean_attestation(server, &payload, compressed_len).await
         }
-        beacon_topics::BEACON_BLOCK => handle_beacon_block(server, &payload).await,
+        beacon_topics::BEACON_BLOCK => handle_beacon_block(server, &payload, wire_at).await,
         beacon_topics::BEACON_AGGREGATE_AND_PROOF => {
             handle_beacon_aggregate(server, &payload).await
         }
@@ -115,7 +121,12 @@ fn beacon_wire<'a>(server: &'a P2PServer, kind: &str) -> Option<&'a BeaconWire> 
     wire
 }
 
-async fn handle_lean_block(server: &mut P2PServer, payload: &[u8], compressed_len: usize) {
+async fn handle_lean_block(
+    server: &mut P2PServer,
+    payload: &[u8],
+    compressed_len: usize,
+    wire_at: Instant,
+) {
     metrics::observe_gossip_block_size(payload.len(), compressed_len);
     let Some(signed_block) = decode_lean::<SignedBlock>(payload, "block") else {
         return;
@@ -130,8 +141,17 @@ async fn handle_lean_block(server: &mut P2PServer, payload: &[u8], compressed_le
         "Received block from gossip"
     );
     if let Some(ref blockchain) = server.blockchain {
+        let arrival = BlockArrival {
+            decode_start: Some(wire_at),
+            handed_off: Instant::now(),
+            deferred_from: None,
+        };
         let _ = blockchain
-            .new_block(SignedBeaconBlock::Lean(signed_block), BlockSource::Gossip)
+            .new_block(
+                SignedBeaconBlock::Lean(signed_block),
+                BlockSource::Gossip,
+                arrival,
+            )
             .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
     }
 }
@@ -186,7 +206,7 @@ async fn handle_lean_attestation(server: &mut P2PServer, payload: &[u8], compres
 /// The anchor block puts a parent in the store before gossip starts, so
 /// `on_block` no longer rejects these for want of one: forward every decoded
 /// block the way [`handle_lean_block`] forwards its own.
-async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8]) {
+async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8], wire_at: Instant) {
     const KIND: &str = beacon_topics::BEACON_BLOCK;
     let Some(wire) = beacon_wire(server, KIND) else {
         return;
@@ -203,8 +223,13 @@ async fn handle_beacon_block(server: &mut P2PServer, payload: &[u8]) {
                 "Beacon block decoded"
             );
             if let Some(ref blockchain) = server.blockchain {
+                let arrival = BlockArrival {
+                    decode_start: Some(wire_at),
+                    handed_off: Instant::now(),
+                    deferred_from: None,
+                };
                 let _ = blockchain
-                    .new_block(block, BlockSource::Gossip)
+                    .new_block(block, BlockSource::Gossip, arrival)
                     .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
             }
         }

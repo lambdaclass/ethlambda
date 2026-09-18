@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedBeaconBlock, fulu::DataColumnSidecar},
@@ -73,6 +75,68 @@ pub enum BlockSource {
     Deferred,
 }
 
+/// When a block's payload reached this node.
+///
+/// Carried on the message rather than read by the chain actor when it handles
+/// one, because the two differ by however long the block sat in that actor's
+/// mailbox, and that wait is invisible from the far side. It is also the one
+/// thing about a block's arrival that no store state records, which is why it
+/// rides here instead of being derived on receipt.
+///
+/// Instants rather than wall-clock milliseconds: these exist to be subtracted
+/// from one another, and a monotonic clock is the only one that may be.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockArrival {
+    /// The payload came off the wire, before decompression.
+    ///
+    /// `None` where this node did not decode the block itself, which is the
+    /// req/resp path: its codec has already produced a block by the time any
+    /// handler sees one, so the only instant that path can report is the
+    /// hand-off. `None` rather than a copy of `handed_off`, because a decode
+    /// of zero reads as "free" where the truth is "not measured".
+    pub decode_start: Option<Instant>,
+    /// The block is about to be handed to the chain actor.
+    ///
+    /// Where `decode_start` is set, this doubles as the end of the decode: a
+    /// producer hands a block over as soon as it has one.
+    pub handed_off: Instant,
+    /// Set when this delivery re-delivers a block held for a slot that had
+    /// not started.
+    ///
+    /// `Some` only alongside [`BlockSource::Deferred`]. It is what lets the
+    /// held block's end-to-end timing still start where it really started,
+    /// rather than at the re-delivery.
+    pub deferred_from: Option<DeferredFrom>,
+}
+
+/// Where a re-delivered block was before it was re-delivered.
+///
+/// Carries the original source as well as the instant, because
+/// [`BlockSource::Deferred`] on the re-delivery says how the block reached the
+/// actor this time, not how it reached the node. Reporting a deferred block
+/// under its own source would take it out of the population it belongs to:
+/// a gossip block held for 200ms is still a gossip block, and the hold is
+/// already visible as its own section of the import.
+#[derive(Clone, Copy, Debug)]
+pub struct DeferredFrom {
+    pub at: Instant,
+    pub source: BlockSource,
+}
+
+impl BlockArrival {
+    /// An arrival whose earliest knowable moment is now.
+    ///
+    /// For producers that did not decode the block themselves, so have no
+    /// earlier instant to report than the one they hand it over at.
+    pub fn now() -> Self {
+        Self {
+            decode_start: None,
+            handed_off: Instant::now(),
+            deferred_from: None,
+        }
+    }
+}
+
 // --- Protocol: P2P -> BlockChain ---
 
 #[protocol]
@@ -83,7 +147,12 @@ pub trait P2PToBlockChain: Send + Sync {
     /// `Lean` variant carries one, and its `message:` accessors answer for that
     /// variant too. That is what lets the actor's import cascade be written
     /// once for both chains rather than twice.
-    fn new_block(&self, block: SignedBeaconBlock, source: BlockSource) -> Result<(), ActorError>;
+    fn new_block(
+        &self,
+        block: SignedBeaconBlock,
+        source: BlockSource,
+        arrival: BlockArrival,
+    ) -> Result<(), ActorError>;
     fn new_attestation(&self, attestation: SignedAttestation) -> Result<(), ActorError>;
     fn new_aggregated_attestation(
         &self,

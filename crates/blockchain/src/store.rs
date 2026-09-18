@@ -15,11 +15,12 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
     state::{HISTORICAL_ROOTS_LIMIT, State},
 };
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, SlotInterval,
     block_builder::{PostBlockCheckpoints, ProposerConfig, build_block},
+    import_timing::{StoreTimings, VerifyTimings},
     metrics,
 };
 
@@ -625,7 +626,7 @@ fn on_gossip_aggregated_attestation_core(
 ///
 /// This is the safe default: it always verifies cryptographic signatures
 /// and stores them for future block building. Use this for all production paths.
-pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), StoreError> {
+pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<StoreTimings, StoreError> {
     on_block_core(store, signed_block, true)
 }
 
@@ -636,7 +637,7 @@ pub fn on_block(store: &mut Store, signed_block: SignedBlock) -> Result<(), Stor
 pub fn on_block_without_verification(
     store: &mut Store,
     signed_block: SignedBlock,
-) -> Result<(), StoreError> {
+) -> Result<StoreTimings, StoreError> {
     on_block_core(store, signed_block, false)
 }
 
@@ -648,9 +649,13 @@ fn on_block_core(
     store: &mut Store,
     signed_block: SignedBlock,
     verify: bool,
-) -> Result<(), StoreError> {
+) -> Result<StoreTimings, StoreError> {
     let timing = metrics::time_fork_choice_block_processing();
     let block_start = std::time::Instant::now();
+    let mut timings = StoreTimings {
+        guards_start: Some(block_start),
+        ..StoreTimings::default()
+    };
 
     let block = &signed_block.message;
     let block_root = block.hash_tree_root();
@@ -662,7 +667,10 @@ fn on_block_core(
         .expect("DB read should succeed")
     {
         timing.discard();
-        return Ok(());
+        // Nothing ran, so nothing but the guard boundary is marked: the report
+        // this feeds prints only the rows whose timings are present.
+        timings.guards_end = Some(std::time::Instant::now());
+        return Ok(timings);
     }
 
     // Verify parent state is available
@@ -727,9 +735,14 @@ fn on_block_core(
     }
 
     let sig_verification_start = std::time::Instant::now();
+    timings.guards_end = Some(sig_verification_start);
     if verify {
         // Validate cryptographic signatures
-        verify_block_signatures(parent_state, &signed_block)?;
+        let verified = verify_block_signatures(parent_state, &signed_block)?;
+        timings.verify_structural_start = verified.structural_start;
+        timings.verify_structural_end = verified.structural_end;
+        timings.verify_crypto_start = verified.crypto_start;
+        timings.verify_crypto_end = verified.crypto_end;
     }
     let sig_verification = sig_verification_start.elapsed();
 
@@ -739,9 +752,11 @@ fn on_block_core(
     // through the cache's `Arc` since the transition mutates in place and the
     // store's own cached parent state must be left untouched.
     let state_transition_start = std::time::Instant::now();
+    timings.stf_start = Some(state_transition_start);
     let mut post_state = parent_state.clone();
     ethlambda_state_transition::state_transition(&mut post_state, &block)?;
     let state_transition = state_transition_start.elapsed();
+    timings.stf_end = Some(std::time::Instant::now());
 
     // Cache the state root in the latest block header
     let state_root = block.state_root;
@@ -764,12 +779,14 @@ fn on_block_core(
     }
 
     // Store signed block and state
+    timings.db_write_start = Some(std::time::Instant::now());
     store
         .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block.clone()))
         .expect("DB insert should succeed");
     store
         .insert_state(block_root, BeaconState::Lean(post_state))
         .expect("DB insert should succeed");
+    timings.db_write_end = Some(std::time::Instant::now());
 
     // Block-included attestations are intentionally not counted here.
     // `lean_attestations_valid_total` tracks the gossip validation pipeline
@@ -778,10 +795,18 @@ fn on_block_core(
     // `lean_state_transition_attestations_processed_total` instead.
 
     // Update forkchoice head based on new block and attestations
+    timings.fc_head_start = Some(std::time::Instant::now());
     update_head(store);
+    timings.fc_head_end = Some(std::time::Instant::now());
 
     let block_total = block_start.elapsed();
-    info!(
+    // Every number here is a row of the import tree `BlockImportReport` prints,
+    // which additionally separates the writes and the head update this log
+    // folded into `block_total`. Kept at debug so the two do not say the same
+    // thing twice at info on every imported block, and so the paths with no
+    // report to print (the spec-test runner, the corpus builder) still have
+    // something to turn on.
+    debug!(
         %slot,
         %block_root,
         %state_root,
@@ -790,7 +815,7 @@ fn on_block_core(
         ?block_total,
         "Processed new block"
     );
-    Ok(())
+    Ok(timings)
 }
 
 /// Calculate target checkpoint for validator attestations.
@@ -1197,8 +1222,12 @@ pub enum StoreError {
 pub fn verify_block_signatures(
     state: &State,
     signed_block: &SignedBlock,
-) -> Result<(), StoreError> {
+) -> Result<VerifyTimings, StoreError> {
     let total_start = std::time::Instant::now();
+    let mut timings = VerifyTimings {
+        structural_start: Some(total_start),
+        ..VerifyTimings::default()
+    };
 
     let block = &signed_block.message;
     let attestations = &block.body.attestations;
@@ -1229,6 +1258,7 @@ pub fn verify_block_signatures(
 
     let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
+    timings.structural_end = Some(std::time::Instant::now());
 
     // Resolve pubkeys per multi-message aggregate component for verify_type_2 and rederive the
     // expected (message, slot) bindings from the block body. Attestation
@@ -1274,6 +1304,7 @@ pub fn verify_block_signatures(
     let merged_bytes = signed_block.proof.proof_bytes();
 
     let crypto_start = std::time::Instant::now();
+    timings.crypto_start = Some(crypto_start);
     ethlambda_crypto::verify_type_2_signature(
         merged_bytes,
         pubkeys_per_component,
@@ -1281,9 +1312,14 @@ pub fn verify_block_signatures(
     )
     .map_err(StoreError::BlockProofVerificationFailed)?;
     let crypto_elapsed = crypto_start.elapsed();
+    timings.crypto_end = Some(std::time::Instant::now());
 
     let total_elapsed = total_start.elapsed();
-    info!(
+    // At debug for the same reason as `on_block_core`'s own timing log: on the
+    // import path the tree already carries both of these spans as rows. The one
+    // caller that is not the import path, the Hive driver's `verify_signatures`
+    // endpoint, prints no tree and reads the returned timings instead.
+    debug!(
         slot = block.slot,
         attestation_count = attestations.len(),
         ?structural_elapsed,
@@ -1292,7 +1328,7 @@ pub fn verify_block_signatures(
         "Block multi-message aggregate proof verified"
     );
 
-    Ok(())
+    Ok(timings)
 }
 
 /// Check if a head change represents a reorg, returning the depth if so.

@@ -41,6 +41,45 @@ pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
 /// `wrap_proposer` (singleton single-message aggregate over that signature),
 /// `merge_type2` (merge of every single-message aggregate into the block's
 /// multi-message aggregate).
+/// Per-block section labels for `lean_block_import_phase_seconds`, in the
+/// order a block crosses them. Every one of these is produced by
+/// `import_timing::ImportTimings::rows`, which a test in that module asserts.
+pub const BLOCK_IMPORT_PHASES: &[&str] = &[
+    "decode",
+    "queue",
+    "defer",
+    "admit",
+    "guards",
+    "preamble",
+    "parent_wait",
+    "cascade_wait",
+    "da_check",
+    "columns_wait",
+    "engine",
+    "verify_struct",
+    "verify_crypto",
+    "stf",
+    "db_write",
+    "fc_head",
+    "block_atts",
+];
+
+/// The label for a whole completed import.
+///
+/// Written only when the block actually imported: a held block has no total,
+/// because its import has not finished. That is what keeps a two-slot hold
+/// out of the import-cost percentiles without an `outcome` label to filter on.
+pub const BLOCK_IMPORT_TOTAL_PHASE: &str = "total";
+
+/// Section labels charged once per arrival rather than once per block, on the
+/// same histogram as [`BLOCK_IMPORT_PHASES`].
+///
+/// One metric rather than two: the query that matters is `rate(..._sum[5m])`,
+/// seconds spent per second, which does not divide by an event count and so
+/// does not care that these are counted per arrival. `arrival` is the whole
+/// handler call, `cascade` the block drain inside it.
+pub const BLOCK_ARRIVAL_PHASES: &[&str] = &["arrival", "cascade", "prune", "get_head", "fcu"];
+
 pub const BLOCK_PROPOSAL_SEAL_PHASES: &[&str] = &["sign_proposer", "wrap_proposer", "merge_type2"];
 
 /// Where a gossip message landed relative to the interval it was due in.
@@ -534,6 +573,44 @@ static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<
         .unwrap()
     });
 
+// --- Block import (the sections `import_timing` marks off) ---
+
+static LEAN_BLOCK_IMPORT_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        register_histogram_vec!(
+            "lean_block_import_phase_seconds",
+            "Time one section of a block's journey from the wire to a post-state took. `phase` \
+             is one of [`BLOCK_IMPORT_PHASES`]: the per-block sections, `total` for a whole \
+             completed import, and the per-arrival sections an arrival is charged once for \
+             however many blocks its cascade imported. A section that did not run writes \
+             nothing, so a lean node never reports the beacon-only phases and vice versa.",
+            &["phase", "source"],
+            // One bucket set spans the whole range deliberately: `guards` is
+            // tens of microseconds, `parent_wait` is tens of seconds, and
+            // splitting them into two metrics would mean choosing which
+            // sections may ever be compared against which.
+            vec![
+                0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0,
+                64.0
+            ]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_IMPORT_CASCADE_BLOCKS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_import_cascade_blocks",
+            "Blocks one arrival put through the import path. Attempts, not imports: a block \
+             that ends the pass held or pended counted here all the same, because the question \
+             is how much work the arrival caused. Above one means it unblocked children waiting \
+             on it, which is when the per-arrival sections are amortised and a late sibling's \
+             `cascade_wait` is not the network's fault.",
+            vec![1.0, 2.0, 3.0, 5.0, 8.0, 16.0, 32.0, 64.0, 128.0]
+        )
+        .unwrap()
+    });
+
 static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL: std::sync::LazyLock<IntCounter> =
     std::sync::LazyLock::new(|| {
         register_int_counter!(
@@ -956,6 +1033,12 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED);
+    // Block import timing. The label combinations are left to appear as
+    // blocks arrive: seeding every phase against every source would publish
+    // over fifty series a lean node can never write to, since a third of the
+    // phases are beacon-only and a third of the sources are too.
+    std::sync::LazyLock::force(&LEAN_BLOCK_IMPORT_PHASE_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_IMPORT_CASCADE_BLOCKS);
     // Gossip arrival timing
     std::sync::LazyLock::force(&LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS);
     std::sync::LazyLock::force(&LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS);
@@ -1259,6 +1342,23 @@ pub fn observe_block_proposal_phase(phase: &str, elapsed: Duration) {
     LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS
         .with_label_values(&[phase])
         .observe(elapsed.as_secs_f64());
+}
+
+/// Observe one section of a block's import or of the arrival that carried it.
+///
+/// `phase` must be one of [`BLOCK_IMPORT_PHASES`], [`BLOCK_ARRIVAL_PHASES`] or
+/// [`BLOCK_IMPORT_TOTAL_PHASE`]. `source` is `gossip` or `sync`; a block this
+/// node built itself is not observed at all, since it crossed no wire and its
+/// arrival sections would be zeroes that drag every percentile down.
+pub fn observe_block_import_phase(phase: &str, source: &str, elapsed: Duration) {
+    LEAN_BLOCK_IMPORT_PHASE_SECONDS
+        .with_label_values(&[phase, source])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Observe how many blocks one arrival put through the import path.
+pub fn observe_block_import_cascade_blocks(blocks: usize) {
+    LEAN_BLOCK_IMPORT_CASCADE_BLOCKS.observe(blocks as f64);
 }
 
 /// Increment the completed block-proposal attestation selection runs counter.

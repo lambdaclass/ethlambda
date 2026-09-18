@@ -320,7 +320,7 @@ async fn run_verify_signatures(
     };
 
     let response = match verify_block_signatures(&state, &signed_block) {
-        Ok(()) => VerifySignaturesResponse {
+        Ok(_timings) => VerifySignaturesResponse {
             succeeded: true,
             error: None,
         },

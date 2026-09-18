@@ -1,5 +1,7 @@
 use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as EnginePayloadStatus};
-use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, FetchRequest, InitP2P};
+use ethlambda_network_api::{
+    BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest, InitP2P,
+};
 use ethlambda_state_transition::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
@@ -47,6 +49,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEventSnapshot;
+use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
 use crate::store::StoreError;
 
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
@@ -57,6 +60,7 @@ pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
 pub(crate) mod fork_choice_tree;
+pub mod import_timing;
 pub mod key_manager;
 pub mod metrics;
 pub mod reaggregate;
@@ -377,6 +381,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
+            held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
             custody_columns,
             engine,
@@ -434,6 +439,18 @@ pub struct BlockChainServer {
     /// which is the one thing that map tracks the absence of. Always empty on
     /// lean, which carries no `DataAvailability::Columns` evidence to gate on.
     blocks_awaiting_columns: HashMap<H256, u64>,
+
+    /// Timing timings for every block currently held, keyed by root.
+    ///
+    /// One map for all three hold kinds rather than a field widening each of
+    /// the hold maps, because what has to survive a hold is the same thing
+    /// whichever hold it is: the block's original arrival, so that its
+    /// end-to-end time still starts where it really started. Entries are taken
+    /// on release and removed by [`Self::discard_pending_subtree`], the funnel
+    /// both eviction paths already use for `pending_blocks` and
+    /// `blocks_awaiting_columns`, so a block nobody ever redelivers cannot
+    /// leave one behind.
+    held_timings: HashMap<H256, ImportTimings>,
 
     /// Sidecars whose block's parent this node cannot yet transition from,
     /// keyed by that parent's root and replayed when it gains a post-state.
@@ -1523,10 +1540,14 @@ impl BlockChainServer {
         validator_id: u64,
         signed_block: SignedBlock,
     ) {
-        if let Err(err) = self
-            .process_block(SignedBeaconBlock::Lean(signed_block.clone()))
-            .await
-        {
+        let block_root = signed_block.message.hash_tree_root();
+        let attestations = signed_block.message.body.attestations.len();
+        let timings = ImportTimings::starting_now();
+        let (timings, outcome) = self
+            .process_block(SignedBeaconBlock::Lean(signed_block.clone()), timings)
+            .await;
+        self.log_import_report(slot, block_root, attestations, &outcome, timings);
+        if let Err(err) = outcome {
             error!(%slot, %validator_id, %err, "Failed to process built block");
             metrics::inc_block_building_failures();
             return;
@@ -1549,7 +1570,8 @@ impl BlockChainServer {
     async fn process_block(
         &mut self,
         signed_block: SignedBeaconBlock,
-    ) -> Result<ImportOutcome, ImportError> {
+        mut timings: ImportTimings,
+    ) -> (ImportTimings, Result<ImportOutcome, ImportError>) {
         // Gate the `block` event on whether this root is actually new, so a
         // re-delivery does not announce the same block twice.
         //
@@ -1569,8 +1591,13 @@ impl BlockChainServer {
 
         let outcome = match signed_block {
             SignedBeaconBlock::Lean(lean_block) => {
-                store::on_block(&mut self.store, lean_block)?;
-                ImportOutcome::Imported
+                match store::on_block(&mut self.store, lean_block) {
+                    Ok(store_timings) => {
+                        timings.absorb_store(store_timings);
+                        ImportOutcome::Imported
+                    }
+                    Err(err) => return (timings, Err(err.into())),
+                }
             }
             // Already imported: skip the whole transition rather than redo
             // it. Lean's `store::on_block` makes exactly this `has_state`
@@ -1604,11 +1631,17 @@ impl BlockChainServer {
                     &config,
                 );
                 let evidence = if within_da_window {
-                    match data_availability_for(&self.store, &beacon_block, &self.custody_columns) {
+                    timings.da_check_start = Some(Instant::now());
+                    let evidence =
+                        data_availability_for(&self.store, &beacon_block, &self.custody_columns);
+                    timings.da_check_end = Some(Instant::now());
+                    match evidence {
                         Some(evidence) => evidence,
                         None => {
-                            self.hold_block_for_columns(beacon_block);
-                            return Ok(ImportOutcome::Held);
+                            timings.columns_wait_start =
+                                timings.columns_wait_start.or(timings.da_check_end);
+                            self.hold_block_for_columns(beacon_block, timings);
+                            return (timings, Ok(ImportOutcome::Held));
                         }
                     }
                 } else {
@@ -1621,6 +1654,7 @@ impl BlockChainServer {
                 // `is_data_available` runs before `state_transition`, so a
                 // block about to be held for its custody columns is never one
                 // this node asks an execution client about.
+                timings.engine_start = Some(Instant::now());
                 let validity = match &self.engine {
                     None => fork_choice::PayloadValidity::NotRequired,
                     Some(client) => match beacon_engine::ask(client, &beacon_block).await {
@@ -1641,10 +1675,12 @@ impl BlockChainServer {
                                 "No verdict from the execution client; not importing"
                             );
                             metrics::inc_engine_no_verdict();
-                            return Ok(ImportOutcome::Held);
+                            timings.engine_end = Some(Instant::now());
+                            return (timings, Ok(ImportOutcome::Held));
                         }
                     },
                 };
+                timings.engine_end = Some(Instant::now());
 
                 // An optimistic import is only permitted for a block that
                 // qualifies. A block that does not, and got a NOT_VALIDATED
@@ -1666,17 +1702,22 @@ impl BlockChainServer {
                              block and it is not an optimistic candidate"
                         );
                         metrics::inc_engine_not_optimistic_candidate();
-                        return Ok(ImportOutcome::Held);
+                        return (timings, Ok(ImportOutcome::Held));
                     }
                 }
 
-                fork_choice::on_block(
+                timings.stf_start = Some(Instant::now());
+                let imported = fork_choice::on_block(
                     &mut self.store,
                     beacon_block,
                     &config,
                     &evidence,
                     &validity,
-                )?;
+                );
+                timings.stf_end = Some(Instant::now());
+                if let Err(err) = imported {
+                    return (timings, Err(err.into()));
+                }
 
                 // The block is already in the store whatever the rest of this
                 // arm does with its body, so nothing below may turn into an
@@ -1693,6 +1734,7 @@ impl BlockChainServer {
                 // See `fork_choice::on_block_attestation`'s documentation for
                 // why the two name the same committees, and for what asking
                 // the checkpoint instead costs.
+                timings.block_atts_start = Some(Instant::now());
                 let block_state = self
                     .store
                     .get_state(&block_root)
@@ -1740,6 +1782,7 @@ impl BlockChainServer {
                             |err| trace!(%slot, ?err, "Ignoring an unusable slashing from a block"),
                         );
                 }
+                timings.block_atts_end = Some(Instant::now());
 
                 ImportOutcome::Imported
             }
@@ -1773,7 +1816,11 @@ impl BlockChainServer {
         for table in ALL_TABLES {
             metrics::update_table_bytes(table.name(), self.store.estimate_table_bytes(table));
         }
-        Ok(outcome)
+        // Everything since the import call returned is bookkeeping it caused:
+        // the events, the finality sweep and the gauge refresh. It is charged
+        // to the section it follows rather than to sections of its own.
+        timings.absorb_tail(Instant::now());
+        (timings, Ok(outcome))
     }
 
     /// Process a newly received block, whichever chain it belongs to.
@@ -1791,10 +1838,18 @@ impl BlockChainServer {
     /// means it never reached [`Self::process_block`], so some other structure
     /// is now responsible for it (a pending-parent entry, a fresh column hold)
     /// or it was deliberately discarded.
-    async fn on_block(&mut self, signed_block: SignedBeaconBlock) -> Option<ImportOutcome> {
+    async fn on_block(
+        &mut self,
+        signed_block: SignedBeaconBlock,
+        timings: ImportTimings,
+    ) -> Option<ImportOutcome> {
+        let mut cascade = CascadeTimings {
+            source: timings.source,
+            ..CascadeTimings::starting_now()
+        };
         let mut queue = VecDeque::new();
-        queue.push_back(signed_block);
-        let outcome = self.run_import_cascade(queue).await;
+        queue.push_back((signed_block, timings));
+        let (outcome, blocks) = self.run_import_cascade(queue, &mut cascade).await;
 
         if self.store.chain() == Chain::Beacon {
             // `lean_current_slot` had the same single writer the head did, so
@@ -1805,9 +1860,12 @@ impl BlockChainServer {
             // the store clock, which only `on_tick` and an early arrival
             // advance.
             metrics::update_current_slot(self.wall_clock_slot());
-            self.recompute_beacon_head().await;
+            let head = self.recompute_beacon_head().await;
+            cascade.absorb_head(head);
         }
 
+        cascade.observe(blocks);
+        cascade.log(blocks);
         outcome
     }
 
@@ -1818,20 +1876,30 @@ impl BlockChainServer {
     /// Reports on the block the cascade was handed, and only that one: a
     /// caller re-delivering a block asks about that block, while the children
     /// its import unblocks are the cascade's own business and each have their
-    /// own tracking already.
+    /// own tracking already. The count beside it is every block the cascade
+    /// imported, which is what the timing tree reports.
     async fn run_import_cascade(
         &mut self,
-        mut queue: VecDeque<SignedBeaconBlock>,
-    ) -> Option<ImportOutcome> {
+        mut queue: VecDeque<(SignedBeaconBlock, ImportTimings)>,
+        cascade: &mut CascadeTimings,
+    ) -> (Option<ImportOutcome>, usize) {
         let mut first = None;
         let mut is_first = true;
-        while let Some(block) = queue.pop_front() {
-            let outcome = self.process_or_pend_block(block, &mut queue).await;
+        let mut blocks = 0;
+        while let Some((block, mut timings)) = queue.pop_front() {
+            // A block released by its parent's import waited here, behind
+            // whatever siblings were ahead of it in the same cascade.
+            if timings.cascade_wait_start.is_some() {
+                timings.cascade_wait_end = Some(Instant::now());
+            }
+            blocks += 1;
+            let outcome = self.process_or_pend_block(block, timings, &mut queue).await;
             if is_first {
                 first = outcome;
                 is_first = false;
             }
         }
+        cascade.cascade_end = Some(Instant::now());
 
         // Prune old states and blocks AFTER the entire cascade completes.
         // Running this mid-cascade would delete states that pending children
@@ -1842,12 +1910,14 @@ impl BlockChainServer {
         // a whole-block decode (`Store::get_block_header`) on a beacon
         // directory.
         if self.store.chain() == Chain::Lean {
+            cascade.prune_start = Some(Instant::now());
             self.store
                 .prune_old_data()
                 .expect("DB pruning should succeed");
+            cascade.prune_end = Some(Instant::now());
         }
 
-        first
+        (first, blocks)
     }
 
     /// Re-deliver `block` to this actor once its own slot has started.
@@ -1875,13 +1945,77 @@ impl BlockChainServer {
     /// ahead. Beacon cannot copy the margin, as its own `on_block` carries
     /// the specification's assertion and the fork-choice fixture suite tests
     /// it.
-    fn defer_early_block(&self, block: SignedBeaconBlock, ctx: &Context<Self>) {
+    fn defer_early_block(
+        &self,
+        block: SignedBeaconBlock,
+        timings: ImportTimings,
+        ctx: &Context<Self>,
+    ) {
         let delay = Duration::from_millis(self.ms_until_slot_start(block.slot()));
+        let now = Instant::now();
+        // The re-delivery carries the block's original arrival rather than a
+        // fresh one, so the hold shows up as the `defer` row of one report
+        // instead of vanishing between two.
         let redelivery = NewBlock {
             block,
             source: BlockSource::Deferred,
+            arrival: BlockArrival {
+                decode_start: timings.decode_start,
+                // The original hand-off, so the first mailbox wait stays the
+                // `queue` row and the hold becomes `defer` rather than more
+                // queue.
+                handed_off: timings.queue_start.unwrap_or(now),
+                // The source travels with the hold so the re-delivery reports
+                // under it rather than under `Deferred`.
+                deferred_from: Some(DeferredFrom {
+                    at: now,
+                    source: timings.source.unwrap_or(BlockSource::Gossip),
+                }),
+            },
         };
         send_after(delay, ctx.clone(), redelivery);
+    }
+
+    /// Print one block's import tree.
+    ///
+    /// The single consumer of [`ImportTimings`], and therefore the only place
+    /// any of them is subtracted from another. `outcome` is borrowed rather
+    /// than taken because the caller still has to act on it.
+    fn log_import_report(
+        &self,
+        slot: u64,
+        block_root: H256,
+        attestations: usize,
+        outcome: &Result<ImportOutcome, ImportError>,
+        timings: ImportTimings,
+    ) {
+        let report = BlockImportReport {
+            slot,
+            block_root,
+            attestations,
+            outcome: match outcome {
+                Ok(ImportOutcome::Imported) => "imported",
+                Ok(ImportOutcome::Held) => "held",
+                Err(_) => "failed",
+            },
+            slot_offset_ms: Some(self.ms_into_slot(slot)),
+            timings,
+        };
+        report.observe();
+        report.log();
+    }
+
+    /// Milliseconds since `slot` started on the wall clock, negative while it
+    /// has not.
+    ///
+    /// The deadline number: an import that finishes past the interval its
+    /// chain expects attestations at was late whatever its sections say.
+    fn ms_into_slot(&self, slot: u64) -> i64 {
+        let time_config = self.store.config().time_grid();
+        let slot_start_ms = time_config
+            .genesis_time_ms()
+            .saturating_add(SlotInterval::BlockPublication.to_ms_since_genesis(slot, &time_config));
+        unix_now_ms() as i64 - slot_start_ms as i64
     }
 
     /// Milliseconds from now until `slot` starts on the wall clock, zero once
@@ -1932,9 +2066,13 @@ impl BlockChainServer {
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
-    async fn recompute_beacon_head(&mut self) {
-        self.update_head_from_fork_choice();
-        self.notify_forkchoice_updated().await;
+    async fn recompute_beacon_head(&mut self) -> HeadTimings {
+        let mut timings = self.update_head_from_fork_choice();
+        if let Some((start, end)) = self.notify_forkchoice_updated().await {
+            timings.fcu_start = Some(start);
+            timings.fcu_end = Some(end);
+        }
+        timings
     }
 
     /// Re-run beacon fork choice, write the head it finds, and republish the
@@ -1950,8 +2088,12 @@ impl BlockChainServer {
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
-    fn update_head_from_fork_choice(&mut self) {
+    fn update_head_from_fork_choice(&mut self) -> HeadTimings {
         let _timing = metrics::time_beacon_head_compute();
+        let mut timings = HeadTimings {
+            head_start: Some(Instant::now()),
+            ..HeadTimings::default()
+        };
         let config = self.store.config();
         if let Err(err) = fork_choice::get_head(&mut self.store, &config) {
             // An invalidated justified checkpoint reaches here:
@@ -1960,11 +2102,14 @@ impl BlockChainServer {
             // sanctions alerting and refusing rather than degrading, which is
             // what this does: the head simply does not move.
             warn!(%err, "Failed to compute beacon head");
-            return;
+            timings.head_end = Some(Instant::now());
+            return timings;
         }
+        timings.head_end = Some(Instant::now());
         if let Some((head_slot, _)) = self.store.beacon_head() {
             metrics::update_head_slot(head_slot);
         }
+        timings
     }
 
     /// Tell the execution client where the chain's head, safe and finalized
@@ -1978,13 +2123,9 @@ impl BlockChainServer {
     /// The response carries a `PayloadStatusV1` of its own, which is the channel
     /// by which a block imported on `SYNCING` later becomes `VALID` or is found
     /// to be `INVALID`.
-    async fn notify_forkchoice_updated(&mut self) {
-        let Some(client) = self.engine.clone() else {
-            return;
-        };
-        let Some((_head_slot, head_root)) = self.store.beacon_head() else {
-            return;
-        };
+    async fn notify_forkchoice_updated(&mut self) -> Option<(Instant, Instant)> {
+        let client = self.engine.clone()?;
+        let (_head_slot, head_root) = self.store.beacon_head()?;
 
         let justified_root = self.store.beacon_justified_checkpoint().root;
         let finalized_root = self.store.beacon_finalized_checkpoint().root;
@@ -2013,7 +2154,7 @@ impl BlockChainServer {
         // Nothing to say yet: a follower whose head has no cached payload hash
         // is still on its checkpoint anchor.
         if state.head_block_hash.is_zero() {
-            return;
+            return None;
         }
 
         // `head_root` stays valid across the await: this is a single-threaded
@@ -2024,10 +2165,12 @@ impl BlockChainServer {
         // head in `Status` and serve blocks out of `BlockRoots`. Which is why
         // `apply_forkchoice_verdict` recomputes the head itself rather than
         // leaving it to the next tick.
+        let start = Instant::now();
         match client.forkchoice_updated(&state).await {
             Ok(status) => self.apply_forkchoice_verdict(head_root, &status),
             Err(err) => warn!(%err, "forkchoiceUpdated failed"),
         }
+        Some((start, Instant::now()))
     }
 
     /// Apply a `forkchoiceUpdated` response to the optimistic bookkeeping.
@@ -2099,12 +2242,28 @@ impl BlockChainServer {
     async fn process_or_pend_block(
         &mut self,
         signed_block: SignedBeaconBlock,
-        queue: &mut VecDeque<SignedBeaconBlock>,
+        mut timings: ImportTimings,
+        queue: &mut VecDeque<(SignedBeaconBlock, ImportTimings)>,
     ) -> Option<ImportOutcome> {
         let slot = signed_block.slot();
         let block_root = signed_block.message_hash_tree_root();
         let parent_root = signed_block.parent_root();
         let proposer = signed_block.proposer_index();
+        timings.guards_start = Some(Instant::now());
+
+        // Asked before the parent check, so that an absent `columns_wait` row
+        // can be read two ways rather than one: the columns were never
+        // missing, or they landed while this block was held for its parent.
+        // Beacon-only, and only on the first pass, since a later pass would
+        // answer for a different moment than the one the field names.
+        if timings.da_complete_on_arrival.is_none() && !self.custody_columns.is_empty() {
+            timings.da_complete_on_arrival = Some(custody_columns_present(
+                &self.store,
+                slot,
+                &block_root,
+                &self.custody_columns,
+            ));
+        }
 
         // Never process blocks at or below the finalized slot — they are
         // already part of the canonical chain and cannot affect fork choice.
@@ -2176,6 +2335,9 @@ impl BlockChainServer {
             .expect("DB read should succeed")
         {
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
+            timings.guards_end = Some(Instant::now());
+            timings.parent_wait_start = timings.parent_wait_start.or(timings.guards_end);
+            self.held_timings.insert(block_root, timings);
 
             // Resolve the actual missing ancestor by walking the chain. A stale entry
             // can occur when a cached ancestor was itself received and became pending
@@ -2217,7 +2379,16 @@ impl BlockChainServer {
                         .get_signed_block(&missing_root)
                         .expect("header and parent state exist, so the full signed block must too")
                         .unwrap();
-                    queue.push_back(fetched);
+                    // A block taken back out of storage has no arrival to
+                    // report, so its clock starts at the moment it was taken.
+                    let mut fetched_timings =
+                        self.held_timings.remove(&missing_root).unwrap_or_else(|| {
+                            let mut fresh = ImportTimings::starting_now();
+                            fresh.source = timings.source;
+                            fresh
+                        });
+                    fetched_timings.parent_wait_end = Some(Instant::now());
+                    queue.push_back((fetched, fetched_timings));
                     return None;
                 }
                 // Block exists but parent doesn't have state — register as pending
@@ -2252,7 +2423,14 @@ impl BlockChainServer {
             }
             _ => None,
         };
-        match self.process_block(signed_block).await {
+        timings.guards_end = Some(Instant::now());
+        let attestations = match &signed_block {
+            SignedBeaconBlock::Lean(lean) => lean.message.body.attestations.len(),
+            _ => 0,
+        };
+        let (timings, outcome) = self.process_block(signed_block, timings).await;
+        self.log_import_report(slot, block_root, attestations, &outcome, timings);
+        match outcome {
             Ok(ImportOutcome::Imported) => {
                 info!(
                     %slot,
@@ -2395,7 +2573,7 @@ impl BlockChainServer {
     fn collect_pending_children(
         &mut self,
         parent_root: H256,
-        queue: &mut VecDeque<SignedBeaconBlock>,
+        queue: &mut VecDeque<(SignedBeaconBlock, ImportTimings)>,
     ) {
         let Some(child_roots) = self.pending_blocks.remove(&parent_root) else {
             return;
@@ -2420,7 +2598,17 @@ impl BlockChainServer {
             let slot = fetched.slot();
             trace!(%parent_root, %slot, "Processing pending child block");
 
-            queue.push_back(fetched);
+            // The parent's import is what ended this child's wait. Whatever
+            // passes between here and the child being popped is the cascade's
+            // own queueing, which is a separate row.
+            let released = Instant::now();
+            let mut timings = self
+                .held_timings
+                .remove(&block_root)
+                .unwrap_or_else(ImportTimings::starting_now);
+            timings.parent_wait_end = Some(released);
+            timings.cascade_wait_start = Some(released);
+            queue.push_back((fetched, timings));
         }
     }
 
@@ -2434,7 +2622,7 @@ impl BlockChainServer {
     /// there: das-core leaves the timing question open, and lighthouse prunes
     /// its pending components at `max(finalized_epoch + 1, the availability
     /// boundary)` instead.
-    fn hold_block_for_columns(&mut self, block: SignedBeaconBlock) {
+    fn hold_block_for_columns(&mut self, block: SignedBeaconBlock, timings: ImportTimings) {
         let slot = block.slot();
         let block_root = block.message_hash_tree_root();
 
@@ -2465,6 +2653,7 @@ impl BlockChainServer {
             .expect("DB insert should succeed");
 
         self.blocks_awaiting_columns.insert(block_root, slot);
+        self.held_timings.insert(block_root, timings);
         metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
 
         // The block itself is in the DB by now: this very method just wrote it.
@@ -2488,6 +2677,10 @@ impl BlockChainServer {
         if self.blocks_awaiting_columns.remove(&block_root).is_some() {
             metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
         }
+
+        // Both eviction paths reach this function, so removing here is what
+        // keeps `held_timings` from outliving the blocks it describes.
+        self.held_timings.remove(&block_root);
 
         let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
             return;
@@ -3113,6 +3306,11 @@ impl BlockChainServer {
         }
 
         self.blocks_awaiting_columns.remove(&block_root);
+        let mut timings = self
+            .held_timings
+            .remove(&block_root)
+            .unwrap_or_else(ImportTimings::starting_now);
+        timings.columns_wait_end = Some(Instant::now());
         metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
 
         let Ok(Some(block)) = self.store.get_signed_block(&block_root) else {
@@ -3145,7 +3343,7 @@ impl BlockChainServer {
         // replaying it, and `release_block_if_columns_complete` removes the
         // hold before re-importing, so no block or sidecar can drive this edge
         // twice.
-        let outcome = Box::pin(self.on_block(block)).await;
+        let outcome = Box::pin(self.on_block(block, timings)).await;
 
         // The re-import can fail for a reason that has nothing to do with
         // columns: no verdict from the execution client, or a `NOT_VALIDATED`
@@ -3326,6 +3524,32 @@ impl Handler<InitP2P> for BlockChainServer {
 impl Handler<NewBlock> for BlockChainServer {
     async fn handle(&mut self, msg: NewBlock, ctx: &Context<Self>) {
         let arrival_ms = unix_now_ms();
+        // The mailbox hop ends here. Everything before it happened in the p2p
+        // actor and rode in on the message, because nothing on this side can
+        // see how long the block waited to be picked up.
+        let picked_up = Instant::now();
+        // A re-delivery reports under the source the block first arrived on,
+        // not under `Deferred`. `Deferred` describes this hop, and the hold it
+        // names is already a section of the import; letting it stand as the
+        // source would move a gossip block out of the gossip population for
+        // every section it has left to cross.
+        let deferred = msg.arrival.deferred_from;
+        let mut timings = ImportTimings {
+            source: Some(deferred.map_or(msg.source, |from| from.source)),
+            // Gossip decodes the block itself and reports both ends; the
+            // req/resp codec has already decoded by the time a handler sees a
+            // block, so that path reports no decode at all rather than a zero.
+            decode_start: msg.arrival.decode_start,
+            decode_end: msg.arrival.decode_start.map(|_| msg.arrival.handed_off),
+            queue_start: Some(msg.arrival.handed_off),
+            // A re-delivered block waited in this mailbox twice. The first wait
+            // is the queue; the second is part of the hold, and ends here.
+            queue_end: Some(deferred.map_or(picked_up, |from| from.at)),
+            defer_start: deferred.map(|from| from.at),
+            defer_end: deferred.map(|_| picked_up),
+            admit_start: Some(picked_up),
+            ..ImportTimings::default()
+        };
         // If message came from gossip, emit event and metric.
         if msg.source == BlockSource::Gossip {
             let slot = msg.block.slot();
@@ -3370,7 +3594,7 @@ impl Handler<NewBlock> for BlockChainServer {
                     block_root = %ShortRoot(&block_root.0),
                     "Deferring block: its slot has not started yet"
                 );
-                self.defer_early_block(msg.block, ctx);
+                self.defer_early_block(msg.block, timings, ctx);
                 return;
             }
             // The slot has started on the wall clock. Make the store clock
@@ -3390,7 +3614,11 @@ impl Handler<NewBlock> for BlockChainServer {
         }
 
         // The import path itself is common to every source and both chains.
-        self.on_block(msg.block).await;
+        // Everything above ran on this block's behalf between the mailbox and
+        // the import, the catch-up tick included, so it is its own section
+        // rather than the head of the first pass's guards.
+        timings.admit_end = Some(Instant::now());
+        self.on_block(msg.block, timings).await;
     }
 }
 
@@ -3865,6 +4093,7 @@ mod tests {
             pending_blocks: HashMap::new(),
             pending_block_parents: HashMap::new(),
             blocks_awaiting_columns: HashMap::new(),
+            held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
             custody_columns: Vec::new(),
             engine: None,
@@ -4600,7 +4829,7 @@ mod tests {
         let root = block.message_hash_tree_root();
         let slot = block.slot();
 
-        server.hold_block_for_columns(block);
+        server.hold_block_for_columns(block, ImportTimings::default());
 
         assert_eq!(server.blocks_awaiting_columns.get(&root), Some(&slot));
         assert!(server.store.get_signed_block(&root).unwrap().is_some());
@@ -4614,7 +4843,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block);
+        server.hold_block_for_columns(block, ImportTimings::default());
 
         // Only one of the two custody columns has arrived.
         server
@@ -4635,7 +4864,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block.clone());
+        server.hold_block_for_columns(block.clone(), ImportTimings::default());
 
         for index in CUSTODY {
             let sidecar = sidecar_for(&block, index);
@@ -4711,7 +4940,9 @@ mod tests {
 
         // First arrival: no columns yet, so the parent must be held, not
         // imported.
-        server.on_block(parent.clone()).await;
+        server
+            .on_block(parent.clone(), ImportTimings::default())
+            .await;
         assert!(
             !server.store.has_state(&parent_root).unwrap(),
             "a held block must not have a post-state"
@@ -4724,7 +4955,7 @@ mod tests {
         // never returns.
         let child = fulu_block(parent_root, parent.slot() + 1, 0);
         let child_root = child.message_hash_tree_root();
-        server.on_block(child).await;
+        server.on_block(child, ImportTimings::default()).await;
 
         // Reaching this line at all is most of the proof: the cascade
         // terminated. What it terminated *into* matters too — the parent
@@ -4812,7 +5043,7 @@ mod tests {
         let parent = fulu_block_with_commitments(&server.store, 2);
         let parent_root = parent.message_hash_tree_root();
         let slot = parent.slot();
-        server.hold_block_for_columns(parent.clone());
+        server.hold_block_for_columns(parent.clone(), ImportTimings::default());
 
         // A child parked behind the still-held parent, seeded directly in
         // the same shape `process_or_pend_block`'s "parent missing" branch
@@ -4867,7 +5098,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let block_root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block);
+        server.hold_block_for_columns(block, ImportTimings::default());
 
         // Every custody column is written straight to the store, the way a
         // fetched sidecar that never reached `release_block_if_columns_complete`
@@ -4929,7 +5160,7 @@ mod tests {
         let block_root = block.message_hash_tree_root();
         let parent_root = block.parent_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block);
+        server.hold_block_for_columns(block, ImportTimings::default());
 
         // The parent's post-state, so the re-import reaches `process_block`
         // rather than parking the block on a missing parent.
@@ -4975,7 +5206,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let block_root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block);
+        server.hold_block_for_columns(block, ImportTimings::default());
 
         // All but one column. The re-drive re-asks for the last one; what it
         // must not do is decide the block is available without it.

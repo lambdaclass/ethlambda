@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ethlambda_network_api::BlockSource;
+use ethlambda_network_api::{BlockArrival, BlockSource};
 use ethlambda_storage::{Chain, Store};
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
@@ -678,7 +678,7 @@ async fn handle_blocks_by_root_response(
     }
 
     let _ = blockchain
-        .new_block(block, BlockSource::Sync)
+        .new_block(block, BlockSource::Sync, BlockArrival::now())
         .inspect_err(|err| error!(%err, "Failed to forward fetched block to blockchain"));
 }
 
@@ -712,7 +712,11 @@ async fn handle_lean_blocks_by_range_response(
         }
 
         let block_root = block.message.hash_tree_root();
-        if let Err(err) = blockchain.new_block(SignedBeaconBlock::Lean(block), BlockSource::Sync) {
+        if let Err(err) = blockchain.new_block(
+            SignedBeaconBlock::Lean(block),
+            BlockSource::Sync,
+            BlockArrival::now(),
+        ) {
             error!(
                 %err, %slot, %peer,
                 block_root = %ethlambda_types::ShortRoot(&block_root.0),
@@ -2272,9 +2276,11 @@ async fn handle_beacon_blocks_by_range_response(
         // (execution payload included) that would then be paid for every
         // block on the sync path. [`handle_blocks_by_root_response`] computes
         // one because it has an answer to check; a range batch does not.
-        let _ = blockchain.new_block(block, BlockSource::Sync).inspect_err(
-            |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
-        );
+        let _ = blockchain
+            .new_block(block, BlockSource::Sync, BlockArrival::now())
+            .inspect_err(
+                |err| error!(%err, %slot, %peer, "Failed to forward beacon block to blockchain"),
+            );
     }
 
     debug!(%peer, received, accepted, "Beacon blocks received");

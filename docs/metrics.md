@@ -183,6 +183,63 @@ samples nothing and publishes no series here.
 | `lean_swarm_established_connections` | Gauge | Established connections as libp2p itself counts them | On the swarm's own metric tick | direction=inbound,outbound |
 | `lean_custody_column_peers` | Gauge | Connected peers known to custody each data column this node samples | On every connection established and closed, and whenever a peer's custody is recorded from its `metadata/3` answer or its ENR `cgc` | column=`<index>` |
 
+### Block Import Timing
+
+These record where a block's time goes between coming off the wire and having a post-state, which is the question `lean_fork_choice_block_processing_time_seconds` cannot answer: it starts inside `store::on_block`, so the mailbox hop, the holds, the head update and the per-table size estimates every import pays for all fall outside it. The sections here are the same ones the `Block import timing` log prints as a tree, and a test asserts the two lists stay identical.
+
+One histogram carries every section, including `total` for a whole import and the sections an arrival is charged once for. They share a unit and a bucket set, and the query that matters is `rate(..._sum[5m])`, seconds spent per second, which does not divide by an event count and so does not care that some sections are counted per block and others per arrival. `lean_block_import_cascade_blocks` is what relates the two counts when you do need them.
+
+`total` is written only when the block actually imported. A held block publishes every section it crossed and no total, because its import has not finished: that is what keeps a block that waited two slots for its parent out of the import-cost percentiles, and why there is no `outcome` label to filter on.
+
+`parent_wait` and `columns_wait` are separate sections rather than one "pending", so a block held for its parent and a block held for its custody columns never collapse into the same number. An absent `columns_wait` still has two readings, and only the log separates them: its `da_complete_on_arrival` field says whether the columns were never missing, or landed while the block was held for its parent.
+
+The bookkeeping an import triggers (chain-event emission, the finality eviction sweep, the gauge refresh including a RocksDB size estimate per table) has no section of its own. It is charged to the section it follows, which is `fc_head` on lean and `block_atts` on beacon. Those three were sections once: across 5248 imports on a mainnet follower none of them reached a millisecond, so they were three rows that never moved in every tree and three label values that never said anything. The work is still counted, just where it happens.
+
+`decode` is a gossip-only section, so `queue` is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: `decode` is a gossip population even though the `source` label allows `sync`, and a fetched block's `total` starts later in its life than a gossiped block's, having never counted the request round trip at all.
+
+`engine` and `fcu` are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.
+
+The `source` label has two values, `gossip` and `sync` (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its `defer` section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no `decode` and an empty `queue` taken when the import began. Both still appear in the log, which names them `deferred` and `local`.
+
+Series appear as blocks arrive rather than being seeded, since a third of the phases are beacon-only and a lean node can never write to them.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 64 |
+| `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
+
+Per-block phases, in the order a block crosses them, plus `total` for a completed import:
+
+| Phase | What it covers | Chain |
+|-------|----------------|-------|
+| `decode` | Snappy decompression, SSZ decode and the root the p2p handler computes. Gossip only; see above | both |
+| `queue` | The wait in the chain actor's mailbox | both |
+| `defer` | Held because the block's own slot had not started yet | beacon |
+| `guards` | Finality and future-slot checks, the already-imported check, the parent-state lookup | both |
+| `preamble` | The checks `store::on_block` makes before verifying: parent state load, duplicate attestation data scan | lean |
+| `parent_wait` | Held because the parent had no post-state | both |
+| `cascade_wait` | Between the parent's import finishing and this block being popped off the cascade queue | both |
+| `da_check` | The custody-column availability check itself, not the wait | beacon |
+| `columns_wait` | Held because custody columns had not all arrived | beacon |
+| `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
+| `verify_struct` | Participant bounds checks and pubkey resolution | lean |
+| `verify_crypto` | The leanVM multi-message aggregate verification | lean |
+| `stf` | The state transition. On beacon this bundles the transition, the state root and the state write | both |
+| `db_write` | The block and post-state writes | lean |
+| `fc_head` | `update_head` | lean |
+| `block_atts` | Replaying the block's own attestations and slashings into fork choice | beacon |
+| `total` | The whole import, wire to post-state, spanning any holds. Only on a completed import | both |
+
+Per-arrival phases, charged once per arriving message however many blocks its cascade imported:
+
+| Phase | What it covers |
+|-------|----------------|
+| `arrival` | The whole handler call: the cascade plus everything after it |
+| `cascade` | The block drain alone |
+| `prune` | `prune_old_data` after the cascade (lean) |
+| `get_head` | `fork_choice::get_head` (beacon) |
+| `fcu` | The `engine_forkchoiceUpdated` round trip (beacon) |
+
 ### Gossip Arrival Timing
 
 These histograms record the absolute distance between a gossip message's arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters' `position` label is what tells them apart. `inside` means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10's interval 2 is `after`, not `inside`, since it missed the AttestationProduction interval it was actually due in.
