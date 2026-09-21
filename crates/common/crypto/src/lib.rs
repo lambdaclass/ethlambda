@@ -273,9 +273,9 @@ fn compress_to_byte_list(sig: &EthereumProof) -> Result<ByteList512KiB, Aggregat
 
 /// leanVM's aggregation errors, kept as their own text.
 ///
-/// They cover both proving failures and malformed requests (a slot carrying two
-/// messages, a child that does not verify, too many children); the message says
-/// which, and no caller here branches on the distinction.
+/// They cover both proving failures and malformed requests (a child that does
+/// not verify, too many children); the message says which, and no caller here
+/// branches on the distinction.
 fn aggregation_failed(err: leanvm::AggregationError) -> AggregationError {
     AggregationError::ProverFailure(err.to_string())
 }
@@ -461,11 +461,13 @@ pub fn verify_aggregated_signature(
 /// `to_bytes_without_pubkeys()` form of an aggregate over exactly that claim.
 ///
 /// The returned blob is the `to_bytes_without_pubkeys()` form of the merged
-/// aggregate, whose signer set is the union of the claims grouped by slot. A
-/// verifier decoding it back needs the same claims, in any order.
+/// aggregate, whose signer set is the union of the claims grouped by
+/// `(slot, message)`. A verifier decoding it back needs the same claims, in any
+/// order: [`wire_keys`] puts them back into leanVM's order.
 ///
-/// Two claims at one slot under different messages cannot be merged at all:
-/// leanVM rejects the pair rather than producing a proof (see the module docs).
+/// Two claims at one slot under different messages merge like any other pair,
+/// each into its own group. That is what a block carries whenever validators
+/// disagree inside a slot, so it is the ordinary case, not an edge one.
 pub fn merge_type_1s_into_type_2(
     type_1s: Vec<(SignerSet, ByteList512KiB)>,
 ) -> Result<ByteList512KiB, AggregationError> {
