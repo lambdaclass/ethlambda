@@ -45,9 +45,31 @@
 //! different kind of failure than "verification did not pass". Keeping it a
 //! `Result` keeps that distinction visible at the call site instead of forcing
 //! an aggregation failure to masquerade as a rejected signature.
+//!
+//! # Why key validation is parallelized
+//!
+//! [`aggregate_verify`] and [`fast_aggregate_verify`] each loop over
+//! `pubkeys`, decompressing and subgroup-checking one key per attester before
+//! the pairing check runs; a single Electra block can carry up to
+//! `MAX_ATTESTATIONS_ELECTRA` aggregates, each covering up to a whole
+//! committee, so that loop is thousands of independent point checks per
+//! block import. The beacon state transition runs on one actor thread (see
+//! `BlockChain` in `crates/blockchain/src/lib.rs`), so on a multi-core host
+//! every one of those checks but the one currently running leaves a core
+//! idle. Validating one key never reads or writes anything another key's
+//! validation touches, so nothing depends on which order they run in or
+//! finish in: `pubkeys.par_iter().map(...).collect::<Option<Vec<_>>>()`
+//! spreads the checks across rayon's global thread pool and still collapses
+//! to `None` the moment any key fails, the same predicate the sequential
+//! loop's early `return false` expressed, without skipping or weakening
+//! [`key_validate`] for a single key. The successful points land back at
+//! their original indices because collecting into a `Vec` from an indexed
+//! parallel iterator preserves source order, which `aggregate_verify` relies
+//! on to keep `points[i]` paired with `messages[i]`.
 
 use blst::BLST_ERROR;
 use blst::min_pk::{AggregatePublicKey, AggregateSignature, PublicKey, Signature};
+use rayon::prelude::*;
 
 use crate::beacon::error::Error;
 use crate::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Root};
@@ -62,6 +84,22 @@ use crate::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Roo
 /// keys be reused for other purposes (or other chains) without cross-protocol
 /// signature reuse.
 const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// The minimum number of public keys rayon may put in one sequential chunk
+/// when [`aggregate_verify`] and [`fast_aggregate_verify`] validate an
+/// aggregate's signers in parallel.
+///
+/// A devnet or a spec-fixture aggregate can be as small as a single signer,
+/// and splitting a handful of keys across worker threads would spend more
+/// time on task dispatch than [`PublicKey::key_validate`] itself takes to
+/// decompress and subgroup-check one key. `with_min_len` keeps that decision
+/// inside rayon's own splitting logic rather than a hand-rolled length check
+/// before choosing serial or parallel: sixteen is comfortably above the
+/// single-digit-signer inputs a fixture or a small devnet produces, so those
+/// stay on the calling thread, while a mainnet aggregate of hundreds to
+/// thousands of signers still splits into far more chunks than there are
+/// cores to run them on.
+const KEY_VALIDATE_MIN_PAR_LEN: usize = 16;
 
 /// Builds `specs/altair/bls.md`'s `G2_POINT_AT_INFINITY` constant: the
 /// compressed encoding of the identity element of G2, which is the
@@ -131,7 +169,9 @@ pub fn aggregate(signatures: &[BlsSignature]) -> crate::beacon::Result<BlsSignat
 /// immediately rather than vacuously succeeding. As with [`verify`], every
 /// public key and the signature are independently deserialized and validated
 /// (subgroup membership, non-identity for the keys) before the pairing check
-/// runs, so an invalid key or signature simply fails this predicate.
+/// runs, so an invalid key or signature simply fails this predicate. The
+/// per-key validation runs in parallel; see the module documentation for why
+/// that is safe and why `points` still lines up with `messages` afterward.
 pub fn aggregate_verify(
     pubkeys: &[BlsPubkey],
     messages: &[Root],
@@ -143,13 +183,14 @@ pub fn aggregate_verify(
     let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
         return false;
     };
-    let mut points = Vec::with_capacity(pubkeys.len());
-    for pubkey in pubkeys {
-        match PublicKey::key_validate(pubkey.as_ref()) {
-            Ok(point) => points.push(point),
-            Err(_) => return false,
-        }
-    }
+    let Some(points): Option<Vec<PublicKey>> = pubkeys
+        .par_iter()
+        .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
+        .map(|pubkey| PublicKey::key_validate(pubkey.as_ref()).ok())
+        .collect()
+    else {
+        return false;
+    };
     let point_refs: Vec<&PublicKey> = points.iter().collect();
     let message_refs: Vec<&[u8]> = messages.iter().map(Root::as_slice).collect();
     let result = signature.aggregate_verify(false, &message_refs, DST, &point_refs, false);
@@ -163,7 +204,10 @@ pub fn aggregate_verify(
 /// which is the shape every attestation aggregate takes. An empty `pubkeys`
 /// always fails here: this function has no notion of "no one signed, and that
 /// is fine", unlike its eth2-specific wrapper [`eth_fast_aggregate_verify`],
-/// which is exactly why that wrapper exists.
+/// which is exactly why that wrapper exists. This is the hot path for a real
+/// Electra block's attestations, where a single aggregate can carry
+/// thousands of signers behind one shared message; the per-key validation
+/// runs in parallel, see the module documentation for why that is safe.
 pub fn fast_aggregate_verify(
     pubkeys: &[BlsPubkey],
     message: Root,
@@ -175,13 +219,14 @@ pub fn fast_aggregate_verify(
     let Ok(signature) = Signature::sig_validate(signature.as_ref(), false) else {
         return false;
     };
-    let mut points = Vec::with_capacity(pubkeys.len());
-    for pubkey in pubkeys {
-        match PublicKey::key_validate(pubkey.as_ref()) {
-            Ok(point) => points.push(point),
-            Err(_) => return false,
-        }
-    }
+    let Some(points): Option<Vec<PublicKey>> = pubkeys
+        .par_iter()
+        .with_min_len(KEY_VALIDATE_MIN_PAR_LEN)
+        .map(|pubkey| PublicKey::key_validate(pubkey.as_ref()).ok())
+        .collect()
+    else {
+        return false;
+    };
     let point_refs: Vec<&PublicKey> = points.iter().collect();
     let result = signature.fast_aggregate_verify(false, message.as_slice(), DST, &point_refs);
     result == BLST_ERROR::BLST_SUCCESS
@@ -429,5 +474,62 @@ mod tests {
     #[test]
     fn key_validate_rejects_the_all_zero_pubkey() {
         assert!(!key_validate(&BlsPubkey::default()));
+    }
+
+    /// Builds a realistic attestation aggregate of `count` independent
+    /// signers over one shared message: each signer gets its own
+    /// `key_gen`-derived keypair and signs [`message`](Root) under this
+    /// module's own [`DST`], the same DST [`fast_aggregate_verify`] checks
+    /// against, and the resulting signatures are folded together with this
+    /// module's own [`aggregate`], the same call a real caller makes to
+    /// produce one. This mirrors the shape of an Electra attestation
+    /// aggregate, where every attester signs identical attestation data.
+    fn build_aggregate(count: usize) -> (Vec<BlsPubkey>, Root, BlsSignature) {
+        let message = crate::beacon::primitives::H256([7u8; 32]);
+        let mut pubkeys = Vec::with_capacity(count);
+        let mut signatures = Vec::with_capacity(count);
+        for index in 0..count {
+            // `key_gen` requires at least 32 bytes of input key material;
+            // seeding it with the signer's index keeps every key distinct
+            // and the whole aggregate reproducible run to run.
+            let mut ikm = [0u8; 32];
+            ikm[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[])
+                .expect("32 bytes of input material is enough for key generation");
+            pubkeys.push(BlsPubkey(secret.sk_to_pk().to_bytes()));
+            let signature = secret.sign(message.as_slice(), DST, &[]);
+            signatures.push(BlsSignature(signature.to_bytes()));
+        }
+        let aggregated = aggregate(&signatures)
+            .expect("every signature above comes from a fresh, valid keypair");
+        (pubkeys, message, aggregated)
+    }
+
+    /// Wall-clock timing for [`fast_aggregate_verify`]'s parallel key
+    /// validation at the scale a real Electra attestation aggregate reaches:
+    /// hundreds to thousands of attesters behind one shared message. Prints
+    /// the elapsed time for each size so a run before and after the rayon
+    /// change (or on different hardware) can be compared by hand; the
+    /// `assert!` below also makes this a correctness check, not only a
+    /// stopwatch, since a bug in the parallel path that dropped or
+    /// misaligned a key would make the aggregate fail to verify.
+    ///
+    /// `#[ignore]`d for the same reason the crate's other slow crypto tests
+    /// are: generating and signing thousands of real BLS keypairs, twice,
+    /// dominates the run time and has no place in a default `cargo test`.
+    #[test]
+    #[ignore = "slow: generates and signs thousands of real BLS keypairs"]
+    fn fast_aggregate_verify_parallel_key_validation_timing() {
+        for count in [512usize, 2048] {
+            let (pubkeys, message, signature) = build_aggregate(count);
+            let start = std::time::Instant::now();
+            let result = fast_aggregate_verify(&pubkeys, message, &signature);
+            let elapsed = start.elapsed();
+            println!("fast_aggregate_verify, {count} signers: {elapsed:?}");
+            assert!(
+                result,
+                "a freshly-built, correctly-aggregated signature over {count} signers must verify"
+            );
+        }
     }
 }

@@ -62,6 +62,15 @@ sha2.workspace = true
 # BLS12-381. Assembly-optimized, and the canonical consensus-layer backend.
 blst = "0.3.16"
 
+# For `beacon::bls`'s `aggregate_verify` and `fast_aggregate_verify`, which
+# validate an aggregate's public keys (a subgroup check per signer) in
+# parallel: a mainnet Electra aggregate can carry thousands of signers behind
+# one pairing check, and the beacon state transition otherwise runs that loop
+# on a single actor thread while the rest of the host's cores sit idle.
+# `crates/blockchain` already depends on this for its own worker, so this
+# only adds it to a crate that did not need it before.
+rayon.workspace = true
+
 # KZG, including the EIP-7594 cell and column proofs that fulu needs. Same
 # version and feature set ethrex uses, plus the embedded mainnet trusted setup.
 c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
