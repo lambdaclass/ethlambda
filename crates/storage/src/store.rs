@@ -329,36 +329,38 @@ type StorageKey = Vec<u8>;
 type StorageEntry = (StorageKey, Vec<u8>);
 type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
 
+/// The head-vote baseline a proposer scores against: the last
+/// `HEAD_VOTE_WINDOW_BLOCKS` blocks of the branch it is extending.
+///
+/// The two halves answer different questions and are both needed.
+///
+/// `roots` answers "is this entry's head still in play". A vote naming a head
+/// older than the window moves nothing a proposer can influence: the block it
+/// names is already buried under the window's worth of descendants, and fork
+/// choice settled that stretch of chain before the window opened. Crediting it
+/// would also let a vote be packed again once the block that carried it ages
+/// out of `votes`, paying a block entry per cycle for weight nobody is
+/// contesting.
+///
+/// `votes` answers "does this branch already carry the vote", so an entry is
+/// valued for the weight it would ADD rather than for its whole coverage.
+///
+/// They come from one walk because they must agree: a root in `roots` whose
+/// votes are missing from `votes` reads as a head still in play that nobody
+/// has voted on, which is exactly backwards.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeadVoteWindow {
+    /// Roots of the blocks in the window, the head itself included.
+    pub roots: HashSet<H256>,
+    /// Latest vote per validator those blocks carry, by the same
+    /// latest-message rule fork choice uses.
+    pub votes: HashMap<u64, AttestationData>,
+}
+
 #[derive(Clone, Default)]
 struct ForkChoiceState {
     known_votes: HashMap<u64, AttestationData>,
     new_votes: HashMap<u64, AttestationData>,
-    /// Latest vote per validator that a BLOCK has carried, as opposed to one
-    /// this node merely learned about.
-    ///
-    /// Maintained only from `insert_signed_block`, never from gossip or the
-    /// aggregation pool, which is the whole point: the vote maps and the
-    /// payload buffers advance in lockstep from the same data, at both stages.
-    /// [`Store::insert_new_aggregated_payload`] writes `new_votes` and
-    /// `new_payloads` in one call, and [`Store::promote_new_aggregated_payloads`]
-    /// then drains `new_votes` into `known_votes` and `new_payloads` into
-    /// `known_payloads`, also in one call. So `known_votes` and the pool that
-    /// `known_aggregated_payloads` serves are two views of the same set of
-    /// votes, and a candidate body built out of that pool can never carry a
-    /// vote newer than `known_votes`. Scoring a body's head-vote value against
-    /// `known_votes` therefore always yields zero and is the wrong question.
-    /// The one that matters when deciding what to PACK is whether the chain
-    /// already carries the vote, which is exactly what this map answers.
-    ///
-    /// Not fork-aware: a vote carried by a block on an abandoned branch still
-    /// counts as on-chain here. That only ever makes a vote look less novel
-    /// than it is, so the failure mode is packing slightly less rather than
-    /// double-counting, and keeping it fork-aware would cost an ancestor walk
-    /// per scoring call to save nothing at the scale we run at.
-    ///
-    /// Bounded by the validator-set size: one entry per validator, replaced in
-    /// place, so it needs no pruning as the chain advances.
-    on_chain_votes: HashMap<u64, AttestationData>,
 }
 
 /// Bounded buffer for gossip signatures with FIFO eviction.
@@ -1553,23 +1555,16 @@ impl Store {
 
     /// Record a block's attestations as fork-choice votes.
     ///
-    /// Called from `insert_signed_block` only, so it doubles as the one place
-    /// that learns a vote is now ON CHAIN. Both maps are updated: `known_votes`
-    /// is what fork choice weighs, `on_chain_votes` is the baseline block
-    /// production scores a candidate body's head-vote value against. See
-    /// [`ForkChoiceState::on_chain_votes`] for why the two cannot be the same
-    /// map.
+    /// Feeds `known_votes`, which is what fork choice weighs: every vote this
+    /// node knows, however it arrived. Block production does NOT score against
+    /// this map; it reads the branch it is building on through
+    /// [`Self::extract_head_window_votes`].
     fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
         let mut fork_choice = self.fork_choice.lock().unwrap();
         for attestation in attestations {
             for validator_id in validator_indices(&attestation.aggregation_bits) {
                 Self::record_vote(
                     &mut fork_choice.known_votes,
-                    validator_id,
-                    &attestation.data,
-                );
-                Self::record_vote(
-                    &mut fork_choice.on_chain_votes,
                     validator_id,
                     &attestation.data,
                 );
@@ -1582,16 +1577,53 @@ impl Store {
         self.fork_choice.lock().unwrap().known_votes.clone()
     }
 
-    /// Extract the latest vote per validator that a block has already carried.
+    /// The last `blocks` blocks of the branch ending at `head_root`: which
+    /// blocks they are, and the latest vote per validator they carry.
     ///
     /// The baseline for scoring how much fork-choice weight a candidate body
-    /// would ADD to the chain. Deliberately not
-    /// [`Self::extract_latest_known_attestations`]: that map is written in
-    /// lockstep with the aggregated-payload pool bodies are built from, so
-    /// scoring against it reports zero for every candidate. See
-    /// [`ForkChoiceState::on_chain_votes`].
-    pub fn extract_on_chain_votes(&self) -> HashMap<u64, AttestationData> {
-        self.fork_choice.lock().unwrap().on_chain_votes.clone()
+    /// would ADD to the branch it is built on. See [`HeadVoteWindow`] for what
+    /// each half answers and why the two must come from one walk.
+    ///
+    /// Deliberately not [`Self::extract_latest_known_attestations`]. That map
+    /// advances in lockstep with the aggregated-payload pool bodies are built
+    /// from: [`Self::insert_new_aggregated_payload`] writes `new_votes` and
+    /// `new_payloads` in one call, and [`Self::promote_new_aggregated_payloads`]
+    /// drains both into their `known` counterparts in one call. A body built
+    /// out of that pool can therefore never carry a vote newer than
+    /// `known_votes`, so scoring against it reports zero for every candidate
+    /// and the head-vote axis is dead.
+    ///
+    /// Read from the block store on demand rather than kept as a running map
+    /// because the answer is branch-relative. `insert_signed_block` runs for
+    /// every valid block, including ones on branches this node never adopts,
+    /// so a running map would report a vote as carried by the branch we are
+    /// building on when only an abandoned sibling carried it. The proposer
+    /// would then score the vote at zero on both axes and drop it, leaving the
+    /// branch it kept with nothing to pack.
+    ///
+    /// The walk follows headers, so a block whose body the store does not hold
+    /// still bounds the window; only the votes it carried are unreadable. That
+    /// is the checkpoint-sync anchor, and it resolves on the first import. The
+    /// walk stops at a root with no header at all, which is the normal
+    /// terminator: the anchor's parent names no block.
+    pub fn extract_head_vote_window(&self, head_root: H256, blocks: usize) -> HeadVoteWindow {
+        let mut window = HeadVoteWindow::default();
+        let mut root = head_root;
+        for _ in 0..blocks {
+            let Ok(Some(header)) = self.get_block_header(&root) else {
+                break;
+            };
+            window.roots.insert(root);
+            if let Ok(Some(block)) = self.get_block(&root) {
+                for attestation in block.body.attestations.iter() {
+                    for validator_id in validator_indices(&attestation.aggregation_bits) {
+                        Self::record_vote(&mut window.votes, validator_id, &attestation.data);
+                    }
+                }
+            }
+            root = header.parent_root;
+        }
+        window
     }
 
     /// Extract per-validator latest attestations from new (pending) payloads.
@@ -2166,17 +2198,189 @@ mod tests {
         assert_eq!(votes[&3], data);
     }
 
+    /// Build a chain of `count` blocks on top of the anchor, block `i`
+    /// carrying one attestation from validator `i` for target slot `i + 1`.
+    /// Returns the roots and datas, oldest first.
+    fn chain_of_attesting_blocks(
+        store: &mut Store,
+        count: u64,
+    ) -> (Vec<H256>, Vec<AttestationData>) {
+        let mut parent = store.head().expect("head root");
+        let mut roots = Vec::new();
+        let mut datas = Vec::new();
+        for i in 0..count {
+            let slot = i + 1;
+            let data = make_att_data_for_target(slot, root(slot));
+            let block = signed_block_with_attestations(
+                slot,
+                parent,
+                vec![AggregatedAttestation {
+                    aggregation_bits: make_proof_for_validator(i as usize).participants,
+                    data: data.clone(),
+                }],
+            );
+            let block_root = block.message.hash_tree_root();
+            store
+                .insert_signed_block(block_root, block)
+                .expect("insert block");
+            parent = block_root;
+            roots.push(block_root);
+            datas.push(data);
+        }
+        (roots, datas)
+    }
+
+    fn anchored_store() -> Store {
+        let backend = Arc::new(InMemoryBackend::new());
+        Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        )
+    }
+
+    /// The window is exactly the head block plus the `blocks - 1` blocks it
+    /// descends from; anything older is outside it and reads as not carried.
+    #[test]
+    fn head_vote_window_covers_the_head_and_its_recent_ancestors() {
+        let mut store = anchored_store();
+        let (roots, datas) = chain_of_attesting_blocks(&mut store, 4);
+        let head = *roots.last().expect("four blocks");
+
+        let window = store.extract_head_vote_window(head, 3);
+
+        assert_eq!(
+            window.roots,
+            HashSet::from([roots[3], roots[2], roots[1]]),
+            "the head and the two blocks it descends from are in play"
+        );
+        assert!(
+            !window.roots.contains(&roots[0]),
+            "the fourth block back is behind the window, so an entry naming it \
+             as head scores nothing"
+        );
+
+        assert_eq!(window.votes.len(), 3, "three blocks, one validator each");
+        assert_eq!(window.votes[&3], datas[3], "the head block");
+        assert_eq!(window.votes[&2], datas[2]);
+        assert_eq!(window.votes[&1], datas[1]);
+        assert!(
+            !window.votes.contains_key(&0),
+            "a vote carried only behind the window is not part of the baseline"
+        );
+    }
+
+    /// The regression this window exists for. `insert_signed_block` runs for
+    /// every valid block, so a sibling this node never adopts would enter a
+    /// running on-chain map and suppress packing on the branch it kept. The
+    /// window is anchored at a head, so it cannot see the sibling at all.
+    #[test]
+    fn head_vote_window_ignores_a_block_on_an_abandoned_branch() {
+        let mut store = anchored_store();
+        let anchor = store.head().expect("head root");
+
+        // The branch we keep: validator 0's slot-1 vote.
+        let kept_data = make_att_data_for_target(1, root(1));
+        let kept = signed_block_with_attestations(
+            1,
+            anchor,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validator(0).participants,
+                data: kept_data.clone(),
+            }],
+        );
+        let kept_root = kept.message.hash_tree_root();
+        store
+            .insert_signed_block(kept_root, kept)
+            .expect("insert kept block");
+
+        // A sibling off the same anchor, carrying a LATER vote from the same
+        // validator. A running per-validator map would let this win.
+        let orphan_data = make_att_data_for_target(2, root(2));
+        let orphan = signed_block_with_attestations(
+            2,
+            anchor,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validator(0).participants,
+                data: orphan_data.clone(),
+            }],
+        );
+        let orphan_root = orphan.message.hash_tree_root();
+        store
+            .insert_signed_block(orphan_root, orphan)
+            .expect("insert orphan block");
+
+        let window = store.extract_head_vote_window(kept_root, 3);
+
+        assert_eq!(
+            window.votes[&0], kept_data,
+            "the baseline must name what the branch we build on carries"
+        );
+        assert!(
+            !window.votes.values().any(|vote| *vote == orphan_data),
+            "a branch we abandoned must not suppress packing on the branch we \
+             kept"
+        );
+        assert!(
+            !window.roots.contains(&orphan_root),
+            "nor may it put its own block in play as a head worth voting for"
+        );
+    }
+
+    /// Within the window the latest-message rule still decides, so a validator
+    /// that voted in two of the last three blocks reads as carrying the newer
+    /// vote whichever order the walk visits them in.
+    #[test]
+    fn head_vote_window_keeps_the_latest_vote_per_validator() {
+        let mut store = anchored_store();
+        let anchor = store.head().expect("head root");
+
+        let older = make_att_data_for_target(1, root(1));
+        let first = signed_block_with_attestations(
+            1,
+            anchor,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validator(0).participants,
+                data: older.clone(),
+            }],
+        );
+        let first_root = first.message.hash_tree_root();
+        store
+            .insert_signed_block(first_root, first)
+            .expect("insert first block");
+
+        let newer = make_att_data_for_target(2, root(2));
+        let second = signed_block_with_attestations(
+            2,
+            first_root,
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validator(0).participants,
+                data: newer.clone(),
+            }],
+        );
+        let second_root = second.message.hash_tree_root();
+        store
+            .insert_signed_block(second_root, second)
+            .expect("insert second block");
+
+        assert_eq!(
+            store.extract_head_vote_window(second_root, 3).votes[&0],
+            newer
+        );
+    }
+
     /// The pool and `known_votes` are written in lockstep, so a candidate body
     /// built from the pool can never carry a vote newer than `known_votes`.
-    /// `on_chain_votes` must NOT move with them, or head-vote scoring reports
-    /// zero for every candidate and the whole axis is dead.
+    /// The window baseline must NOT move with them, or head-vote scoring
+    /// reports zero for every candidate and the whole axis is dead.
     ///
     /// This is the regression guard for exactly that: scoring a body's
     /// head-vote value against `known_votes` looks reasonable and silently
     /// always returns nothing.
     #[test]
-    fn aggregated_payloads_move_known_votes_but_never_on_chain_votes() {
-        let mut store = Store::test_store();
+    fn head_vote_window_does_not_move_with_the_aggregated_payload_pool() {
+        let mut store = anchored_store();
+        let head = store.head().expect("head root");
         let data = make_att_data_for_target(8, root(8));
 
         store.insert_new_aggregated_payload(
@@ -2191,58 +2395,30 @@ mod tests {
             "the pool write must reach the fork-choice map"
         );
         assert!(
-            store.extract_on_chain_votes().is_empty(),
-            "no block has carried this vote, so it is not on chain"
+            store.extract_head_vote_window(head, 3).votes.is_empty(),
+            "no block on this branch has carried this vote"
         );
     }
 
-    /// The other half: a block import is what makes a vote on-chain, and it
-    /// must move BOTH maps.
+    /// A pooled vote strictly newer than what the window carries must read as
+    /// new against it. This is the property the whole axis turns on: if it
+    /// fails, candidates score zero again.
     #[test]
-    fn insert_signed_block_records_on_chain_votes() {
-        let mut store = Store::test_store();
-        let data = make_att_data_for_target(8, root(8));
+    fn a_pooled_vote_newer_than_the_window_supersedes_the_baseline() {
+        let mut store = anchored_store();
+        let anchor = store.head().expect("head root");
+        let carried = make_att_data_for_target(8, root(8));
         let block = signed_block_with_attestations(
-            1,
-            H256::ZERO,
-            vec![AggregatedAttestation {
-                aggregation_bits: make_proof_for_validators(&[1, 3]).participants,
-                data: data.clone(),
-            }],
-        );
-        let block_root = block.message.hash_tree_root();
-
-        store
-            .insert_signed_block(block_root, block)
-            .expect("insert signed block");
-
-        let on_chain = store.extract_on_chain_votes();
-        assert_eq!(on_chain[&1], data);
-        assert_eq!(on_chain[&3], data);
-        assert_eq!(
-            store.extract_latest_known_attestations()[&1],
-            data,
-            "a block import still feeds fork choice as before"
-        );
-    }
-
-    /// A pooled vote strictly newer than what the chain carries must read as
-    /// new against the on-chain baseline. This is the property the whole fix
-    /// turns on: if it fails, candidates score zero again.
-    #[test]
-    fn a_pooled_vote_newer_than_the_chain_supersedes_the_on_chain_baseline() {
-        let mut store = Store::test_store();
-        let on_chain_data = make_att_data_for_target(8, root(8));
-        let block = signed_block_with_attestations(
-            1,
-            H256::ZERO,
+            8,
+            anchor,
             vec![AggregatedAttestation {
                 aggregation_bits: make_proof_for_validator(0).participants,
-                data: on_chain_data.clone(),
+                data: carried.clone(),
             }],
         );
+        let head = block.message.hash_tree_root();
         store
-            .insert_signed_block(block.message.hash_tree_root(), block)
+            .insert_signed_block(head, block)
             .expect("insert signed block");
 
         // A later attestation from the same validator, still only in the pool.
@@ -2253,18 +2429,19 @@ mod tests {
         );
         store.promote_new_aggregated_payloads();
 
-        let on_chain = store.extract_on_chain_votes();
+        let window = store.extract_head_vote_window(head, 3);
         assert_eq!(
-            on_chain[&0], on_chain_data,
-            "the pool must not advance the on-chain baseline"
+            window.votes[&0], carried,
+            "the pool must not advance the branch-relative baseline"
         );
         assert!(
-            fresher.supersedes(&on_chain[&0]),
-            "the pooled vote must read as new against what the chain carries"
+            fresher.supersedes(&window.votes[&0]),
+            "the pooled vote must read as new against what the branch carries"
         );
         assert!(
             !fresher.supersedes(&store.extract_latest_known_attestations()[&0]),
-            "and must read as NOT new against known_votes, which is the bug this fixes"
+            "and must read as NOT new against known_votes, which is the bug \
+             this baseline exists to avoid"
         );
     }
 
