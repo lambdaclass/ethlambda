@@ -12,16 +12,18 @@
 //! # One aggregate type, grouped by slot
 //!
 //! leanVM has a single `AggregateSignature`, whose XMSS claims are grouped by
-//! epoch: one [`XmssGroup`] per slot, carrying the one message signed at it and
-//! the group's strictly sorted, deduplicated keys. Type-1 and Type-2 are the
-//! same object here, one group versus several, and the wrappers below only
-//! differ in how many groups they build.
+//! `(epoch, message)`. This crate builds one [`XmssGroup`] per slot, carrying
+//! the one message signed at it and the group's strictly sorted, deduplicated
+//! keys. Type-1 and Type-2 are the same object here, one group versus several,
+//! and the wrappers below only differ in how many groups they build.
 //!
 //! Two consequences run through everything in this module:
 //!
 //! - **A slot carries one message.** Several distinct `AttestationData` at one
-//!   slot have no representation inside a single aggregate; that is
-//!   [`ConflictingMessages`].
+//!   slot have no representation inside a single aggregate built here; that is
+//!   [`ConflictingMessages`]. leanVM itself stopped requiring this: it groups
+//!   by `(epoch, message)`, so the restriction is this crate's, not the
+//!   prover's.
 //! - **The binding travels out of band.** The without-pubkeys wire form carries
 //!   neither the keys nor the `(slot, message)` pairs, so a decode has to
 //!   rebuild the whole signer set from the caller's own view of it (a
@@ -120,9 +122,10 @@ impl SignerSet {
 
 /// Two claims at one slot carrying different messages.
 ///
-/// leanVM keys an aggregate's XMSS groups by epoch, so inside one proof the
-/// message is a function of the slot. Nothing in this crate can work around it:
-/// the group holds a single message, so the second claim has nowhere to go.
+/// leanVM keys an aggregate's XMSS groups by `(epoch, message)` and would take
+/// both claims, but everything here builds one group per slot, so inside a
+/// proof this crate assembles the message is a function of the slot: the group
+/// holds a single message, and the second claim has nowhere to go.
 #[derive(Debug, Clone, Copy, Error)]
 #[error("slot {slot} carries two different messages in one aggregate")]
 pub struct ConflictingMessages {
@@ -215,6 +218,8 @@ fn wire_keys(components: &[SignerSet]) -> Result<SignatureClaims, ConflictingMes
     for group in &mut groups {
         sort_dedup(&mut group.keys);
     }
+    // leanVM wants the groups strictly increasing on `(epoch, message)`; one
+    // group per slot makes the epoch alone a strict order.
     groups.sort_unstable_by_key(|group| group.epoch);
     Ok(SignatureClaims {
         xmss: groups,

@@ -283,12 +283,14 @@ actual_slot = finalized_slot + 1 + relative_index
   a client on the matching revision, and no file size changes when the scheme
   does, so the manifest records `leanvm_rev`. See [`docs/keygen.md`](docs/keygen.md)
 
-**Aggregation shape (one leanVM `AggregateSignature`, grouped by epoch):**
+**Aggregation shape (one leanVM `AggregateSignature`, grouped by `(epoch, message)`):**
 - Type-1 and Type-2 are the same object: one `XmssGroup` per slot, carrying the
   one message signed at it and that group's sorted, deduplicated keys
 - **A slot carries one message.** Two distinct `AttestationData` at one slot
-  cannot share an aggregate; `ethlambda_crypto::ConflictingMessages` says so, and
-  nothing below it can work around the constraint
+  cannot share an aggregate built here; `ethlambda_crypto::ConflictingMessages`
+  says so. leanVM lifted the constraint in `48a90420` (groups are keyed by
+  `(epoch, message)`), so it is now the wrapper's, and nothing below the wrapper
+  enforces it
 - **The binding is off the wire.** `to_bytes_without_pubkeys()` carries neither
   the keys nor the `(slot, message)` pairs, so every decode rebuilds the whole
   signer set from a `SignerSet` per claim. A wrong set, message or slot decodes
