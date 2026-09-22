@@ -6,7 +6,12 @@ ethlambda exposes HTTP over **two independent [Axum](https://github.com/tokio-rs
 - **Metrics & debug server** — Prometheus metrics and heap-profiling endpoints. No store access.
 
 
-All consensus API paths are versioned under the `/lean/v0` prefix. Roots are serialized as `0x`-prefixed hex strings.
+Which API server a node serves follows from its store's chain tag, not from the
+sub-command: `ethlambda node` serves the lean surface under `/lean/v0`,
+`ethlambda beacon` serves the [Beacon API](#beacon-api-server-5052-on-ethlambda-beacon)
+under `/eth/v1` and `/eth/v2`. The two are alternatives, never merged, because the
+lean handlers read state variants and metadata keys a beacon directory does not
+carry. Roots are serialized as `0x`-prefixed hex strings on both.
 
 ## Servers & Ports
 
@@ -26,7 +31,7 @@ If `--api-port` and `--metrics-port` are equal, all routers are merged onto a si
 | `GET` | `/lean/v0/config/spec` | JSON | Protocol constants the node runs with |
 | `GET` | `/lean/v0/genesis` | JSON | Genesis time and validator count |
 | `GET` | `/lean/v0/states/finalized` | SSZ | Latest finalized `State` |
-| `GET` | `/lean/v0/blocks/finalized` | SSZ | Latest finalized `SignedBlock` |
+| `GET` | `/lean/v0/blocks/finalized` | SSZ, or JSON on request | Latest finalized `SignedBlock` |
 | `GET` | `/lean/v0/checkpoints/justified` | JSON | Latest justified `Checkpoint` |
 | `GET` | `/lean/v0/events` | SSE | Live stream of chain events |
 | `GET` | `/lean/v0/blocks/{block_id}` | JSON | Block by root or slot |
@@ -210,6 +215,65 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 | `503` | Aggregator controller not wired (does not occur in normal `main.rs` boot) |
 
 > **Note:** Runtime toggles do **not** resubscribe gossip subnets, which are frozen at startup. A standby aggregator should boot with `--is-aggregator=true` (so subscriptions are in place), then use this endpoint to rotate duties. See the CLAUDE.md "Runtime Aggregator Toggle" notes for the operational model.
+
+## Beacon API Server (`:5052`, on `ethlambda beacon`)
+
+The subset of the [Ethereum Beacon API](https://ethereum.github.io/beacon-APIs/)
+that this follower can answer from its own store. It **replaces** the `/lean/v0`
+surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
+`404`.
+
+| Method | Path | Response | Description |
+|--------|------|----------|-------------|
+| `GET` | `/eth/v2/beacon/blocks/{block_id}` | JSON or SSZ | `SignedBeaconBlock` at `block_id` |
+| `GET` | `/eth/v1/beacon/blocks/{block_id}/root` | JSON | That block's root |
+| `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
+| `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
+| `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
+| `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
+| `GET` | `/eth/v1/config/spec` | JSON | The `Config` the store was bootstrapped with |
+| `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
+| `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
+| `GET` | `/eth/v1/node/version` | JSON | Client version string |
+| `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
+
+### Encoding
+
+**JSON is the default**; SSZ is served on `Accept: application/octet-stream`,
+which is the order lighthouse serves. An `Accept` listing both is ranked by its
+`q` weights. Every response carrying a fork-versioned container also sets
+`Eth-Consensus-Version` to the lowercase fork name, in both encodings, since SSZ
+carries no type tag.
+
+JSON here follows the Beacon API's own encoding, which is **not** the lean
+surface's: every integer is a quoted decimal string, byte strings are
+`0x`-prefixed hex, and `Uint256` is quoted decimal rather than hex. Errors are
+`{"code": ..., "message": ...}`, where the lean surface uses `{"error": ...}`.
+
+Serving `/eth/v2/debug/beacon/states/finalized` as SSZ is what makes this client
+checkpoint-syncable from itself: it is the exact path
+[`checkpoint_sync.rs`](./checkpoint_sync.md) fetches from other clients.
+
+### Accepted ids, and three that are refused
+
+`block_id` and `state_id` accept `head`, `finalized`, `justified`, a slot
+number, and a `0x`-prefixed 32-byte root. Two cases are deliberate refusals,
+both recorded in [Spec Deviations](./spec_deviations.md):
+
+- **`genesis`** is a `404` on either id. `Table::BlockRoots` indexes the
+  canonical branch above the store's anchor, and the anchor's own slot is never
+  written to it; a checkpoint-synced directory has no genesis block either way.
+- **A `state_id` given as a `0x…` root** is a `404`: states are keyed by *block*
+  root here, with no reverse index. The refusal names the ids that do work.
+
+The **anchor's own slot** does resolve, despite being absent from that index:
+the lookup falls back to the roots the store can name and accepts one only when
+the block under it really sits at that slot. This matters because it is the
+slot a checkpoint-syncing peer asks for right after reading the finalized
+state. A slot the store holds nothing at is still a `404`.
+
+`/eth/v1/node/identity` reports `peer_id` and `metadata`; `enr`,
+`p2p_addresses` and `discovery_addresses` are empty.
 
 ## Metrics & Debug Server (`:5054`)
 

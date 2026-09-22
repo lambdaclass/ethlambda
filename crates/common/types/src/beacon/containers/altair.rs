@@ -82,8 +82,11 @@ pub type SyncSubcommitteeBits =
 /// Carried in every altair-and-later [`BeaconBlockBody`], since every block
 /// needs one regardless of how many attestations or other operations it
 /// includes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SyncAggregate {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
     pub sync_committee_bits: SyncCommitteeBits,
     /// The aggregate of every signature from a member set in
     /// `sync_committee_bits`, over the previous slot's block root.
@@ -93,8 +96,9 @@ pub struct SyncAggregate {
 /// The committee currently responsible for signing sync aggregates, plus its
 /// combined key precomputed for the common case where every member
 /// participates.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SyncCommittee {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub pubkeys: SyncCommitteePubkeys,
     /// The aggregate of every key in `pubkeys`, so `process_sync_aggregate` does
     /// not have to re-aggregate from scratch when the whole committee signs.
@@ -107,7 +111,9 @@ pub struct SyncCommittee {
 
 /// The contents of a block: phase0's operations, plus the sync committee's
 /// contribution to this block.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct BeaconBlockBody {
     /// The proposer's contribution to the chain's randomness, which is a
     /// signature over the current epoch and so cannot be chosen freely.
@@ -116,10 +122,15 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub proposer_slashings: SszList<ProposerSlashing, { preset::MAX_PROPOSER_SLASHINGS }>,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub attester_slashings: SszList<AttesterSlashing, { preset::MAX_ATTESTER_SLASHINGS }>,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub attestations: SszList<Attestation, { preset::MAX_ATTESTATIONS }>,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub deposits: SszList<Deposit, { preset::MAX_DEPOSITS }>,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub voluntary_exits: SszList<SignedVoluntaryExit, { preset::MAX_VOLUNTARY_EXITS }>,
     /// The aggregated sync committee signature over the previous slot's block
     /// root, plus which members contributed. This is what lets a light client
@@ -129,9 +140,11 @@ pub struct BeaconBlockBody {
 }
 
 /// A block.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BeaconBlock {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub proposer_index: ValidatorIndex,
     pub parent_root: Root,
     /// The root of the state after this block is applied, which the state
@@ -140,7 +153,7 @@ pub struct BeaconBlock {
     pub body: BeaconBlockBody,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedBeaconBlock {
     pub message: BeaconBlock,
     pub signature: BlsSignature,
@@ -163,13 +176,15 @@ pub struct SignedBeaconBlock {
 /// (`List<ParticipationFlags, _>`) in those same two positions, keeps
 /// `justification_bits` through `finalized_checkpoint` unchanged, and appends
 /// `inactivity_scores`, `current_sync_committee`, and `next_sync_committee`.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BeaconState {
     // -- Versioning --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub genesis_time: u64,
     /// The root of the genesis validator registry, which separates this chain
     /// from any other running the same fork schedule.
     pub genesis_validators_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     pub fork: Fork,
 
@@ -178,25 +193,34 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub block_roots: BlockRoots,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub state_roots: StateRoots,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is where
     /// the next one will be read from.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub eth1_deposit_index: u64,
 
     // -- Registry --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub validators: Validators,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub balances: Balances,
 
     // -- Randomness --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub slashings: Slashings,
 
     // -- Participation --
@@ -206,12 +230,15 @@ pub struct BeaconState {
     /// it is processed instead of deferring to the epoch boundary, so there is
     /// no longer a backlog of whole attestations to keep around, only a flag
     /// per validator per epoch.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub previous_epoch_participation: EpochParticipation,
     /// Flags for the current epoch, which become `previous_epoch_participation`
     /// at the next epoch boundary.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
@@ -223,6 +250,7 @@ pub struct BeaconState {
     /// non-finalizing epoch and falls otherwise, which is what lets the
     /// inactivity leak single out validators who are actually offline rather
     /// than penalizing everyone during a stall.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -248,10 +276,14 @@ pub struct BeaconState {
 /// The sync committee analogue of a phase0 attestation, but unaggregated: a
 /// committee member gossips one of these every slot, and an aggregator
 /// combines a subcommittee's worth into a [`SyncCommitteeContribution`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SyncCommitteeMessage {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     pub beacon_block_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub validator_index: ValidatorIndex,
     pub signature: BlsSignature,
 }
@@ -263,11 +295,14 @@ pub struct SyncCommitteeMessage {
 /// `SYNC_COMMITTEE_SUBNET_COUNT` aggregators work in parallel on disjoint
 /// slices of the committee, the same way phase0 attestation aggregation is
 /// scoped to one committee rather than the whole active set.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SyncCommitteeContribution {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     pub beacon_block_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subcommittee_index: u64,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
     pub aggregation_bits: SyncSubcommitteeBits,
     /// The aggregate signature of every member set in `aggregation_bits`, over
     /// `beacon_block_root`.
@@ -278,8 +313,9 @@ pub struct SyncCommitteeContribution {
 /// selected to produce it.
 ///
 /// The sync committee analogue of phase0's `AggregateAndProof`.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct ContributionAndProof {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregator_index: ValidatorIndex,
     pub contribution: SyncCommitteeContribution,
     /// The aggregator's signature over the selection data, which is what makes
@@ -287,7 +323,7 @@ pub struct ContributionAndProof {
     pub selection_proof: BlsSignature,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedContributionAndProof {
     pub message: ContributionAndProof,
     pub signature: BlsSignature,
@@ -298,9 +334,13 @@ pub struct SignedContributionAndProof {
 ///
 /// Separate from [`ContributionAndProof::selection_proof`]'s signature target
 /// only in name: this is the unsigned message that signature covers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SyncAggregatorSelectionData {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subcommittee_index: u64,
 }
 

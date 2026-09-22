@@ -201,6 +201,53 @@ pub enum BeaconState {
     Lean(crate::state::State),
 }
 
+/// Hand-written rather than derived, unlike its sibling
+/// [`SignedBeaconBlock`]'s `#[serde(untagged)]`.
+///
+/// Every beacon-fork variant still has to serialize as exactly the inner
+/// value, with no tag added: the fork travels in the Beacon API response
+/// envelope, as a `version` field and an `Eth-Consensus-Version` header, the
+/// same reasoning [`SignedBeaconBlock`]'s derive relies on. What differs is
+/// [`BeaconState::Lean`]. `SignedBeaconBlock::Lean` is real, servable JSON —
+/// `/lean/v0/blocks/finalized` answers it — but lean's *state* stays
+/// SSZ-only by design: `/lean/v0/states/finalized` serves SSZ and always
+/// will, so `crate::state::State` deliberately has no `Serialize` impl, and
+/// `#[derive(Serialize)]` here could not compile without inventing one.
+///
+/// So this impl lets every beacon fork serialize normally and turns the
+/// `Lean` arm into a serde error instead of a tag or a fabricated encoding.
+/// That mirrors how the lean/beacon split is enforced everywhere else in
+/// this crate: at the boundary, not in the type system —
+/// [`BeaconState::expect_lean`] panics, `dispatch_state!`'s `Lean` arm panics
+/// for beacon-only accessors, and this is the same boundary reached through
+/// serde instead of a direct call. A panic would be wrong here specifically
+/// because serialization is fallible in the caller's vocabulary already (an
+/// axum handler already has to handle a `serde_json::to_value` failure), so
+/// an `Err` is the gentler member of that family rather than a new one.
+///
+/// If a future refactor "simplifies" this back into a derive, it will hit
+/// the same missing-`Serialize`-on-`State` wall this impl exists to route
+/// around, on purpose.
+impl serde::Serialize for BeaconState {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            BeaconState::Phase0(state) => state.serialize(serializer),
+            BeaconState::Altair(state) => state.serialize(serializer),
+            BeaconState::Bellatrix(state) => state.serialize(serializer),
+            BeaconState::Capella(state) => state.serialize(serializer),
+            BeaconState::Deneb(state) => state.serialize(serializer),
+            BeaconState::Electra(state) => state.serialize(serializer),
+            BeaconState::Fulu(state) => state.serialize(serializer),
+            BeaconState::Lean(_) => Err(serde::ser::Error::custom(
+                "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
+            )),
+        }
+    }
+}
+
 impl BeaconState {
     /// The lean [`State`](crate::state::State) this value wraps.
     ///
@@ -670,7 +717,24 @@ impl BeaconState {
 /// dispatches on fork therefore still needs to be able to tell a fulu block
 /// from an electra one, even though both carry the identical
 /// `electra::SignedBeaconBlock` payload.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `#[serde(untagged)]`: the Beacon API's response envelope carries the fork
+/// name as `version` and as the `Eth-Consensus-Version` header, never as a
+/// tag inside the block object, so serializing this enum must produce
+/// exactly the inner value's JSON with no variant wrapper.
+/// [`SignedBeaconBlock::Fulu`] and [`SignedBeaconBlock::Electra`] wrap the
+/// identical `electra::SignedBeaconBlock` type, which is exactly why an
+/// *envelope* tag is required to distinguish them on the wire and a data tag
+/// would be actively wrong: `untagged` serialization always writes the
+/// active variant's payload, so this holds even for that pair.
+///
+/// Unlike [`BeaconState`]'s enum, a plain derive works here:
+/// [`SignedBeaconBlock::Lean`] is real, servable JSON —
+/// `/lean/v0/blocks/finalized` answers it — so `crate::block::SignedBlock`
+/// does implement `Serialize`, bare integers included. See `BeaconState`'s
+/// hand-written impl for the state side of this asymmetry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
 pub enum SignedBeaconBlock {
     Phase0(phase0::SignedBeaconBlock),
     Altair(altair::SignedBeaconBlock),
@@ -811,6 +875,23 @@ impl SignedBeaconBlock {
     /// does, re-exported under this module's own `Root` alias.
     pub fn message_hash_tree_root(&self) -> Root {
         dispatch_block_including_lean!(self, |block| block.message.hash_tree_root())
+    }
+
+    /// The `hash_tree_root` of this block's body.
+    ///
+    /// Not part of `signed_beacon_block_accessors!`, which hands back a field
+    /// verbatim: every fork stores a different body container, so what a
+    /// caller wants is the merkle root of whichever one this is, not a value
+    /// to compare directly. `/eth/v1/beacon/headers/{id}` answers with a
+    /// `SignedBeaconBlockHeader`, whose `body_root` is the one field the
+    /// other accessors here cannot produce.
+    ///
+    /// Answers for [`SignedBeaconBlock::Lean`] too, for the reason
+    /// [`SignedBeaconBlock::message_hash_tree_root`] gives: lean's `Block`
+    /// also has a `body`, which merkleizes through the same `HashTreeRoot`
+    /// blanket impl as every beacon fork's does.
+    pub fn body_root(&self) -> Root {
+        dispatch_block_including_lean!(self, |block| block.message.body.hash_tree_root())
     }
 }
 
@@ -984,6 +1065,25 @@ mod tests {
     }
 
     #[test]
+    fn a_lean_block_reports_its_body_root() {
+        let block = crate::block::SignedBlock {
+            message: crate::block::Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: crate::primitives::H256::ZERO,
+                state_root: crate::primitives::H256::ZERO,
+                body: crate::block::BlockBody::default(),
+            },
+            proof: crate::block::MultiMessageAggregate::default(),
+        };
+        let expected =
+            crate::primitives::HashTreeRoot::hash_tree_root(&crate::block::BlockBody::default());
+
+        let wrapped = SignedBeaconBlock::Lean(block);
+        assert_eq!(wrapped.body_root(), expected);
+    }
+
+    #[test]
     #[should_panic(expected = "lean block reached a beacon accessor")]
     fn a_lean_block_has_no_bls_signature() {
         // A lean block carries a MultiMessageAggregate proof, not a
@@ -1139,5 +1239,24 @@ mod tests {
         let expected = ExecutionBlockHash::repeat_byte(7);
         let block = SignedBeaconBlock::Fulu(empty_electra_signed_block(expected));
         assert_eq!(block.execution_block_hash(), Some(expected));
+    }
+
+    // -- body_root --
+
+    #[test]
+    fn a_beacon_blocks_body_root_is_its_bodys_own_merkle_root() {
+        // Computed independently of `body_root`'s own implementation, through
+        // the raw `libssz_merkle` trait rather than this crate's convenience
+        // wrapper, so a body_root that only ever ran on the lean arm would be
+        // caught here rather than passing by construction.
+        let signed = empty_phase0_signed_block();
+        let body = signed.message.body.clone();
+        let expected = crate::primitives::H256(libssz_merkle::HashTreeRoot::hash_tree_root(
+            &body,
+            &libssz_merkle::Sha2Hasher,
+        ));
+
+        let block = SignedBeaconBlock::Phase0(signed);
+        assert_eq!(block.body_root(), expected);
     }
 }

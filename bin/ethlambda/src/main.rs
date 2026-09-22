@@ -640,18 +640,36 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
 
+    // Which HTTP surface this node serves follows from the store's own chain
+    // tag rather than from the sub-command, so the two can never disagree.
+    // A beacon node served `/lean/v0` until now, off a store those handlers
+    // cannot read: they reach for lean state variants and metadata keys a
+    // beacon directory never carries, so calling one panicked that request.
+    let serves_beacon_api = setup.store.chain() == ethlambda_storage::Chain::Beacon;
+
     let http = tokio::spawn(async move {
-        let _ = ethlambda_rpc::start_rpc_server(
-            rpc_config,
-            rpc_store,
-            rpc_aggregator,
-            rpc_sync_status,
-            local_peer_id,
-            rpc_events,
-            rpc_shutdown,
-        )
-        .await
-        .inspect_err(|err| error!(%err, "RPC server failed"));
+        let served = if serves_beacon_api {
+            ethlambda_rpc::start_beacon_rpc_server(
+                rpc_config,
+                rpc_store,
+                rpc_sync_status,
+                local_peer_id,
+                rpc_shutdown,
+            )
+            .await
+        } else {
+            ethlambda_rpc::start_rpc_server(
+                rpc_config,
+                rpc_store,
+                rpc_aggregator,
+                rpc_sync_status,
+                local_peer_id,
+                rpc_events,
+                rpc_shutdown,
+            )
+            .await
+        };
+        let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
     let blockchain = match setup.chain {

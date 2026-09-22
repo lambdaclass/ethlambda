@@ -362,12 +362,12 @@ whose `blockchain` is still `None` and is dropped; every access is an `if let
 Some`, and the window is a handful of statements. And `beacon` now binds
 `--api-port` off a real, DB-backed anchored `Store`, not an empty in-memory
 placeholder: checkpoint sync or resume gives it one, the same way `node` gets
-its own. The lean-shaped `/lean/v0/...` routes still don't answer for it,
-though: they read metadata keys and state variants a beacon directory never
-carries, so calling one of them, e.g. `GET /lean/v0/states/finalized`, panics
-that request rather than quietly answering for a chain that is not running.
-That panic is deliberate, not an accepted placeholder: failing loudly beats
-making up an answer in a lean shape for a chain that does not keep one.
+its own, and it serves the **Beacon API** off it rather than the lean-shaped
+`/lean/v0/...` routes, which read metadata keys and state variants a beacon
+directory never carries. Which surface a node serves follows from
+`Store::chain()`, not from the sub-command, so the two cannot disagree; a
+`/lean/v0` path on a `beacon` run is a 404 rather than the panicked request it
+used to be.
 
 `RunningNode.blockchain` is a plain `BlockChain`, not an `Option`: the beacon
 follower runs a chain actor too, so there is always exactly one to stop and
@@ -434,22 +434,32 @@ The RPC crate serves the API router (`--api-port`, default 5052) and the metrics
 when they are equal it merges all three routers onto a single listener, so pointing both flags at
 one port is supported and not a misconfiguration.
 
-Both sub-commands bind through one call to `start_rpc_server`, from one site in `run_node`, so
-both serve all three routers. `beacon` reaches it with real handles now: the DB-backed anchored
-`Store` its `P2PServer` already holds (checkpoint sync or resume gave it one, the same way `node`
-gets its own), plus clones of the same `SyncStatusController` and `EventBus` its chain actor
-writes to, so the follower's own sync status and chain events are what these report. Only the
-`AggregatorController`, seeded `false`, stays a placeholder: this chain has no aggregator duty to
-toggle. The lean-shaped `/lean/v0/...` routes still
-don't answer for a `beacon` run, though: they read metadata keys and state variants a beacon
-directory never carries, so calling one panics that request rather than answering for a chain that
-is not running (see "One startup path for both chains" above). That is deliberate for now, to keep
-one HTTP call site rather than two; giving the beacon follower its own surface is a change of its
-own. `start_http_servers(config, api_router, shutdown)` still takes `api_router` as an `Option` and
-`crates/net/rpc/tests/http_servers.rs` still covers the `None` arm, because that is the shape the
-beacon follower returns to once it has a surface of its own.
+Both sub-commands bind from one site in `run_node`, which picks the API router by
+`Store::chain()` rather than by sub-command, so the surface and the data behind it cannot
+disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
+`start_beacon_rpc_server` and gets the **Beacon API** under `/eth/v1` and `/eth/v2`
+(`crates/net/rpc/src/beacon/`, one file per endpoint group). Both reach it with real
+handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
+same `SyncStatusController` the chain actor writes to. The beacon arm takes no
+`AggregatorController` and no `EventBus`, because a follower has no aggregator duty to
+toggle and the chain-events stream is part of the lean surface.
 
-See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
+The two API routers are alternatives, never merged. A `/lean/v0` path on a `beacon` run is
+a 404: those handlers read lean state variants and metadata keys a beacon directory never
+carries, so serving both off one store would answer lean questions with beacon data, or
+panic trying. `crates/net/rpc/tests/http_servers.rs` pins both halves of that.
+`start_http_servers(config, api_router, shutdown)` still takes `api_router` as an `Option`
+and that test still covers the `None` arm, which is now the test-driver-less shape rather
+than the beacon one.
+
+Encoding differs between the two surfaces, deliberately. The Beacon API serves **JSON by
+default** and SSZ on `Accept: application/octet-stream`, quotes every integer, and tags
+fork-versioned responses with `Eth-Consensus-Version`. The lean surface keeps **SSZ as the
+default** on its two SSZ endpoints and bare integers in JSON, because
+`checkpoint_sync.rs` and other clients' lean sync read those bytes and may send no
+`Accept` at all; `/lean/v0/blocks/finalized` now answers JSON when asked for it by name.
+
+See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults, the lean API endpoints (health, finalized state/block, justified checkpoint, blocks by root/slot, fork-choice tree + D3.js UI, runtime aggregator toggle), the Beacon API endpoints and the three ids they refuse, the metrics/debug endpoints (Prometheus `/metrics`, jemalloc heap profiling), the Hive test-driver endpoints, plus request/response shapes, status codes, and content types.
 
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 

@@ -2080,6 +2080,7 @@ dependencies = [
  "http-body-util",
  "jemalloc_pprof",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "serde",
  "serde_json",
  "tokio",

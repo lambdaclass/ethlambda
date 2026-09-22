@@ -93,13 +93,18 @@ pub type HistoricalSummaries = SszList<HistoricalSummary, { preset::HISTORICAL_R
 /// Both versions are kept because a signature is verified under the fork version
 /// in effect when the message was signed, so a message from just before a fork
 /// boundary still verifies just after it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct Fork {
     /// The version in effect before [`Fork::epoch`].
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub previous_version: Version,
     /// The version in effect from [`Fork::epoch`] onward.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub current_version: Version,
     /// The epoch at which `current_version` took effect.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub epoch: Epoch,
 }
 
@@ -108,16 +113,22 @@ pub struct Fork {
 ///
 /// Including the genesis validators root is what separates two chains running
 /// the same fork schedule: a signature from one never verifies on the other.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct ForkData {
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub current_version: Version,
     pub genesis_validators_root: Root,
 }
 
 /// An epoch and the block root at its start: what attestations vote on and what
 /// justification and finalization track.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct Checkpoint {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub epoch: Epoch,
     /// The root of the first block of [`Checkpoint::epoch`], or of the most
     /// recent block before it if that slot was empty.
@@ -125,7 +136,9 @@ pub struct Checkpoint {
 }
 
 /// A registry entry for one validator.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct Validator {
     /// The key attestations and proposals are signed with.
     pub pubkey: BlsPubkey,
@@ -136,29 +149,38 @@ pub struct Validator {
     /// real balance rounded down to a multiple of `EFFECTIVE_BALANCE_INCREMENT`
     /// and capped. Rounding with hysteresis is what keeps the merkle tree from
     /// being redirtied by every small balance change.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub effective_balance: Gwei,
     pub slashed: bool,
     /// The epoch the validator's balance first reached the activation minimum,
     /// making it a candidate for activation. Distinct from
     /// [`Validator::activation_epoch`], which is when the churn limit actually
     /// let it in: eligibility is immediate, activation is queued.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub activation_eligibility_epoch: Epoch,
     /// The epoch the validator became active.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub activation_epoch: Epoch,
     /// The epoch the validator stops being active.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub exit_epoch: Epoch,
     /// The epoch the validator's balance may be withdrawn, which lags
     /// [`Validator::exit_epoch`] so that slashable offences remain punishable
     /// for a while after exit.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub withdrawable_epoch: Epoch,
 }
 
 /// What an attestation actually attests to.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct AttestationData {
     /// The slot being attested for.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     /// Which of the slot's committees the attester belongs to.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub index: CommitteeIndex,
     /// The attester's view of the head of the chain, which is the LMD GHOST
     /// vote.
@@ -172,12 +194,15 @@ pub struct AttestationData {
 }
 
 /// The execution chain's deposit state, as voted on by proposers.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct Eth1Data {
     /// The deposit contract's merkle root at this point.
     pub deposit_root: Root,
     /// The total number of deposits the contract has ever seen, not the number
     /// still unprocessed.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_count: u64,
     pub block_hash: Root,
 }
@@ -187,18 +212,24 @@ pub struct Eth1Data {
 ///
 /// The specification defines only these three fields and notes the rest are
 /// omitted, since nothing in consensus reads them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct Eth1Block {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub timestamp: u64,
     pub deposit_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_count: u64,
 }
 
 /// A window of block and state roots, whose root is appended to
 /// [`HistoricalRoots`] once the window is full.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct HistoricalBatch {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub block_roots: BlockRoots,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub state_roots: StateRoots,
 }
 
@@ -208,7 +239,9 @@ pub struct HistoricalBatch {
 /// Keeping the two roots separately, rather than hashing them together as
 /// [`HistoricalBatch`] does, is what lets a light client prove a block root
 /// against history without also having the state roots.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct HistoricalSummary {
     pub block_summary_root: Root,
     pub state_summary_root: Root,
@@ -216,9 +249,12 @@ pub struct HistoricalSummary {
 
 /// A root paired with the domain it is signed under, hashed together to give the
 /// message a signature actually covers.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SigningData {
     pub object_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub domain: Domain,
 }
 
@@ -231,18 +267,24 @@ pub struct SigningData {
 /// Separate from [`DepositData`] precisely because the signature cannot cover
 /// itself: the signature in `DepositData` is over the `DepositMessage` with the
 /// same fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct DepositMessage {
     pub pubkey: BlsPubkey,
     pub withdrawal_credentials: Bytes32,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub amount: Gwei,
 }
 
 /// A deposit as recorded by the deposit contract.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct DepositData {
     pub pubkey: BlsPubkey,
     pub withdrawal_credentials: Bytes32,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub amount: Gwei,
     /// Proof of possession over the corresponding [`DepositMessage`]. An invalid
     /// signature does not make the deposit invalid: it is simply not credited to
@@ -252,8 +294,9 @@ pub struct DepositData {
 }
 
 /// A deposit together with its merkle proof against the deposit contract root.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Deposit {
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub proof: DepositProof,
     pub data: DepositData,
 }
@@ -264,9 +307,13 @@ pub struct Deposit {
 
 /// A block without its body, which is what the state retains and what proposer
 /// slashings compare.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct BeaconBlockHeader {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub proposer_index: ValidatorIndex,
     pub parent_root: Root,
     /// The root of the state after applying this block. Left zero in the state's
@@ -278,28 +325,38 @@ pub struct BeaconBlockHeader {
     pub body_root: Root,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SignedBeaconBlockHeader {
     pub message: BeaconBlockHeader,
     pub signature: BlsSignature,
 }
 
 /// Evidence that a proposer signed two different blocks for the same slot.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct ProposerSlashing {
     pub signed_header_1: SignedBeaconBlockHeader,
     pub signed_header_2: SignedBeaconBlockHeader,
 }
 
 /// A validator's request to stop validating.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct VoluntaryExit {
     /// The earliest epoch the exit may be processed at.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub epoch: Epoch,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub validator_index: ValidatorIndex,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,
     pub signature: BlsSignature,

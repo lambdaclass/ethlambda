@@ -106,16 +106,27 @@ pub type RowIndex = u64;
 /// the commitments directly, and `kzg_commitments_inclusion_proof` is enough
 /// to check that those commitments are the ones the block actually committed
 /// to, via `signed_block_header`.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct DataColumnSidecar {
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub index: ColumnIndex,
+    /// A [`DataColumn`] is a `SszList<Cell, N>`, and `Cell` is itself a
+    /// foreign `SszVector<u8, N>` with no `Serialize` of its own, so this
+    /// needs the per-element hex adapter rather than [`seq`](crate::beacon::serde_helpers::seq)
+    /// (which requires each element to already implement `Serialize`) or
+    /// [`ssz_hex`](crate::beacon::serde_helpers::ssz_hex) (which would hex-encode
+    /// the whole list as one string instead of one string per cell).
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
     pub column: DataColumn,
     /// The block's full `blob_kzg_commitments`, repeated in every one of that
     /// block's sidecars rather than fetched separately, which is what lets a
     /// sidecar be checked on its own.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub kzg_commitments: KzgCommitments,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub kzg_proofs: KzgProofs,
     pub signed_block_header: SignedBeaconBlockHeader,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub kzg_commitments_inclusion_proof: KzgCommitmentsInclusionProof,
 }
 
@@ -127,19 +138,30 @@ pub struct DataColumnSidecar {
 /// names a single cell independent of that grouping, which is the form
 /// `compute_matrix` and `recover_matrix` operate on when demonstrating how a
 /// node might store and reconstruct the matrix.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct MatrixEntry {
+    /// One byte string, not a sequence of them: [`Cell`] is a foreign
+    /// `SszVector<u8, N>` with no `Serialize` of its own, so this is exactly
+    /// what [`ssz_hex`](crate::beacon::serde_helpers::ssz_hex) exists for,
+    /// unlike [`DataColumnSidecar::column`], which holds a whole list of
+    /// cells.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
     pub cell: Cell,
     pub kzg_proof: KzgProof,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub column_index: ColumnIndex,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub row_index: RowIndex,
 }
 
 /// A request for specific columns of a specific block, used by the
 /// `DataColumnSidecarsByRoot` request-response protocol.
-#[derive(Debug, Clone, Default, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+)]
 pub struct DataColumnsByRootIdentifier {
     pub block_root: Root,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub columns: ColumnIndices,
 }
 
@@ -158,13 +180,15 @@ pub struct DataColumnsByRootIdentifier {
 /// field for field; `proposer_lookahead` is appended after it rather than
 /// inserted anywhere earlier, so nothing electra already committed to shifts
 /// position.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BeaconState {
     // -- Versioning --
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub genesis_time: u64,
     /// The root of the genesis validator registry, which separates this chain
     /// from any other running the same fork schedule.
     pub genesis_validators_root: Root,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
     pub fork: Fork,
 
@@ -173,41 +197,53 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub block_roots: BlockRoots,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub state_roots: StateRoots,
     /// Frozen since capella: further history is committed to by
     /// `historical_summaries` instead. Kept rather than removed so a fulu
     /// state's shape stays hash-tree-root-compatible with every root
     /// committed while this field was still growing.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is
     /// where the next one will be read from.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub eth1_deposit_index: u64,
 
     // -- Registry --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub validators: Validators,
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub balances: Balances,
 
     // -- Randomness --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub slashings: Slashings,
 
     // -- Participation --
     /// Per-validator participation flags for the previous epoch, positionally
     /// parallel to `validators`. See altair for why this replaces phase0's
     /// accumulated attestations.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub previous_epoch_participation: EpochParticipation,
     /// Flags for the current epoch, which become `previous_epoch_participation`
     /// at the next epoch boundary.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
+    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
@@ -215,6 +251,7 @@ pub struct BeaconState {
 
     // -- Inactivity --
     /// Per-validator inactivity score, positionally parallel to `validators`.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -235,12 +272,15 @@ pub struct BeaconState {
     /// Where the withdrawal sweep across `validators` last stopped, so
     /// `get_expected_withdrawals` resumes from here each slot instead of
     /// rescanning the registry from the start.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub next_withdrawal_index: WithdrawalIndex,
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub next_withdrawal_validator_index: ValidatorIndex,
 
     // -- History (capella) --
     /// The commitment to history from capella onward, appended to instead of
     /// `historical_roots` once that field was frozen.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub historical_summaries: HistoricalSummaries,
 
     // -- Deposits, exits, and consolidations (electra) --
@@ -248,27 +288,36 @@ pub struct BeaconState {
     /// crediting `Eth1Data` votes to crediting execution layer deposit
     /// requests directly, or `UNSET_DEPOSIT_REQUESTS_START_INDEX` before the
     /// first request arrives.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_requests_start_index: u64,
     /// Deposit churn left over from the current epoch's activation queue,
     /// carried into the next epoch rather than wasted.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_balance_to_consume: Gwei,
     /// Exit churn left over from the current epoch's exit queue, carried
     /// forward the same way as `deposit_balance_to_consume`.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub exit_balance_to_consume: Gwei,
     /// The earliest epoch the exit queue has not yet exhausted its churn for.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub earliest_exit_epoch: Epoch,
     /// Consolidation churn left over from the current epoch's consolidation
     /// queue.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub consolidation_balance_to_consume: Gwei,
     /// The earliest epoch the consolidation queue has not yet exhausted its
     /// churn for.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub earliest_consolidation_epoch: Epoch,
     /// Deposits credited on the execution layer but not yet applied to the
     /// registry, drained a bounded number at a time each epoch.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub pending_deposits: PendingDeposits,
     /// Partial withdrawals requested but not yet paid out.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub pending_partial_withdrawals: PendingPartialWithdrawals,
     /// Validator consolidations requested but not yet applied.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
     pub pending_consolidations: PendingConsolidations,
 
     // -- Proposer lookahead (fulu) --
@@ -277,6 +326,7 @@ pub struct BeaconState {
     /// epoch boundary by `process_proposer_lookahead` so that
     /// `get_beacon_proposer_index` becomes a lookup into this vector rather
     /// than a shuffle computed on demand.
+    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
     pub proposer_lookahead: ProposerLookahead,
 }
 

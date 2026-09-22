@@ -21,6 +21,7 @@ use core::{cmp::Ordering, fmt};
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
+use super::serde_helpers::HexPrefixed;
 pub use crate::primitives::{H256, HashTreeRoot};
 
 /// A slot number.
@@ -217,6 +218,19 @@ impl U256 {
         }
         Ok(Self(bytes))
     }
+
+    /// The value as decimal digits, which is how the Beacon API writes it.
+    ///
+    /// A thin wrapper over the [`Display`](fmt::Display) impl above, kept as
+    /// its own named method for callers reading `crates/common/types` that
+    /// want an owned decimal `String` without needing to know `U256`
+    /// implements `Display` to reach for `.to_string()`. The `Serialize` impl
+    /// bypasses this and goes through `Display` directly via `collect_str`,
+    /// since going through this method first would allocate the `String`
+    /// `collect_str` exists to avoid.
+    pub fn to_decimal_string(&self) -> String {
+        self.to_string()
+    }
 }
 
 impl From<u64> for U256 {
@@ -260,6 +274,63 @@ impl fmt::LowerHex for U256 {
 impl fmt::Debug for U256 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "U256(0x{self:x})")
+    }
+}
+
+impl fmt::Display for U256 {
+    /// Decimal digits, most significant first: the form the Beacon API writes
+    /// a `uint256` in (see the [`Serialize`](serde::Serialize) impl below,
+    /// which is the whole reason this exists rather than only [`fmt::LowerHex`]
+    /// above).
+    ///
+    /// Long division by 10 over the big-endian bytes: the value is 256 bits,
+    /// so no primitive integer holds it and no `u128` shortcut is correct.
+    /// `(remainder << 8) | u16::from(byte)` needs `remainder` wide enough to
+    /// hold that shift: `remainder` is always a base-10 digit (at most 9), so
+    /// the widest case is `9 << 8 | 255 = 2559`, which fits `u16` with room to
+    /// spare.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut digits = self.0;
+        digits.reverse(); // stored little-endian; divide big-endian
+        let mut out = Vec::new();
+
+        while digits.iter().any(|byte| *byte != 0) {
+            let mut remainder = 0u16;
+            for byte in digits.iter_mut() {
+                let current = (remainder << 8) | u16::from(*byte);
+                *byte = (current / 10) as u8;
+                remainder = current % 10;
+            }
+            out.push(b'0' + remainder as u8);
+        }
+
+        if out.is_empty() {
+            return f.write_str("0");
+        }
+        out.reverse();
+        // `out` holds only ASCII digits `b'0'..=b'9'`, so this cannot fail.
+        f.write_str(std::str::from_utf8(&out).expect("ascii digits"))
+    }
+}
+
+impl serde::Serialize for U256 {
+    /// Always written as a quoted decimal string, the same convention
+    /// [`super::serde_helpers::quoted_or_bare::serialize`] uses for the `u64`
+    /// spec aliases.
+    ///
+    /// Routes through `collect_str` over the [`Display`](fmt::Display) impl
+    /// above rather than `serialize_str(&self.to_decimal_string())`: the
+    /// latter allocates a `String` up front, but serde_json overrides
+    /// `collect_str` to format straight into its output buffer, so on that
+    /// (our) backend this allocates nothing. `uint256` fields
+    /// (`total_difficulty`, `base_fee_per_gas`) appear once per execution
+    /// payload header, not per validator, but the adapter is free, so there
+    /// is no reason to pay for a `String` here either.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
     }
 }
 
@@ -379,6 +450,41 @@ impl fmt::Debug for KzgProof {
     }
 }
 
+/// Implements the Beacon API's `Serialize` for a fixed-width byte newtype:
+/// `0x`-prefixed lowercase hex, always, of the inner bytes.
+///
+/// A macro over the list rather than five copies of the same four lines,
+/// mirroring [`debug_byte_vector`] above: [`H160`], [`BlsPubkey`],
+/// [`BlsSignature`], [`KzgCommitment`], and [`KzgProof`] share no trait to hang
+/// a blanket impl on that would not also catch [`H256`] (re-exported into this
+/// module), which already carries its own hand-written `Serialize` and must
+/// keep it untouched.
+///
+/// Routes through [`HexPrefixed`] and `collect_str` rather than
+/// `serialize_str(&format!("0x{}", hex::encode(&self.0)))`, for the same
+/// reason [`super::serde_helpers::hex_array::serialize`] does: the `format!`
+/// route allocates twice per call (once in `hex::encode`, once in `format!`),
+/// but serde_json overrides `collect_str` to write straight into its output
+/// buffer, so on that (our) backend this allocates nothing. These types make
+/// every leaf of a signed block or a blob sidecar, so the saving is not
+/// theoretical.
+macro_rules! impl_hex_serialize {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl serde::Serialize for $ty {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    serializer.collect_str(&HexPrefixed(self.0.as_slice()))
+                }
+            }
+        )*
+    };
+}
+
+impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};
@@ -492,5 +598,59 @@ mod tests {
     fn uint256_debug_is_big_endian_hex() {
         assert_eq!(format!("{:?}", U256::ZERO), "U256(0x0)");
         assert_eq!(format!("{:?}", U256::from(258u64)), "U256(0x102)");
+    }
+
+    #[test]
+    fn byte_newtypes_serialize_as_prefixed_hex() {
+        let sig = BlsSignature([0xab; BLS_SIGNATURE_SIZE]);
+        let json = serde_json::to_string(&sig).unwrap();
+        assert!(json.starts_with(r#""0xabab"#), "got {json}");
+        assert_eq!(json.len(), BLS_SIGNATURE_SIZE * 2 + 4); // 0x + quotes
+
+        let address = H160([0x11; 20]);
+        assert_eq!(
+            serde_json::to_string(&address).unwrap(),
+            r#""0x1111111111111111111111111111111111111111""#
+        );
+    }
+
+    #[test]
+    fn uint256_serializes_as_a_quoted_decimal() {
+        // 32_000_000_000 Gwei, little-endian, the way SSZ stores it.
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&32_000_000_000u64.to_le_bytes());
+        assert_eq!(
+            serde_json::to_string(&U256(bytes)).unwrap(),
+            r#""32000000000""#
+        );
+    }
+
+    #[test]
+    fn a_large_uint256_does_not_lose_digits() {
+        // 2^128, which no u128 path would round-trip through f64.
+        let mut bytes = [0u8; 32];
+        bytes[16] = 1;
+        assert_eq!(
+            serde_json::to_string(&U256(bytes)).unwrap(),
+            r#""340282366920938463463374607431768211456""#
+        );
+    }
+
+    /// A zero byte in the *middle* of the value (not just trailing) is the case
+    /// most likely to break a long-division-by-10 implementation: any off-by-one
+    /// in how the carry propagates across a zero limb either drops digits or
+    /// inserts a spurious one. `2^136 + 1` sets the lowest byte and byte 17,
+    /// leaving sixteen zero bytes between two nonzero ones, which the other
+    /// three cases (a small value, a lone high bit, and their combination) do
+    /// not exercise: each of those has nonzero bytes only at one end.
+    #[test]
+    fn a_uint256_with_an_interior_zero_byte_round_trips_through_decimal() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 1;
+        bytes[17] = 1;
+        assert_eq!(
+            serde_json::to_string(&U256(bytes)).unwrap(),
+            r#""87112285931760246646623899502532662132737""#
+        );
     }
 }

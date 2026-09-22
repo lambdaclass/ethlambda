@@ -134,3 +134,81 @@ async fn a_cancelled_token_stops_the_server() {
         .expect("the server task joins")
         .expect("the server exits cleanly");
 }
+
+/// The beacon router answers where the lean one used to, and does **not**
+/// serve `/lean/v0`.
+///
+/// That absence is the point of the whole surface: the lean handlers read
+/// metadata keys and state variants a beacon directory never carries, so
+/// before this existed a beacon node's `--api-port` answered lean questions
+/// by panicking the request. A 404 is the honest answer for a chain that is
+/// not running.
+#[tokio::test]
+async fn the_beacon_router_replaces_the_lean_one() {
+    use axum::{body::Body, http::Request};
+    use ethlambda_types::beacon::{
+        config::Config,
+        containers::{SignedBeaconBlock, phase0},
+        primitives::Root,
+    };
+    use tower::ServiceExt as _;
+
+    const GENESIS_TIME: u64 = 1_606_824_023;
+    let slot = 64;
+
+    let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+        message: phase0::BeaconBlock {
+            slot,
+            proposer_index: 0,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body: phase0::BeaconBlockBody::default(),
+        },
+        signature: Default::default(),
+    });
+    let root = block.message_hash_tree_root();
+
+    let mut store = ethlambda_storage::Store::init_beacon(
+        std::sync::Arc::new(ethlambda_storage::backend::InMemoryBackend::default()),
+        GENESIS_TIME,
+        Config::mainnet(),
+        root,
+        ethlambda_types::checkpoint::Checkpoint { root, slot },
+        slot,
+    );
+    store
+        .insert_signed_block(root, block)
+        .expect("insert anchor block");
+
+    let router = ethlambda_rpc::build_beacon_api_router(store, "ethlambda/test", "peer".into())
+        .layer(axum::Extension(
+            ethlambda_blockchain::SyncStatusController::default(),
+        ));
+
+    let beacon = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/eth/v1/node/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(beacon.status(), axum::http::StatusCode::OK);
+
+    let lean = router
+        .oneshot(
+            Request::builder()
+                .uri("/lean/v0/node/syncing")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        lean.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "a beacon node must not serve the lean surface off a beacon store"
+    );
+}

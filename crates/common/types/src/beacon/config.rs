@@ -53,14 +53,16 @@ use crate::constants::INTERVALS_PER_SLOT;
 /// Modeled as a plain struct rather than a `(Epoch, u64)` tuple so that
 /// [`Config::max_blobs_per_block`]'s search reads as "find the entry", not
 /// "find the pair".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct BlobScheduleEntry {
     /// The first epoch this entry applies to.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub epoch: Epoch,
     /// The blob count limit from `epoch` onward.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_blobs_per_block: u64,
 }
 
@@ -79,23 +81,25 @@ pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 /// Construct one with [`Config::mainnet`], [`Config::minimal`], or
 /// [`Config::active`]; adjust a single fork's activation epoch with
 /// [`Config::with_fork_epoch`] for fixture-driven tests that need one.
-#[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", default)]
 pub struct Config {
     // -- Genesis construction ---------------------------------------------
     /// How many active validators the chain needs before it may start.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_genesis_active_validator_count: u64,
     /// The earliest wall-clock time the chain may start at, whatever the Eth1
     /// deposit history says.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_genesis_time: u64,
     /// How long after the Eth1 block that satisfies the genesis conditions the
     /// chain actually starts.
     ///
     /// The delay exists so that validators who deposited just before the
     /// threshold was crossed still have time to get their nodes running.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub genesis_delay: u64,
     /// The wall-clock second the chain's slot 0 began, which every slot
     /// boundary is computed from.
@@ -116,51 +120,51 @@ pub struct Config {
     /// mixed into `compute_fork_data_root` when computing the genesis
     /// validators root's domain, alongside the all-zero genesis validators
     /// root, at chain start.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub genesis_fork_version: Version,
     /// The `Fork.current_version` an altair block or attestation signs under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub altair_fork_version: Version,
     /// The epoch altair activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled on this network.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub altair_fork_epoch: Epoch,
     /// The `Fork.current_version` a bellatrix block or attestation signs
     /// under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub bellatrix_fork_version: Version,
     /// The epoch bellatrix (the Merge) activates at, or
     /// [`constants::FAR_FUTURE_EPOCH`] if it is not scheduled.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub bellatrix_fork_epoch: Epoch,
     /// The `Fork.current_version` a capella block or attestation signs under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub capella_fork_version: Version,
     /// The epoch capella activates at, or [`constants::FAR_FUTURE_EPOCH`] if
     /// it is not scheduled.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub capella_fork_epoch: Epoch,
     /// The `Fork.current_version` a deneb block or attestation signs under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub deneb_fork_version: Version,
     /// The epoch deneb activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deneb_fork_epoch: Epoch,
     /// The `Fork.current_version` an electra block or attestation signs
     /// under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub electra_fork_version: Version,
     /// The epoch electra activates at, or [`constants::FAR_FUTURE_EPOCH`] if
     /// it is not scheduled.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub electra_fork_epoch: Epoch,
     /// The `Fork.current_version` a fulu block or attestation signs under.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub fulu_fork_version: Version,
     /// The epoch fulu activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
     /// is not scheduled.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub fulu_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
@@ -169,77 +173,77 @@ pub struct Config {
     /// but still how `compute_time_at_slot` and the fork choice store's
     /// `genesis_time`-to-slot arithmetic convert between a slot number and a
     /// wall-clock time.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub seconds_per_slot: u64,
     /// Milliseconds per slot. What the fork choice store's timeliness
     /// checks (`get_attestation_due_ms` and friends) actually divide the
     /// `*_due_bps` fields below by; equal to `seconds_per_slot * 1000` on
     /// every network this crate ships a constructor for, but tracked
     /// separately because the specification does.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot_duration_ms: u64,
     /// The assumed seconds per execution-layer block, used to convert
     /// [`Self::eth1_follow_distance`] (a block count) into a voting-period
     /// safety margin.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub seconds_per_eth1_block: u64,
     /// Epochs a validator must wait after its exit is processed before its
     /// balance becomes withdrawable.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_validator_withdrawability_delay: Epoch,
     /// Epochs a validator must be active before it is eligible to propose,
     /// perform voluntary exits, or (from electra) initiate a consolidation.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub shard_committee_period: Epoch,
     /// Execution-layer blocks a state's Eth1 vote must lag the execution
     /// chain's head by, so that every node's view of "current" Eth1 data
     /// agrees despite network latency and minor reorgs.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub eth1_follow_distance: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an attestation is
     /// due; read by the fork choice store's `get_attestation_due_ms`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an aggregate
     /// attestation is due; read by `get_aggregate_due_ms`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregate_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] past which a proposer must
     /// no longer attempt a late-block reorg; read by
     /// `get_proposer_reorg_cutoff_ms`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub proposer_reorg_cutoff_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which a sync committee
     /// message is due (altair); read by `get_sync_message_due_ms`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub sync_message_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which a sync committee
     /// contribution is due (altair); read by `get_contribution_due_ms`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub contribution_due_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
     /// is offline (or the chain is leaking) without a timely target vote.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub inactivity_score_bias: u64,
     /// Score points subtracted from a validator's inactivity score for each
     /// epoch it casts a timely target vote while the chain is not leaking.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub inactivity_score_recovery_rate: u64,
     /// Effective balance floor below which a validator is force-exited at the
     /// next opportunity, regardless of its own wishes.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub ejection_balance: Gwei,
     /// The minimum validators allowed to enter the activation/exit queue in
     /// one epoch, regardless of the active validator set's size. Prevents the
     /// churn limit from collapsing to zero on a small validator set.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_per_epoch_churn_limit: u64,
     /// Active validators per unit of per-epoch activation/exit churn: the
     /// churn limit before electra is `active_validator_count /
     /// churn_limit_quotient`, floored at [`Self::min_per_epoch_churn_limit`].
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub churn_limit_quotient: u64,
     /// Deneb: an additional cap on the activation churn limit specifically
     /// (separate from the combined activation/exit limit above), so that
@@ -247,17 +251,17 @@ pub struct Config {
     /// Superseded by [`Self::max_per_epoch_activation_exit_churn_limit`] from
     /// electra onward, but the specification keeps both names rather than
     /// reusing one.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_per_epoch_activation_churn_limit: u64,
     /// Electra: the churn limit is now denominated in Gwei rather than a
     /// validator count (`get_balance_churn_limit`), and this is its floor,
     /// replacing [`Self::min_per_epoch_churn_limit`] from electra onward.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_per_epoch_churn_limit_electra: Gwei,
     /// Electra: the ceiling on the portion of the (Gwei-denominated) churn
     /// limit dedicated to activations and exits, as opposed to
     /// consolidations (`get_activation_exit_churn_limit`).
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_per_epoch_activation_exit_churn_limit: Gwei,
 
     // -- Fork choice ---------------------------------------------------------
@@ -265,21 +269,21 @@ pub struct Config {
     /// block proposed on time when comparing it against competitors for head.
     /// Deters "balancing" attacks that rely on splitting the vote right at a
     /// slot boundary.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub proposer_score_boost: u64,
     /// Percentage of committee weight the current head must be below the
     /// parent's competing child by for a proposer to consider reorging it out.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub reorg_head_weight_threshold: u64,
     /// Percentage of committee weight the parent block must exceed for a
     /// proposer to consider reorging its late child out.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub reorg_parent_weight_threshold: u64,
     /// How many epochs finality is allowed to lag before a proposer refuses to
     /// attempt a reorg at all, regardless of the weight thresholds above.
     /// Reorgs are a liveness optimization; this bounds how much they may risk
     /// finality progress to pursue it.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub reorg_max_epochs_since_finalization: Epoch,
 
     // -- Transition (bellatrix) -----------------------------------------------
@@ -298,7 +302,7 @@ pub struct Config {
     /// The epoch at or after which [`Self::terminal_block_hash`], if set, is
     /// honored. Guards against an old override value being replayed before
     /// the network is ready for it.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub terminal_block_hash_activation_epoch: Epoch,
 
     // -- Blob limits -----------------------------------------------------------
@@ -306,7 +310,7 @@ pub struct Config {
     /// deneb until electra raises it.
     #[serde(
         rename = "MAX_BLOBS_PER_BLOCK",
-        deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize"
+        with = "crate::beacon::serde_helpers::quoted_or_bare"
     )]
     pub max_blobs_per_block_deneb: u64,
     /// Electra's fixed cap on `blob_kzg_commitments` per block. Also the value
@@ -314,14 +318,17 @@ pub struct Config {
     /// schedule does not (yet) cover, matching `get_blob_parameters`'s own
     /// fallback of `BlobParameters(ELECTRA_FORK_EPOCH,
     /// MAX_BLOBS_PER_BLOCK_ELECTRA)`.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_blobs_per_block_electra: u64,
     /// Fulu's blob schedule (EIP7892): a possibly-empty list of `(epoch,
     /// limit)` entries, kept sorted ascending by epoch, that lets the blob
     /// count limit change again after electra without a new hard fork per
     /// change. Read through [`Config::max_blobs_per_block`] rather than
     /// directly.
-    #[serde(deserialize_with = "deserialize_blob_schedule")]
+    #[serde(
+        deserialize_with = "deserialize_blob_schedule",
+        serialize_with = "crate::beacon::serde_helpers::seq::serialize"
+    )]
     pub blob_schedule: SszList<BlobScheduleEntry, MAX_BLOB_SCHEDULE_ENTRIES>,
 
     // -- Networking --------------------------------------------------------
@@ -330,39 +337,39 @@ pub struct Config {
     // them, `/eth/v1/config/spec` has to echo them, and a field with no typed
     // home would otherwise be reported as an unknown key on every startup of
     // every valid configuration.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_propagation_slot_range: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_subnet_count: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_subnet_extra_bits: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub blob_sidecar_subnet_count: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub blob_sidecar_subnet_count_electra: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub data_column_sidecar_subnet_count: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub epochs_per_subnet_subscription: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_payload_size: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_blocks: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_blocks_deneb: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_payloads: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub maximum_gossip_clock_disparity: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub message_domain_invalid_snappy: [u8; 4],
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub message_domain_valid_snappy: [u8; 4],
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_blob_sidecars_requests: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_data_column_sidecars_requests: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub subnets_per_node: u64,
 
     // -- Deposit contract --------------------------------------------------
@@ -370,27 +377,27 @@ pub struct Config {
     // The state transition only processes deposits already in a block, so it
     // never looks the contract up; `/eth/v1/config/deposit_contract` serves
     // these.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_chain_id: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub deposit_network_id: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::hex_array::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub deposit_contract_address: [u8; 20],
 
     // -- PeerDAS custody ---------------------------------------------------
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub balance_per_additional_custody_group: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub custody_requirement: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub number_of_custody_groups: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub samples_per_slot: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub validator_custody_requirement: u64,
 
     // -- Other runtime values ----------------------------------------------
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub consolidation_churn_limit_quotient: u64,
 
     // -- Networking (added after an incomplete initial key list) -----------
@@ -398,15 +405,15 @@ pub struct Config {
     // carries; missed initially because the key list this struct was
     // checked against came from a genesis generator's example rather than
     // the published file itself.
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_subnet_prefix_bits: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_blob_sidecars: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_blob_sidecars_electra: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub max_request_data_column_sidecars: u64,
-    #[serde(deserialize_with = "crate::beacon::serde_helpers::quoted_or_bare::deserialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_block_requests: u64,
 }
 
@@ -1244,5 +1251,68 @@ mod tests {
         let perturbed: Config = serde_yaml_ng::from_str(&perturbed_text).unwrap();
         assert_eq!(perturbed.blob_schedule[0].max_blobs_per_block, 99);
         assert_ne!(perturbed.blob_schedule, Config::mainnet().blob_schedule);
+    }
+
+    #[test]
+    fn the_spec_config_serializes_in_the_beacon_apis_encoding() {
+        let json = serde_json::to_value(Config::mainnet()).expect("serializes");
+
+        // Keys are SCREAMING_SNAKE_CASE, as /eth/v1/config/spec reports them.
+        assert!(json.get("SECONDS_PER_SLOT").is_some(), "got keys: {json}");
+
+        // Every integer is a quoted decimal string, not a bare number.
+        assert_eq!(json["SECONDS_PER_SLOT"], "12");
+        assert!(json["DEPOSIT_CHAIN_ID"].is_string());
+        assert!(json["ELECTRA_FORK_EPOCH"].is_string());
+
+        // Byte strings are 0x-prefixed hex.
+        assert!(
+            json["GENESIS_FORK_VERSION"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x"),
+            "got {}",
+            json["GENESIS_FORK_VERSION"]
+        );
+        assert!(
+            json["DEPOSIT_CONTRACT_ADDRESS"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x"),
+            "got {}",
+            json["DEPOSIT_CONTRACT_ADDRESS"]
+        );
+        assert!(
+            json["TERMINAL_BLOCK_HASH"]
+                .as_str()
+                .unwrap()
+                .starts_with("0x"),
+            "got {}",
+            json["TERMINAL_BLOCK_HASH"]
+        );
+
+        // Uint256 is quoted DECIMAL in this API, not hex.
+        let ttd = json["TERMINAL_TOTAL_DIFFICULTY"].as_str().expect("quoted");
+        assert!(!ttd.starts_with("0x"), "got {ttd}");
+        assert!(ttd.chars().all(|c| c.is_ascii_digit()), "got {ttd}");
+
+        // genesis_time is #[serde(skip)]: it is not a config.yaml key and
+        // /eth/v1/beacon/genesis is where it is reported.
+        assert!(json.get("GENESIS_TIME").is_none());
+    }
+
+    #[test]
+    fn the_blob_schedule_serializes_as_a_list_of_quoted_entries() {
+        let mut config = Config::mainnet();
+        config.blob_schedule = SszList::try_from(vec![BlobScheduleEntry {
+            epoch: 100,
+            max_blobs_per_block: 9,
+        }])
+        .expect("within capacity");
+
+        let json = serde_json::to_value(&config).expect("serializes");
+        let entry = &json["BLOB_SCHEDULE"][0];
+        assert_eq!(entry["EPOCH"], "100");
+        assert_eq!(entry["MAX_BLOBS_PER_BLOCK"], "9");
     }
 }

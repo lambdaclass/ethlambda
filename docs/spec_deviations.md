@@ -27,3 +27,53 @@ target-slot order as they are scanned.
 - **leanSpec:** `build_block` scans candidates sorted by `(target.slot, data_root)`, oldest target first, and includes the first ones that pass its filters (greedy, no scoring), re-running the scan as a fixed point when justification/finalization advances. Its proposer budget is `MAX_ATTESTATIONS_DATA` itself.
 - **Equivalence:** both produce a valid block. ethlambda front-loads the attestations that advance justification and finality, and within those tiers prefers the *newest* target where leanSpec takes the *oldest*; combined with the smaller default budget, an older entry can be outranked by newer ones round after round, so which votes reach peers through blocks differs even though every block stays valid. The smaller budget yields smaller blocks and lower build times.
 - **Upstream status:** the tiered strategy is proposed upstream as leanSpec [PR #1149](https://github.com/leanEthereum/leanSpec/pull/1149) (open at the time of writing), so this deviation may converge; the recursive-merge collapse follows leanSpec #510.
+
+## `/eth/v1/node/identity` reports no ENR
+
+The endpoint's `enr`, `p2p_addresses` and `discovery_addresses` are empty
+rather than populated, which is not spec-valid.
+
+- **ethlambda:** `get_identity` (`crates/net/rpc/src/beacon/node.rs`) reports
+  `peer_id` and a placeholder `metadata` block and nothing else. The ENR is
+  built for discv5 and owned by the P2P actor; `BuiltSwarm` hands `run_node`
+  only a `local_peer_id`, so serving the record means widening the
+  `ethlambda-p2p` surface and threading it through startup.
+- **Beacon API:** `enr` is the node's base64 ENR and the two lists are its
+  libp2p multiaddrs.
+- **Consequence:** a consumer reading `enr` to dial this node gets an empty
+  string rather than a record, so peer discovery through this endpoint does not
+  work. Everything that reads `peer_id` is unaffected. Out of scope for the
+  change that added the Beacon API surface; a follow-up exposes the record.
+
+## `block_id` cannot name `genesis`, and `state_id` cannot be a state root
+
+Two id forms the Beacon API defines return `404` here.
+
+- **`genesis`, on either id.** `Table::BlockRoots` is the slot-to-root index
+  every slot lookup reads, and `Store::update_checkpoints` is its only writer.
+  That writer computes its delta by walking from the old head to the new one
+  (`block_root_index_changes`, `crates/storage/src/store.rs`) and returns early
+  when the two are the same root, which is exactly the situation at bootstrap:
+  `Store::init_beacon` seeds `KEY_HEAD` with the anchor. So the anchor's own
+  slot is never written to that index, on either chain, and a
+  checkpoint-synced directory has no genesis block to serve in any case.
+  `BlockId::Genesis` refuses outright rather than resolving to the anchor and
+  calling that genesis.
+- **A `state_id` given as a `0x…` root.** That id is a *state* root, and states
+  are stored keyed by **block** root (`Store::get_state`) with no reverse
+  index. Refusing is better than answering with a state that is right only when
+  the two roots happen to coincide. The refusal names the ids that do work.
+
+**The anchor's own slot is not among these.** It is missing from `BlockRoots`
+for the reason above, but it is the slot `checkpoint_sync.rs` asks a peer for
+immediately after reading that peer's finalized state, so a `404` there would
+make this node unusable as a checkpoint-sync source for any client.
+`anchored_root_at_slot` (`crates/net/rpc/src/shared/block_id.rs`) covers it: on
+an index miss it tries the roots the store can name (finalized, justified,
+head) and accepts one only when `Store::block_entry` confirms that root's block
+really sits at the slot asked for. A slot the store holds nothing at still
+answers `404`, since no candidate matches.
+
+This was found by running a mainnet follower and pointing a second one at its
+API: before the fallback existed, the second died with `peer served no block at
+the anchor slot 15265888`.
