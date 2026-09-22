@@ -205,7 +205,7 @@ Series appear as blocks arrive rather than being seeded, since a third of the ph
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 64 |
+| `lean_block_import_phase_seconds` | Histogram | Time one section of a block's import, or of the arrival carrying it, took | Per section that ran, on each import, hold or failure | phase (see below); source=gossip,sync | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32 |
 | `lean_block_import_cascade_blocks` | Histogram | Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts) | Once per arriving block message | | 1, 2, 3, 5, 8, 16, 32, 64, 128 |
 
 Per-block phases, in the order a block crosses them, plus `total` for a completed import:

@@ -589,9 +589,17 @@ static LEAN_BLOCK_IMPORT_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
             // tens of microseconds, `parent_wait` is tens of seconds, and
             // splitting them into two metrics would mean choosing which
             // sections may ever be compared against which.
+            //
+            // Above half a second the edges step by 1.5x and 1.33x rather than
+            // doubling. That is where a mainnet block's `stf`, `block_atts`,
+            // `queue` and `total` all sit, and with doubling edges a 16%
+            // drop in the mean `stf` left its percentiles interpolated inside
+            // the same two buckets. The ladder also puts an edge on one
+            // mainnet slot. It stops at 32 s, so a longer section (in
+            // practice a `parent_wait`) lands in `+Inf`.
             vec![
-                0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0,
-                64.0
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0,
+                6.0, 8.0, 12.0, 16.0, 32.0,
             ]
         )
         .unwrap()
