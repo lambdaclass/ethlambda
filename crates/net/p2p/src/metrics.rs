@@ -249,6 +249,56 @@ pub fn notify_peer_disconnected(node_name: &str, direction: &str, reason: &str) 
     LEAN_CONNECTED_PEERS.with_label_values(&[node_name]).dec();
 }
 
+/// Count a closed connection against what actually ended it.
+///
+/// A separate metric rather than more values on
+/// `lean_peer_disconnection_events_total`'s `reason`, for the same reason
+/// [`inc_peer_connection_transport`] is separate: that one is leanMetrics-
+/// specified down to its label values, so adding to them would put ethlambda
+/// off-spec.
+///
+/// The specified set is `timeout`/`remote_close`/`local_close`/`error`, and on
+/// a mainnet follower nine in ten closes land in `error`, which says only that
+/// libp2p handed back a cause. This splits that bucket: see
+/// [`crate::disconnect_cause`] for the values and what each one means.
+pub fn inc_peer_disconnect_cause(direction: &str, cause: &str) {
+    static LEAN_PEER_DISCONNECT_CAUSE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_peer_disconnect_cause_total",
+            "Closed peer connections by the cause libp2p reported for the close",
+            &["direction", "cause"]
+        )
+        .unwrap()
+    });
+    LEAN_PEER_DISCONNECT_CAUSE
+        .with_label_values(&[direction, cause])
+        .inc();
+}
+
+/// Count a `goodbye/1` received, against the reason the peer gave.
+///
+/// The only place a peer states *why* it is leaving. Everything else about a
+/// disconnect is inferred from how the socket ended, and the two readings that
+/// matter most are indistinguishable there: a peer that is merely full closes
+/// exactly like one that has scored us badly or banned us.
+///
+/// One-directional by construction, so there is no `direction` label: this node
+/// never sends a `goodbye`, and the protocol is registered inbound-only.
+///
+/// See [`crate::beacon::messages::Goodbye::reason_label`] for the values, which
+/// are bounded there because the wire code is not.
+pub fn inc_peer_goodbye(reason: &str) {
+    static LEAN_PEER_GOODBYE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_peer_goodbye_total",
+            "Goodbye messages received, by the reason code the peer sent",
+            &["reason"]
+        )
+        .unwrap()
+    });
+    LEAN_PEER_GOODBYE.with_label_values(&[reason]).inc();
+}
+
 /// Counts dials initiated from discv5 discovery, as opposed to static bootnode
 /// dials. Connection outcomes are already covered by the peer connect and
 /// disconnect metrics.

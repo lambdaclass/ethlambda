@@ -91,6 +91,41 @@ pub struct Goodbye {
     pub reason: u64,
 }
 
+impl Goodbye {
+    /// A bounded label for this reason code, for
+    /// [`crate::metrics::inc_peer_goodbye`].
+    ///
+    /// Bounded because the code is a `u64` read off the wire: a peer may send
+    /// any of 2^64 values, and labelling with one straight would let a remote
+    /// decide this node's metric cardinality.
+    ///
+    /// Only 1, 2 and 3 are named by the spec, which reserves `[4, 127]` and
+    /// leaves everything from 128 up to the "alternative, erroneous
+    /// request-specific responses" a client picks for itself. The four above
+    /// 127 are therefore a convention rather than a standard, taken from
+    /// lighthouse's `GoodbyeReason` because that is what mainnet peers send.
+    /// They are the codes worth telling apart: `too_many_peers` says the peer
+    /// had no room, while `bad_score`, `banned` and `banned_ip` say it decided
+    /// against *us*, and those two readings call for opposite responses.
+    ///
+    /// `unknown` is code 0, which lighthouse sends when it has no code for the
+    /// reason; `other` is anything unmapped, including the reserved range.
+    pub fn reason_label(&self) -> &'static str {
+        match self.reason {
+            0 => "unknown",
+            1 => "client_shutdown",
+            2 => "irrelevant_network",
+            3 => "fault",
+            128 => "unable_to_verify_network",
+            129 => "too_many_peers",
+            250 => "bad_score",
+            251 => "banned",
+            252 => "banned_ip",
+            _ => "other",
+        }
+    }
+}
+
 /// `MetaData` v1: phase0.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode)]
 pub struct MetaDataV1 {
@@ -258,5 +293,40 @@ mod tests {
             Ping::from_ssz_bytes(&Ping { seq_number: 3 }.to_ssz()).unwrap(),
             Ping { seq_number: 3 }
         );
+    }
+
+    /// The three the spec names, and the four above 127 that mainnet clients
+    /// agree on. Pinned because the whole point of the metric is telling
+    /// "the peer was full" apart from "the peer rejected us", and those are
+    /// 129 against 250/251/252.
+    #[test]
+    fn a_goodbye_reason_is_labelled_by_its_code() {
+        for (reason, label) in [
+            (0, "unknown"),
+            (1, "client_shutdown"),
+            (2, "irrelevant_network"),
+            (3, "fault"),
+            (128, "unable_to_verify_network"),
+            (129, "too_many_peers"),
+            (250, "bad_score"),
+            (251, "banned"),
+            (252, "banned_ip"),
+        ] {
+            assert_eq!(Goodbye { reason }.reason_label(), label, "reason {reason}");
+        }
+    }
+
+    /// The code is a `u64` off the wire, so the label set must not follow it.
+    /// A peer sending an unmapped code, including one from the range the spec
+    /// reserves, has to land on a value already in the set.
+    #[test]
+    fn an_unmapped_goodbye_reason_cannot_add_a_label() {
+        for reason in [4, 127, 130, 249, 253, u64::MAX] {
+            assert_eq!(
+                Goodbye { reason }.reason_label(),
+                "other",
+                "reason {reason}"
+            );
+        }
     }
 }

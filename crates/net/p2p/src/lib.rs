@@ -28,13 +28,14 @@ pub mod muxers {
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    fmt,
+    fmt, io,
     net::{IpAddr, SocketAddr},
     num::NonZeroU8,
     ops::Range,
     time::{Duration, Instant},
 };
 
+use either::Either;
 use ethlambda_network_api::{
     FetchRequest, InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
@@ -52,7 +53,7 @@ use libp2p::{
     identity::{Keypair, PublicKey, secp256k1},
     multiaddr::Protocol,
     request_response::OutboundRequestId,
-    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+    swarm::{ConnectionError, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use sha2::Digest;
 use spawned_concurrency::actor;
@@ -1371,7 +1372,7 @@ async fn handle_swarm_event(
             ..
         } => {
             let closed_direction = ConnectionDirection::from(&endpoint);
-            let reason = match cause {
+            let reason = match &cause {
                 None => "remote_close",
                 Some(err) => {
                     // Categorize disconnection reasons
@@ -1388,6 +1389,7 @@ async fn handle_swarm_event(
                     }
                 }
             };
+            let cause_label = disconnect_cause(cause.as_ref());
             if num_established == 0 {
                 // Report the direction this peer was *counted* under, not the
                 // one the last socket happened to carry. A peer may hold both
@@ -1408,7 +1410,21 @@ async fn handle_swarm_event(
                     direction.as_str(),
                     reason,
                 );
+                // Charged here rather than on every closed connection, so this
+                // totals to the same count as the metric above and the two can
+                // be read against each other directly.
+                metrics::inc_peer_disconnect_cause(direction.as_str(), cause_label);
 
+                // `debug!` rather than the `trace!` below, and carrying the
+                // cause itself: `cause_label` deliberately cannot name what an
+                // `io_other` was, so this is the only place that answer exists.
+                debug!(
+                    %peer_id,
+                    %direction,
+                    %cause_label,
+                    cause = ?cause,
+                    "Peer connection closed"
+                );
                 trace!(
                     %peer_id,
                     %direction,
@@ -1900,6 +1916,160 @@ fn transport_label(addr: &Multiaddr) -> &'static str {
     "unknown"
 }
 
+/// What ended a connection, as the label
+/// [`metrics::inc_peer_disconnect_cause`] counts it under.
+///
+/// Read off the `ConnectionError` variant and the error types inside it,
+/// rather than sniffed out of the whole `Display` string the way the
+/// leanMetrics-specified `reason` beside it still has to be. That string test
+/// is why nine closes in ten on a mainnet follower read only `error`: it looks
+/// for "timeout" and "reset" and calls everything else a fault, and a peer
+/// hanging up on us produces neither word.
+///
+/// `clean_close` is `None`, which libp2p reports when a connection ended with
+/// no error at all. For a beacon peer that is the ordinary shape of a
+/// deliberate disconnect, so it should be read against `lean_peer_goodbye_total`
+/// rather than on its own.
+///
+/// An I/O close's kind is rarely the answer on its own. `StreamMuxerBox` wraps
+/// every muxer error in `io::Error::other`, so almost every close arrives as
+/// `ErrorKind::Other` with the muxer's own error behind it, and that inner
+/// error is read by downcasting to the two muxers this node runs; see
+/// [`io_disconnect_cause`].
+///
+/// `io_other` is the residue: an I/O error that is neither one of the kinds
+/// below nor one of those two muxers' errors. It should stay near empty; a
+/// rise means a close shape this function does not know yet, and the `debug!`
+/// at the call site prints the full cause for exactly that case.
+///
+/// Matched exhaustively on purpose. `ConnectionError` is not `#[non_exhaustive]`,
+/// so a new variant upstream should fail this build rather than quietly join
+/// the residue.
+fn disconnect_cause(cause: Option<&ConnectionError>) -> &'static str {
+    match cause {
+        None => "clean_close",
+        Some(ConnectionError::KeepAliveTimeout) => "keep_alive_timeout",
+        Some(ConnectionError::IO(err)) => io_disconnect_cause(err),
+    }
+}
+
+/// The label for an I/O close: its kind when that names something, otherwise
+/// whatever the muxer error inside it says.
+///
+/// Each transport is boxed on its own by the swarm builder, so the error
+/// behind an `Other` is exactly one of two types: `libp2p::quic::Error` for a
+/// QUIC connection, or the TCP stack's muxer selection,
+/// `Either<libp2p::yamux::Error, io::Error>` (mplex reports plain I/O errors).
+fn io_disconnect_cause(err: &io::Error) -> &'static str {
+    if let Some(label) = io_kind_label(err.kind()) {
+        return label;
+    }
+    let Some(inner) = err.get_ref() else {
+        return "io_other";
+    };
+    if let Some(err) = inner.downcast_ref::<libp2p::quic::Error>() {
+        return quic_disconnect_cause(err);
+    }
+    if let Some(err) = inner.downcast_ref::<Either<libp2p::yamux::Error, io::Error>>() {
+        return tcp_muxer_disconnect_cause(err);
+    }
+    "io_other"
+}
+
+/// The I/O kinds worth a label of their own. `None` for the rest, `Other`
+/// included, which is where the muxer's error has to be read instead.
+fn io_kind_label(kind: io::ErrorKind) -> Option<&'static str> {
+    match kind {
+        io::ErrorKind::ConnectionReset => Some("connection_reset"),
+        io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+        io::ErrorKind::BrokenPipe => Some("broken_pipe"),
+        io::ErrorKind::NotConnected => Some("not_connected"),
+        io::ErrorKind::TimedOut => Some("timed_out"),
+        io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
+        // `io::ErrorKind` *is* `#[non_exhaustive]`, so this arm is required
+        // rather than chosen.
+        _ => None,
+    }
+}
+
+/// A QUIC connection's close.
+///
+/// Matched exhaustively, like [`disconnect_cause`], so a new variant fails the
+/// build. Only `Connection` and `Io` can end an established connection; the
+/// rest are dial and listener errors, kept apart from the residue anyway so a
+/// surprise shows up under its own transport.
+fn quic_disconnect_cause(err: &libp2p::quic::Error) -> &'static str {
+    use libp2p::quic::Error;
+    match err {
+        Error::Connection(err) => quic_close_label(&err.to_string()),
+        Error::Io(err) => io_kind_label(err.kind()).unwrap_or("quic_other"),
+        Error::Reach(_)
+        | Error::HandshakeTimedOut
+        | Error::NoActiveListenerForDialAsListener
+        | Error::HolePunchInProgress(_) => "quic_other",
+    }
+}
+
+/// Which `quinn::ConnectionError` a QUIC close was, read off its `Display`.
+///
+/// Read off the text because it is the only way in: `libp2p::quic`'s
+/// `ConnectionError` keeps the quinn error in a private field and forwards
+/// nothing but `Display`. What makes this safe to match is that each of
+/// quinn-proto 0.11's messages opens with a fixed string of quinn's own, and
+/// anything the peer supplies (the close reason and code) only follows the
+/// colon. So the prefix is chosen by quinn, never by the remote.
+///
+/// `quic_application_close` is the peer's application closing the connection
+/// (libp2p's normal close, and go-libp2p's connection gater); the reason is
+/// in the `debug!` line, deliberately not in a label. `quic_transport_close`
+/// is a transport-level `CONNECTION_CLOSE`.
+fn quic_close_label(display: &str) -> &'static str {
+    if display.starts_with("closed by peer: ") {
+        "quic_application_close"
+    } else if display.starts_with("aborted by peer: ") {
+        "quic_transport_close"
+    } else if display == "reset by peer" {
+        "quic_reset"
+    } else if display == "timed out" {
+        "quic_timed_out"
+    } else if display == "closed" {
+        "quic_local_close"
+    } else {
+        // Version mismatch, a locally detected transport error, exhausted
+        // connection ids: none of them a peer leaving.
+        "quic_other"
+    }
+}
+
+/// A TCP connection's close, through whichever muxer it negotiated.
+///
+/// yamux hides its variants too, but forwards `source` down to the I/O error
+/// beneath an `Io` or a `Decode` failure, so the chain is walked for one
+/// before falling back to the one variant worth naming, a clean `Closed`.
+fn tcp_muxer_disconnect_cause(err: &Either<libp2p::yamux::Error, io::Error>) -> &'static str {
+    match err {
+        Either::Right(err) => io_kind_label(err.kind()).unwrap_or("mplex_other"),
+        Either::Left(err) => {
+            let mut source = std::error::Error::source(err);
+            while let Some(err) = source {
+                if let Some(label) = err
+                    .downcast_ref::<io::Error>()
+                    .and_then(|err| io_kind_label(err.kind()))
+                {
+                    return label;
+                }
+                source = err.source();
+            }
+            // yamux's own `Closed` message, in both versions libp2p carries.
+            if err.to_string() == "connection is closed" {
+                "yamux_closed"
+            } else {
+                "yamux_other"
+            }
+        }
+    }
+}
+
 fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
     const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
     const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
@@ -1930,6 +2100,99 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    /// The split the specified `reason` label cannot make. Each of these is a
+    /// distinct answer to "who ended this and why", and all but the first two
+    /// collapse into `error` next door.
+    #[test]
+    fn a_close_is_labelled_by_the_cause_libp2p_reported() {
+        assert_eq!(disconnect_cause(None), "clean_close");
+        assert_eq!(
+            disconnect_cause(Some(&ConnectionError::KeepAliveTimeout)),
+            "keep_alive_timeout"
+        );
+        for (kind, label) in [
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::ConnectionAborted, "connection_aborted"),
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::NotConnected, "not_connected"),
+            (io::ErrorKind::TimedOut, "timed_out"),
+            (io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+        ] {
+            let err = ConnectionError::IO(io::Error::new(kind, "test"));
+            assert_eq!(disconnect_cause(Some(&err)), label, "{kind:?}");
+        }
+    }
+
+    /// `io::ErrorKind` is `#[non_exhaustive]`, and an error that is neither a
+    /// named kind nor one of the two muxers' errors has to land somewhere, so
+    /// the residue is a real bucket rather than an unreachable arm.
+    #[test]
+    fn an_unclassified_io_error_falls_to_the_residue() {
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let err = ConnectionError::IO(io::Error::new(kind, "some other close"));
+            assert_eq!(disconnect_cause(Some(&err)), "io_other", "{kind:?}");
+        }
+    }
+
+    /// The shape nine closes in ten actually take on mainnet: the muxer's
+    /// error boxed inside an `io::Error` of kind `Other`, the way
+    /// `StreamMuxerBox` wraps it. Reading only the outer kind put every one of
+    /// these in `io_other`.
+    #[test]
+    fn a_muxer_error_inside_an_other_io_error_is_read_through() {
+        let boxed = |err: Either<libp2p::yamux::Error, io::Error>| {
+            ConnectionError::IO(io::Error::other(err))
+        };
+        for (kind, label) in [
+            (io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::Other, "mplex_other"),
+        ] {
+            let err = boxed(Either::Right(io::Error::new(kind, "mplex")));
+            assert_eq!(disconnect_cause(Some(&err)), label, "mplex {kind:?}");
+        }
+
+        // `libp2p::quic::Error::Connection` cannot be built outside its crate
+        // (the quinn error is a private field), so its reading is pinned
+        // through `quic_close_label` below; these are the variants that can.
+        let quic = |err: libp2p::quic::Error| ConnectionError::IO(io::Error::other(err));
+        let reset = io::Error::new(io::ErrorKind::ConnectionReset, "quic socket");
+        assert_eq!(
+            disconnect_cause(Some(&quic(libp2p::quic::Error::Io(reset)))),
+            "connection_reset"
+        );
+        assert_eq!(
+            disconnect_cause(Some(&quic(libp2p::quic::Error::HandshakeTimedOut))),
+            "quic_other"
+        );
+    }
+
+    /// quinn-proto 0.11's `ConnectionError` messages, as a mainnet follower
+    /// logs them. The last case is the one the prefix match exists for: the
+    /// reason is the peer's to choose, so it must not be able to pass for
+    /// another variant.
+    #[test]
+    fn a_quic_close_is_labelled_by_quinns_prefix_not_the_peers_reason() {
+        for (display, label) in [
+            (
+                "closed by peer: connection gated (code 4103)",
+                "quic_application_close",
+            ),
+            ("closed by peer: 0", "quic_application_close"),
+            ("aborted by peer: NO_ERROR", "quic_transport_close"),
+            ("reset by peer", "quic_reset"),
+            ("timed out", "quic_timed_out"),
+            ("closed", "quic_local_close"),
+            ("CIDs exhausted", "quic_other"),
+            (
+                "closed by peer: reset by peer (code 1)",
+                "quic_application_close",
+            ),
+        ] {
+            assert_eq!(quic_close_label(display), label, "{display}");
+        }
     }
 
     /// Proves the TCP transport `build_swarm` now adds actually completes a

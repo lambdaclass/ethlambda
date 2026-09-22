@@ -156,6 +156,54 @@ which nothing ethlambda binds produces.
 |------|------|-------|-------------------------|--------|
 | `lean_peer_connections_by_transport_total` | Counter | Established peer connections by the transport that carried them | On connection established | direction=inbound,outbound<br>transport=quic,tcp,unknown |
 
+### Why Peers Leave
+
+`lean_peer_disconnection_events_total` above is leanMetrics-specified down to
+its `reason` values, and those four cannot carry this: measured on the mainnet
+follower, 92% of outbound closes land in `error`, which says only that libp2p
+handed back a cause. These two split that bucket without widening the specified
+metric, the same way the transport counter above sits beside the specified
+connect counter rather than inside it.
+
+`lean_peer_goodbye_total` is the only one of the three that is not an
+inference. A `goodbye` is the peer stating why it is dropping us, and the two
+readings that matter are indistinguishable from the socket alone:
+`too_many_peers` means the peer had no room, while `bad_score`, `banned` and
+`banned_ip` mean it decided against *this node*, and those call for opposite
+responses. It has no `direction` label because `goodbye/1` is registered
+inbound-only; ethlambda never sends one. The reason is a `u64` off the wire, so
+the labels are a fixed set with `other` as the residue: a remote must not be
+able to choose this node's metric cardinality.
+
+`lean_peer_disconnect_cause_total` covers the closes that carry no `goodbye`,
+read off the `ConnectionError` variant and the error types inside it. It is
+charged on the same event as the specified counter, once per peer fully
+disconnecting rather than once per connection, so the two total to the same
+number and can be read against each other directly. `clean_close` is libp2p
+reporting no error at all, which for a beacon peer is the ordinary shape of a
+deliberate disconnect and should be read beside `lean_peer_goodbye_total`.
+
+An I/O close almost always arrives as `ErrorKind::Other` with the muxer's own
+error inside, so the label comes from that inner error. The `quic_*` values
+are QUIC's close reasons: `quic_application_close` is the peer's application
+closing (libp2p's normal close after a `goodbye`, and go-libp2p's connection
+gater), `quic_transport_close` a transport-level close. TCP closes resolve to
+the socket error beneath the muxer where there is one (`unexpected_eof`,
+`connection_reset`), otherwise `yamux_closed` for a clean yamux shutdown.
+`io_other` is the residue and should stay near empty; the `Peer connection
+closed` line at `DEBUG` prints the full cause for whatever lands there.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_peer_goodbye_total` | Counter | Goodbye messages received, by the reason code the peer sent | On receiving a `goodbye/1` | reason=unknown,client_shutdown,irrelevant_network,fault,unable_to_verify_network,too_many_peers,bad_score,banned,banned_ip,other |
+| `lean_peer_disconnect_cause_total` | Counter | Closed peer connections by the cause libp2p reported for the close | On a peer's last connection closing | direction=inbound,outbound<br>cause=clean_close,keep_alive_timeout,connection_reset,connection_aborted,broken_pipe,not_connected,timed_out,unexpected_eof,quic_application_close,quic_transport_close,quic_reset,quic_timed_out,quic_local_close,quic_other,yamux_closed,yamux_other,mplex_other,io_other |
+
+Reason codes 1, 2 and 3 are the only ones
+[the spec](https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md)
+names; it reserves `[4, 127]` and leaves 128 and up to each client. The four
+above 127 follow lighthouse's `GoodbyeReason`, which is what mainnet peers
+actually send.
+
 ### Peer Supply
 
 Who this node is connected to, and whether those peers can serve what it needs.

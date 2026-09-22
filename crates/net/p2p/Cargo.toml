@@ -38,6 +38,11 @@ libp2p-mplex = { git = "https://github.com/lambdaclass/rust-libp2p.git", rev = "
 
 snap = "1.1"
 
+# Only to name the TCP muxer's error type, `Either<yamux::Error, io::Error>`,
+# which libp2p-core builds from this crate and does not re-export. Read by
+# `disconnect_cause` to say why a TCP peer's connection ended.
+either = "1"
+
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true

@@ -1490,8 +1490,15 @@ async fn handle_metadata_request(
 }
 
 /// Record a `goodbye/1`. One-way, so the caller drops the channel.
-fn handle_goodbye(peer: PeerId, Goodbye { reason }: Goodbye) {
-    trace!(%peer, reason, "Peer said goodbye");
+///
+/// `debug!` rather than `trace!`: this is a peer stating why it is dropping us,
+/// which is the one disconnect signal that is not inferred, and the follower
+/// runs at `INFO` in production where a `trace!` reaches nobody. The counter is
+/// what makes it readable without raising the level at all.
+fn handle_goodbye(peer: PeerId, goodbye: Goodbye) {
+    let label = goodbye.reason_label();
+    metrics::inc_peer_goodbye(label);
+    debug!(%peer, reason = goodbye.reason, label, "Peer said goodbye");
 }
 
 /// The `[start_slot, end_exclusive)` a beacon range sync should now cover,
