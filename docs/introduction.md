@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./assets/ethlambda_banner.png" alt="ethlambda banner" width="300">
+</p>
+
 # Introduction
 
 **ethlambda** is a minimalist, fast and modular implementation of the Lean Ethereum
