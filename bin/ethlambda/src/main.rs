@@ -225,7 +225,8 @@ struct ChainSetup {
 ///
 /// `Network::Lean` runs the full consensus node: a `BlockChain` actor with
 /// validator duties, a RocksDB store, checkpoint sync and the `/lean/v0` API.
-/// `Network::Mainnet` runs a beacon follower: it derives mainnet's fork digest,
+/// `Network::Mainnet` runs a beacon follower on whichever network `--network`
+/// resolved to (mainnet by default): it derives that network's fork digest,
 /// joins discv5, subscribes to the global gossip topics, resolves the
 /// checkpoint anchor `fetch_initial_beacon_state` at startup, then hands the
 /// resulting store to a `BlockChain` actor spawned with `spawn_beacon`, which
@@ -473,7 +474,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // The Ethereum Beacon Chain follower: the wire plus a duty-free chain
         // actor (`ChainActor::Beacon`, filled in below) that imports blocks
         // through fork choice. Every network parameter is derived rather than
-        // configured, from the genesis state built into the binary: the fork
+        // configured, from the resolved network's genesis values: the fork
         // digest depends on the epoch, which depends on genesis time. See
         // `crate::beacon`.
         Network::Mainnet { mainnet, execution } => {
@@ -805,17 +806,23 @@ fn default_bootnodes(source: Option<&network::NetworkSource>) -> Vec<String> {
 fn read_bootnode_strings(path: &Path) -> eyre::Result<Vec<String>> {
     let contents = std::fs::read_to_string(path)
         .wrap_err_with(|| format!("failed to read bootnodes from {}", path.display()))?;
+    Ok(parse_bootnode_strings(&contents))
+}
 
-    if let Ok(entries) = serde_yaml_ng::from_str::<Vec<String>>(&contents) {
-        return Ok(entries);
+/// [`read_bootnode_strings`] without the file: also what a built-in network's
+/// embedded `bootstrap_nodes.yaml` is read through, so a file on disk and a
+/// file in the binary cannot be parsed two different ways.
+fn parse_bootnode_strings(contents: &str) -> Vec<String> {
+    if let Ok(entries) = serde_yaml_ng::from_str::<Vec<String>>(contents) {
+        return entries;
     }
 
-    Ok(contents
+    contents
         .lines()
         .map(|line| line.trim().trim_start_matches("- ").trim())
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(|line| line.to_string())
-        .collect())
+        .collect()
 }
 
 /// Apply the Shadow-simulator sim-cost / fake-XMSS configuration from the CLI.
@@ -1504,11 +1511,11 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
 /// when there is neither a DB nor a URL; beacon does the same for a
 /// [`network::NetworkSource::Loaded`] network, since a freshly started devnet
 /// has no checkpoint provider at slot 0 and this is the only way to join one.
-/// The built-in network still aborts: mainnet's genesis state is built into
-/// the binary, so anchoring there is possible, but this node imports nothing,
-/// so it would park at slot 0 while claiming to follow a chain that has been
-/// live since 2020. See [`genesis_anchor_block`] for the block this pairs with
-/// the genesis state to build that anchor.
+/// A built-in network still aborts: this node imports nothing at startup, so
+/// it would park at slot 0 while claiming to follow a chain that has been live
+/// for years (and no built-in network carries a genesis state at all; see
+/// [`network::built_in`]). See [`genesis_anchor_block`] for the block this
+/// pairs with the genesis state to build that anchor.
 ///
 /// Staleness reuses [`MAX_RESUMABLE_DB_STATE_AGE`], which is expressed in
 /// slots: 90 minutes at beacon's 12-second slots against 30 at lean's four.
@@ -1581,15 +1588,15 @@ async fn fetch_initial_beacon_state(
 
     // A loaded network carries its own genesis state, which is a legitimate
     // anchor: a fresh devnet has no checkpoint provider at slot 0, so this is
-    // the only way to join one. The built-in network still refuses, because
-    // mainnet's genesis is 2020 and this follower would sit at slot 0 claiming
-    // to follow a live chain.
+    // the only way to join one. A built-in network still refuses, because
+    // every one has been live for years and this follower would sit at slot 0
+    // claiming to follow a live chain.
     if checkpoint_urls.is_empty() {
-        let network::NetworkSource::Loaded(_) = source else {
+        let network::NetworkSource::Loaded(loaded) = source else {
             return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
         };
 
-        let state = source.genesis_state().clone();
+        let state = loaded.genesis_state.as_ref().clone();
         let block = genesis_anchor_block(&state);
         info!(
             genesis_time = genesis.genesis_time,
@@ -2151,12 +2158,9 @@ validators:
 
         // Now resume with one fork epoch moved. Genesis time and validators
         // root are untouched, so the existing check cannot see this.
-        let mut edited = source.config().clone();
-        edited.electra_fork_epoch += 1;
-        let tampered = network::NetworkSource::BuiltInMainnet {
-            genesis_state: Box::new(source.genesis_state().clone()),
-            config: Box::new(edited),
-        };
+        let mut edited = network::dir::NetworkDir::load(dir.path()).unwrap();
+        edited.config.electra_fork_epoch += 1;
+        let tampered = network::NetworkSource::Loaded(Box::new(edited));
 
         // `Store` is not `Debug`, so unwrap the error by pattern rather than
         // with `unwrap_err`.
@@ -2189,22 +2193,28 @@ validators:
         );
     }
 
-    /// Mainnet's genesis is in the binary, but this follower imports nothing,
-    /// so anchoring there would park it at slot 0 while claiming to follow a
-    /// live chain. That refusal is deliberate and must survive.
+    /// Every built-in network has been live for years, and this follower
+    /// imports nothing at startup, so anchoring at genesis would park it at
+    /// slot 0 while claiming to follow a live chain. That refusal is
+    /// deliberate and must survive; no built-in network carries a genesis
+    /// state to anchor at in the first place.
     #[tokio::test]
     async fn the_built_in_network_still_requires_a_checkpoint_url() {
-        let source = network::NetworkSource::built_in_mainnet().unwrap();
-        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
-        // `Store` is not `Debug`, so unwrap the error by pattern rather than
-        // with `unwrap_err`.
-        let Err(err) = fetch_initial_beacon_state(&[], backend, &source).await else {
-            panic!("the built-in network must not anchor at its own genesis");
-        };
-        assert!(
-            format!("{err}").contains("checkpoint"),
-            "the error should point at --checkpoint-sync-url: {err}"
-        );
+        for built_in in network::BuiltInNetwork::ALL {
+            let spec = network::NetworkSpec::BuiltIn(built_in);
+            let source = network::NetworkSource::resolve(&spec).unwrap();
+            let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+            // `Store` is not `Debug`, so unwrap the error by pattern rather
+            // than with `unwrap_err`.
+            let Err(err) = fetch_initial_beacon_state(&[], backend, &source).await else {
+                panic!("{} must not anchor at its own genesis", built_in.name());
+            };
+            assert!(
+                format!("{err}").contains("checkpoint"),
+                "{}: the error should point at --checkpoint-sync-url: {err}",
+                built_in.name()
+            );
+        }
     }
 
     /// Pins the one invariant `get_forkchoice_store` actually checks: the
@@ -2418,9 +2428,8 @@ validators:
         assert!(default_bootnodes(None).is_empty());
 
         let mainnet_source = network::NetworkSource::built_in_mainnet().unwrap();
-        assert_eq!(
-            default_bootnodes(Some(&mainnet_source)).len(),
-            beacon::MAINNET_BOOTNODES.len()
-        );
+        let fallback = default_bootnodes(Some(&mainnet_source));
+        assert!(!fallback.is_empty());
+        assert_eq!(fallback, mainnet_source.bootnodes());
     }
 }

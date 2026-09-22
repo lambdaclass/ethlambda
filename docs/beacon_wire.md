@@ -20,22 +20,23 @@ ethlambda beacon \
   --gossipsub-port 9001
 ```
 
-No flag is required, but that is only true for the built-in network:
+No flag is required, but that is only true for a built-in network:
 `ethlambda beacon` on its own follows mainnet, since `--network` defaults to
-`mainnet`. To follow another network, pass `--network` naming a directory of
-published files (`config.yaml` and `genesis.ssz`, see [`cli.md`](./cli.md)):
+`mainnet`. Sepolia and Hoodi are built in too, and any other network is a
+`--network` naming a directory of published files (`config.yaml` and
+`genesis.ssz`, see [`cli.md`](./cli.md)):
 
 ```bash
+ethlambda beacon --network hoodi --checkpoint-sync-url https://checkpoint-sync.hoodi.ethpandaops.io
 ethlambda beacon --network ./my-network --node-key ./node-key
 ```
 
 `genesis_time` and `genesis_validators_root`, and therefore the fork digest,
-are derived from whichever genesis state the resolved network supplies: for
-the built-in `mainnet`, that state is built into the binary as
-`bin/ethlambda/assets/mainnet/genesis.ssz` (`eth-clients/mainnet`'s file, byte
-for byte, decoded at startup in about 4 ms); for a loaded network it is that
-directory's own `genesis.ssz`. Nothing about startup touches the network to
-get there. discv5 is forced on and needs no flag either: published mainnet
+are derived from the resolved network: a built-in network (`mainnet`,
+`sepolia`, `hoodi`) carries the two values as constants beside its
+`eth-clients` `config.yaml` and bootnode list, and no genesis state; for a
+loaded network they are read off that directory's own `genesis.ssz`. Nothing
+about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
 bootnodes are largely seed-only, so a crawl is how a peer is reached.
 
 ## The fork digest

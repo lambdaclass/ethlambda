@@ -5,25 +5,24 @@
 //! named `mainnet` can never shadow the built-in and a mistyped name fails
 //! saying what names exist rather than saying a path is missing.
 
+pub(crate) mod built_in;
 pub(crate) mod config_file;
 pub(crate) mod dir;
 
 use std::path::PathBuf;
 
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::BeaconState;
 
-/// The built-in networks, by the name `--network` accepts.
-pub(crate) const BUILT_IN_NETWORKS: [&str; 1] = ["mainnet"];
+pub(crate) use built_in::BuiltInNetwork;
 
 /// The default when `--network` is absent.
-pub(crate) const DEFAULT_NETWORK: &str = "mainnet";
+pub(crate) const DEFAULT_NETWORK: &str = BuiltInNetwork::Mainnet.name();
 
 /// What a `--network` value named.
 #[derive(Debug, Clone)]
 pub(crate) enum NetworkSpec {
     /// A network compiled into the binary.
-    BuiltIn(String),
+    BuiltIn(BuiltInNetwork),
     /// A directory of published files.
     Directory(PathBuf),
 }
@@ -45,12 +44,13 @@ impl NetworkSpec {
         if value.contains('/') {
             return Ok(Self::Directory(PathBuf::from(value)));
         }
-        if BUILT_IN_NETWORKS.contains(&value) {
-            return Ok(Self::BuiltIn(value.to_string()));
+        if let Some(network) = BuiltInNetwork::from_name(value) {
+            return Ok(Self::BuiltIn(network));
         }
+        let known: Vec<&str> = BuiltInNetwork::ALL.iter().map(|n| n.name()).collect();
         Err(UnknownNetwork {
             name: value.to_string(),
-            known: BUILT_IN_NETWORKS.join(", "),
+            known: known.join(", "),
         })
     }
 }
@@ -115,21 +115,40 @@ pub(crate) fn check_preset(declared: &str) -> Result<(), PresetCheckError> {
     .into())
 }
 
+/// Fill in the two [`Config`] fields a `config.yaml` cannot be trusted for.
+///
+/// Shared by a loaded directory and the built-in networks, whose configs both
+/// come out of [`config_file::ConfigFile::parse`].
+///
+/// `genesis_time` is `#[serde(skip)]`, so parsing leaves it at whatever
+/// `Config::default()` carries, which is mainnet's 2020 genesis. It is a
+/// property of the genesis state: mainnet's `MIN_GENESIS_TIME` is 23 seconds
+/// before its actual genesis, so reading it from the file would put every slot
+/// boundary off by that much.
+///
+/// `slot_duration_ms` is always derived, never read from the file. A beacon
+/// chain's slots are a whole number of seconds, so `SECONDS_PER_SLOT` is
+/// authoritative and the millisecond field exists for lean's sub-second
+/// cadence. A config carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS`
+/// would otherwise keep mainnet's 12000 by default, and every duty would fire
+/// at the wrong time while the second-resolution field looked correct.
+fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
+    config.genesis_time = genesis_time;
+    config.slot_duration_ms = config.seconds_per_slot * 1_000;
+}
+
 /// A resolved network: everything startup needs before it can build a swarm.
 ///
-/// The built-in arm keeps the compiled-in constants; the loaded arm holds what
-/// a directory supplied. Both answer the same three questions, so everything
+/// The built-in arm holds what the binary carries; the loaded arm holds what
+/// a directory supplied. Both answer the same questions, so everything
 /// downstream reads this rather than branching on where the values came from.
+///
+/// Both arms are boxed: `Config` is large enough that an inline copy would
+/// make one variant far bigger than the other's pointer, which is what
+/// `clippy::large_enum_variant` (denied by `make lint`) catches.
 #[derive(Debug)]
 pub(crate) enum NetworkSource {
-    BuiltInMainnet {
-        genesis_state: Box<BeaconState>,
-        // Boxed like `genesis_state`, not inline: `Config` is large enough
-        // that an inline copy here would make this variant far bigger than
-        // `Loaded`'s single pointer, which is what `clippy::large_enum_variant`
-        // (denied by `make lint`) catches.
-        config: Box<Config>,
-    },
+    BuiltIn(Box<built_in::BuiltIn>),
     Loaded(Box<dir::NetworkDir>),
 }
 
@@ -137,21 +156,9 @@ impl NetworkSource {
     /// Resolve a classified `--network` value.
     pub(crate) fn resolve(spec: &NetworkSpec) -> eyre::Result<Self> {
         match spec {
-            NetworkSpec::BuiltIn(name) => {
-                // `BUILT_IN_NETWORKS` has exactly one entry today, so `name`
-                // can only be "mainnet" here (`NetworkSpec::parse` only
-                // constructs this variant for a value found in that list).
-                // Nothing dispatches on `name` below: a second built-in
-                // network would silently resolve to mainnet too. Adding a
-                // registry now would be speculative for a single entry, so
-                // this assertion is the guard instead -- it turns loud the
-                // day `BUILT_IN_NETWORKS` actually grows.
-                debug_assert_eq!(
-                    name, "mainnet",
-                    "a second built-in network needs its own dispatch here, not just a list entry"
-                );
-                tracing::info!(network = %name, "Using the built-in network");
-                Self::built_in_mainnet()
+            NetworkSpec::BuiltIn(network) => {
+                tracing::info!(network = network.name(), "Using the built-in network");
+                Ok(Self::BuiltIn(Box::new(network.resolve()?)))
             }
             NetworkSpec::Directory(path) => {
                 let loaded = dir::NetworkDir::load(path)?;
@@ -166,55 +173,45 @@ impl NetworkSource {
         }
     }
 
-    /// The built-in mainnet network.
+    /// The built-in mainnet network, for the tests that want a real network
+    /// without writing a directory.
+    #[cfg(test)]
     pub(crate) fn built_in_mainnet() -> eyre::Result<Self> {
-        Ok(Self::BuiltInMainnet {
-            genesis_state: Box::new(crate::beacon::mainnet_genesis_state()?),
-            config: Box::new(Config::mainnet()),
-        })
+        Ok(Self::BuiltIn(Box::new(BuiltInNetwork::Mainnet.resolve()?)))
     }
 
     pub(crate) fn config(&self) -> &Config {
         match self {
-            Self::BuiltInMainnet { config, .. } => config.as_ref(),
+            Self::BuiltIn(built_in) => &built_in.config,
             Self::Loaded(loaded) => &loaded.config,
         }
     }
 
-    /// The resolved network's name, for logging: the one built-in name, or a
-    /// loaded directory's own `CONFIG_NAME`.
+    /// The resolved network's name, for logging: a built-in network's name,
+    /// or a loaded directory's own `CONFIG_NAME`.
     pub(crate) fn name(&self) -> &str {
         match self {
-            Self::BuiltInMainnet { .. } => "mainnet",
+            Self::BuiltIn(built_in) => built_in.network.name(),
             Self::Loaded(loaded) => &loaded.config_name,
         }
     }
 
-    pub(crate) fn genesis_state(&self) -> &BeaconState {
-        // `as_ref` on both arms, not `&`: the fields are `Box<BeaconState>`,
-        // so a bare borrow yields `&Box<BeaconState>`.
-        match self {
-            Self::BuiltInMainnet { genesis_state, .. } => genesis_state.as_ref(),
-            Self::Loaded(loaded) => loaded.genesis_state.as_ref(),
-        }
-    }
-
     /// The two genesis values the fork digest is derived from.
+    ///
+    /// Read off the genesis state for a loaded network. A built-in network
+    /// carries no state at all (see [`built_in`]), so it answers from the
+    /// pair it was resolved with.
     pub(crate) fn genesis(&self) -> crate::beacon::Genesis {
-        let state = self.genesis_state();
-        crate::beacon::Genesis {
-            genesis_time: state.genesis_time(),
-            genesis_validators_root: state.genesis_validators_root(),
+        match self {
+            Self::BuiltIn(built_in) => built_in.genesis,
+            Self::Loaded(loaded) => crate::beacon::Genesis::of(&loaded.genesis_state),
         }
     }
 
     /// The bootnodes this network ships, before `--bootnodes` overrides them.
     pub(crate) fn bootnodes(&self) -> Vec<String> {
         match self {
-            Self::BuiltInMainnet { .. } => crate::beacon::MAINNET_BOOTNODES
-                .iter()
-                .map(|enr| enr.to_string())
-                .collect(),
+            Self::BuiltIn(built_in) => built_in.bootnodes.clone(),
             Self::Loaded(loaded) => loaded.bootnodes.clone(),
         }
     }
@@ -226,20 +223,54 @@ mod tests {
 
     #[test]
     fn a_bare_known_name_resolves_to_the_built_in() {
+        for (name, expected) in [
+            ("mainnet", BuiltInNetwork::Mainnet),
+            ("sepolia", BuiltInNetwork::Sepolia),
+            ("hoodi", BuiltInNetwork::Hoodi),
+        ] {
+            assert!(
+                matches!(
+                    NetworkSpec::parse(name),
+                    Ok(NetworkSpec::BuiltIn(network)) if network == expected
+                ),
+                "{name} should name its built-in network"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_network_is_built_in_mainnet() {
         assert!(matches!(
-            NetworkSpec::parse("mainnet"),
-            Ok(NetworkSpec::BuiltIn(_))
+            NetworkSpec::parse(DEFAULT_NETWORK),
+            Ok(NetworkSpec::BuiltIn(BuiltInNetwork::Mainnet))
         ));
     }
 
     #[test]
     fn a_bare_unknown_name_errors_listing_the_known_ones() {
-        let err = NetworkSpec::parse("hoodi").unwrap_err().to_string();
-        assert!(err.contains("hoodi"), "got {err}");
-        assert!(
-            err.contains("mainnet"),
-            "the error should list what is known: {err}"
-        );
+        let err = NetworkSpec::parse("holesky").unwrap_err().to_string();
+        assert!(err.contains("holesky"), "got {err}");
+        for network in BuiltInNetwork::ALL {
+            assert!(
+                err.contains(network.name()),
+                "the error should list every known network: {err}"
+            );
+        }
+    }
+
+    /// Each name resolves to its own chain rather than to mainnet's, which is
+    /// what a list of names with a single dispatch arm behind it would do.
+    #[test]
+    fn each_built_in_network_resolves_to_its_own_chain() {
+        let mut roots = Vec::new();
+        for network in BuiltInNetwork::ALL {
+            let source = NetworkSource::resolve(&NetworkSpec::BuiltIn(network)).unwrap();
+            assert_eq!(source.name(), network.name());
+            roots.push(source.genesis().genesis_validators_root);
+        }
+        roots.sort();
+        roots.dedup();
+        assert_eq!(roots.len(), BuiltInNetwork::ALL.len());
     }
 
     #[test]

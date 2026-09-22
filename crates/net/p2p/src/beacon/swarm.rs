@@ -211,9 +211,9 @@ mod tests {
 
     /// Real mainnet bootnode ENRs, two `tcp`-dialable and two seed-only.
     ///
-    /// A fixture, not the shipped list: `beacon::MAINNET_BOOTNODES` moved to
-    /// the binary, and what these tests need from it is the shape of a mixed
-    /// dial set, not its current membership.
+    /// A fixture, not the shipped list (that is the binary's
+    /// `assets/mainnet/bootstrap_nodes.yaml`): what these tests need is the
+    /// shape of a mixed dial set, not its current membership.
     const BOOTNODE_FIXTURE: [&str; 4] = [
         // Teku, 3.147.37.0 | aws-us-east-2-ohio: ip/tcp/udp.
         "enr:-Iu4QLm7bZGdAt9NSeJG0cEnJohWcQTQaI9wFLu3Q7eHIDfrI4cwtzvEW3F3VbG9XdFXlrHyFGeXPn9snTCQJ9bnMRABgmlkgnY0gmlwhAOTJQCJc2VjcDI1NmsxoQIZdZD6tDYpkpEfVo5bgiU8MGRjhcOmHGD2nErK0UKRrIN0Y3CCIyiDdWRwgiMo",

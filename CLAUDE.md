@@ -16,10 +16,12 @@ bin/ethlambda/              # Entry point, CLI, orchestration
   ├─ src/main.rs            # run_node: one entry point for both chains (see below)
   ├─ src/cli.rs             # Options { common, network: Lean | Mainnet }
   ├─ src/command.rs         # Sub-command dispatch + default-subcommand injection
-  ├─ src/beacon.rs          # Mainnet wire params: built-in genesis, fork digest
+  ├─ src/beacon.rs          # Beacon wire params derived from a resolved network: epoch, fork digest
   ├─ src/checkpoint_sync.rs # Checkpoint sync for both chains (lean's `/lean/v0/...`, beacon's Beacon API)
   ├─ src/network/           # --network resolution: built-in name vs. directory of published files
-  ├─ assets/mainnet/genesis.ssz  # Mainnet genesis BeaconState (eth-clients/mainnet's file)
+  │   └─ built_in.rs        # Built-in chains (mainnet, sepolia, hoodi) and their genesis constants
+  ├─ assets/{mainnet,sepolia,hoodi}/  # config.yaml + bootstrap_nodes.yaml (eth-clients/<name>'s files)
+  ├─ tests/fixtures/networks/mainnet/genesis.ssz  # Mainnet genesis state, test-only
   └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
   blockchain/               # State machine actor (GenServer pattern)
@@ -377,36 +379,42 @@ lean does (it used to park on `std::future::pending()`).
 
 `docs/cli.md` has the step-by-step table.
 
-### Mainnet's genesis is built into the binary
+### Built-in networks
 
-`beacon` takes a `--network` flag (built-in name, default `mainnet`, or a path
-to a directory of published network files) and resolves it into a
-`NetworkSource` before doing anything else; see `bin/ethlambda/src/network/`.
-`genesis_time` and `genesis_validators_root`, which the fork digest keying
-every gossip topic, the ENR `eth2` entry and discv5 admission are computed
-from, come from whichever genesis `BeaconState` that resolved network
-supplies. `mainnet` is the built-in arm, not the only source any more: its
-state comes from `bin/ethlambda/assets/mainnet/genesis.ssz`, which is
-`metadata/genesis.ssz` from `eth-clients/mainnet` byte for byte, the same repo
-`beacon::MAINNET_BOOTNODES` is copied from, so both of this arm's hardcoded
-values have one upstream; `beacon::tests::the_shipped_state_is_eth_clients_file`
-pins its SHA-256 so replacing it has to be deliberate.
-`beacon::mainnet_genesis_state` decodes it as a **phase0** `BeaconState`, whole
-rather than reading the prefix those two fields sit in, so a corrupt asset fails
-loudly at startup rather than yielding two plausible numbers. 5.4 MB stored
-uncompressed and about 4 ms to decode: a deflated copy is under a third the
-size, but paying for it means a zip or gzip decoder in the dependency graph to
-read one build-time constant. A loaded network decodes its own `genesis.ssz`
-instead, at whatever fork its own schedule names for epoch 0, and its
-`config.yaml` is checked for a matching `PRESET_BASE` before anything else runs.
+`beacon` takes a `--network` flag (built-in name `mainnet` (default),
+`sepolia` or `hoodi`, or a path to a directory of published network files)
+and resolves it into a `NetworkSource` before doing anything else; see
+`bin/ethlambda/src/network/`. `genesis_time` and `genesis_validators_root`,
+which the fork digest keying every gossip topic, the ENR `eth2` entry and
+discv5 admission are computed from, come from that resolved network.
+
+Every built-in chain is a `network::built_in::EmbeddedChain`: its
+`eth-clients` repo's `config.yaml` and `bootstrap_nodes.yaml` byte for byte
+(`bin/ethlambda/assets/<name>/`), parsed through the same
+`ConfigFile::parse`/bootnode reader a directory goes through, plus the two
+genesis values as constants. None carries a **genesis state**: a built-in
+network never anchors at genesis, and the states are 5 MB (mainnet) to 150 MB
+(Hoodi). The constants are checked offline (mainnet's against
+`tests/fixtures/networks/mainnet/genesis.ssz`, eth-clients' file, whose SHA-256
+`beacon::tests::the_fixture_state_is_eth_clients_file` pins; Sepolia's and
+Hoodi's against fork digests published in their own bootnode ENRs), and at
+runtime by checkpoint sync and resume, which both check the anchor state
+against them. `beacon::tests::the_built_in_network_derives_what_it_always_did`
+pins the parsed mainnet config to `Config::mainnet()`, so the file and the
+Rust constant cannot drift apart. Sepolia's config schedules gloas, which this
+build cannot process, so a Sepolia follower stops tracking the chain at
+`GLOAS_FORK_EPOCH`; the ignored-keys warning at startup names it.
+
+A loaded network decodes its own `genesis.ssz` instead, at whatever fork its
+own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, is
+checked for a matching `PRESET_BASE` before anything else runs.
 
 Two consequences, on the built-in arm. `beacon` takes **no genesis**
 configuration of its own the way `node` does: `genesis_time` and
 `genesis_validators_root` need nothing from the command line beyond
-`--network`. And a build with `ethlambda-types/preset-minimal` on cannot decode
-this asset, because the minimal preset shortens the state's fixed-size
-vectors; nothing enables that feature for this binary, and failing is the
-right answer if anything does.
+`--network`. And a build with `ethlambda-types/preset-minimal` on refuses every
+built-in network, since each declares `PRESET_BASE: mainnet`; nothing enables
+that feature for this binary, and failing is the right answer if anything does.
 
 `--checkpoint-sync-url` is no longer merely accepted-but-unused on `beacon`:
 the anchor work has landed, and this flag is now how `beacon` fetches its
@@ -414,7 +422,7 @@ finalized `BeaconState` and anchor block from a standard Beacon API server.
 The full anchor precedence is a resumable data directory, then this URL, then,
 for a loaded network only, the resolved network's own `genesis.ssz`, then
 abort. The URL is therefore required on a fresh data directory only for the
-built-in `mainnet` network, since it alone has no genesis-sync path (see
+built-in networks, since they alone have no genesis-sync path (see
 `docs/checkpoint_sync.md`).
 
 These genesis values used to come from a Beacon API's `/eth/v1/beacon/genesis`,

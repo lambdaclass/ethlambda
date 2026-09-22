@@ -76,31 +76,48 @@ under `lean-quickstart/local-devnet/genesis/`. See
 
 #### `ethlambda beacon` — the Ethereum Beacon Chain
 
-Follows mainnet's gossip. It derives the fork digest from the chain's genesis,
-joins discv5, subscribes to the seven global gossip topics, and logs every
-block and aggregate attestation it decodes:
+A beacon chain follower. It anchors at a finalized checkpoint fetched from a
+Beacon API, then follows the chain to its tip: blocks arriving over gossip and
+range sync are imported through fork choice, and it custodies its slice of the
+fulu data column matrix. What it stores it serves back, to peers over
+`beacon_blocks_by_{range,root}` and to anyone over the standard Beacon API on
+`--api-port`. It has no validator duties: it publishes nothing and subscribes to
+no attestation or sync committee subnet.
 
 ```sh
-./target/release/ethlambda beacon
+./target/release/ethlambda beacon \
+  --network             mainnet \
+  --checkpoint-sync-url <beacon-api-url> \
+  --node-key            ./node-key \
+  --data-dir            ./data
 ```
 
-No flag is required. The `genesis_time` and `genesis_validators_root` the fork
-digest is computed from come from mainnet's genesis `BeaconState`, which is
-built into the binary (`eth-clients/mainnet`'s `genesis.ssz`, byte for byte), so
-startup touches no network and depends on no checkpoint provider. `--node-key`
-is worth passing anyway: without one a fresh identity is generated in memory
-for that run, so the PeerId and ENR change on every restart.
+| Flag | Meaning |
+|---|---|
+| `--network` | `mainnet` (default), `sepolia`, `hoodi`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
+| `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
+| `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
+| `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
 
-Within about half a minute you should see:
+A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`
+and bootnode list, and the two genesis values the fork digest is computed from,
+are compiled into the binary, so deriving the wire parameters touches no
+network.
+
+A healthy run logs its anchor, then imports each new block within a couple of
+seconds of its slot starting (from a Sepolia run):
 
 ```
-Beacon block decoded  slot=15115256 proposer=2241096 fork="fulu" block_root=455f66bc bytes=158301
-Beacon aggregate attestation decoded  slot=15115256 aggregator=111250 attesters=442 …
+Beacon checkpoint sync complete slot=11197376 fork=fulu validators=1997 finalized_epoch=349916 anchor_block_slot=11197376
+Beacon block decoded slot=11197516 proposer=834 fork="fulu" block_root=c44ad3d8 bytes=92333
+Block imported successfully slot=11197516 proposer=834 block_root=c44ad3d8 parent_root=4397e224
+Beacon aggregate attestation decoded slot=11197516 aggregator=574 attesters=53 target_epoch=349922 …
 ```
 
-This is a follower and nothing more: it keeps no chain, imports nothing, and
-publishes nothing. See [`docs/beacon_wire.md`](./docs/beacon_wire.md) for what
-goes on the wire and how to tell a healthy run from a broken one.
+See [`docs/beacon_wire.md`](./docs/beacon_wire.md) for what goes on the wire,
+[`docs/checkpoint_sync.md`](./docs/checkpoint_sync.md) for how the anchor is
+chosen and verified, and [`docs/rpc.md`](./docs/rpc.md) for the Beacon API
+endpoints.
 
 ### Running in a devnet
 

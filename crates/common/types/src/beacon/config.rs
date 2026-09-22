@@ -1063,9 +1063,7 @@ mod tests {
         // The fork schedule, slot timing and churn values in eth-clients'
         // published file must be exactly what `Config::mainnet` hardcodes. If
         // they ever diverge, one of the two is wrong.
-        let text = include_str!(
-            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
-        );
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
         let parsed: Config = serde_yaml_ng::from_str(text).expect("mainnet config.yaml parses");
         let built_in = Config::mainnet();
 
@@ -1103,9 +1101,7 @@ mod tests {
         // MIN_GENESIS_TIME never becomes genesis_time: mainnet's differ by 23
         // seconds, and using the wrong one moves every slot boundary. A later
         // task fills this from the genesis state.
-        let text = include_str!(
-            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
-        );
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
         let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
         assert_ne!(
             parsed.genesis_time, 1_606_824_000,
@@ -1134,9 +1130,7 @@ mod tests {
 
     #[test]
     fn the_networking_and_deposit_keys_come_from_the_file() {
-        let text = include_str!(
-            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
-        );
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
         let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
 
         assert_eq!(parsed.attestation_subnet_count, 64);
@@ -1203,9 +1197,7 @@ mod tests {
     fn a_key_absent_from_the_file_falls_back_to_mainnet() {
         // mainnet's own config.yaml carries no MAX_REQUEST_PAYLOADS. The default
         // has to fill it rather than the parse failing.
-        let text = include_str!(
-            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
-        );
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
         let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
         assert_eq!(
             parsed.max_request_payloads,
@@ -1233,9 +1225,7 @@ mod tests {
 
     #[test]
     fn the_blob_schedule_parses_from_the_file() {
-        let text = include_str!(
-            "../../../../../bin/ethlambda/tests/fixtures/networks/mainnet/config.yaml"
-        );
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
         let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
         assert_eq!(parsed.blob_schedule, Config::mainnet().blob_schedule);
 

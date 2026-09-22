@@ -91,31 +91,19 @@ impl NetworkDir {
 
         let bootnodes = read_bootnodes(base)?;
 
-        // Two fields cannot come from the file and must be reconciled here,
-        // once, before anything reads the config.
-        let mut config = parsed.config;
-        // `genesis_time` is `#[serde(skip)]`, so parsing leaves it at whatever
-        // `Config::default()` carries, which is mainnet's 2020 genesis. It is a
-        // property of the genesis state: mainnet's MIN_GENESIS_TIME is 23
-        // seconds before its actual genesis, so reading it from the file would
-        // put every slot boundary off by that much.
-        config.genesis_time = genesis_state.genesis_time();
         // A zero divides in `epoch_at` and `milliseconds_per_interval` (both
         // key wall-clock time off `seconds_per_slot`/`slot_duration_ms`), so
         // it must be rejected here rather than loading cleanly into a config
         // that panics the first time a duty fires.
-        if config.seconds_per_slot == 0 {
+        if parsed.config.seconds_per_slot == 0 {
             return Err(NetworkDirError::ZeroSecondsPerSlot {
                 path: config_path.clone(),
             });
         }
-        // Always derived, never read from the file. A beacon chain's slots are
-        // a whole number of seconds, so `SECONDS_PER_SLOT` is authoritative and
-        // the millisecond field exists for lean's sub-second cadence. A config
-        // carrying `SECONDS_PER_SLOT: 6` and no `SLOT_DURATION_MS` would
-        // otherwise keep mainnet's 12000 by default, and every duty would fire
-        // at the wrong time while the second-resolution field looked correct.
-        config.slot_duration_ms = config.seconds_per_slot * 1_000;
+        // Two fields cannot come from the file and must be reconciled here,
+        // once, before anything reads the config.
+        let mut config = parsed.config;
+        super::derive_genesis_fields(&mut config, genesis_state.genesis_time());
 
         Ok(Self {
             config,

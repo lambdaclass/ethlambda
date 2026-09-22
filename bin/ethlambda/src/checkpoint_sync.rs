@@ -195,12 +195,13 @@ pub enum CheckpointSyncError {
     },
     #[error("peer served no block at the anchor slot {slot}")]
     AnchorBlockMissing { slot: u64 },
-    // Only the built-in network reaches this: a `--network <dir>` network
-    // anchors at the directory's own `genesis.ssz`. Mainnet's genesis is 2020
-    // and this follower imports nothing at startup, so anchoring there would
-    // park it at slot 0 while claiming to follow a live chain.
+    // Only a built-in network reaches this: a `--network <dir>` network
+    // anchors at the directory's own `genesis.ssz`. Every built-in network has
+    // been live for years and this follower imports nothing at startup, so
+    // anchoring there would park it at slot 0 while claiming to follow a live
+    // chain.
     #[error(
-        "the built-in network has no genesis-sync path, so a fresh data directory needs \
+        "a built-in network has no genesis-sync path, so a fresh data directory needs \
          --checkpoint-sync-url; a network loaded with --network <dir> anchors at its own \
          genesis.ssz instead"
     )]
@@ -1019,12 +1020,11 @@ mod tests {
 
     // --- beacon anchor verification ---
 
-    /// A recent-looking anchor built from the genesis state shipped in the
-    /// binary. A real mainnet state, and the one the identity check runs
-    /// against, moved off slot 0 so it is a legitimate checkpoint.
+    /// A recent-looking anchor built from the mainnet genesis fixture. A real
+    /// mainnet state, and the one the identity check runs against, moved off
+    /// slot 0 so it is a legitimate checkpoint.
     fn beacon_anchor_state() -> BeaconState {
-        let mut state =
-            crate::beacon::mainnet_genesis_state().expect("the built-in archive decodes");
+        let mut state = crate::beacon::mainnet_genesis_state().expect("the fixture decodes");
         *state.slot_mut() = 288;
         state
     }

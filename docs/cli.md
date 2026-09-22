@@ -51,7 +51,7 @@ one `CommonOptions` struct flattened into each.
 | `--metrics-port` | `5054` | Metrics and debug server port. Equal to `--api-port` merges the routers onto one listener |
 | `--node-key` | generates an ephemeral key | Hex file holding the secp256k1 key that is this node's libp2p and discv5 identity. When omitted, a fresh key is generated in memory each start (logged as a warning), so the PeerId and ENR differ on every restart |
 | `--bootnodes` | see below | Bootnode ENR list: one `enr:...` per line, as a YAML block sequence, a YAML flow sequence, or a plain list (`#` comments and leading `- ` are both tolerated) |
-| `--checkpoint-sync-url` | see below | API base URLs, tried in order until one answers. Supplies `node`'s starting state on the lean API, and `beacon`'s anchor on a standard Beacon API; required on a fresh `beacon` data directory only for the built-in network, since a loaded network anchors at its own `genesis.ssz` instead. See [`checkpoint_sync.md`](checkpoint_sync.md) |
+| `--checkpoint-sync-url` | see below | API base URLs, tried in order until one answers. Supplies `node`'s starting state on the lean API, and `beacon`'s anchor on a standard Beacon API; required on a fresh `beacon` data directory only for a built-in network, since a loaded network anchors at its own `genesis.ssz` instead. See [`checkpoint_sync.md`](checkpoint_sync.md) |
 | `--discovery.port` | `9000` | discv5 UDP port; must differ from `--gossipsub-port`. See [Peer discovery](./discovery.md) |
 | `--discovery.advertise-ip` | bind address | IP published in the ENR |
 | `--discovery.target-peers` | `200` | Connected-peer count above which discovery stops dialing |
@@ -63,7 +63,7 @@ carries none and each chain resolves an absent value itself:
 | Flag | Absent on `node` | Absent on `beacon` |
 |---|---|---|
 | `--node-key` | ephemeral in-memory key, warned about | same |
-| `--bootnodes` | no bootnodes: peers only via discv5, warned about | falls back to the resolved network's own bootnode list: the built-in mainnet ENR list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
+| `--bootnodes` | no bootnodes: peers only via discv5, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
 | `--checkpoint-sync-url` | start from a resumable DB, else from genesis | start from a resumable DB, else anchor at the resolved network's own genesis (loaded network only), else abort |
 
 There is no `--discovery.enable`. discv5 is always on, on both chains, on
@@ -133,18 +133,26 @@ something specific here.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--network` | `mainnet` | A built-in network name, or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
+| `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia` or `hoodi`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,
-come from the resolved network's own genesis `BeaconState`: for the built-in
-`mainnet` (the default), that is `bin/ethlambda/assets/mainnet/genesis.ssz`
-(`eth-clients/mainnet`'s file, byte for byte, the same repo the built-in
-bootnode list is copied from); for a loaded network it is that directory's own
-`genesis.ssz`. `beacon` therefore takes no genesis config, validator registry,
-or bootnode file of its own the way `node` does: those are read off the
-resolved network instead of being separate operator input. A directory's
-`config.yaml` is read permissively: absent keys fall back to mainnet's values,
+come from the resolved network:
+
+| `--network` | genesis values | config | bootnodes |
+|---|---|---|---|
+| `mainnet` (default), `sepolia`, `hoodi` | two constants in `network::built_in`; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB) | `bin/ethlambda/assets/<name>/config.yaml`, `eth-clients/<name>`'s file byte for byte | `bin/ethlambda/assets/<name>/bootstrap_nodes.yaml`, from the same repo |
+| a directory | read off the directory's own `genesis.ssz` | the directory's `config.yaml` | the directory's `bootstrap_nodes.yaml`/`.txt` |
+
+The genesis constants are checked twice at runtime: checkpoint sync verifies the
+downloaded anchor state against both, and a resumed data directory is checked
+the same way, so a wrong constant fails at startup rather than following the
+wrong chain.
+
+`beacon` therefore takes no genesis config, validator registry, or bootnode file
+of its own the way `node` does: those are read off the resolved network instead
+of being separate operator input. A `config.yaml` (a directory's, or a built-in
+network's embedded one) is read permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the gloas and heze schedule this build cannot process) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
@@ -157,10 +165,10 @@ and verified against the genesis identity above plus the anchor's own internal
 consistency (see [`checkpoint_sync.md`](checkpoint_sync.md)). The full anchor
 precedence is: a resumable data directory, then `--checkpoint-sync-url`, then,
 for a loaded network only, that directory's own `genesis.ssz`, then abort. The
-URL is therefore **required** on a fresh data directory only for the built-in
-network: this follower imports nothing past its anchor, so anchoring the
-built-in mainnet at genesis would leave it parked at slot 0 while claiming to
-follow a chain that has been live since 2020. A loaded network's own genesis
+URL is therefore **required** on a fresh data directory only for a built-in
+network: this follower imports nothing past its anchor, so anchoring a built-in
+network at genesis would leave it parked at slot 0 while claiming to follow a
+chain that has been live for years. A loaded network's own genesis
 state is a legitimate anchor instead, since a freshly started devnet has no
 checkpoint provider at slot 0 and this is the only way to join one. A
 directory already anchored from a previous run resumes without the flag
@@ -198,7 +206,7 @@ not chain-specific, branches once, and shares the shutdown:
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
 | resolve `--node-key` | shared | shared |
-| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); for a directory, read `config.yaml` and `genesis.ssz` and check `PRESET_BASE` against the compiled preset |
+| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); for a directory, read `config.yaml` and `genesis.ssz`; for either kind, check `PRESET_BASE` against the compiled preset |
 | read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
@@ -217,9 +225,9 @@ in once below the match. That `Option` being `None` is what ends the mainnet pat
 `run_node` returns straight into the shared shutdown after starting the wire.
 
 `beacon::wire_params` reads `genesis_time` and `genesis_validators_root` off
-whichever genesis state the resolved network supplies (the built-in mainnet
-archive, decoded as phase0, or a loaded network's own `genesis.ssz`, decoded at
-whatever fork its own schedule names for epoch 0), derives the wall-clock epoch
+the resolved network (a built-in network's two constants, or a loaded
+network's own `genesis.ssz`, decoded at whatever fork its own schedule names
+for epoch 0), derives the wall-clock epoch
 and fork digest from them, and logs the next boundary that would move the
 digest. It builds nothing: one `build_swarm` serves both chains, dispatching on
 the `WireConfig` variant for the topics, the req/resp protocol set, the

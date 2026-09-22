@@ -157,7 +157,7 @@ mod tests {
     use super::*;
 
     const DEVNET: &str = include_str!("../../tests/fixtures/networks/devnet/config.yaml");
-    const MAINNET: &str = include_str!("../../tests/fixtures/networks/mainnet/config.yaml");
+    const MAINNET: &str = include_str!("../../assets/mainnet/config.yaml");
 
     #[test]
     fn the_devnets_values_are_read() {
