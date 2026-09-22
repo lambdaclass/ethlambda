@@ -222,16 +222,24 @@ impl DiscoveredPeer {
 }
 
 /// Order candidates so the ones filling this node's gaps are dialed first:
-/// custody columns it samples and no connected peer holds, then attestation
+/// custody columns it samples that are undersupplied (fewer connected
+/// custodians than `dial::CUSTODY_REDUNDANCY_TARGET`), then attestation
 /// subnets no connected peer covers.
 ///
-/// Custody outranks subnets because the two shortfalls do not cost the same. A
-/// column no connected peer custodies cannot be fetched by root at all, since
-/// every peer answers `DataColumnsByRoot` for a column it does not hold with
-/// an empty list, and the availability gate then stops the chain on the first
-/// block that needs it. An uncovered attestation subnet only narrows what this
-/// node sees of the mesh. The ordering also puts a supernode, which custodies
-/// every column, ahead of everything else while any column is uncovered, which
+/// Custody outranks subnets because the two shortfalls do not cost the same.
+/// At the extreme, a column no connected peer custodies cannot be fetched by
+/// root at all, since every peer answers `DataColumnsByRoot` for a column it
+/// does not hold with an empty list, and the availability gate then stops the
+/// chain on the first block that needs it. But thin, nonzero supply is not
+/// safe either: a by-root lookup retries against a custodian it has not
+/// already asked, so a column with fewer custodians than the retry ladder has
+/// rounds exhausts its ladder re-asking peers that already failed it, with no
+/// fresh one left to try. That is the failure a mainnet follower actually hit
+/// with 5-8 custodians per sampled column: 78% of its by-root requests went
+/// unanswered even though every column had *some* custodian. An uncovered
+/// attestation subnet only narrows what this node sees of the mesh, by
+/// comparison. The ordering also puts a supernode, which custodies every
+/// column, ahead of everything else while any column is undersupplied, which
 /// is the fastest way out of that state.
 ///
 /// A candidate advertising neither scores zero on both and sorts last, but is
@@ -244,7 +252,8 @@ pub(crate) fn rank_candidates(
     candidates.sort_by_key(|candidate| {
         // Skipped rather than computed and discarded when nothing is wanted,
         // which is every lean node and every beacon node whose peers already
-        // cover it: `custody_coverage` runs the custody shuffle per candidate.
+        // supply every sampled column at the target: `custody_coverage` runs
+        // the custody shuffle per candidate.
         let columns = if wanted_columns.is_empty() {
             0
         } else {

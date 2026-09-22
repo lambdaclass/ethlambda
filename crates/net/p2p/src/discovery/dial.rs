@@ -251,7 +251,7 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) -> bool {
         }
         if !admitted.is_empty() {
             let covered = covered_subnets(&server.discovery.peer_attnets, &server.connected_peers);
-            let wanted = uncovered_custody_columns(server);
+            let wanted = undersupplied_custody_columns(server);
             rank_candidates(&mut admitted, &covered, &wanted);
             server.discovery.candidates.extend(admitted);
         }
@@ -376,40 +376,76 @@ fn spawn_contact_poll(peer_table: PeerTable, filter: LeanFilter) -> mpsc::Receiv
     receiver
 }
 
-/// The columns this node samples that no connected peer is known to custody.
+/// How many distinct custodians a sampled column needs before dialing stops
+/// treating it as a gap.
 ///
-/// Empty on lean, which samples nothing, and empty on a beacon node whose peers
-/// already cover it, which is what lets the ranking skip the per-candidate
-/// custody shuffle entirely in the common case.
+/// Tied to [`crate::MAX_FETCH_RETRIES`]: a by-root column lookup gets that many
+/// attempts, `handle_column_fetch_failure` in `req_resp/handlers.rs` tracks
+/// `failed_peers` so each retry asks a custodian it has not already asked, and
+/// a column with fewer custodians than the ladder has rounds runs out of fresh
+/// peers before it runs out of retries. Below this count, a lookup can still
+/// exhaust its ladder on a handful of peers that are slow, unreachable, or
+/// simply don't have the column cached, with no untried custodian left to
+/// fall back to.
+///
+/// Presence — at least one custodian — used to be the bar, and it was too low
+/// to catch this: a mainnet follower whose `lean_custody_column_peers` showed
+/// only 5-8 custodians per sampled column (of 129 connected peers) still read
+/// every one of those columns as "covered", so custody stopped contributing to
+/// [`rank_candidates`] and dialing optimized purely for attestation-subnet
+/// coverage. 78% of that node's by-root column requests went unanswered
+/// (81,073 requests against 17,785 response chunks) while it was off the tip
+/// and depended on by-root fetches alone.
+const CUSTODY_REDUNDANCY_TARGET: usize = crate::MAX_FETCH_RETRIES as usize;
+
+/// The columns this node samples whose connected-peer custodian count is below
+/// [`CUSTODY_REDUNDANCY_TARGET`].
+///
+/// Empty on lean, which samples nothing, and empty on a beacon node whose
+/// peers already supply every sampled column at the target, which is what
+/// lets the ranking skip the per-candidate custody shuffle entirely in the
+/// common case.
 ///
 /// `peer_custody` holds a peer only once its `metadata/3` answer, or the `cgc`
 /// its ENR carried at dial time, has been recorded, so a peer that has told us
-/// neither counts as covering nothing. That makes the ranking more eager than
-/// strictly necessary, never wrong: the cost of over-counting a gap is one dial
-/// aimed at a peer that would have been worth dialing anyway.
-fn uncovered_custody_columns(server: &P2PServer) -> HashSet<u64> {
+/// neither contributes to any column's count. That makes the ranking more
+/// eager than strictly necessary, never wrong: the cost of over-counting a gap
+/// is one dial aimed at a peer that would have been worth dialing anyway.
+fn undersupplied_custody_columns(server: &P2PServer) -> HashSet<u64> {
     let Some(wire) = server.wire.beacon() else {
         return HashSet::new();
     };
-    let covered = covered_custody_columns(&server.peer_custody, &server.connected_peers);
+    let custodian_counts =
+        custodian_counts_by_column(&server.peer_custody, &server.connected_peers);
     wire.custody_columns
         .iter()
         .copied()
-        .filter(|column| !covered.contains(column))
+        .filter(|column| {
+            custodian_counts.get(column).copied().unwrap_or(0) < CUSTODY_REDUNDANCY_TARGET
+        })
         .collect()
 }
 
-/// Columns held by peers we are currently connected to, the custody
+/// Distinct connected-peer custodian counts per column, the custody
 /// counterpart of [`covered_subnets`] and read the same way.
-fn covered_custody_columns(
+///
+/// A peer's own column list is deduplicated before it contributes, so a
+/// column listed twice for the same peer (which should not happen, but
+/// `metadata/3` is peer-supplied) still counts that peer once.
+fn custodian_counts_by_column(
     peer_custody: &HashMap<PeerId, Vec<u64>>,
     connected_peers: &HashMap<PeerId, ConnectionDirection>,
-) -> HashSet<u64> {
-    peer_custody
+) -> HashMap<u64, usize> {
+    let mut counts = HashMap::new();
+    for (_, columns) in peer_custody
         .iter()
         .filter(|(peer, _)| connected_peers.contains_key(peer))
-        .flat_map(|(_, columns)| columns.iter().copied())
-        .collect()
+    {
+        for column in columns.iter().copied().collect::<HashSet<_>>() {
+            *counts.entry(column).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// Attestation subnets covered by peers we are currently connected to.
@@ -456,18 +492,85 @@ mod tests {
         // The case that stops the chain: what a peer custodied is only
         // reachable while that peer is connected, so a lookup aimed at a
         // column only a departed peer held gets an empty answer from
-        // everyone. Counting it as covered would keep the dial loop from
+        // everyone. Counting it as supplied would keep the dial loop from
         // looking for a replacement.
         let connected = random_peer();
         let gone = random_peer();
         let peer_custody = HashMap::from([(connected, vec![47u64, 63]), (gone, vec![97u64])]);
 
-        let covered = covered_custody_columns(
+        let counts = custodian_counts_by_column(
             &peer_custody,
             &HashMap::from([(connected, ConnectionDirection::Inbound)]),
         );
 
-        assert_eq!(covered, HashSet::from([47, 63]));
+        assert_eq!(counts, HashMap::from([(47, 1), (63, 1)]));
+    }
+
+    #[test]
+    fn two_peers_custodying_the_same_column_count_as_two() {
+        let first = random_peer();
+        let second = random_peer();
+        let peer_custody = HashMap::from([(first, vec![47u64]), (second, vec![47u64])]);
+        let connected = HashMap::from([
+            (first, ConnectionDirection::Inbound),
+            (second, ConnectionDirection::Outbound),
+        ]);
+
+        let counts = custodian_counts_by_column(&peer_custody, &connected);
+
+        assert_eq!(counts, HashMap::from([(47, 2)]));
+    }
+
+    #[test]
+    fn the_same_peer_listed_twice_for_a_column_counts_once() {
+        // `metadata/3` is peer-supplied, so a duplicate in its own answer must
+        // not inflate that one peer into two custodians.
+        let peer = random_peer();
+        let peer_custody = HashMap::from([(peer, vec![47u64, 47u64])]);
+        let connected = HashMap::from([(peer, ConnectionDirection::Inbound)]);
+
+        let counts = custodian_counts_by_column(&peer_custody, &connected);
+
+        assert_eq!(counts, HashMap::from([(47, 1)]));
+    }
+
+    /// A column already at the redundancy target is not a gap: dialing should
+    /// not keep chasing coverage it already has.
+    #[test]
+    fn a_column_at_the_target_is_not_undersupplied() {
+        let peers: Vec<PeerId> = (0..CUSTODY_REDUNDANCY_TARGET)
+            .map(|_| random_peer())
+            .collect();
+        let peer_custody = peers.iter().map(|peer| (*peer, vec![9u64])).collect();
+        let connected = peers
+            .iter()
+            .map(|peer| (*peer, ConnectionDirection::Inbound))
+            .collect();
+
+        let counts = custodian_counts_by_column(&peer_custody, &connected);
+
+        assert_eq!(
+            counts.get(&9).copied().unwrap_or(0),
+            CUSTODY_REDUNDANCY_TARGET
+        );
+    }
+
+    /// One custodian short of the target must still read as a gap, so dialing
+    /// keeps looking for one more.
+    #[test]
+    fn a_column_below_the_target_is_undersupplied() {
+        let peers: Vec<PeerId> = (0..CUSTODY_REDUNDANCY_TARGET - 1)
+            .map(|_| random_peer())
+            .collect();
+        let peer_custody = peers.iter().map(|peer| (*peer, vec![9u64])).collect();
+        let connected = peers
+            .iter()
+            .map(|peer| (*peer, ConnectionDirection::Inbound))
+            .collect();
+
+        let counts = custodian_counts_by_column(&peer_custody, &connected);
+
+        assert!(counts.get(&9).copied().unwrap_or(0) < CUSTODY_REDUNDANCY_TARGET);
     }
 
     /// The mainnet-follower regression this budget exists for: the peer table
