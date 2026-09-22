@@ -159,10 +159,31 @@ jobs:
         with:
           make-target: test-${{ matrix.half }}
 
-      # This is the half that builds `bin/ethlambda`, so the binary is already
-      # linked. Validates the harness and its JSON contract in a few seconds.
+  # Validates the benchmark harness and its JSON contract. This used to be a
+  # step in `Test (node)`, on the theory that the binary was already built there.
+  # It was not: `cargo test` never links the plain binary, and it builds with the
+  # dev-dependencies' features unified in (`bin/ethlambda` enables tokio's
+  # `test-util`), which `cargo run` leaves out. So the step rebuilt tokio and
+  # everything above it (libp2p, hyper, axum, the ethrex crates) into a target
+  # dir the test build had already brought to the disk ceiling, and the job then
+  # failed at random in the cache save step with ENOSPC. Here it builds only the
+  # binary's own graph. No fixtures: with `--mock-crypto` the synthetic benchmark
+  # generates its chain and reads no files.
+  benchmark-smoke:
+    name: Benchmark smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Benchmark smoke (mock crypto)
-        if: matrix.half == 'node'
         run: |
           cargo run --locked --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
             --num-validators 4 --warmup-slots 4 --iterations 3 --format json \
