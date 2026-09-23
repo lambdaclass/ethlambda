@@ -30,10 +30,13 @@ use ethlambda_types::{
 };
 use libssz::{SszDecode, SszEncode};
 
-use crate::beacon_state_delta;
-use crate::state_diff::StateDiff;
+use crate::state_codec::encode_state_value;
+use crate::state_writer::{
+    CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateWriteRequest,
+    StateWriterHandle, read_state,
+};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -423,10 +426,6 @@ type StorageKey = Vec<u8>;
 type StorageEntry = (StorageKey, Vec<u8>);
 type BlockRootIndexChanges = (Vec<StorageKey>, Vec<StorageEntry>);
 
-/// [`Store::encoded_memo`]'s single entry: the root it was encoded for, and
-/// its [`encode_state_value`] bytes.
-type EncodedStateMemo = Arc<Mutex<Option<(H256, Vec<u8>)>>>;
-
 #[derive(Clone, Default)]
 struct ForkChoiceState {
     known_votes: HashMap<u64, AttestationData>,
@@ -707,44 +706,6 @@ fn data_column_block_prefix(slot: u64, block_root: &H256) -> Vec<u8> {
     encode_slot_root_key(slot, block_root)
 }
 
-/// Encodes a `States` value: the state's fork selector, then the variant's own
-/// SSZ.
-///
-/// The tag is what lets one table hold both a lean `State` and a beacon
-/// `BeaconState` without the reader having to already know which it is. Note
-/// [`ForkName::Lean`]'s selector is not a variant index, so the byte must go
-/// back through [`ForkName::from_selector`] rather than being cast.
-pub(crate) fn encode_state_value(state: &BeaconState) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.push(state.fork_name().selector());
-    bytes.extend_from_slice(&state.to_ssz());
-    bytes
-}
-
-/// The inverse of [`encode_state_value`].
-///
-/// Panics on a value this build cannot tag-decode, matching every other read in
-/// this file: `from_db_state` has already rejected a directory of the wrong
-/// format version, so anything reaching here is corruption rather than an old
-/// database.
-pub(crate) fn decode_state_value(bytes: &[u8]) -> BeaconState {
-    let (tag, ssz) = bytes.split_first().expect("value is never empty");
-    let fork = ForkName::from_selector(*tag).expect("value carries a known fork selector");
-    BeaconState::from_ssz(fork, ssz).expect("valid state value")
-}
-
-/// [`decode_state_value`] for the lean reader, which has no beacon shape to do
-/// anything with.
-fn decode_lean_state_value(bytes: &[u8]) -> State {
-    match decode_state_value(bytes) {
-        BeaconState::Lean(state) => state,
-        beacon => panic!(
-            "lean read a {} state out of the States table; a data directory holds one chain",
-            beacon.fork_name()
-        ),
-    }
-}
-
 /// Encodes a beacon `BlockHeaders` value: the block's fork selector, then the
 /// variant's own SSZ.
 ///
@@ -768,6 +729,28 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
     let (tag, ssz) = bytes.split_first().expect("value is never empty");
     let fork = ForkName::from_selector(*tag).expect("value carries a known fork selector");
     SignedBeaconBlock::from_ssz(fork, ssz).expect("valid signed block")
+}
+
+/// `root`'s slot on a beacon chain, read without a `Store`, for the writer
+/// thread's anchor decision.
+///
+/// `None` when no block is on record for `root`, which is how the store's
+/// first-ever beacon state is recognised: it has no parent block, so there is
+/// no base to diff against and it is always a snapshot.
+///
+/// Beacon directories only: it decodes the row as a tagged
+/// [`SignedBeaconBlock`], which is the wrong shape for a lean directory's bare
+/// [`BlockHeader`] (unlike [`block_fields`](Store::block_fields), which
+/// dispatches on `self.chain`). Nothing does today: [`StateWriter::write`](crate::state_writer)'s
+/// non-`Lean` match arm is this function's only caller, so that invariant is
+/// enforced by having exactly one caller rather than by a runtime check.
+pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Option<u64> {
+    let view = backend.begin_read().expect("read view");
+    let bytes = view
+        .get(Table::BlockHeaders, &root.to_ssz())
+        .expect("get")?;
+    drop(view);
+    Some(decode_beacon_block_value(&bytes).slot())
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -842,35 +825,19 @@ pub struct Store {
     /// is a pure speed and memory trade with no correctness stake. Nothing
     /// here may become a consensus input: a decision that changed with cache
     /// residency would be a bug, not a tuning choice.
-    state_cache: Arc<Mutex<LruCache<CacheKey, Arc<BeaconState>>>>,
+    state_cache: Arc<StateCache>,
+    /// States handed to the writer but not yet committed; see
+    /// [`PendingStates`].
+    pending_states: Arc<PendingStates>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
-    /// The most recently encoded beacon state, so the beacon write path does
-    /// not re-encode a parent's whole SSZ on every import.
-    ///
-    /// One entry, and beacon-only. Import is sequential, so the parent is
-    /// almost always the state the previous import wrote, and a
-    /// reconstruction produces the bytes as a by-product so a miss fills it
-    /// for free.
-    encoded_memo: EncodedStateMemo,
-}
-
-/// What a cached state is keyed by.
-///
-/// One cache rather than two, so a single capacity bounds the total rather
-/// than each kind separately overshooting it. A checkpoint state is keyed by
-/// its epoch as well as its root because a checkpoint's root is the last block
-/// at or before its boundary slot, so the same root can serve different epochs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum CacheKey {
-    /// A block's post-state, keyed by that block's root.
-    BlockState(H256),
-    /// The state advanced to a checkpoint's epoch boundary.
-    CheckpointState { epoch: u64, root: H256 },
+    /// The background writer, joined when the last clone of this `Store`
+    /// drops. See [`StateWriterHandle`].
+    state_writer: Arc<StateWriterHandle>,
 }
 
 /// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
-fn new_state_cache() -> Arc<Mutex<LruCache<CacheKey, Arc<BeaconState>>>> {
+fn new_state_cache() -> Arc<StateCache> {
     let capacity = NonZeroUsize::new(STATE_CACHE_CAPACITY).expect("cache capacity is non-zero");
     Arc::new(Mutex::new(LruCache::new(capacity)))
 }
@@ -944,6 +911,15 @@ impl Store {
     /// `fetch_initial_state` is the caller, and it discharges the obligation
     /// immediately; the beacon path grows its own alongside it.
     ///
+    /// **The caller must also call [`Store::repair_head`], after its own
+    /// checks, before trusting this store for anything else.** This does not
+    /// do it itself: repairing the head is a mutation, and this function's own
+    /// contract (like every other read here) is to load without writing.
+    /// `repair_head` also wants the caller's checks to have already run: it
+    /// assumes justified and finalized both have persisted states (see
+    /// [`Store::verify_anchor_states`]), which is what lets it bound its walk
+    /// against finalized rather than potentially rewinding past it.
+    ///
     /// # Errors
     ///
     /// [`Error::DbVersionMismatch`] when the directory was written by a build
@@ -1016,6 +992,239 @@ impl Store {
             chain,
             anchor_slot,
         )))
+    }
+
+    /// Checks that both the justified and finalized checkpoints have a
+    /// persisted state, returning the finalized state (which a resuming
+    /// caller needs anyway, to verify genesis) or [`Error::AnchorStateLost`]
+    /// naming whichever checkpoint does not.
+    ///
+    /// Call this, and act on its error, before [`Store::repair_head`]:
+    /// unlike the head, justified and finalized are consensus statements. A
+    /// repair may roll the head back to a recent ancestor because fork choice
+    /// reprocesses forward from there on its own (see `repair_head`'s doc),
+    /// but there is no equivalent recovery for a checkpoint a repair cannot
+    /// simply invent an earlier version of. So this reports the loss instead,
+    /// for the caller's own retry logic to treat exactly like a stale
+    /// directory: fall back to checkpoint sync if a URL is configured, or
+    /// fail naming the remedy in [`Error::AnchorStateLost`] if not.
+    ///
+    /// This is also what lets `repair_head` bound its own walk against
+    /// finalized: once this has passed, finalized's state is known good, so a
+    /// walk that reaches it (rather than running past it) is a normal
+    /// termination, not a case `repair_head` has to guard against on its own.
+    pub fn verify_anchor_states(&self) -> Result<Arc<BeaconState>, Error> {
+        let justified = self.latest_justified()?;
+        if !self.has_state(&justified.root)? {
+            return Err(Error::AnchorStateLost {
+                checkpoint: justified,
+            });
+        }
+        let finalized = self.latest_finalized()?;
+        self.get_state(&finalized.root)?
+            .ok_or(Error::AnchorStateLost {
+                checkpoint: finalized,
+            })
+    }
+
+    /// Rewinds the head to the newest ancestor with a persisted state, if the
+    /// recorded head has none.
+    ///
+    /// A resuming caller (see [`Store::from_db_state`]'s doc) calls this
+    /// after [`Store::verify_anchor_states`] has already confirmed justified
+    /// and finalized both have one; this method assumes that and does not
+    /// re-check it.
+    ///
+    /// # Why the head can outrun its own state
+    ///
+    /// The writer thread (see [`crate::state_writer::StateWriterHandle`])
+    /// commits a block's post-state asynchronously; the caller that hands it
+    /// off gets control back once the state is cached and buffered, not once
+    /// it is on disk. The importer's `update_head` writes `KEY_HEAD` (and the
+    /// canonical `BlockRoots` index) synchronously, right after that hand-off,
+    /// so an unclean shutdown can catch the head pointer on disk before the
+    /// state it names is. Before the writer thread existed the state write
+    /// was synchronous and always preceded the head write, so a persisted
+    /// head implied a persisted state; this restores that invariant on the
+    /// way back up, once per resume, rather than requiring every future
+    /// reader of the head to re-check it.
+    ///
+    /// Only the head pointer and the canonical `BlockRoots` index are
+    /// rewritten (the latter by the same [`Store::update_checkpoints`] every
+    /// head move already goes through). Justified and finalized are never
+    /// touched here; see [`Store::verify_anchor_states`] for why.
+    ///
+    /// `KEY_SAFE_TARGET` is left exactly as stale as it already was: it can
+    /// still name a hopped block whose `LiveChain` row this method just
+    /// deleted. Harmless, deliberately not fixed up here: its only reader
+    /// (the lean tick pipeline's block-building guard) takes the block's
+    /// header, never its state, and the next interval-3 tick recomputes it
+    /// from `get_live_chain()`, which already reflects the deletion.
+    ///
+    /// # This also removes the hopped blocks from fork choice
+    ///
+    /// Each block walked past keeps its `BlockHeaders`/`BlockBodies`/
+    /// `BlockProof` rows; only its `LiveChain` row is deleted. That is
+    /// already this codebase's encoding of "invisible to fork choice" (see
+    /// [`Store::insert_pending_block`]'s doc), and it is what makes the
+    /// rewind stick: leaving the row behind would keep the stateless tip
+    /// visible to `compute_lmd_ghost_head`, which does not consult
+    /// `has_state`, so the very next fork-choice run would walk right back to
+    /// it. Deleting it composes with machinery that already exists to bring a
+    /// stateless block back: `on_block_core` keys its duplicate check on
+    /// `has_state`, not on the block being on record, so re-processing it is
+    /// not treated as a no-op; range sync asks peers for blocks starting at
+    /// `head_slot + 1`, which is now this block's slot again; and the
+    /// pending-block walk that runs when a new block's parent has no state
+    /// pulls a stateless ancestor back out of storage with
+    /// [`Store::get_signed_block`] and re-imports it. Nothing here has to
+    /// reach across into the blockchain crate to trigger any of that; it
+    /// falls out of a block just being stateless again, which is the
+    /// ordinary case those three already handle.
+    ///
+    /// # Termination
+    ///
+    /// On the lean arm, guaranteed: [`Store::init_store`] writes the anchor's
+    /// snapshot synchronously, in the same atomic batch as the rest of the
+    /// metadata, and a lean head always names a block (`init_store` writes it
+    /// in that same batch), so the walk always reaches a persisted state
+    /// before it could reach a root with no block entry at all.
+    ///
+    /// On the beacon arm this is not guaranteed the same way: the anchor
+    /// insertion that follows [`Store::init_beacon`] now enqueues its state
+    /// like any other (`insert_state` no longer writes synchronously on
+    /// either arm), so the same unclean-shutdown window that motivates this
+    /// method can also catch the anchor itself without a state. Two
+    /// independent bounds cover this instead of trusting synchronous writes
+    /// that no longer happen, checked together since
+    /// [`Store::anchor_slot`] `<=` [`Store::latest_finalized`]'s slot always
+    /// holds and the two therefore coincide on a fresh checkpoint-sync
+    /// anchor with no finalization progress yet:
+    ///
+    /// - Below or at [`Store::latest_finalized`]'s slot,
+    ///   [`Store::prune_live_chain`] has already deleted `LiveChain` rows for
+    ///   every slot down there, so a head rewound that far would be invisible
+    ///   to fork choice regardless — worse than the state it is missing.
+    ///   Reported as [`Error::AnchorStateLost`], the same error
+    ///   `verify_anchor_states` reports; reaching it here means that check's
+    ///   invariant did not hold, which this treats as an error rather than
+    ///   trusting. This is what the tie above resolves to, since it names the
+    ///   checkpoint and a remedy.
+    /// - Strictly below [`Store::anchor_slot`] *and* strictly below
+    ///   finalized's slot (so distinguishable from the tie), this directory
+    ///   could never have held a state to fall back to at all. Reported as
+    ///   [`Error::UnexpectedMissingState`] naming the original head, not an
+    ///   unfamiliar ancestor the operator never saw the walk step onto.
+    ///
+    /// Independently of both, at most [`STATE_WRITE_QUEUE_CAPACITY`] + 1
+    /// blocks can have an unwritten state behind the head at once (the queue
+    /// plus the one write the worker thread can be holding), so a walk
+    /// longer than that means something other than this window caused it.
+    /// That case is reported as [`Error::HeadRepairExceededWindow`] rather
+    /// than walked past. A root with no block entry at all, reached partway
+    /// through the walk (not at the start; see below), is a broken parent
+    /// chain and is reported as [`Error::UnexpectedMissingBlockHeader`].
+    ///
+    /// # A head with no block at all
+    ///
+    /// On a lean directory this is corruption: `init_store` writes the head's
+    /// own block in the same batch as `KEY_HEAD`, so nothing legitimate
+    /// leaves that row pointing at an absent header. Reported as
+    /// [`Error::UnexpectedMissingBlockHeader`].
+    ///
+    /// On a beacon directory this can be legitimate: [`Store::init_beacon`]
+    /// alone seeds `KEY_HEAD` at the checkpoint root before the anchor block
+    /// and state that pair with it have been inserted (a separate step,
+    /// taken by the caller once checkpoint sync or the genesis path completes
+    /// it), and `from_db_state`'s contract is to load that directory anyway.
+    /// The writer-outran-the-head race this method repairs cannot produce
+    /// that shape on its own: it requires the head's own block to already be
+    /// on disk, only its state to be missing. So this bails out untouched,
+    /// rather than reporting corruption for a directory `from_db_state` has
+    /// always accepted.
+    pub fn repair_head(&mut self) -> Result<(), Error> {
+        let start = self.head()?;
+        // `has_state` checks `pending_states` before the backend, but that
+        // buffer is always empty here: this runs once per resume, right after
+        // `from_parts` built a fresh one, before anything has been inserted.
+        // So this is a pure backend check, not a reason to reach for a raw
+        // table read instead. Checked before `block_entry` so the common,
+        // already-healthy case pays for exactly one read, not two.
+        if self.has_state(&start)? {
+            return Ok(());
+        }
+
+        // See "A head with no block at all" above.
+        let Some((mut slot, mut parent_root)) = self.block_entry(&start) else {
+            return match self.chain {
+                Chain::Lean => Err(Error::UnexpectedMissingBlockHeader(start)),
+                Chain::Beacon => Ok(()),
+            };
+        };
+
+        let finalized = self.latest_finalized()?;
+        let mut cursor = start;
+        let mut hops = 0usize;
+        // `(slot, root)` pairs to delete from `LiveChain`; see "This also
+        // removes the hopped blocks from fork choice" above.
+        let mut hopped = Vec::new();
+
+        loop {
+            // `anchor_slot <= finalized.slot` always holds, so the two bounds
+            // coincide on a fresh checkpoint-sync anchor with no finalization
+            // progress yet. The tie, and everything at or below finalized in
+            // general, is reported as `AnchorStateLost`: it names the
+            // checkpoint and a remedy, which `UnexpectedMissingState` does
+            // not. Only where the anchor sits strictly *above* finalized
+            // does a stop at or below it get the more specific error: there,
+            // "this directory never held that block" is the more accurate
+            // statement than a reader would get from the checkpoint's own
+            // (later) slot.
+            if slot <= finalized.slot {
+                return Err(
+                    if slot <= self.anchor_slot && self.anchor_slot < finalized.slot {
+                        Error::UnexpectedMissingState(start)
+                    } else {
+                        Error::AnchorStateLost {
+                            checkpoint: finalized,
+                        }
+                    },
+                );
+            }
+
+            hopped.push((slot, cursor));
+            hops += 1;
+            if hops > STATE_WRITE_QUEUE_CAPACITY + 1 {
+                return Err(Error::HeadRepairExceededWindow {
+                    start,
+                    stalled_at: cursor,
+                    hops,
+                });
+            }
+
+            cursor = parent_root;
+            if self.has_state(&cursor)? {
+                break;
+            }
+            let Some(next) = self.block_entry(&cursor) else {
+                return Err(Error::UnexpectedMissingBlockHeader(cursor));
+            };
+            slot = next.0;
+            parent_root = next.1;
+        }
+
+        // Reaching here means the loop hopped at least once, so `cursor` is
+        // strictly an ancestor of `start`: nothing below removes a row for a
+        // head that was never touched.
+        self.delete_live_chain_entries(&hopped);
+        warn!(
+            from = %start,
+            to = %cursor,
+            hops,
+            "head outran the state writer; rewound to the newest ancestor with a persisted state"
+        );
+        self.update_checkpoints(ForkCheckpoints::head_only(cursor))?;
+        Ok(())
     }
 
     /// Internal helper to initialize the store with anchor data.
@@ -1228,6 +1437,14 @@ impl Store {
         chain: Chain,
         anchor_slot: u64,
     ) -> Self {
+        let state_cache = new_state_cache();
+        let pending_states = Arc::new(PendingStates::default());
+        let state_writer = Arc::new(StateWriterHandle::spawn(
+            backend.clone(),
+            chain,
+            state_cache.clone(),
+            pending_states.clone(),
+        ));
         Self {
             backend,
             config,
@@ -1239,9 +1456,10 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
-            state_cache: new_state_cache(),
+            state_cache,
+            pending_states,
             beacon: Default::default(),
-            encoded_memo: Arc::new(Mutex::new(None)),
+            state_writer,
         }
     }
 
@@ -2339,60 +2557,19 @@ impl Store {
     /// data directory holds one chain for its whole life and the tag is
     /// authoritative.
     ///
-    /// Lean: fast path is a full snapshot in `States`; otherwise the state is
-    /// reconstructed by walking parent-linked `StateDiffs` back to the nearest
-    /// ancestor snapshot and replaying forward. Returns `None` if the diff
-    /// chain is broken or the target block header is unavailable.
-    ///
-    /// Beacon: the same snapshot-or-reconstruct shape as lean, but the fold
-    /// works in the byte domain and only decodes once at the end; see
-    /// [`Store::reconstruct_beacon_state_bytes`].
-    ///
-    /// Checks [`Store::state_cache`] first for both chains, keyed by
-    /// [`CacheKey::BlockState`]; a hit returns the same `Arc` without
-    /// touching storage or decoding anything. A miss reconstructs the state
-    /// as described above and memoizes it before returning.
+    /// The lookup order (cache, then the `pending_states` write-buffer, then
+    /// the backend) and the per-chain reconstruction live on
+    /// [`read_state`](crate::state_writer::read_state), which this calls
+    /// directly rather than restating: one copy of the algorithm is one copy
+    /// that can go stale.
     pub fn get_state(&self, root: &H256) -> Result<Option<Arc<BeaconState>>, Error> {
-        let key = CacheKey::BlockState(*root);
-        if let Some(state) = self.cached_state(key) {
-            return Ok(Some(state));
-        }
-
-        let state = match self.chain {
-            Chain::Lean => {
-                // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
-                let snapshot = {
-                    let view = self.backend.begin_read().expect("read view");
-                    view.get(Table::States, &root.to_ssz())
-                        .expect("get")
-                        .map(|bytes| decode_lean_state_value(&bytes))
-                };
-                let state = if let Some(s) = snapshot {
-                    s
-                } else {
-                    let Some(s) = self.reconstruct_state(root)? else {
-                        return Ok(None);
-                    };
-                    s
-                };
-                BeaconState::Lean(state)
-            }
-            Chain::Beacon => {
-                let Some(bytes) = self.reconstruct_beacon_state_bytes(root)? else {
-                    return Ok(None);
-                };
-                // Decoded exactly once, after every delta in the chain has
-                // already been folded in the byte domain; see
-                // `reconstruct_beacon_state_bytes`'s doc comment for why an
-                // SSZ decode per hop instead would be the whole cost this
-                // delta layer exists to avoid.
-                decode_state_value(&bytes)
-            }
-        };
-
-        let state = Arc::new(state);
-        self.cache_state(key, state.clone());
-        Ok(Some(state))
+        read_state(
+            self.backend.as_ref(),
+            self.chain,
+            &self.state_cache,
+            &self.pending_states,
+            root,
+        )
     }
 
     /// The memoized state for `key`, if it is still resident.
@@ -2410,103 +2587,16 @@ impl Store {
         self.state_cache.lock().unwrap().put(key, state);
     }
 
-    /// Reconstructs a beacon state's raw *encoded* bytes (see
-    /// [`encode_state_value`]) by walking `StateDiffs` back to the nearest
-    /// `States` snapshot and folding deltas forward, byte domain only.
-    ///
-    /// Mirrors [`Store::reconstruct_state`]'s walk-then-replay shape for
-    /// lean, but cannot share its body: a beacon `StateDiffs` record is a
-    /// [`beacon_state_delta::frame`]d byte delta, not a [`StateDiff`], so the
-    /// base root read off each hop comes from
-    /// [`beacon_state_delta::unframe`] instead of a `StateDiff`'s own field.
-    ///
-    /// Returns encoded bytes rather than a decoded [`BeaconState`] so that a
-    /// caller that only needs the bytes ([`Store::beacon_encoded_parent_bytes`]'s
-    /// diff base) is never made to pay for a decode it will not use.
-    /// [`Store::get_state`]'s beacon arm is the one caller that decodes, and
-    /// it does so exactly once, after every delta has already been folded.
-    ///
-    /// `Ok(None)` when `root` is unknown, or the chain runs off the retained
-    /// window before reaching a snapshot: a missing `StateDiffs` record below
-    /// the pruned boundary, matching how the lean walk in
-    /// [`Store::reconstruct_state`] handles both cases.
-    fn reconstruct_beacon_state_bytes(&self, root: &H256) -> Result<Option<Vec<u8>>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        let mut records: Vec<Vec<u8>> = Vec::new();
-        let mut cursor = *root;
-        let snapshot = loop {
-            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
-                break bytes;
-            }
-            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
-            else {
-                return Ok(None);
-            };
-            let (base_root, _, _, _) = beacon_state_delta::unframe(&diff_bytes);
-            cursor = base_root;
-            records.push(diff_bytes);
-        };
-        drop(view);
-
-        // `records` runs target -> snapshot child; reverse to snapshot child
-        // -> target, the order the chain was written in, so folding forward
-        // replays it correctly.
-        records.reverse();
-
-        let mut bytes = snapshot;
-        for record in &records {
-            let (_, _, target_len, delta) = beacon_state_delta::unframe(record);
-            bytes = beacon_state_delta::decode(delta, &bytes, target_len as usize);
-        }
-        Ok(Some(bytes))
-    }
-
-    /// Reconstruct a state from diffs and the nearest ancestor snapshot.
-    ///
-    /// Walks `base_root` pointers back until a snapshot is found, fetches the
-    /// target's block header, and delegates the assembly to
-    /// [`state_diff::reconstruct`](crate::state_diff::reconstruct).
-    ///
-    /// Returns `Ok(None)` when the root is unknown or the diff chain is broken.
-    fn reconstruct_state(&self, root: &H256) -> Result<Option<State>, Error> {
-        // Walk back collecting diffs until we reach a snapshot.
-        let view = self.backend.begin_read().expect("read view");
-        let mut diffs: Vec<StateDiff> = Vec::new();
-        let mut cursor = *root;
-        let snapshot = loop {
-            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
-                break decode_lean_state_value(&bytes);
-            }
-            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
-            else {
-                return Ok(None);
-            };
-            let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
-            cursor = diff.base_root;
-            diffs.push(diff);
-        };
-        drop(view);
-
-        // `diffs` runs target -> snapshot child; reverse to snapshot child -> target.
-        diffs.reverse();
-
-        // The latest block header lives in BlockHeaders; the stored state caches
-        // the real state_root there, so it equals the header byte-for-byte.
-        let Some(latest_block_header) = self.get_block_header(root)? else {
-            return Ok(None);
-        };
-
-        Ok(Some(crate::state_diff::reconstruct(
-            snapshot,
-            &diffs,
-            latest_block_header,
-        )))
-    }
-
     /// Returns whether a state is available for the given block root.
     ///
-    /// True if a snapshot exists or the state can be reconstructed from a diff.
+    /// True if `pending_states` holds the state, a snapshot exists, or the
+    /// state can be reconstructed from a diff.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
+        // Same pending-before-backend order as `read_state`; see its doc for
+        // why the backend never has to consult `pending_states` on its own.
+        if self.pending_states.get(root).is_some() {
+            return Ok(true);
+        }
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
         let states = view.get(Table::States, &key).expect("get");
@@ -2521,6 +2611,11 @@ impl Store {
     /// concrete value in hand (mirrors [`insert_signed_block`](Self::insert_signed_block),
     /// which dispatches its write the same way while its `get_signed_block`
     /// counterpart dispatches reads on `self.chain`).
+    ///
+    /// The byte-producing half of each arm, and the backend reads, the
+    /// commit and the parent-bytes memo, all live on the background writer in
+    /// [`crate::state_writer`]; this method only builds the request and hands
+    /// it off.
     ///
     /// Lean: a parent-linked diff, snapshotting at anchors. Every non-genesis
     /// state gets a `StateDiffs` entry (never pruned, so the full state
@@ -2539,143 +2634,39 @@ impl Store {
     /// Beacon: a byte-domain [`beacon_state_delta`](crate::beacon_state_delta)
     /// diff, snapshotting at anchors, the same shape as lean's but working in
     /// the SSZ byte domain rather than the field domain: a beacon validator
-    /// registry breaks lean's [`StateDiff`]'s "`validators` never changes"
+    /// registry breaks lean's [`StateDiff`](crate::state_diff::StateDiff)'s "`validators` never changes"
     /// assumption every epoch, so lean's diff cannot be reused as-is. The
     /// parent is identified the same way lean's is, off the post-state's own
     /// `latest_block_header.parent_root`, but its *encoded* bytes are what the
-    /// delta is computed against; [`Store::beacon_encoded_parent_bytes`]
-    /// explains how those are obtained without an extra encode round trip.
-    /// The store's first-ever beacon state (a bootstrap or checkpoint-sync
-    /// anchor) has no parent block on record, so it is always a snapshot
-    /// regardless of the interval math: there is no base to diff against.
+    /// delta is computed against; the writer thread's parent-bytes lookup
+    /// (`StateWriter::encoded_parent_bytes`) explains how those are obtained
+    /// without an extra encode round trip. The store's first-ever beacon
+    /// state (a bootstrap or checkpoint-sync anchor) has no parent block on
+    /// record, so it is always a snapshot regardless of the interval math:
+    /// there is no base to diff against.
+    ///
+    /// The work itself happens on the writer thread; this call returns once
+    /// the state is in the cache and the handoff buffer, which is what makes
+    /// it readable before it is written. A full queue blocks here.
     ///
     /// # Panics
     ///
-    /// On the lean arm, panics if no state exists for the parent root: a
-    /// child state can only be inserted after its parent's state has been
-    /// persisted. The beacon arm's equivalent invariant is documented on
-    /// [`Store::beacon_encoded_parent_bytes`].
+    /// If the writer thread has already died from a previous write's panic;
+    /// see [`StateWriterHandle::send`](crate::state_writer::StateWriterHandle::send).
+    /// The invariant that a child state's parent must already be persisted is
+    /// still enforced, and still panics on violation, but on the writer
+    /// thread now rather than in this call.
     pub fn insert_state(&mut self, root: H256, state: BeaconState) -> Result<(), Error> {
-        match state {
-            BeaconState::Lean(state) => {
-                // The post-state's latest_block_header is the block's own header, so its
-                // parent_root identifies the parent (base) state to diff against.
-                let parent_root = state.latest_block_header.parent_root;
-                let parent_state = self
-                    .get_state(&parent_root)
-                    .expect("parent state must exist to diff against")
-                    .unwrap();
-                // A lean directory's own `get_state` never returns a beacon
-                // state; see its `Chain::Lean` arm.
-                let parent_state = parent_state.expect_lean();
-                let interval = ForkName::Lean.snapshot_interval();
-                let is_anchor = state.slot / interval > parent_state.slot / interval;
-
-                // Snapshot only at anchors; serialize before `state` is consumed.
-                let snapshot_bytes =
-                    is_anchor.then(|| encode_state_value(&BeaconState::Lean(state.clone())));
-                // Memoize the post-state for fast reads, then move it into the diff so
-                // its multi-MB justification fields are not cloned again.
-                self.cache_state(
-                    CacheKey::BlockState(root),
-                    Arc::new(BeaconState::Lean(state.clone())),
-                );
-                let diff_bytes = StateDiff::from_states(parent_state, state)
-                    .expect("state transition produced a non-append historical_block_hashes")
-                    .to_ssz();
-
-                let key = root.to_ssz();
-                let mut batch = self.backend.begin_write().expect("write batch");
-                batch
-                    .put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])
-                    .expect("put state diff");
-                if let Some(snapshot_bytes) = snapshot_bytes {
-                    batch
-                        .put_batch(Table::States, vec![(key, snapshot_bytes)])
-                        .expect("put state snapshot");
-                }
-                batch.commit().expect("commit");
-                Ok(())
-            }
-            beacon_state => {
-                let slot = beacon_state.slot();
-                let parent_root = beacon_state.latest_block_header().parent_root;
-                let interval = beacon_state.fork_name().snapshot_interval();
-
-                // No parent block on record means this is the store's
-                // first-ever beacon state; see this method's doc comment.
-                let is_anchor = match self.block_entry(&parent_root) {
-                    Some((parent_slot, _)) => slot / interval > parent_slot / interval,
-                    None => true,
-                };
-
-                let target = encode_state_value(&beacon_state);
-                // Memoize the post-state for fast reads. `target` already holds
-                // the encoded bytes this needs, so `beacon_state` itself is free
-                // to move into the cache rather than being cloned into it.
-                self.cache_state(CacheKey::BlockState(root), Arc::new(beacon_state));
-                let key = root.to_ssz();
-                let mut batch = self.backend.begin_write().expect("write batch");
-                if is_anchor {
-                    batch
-                        .put_batch(Table::States, vec![(key, target.clone())])
-                        .expect("put beacon state snapshot");
-                } else {
-                    let base = self.beacon_encoded_parent_bytes(parent_root);
-                    let delta = beacon_state_delta::encode(&target, &base);
-                    // Deliberately not weakened to a plain `assert`: this
-                    // repo's release-fast profile keeps debug assertions on
-                    // in tests while stripping them from shipped binaries, so
-                    // this round trip is exercised on every test run without
-                    // costing anything in production.
-                    debug_assert_eq!(
-                        beacon_state_delta::decode(&delta, &base, target.len()),
-                        target,
-                        "a beacon state delta must decode back to its target"
-                    );
-                    let target_len = target.len() as u64;
-                    let framed = beacon_state_delta::frame(parent_root, slot, target_len, &delta);
-                    batch
-                        .put_batch(Table::StateDiffs, vec![(key, framed)])
-                        .expect("put beacon state diff");
-                }
-                batch.commit().expect("commit");
-
-                *self.encoded_memo.lock().unwrap() = Some((root, target));
-                Ok(())
-            }
-        }
-    }
-
-    /// The parent's encoded state bytes ([`encode_state_value`]'s output),
-    /// for the beacon delta write path in [`Store::insert_state`].
-    ///
-    /// Checks [`Store::encoded_memo`] first: import is sequential, so the
-    /// parent is almost always the state the previous [`Store::insert_state`]
-    /// call wrote, making this a free hit. A miss falls back to
-    /// [`Store::reconstruct_beacon_state_bytes`], which is already producing
-    /// these exact bytes as a fold by-product, so nothing is decoded and then
-    /// re-encoded merely to satisfy this call.
-    ///
-    /// # Panics
-    ///
-    /// If `parent_root` has no state. `insert_state`'s beacon arm only
-    /// reaches this once [`Store::block_entry`] has found a parent block,
-    /// which is only ever true once that parent's own state has already been
-    /// persisted, mirroring the lean arm's equivalent invariant.
-    fn beacon_encoded_parent_bytes(&self, parent_root: H256) -> Vec<u8> {
-        let memo_hit = self
-            .encoded_memo
-            .lock()
-            .unwrap()
-            .as_ref()
-            .filter(|(root, _)| *root == parent_root)
-            .map(|(_, bytes)| bytes.clone());
-        memo_hit.unwrap_or_else(|| {
-            self.reconstruct_beacon_state_bytes(&parent_root)
-                .expect("read parent state")
-                .expect("parent state must exist to diff against")
-        })
+        let state = Arc::new(state);
+        // Both the cache and the buffer take a handle to the same state. The
+        // cache is the hot path for the immediate next read; the buffer is
+        // what keeps the state readable if the cache evicts it before the
+        // writer has committed. See `PendingStates`.
+        self.cache_state(CacheKey::BlockState(root), state.clone());
+        self.pending_states.insert(root, state.clone());
+        crate::metrics::inc_state_write_queue_depth();
+        self.state_writer.send(StateWriteRequest { root, state });
+        Ok(())
     }
 
     // ============ Attestation Extraction ============
@@ -4291,6 +4282,11 @@ mod tests {
 
     #[test]
     fn from_db_state_preserves_block_root_index() {
+        // No state is ever inserted for the block below, and none needs to
+        // be: `from_db_state` only loads (see its doc); `repair_head` is a
+        // separate, explicit step a resuming caller takes afterward (see
+        // `main.rs`'s `fetch_initial_state`), so nothing here mutates the
+        // head this test is checking the index survives around.
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::from_anchor_state(
             backend.clone(),
@@ -4315,6 +4311,333 @@ mod tests {
             .expect("get blocks by slot range");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].message_hash_tree_root(), block_root);
+    }
+
+    /// A lean chain rooted at a real anchor, up to `head_slot`. Every block
+    /// gets a real `insert_signed_block` (so it carries a `LiveChain` row,
+    /// like production data would), and every state is a [`child_of`] the
+    /// anchor, so the diff chain reconstructs against real, consistent
+    /// `config`/`validators` rather than an unrelated fixture's.
+    ///
+    /// `stateless_from` marks the first slot whose state is never inserted
+    /// (standing in for the writer never having gotten to it); every slot
+    /// from there to `head_slot` is left stateless the same way. Returns the
+    /// roots in slot order, `r0` (the anchor) included, and does not move
+    /// `KEY_HEAD` itself: callers do that with `set_metadata`, the same way a
+    /// crash would leave it pointing further than the writer had reached.
+    fn lean_chain_with_stateless_tail(
+        store: &mut Store,
+        head_slot: u64,
+        stateless_from: u64,
+    ) -> Vec<H256> {
+        let r0 = store.head().expect("head root");
+        let anchor_state = store
+            .get_state(&r0)
+            .expect("get anchor state")
+            .expect("anchor state exists")
+            .expect_lean()
+            .clone();
+
+        let mut roots = vec![r0];
+        let mut parent_root = r0;
+        let mut hbh = Vec::new();
+        for slot in 1..=head_slot {
+            hbh.push(parent_root);
+            let root = signed_block(slot, parent_root).message.hash_tree_root();
+            store
+                .insert_signed_block(
+                    root,
+                    SignedBeaconBlock::Lean(signed_block(slot, parent_root)),
+                )
+                .expect("insert block");
+            if slot < stateless_from {
+                let state = child_of(&anchor_state, slot, parent_root, hbh.clone());
+                store
+                    .insert_state(root, BeaconState::Lean(state))
+                    .expect("insert state");
+            }
+            roots.push(root);
+            parent_root = root;
+        }
+        roots
+    }
+
+    /// The regression this whole repair exists for, walking back more than
+    /// one hop: three blocks in a row whose states the writer never got to
+    /// (standing in for an unclean shutdown inside the writer's queue
+    /// window) are rewound past. Each of their `LiveChain` rows -- fork
+    /// choice's only record of them -- goes with the rewind, which is what
+    /// makes it stick rather than have the very next fork-choice run walk
+    /// right back to the stateless tip.
+    #[test]
+    fn repair_head_rewinds_three_hops_and_drops_them_from_fork_choice() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let roots = lean_chain_with_stateless_tail(&mut store, 4, 2);
+        let (r1, r2, r3, r4) = (roots[1], roots[2], roots[3], roots[4]);
+        store.set_metadata(KEY_HEAD, &r4);
+
+        // Settle every write before resuming; r2, r3 and r4 never get one.
+        drop(store);
+
+        let mut resumed = Store::from_db_state(backend.clone())
+            .expect("restore store")
+            .expect("store exists");
+        resumed.repair_head().expect("repair head");
+        assert_eq!(
+            resumed.head().expect("head"),
+            r1,
+            "rewound three hops to the newest ancestor with a persisted state"
+        );
+
+        let live_chain = resumed.get_live_chain().expect("get live chain");
+        for hopped in [r2, r3, r4] {
+            assert!(
+                !live_chain.contains_key(&hopped),
+                "a hopped block's LiveChain row must be gone"
+            );
+        }
+        assert!(
+            live_chain.contains_key(&r1),
+            "the repaired head's own LiveChain row must survive"
+        );
+
+        // Persisted, not just an in-memory correction: a second Store over
+        // the same backend reads back the repaired head.
+        drop(resumed);
+        let reread = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        assert_eq!(reread.head().expect("head"), r1);
+    }
+
+    /// The walk's own bound: exactly `STATE_WRITE_QUEUE_CAPACITY + 1` missing
+    /// states behind the head is still within what the writer's queue can
+    /// explain, and repairs cleanly.
+    #[test]
+    fn repair_head_accepts_a_rewind_exactly_at_the_writer_queue_bound() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        // r1 has a state; r2, r3 and r4 (three hops) do not.
+        let roots = lean_chain_with_stateless_tail(&mut store, 4, 2);
+        let (r1, r4) = (roots[1], roots[4]);
+        store.set_metadata(KEY_HEAD, &r4);
+
+        drop(store);
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        resumed
+            .repair_head()
+            .expect("three hops is within the bound");
+        assert_eq!(resumed.head().expect("head"), r1);
+    }
+
+    /// One hop past that bound is no longer explained by the writer's queue,
+    /// and is reported rather than walked past.
+    #[test]
+    fn repair_head_rejects_a_rewind_one_hop_past_the_writer_queue_bound() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        // r1 has a state; r2 through r5 (four hops) do not.
+        let roots = lean_chain_with_stateless_tail(&mut store, 5, 2);
+        let r5 = roots[5];
+        store.set_metadata(KEY_HEAD, &r5);
+
+        drop(store);
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        let err = resumed
+            .repair_head()
+            .expect_err("four missing states is past the bound");
+        assert!(
+            matches!(err, Error::HeadRepairExceededWindow { hops: 4, .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A broken parent chain reached partway through the walk is corruption,
+    /// not this race: the race requires the head's own block, and every
+    /// block it walks through, to already be on disk, only their states
+    /// missing.
+    #[test]
+    fn repair_head_reports_a_broken_parent_chain_mid_walk() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        // r1 has a block on record and no state, but its own parent root
+        // names nothing this directory ever held.
+        let ghost = H256::repeat_byte(0xee);
+        let r1 = signed_block(1, ghost).message.hash_tree_root();
+        store
+            .insert_signed_block(r1, SignedBeaconBlock::Lean(signed_block(1, ghost)))
+            .expect("insert block");
+        store.set_metadata(KEY_HEAD, &r1);
+
+        drop(store);
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        let err = resumed
+            .repair_head()
+            .expect_err("a broken parent chain is corruption");
+        assert!(
+            matches!(err, Error::UnexpectedMissingBlockHeader(root) if root == ghost),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `anchor_slot` and finalized's slot are both zero on a freshly
+    /// bootstrapped store (`init_store` seeds finalized at the anchor
+    /// itself), so a walk that bottoms out there hits the tie between the
+    /// two bounds. It must resolve to `AnchorStateLost`, which names the
+    /// checkpoint and a remedy, not `UnexpectedMissingState`, which names
+    /// neither.
+    #[test]
+    fn repair_head_resolves_the_anchor_finalized_tie_to_anchor_state_lost() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        assert_eq!(
+            store.latest_finalized().expect("finalized").slot,
+            0,
+            "the tie this test needs: nothing has finalized past the anchor yet"
+        );
+
+        // A block on record at slot 0 itself, with no state and a parent
+        // this directory never held: not a descendant of the real anchor,
+        // just something at the same slot the walk's bound checks compare
+        // against.
+        let unknown_parent = H256::repeat_byte(0xcc);
+        let stale = signed_block(0, unknown_parent);
+        let r_stale = stale.message.hash_tree_root();
+        store
+            .insert_signed_block(r_stale, SignedBeaconBlock::Lean(stale))
+            .expect("insert block");
+        store.set_metadata(KEY_HEAD, &r_stale);
+
+        drop(store);
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        let err = resumed
+            .repair_head()
+            .expect_err("nothing to rewind to below the tie");
+        assert!(
+            matches!(err, Error::AnchorStateLost { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// `repair_head` works the same way on a beacon directory with a real
+    /// chain behind it, not just at `init_beacon`'s bare bootstrap (see
+    /// `from_db_state_loads_a_beacon_directory_as_beacon` for that case).
+    #[test]
+    fn repair_head_rewinds_a_beacon_head_past_bootstrap() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let anchor_root = H256::repeat_byte(0xaa);
+        // Never given its own block, which is what makes the anchor state a
+        // snapshot rather than a diff (see `is_anchor`): a real checkpoint
+        // sync anchor's parent is exactly as unknown to this directory.
+        let unknown_parent = H256::repeat_byte(0xbb);
+        let mut store = Store::init_beacon(
+            backend.clone(),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint {
+                root: anchor_root,
+                slot: 0,
+            },
+            0,
+        );
+        store
+            .insert_signed_block(anchor_root, beacon_test_block(0, unknown_parent))
+            .expect("insert anchor block");
+        store
+            .insert_state(
+                anchor_root,
+                beacon_test_state_with_parent(0, unknown_parent),
+            )
+            .expect("insert anchor state");
+
+        // r1: a real, committed state.
+        let block1 = beacon_test_block(1, anchor_root);
+        let r1 = block1.message_hash_tree_root();
+        store.insert_signed_block(r1, block1).expect("insert block");
+        store
+            .insert_state(r1, beacon_test_state_with_parent(1, anchor_root))
+            .expect("insert state");
+
+        // r2: a block on record, but the writer never got to its state.
+        let block2 = beacon_test_block(2, r1);
+        let r2 = block2.message_hash_tree_root();
+        store.insert_signed_block(r2, block2).expect("insert block");
+        store.set_metadata(KEY_HEAD, &r2);
+
+        drop(store);
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        resumed.repair_head().expect("repair head");
+        assert_eq!(resumed.head().expect("head"), r1);
+    }
+
+    /// The common case: nothing for `repair_head` to do when the recorded
+    /// head already has a persisted state. Same head back, and the slot-1
+    /// `BlockRoots` entry survives untouched, which is what proves no rewind
+    /// through `update_checkpoints` ran to produce that answer.
+    #[test]
+    fn repair_head_leaves_an_already_settled_head_alone() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(1_000, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let roots = lean_chain_with_stateless_tail(&mut store, 1, 2);
+        let r1 = roots[1];
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(r1))
+            .expect("update head");
+
+        drop(store);
+
+        let mut resumed = Store::from_db_state(backend)
+            .expect("restore store")
+            .expect("store exists");
+        resumed.repair_head().expect("repair head");
+        assert_eq!(
+            resumed.head().expect("head"),
+            r1,
+            "a head whose state is already settled is left exactly where it was"
+        );
+        assert_eq!(
+            canonical_root(&resumed, 1),
+            Some(r1),
+            "no rewind ran: the slot-1 canonical entry update_checkpoints would \
+             otherwise have touched is untouched"
+        );
     }
 
     #[test]
@@ -4444,6 +4767,24 @@ mod tests {
         state
     }
 
+    /// A child of `anchor` at `slot`, inheriting its `config` and
+    /// `validators` rather than starting a fresh, unrelated
+    /// `State::from_genesis`.
+    ///
+    /// `StateDiff` omits both fields, trusting they never change from parent
+    /// to child, so a diff chain built on a child from an unrelated fixture
+    /// would still reconstruct using the *real* anchor's values: a test that
+    /// compared against the fixture's own (different) values would be
+    /// checking a premise the store never held, whether or not that
+    /// happened to matter for what it asserted.
+    fn child_of(anchor: &State, slot: u64, parent_root: H256, hbh: Vec<H256>) -> State {
+        let mut child = anchor.clone();
+        child.slot = slot;
+        child.latest_block_header = header_at(slot, parent_root);
+        child.historical_block_hashes = hbh.try_into().unwrap();
+        child
+    }
+
     #[test]
     fn get_state_reconstructs_from_diff() {
         let backend = Arc::new(InMemoryBackend::new());
@@ -4467,10 +4808,9 @@ mod tests {
             .insert_state(r1, BeaconState::Lean(s1.clone()))
             .expect("insert state");
 
-        // Not an anchor, so no snapshot was written; only the diff.
-        assert!(!has_key(backend.as_ref(), Table::States, &r1));
-
-        // Hot path: the just-imported state is memoized in the cache.
+        // Hot path: the just-imported state is memoized in the cache, readable
+        // immediately regardless of whether the writer thread has committed
+        // it yet.
         assert_eq!(
             store
                 .get_state(&r1)
@@ -4480,14 +4820,42 @@ mod tests {
             s1.to_ssz()
         );
 
-        // A cold store (empty cache, shared backend) reconstructs from the diff,
-        // byte-identically.
+        // A cold store (empty cache, shared backend) reconstructs from the
+        // diff, byte-identically. Dropping the writing store first joins its
+        // writer thread, which is what settles the backend.
+        drop(store);
         let cold = Store::test_store_with_backend(backend.clone());
         let reconstructed = cold
             .get_state(&r1)
             .expect("reconstructs from diff")
             .expect("state exists");
         assert_eq!(reconstructed.to_ssz(), s1.to_ssz());
+    }
+
+    /// A state that only the handoff buffer holds is still readable. The LRU
+    /// is cleared first, so a pass here cannot come from the cache, and the
+    /// backend was never written for this root, so it cannot come from disk.
+    #[test]
+    fn a_pending_state_is_readable_without_the_cache_or_the_backend() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::test_store_with_backend(backend.clone());
+
+        let s = sample_state(1, H256::ZERO, vec![]);
+        let r = s.latest_block_header.hash_tree_root();
+        store
+            .pending_states
+            .insert(r, Arc::new(BeaconState::Lean(s.clone())));
+        store.state_cache.lock().unwrap().clear();
+
+        assert!(store.has_state(&r).expect("has_state"));
+        assert_eq!(
+            store
+                .get_state(&r)
+                .expect("get state")
+                .expect("pending state is readable")
+                .to_ssz(),
+            s.to_ssz()
+        );
     }
 
     #[test]
@@ -4517,9 +4885,9 @@ mod tests {
             .expect("insert state");
 
         // Neither child is an anchor, so a cold store reconstructs s2 by walking
-        // the diff chain back to the s0 snapshot.
-        assert!(!has_key(backend.as_ref(), Table::States, &r1));
-        assert!(!has_key(backend.as_ref(), Table::States, &r2));
+        // the diff chain back to the s0 snapshot. Dropping the writing store
+        // first joins its writer thread, which is what settles the backend.
+        drop(store);
         let cold = Store::test_store_with_backend(backend.clone());
         let reconstructed = cold
             .get_state(&r2)
@@ -4528,34 +4896,56 @@ mod tests {
         assert_eq!(reconstructed.to_ssz(), s2.to_ssz());
     }
 
+    /// Dropping the store joins the writer, so every state inserted through
+    /// it is on the backend afterwards and a fresh store reads them all back.
+    ///
+    /// The chain is longer than the writer's queue capacity, but that does not
+    /// make this a test of the blocking send path or of commit ordering: these
+    /// are small in-memory lean states the worker drains faster than the loop
+    /// can fill the queue, and the lean parent lookup goes through the shared
+    /// LRU rather than the backend, so an out-of-order commit would still
+    /// pass here. What this actually proves is narrower and still the point
+    /// of the task: drop joins the writer, and every write made it to the
+    /// backend by the time a fresh store reads it back.
     #[test]
-    fn insert_state_snapshots_only_on_boundary_crossing() {
+    fn dropping_the_store_settles_every_queued_write() {
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = Store::test_store_with_backend(backend.clone());
-        let interval = ForkName::Lean.snapshot_interval();
 
-        let s0 = sample_state(interval - 1, H256::ZERO, vec![]);
+        let s0 = sample_state(0, H256::ZERO, vec![]);
         let r0 = s0.latest_block_header.hash_tree_root();
-        insert_header(backend.as_ref(), r0, s0.slot, H256::ZERO);
+        insert_header(backend.as_ref(), r0, 0, H256::ZERO);
         insert_snapshot(backend.as_ref(), r0, &s0);
 
-        // Crossing the interval boundary records an anchor.
-        let s1 = sample_state(interval, r0, vec![r0]);
-        let r1 = s1.latest_block_header.hash_tree_root();
-        insert_header(backend.as_ref(), r1, s1.slot, r0);
-        store
-            .insert_state(r1, BeaconState::Lean(s1.clone()))
-            .expect("insert state");
-        assert!(has_key(backend.as_ref(), Table::States, &r1));
+        let mut parent = s0;
+        let mut parent_root = r0;
+        let mut expected = Vec::new();
+        for slot in 1..=6u64 {
+            let mut hbh = parent.historical_block_hashes.to_vec();
+            hbh.push(parent_root);
+            let state = sample_state(slot, parent_root, hbh);
+            let root = state.latest_block_header.hash_tree_root();
+            insert_header(backend.as_ref(), root, slot, parent_root);
+            store
+                .insert_state(root, BeaconState::Lean(state.clone()))
+                .expect("insert state");
+            expected.push((root, state.clone()));
+            parent = state;
+            parent_root = root;
+        }
 
-        // A non-crossing child does not.
-        let s2 = sample_state(interval + 1, r1, vec![r0, r1]);
-        let r2 = s2.latest_block_header.hash_tree_root();
-        insert_header(backend.as_ref(), r2, s2.slot, r1);
-        store
-            .insert_state(r2, BeaconState::Lean(s2.clone()))
-            .expect("insert state");
-        assert!(!has_key(backend.as_ref(), Table::States, &r2));
+        drop(store);
+
+        let cold = Store::test_store_with_backend(backend.clone());
+        for (root, state) in expected {
+            assert_eq!(
+                cold.get_state(&root)
+                    .expect("reconstructs from the settled backend")
+                    .expect("state exists")
+                    .to_ssz(),
+                state.to_ssz(),
+            );
+        }
     }
 
     // ============ State Value Fork Tagging Tests ============
@@ -4576,26 +4966,6 @@ mod tests {
             .expect("get")
             .expect("anchor snapshot written at bootstrap");
         assert_eq!(value[0], ForkName::Lean.selector());
-    }
-
-    #[test]
-    fn a_tagged_state_value_round_trips() {
-        let state = BeaconState::Lean(State::from_genesis(7, vec![]));
-        let bytes = encode_state_value(&state);
-        assert_eq!(decode_state_value(&bytes), state);
-    }
-
-    #[test]
-    fn the_selector_is_not_a_dense_index() {
-        // ForkName::Lean is 255 so that beacon forks after fulu keep taking the
-        // next free value. A reader that treated the tag as a variant index
-        // would decode a lean state as phase0-shaped, so this pins the round
-        // trip through from_selector rather than the raw byte.
-        assert_eq!(ForkName::Lean.selector(), 255);
-        assert_eq!(
-            ForkName::from_selector(ForkName::Lean.selector()),
-            Some(ForkName::Lean)
-        );
     }
 
     // ============ Beacon State Persistence Tests ============
@@ -4828,6 +5198,10 @@ mod tests {
             parent = root;
         }
 
+        // Dropping the store joins the writer, which is what settles the
+        // backend; counting rows against an unsettled writer would only make
+        // this one-sided assertion easier to pass, not harder.
+        drop(store);
         let view = backend.begin_read().expect("read view");
         let snapshots = view
             .prefix_iterator(Table::States, &[])
@@ -5713,10 +6087,19 @@ mod tests {
             0,
         );
 
-        let store = Store::from_db_state(backend).unwrap().unwrap();
+        let mut store = Store::from_db_state(backend).unwrap().unwrap();
 
         assert_eq!(store.chain(), Chain::Beacon);
         assert_eq!(store.config().genesis_time, 1_606_824_023);
+
+        // `init_beacon` alone seeds the head at the checkpoint root before
+        // the anchor block/state pair that follows it is ever inserted, so
+        // `repair_head` must leave a directory shaped exactly like this one
+        // alone rather than reporting corruption; see its doc. Pinned here,
+        // on purpose, rather than left to be covered incidentally by
+        // whichever other test happens to build this shape.
+        store.repair_head().expect("repair head leaves this alone");
+        assert_eq!(store.head().expect("head"), anchor.root);
     }
 
     #[test]

@@ -560,9 +560,12 @@ sequence of independent write batches:
    │                            │            LiveChain[slot‖root]
    │                            ┘
    │
-   ├─ 3. insert_state()         ┐            StateDiffs[root]
-   │                            ├─one batch─ States[root]         (anchors only)
-   │                            ┘            (+ LRU cache insert)
+   ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
+   │      (hands the state to the        then a hand-off to the background writer
+   │       storage crate's own writer     thread, which commits
+   │       thread; see below)                   StateDiffs[root]
+   │                                            States[root]         (anchors only)
+   │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
           (re-runs fork choice)        (+ justified/finalized if advanced,
@@ -571,16 +574,31 @@ sequence of independent write batches:
 ```
 
 Each numbered step is atomic on its own, but the import as a whole is **not**
-one transaction. The commit order keeps the on-disk store consistent after any
-prefix of these steps: the justified checkpoint written in step 1 always names
-an already-persisted **ancestor** of the imported block (the state transition
-only counts attestations whose roots match the state's own
-`historical_block_hashes`, and every ancestor was fully persisted when it was
-imported), and the head only advances in step 4, after the block and state are
-durable. A crash mid-import can therefore lose the tail of the import — e.g. a
-persisted block and state the head does not point to yet — but never leave
-metadata referencing missing data. Re-importing the block is idempotent (a
-duplicate is skipped via `has_state`).
+one transaction, and step 3 is no longer one write at all: `insert_state`
+returns once the state is cached and buffered (see `crates/storage/src/state_writer.rs`),
+not once the writer thread has actually committed it. That thread drains a
+FIFO one state behind the importer at most (`STATE_WRITE_QUEUE_CAPACITY = 2`,
+plus the one write it can be holding), so steps 1, 2 and 4 can all reach disk
+before step 3's own commit does. An unclean shutdown inside that window can
+therefore leave `head` (from step 4), or `latest_justified` (from step 1, for
+an even earlier block whose own step 3 might itself still be mid-flight), or
+the finalized checkpoint `update_head` derives from the head state, naming a
+root this directory has no state for yet — the exact thing "never leave
+metadata referencing missing data" used to rule out, before the state write
+moved off the importer's thread.
+
+`Store::repair_head`, called by a resuming caller (see
+[Startup and Restore](#startup-and-restore) below), is what restores that
+property for the head: it walks back to the newest ancestor with a persisted
+state and rewinds there, dropping the `LiveChain` rows of whatever it hops
+over so fork choice does not walk straight back to the stateless tip.
+Justified and finalized are never rewound the same way — they are consensus
+statements, not a pointer a repair may quietly move to an earlier one — so
+`Store::verify_anchor_states` checks them instead, and a directory that fails
+it is treated as needing a fresh anchor. Re-importing a block whose `LiveChain`
+row was dropped this way is idempotent the same way any duplicate is: the skip
+check is keyed on `has_state`, not on whether the block is already on record,
+so a stateless block is reprocessed rather than skipped.
 
 ## Pruning
 
@@ -680,27 +698,41 @@ entries are written by its caller instead, through the same `insert_state` and
 `config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
 mismatch is still fatal, failing with `Error::DbVersionMismatch` or
 `Error::PresetMismatch` rather than reading on, but `from_db_state` no longer
-judges the network or the chain: it hands back whichever chain the directory
-holds, without comparing either against anything. That comparison is now the
-caller's job. `fetch_initial_state` (lean) and `fetch_initial_beacon_state`
+judges the network or the chain, and it does not mutate anything either: it
+hands back whichever chain the directory holds, without comparing either
+against anything or repairing anything. Both are now the caller's job, in a
+fixed order: `fetch_initial_state` (lean) and `fetch_initial_beacon_state`
 (beacon) each check `Store::chain()` against the sub-command they are running
-under, read the finalized state back through `Store::finalized_state_root`
-(see [Metadata](#metadata) above), and run `verify_state_genesis` against it.
+under, then call `Store::verify_anchor_states` — which reads back both the
+justified and finalized checkpoints (see [Metadata](#metadata) above) and
+confirms each has a persisted state, returning the finalized state — before
+running `verify_state_genesis` against it. Only once both of those pass does
+either caller call `Store::repair_head`, described under
+[Write Paths](#write-paths-what-a-block-import-persists) above: it is a
+mutation, so it waits until the store it would mutate has been judged fit to
+resume at all, and it leans on `verify_anchor_states` having already confirmed
+finalized has a state, which is what lets it treat reaching finalized's slot
+during its own walk as a plain stopping point rather than something it has to
+guard against.
+
 A chain mismatch aborts with `CheckpointSyncError::WrongChain`; a genesis
 mismatch aborts with `CheckpointSyncError::Genesis`, wrapping
-`GenesisMismatch::GenesisTime` or `::GenesisValidatorsRoot`. Both used to be
-raised from inside `from_db_state` itself, as `storage::Error::GenesisMismatch`
-and `::WrongChain`; neither variant exists in the storage crate anymore, now
-that the check that needed them moved one layer up, to the caller that
-actually knows which network and which chain it wants. Either failure is not
-treated as an empty directory: writing a fresh anchor on top would leave the
-foreign chain's rows in place, to be served to peers.
+`GenesisMismatch::GenesisTime` or `::GenesisValidatorsRoot`; a missing anchor
+state (`storage::Error::AnchorStateLost`) is treated exactly like a stale DB,
+described next. All three used to be raised (the first two) or were not yet
+possible to raise (the third) from inside `from_db_state` itself; none of that
+judgment lives in the storage crate anymore, now that the checks that need it
+moved one layer up, to the caller that actually knows which network and which
+chain it wants. None of these failures are treated as an empty directory:
+writing a fresh anchor on top would leave the foreign (or merely incomplete)
+chain's rows in place, to be served to peers.
 
 At startup, each chain prefers this path but only accepts the on-disk store if
 its head is at most `MAX_RESUMABLE_DB_STATE_AGE = 450` slots behind the
 current slot: ~30 minutes at lean's four-second slots, ~90 minutes at beacon's
-twelve-second ones. A staler DB falls through to checkpoint sync, which writes
-a fresh anchor on top of the existing data.
+twelve-second ones. A staler DB, or one whose anchor checkpoint state is
+missing, falls through to checkpoint sync, which writes a fresh anchor on top
+of the existing data.
 
 ## Key Files
 

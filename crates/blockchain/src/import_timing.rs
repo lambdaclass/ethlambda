@@ -184,7 +184,12 @@ pub struct ImportTimings {
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
 
-    /// Lean: the block and post-state writes.
+    /// Lean: the block write (`insert_signed_block`) and the state hand-off
+    /// (`insert_state`, which since the storage crate moved state writes to a
+    /// background thread only enqueues the state — cache, buffer and a
+    /// channel send). The state's own encode/diff/commit cost is no longer in
+    /// this row; it is `lean_state_write_seconds` on the storage crate's
+    /// writer thread instead.
     pub db_write_start: Option<Instant>,
     pub db_write_end: Option<Instant>,
 

@@ -273,7 +273,7 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
 | `stf` | The state transition. On beacon this bundles the transition, the state root and the state write | both |
-| `db_write` | The block and post-state writes | lean |
+| `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |
 | `block_atts` | Replaying the block's own attestations and slashings into fork choice | beacon |
 | `total` | The whole import, wire to post-state, spanning any holds. Only on a completed import | both |
@@ -316,6 +316,8 @@ In practice the distribution is bimodal and dominated by production rather than 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
 | `lean_table_bytes` | Gauge | Estimated byte size of a storage table (key + value bytes) | After each processed block (one update per table); retains its previous value on empty slots | table=`<table_name>` |
+| `lean_state_write_queue_depth` | Gauge | States handed to the background writer but not yet committed | On every hand-off and on every commit | |
+| `lean_state_write_seconds` | Histogram | Time the background writer spends encoding, diffing and committing one state | Per state written | |
 
 **On a beacon follower, watch `lean_table_bytes{table="data_columns"}`.** Every
 other table's series either stays flat or is bounded by pruning; `data_columns`
@@ -325,6 +327,15 @@ trajectory for the whole node. Budget roughly 360 KB per slot across the
 columns this node custodies at the blob cap, nearer 1 GB per day at current
 mainnet blob counts, and size the disk against however long the node is meant
 to run before a pruner exists.
+
+**`lean_state_write_queue_depth` is the early warning for a slow disk.** Up to
+three states can be in flight without the importer ever blocking — two queued
+plus the one the writer thread is currently encoding, diffing and committing —
+so a depth resting at or below three is healthy overlap. A depth climbing past
+three means `insert_state` blocked on the full channel waiting for the writer,
+and `lean_state_write_seconds` says whether that time went into the encode or
+the commit. A depth that stays at zero means the writer has nothing
+outstanding.
 
 ### Data Column Sidecars (Fulu DAS)
 

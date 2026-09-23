@@ -2123,6 +2123,7 @@ name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
  "ethlambda-crypto",
+ "ethlambda-metrics",
  "ethlambda-types",
  "leansig",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",

@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ethlambda-crypto.workspace = true
+ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 
 tracing.workspace = true

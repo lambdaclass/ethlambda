@@ -778,7 +778,10 @@ fn on_block_core(
             .expect("update_checkpoints should succeed");
     }
 
-    // Store signed block and state
+    // Store signed block, and hand the post-state to the storage crate's
+    // background writer. `insert_state` only enqueues; the state's own
+    // encode/diff/commit cost is measured on that thread instead, as
+    // `lean_state_write_seconds`, not here.
     timings.db_write_start = Some(std::time::Instant::now());
     store
         .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block.clone()))

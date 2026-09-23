@@ -1187,71 +1187,118 @@ async fn fetch_initial_state(
     // `from_db_state` loads without judging, so the identity check is here:
     // the wrong chain or the wrong genesis aborts startup rather than being
     // built on top of.
-    if let Some(store) = Store::from_db_state(backend.clone())? {
-        if store.chain() != Chain::Lean {
-            return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
-                expected: Chain::Lean,
-                found: store.chain(),
-            });
-        }
+    'resume: {
+        if let Some(mut store) = Store::from_db_state(backend.clone())? {
+            if store.chain() != Chain::Lean {
+                return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
+                    expected: Chain::Lean,
+                    found: store.chain(),
+                });
+            }
 
-        // The slot duration is deliberately absent from the SSZ state, so the
-        // state check below cannot see it: compare the persisted config's time
-        // grid. A data directory built at another cadence indexes its blocks
-        // against a different time grid, which makes it as foreign as another
-        // genesis.
-        let persisted_grid = store.config().time_grid();
-        genesis
-            .verify_time_config(&persisted_grid)
-            .inspect_err(|err| {
+            // The slot duration is deliberately absent from the SSZ state, so the
+            // state check below cannot see it: compare the persisted config's time
+            // grid. A data directory built at another cadence indexes its blocks
+            // against a different time grid, which makes it as foreign as another
+            // genesis.
+            let persisted_grid = store.config().time_grid();
+            genesis
+                .verify_time_config(&persisted_grid)
+                .inspect_err(|err| {
+                    error!(
+                        %err,
+                        db_genesis_time = persisted_grid.genesis_time,
+                        db_milliseconds_per_slot = persisted_grid.milliseconds_per_slot,
+                        expected_genesis_time = genesis.genesis_time,
+                        expected_milliseconds_per_slot = genesis.milliseconds_per_slot,
+                        "Persisted DB was built on a different time grid; refusing to reuse this data directory"
+                    )
+                })?;
+
+            // Justified and finalized must both have a persisted state before
+            // anything else is trusted: `repair_head` below assumes it, and a
+            // directory that fails this check needs a fresh anchor, not a
+            // storage-layer repair (see `Store::verify_anchor_states`'s doc).
+            // Treated exactly like a stale DB below: fall back to checkpoint
+            // sync if a URL is configured (`break 'resume` does that, the same
+            // way falling out of this `match` without returning does further
+            // down), otherwise fail naming the remedy.
+            let state = match store.verify_anchor_states() {
+                Ok(state) => state,
+                Err(err @ ethlambda_storage::Error::AnchorStateLost { checkpoint }) => {
+                    if checkpoint_urls.is_empty() {
+                        error!(?checkpoint, %err, "Anchor checkpoint's state is missing");
+                        return Err(err.into());
+                    }
+                    warn!(
+                        ?checkpoint,
+                        "Anchor checkpoint's state is missing; checkpoint sync"
+                    );
+                    break 'resume;
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            genesis.verify_state(&state).inspect_err(|err| {
                 error!(
                     %err,
-                    db_genesis_time = persisted_grid.genesis_time,
-                    db_milliseconds_per_slot = persisted_grid.milliseconds_per_slot,
+                    db_genesis_time = state.genesis_time(),
                     expected_genesis_time = genesis.genesis_time,
-                    expected_milliseconds_per_slot = genesis.milliseconds_per_slot,
-                    "Persisted DB was built on a different time grid; refusing to reuse this data directory"
+                    expected_validators = genesis.genesis_validators.len(),
+                    "Persisted DB belongs to a different network; refusing to reuse this data directory"
                 )
             })?;
 
-        let root = store.finalized_state_root()?;
-        let state = store
-            .get_state(&root)?
-            .ok_or(ethlambda_storage::Error::UnexpectedMissingState(root))?;
-        genesis.verify_state(&state).inspect_err(|err| {
-            error!(
-                %err,
-                db_genesis_time = state.genesis_time(),
-                expected_genesis_time = genesis.genesis_time,
-                expected_validators = genesis.genesis_validators.len(),
-                "Persisted DB belongs to a different network; refusing to reuse this data directory"
-            )
-        })?;
+            // The only mutation on this path, and only reached once both
+            // checks above have passed; see `Store::from_db_state`'s doc.
+            // `repair_head` can raise the same `AnchorStateLost` its own doc
+            // lists as one of its three outcomes (the walk reaching at or
+            // below finalized), so it gets the same fallback rather than a
+            // bare `?`: a node with a checkpoint-sync URL configured should
+            // resync, not abort, in exactly the situation this repair exists
+            // for.
+            match store.repair_head() {
+                Ok(()) => {}
+                Err(err @ ethlambda_storage::Error::AnchorStateLost { checkpoint }) => {
+                    if checkpoint_urls.is_empty() {
+                        error!(?checkpoint, %err, "Anchor checkpoint's state is missing");
+                        return Err(err.into());
+                    }
+                    warn!(
+                        ?checkpoint,
+                        "Anchor checkpoint's state is missing; checkpoint sync"
+                    );
+                    break 'resume;
+                }
+                Err(err) => return Err(err.into()),
+            }
 
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
-        let current_slot =
-            now_ms.saturating_sub(genesis.genesis_time * 1000) / genesis.milliseconds_per_slot;
-        let head_slot = store.head_slot();
-        let gap = current_slot.saturating_sub(head_slot);
-        if gap <= MAX_RESUMABLE_DB_STATE_AGE {
-            info!(head_slot, current_slot, gap, "Resuming from existing DB");
-            return Ok(store);
+            let now_ms = SystemTime::UNIX_EPOCH
+                .elapsed()
+                .expect("already past the unix epoch")
+                .as_millis() as u64;
+            let current_slot =
+                now_ms.saturating_sub(genesis.genesis_time * 1000) / genesis.milliseconds_per_slot;
+            let head_slot = store.head_slot();
+            let gap = current_slot.saturating_sub(head_slot);
+            if gap <= MAX_RESUMABLE_DB_STATE_AGE {
+                info!(head_slot, current_slot, gap, "Resuming from existing DB");
+                return Ok(store);
+            }
+            // No checkpoint URL was configured, so just run the node
+            // against the data directory it was given: that is the setup
+            // asked for, and there is no anchor to switch to. The warning
+            // is the point of this arm, since the DB is known to be stale
+            // and range sync may not be able to close a gap this large:
+            // peers prune block signatures past `SIGNATURE_PRUNING_RANGE`,
+            // so beyond that horizon they cannot serve the history the
+            // node is missing.
+            if checkpoint_urls.is_empty() {
+                warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+                return Ok(store);
+            }
+            warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
         }
-        // No checkpoint URL was configured, so just run the node against the
-        // data directory it was given: that is the setup asked for, and there
-        // is no anchor to switch to. The warning is the point of this arm,
-        // since the DB is known to be stale and range sync may not be able to
-        // close a gap this large: peers prune block signatures past
-        // `SIGNATURE_PRUNING_RANGE`, so beyond that horizon they cannot serve
-        // the history the node is missing.
-        if checkpoint_urls.is_empty() {
-            warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
-            return Ok(store);
-        }
-        warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
     }
 
     if checkpoint_urls.is_empty() {
@@ -1529,61 +1576,109 @@ async fn fetch_initial_beacon_state(
     let config = source.config().clone();
     let genesis = source.genesis();
 
-    if let Some(store) = Store::from_db_state(backend.clone())? {
-        if store.chain() != Chain::Beacon {
-            return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
-                expected: Chain::Beacon,
-                found: store.chain(),
-            });
-        }
+    'resume: {
+        if let Some(mut store) = Store::from_db_state(backend.clone())? {
+            if store.chain() != Chain::Beacon {
+                return Err(checkpoint_sync::CheckpointSyncError::WrongChain {
+                    expected: Chain::Beacon,
+                    found: store.chain(),
+                });
+            }
 
-        let root = store.finalized_state_root()?;
-        let state = store
-            .get_state(&root)?
-            .ok_or(ethlambda_storage::Error::UnexpectedMissingState(root))?;
-        verify_state_genesis(
-            &state,
-            genesis.genesis_time,
-            genesis.genesis_validators_root,
-        )
-        .inspect_err(|err| {
-            error!(
-                %err,
-                db_genesis_time = state.genesis_time(),
-                expected_genesis_time = genesis.genesis_time,
-                "Persisted DB belongs to a different network; refusing to reuse this data directory"
+            // Justified and finalized must both have a persisted state before
+            // anything else is trusted: `repair_head` below assumes it, and a
+            // directory that fails this check needs a fresh anchor, not a
+            // storage-layer repair (see `Store::verify_anchor_states`'s doc).
+            // Treated exactly like a stale DB below: fall back to checkpoint
+            // sync if a URL is configured (`break 'resume` does that, the same
+            // way falling out of this `match` without returning does further
+            // down), otherwise fail naming the remedy.
+            let state = match store.verify_anchor_states() {
+                Ok(state) => state,
+                Err(err @ ethlambda_storage::Error::AnchorStateLost { checkpoint }) => {
+                    if checkpoint_urls.is_empty() {
+                        error!(?checkpoint, %err, "Anchor checkpoint's state is missing");
+                        return Err(err.into());
+                    }
+                    warn!(
+                        ?checkpoint,
+                        "Anchor checkpoint's state is missing; checkpoint sync"
+                    );
+                    break 'resume;
+                }
+                Err(err) => return Err(err.into()),
+            };
+
+            verify_state_genesis(
+                &state,
+                genesis.genesis_time,
+                genesis.genesis_validators_root,
             )
-        })?;
+            .inspect_err(|err| {
+                error!(
+                    %err,
+                    db_genesis_time = state.genesis_time(),
+                    expected_genesis_time = genesis.genesis_time,
+                    "Persisted DB belongs to a different network; refusing to reuse this data directory"
+                )
+            })?;
 
-        if let Some(difference) = first_config_difference(&store.config(), &config) {
-            error!(%difference, "Persisted config disagrees with the network config");
-            return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
-        }
+            if let Some(difference) = first_config_difference(&store.config(), &config) {
+                error!(%difference, "Persisted config disagrees with the network config");
+                return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
+            }
 
-        let now = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_secs();
-        let current_slot = now.saturating_sub(genesis.genesis_time) / config.seconds_per_slot;
-        // `init_beacon` writes the head in the same batch as the finalized
-        // checkpoint, and `finalized_state_root` above has already succeeded,
-        // so a directory that got this far has one. Asserting beats
-        // substituting a slot, which would read as maximally stale and force a
-        // re-sync of a directory that should have resumed.
-        let (head_slot, _) = store
-            .beacon_head()
-            .expect("an anchored directory has a head");
-        let gap = current_slot.saturating_sub(head_slot);
+            // The only mutation on this path, and only reached once both
+            // checks above have passed; see `Store::from_db_state`'s doc.
+            // Also what makes `beacon_head`'s `.expect` below safe: a
+            // directory whose head had no state at all would have failed
+            // `verify_anchor_states` above instead of reaching here (see
+            // "A head with no block at all" on `repair_head`'s doc), so
+            // this call always leaves the head naming a real block, once it
+            // does not fall through below.
+            //
+            // `repair_head` can raise the same `AnchorStateLost` its own doc
+            // lists as one of its three outcomes (the walk reaching at or
+            // below finalized), so it gets the same fallback rather than a
+            // bare `?`: a node with a checkpoint-sync URL configured should
+            // resync, not abort, in exactly the situation this repair exists
+            // for.
+            match store.repair_head() {
+                Ok(()) => {}
+                Err(err @ ethlambda_storage::Error::AnchorStateLost { checkpoint }) => {
+                    if checkpoint_urls.is_empty() {
+                        error!(?checkpoint, %err, "Anchor checkpoint's state is missing");
+                        return Err(err.into());
+                    }
+                    warn!(
+                        ?checkpoint,
+                        "Anchor checkpoint's state is missing; checkpoint sync"
+                    );
+                    break 'resume;
+                }
+                Err(err) => return Err(err.into()),
+            }
 
-        if gap <= MAX_RESUMABLE_DB_STATE_AGE {
-            info!(head_slot, current_slot, gap, "Resuming from existing DB");
-            return Ok(store);
+            let now = SystemTime::UNIX_EPOCH
+                .elapsed()
+                .expect("already past the unix epoch")
+                .as_secs();
+            let current_slot = now.saturating_sub(genesis.genesis_time) / config.seconds_per_slot;
+            let (head_slot, _) = store
+                .beacon_head()
+                .expect("repair_head leaves the head naming a real block");
+            let gap = current_slot.saturating_sub(head_slot);
+
+            if gap <= MAX_RESUMABLE_DB_STATE_AGE {
+                info!(head_slot, current_slot, gap, "Resuming from existing DB");
+                return Ok(store);
+            }
+            if checkpoint_urls.is_empty() {
+                warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+                return Ok(store);
+            }
+            warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
         }
-        if checkpoint_urls.is_empty() {
-            warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
-            return Ok(store);
-        }
-        warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
     }
 
     // A loaded network carries its own genesis state, which is a legitimate
@@ -1744,7 +1839,10 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
 mod tests {
     use super::*;
     use crate::command::{Command, try_parse_from};
+    use ethlambda_storage::ForkCheckpoints;
     use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::block::{Block, BlockBody, MultiMessageAggregate, SignedBlock};
+    use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
 
@@ -1964,6 +2062,120 @@ validators:
         assert!(
             matches!(err, checkpoint_sync::CheckpointSyncError::Http(_)),
             "expected a transport error, got {err:?}"
+        );
+    }
+
+    /// A minimal signed lean block, the same shape the storage crate's own
+    /// tests use: empty body, no proof content, only the fields the diff
+    /// chain and the fork-choice walk actually read.
+    fn signed_block(slot: u64, proposer_index: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
+    /// A child of `parent` at `slot`, inheriting its `config` and
+    /// `validators` rather than building an unrelated one:
+    /// `StateDiff` omits both, trusting they never change from parent to
+    /// child.
+    fn child_state(parent: &State, slot: u64, parent_root: H256) -> State {
+        let mut hbh = parent.historical_block_hashes.to_vec();
+        hbh.push(parent_root);
+        let mut child = parent.clone();
+        child.slot = slot;
+        child.latest_block_header = ethlambda_types::block::BlockHeader {
+            slot,
+            proposer_index: 0,
+            parent_root,
+            state_root: H256::ZERO,
+            body_root: H256::ZERO,
+        };
+        child.historical_block_hashes = hbh.try_into().expect("within limit");
+        child
+    }
+
+    /// `repair_head` itself can raise `AnchorStateLost` (its own doc lists
+    /// the walk reaching at or below finalized as one of its three
+    /// outcomes), a separate path from the `verify_anchor_states` pre-check
+    /// covered by [`falls_through_to_checkpoint_sync_when_db_is_stale`] and
+    /// its siblings. This pins that it gets the same fallback rather than a
+    /// bare `?`: an unreachable checkpoint URL surfaces as a transport
+    /// error, proving checkpoint sync was actually attempted, not skipped in
+    /// favor of aborting.
+    #[tokio::test(start_paused = true)]
+    async fn falls_through_to_checkpoint_sync_when_repair_head_loses_the_anchor() {
+        let genesis = test_genesis(now_secs());
+        let backend = Arc::new(InMemoryBackend::default());
+
+        let mut anchor = State::from_genesis(genesis.genesis_time, genesis.validators());
+        anchor.slot = SEEDED_HEAD_SLOT;
+        anchor.latest_block_header.slot = SEEDED_HEAD_SLOT;
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            anchor.clone(),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let r0 = store.head().expect("head root");
+
+        // A real, state-backed block one slot ahead, made both the justified
+        // and the finalized checkpoint: `verify_anchor_states` must pass for
+        // the flow to reach `repair_head` at all.
+        let finalized_slot = SEEDED_HEAD_SLOT + 1;
+        let finalized_block = signed_block(finalized_slot, 0, r0);
+        let r1 = finalized_block.message.hash_tree_root();
+        store
+            .insert_signed_block(r1, SignedBeaconBlock::Lean(finalized_block))
+            .expect("insert finalized block");
+        store
+            .insert_state(
+                r1,
+                BeaconState::Lean(child_state(&anchor, finalized_slot, r0)),
+            )
+            .expect("insert finalized state");
+        let finalized_checkpoint = Checkpoint {
+            root: r1,
+            slot: finalized_slot,
+        };
+        store
+            .update_checkpoints(ForkCheckpoints::new(
+                r1,
+                Some(finalized_checkpoint),
+                Some(finalized_checkpoint),
+            ))
+            .expect("advance justified and finalized");
+
+        // A sibling of the finalized block, same slot and parent, distinguished
+        // only by proposer index so its root differs, with no state ever
+        // inserted for it. Its parent is the anchor, not `r1`, so
+        // `repair_head`'s walk steps straight from here to the anchor's own
+        // slot without ever reaching `r1`; see its doc's finalized-slot bound.
+        let sibling_block = signed_block(finalized_slot, 1, r0);
+        let sibling_root = sibling_block.message.hash_tree_root();
+        store
+            .insert_signed_block(sibling_root, SignedBeaconBlock::Lean(sibling_block))
+            .expect("insert sibling block");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(sibling_root))
+            .expect("move head to the stateless sibling");
+
+        drop(store);
+
+        let urls = [UNREACHABLE_CHECKPOINT_URL.to_string()];
+        // `Store` is not `Debug`, so unwrap the error by pattern rather than
+        // with `expect_err`.
+        let Err(err) = fetch_initial_state(&urls, &genesis, backend).await else {
+            panic!("an unreachable checkpoint URL must abort startup, not silently resume");
+        };
+        assert!(
+            matches!(err, checkpoint_sync::CheckpointSyncError::Http(_)),
+            "expected checkpoint sync to actually be attempted (a transport error), got {err:?}"
         );
     }
 

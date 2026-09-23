@@ -210,7 +210,7 @@ mod tests {
     use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::{ExecutionAddress, Uint256};
 
-    use crate::store::encode_state_value;
+    use crate::state_codec::encode_state_value;
 
     /// Validators in the synthesized state. Mainnet's active set is this order of
     /// magnitude, and the codec's cost is a function of the encoded length, which
