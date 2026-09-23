@@ -689,17 +689,17 @@ impl ProjectedState {
     ///
     /// Narrower than `state_transition::is_valid_vote`: the entry's head must
     /// be known, its source must be justified, its (source, target) must match
-    /// the candidate-block chain view, `target.slot > source.slot`, and target
-    /// must be a justifiable slot relative to the projected finalized slot.
+    /// the candidate-block chain view, and target must be a justifiable slot
+    /// relative to the projected finalized slot.
     ///
-    /// Deliberately does NOT reject an already-justified target, though
-    /// `is_valid_vote` skips one: that vote still carries fork-choice weight,
-    /// so it is scored rather than filtered (see the note at that check, and
-    /// [`ProjectedState::score_entry`]).
+    /// Deliberately does NOT reject an already-justified target, nor a target
+    /// equal to its source, though `is_valid_vote` skips both: those votes
+    /// still carry fork-choice weight, so they are scored rather than filtered
+    /// (see the note at the end, and [`ProjectedState::score_entry`]).
     ///
     /// The genesis self-vote (source == target == slot 0) is exempt from the
-    /// `target.slot > source.slot` check since fork-choice bootstrapping needs
-    /// it; STF will silently drop it, but it carries fork-choice signal.
+    /// justifiability check since fork-choice bootstrapping needs it; STF will
+    /// silently drop it, but it carries fork-choice signal.
     pub(crate) fn entry_passes_filters(
         &self,
         att_data: &AttestationData,
@@ -727,11 +727,9 @@ impl ProjectedState {
         if !attestation_data_matches_chain(extended_historical_block_hashes, att_data) {
             return Err("chain_mismatch");
         }
-        let is_genesis_self_vote = is_genesis_self_vote(att_data);
-        if !is_genesis_self_vote && att_data.target.slot <= att_data.source.slot {
-            return Err("target_not_after_source");
-        }
-        // An already-justified target is deliberately NOT rejected here.
+        // An already-justified target is deliberately NOT rejected here, and
+        // neither is a target equal to its source (the source is justified by
+        // the check above, so that target is settled too).
         //
         // The state transition skips such a vote without rejecting the block
         // (`is_valid_vote` returns `Ok(false)` and `process_attestations` does
@@ -746,7 +744,17 @@ impl ProjectedState {
         // target with nothing to propose: on devnet-5 the justifiable rungs sit
         // 3 slots apart, so two slots in every three had every pooled entry
         // dropped at this line and built no candidate body at all.
-        if !is_genesis_self_vote
+        //
+        // The target == source case is the same trade on the aggregation
+        // worker, which shares this filter. Once the rung the head can reach is
+        // the one already justified, every honest vote names it as both source
+        // and target. Rejecting them left the aggregators with nothing to prove
+        // for those slots, so the "new" pool was empty when the safe target was
+        // computed, the safe target fell back to the justified root, and the
+        // next slot's target walked back onto that same rung: a loop that held
+        // the safe target several slots behind the head until the attestation
+        // target's lookback cap forced the head onto the next rung.
+        if !is_genesis_self_vote(att_data)
             && !slot_is_justifiable_after(att_data.target.slot, self.finalized_slot)
         {
             return Err("target_not_justifiable");
@@ -1749,6 +1757,61 @@ mod tests {
             Ok(()),
             "a settled target is a scoring question, not a validity one"
         );
+    }
+
+    /// A vote whose target IS its source passes too, on its head votes alone.
+    /// Once the rung the head can reach is the one already justified, every
+    /// honest vote has this shape: filtering it left the aggregators nothing to
+    /// prove for those slots and held the safe target on the justified root.
+    #[test]
+    fn entry_passes_filters_admits_a_target_equal_to_its_source() {
+        const FINALIZED_SLOT: u64 = 0;
+        const JUSTIFIED_SLOT: u64 = 2;
+        const HEAD_SLOT: u64 = 3;
+
+        let mut justified_slots = JustifiedSlots::new();
+        justified_slots_ops::extend_to_slot(&mut justified_slots, FINALIZED_SLOT, JUSTIFIED_SLOT);
+        justified_slots_ops::set_justified(&mut justified_slots, FINALIZED_SLOT, JUSTIFIED_SLOT);
+
+        let roots: Vec<H256> = (0..5u8).map(|i| H256([i + 1; 32])).collect();
+        let justified = Checkpoint {
+            slot: JUSTIFIED_SLOT,
+            root: roots[JUSTIFIED_SLOT as usize],
+        };
+        let att_data = AttestationData {
+            slot: 4,
+            head: Checkpoint {
+                slot: HEAD_SLOT,
+                root: roots[HEAD_SLOT as usize],
+            },
+            target: justified,
+            source: justified,
+        };
+
+        let projected = ProjectedState {
+            justified_slots,
+            finalized_slot: FINALIZED_SLOT,
+            current_votes: HashMap::new(),
+            head_window: Some(window(&[att_data.head.root], &[])),
+        };
+        let known: HashSet<H256> = roots.iter().copied().collect();
+
+        assert_eq!(
+            projected.entry_passes_filters(&att_data, &known, &roots),
+            Ok(()),
+            "target == source is a scoring question, not a validity one"
+        );
+
+        let coverage: HashSet<u64> = HashSet::from([0, 1]);
+        let (score, new_voters, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, 10)
+            .expect("its head votes are new");
+        assert!(
+            new_voters.is_empty(),
+            "a target equal to its justified source adds no justification voter"
+        );
+        assert_eq!(new_head_voters, coverage);
+        assert_eq!(score.tier, Tier::Build);
     }
 
     /// Below the head threshold there is no `TargetAdvance`: the entry is
