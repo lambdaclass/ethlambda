@@ -183,6 +183,13 @@ with no anchor on this node's subnet is never skipped. The full-width fallback i
 under the flag: every width below the committee count has several owners, so retrying there
 would rebuild exactly the duplication the flag buys away.
 
+The rotation guarantees an owner at every width only when every subnet below the committee
+count has an aggregator holding it as its duty subnet, so treat that as a precondition for
+the flag. On a sparser placement a width can have no owner in a given slot even with every
+configured node healthy: with duty subnets {0, 2} at committee count 4, nothing owns width 4
+in an odd slot, and with the fallback off that merge level is dropped for the slot. Leave the
+flag unset on a placement that does not cover every subnet.
+
 ### Sync gate
 
 `sync_status.rs` tracks how far the local head lags the slot clock. Past the threshold the

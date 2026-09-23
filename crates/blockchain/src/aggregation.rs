@@ -463,17 +463,30 @@ impl JobPolicy {
 /// yet, so it derives the narrowest width and is never skipped. The pool only
 /// has something to reach into once a data root has stayed live past its own
 /// slot.
+///
+/// That is a timing expectation, not an invariant this code enforces. A peer's
+/// aggregate for the current slot can land before this worker selects the
+/// candidate, under clock skew or when the peer proved its group early, and
+/// the current-slot candidate then has an anchor and a width of 2. Under
+/// `--skip-redundant-aggregation` that is not free: every duty subnet that
+/// does not own width 2 this slot sits the candidate out, so its raw
+/// signatures miss the next block. On the intended topology, distinct duty
+/// subnets with distinct subscriptions, a round-one peer proof never touches
+/// this node's subnet, so it finds no anchor there and the assumption holds
+/// anyway. Overlapping subscriptions are where it fails.
 fn window_for_candidate(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
     current_slot: u64,
     config: AggregationWindowConfig,
 ) -> Option<SubnetWindow> {
-    // Reduce before both the anchor search and the ownership test, not just
-    // inside `SubnetWindow::new`: an out-of-range duty subnet matches no
-    // validator's subnet, so it would find no anchor at all, and at a width
-    // that does not divide the committee count it would rotate on different
-    // slots from its reduced twin.
+    // The node binary rejects an out-of-range `--aggregate-subnet-ids` value at
+    // startup, so this should be a no-op in production. It stays because
+    // `AggregationWindowConfig` is public and `SubnetWindow::new` reduces
+    // `start` regardless: reducing only there would leave the ownership test
+    // running on the raw value, so an out-of-range duty subnet would rotate on
+    // different slots from its reduced twin, and would find no anchor at all
+    // since it matches no validator's subnet.
     let duty_subnet = if config.committee_count == 0 {
         0
     } else {
@@ -859,6 +872,33 @@ fn trace_skipped_candidate(reason: &'static str, att_data: &AttestationData, dat
     );
 }
 
+/// Whether retrying [`resolve_job`] at the full committee width could recover
+/// anything, given that the windowed attempt found no viable job.
+///
+/// False in the two cases where a wider window provably scores the same
+/// selection, so the retry is pure waste and a `fallback` count would be
+/// misattributed:
+///
+/// - The window is already as wide as the committee, so it admits every
+///   subnet and [`SubnetWindow::full`] is the same lens. `>=` rather than `==`
+///   also folds in a `committee_count` of 0, the "no subnet structure"
+///   degenerate case, where `contains_subnet` admits everything regardless.
+/// - The candidate's proof pool is empty, so there is no child to admit at any
+///   width. This is the ordinary shape of a minority or late vote: one gossip
+///   signature, nothing published against its data root yet. `resolve_job`
+///   declines it for want of material, not for want of window.
+fn fallback_can_recover(
+    window: &SubnetWindow,
+    committee_count: u64,
+    new_proofs: &[SingleMessageAggregate],
+    known_proofs: &[SingleMessageAggregate],
+) -> bool {
+    if window.width() >= committee_count {
+        return false;
+    }
+    !new_proofs.is_empty() || !known_proofs.is_empty()
+}
+
 /// A window can decline a merge the unwindowed pool would have allowed: the
 /// window is a contiguous run of subnets, but the pool need not be contiguous
 /// in subnet space, so a sparse aggregator placement can leave a window
@@ -870,6 +910,16 @@ fn trace_skipped_candidate(reason: &'static str, att_data: &AttestationData, dat
 /// request to do strictly less prover work, and every width below the
 /// committee count has several owners, so a fallback would have all of them
 /// retry at full width and rebuild the duplication the flag buys away.
+///
+/// A miss is only worth retrying when widening the window could admit a child
+/// the narrow one scored out, so two cases return before paying for a second
+/// pass: a window already as wide as the committee admits every subnet, so
+/// [`SubnetWindow::full`] would score identically, and an empty proof pool has
+/// no child to admit at any width. What is left over, a lone raw signature or
+/// a single-proof group, `resolve_job` also declines for reasons the window
+/// had no part in, so the counter below records recoveries rather than
+/// attempts: `lean_aggregation_window_fallback_total` counts merges the window
+/// would have dropped, not candidates that were never viable.
 ///
 /// `resolve_job` is store-free, so trying it twice is cheap.
 fn resolve_job_with_window_fallback(
@@ -892,16 +942,22 @@ fn resolve_job_with_window_fallback(
     if primary.is_some() || config.skip_redundant {
         return primary;
     }
-    metrics::inc_aggregation_window_fallback();
+    if !fallback_can_recover(window, config.committee_count, new_proofs, known_proofs) {
+        return None;
+    }
     let full = SubnetWindow::full(config.committee_count);
-    resolve_job(
+    let recovered = resolve_job(
         hashed,
         validator_sigs,
         new_proofs,
         known_proofs,
         validators,
         &full,
-    )
+    );
+    if recovered.is_some() {
+        metrics::inc_aggregation_window_fallback();
+    }
+    recovered
 }
 
 /// Resolve one candidate's aggregation material, raw-first + trim. No store
@@ -3336,6 +3392,76 @@ mod tests {
             job.coverage(),
             HashSet::from([5, 7, 13, 15]),
             "coverage matches the unwindowed selection's last-two-by-pool-order tie-break"
+        );
+    }
+
+    /// `lean_aggregation_window_fallback_total` claims to count merges the
+    /// window dropped, so the retry that feeds it must not run on candidates
+    /// no window could have saved. A window already spanning the committee is
+    /// the same lens as `SubnetWindow::full`, so the retry can only miss the
+    /// same way.
+    #[test]
+    fn a_full_width_window_has_nothing_to_fall_back_to() {
+        const COMMITTEE_COUNT: u64 = 4;
+        let pool = [SingleMessageAggregate::empty(make_bits(&[0, 1]))];
+
+        assert!(
+            !fallback_can_recover(
+                &SubnetWindow::new(0, COMMITTEE_COUNT, COMMITTEE_COUNT),
+                COMMITTEE_COUNT,
+                &pool,
+                &[],
+            ),
+            "a window as wide as the committee admits every subnet already"
+        );
+        assert!(
+            fallback_can_recover(
+                &SubnetWindow::new(0, COMMITTEE_COUNT - 1, COMMITTEE_COUNT),
+                COMMITTEE_COUNT,
+                &pool,
+                &[],
+            ),
+            "one subnet short of the committee, widening can still admit a child"
+        );
+    }
+
+    /// The common shape of a minority or late vote: one gossip signature and
+    /// nothing published against its data root. `resolve_job` declines it for
+    /// want of material, which no width fixes, so it must not be charged to
+    /// the window.
+    #[test]
+    fn an_empty_proof_pool_has_nothing_to_fall_back_to() {
+        const COMMITTEE_COUNT: u64 = 4;
+        let narrow = SubnetWindow::new(0, 1, COMMITTEE_COUNT);
+
+        assert!(
+            !fallback_can_recover(&narrow, COMMITTEE_COUNT, &[], &[]),
+            "no proof in either pool means no child to admit at any width"
+        );
+        assert!(
+            fallback_can_recover(
+                &narrow,
+                COMMITTEE_COUNT,
+                &[],
+                &[SingleMessageAggregate::empty(make_bits(&[2, 3]))],
+            ),
+            "a known proof outside the narrow window is exactly what widening recovers"
+        );
+    }
+
+    /// `committee_count` is 0 only in the degenerate "no subnet structure"
+    /// case, where `contains_subnet` admits everything, so the retry is a
+    /// no-op there too and the `>=` comparison has to catch it.
+    #[test]
+    fn a_structureless_committee_has_nothing_to_fall_back_to() {
+        assert!(
+            !fallback_can_recover(
+                &SubnetWindow::new(0, 1, 0),
+                0,
+                &[SingleMessageAggregate::empty(make_bits(&[0, 1]))],
+                &[],
+            ),
+            "width 1 still spans a committee of 0, which admits every subnet"
         );
     }
 

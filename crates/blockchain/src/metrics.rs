@@ -317,7 +317,7 @@ static LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL: std::sync::LazyLock<IntCounter> =
     std::sync::LazyLock::new(|| {
         register_int_counter!(
             "lean_aggregation_window_fallback_total",
-            "Candidates whose windowed selection was not viable and fell back to the full committee set"
+            "Merges the subnet window would have dropped, recovered by retrying at the full committee set"
         )
         .unwrap()
     });
@@ -1186,9 +1186,11 @@ pub fn inc_aggregation_skipped_redundant() {
     LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL.inc();
 }
 
-/// Increment the count of candidates whose windowed selection was not viable
-/// (a strided proof pool can leave a contiguous window holding a single
-/// proof) and so fell back to a full-committee-width window.
+/// Increment the count of merges recovered by the full-committee-width retry:
+/// the windowed selection produced no viable job (a strided proof pool can
+/// leave a contiguous window holding a single proof) and the retry did.
+/// Recoveries, not attempts, so candidates that no window could have made
+/// viable are not counted.
 pub fn inc_aggregation_window_fallback() {
     LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL.inc();
 }

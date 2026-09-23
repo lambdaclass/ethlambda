@@ -83,6 +83,8 @@ pub(crate) struct NodeOptions {
     pub(crate) attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    /// Every ID must be below --attestation-committee-count; the node refuses to
+    /// start otherwise, since a higher ID names a topic no validator publishes on.
     ///
     /// The first ID is also this node's aggregation duty subnet: where its
     /// aggregation window starts, and what --skip-redundant-aggregation
@@ -106,10 +108,18 @@ pub(crate) struct NodeOptions {
     /// case, is never skipped.
     ///
     /// Worth enabling when leanVM prover CPU is the bottleneck on co-located
-    /// aggregators. The cost is that a level in a given slot has few
-    /// producers, so a node that is down or late forfeits that slot's merge at
-    /// its level; the narrower levels still run and the next slot rotates to a
-    /// different owner.
+    /// aggregators.
+    ///
+    /// Deployment precondition: give every subnet below
+    /// --attestation-committee-count an aggregator holding it as its duty
+    /// subnet. Ownership is `duty_subnet % width == slot % width`, so on a
+    /// sparser placement a width can have no owner at all while every
+    /// configured node is healthy. With duty subnets {0, 2} at committee count
+    /// 4, nothing owns width 4 in an odd slot, and since this flag also
+    /// disables the full-width fallback, that merge level is simply dropped
+    /// for the slot. The narrower levels still run and the next slot rotates to
+    /// a different owner, but the loss is structural, not just the cost of a
+    /// node that is down or late.
     #[arg(long, default_value = "false", requires = "is_aggregator")]
     pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage
