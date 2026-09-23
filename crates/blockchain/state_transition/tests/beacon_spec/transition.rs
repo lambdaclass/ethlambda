@@ -69,6 +69,7 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::helpers::misc::compute_start_slot_at_epoch;
 use ethlambda_state_transition::beacon::primitives::Epoch;
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
@@ -149,8 +150,15 @@ fn apply_blocks(
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(state, &block, true, &config, &engine)
-            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(
+            state,
+            &block,
+            true,
+            &config,
+            &engine,
+            &mut CommitteeCache::default(),
+        )
+        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }

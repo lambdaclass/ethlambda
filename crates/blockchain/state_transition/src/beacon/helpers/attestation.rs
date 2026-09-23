@@ -12,8 +12,8 @@
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::phase0::{Attestation, AttestingIndices, IndexedAttestation};
 use crate::beacon::error::Result;
-use crate::beacon::helpers::accessors::{get_beacon_committee, get_domain};
-use crate::beacon::helpers::misc::compute_signing_root;
+use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
+use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::are_indices_sorted_and_unique;
 use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
 use crate::beacon::{bls, constants};
@@ -29,16 +29,24 @@ use crate::beacon::{bls, constants};
 /// The sort is not cosmetic. A committee is a *shuffled* slice of the validator
 /// registry, so walking it in position order yields attesters in shuffle order,
 /// which is almost never ascending.
+///
+/// `committees` supplies the slot's shuffling. Only one committee is read per
+/// attestation here, so a caller handling a single attestation loses nothing by
+/// passing a fresh [`CommitteeCache`]; the reuse this parameter exists for is
+/// across the many attestations a block carries. See [`CommitteeCache`].
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
-    let committee = get_beacon_committee(state, attestation.data.slot, attestation.data.index)?;
+    let epoch = compute_epoch_at_slot(attestation.data.slot);
+    let epoch_committees = committees.committees(state, epoch);
+    let committee = epoch_committees.committee(attestation.data.slot, attestation.data.index)?;
     let mut indices: Vec<ValidatorIndex> = committee
-        .into_iter()
+        .iter()
         .enumerate()
         .filter(|(position, _)| attestation.aggregation_bits.get(*position).unwrap_or(false))
-        .map(|(_, index)| index)
+        .map(|(_, index)| *index)
         .collect();
     indices.sort_unstable();
     Ok(indices)
@@ -48,8 +56,9 @@ pub fn get_attesting_indices(
 pub fn get_indexed_attestation(
     state: &BeaconState,
     attestation: &Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<IndexedAttestation> {
-    let indices = get_attesting_indices(state, attestation)?;
+    let indices = get_attesting_indices(state, attestation, committees)?;
     Ok(IndexedAttestation {
         attesting_indices: AttestingIndices::try_from(indices)?,
         data: attestation.data,

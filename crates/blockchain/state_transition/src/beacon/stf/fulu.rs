@@ -41,7 +41,7 @@
 use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
-use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
@@ -60,6 +60,7 @@ pub fn process_block(
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -72,7 +73,7 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    super::electra::process_operations(state, &block.body, config)?;
+    super::electra::process_operations(state, &block.body, config, committees)?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
     Ok(())
 }

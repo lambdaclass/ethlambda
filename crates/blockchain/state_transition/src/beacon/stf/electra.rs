@@ -56,7 +56,7 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, deneb, electra, fulu};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    EpochCommittees, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    CommitteeCache, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
     get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
@@ -656,6 +656,7 @@ pub fn process_attester_slashing(
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &electra::Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -693,16 +694,17 @@ pub fn process_attestation(
     // unconditional `O(registry size)` active-set scan) per named committee:
     // `committee_bits` can name up to `MAX_COMMITTEES_PER_SLOT` committees in
     // a single attestation, all drawn from this same `(state,
-    // data.target.epoch)` pair. See `EpochCommittees`'s own documentation for
-    // why sharing it here needs no cache-key matching to stay sound.
-    let committees = EpochCommittees::new(state, data.target.epoch);
+    // data.target.epoch)` pair. Taken from `committees` rather than built
+    // here, so this shares the shuffling with `get_indexed_attestation`'s own
+    // walk below and with fork choice's replay of this same attestation.
+    let epoch_committees = committees.committees(state, data.target.epoch);
     let mut committee_offset = 0usize;
     for committee_index in committee_indices {
         verify(
-            committee_index < committees.committees_per_slot(),
+            committee_index < epoch_committees.committees_per_slot(),
             "committee_index < get_committee_count_per_slot(state, data.target.epoch)",
         )?;
-        let committee = committees.committee(data.slot, committee_index)?;
+        let committee = epoch_committees.committee(data.slot, committee_index)?;
         let committee_has_an_attester = (0..committee.len()).any(|position| {
             attestation
                 .aggregation_bits
@@ -723,7 +725,7 @@ pub fn process_attestation(
     let participation_flag_indices =
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
-    let indexed_attestation = get_indexed_attestation(state, attestation)?;
+    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     verify(
         is_valid_indexed_attestation(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
@@ -1696,6 +1698,7 @@ pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let deposit_requests_start_index =
         block_ref(state, "process_operations")?.deposit_requests_start_index();
@@ -1721,7 +1724,7 @@ pub fn process_operations(
     }
     // [Modified in Electra:EIP7549]
     for attestation in body.attestations.iter() {
-        process_attestation(state, attestation)?;
+        process_attestation(state, attestation, committees)?;
     }
     for deposit in body.deposits.iter() {
         process_deposit(state, deposit, config)?;
@@ -1761,6 +1764,7 @@ pub fn process_block(
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -1773,7 +1777,7 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config)?;
+    process_operations(state, &block.body, config, committees)?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
     Ok(())
 }

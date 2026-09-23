@@ -168,7 +168,7 @@ use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, Signed
 use crate::beacon::containers::{bellatrix, deneb, electra, fulu, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    get_active_validator_indices, get_beacon_proposer_index, get_current_epoch,
+    CommitteeCache, get_active_validator_indices, get_beacon_proposer_index, get_current_epoch,
     get_total_active_balance,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
@@ -234,8 +234,12 @@ impl Attestation {
     /// indexed form and checking it needs the fork-specific
     /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair, so this
     /// dispatches once here rather than leaving that match to every caller.
-    pub fn verified_attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
-        self.indices(state, true)
+    pub fn verified_attesting_indices(
+        &self,
+        state: &BeaconState,
+        committees: &mut CommitteeCache,
+    ) -> Result<Vec<ValidatorIndex>> {
+        self.indices(state, true, committees)
     }
 
     /// The attesters this attestation names, taking `state`'s word for the
@@ -247,8 +251,12 @@ impl Attestation {
     /// and the same `is_valid_indexed_attestation` the verifying sibling above
     /// does, so for a block's own attestations that verdict is already in hand
     /// and re-reaching it is the expensive part of the import.
-    pub fn attesting_indices(&self, state: &BeaconState) -> Result<Vec<ValidatorIndex>> {
-        self.indices(state, false)
+    pub fn attesting_indices(
+        &self,
+        state: &BeaconState,
+        committees: &mut CommitteeCache,
+    ) -> Result<Vec<ValidatorIndex>> {
+        self.indices(state, false, committees)
     }
 
     /// The body both accessors above share: the one place this enum's two
@@ -257,10 +265,16 @@ impl Attestation {
     /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair. Kept as
     /// one dispatch so a new attestation shape cannot be added to the
     /// verifying path and forgotten on the other.
-    fn indices(&self, state: &BeaconState, verify_signature: bool) -> Result<Vec<ValidatorIndex>> {
+    fn indices(
+        &self,
+        state: &BeaconState,
+        verify_signature: bool,
+        committees: &mut CommitteeCache,
+    ) -> Result<Vec<ValidatorIndex>> {
         match self {
             Attestation::Phase0(attestation) => {
-                let indexed = phase0_attestation::get_indexed_attestation(state, attestation)?;
+                let indexed =
+                    phase0_attestation::get_indexed_attestation(state, attestation, committees)?;
                 if verify_signature {
                     verify(
                         phase0_attestation::is_valid_indexed_attestation(state, &indexed),
@@ -270,7 +284,8 @@ impl Attestation {
                 Ok(indexed.attesting_indices.into_inner())
             }
             Attestation::Electra(attestation) => {
-                let indexed = electra_helpers::get_indexed_attestation(state, attestation)?;
+                let indexed =
+                    electra_helpers::get_indexed_attestation(state, attestation, committees)?;
                 if verify_signature {
                     verify(
                         electra_helpers::is_valid_indexed_attestation(state, &indexed),
@@ -2267,6 +2282,7 @@ pub fn on_block(
     config: &Config,
     blob_evidence: &DataAvailability,
     payload_validity: &PayloadValidity,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
@@ -2351,7 +2367,8 @@ pub fn on_block(
             stf::ExecutionEngine::valid()
         }
     };
-    let transition = stf::state_transition(&mut state, &signed_block, true, config, &engine);
+    let transition =
+        stf::state_transition(&mut state, &signed_block, true, config, &engine, committees);
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
     // in the canonical chain. That is stated here, on the verdict, rather than
@@ -2498,6 +2515,7 @@ pub fn on_attestation(
     attestation: &Attestation,
     is_from_block: bool,
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation(store, data, is_from_block, config)?;
@@ -2508,7 +2526,7 @@ pub fn on_attestation(
     // mutably below, unlike when this cached state lived behind a reference
     // into `store` itself.
     let target_state = checkpoint_state(store, &data.target, config)?;
-    let attesting_indices = attestation.verified_attesting_indices(&target_state)?;
+    let attesting_indices = attestation.verified_attesting_indices(&target_state, committees)?;
 
     // Update latest messages for attesting indices.
     update_latest_messages(store, &attesting_indices, data);
@@ -2556,11 +2574,12 @@ pub fn on_block_attestation(
     block_state: &BeaconState,
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation_indexed(store, data, true, config, index)?;
 
-    let attesting_indices = attestation.attesting_indices(block_state)?;
+    let attesting_indices = attestation.attesting_indices(block_state, committees)?;
     update_latest_messages(store, &attesting_indices, data);
 
     Ok(())

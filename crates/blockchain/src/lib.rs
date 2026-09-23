@@ -6,7 +6,7 @@ use ethlambda_state_transition::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::beacon::helpers::accessors::{
-    get_beacon_proposer_index, get_domain,
+    CommitteeCache, get_beacon_proposer_index, get_domain,
 };
 use ethlambda_state_transition::beacon::helpers::misc::compute_signing_root;
 use ethlambda_state_transition::beacon::{bls, stf};
@@ -391,6 +391,7 @@ impl BlockChain {
             sync_status_controller,
             events,
             duties,
+            committees: CommitteeCache::default(),
         }
         // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
         .start_with_backend(Backend::Thread);
@@ -517,6 +518,20 @@ pub struct BlockChainServer {
     /// Chain-event publication bus. The actor is the sole publisher; consumers
     /// only subscribe, preserving the one-directional write flow.
     events: EventBus,
+
+    /// Committee shufflings shared across everything that asks a beacon state
+    /// which validators attest at a slot: the state transition as it processes
+    /// a block's attestations, and fork choice as it replays those same
+    /// attestations into the latest-message store.
+    ///
+    /// Lives here, on the actor, because the actor is what owns the sequence of
+    /// imports that share it. Deriving a shuffling costs one scan of the
+    /// validator registry and one shuffle of the active set, and at mainnet's
+    /// ~2.4M validators an import that derives one per attestation per pass
+    /// spends most of its time doing nothing else. Keyed so that only states
+    /// that really do agree on an epoch's committees share an entry; see
+    /// `CommitteeCache`. Always empty on lean, which has no beacon committees.
+    committees: CommitteeCache,
 
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
@@ -1713,6 +1728,7 @@ impl BlockChainServer {
                     &config,
                     &evidence,
                     &validity,
+                    &mut self.committees,
                 );
                 timings.stf_end = Some(Instant::now());
                 if let Err(err) = imported {
@@ -1755,6 +1771,7 @@ impl BlockChainServer {
                                 &block_state,
                                 &config,
                                 &index,
+                                &mut self.committees,
                             )
                             .inspect_err(|err| {
                                 trace!(%slot, ?err, "Ignoring an unusable attestation from a block")
@@ -4103,6 +4120,7 @@ mod tests {
             sync_status_controller: SyncStatusController::default(),
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
+            committees: CommitteeCache::default(),
         }
     }
 

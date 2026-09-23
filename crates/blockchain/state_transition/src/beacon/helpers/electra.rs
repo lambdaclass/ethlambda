@@ -135,11 +135,11 @@ use crate::beacon::primitives::{
 };
 
 use super::accessors::{
-    get_active_validator_indices, get_beacon_committee, get_current_epoch, get_domain, get_seed,
+    CommitteeCache, get_active_validator_indices, get_current_epoch, get_domain, get_seed,
     get_total_active_balance,
 };
 use super::math::bytes_to_uint64;
-use super::misc::{compute_activation_exit_epoch, compute_signing_root};
+use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
 use super::predicates::are_indices_sorted_and_unique;
 use super::shuffling::compute_shuffled_index;
 
@@ -430,16 +430,24 @@ pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorInde
 /// `committees_cover_every_active_validator_once_per_epoch` test), so the
 /// same validator index cannot appear under two different named committees,
 /// and a single committee cannot name the same position twice.
+///
+/// `committees` is what keeps this one active-set scan and one shuffle rather
+/// than `MAX_COMMITTEES_PER_SLOT` of each: every committee named by one
+/// attestation belongs to the same slot, and so to the same epoch's shuffling.
+/// See [`CommitteeCache`] for how far that sharing reaches beyond this call.
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &electra::Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
     let committee_indices = get_committee_indices(&attestation.committee_bits);
+    let epoch_committees =
+        committees.committees(state, compute_epoch_at_slot(attestation.data.slot));
 
     let mut indices = Vec::new();
     let mut committee_offset = 0usize;
     for committee_index in committee_indices {
-        let committee = get_beacon_committee(state, attestation.data.slot, committee_index)?;
+        let committee = epoch_committees.committee(attestation.data.slot, committee_index)?;
         for (position, attester_index) in committee.iter().enumerate() {
             let bit = committee_offset + position;
             if attestation.aggregation_bits.get(bit).unwrap_or(false) {
@@ -457,8 +465,9 @@ pub fn get_attesting_indices(
 pub fn get_indexed_attestation(
     state: &BeaconState,
     attestation: &electra::Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<electra::IndexedAttestation> {
-    let indices = get_attesting_indices(state, attestation)?;
+    let indices = get_attesting_indices(state, attestation, committees)?;
     Ok(electra::IndexedAttestation {
         attesting_indices: electra::AttestingIndices::try_from(indices)?,
         data: attestation.data,
@@ -934,6 +943,7 @@ mod tests {
     use super::*;
     use crate::beacon::containers::shared::AttestationData;
     use crate::beacon::fork::ForkName;
+    use crate::beacon::helpers::accessors::get_beacon_committee;
 
     /// An electra state with `count` fully active, full-balance validators,
     /// positioned the same way `crate::beacon::helpers::test_state::with_validators`
@@ -1206,7 +1216,8 @@ mod tests {
             committee_bits,
         };
 
-        let indices = get_attesting_indices(&state, &attestation).unwrap();
+        let indices =
+            get_attesting_indices(&state, &attestation, &mut CommitteeCache::default()).unwrap();
 
         let mut expected = vec![
             committee_0[0],
@@ -1248,7 +1259,8 @@ mod tests {
             committee_bits,
         };
 
-        let indexed = get_indexed_attestation(&state, &attestation).unwrap();
+        let indexed =
+            get_indexed_attestation(&state, &attestation, &mut CommitteeCache::default()).unwrap();
         assert_eq!(&*indexed.attesting_indices, &[committee[0]]);
         assert_eq!(indexed.signature, attestation.signature);
         assert_eq!(indexed.data, attestation.data);

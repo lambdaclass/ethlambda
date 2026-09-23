@@ -36,7 +36,7 @@ use crate::beacon::containers::{BeaconState, deneb, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    get_beacon_committee, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
+    CommitteeCache, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
     get_committee_count_per_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
@@ -78,6 +78,7 @@ pub fn process_block(
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -105,6 +106,7 @@ pub fn process_block(
         &block.body.voluntary_exits,
         &block.body.bls_to_execution_changes,
         config,
+        committees,
     )?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
     Ok(())
@@ -146,6 +148,7 @@ fn process_operations(
     voluntary_exits: &[SignedVoluntaryExit],
     bls_to_execution_changes: &[SignedBLSToExecutionChange],
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -166,7 +169,7 @@ fn process_operations(
         super::operations::process_attester_slashing(state, attester_slashing, config)?;
     }
     for attestation in attestations {
-        process_attestation(state, attestation)?;
+        process_attestation(state, attestation, committees)?;
     }
     for deposit in deposits {
         super::operations::process_deposit(state, deposit, config)?;
@@ -279,6 +282,7 @@ pub fn process_withdrawals(
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -311,9 +315,12 @@ pub fn process_attestation(
         "data.index < get_committee_count_per_slot(state, data.target.epoch)",
     )?;
 
-    let committee = get_beacon_committee(state, data.slot, data.index)?;
+    let committee_len = committees
+        .committees(state, data.target.epoch)
+        .committee(data.slot, data.index)?
+        .len();
     verify(
-        attestation.aggregation_bits.len() == committee.len(),
+        attestation.aggregation_bits.len() == committee_len,
         "len(attestation.aggregation_bits) == len(committee)",
     )?;
 
@@ -323,7 +330,7 @@ pub fn process_attestation(
     let participation_flag_indices =
         attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
-    let indexed_attestation = get_indexed_attestation(state, attestation)?;
+    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     verify(
         is_valid_indexed_attestation(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
@@ -331,7 +338,7 @@ pub fn process_attestation(
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies and add up the proposer's reward for granting them.
-    let attesting_indices = get_attesting_indices(state, attestation)?;
+    let attesting_indices = get_attesting_indices(state, attestation, committees)?;
     let current_epoch_target = data.target.epoch == current_epoch;
     // Through the fork-generic accessor, not a projection to a concrete
     // `altair::BeaconState`. The participation lists are unchanged from altair

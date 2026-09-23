@@ -24,6 +24,7 @@ use crate::beacon::containers::{
 };
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
+use crate::beacon::helpers::accessors::CommitteeCache;
 use crate::beacon::helpers::attestation::get_attesting_indices;
 use crate::beacon::helpers::misc::{compute_activation_exit_epoch, compute_epoch_at_slot};
 use crate::beacon::lean_fork_unreachable;
@@ -56,6 +57,13 @@ fn translate_participation(
     post: &mut BeaconState,
     pending_attestations: &[phase0::PendingAttestation],
 ) -> Result<()> {
+    // The upgrade's own cache, not one threaded in from the caller: every
+    // attestation here targets the epoch the upgrade happens at, so they share
+    // one shuffling between them, and a fork transition runs once per network
+    // rather than once per block. Nothing outside this loop needs it
+    // afterwards.
+    let mut committees = CommitteeCache::default();
+
     for attestation in pending_attestations {
         let participation_flag_indices =
             crate::beacon::helpers::altair::get_attestation_participation_flag_indices(
@@ -74,7 +82,8 @@ fn translate_participation(
             data: attestation.data,
             signature: BlsSignature::default(),
         };
-        let attesting_indices = get_attesting_indices(post, &attestation_for_indices)?;
+        let attesting_indices =
+            get_attesting_indices(post, &attestation_for_indices, &mut committees)?;
 
         let altair_state = match post {
             BeaconState::Altair(state) => state,

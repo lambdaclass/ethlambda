@@ -37,6 +37,7 @@ use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBl
 use ethlambda_state_transition::beacon::fork_choice::{
     self, PayloadStatusEnum, PayloadStatusV1, PayloadValidity, Store,
 };
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::ExecutionBlockHash;
 use libtest_mimic::Trial;
 
@@ -184,6 +185,7 @@ fn apply_block(
             config,
             &fork_choice::DataAvailability::NotRequired,
             &validity,
+            &mut CommitteeCache::default(),
         ),
         expect_valid,
     ) {
@@ -200,9 +202,14 @@ fn apply_block(
     }
 
     for attestation in &attestations {
-        fork_choice::on_attestation(store, attestation, true, config).map_err(|err| {
-            format!("on_attestation for an attestation carried in {name}: {err:?}")
-        })?;
+        fork_choice::on_attestation(
+            store,
+            attestation,
+            true,
+            config,
+            &mut CommitteeCache::default(),
+        )
+        .map_err(|err| format!("on_attestation for an attestation carried in {name}: {err:?}"))?;
     }
     for attester_slashing in &attester_slashings {
         fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {

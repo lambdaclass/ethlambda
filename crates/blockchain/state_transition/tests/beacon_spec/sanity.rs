@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::stf::{self, ExecutionEngine};
 use libtest_mimic::Trial;
 
@@ -55,8 +56,15 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(state, &block, true, config, &engine)
-            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(
+            state,
+            &block,
+            true,
+            config,
+            &engine,
+            &mut CommitteeCache::default(),
+        )
+        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }

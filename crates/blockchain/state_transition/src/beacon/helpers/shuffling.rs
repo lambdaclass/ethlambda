@@ -59,6 +59,78 @@ pub fn compute_shuffled_index(index: u64, index_count: u64, seed: Bytes32) -> Re
     Ok(index)
 }
 
+/// The whole-list form of [`compute_shuffled_index`]: `result[p]` equals
+/// `compute_shuffled_index(p, index_count, seed).unwrap()` for every `p` in
+/// `0..index_count`, computed together instead of one call per `p`.
+///
+/// [`compute_shuffled_index`] rehashes from scratch for every position it is
+/// asked about: `SHUFFLE_ROUND_COUNT` pivot hashes, and for each round a fresh
+/// 256-position "source" window hash even though the caller only ever reads
+/// one bit out of it. Asked about the same `(seed, index_count)` many times,
+/// which is exactly what one epoch's worth of
+/// [`super::accessors::get_beacon_committee`] calls does, that repeats the
+/// same rounds of hashing once per position instead of once per epoch.
+///
+/// This instead processes one round across every position at a time: one
+/// pivot hash, then one source hash per 256-position window
+/// (`index_count.div_ceil(256)` of them, since a permutation of `index_count`
+/// positions covers every window at least once, so precomputing all of them
+/// up front costs no more than the minimum any position in that window would
+/// need) rather than one source hash per position queried, however many of
+/// those there turn out to be.
+///
+/// Verified against [`compute_shuffled_index`] directly, over a range of
+/// sizes and seeds including the 0-, 1-, and 2-element edge cases, by
+/// [`tests::whole_list_shuffle_matches_the_per_index_shuffle`]: the two must
+/// compute the same permutation, since this is a performance change to how
+/// the permutation is derived and not a change to what the permutation is.
+pub fn compute_shuffled_indices(index_count: u64, seed: Bytes32) -> Vec<u64> {
+    let n = index_count;
+    let mut positions: Vec<u64> = (0..n).collect();
+    if n < 2 {
+        // `compute_shuffled_index` would divide by `n` immediately below; for
+        // `n == 1` every round's pivot, flip, and bit computation is moot
+        // anyway, since the only valid index always flips to itself. `n == 0`
+        // has no valid index at all, so the empty permutation is the only
+        // sensible answer.
+        return positions;
+    }
+
+    let window_count = n.div_ceil(256) as usize;
+    let mut window_hashes: Vec<Bytes32> = Vec::with_capacity(window_count);
+
+    for round in 0..preset::SHUFFLE_ROUND_COUNT {
+        let round_byte = round as u8;
+
+        let mut pivot_input = Vec::with_capacity(33);
+        pivot_input.extend_from_slice(&seed.0);
+        pivot_input.push(round_byte);
+        let pivot = bytes_to_uint64(&hash(&pivot_input).0[0..8]) % n;
+
+        window_hashes.clear();
+        for window in 0..window_count {
+            let mut source_input = Vec::with_capacity(37);
+            source_input.extend_from_slice(&seed.0);
+            source_input.push(round_byte);
+            source_input.extend_from_slice(&(window as u32).to_le_bytes());
+            window_hashes.push(hash(&source_input));
+        }
+
+        for value in positions.iter_mut() {
+            let flip = (pivot + n - *value) % n;
+            let position = (*value).max(flip);
+            let window = &window_hashes[(position / 256) as usize];
+            let byte = window.0[((position % 256) / 8) as usize];
+            let bit = (byte >> (position % 8)) % 2;
+            if bit == 1 {
+                *value = flip;
+            }
+        }
+    }
+
+    positions
+}
+
 /// The `index`-th of `count` committees drawn from `indices` under `seed`.
 pub fn compute_committee(
     indices: &[ValidatorIndex],
@@ -222,5 +294,62 @@ mod tests {
     #[test]
     fn proposer_selection_rejects_an_empty_set() {
         assert!(compute_proposer_index(&[], Bytes32::ZERO, 1, |_| Ok(1)).is_err());
+    }
+
+    /// [`compute_shuffled_indices`] is a from-scratch reimplementation of the
+    /// same permutation [`compute_shuffled_index`] computes one position at a
+    /// time, sharing hashing across positions instead of repeating it. A bug
+    /// in the sharing would produce *a* permutation, quietly wrong, not a
+    /// panic or an out-of-range value, so this checks every position agrees
+    /// with the per-index function directly, across sizes small enough to be
+    /// exhaustive and large enough to cross several 256-position hash
+    /// windows, and across several seeds so no single seed's structure hides
+    /// a bug.
+    ///
+    /// Covers `index_count` 0, 1, and 2 explicitly (no shuffling, a
+    /// single-element no-op, and the smallest case with an actual swap to get
+    /// right), since those are exactly the sizes where an off-by-one in the
+    /// pairing or the early-return guard would show up.
+    #[test]
+    fn whole_list_shuffle_matches_the_per_index_shuffle() {
+        let seeds = [
+            Bytes32::ZERO,
+            Bytes32::repeat_byte(0xff),
+            Bytes32::repeat_byte(0x42),
+            Bytes32::repeat_byte(0x17),
+        ];
+        let sizes = [
+            0u64, 1, 2, 3, 4, 5, 16, 25, 100, 255, 256, 257, 511, 512, 1000,
+        ];
+
+        for seed in seeds {
+            for &count in &sizes {
+                let whole_list = compute_shuffled_indices(count, seed);
+                assert_eq!(
+                    whole_list.len(),
+                    count as usize,
+                    "count={count}, seed={seed:?}"
+                );
+
+                for position in 0..count {
+                    let expected = compute_shuffled_index(position, count, seed)
+                        .expect("position is in range by construction");
+                    assert_eq!(
+                        whole_list[position as usize], expected,
+                        "count={count}, seed={seed:?}, position={position}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn empty_shuffle_has_no_positions() {
+        // `compute_shuffled_index` has no valid input at all when
+        // `index_count` is 0 (every index is out of range), so the whole-list
+        // form's only sensible answer is the empty permutation, checked here
+        // rather than folded into the sweep above since there is no per-index
+        // call to compare it against.
+        assert!(compute_shuffled_indices(0, Bytes32::ZERO).is_empty());
     }
 }

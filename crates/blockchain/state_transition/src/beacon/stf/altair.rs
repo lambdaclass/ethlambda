@@ -31,7 +31,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    get_beacon_committee, get_beacon_proposer_index, get_block_root_at_slot,
+    CommitteeCache, get_beacon_proposer_index, get_block_root_at_slot,
     get_committee_count_per_slot, get_current_epoch, get_domain, get_previous_epoch,
     get_total_active_balance,
 };
@@ -84,6 +84,7 @@ use std::collections::HashMap;
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -120,9 +121,12 @@ pub fn process_attestation(
         "data.index < get_committee_count_per_slot(state, data.target.epoch)",
     )?;
 
-    let committee = get_beacon_committee(state, data.slot, data.index)?;
+    let committee_len = committees
+        .committees(state, data.target.epoch)
+        .committee(data.slot, data.index)?
+        .len();
     verify(
-        attestation.aggregation_bits.len() == committee.len(),
+        attestation.aggregation_bits.len() == committee_len,
         "len(attestation.aggregation_bits) == len(committee)",
     )?;
 
@@ -132,7 +136,7 @@ pub fn process_attestation(
     let participation_flag_indices =
         get_attestation_participation_flag_indices(state, &data, inclusion_delay)?;
 
-    let indexed_attestation = get_indexed_attestation(state, attestation)?;
+    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     verify(
         is_valid_indexed_attestation(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
@@ -143,7 +147,7 @@ pub fn process_attestation(
     // Everything here only ever reads `state`, so it can run to completion
     // before the write phase below needs a mutable borrow of the same
     // participation list.
-    let attesting_indices = get_attesting_indices(state, attestation)?;
+    let attesting_indices = get_attesting_indices(state, attestation, committees)?;
     let current_epoch_target = data.target.epoch == current_epoch;
     let (previous_epoch_participation, current_epoch_participation, _) =
         state.altair_validator_lists()?;
@@ -401,6 +405,7 @@ mod tests {
     use super::*;
     use crate::beacon::containers::altair::SyncCommittee;
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
+    use crate::beacon::helpers::accessors::get_beacon_committee;
     use crate::beacon::primitives::{
         BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _, Root,
     };
@@ -570,7 +575,7 @@ mod tests {
         let proposer_index = get_beacon_proposer_index(&state).unwrap();
         let balance_before = state.balance(proposer_index).unwrap();
 
-        process_attestation(&mut state, &attestation).unwrap();
+        process_attestation(&mut state, &attestation, &mut CommitteeCache::default()).unwrap();
 
         let (previous_epoch_participation, _, _) = state.altair_validator_lists().unwrap();
         for &index in &committee {
@@ -600,7 +605,7 @@ mod tests {
         // so reprocessing the identical attestation must grant nothing new, and
         // the proposer's balance must not move.
         let balance_before_replay = state.balance(proposer_index).unwrap();
-        process_attestation(&mut state, &attestation).unwrap();
+        process_attestation(&mut state, &attestation, &mut CommitteeCache::default()).unwrap();
         let balance_after_replay = state.balance(proposer_index).unwrap();
         assert_eq!(
             balance_before_replay, balance_after_replay,

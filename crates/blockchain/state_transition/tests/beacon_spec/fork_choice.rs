@@ -105,6 +105,7 @@ use ethlambda_state_transition::beacon::containers::{
     phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{self, DataAvailability, Store};
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::preset;
 use ethlambda_state_transition::beacon::primitives::{KzgProof, Root};
 use libssz::SszDecode;
@@ -424,6 +425,7 @@ fn apply_block(
             config,
             &blob_evidence,
             &fork_choice::PayloadValidity::NotRequired,
+            &mut CommitteeCache::default(),
         ),
         expect_valid,
     ) {
@@ -440,9 +442,14 @@ fn apply_block(
     }
 
     for attestation in &attestations {
-        fork_choice::on_attestation(store, attestation, true, config).map_err(|err| {
-            format!("on_attestation for an attestation carried in {name}: {err:?}")
-        })?;
+        fork_choice::on_attestation(
+            store,
+            attestation,
+            true,
+            config,
+            &mut CommitteeCache::default(),
+        )
+        .map_err(|err| format!("on_attestation for an attestation carried in {name}: {err:?}"))?;
     }
     for attester_slashing in &attester_slashings {
         fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {
@@ -484,7 +491,13 @@ fn apply_execution_step(
     if let Some(name) = &step.attestation {
         let attestation = decode_attestation(case, name)?;
         return match (
-            fork_choice::on_attestation(store, &attestation, false, config),
+            fork_choice::on_attestation(
+                store,
+                &attestation,
+                false,
+                config,
+                &mut CommitteeCache::default(),
+            ),
             step.valid,
         ) {
             (Ok(()), false) => Err(format!(

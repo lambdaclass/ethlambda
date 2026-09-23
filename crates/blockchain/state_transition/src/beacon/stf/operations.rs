@@ -23,8 +23,8 @@ use crate::beacon::containers::shared::{
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    get_beacon_committee, get_beacon_proposer_index, get_committee_count_per_slot,
-    get_current_epoch, get_domain, get_previous_epoch,
+    CommitteeCache, get_beacon_proposer_index, get_committee_count_per_slot, get_current_epoch,
+    get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{
@@ -53,6 +53,16 @@ use crate::beacon::primitives::{Gwei, HashTreeRoot as _, ValidatorIndex};
 /// than any one operation: a block must include exactly as many deposits as are
 /// outstanding, up to the per-block cap, so a proposer cannot fall behind the
 /// deposit contract by including too few, nor claim more than exist.
+///
+/// Eight parameters, one past clippy's default limit, for the same reason
+/// capella's and deneb's own `process_operations` carry the identical
+/// allowance: this mirrors the specification's `process_operations(state,
+/// body)` unpacked into the lists it reads, which is the point rather than an
+/// accident (see [`crate::beacon::stf`]'s module documentation), and the
+/// committee cache is threaded rather than rebuilt here because its lifetime
+/// is the caller's to decide (see
+/// [`crate::beacon::helpers::accessors::CommitteeCache`]).
+#[allow(clippy::too_many_arguments)]
 pub fn process_operations(
     state: &mut BeaconState,
     proposer_slashings: &[ProposerSlashing],
@@ -61,6 +71,7 @@ pub fn process_operations(
     deposits: &[Deposit],
     voluntary_exits: &[SignedVoluntaryExit],
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     // `eth1_deposit_index` only ever advances by one per processed deposit,
     // and `deposit_count` only ever grows, so in a correctly-derived state the
@@ -96,9 +107,9 @@ pub fn process_operations(
         // `get_base_reward` implementations: neither is renamed, and the call
         // site picks between them by fully-qualified path.
         if state.fork_name() == ForkName::Phase0 {
-            process_attestation(state, attestation, config)?;
+            process_attestation(state, attestation, config, committees)?;
         } else {
-            crate::beacon::stf::altair::process_attestation(state, attestation)?;
+            crate::beacon::stf::altair::process_attestation(state, attestation, committees)?;
         }
     }
     for deposit in deposits {
@@ -254,6 +265,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
     _config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -290,9 +302,12 @@ pub fn process_attestation(
         "data.index < get_committee_count_per_slot(state, data.target.epoch)",
     )?;
 
-    let committee = get_beacon_committee(state, data.slot, data.index)?;
+    let committee_len = committees
+        .committees(state, data.target.epoch)
+        .committee(data.slot, data.index)?
+        .len();
     verify(
-        attestation.aggregation_bits.len() == committee.len(),
+        attestation.aggregation_bits.len() == committee_len,
         "len(attestation.aggregation_bits) == len(committee)",
     )?;
 
@@ -323,7 +338,7 @@ pub fn process_attestation(
             .push(pending_attestation)?;
     }
 
-    let indexed_attestation = get_indexed_attestation(state, attestation)?;
+    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
     verify(
         is_valid_indexed_attestation(state, &indexed_attestation),
         "is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",

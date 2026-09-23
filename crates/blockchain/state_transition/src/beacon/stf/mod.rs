@@ -66,7 +66,7 @@ pub mod operations;
 use crate::beacon::containers;
 use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
-use crate::beacon::helpers::accessors::get_domain;
+use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
 use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -131,6 +131,7 @@ pub fn state_transition(
     validate_result: bool,
     config: &Config,
     engine: &ExecutionEngine,
+    committees: &mut CommitteeCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
 
@@ -152,7 +153,7 @@ pub fn state_transition(
         )?;
     }
 
-    block::process_block(state, signed_block, config, engine)?;
+    block::process_block(state, signed_block, config, engine, committees)?;
 
     if validate_result {
         verify(
