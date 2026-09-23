@@ -23,6 +23,7 @@ use ethlambda_state_transition::{
     attestation_data_matches_chain, justified_slots_ops, process_block, process_slots,
     slot_is_justifiable_after,
 };
+use ethlambda_storage::HeadVoteWindow;
 use ethlambda_types::{
     ShortRoot,
     attestation::{AggregatedAttestation, AggregationBits, AttestationData},
@@ -42,6 +43,26 @@ use crate::{
     metrics,
     store::StoreError,
 };
+
+/// How far back the head-vote baseline is read: the head block and the two
+/// blocks it descends from.
+///
+/// This is the stretch of chain a proposer can still influence, so it bounds
+/// the head axis at both ends. An entry naming a head inside it is scored for
+/// the weight it would add ([`ethlambda_storage::HeadVoteWindow::roots`]);
+/// an entry naming a head behind it scores zero, whatever its votes look like
+/// against what the window carries.
+///
+/// Three blocks is chosen to cover the case the axis exists for. On a chain
+/// whose `justified - finalized` sits at 6 the justifiable rungs are 3 slots
+/// apart, so several consecutive slots all vote for the same settled target and
+/// have nothing but their head votes to offer. Their heads are the last few
+/// blocks, so the window keeps them packable; anything older has had a
+/// window's worth of blocks built past it and is no longer being contested.
+///
+/// It also bounds the walk to three block reads per selection, on the proposal
+/// hot path.
+pub(crate) const HEAD_VOTE_WINDOW_BLOCKS: usize = 3;
 
 /// Post-block checkpoints extracted from the state transition in `build_block`.
 ///
@@ -241,7 +262,7 @@ fn select_attestations(
     let ProposalInputs {
         known_block_roots,
         aggregated_payloads,
-        latest_head_votes,
+        head_window,
     } = inputs;
 
     let mut selected: Vec<(AggregatedAttestation, SingleMessageAggregate)> = Vec::new();
@@ -261,8 +282,7 @@ fn select_attestations(
     // Running per-target-root voter set, seeded from state and updated
     // incrementally as entries are selected. Mirrors the role of Eth2
     // participation flags in Prysm/Lighthouse-style packing.
-    let mut projected =
-        ProjectedState::from_head_state(head_state).with_head_votes(latest_head_votes);
+    let mut projected = ProjectedState::from_head_state(head_state).with_head_window(head_window);
     let mut processed_data_roots: HashSet<H256> = HashSet::new();
 
     // A block may carry at most `MAX_ATTESTATIONS_DATA` distinct entries
@@ -368,15 +388,19 @@ pub(crate) struct ProposalInputs<'a> {
     /// The attestation pool: `data_root -> (data, proofs)`.
     pub(crate) aggregated_payloads:
         &'a HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)>,
-    /// Per-validator latest head votes that the CHAIN already carries.
+    /// The last [`HEAD_VOTE_WINDOW_BLOCKS`] blocks of the branch this block
+    /// extends, and the votes they carry.
     ///
     /// Deliberately not the votes fork choice holds: that map advances in
     /// lockstep with the pool these entries come from, so every entry would
-    /// score zero new head voters. See `ForkChoiceState::on_chain_votes`.
+    /// score zero new head voters. And deliberately branch-relative: a
+    /// per-validator map fed by every block import cannot tell a vote our
+    /// branch carries from one only an abandoned sibling carried. See
+    /// [`ethlambda_storage::HeadVoteWindow`].
     ///
-    /// Owned because `Store::extract_on_chain_votes` already returns
-    /// a clone, and the projection mutates it as entries are selected.
-    pub(crate) latest_head_votes: HashMap<u64, AttestationData>,
+    /// Owned because `Store::extract_head_vote_window` already returns a fresh
+    /// value, and the projection mutates it as entries are selected.
+    pub(crate) head_window: HeadVoteWindow,
 }
 
 /// Static inputs to the attestation selection scan: the candidate pool and
@@ -403,29 +427,25 @@ pub(crate) struct ProjectedState {
     pub(crate) justified_slots: JustifiedSlots,
     pub(crate) finalized_slot: u64,
     pub(crate) current_votes: HashMap<H256, HashSet<u64>>,
-    /// Each validator's latest head vote that the CHAIN already carries,
-    /// advanced as entries are selected so a validator is not credited twice
-    /// across rounds.
+    /// The window of recent blocks on the branch being extended, with its
+    /// `votes` advanced as entries are selected so a validator is not credited
+    /// twice across rounds.
     ///
-    /// `None` turns head-vote scoring off entirely, which is not the same as
-    /// seeding an empty map: with no recorded vote every validator in an
-    /// entry's coverage reads as newly covered, so an empty map scores every
-    /// entry as maximally valuable.
+    /// `None` turns head-vote scoring off entirely. It is not the same as a
+    /// window with an empty `votes`, which says "these blocks are in play and
+    /// carried nothing", and under which every validator in an entry's
+    /// coverage reads as newly covered.
     ///
-    /// An empty map is a real state here, and it no longer means what it meant
-    /// when this was seeded from fork choice: a node that has just resumed
-    /// holds a full set of gossip-learned votes within a slot while it has
-    /// still seen no block, so `on_chain_votes` is empty and every entry scores
-    /// its whole coverage. That errs toward packing more rather than less, it
-    /// is capped by `max_attestations_per_block`, and it resolves on the first
-    /// import that carries attestations. What it must NOT be is a stand-in for
-    /// "not scoring head votes here", which is what `None` is for.
+    /// A window with empty `roots` is the other real state, and it also scores
+    /// every entry at zero on this axis: nothing is in play, so nothing can be
+    /// advanced. That is what a node resumed from an anchor whose header the
+    /// store does not hold sees, and it resolves on the first import.
     ///
     /// Both production callers seed it. It stays optional because the scoring
     /// tests construct projections directly, and because a caller that only
     /// wants justification scoring should have to say so rather than pass an
-    /// empty map and get the opposite.
-    pub(crate) head_votes: Option<HashMap<u64, AttestationData>>,
+    /// empty window and rely on it meaning the same thing.
+    pub(crate) head_window: Option<HeadVoteWindow>,
 }
 
 impl ProjectedState {
@@ -437,19 +457,19 @@ impl ProjectedState {
             justified_slots: head_state.justified_slots.clone(),
             finalized_slot: head_state.latest_finalized.slot,
             current_votes: build_running_votes(head_state),
-            head_votes: None,
+            head_window: None,
         }
     }
 
-    /// Seed the per-validator latest head votes, so scoring can value an
-    /// entry for the fork-choice weight it adds and not only for the
-    /// justification voters it brings.
+    /// Seed the head-vote window, so scoring can value an entry for the
+    /// fork-choice weight it adds and not only for the justification voters it
+    /// brings.
     ///
-    /// Takes the map by value: `Store::extract_on_chain_votes`
-    /// already hands out an owned clone, so there is nothing to gain by
-    /// borrowing it and the projection then owns what it mutates.
-    pub(crate) fn with_head_votes(mut self, head_votes: HashMap<u64, AttestationData>) -> Self {
-        self.head_votes = Some(head_votes);
+    /// Takes the window by value: `Store::extract_head_vote_window` already
+    /// hands out an owned value, so there is nothing to gain by borrowing it
+    /// and the projection then owns what it mutates.
+    pub(crate) fn with_head_window(mut self, head_window: HeadVoteWindow) -> Self {
+        self.head_window = Some(head_window);
         self
     }
 
@@ -507,21 +527,14 @@ impl ProjectedState {
         att_data: &AttestationData,
         new_head_voters: impl IntoIterator<Item = u64>,
     ) {
-        let Some(head_votes) = self.head_votes.as_mut() else {
+        let Some(head_window) = self.head_window.as_mut() else {
             return;
         };
         for validator_id in new_head_voters {
-            head_votes.insert(validator_id, att_data.clone());
+            head_window.votes.insert(validator_id, att_data.clone());
         }
     }
 
-    /// The subset of `coverage` whose latest head vote this entry would
-    /// replace, per the LMD-GHOST latest-message rule
-    /// ([`AttestationData::supersedes`]).
-    ///
-    /// Measured against the votes the CHAIN already carries, so a validator
-    /// with no entry counts as new: no block has carried a vote for it, so this
-    /// entry is the first weight it would contribute on chain.
     /// Whether applying this entry puts 2/3 of the validator set's latest head
     /// votes on `att_data.head.root`.
     ///
@@ -529,6 +542,15 @@ impl ProjectedState {
     /// the same way: over the projected POST-state, not the delta. A validator
     /// counts when the entry moves it onto this head, or when it already names
     /// this head and the entry does not move it elsewhere.
+    ///
+    /// Both halves of that count come from the same branch-relative window, so
+    /// the post-state this measures is the one the block being built would
+    /// actually produce. A per-validator map fed by every block import would
+    /// break the second half in the direction that matters: it would retain
+    /// validators whose vote only a sibling branch carried, letting an entry
+    /// that moves one head claim a threshold this branch is nowhere near and
+    /// outrank, at [`Tier::TargetAdvance`], entries bringing real justification
+    /// voters.
     ///
     /// `None` head votes means the axis is switched off, so no supermajority
     /// can be claimed.
@@ -538,12 +560,13 @@ impl ProjectedState {
         new_head_voters: &HashSet<u64>,
         validator_count: usize,
     ) -> bool {
-        let Some(head_votes) = self.head_votes.as_ref() else {
+        let Some(head_window) = self.head_window.as_ref() else {
             return false;
         };
         let head_root = att_data.head.root;
         // Everyone this entry moves lands on `head_root` by construction.
-        let retained = head_votes
+        let retained = head_window
+            .votes
             .iter()
             .filter(|(vid, vote)| vote.head.root == head_root && !new_head_voters.contains(vid))
             .count();
@@ -555,22 +578,34 @@ impl ProjectedState {
     /// replace, per the LMD-GHOST latest-message rule
     /// ([`AttestationData::supersedes`]).
     ///
-    /// Measured against the votes the CHAIN already carries, so a validator
-    /// with no entry counts as new: no block has carried a vote for it, so this
-    /// entry is the first weight it would contribute on chain.
+    /// Empty unless this entry names a head still inside the window. A head
+    /// older than that is not in play: the block it names already sits under a
+    /// window's worth of descendants on this branch, so weight added there
+    /// moves no decision a proposer can influence, and crediting it would let
+    /// a vote be packed again every time the block that carried it aged out of
+    /// `HeadVoteWindow::votes`.
+    ///
+    /// Within the window, measured against the votes those blocks carry, so a
+    /// validator with no entry counts as new: no block in the window has
+    /// carried a vote for it, so this entry is the first weight it would
+    /// contribute here.
     pub(crate) fn new_head_voters(
         &self,
         att_data: &AttestationData,
         coverage: &HashSet<u64>,
     ) -> HashSet<u64> {
-        let Some(head_votes) = self.head_votes.as_ref() else {
+        let Some(head_window) = self.head_window.as_ref() else {
             return HashSet::new();
         };
+        if !head_window.roots.contains(&att_data.head.root) {
+            return HashSet::new();
+        }
         coverage
             .iter()
             .copied()
             .filter(|vid| {
-                head_votes
+                head_window
+                    .votes
                     .get(vid)
                     .is_none_or(|existing| att_data.supersedes(existing))
             })
@@ -1353,6 +1388,21 @@ mod tests {
         }
     }
 
+    /// A head-vote window over `roots` carrying `votes`.
+    ///
+    /// Scoring credits an entry only when its head is one of `roots`, so a
+    /// test that wants the votes to decide has to put the entry's head in
+    /// play. Tests of the in-play gate itself leave it out on purpose.
+    fn window(roots: &[H256], votes: &[(u64, AttestationData)]) -> HeadVoteWindow {
+        HeadVoteWindow {
+            roots: roots.iter().copied().collect(),
+            votes: votes.iter().cloned().collect(),
+        }
+    }
+
+    /// The head root every `make_att_data` entry votes for.
+    const DEFAULT_HEAD: H256 = H256::ZERO;
+
     fn make_bits(indices: &[usize]) -> AggregationBits {
         let max = indices.iter().copied().max().unwrap_or(0);
         let mut bits = AggregationBits::with_length(max + 1).unwrap();
@@ -1395,7 +1445,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: FINALIZED_SLOT,
             current_votes: HashMap::new(),
-            head_votes: None,
+            head_window: None,
         };
 
         let (score, _, _) = projected
@@ -1412,18 +1462,19 @@ mod tests {
     /// An entry scored against a projection whose head votes were never seeded
     /// must report zero new head voters.
     ///
-    /// `None` must mean "do not score head votes", not "an empty map": with no
-    /// recorded vote every validator in coverage reads as newly covered, so an
-    /// empty map scores every entry as maximally valuable and `score_entry`
-    /// stops returning `None`. A caller wanting justification-only scoring has
-    /// to be able to say so without accidentally getting the opposite.
+    /// `None` must mean "do not score head votes", not "a window carrying no
+    /// votes": in a window with no recorded vote every validator in coverage
+    /// reads as newly covered, so such a window scores every entry as maximally
+    /// valuable and `score_entry` stops returning `None`. A caller wanting
+    /// justification-only scoring has to be able to say so without accidentally
+    /// getting the opposite.
     #[test]
-    fn head_vote_scoring_is_off_when_the_map_is_not_seeded() {
+    fn head_vote_scoring_is_off_when_the_window_is_not_seeded() {
         let projected = ProjectedState {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::from([(H256::ZERO, HashSet::from([0, 1, 2]))]),
-            head_votes: None,
+            head_window: None,
         };
         let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
 
@@ -1462,11 +1513,14 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::from([(att_data.target.root, coverage.clone())]),
-            head_votes: Some(HashMap::from([
-                (0, make_att_data(4)),
-                (1, make_att_data(4)),
-                (2, make_att_data(4)),
-            ])),
+            head_window: Some(window(
+                &[att_data.head.root],
+                &[
+                    (0, make_att_data(4)),
+                    (1, make_att_data(4)),
+                    (2, make_att_data(4)),
+                ],
+            )),
         };
 
         let (score, new_voters, new_head_voters) = projected
@@ -1491,6 +1545,117 @@ mod tests {
         );
     }
 
+    /// A head that has aged out of the window is not in play: this branch has
+    /// built a window's worth of blocks past it, so weight added there moves no
+    /// decision the proposer can influence.
+    ///
+    /// This is also what closes the re-pack cycle. `HeadVoteWindow::votes`
+    /// reaches back only as far as `roots` does, so once the block that carried
+    /// a vote falls out of the window the vote reads as new again; without the
+    /// `roots` gate a settled-target entry would be packable once per window,
+    /// indefinitely, for weight nobody is contesting.
+    #[test]
+    fn score_entry_ignores_a_head_that_has_aged_out_of_the_window() {
+        let att_data = AttestationData {
+            slot: 9,
+            head: Checkpoint {
+                slot: 8,
+                root: H256([8u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 6,
+                root: H256([6u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+        };
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        // Target fully covered, so the entry lives or dies on its head votes.
+        let current_votes = HashMap::from([(att_data.target.root, coverage.clone())]);
+
+        let in_play = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: current_votes.clone(),
+            head_window: Some(window(&[att_data.head.root], &[])),
+        };
+        let (_, _, new_head_voters) = in_play
+            .score_entry(&att_data, &coverage, 4)
+            .expect("a head still in play carries value");
+        assert_eq!(new_head_voters.len(), 3);
+
+        // The same entry against the same (empty) votes. Only `roots` moved on.
+        let aged_out = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes,
+            head_window: Some(window(&[H256([9u8; 32]), H256([10u8; 32])], &[])),
+        };
+        assert!(
+            aged_out.new_head_voters(&att_data, &coverage).is_empty(),
+            "a head behind the window scores nothing, however novel its votes \
+             look against what the window carries"
+        );
+        assert!(
+            aged_out.score_entry(&att_data, &coverage, 4).is_none(),
+            "and with its target settled too, the entry is worth nothing at all"
+        );
+    }
+
+    /// Nor can an aged-out head reach `TargetAdvance`, however much weight the
+    /// window already shows sitting on it. `advances_head` requires the entry
+    /// to move somebody, and behind the window it moves nobody.
+    ///
+    /// The tier matters more than the count: `TargetAdvance` outranks every
+    /// `Build` entry, so a stale head claiming it would displace entries
+    /// bringing real justification voters from a block that carries three.
+    #[test]
+    fn an_aged_out_head_cannot_claim_target_advance() {
+        const NUM_VALIDATORS: usize = 10;
+
+        let att_data = AttestationData {
+            slot: 9,
+            head: Checkpoint {
+                slot: 8,
+                root: H256([8u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 6,
+                root: H256([6u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+        };
+        // 8 of 10 validators already name this head, which would be a
+        // supermajority if the head were still in play.
+        let settled: Vec<(u64, AttestationData)> =
+            (0..8).map(|vid| (vid, att_data.clone())).collect();
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_window: Some(window(&[H256([9u8; 32])], &settled)),
+        };
+        let coverage: HashSet<u64> = HashSet::from([8]);
+
+        let (score, new_voters, new_head_voters) = projected
+            .score_entry(&att_data, &coverage, NUM_VALIDATORS)
+            .expect("it still brings a justification voter");
+
+        assert_eq!(new_voters.len(), 1);
+        assert!(new_head_voters.is_empty());
+        assert_eq!(score.new_head_voters, 0);
+        assert_eq!(
+            score.tier,
+            Tier::Build,
+            "a head nobody is contesting cannot be advanced"
+        );
+    }
+
     /// Worthless on both axes: already counted for the target, and every voter
     /// already holds a newer head vote.
     #[test]
@@ -1500,18 +1665,23 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::from([(H256::ZERO, coverage.clone())]),
-            head_votes: Some(HashMap::from([
-                (0, make_att_data(9)),
-                (1, make_att_data(9)),
-                (2, make_att_data(9)),
-            ])),
+            // The head IS in play, so the entry is dropped for its votes
+            // rather than for naming a head nobody is contesting.
+            head_window: Some(window(
+                &[DEFAULT_HEAD],
+                &[
+                    (0, make_att_data(9)),
+                    (1, make_att_data(9)),
+                    (2, make_att_data(9)),
+                ],
+            )),
         };
 
         assert!(
             projected
                 .score_entry(&make_att_data(5), &coverage, 4)
                 .is_none(),
-            "a vote older than what fork choice already holds adds nothing"
+            "a vote older than what this branch already carries adds nothing"
         );
     }
 
@@ -1523,7 +1693,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
-            head_votes: Some(HashMap::new()),
+            head_window: Some(window(&[DEFAULT_HEAD], &[])),
         };
         let coverage: HashSet<u64> = HashSet::from([0, 1]);
         let first = make_att_data(5);
@@ -1586,7 +1756,7 @@ mod tests {
             // target's tally. Without the settled-target guard the whole
             // coverage would read as new.
             current_votes: HashMap::new(),
-            head_votes: Some(HashMap::new()),
+            head_window: Some(window(&[att_data.head.root], &[])),
         };
 
         let (score, new_voters, new_head_voters) = projected
@@ -1646,7 +1816,7 @@ mod tests {
             justified_slots,
             finalized_slot: FINALIZED_SLOT,
             current_votes: HashMap::new(),
-            head_votes: None,
+            head_window: None,
         };
         let known: HashSet<H256> = roots.iter().copied().collect();
 
@@ -1673,7 +1843,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::from([(att_data.target.root, coverage.clone())]),
-            head_votes: Some(HashMap::from([(0, make_att_data(4))])),
+            head_window: Some(window(&[att_data.head.root], &[(0, make_att_data(4))])),
         };
 
         let (score, _, new_head_voters) = projected
@@ -1715,11 +1885,14 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
-            head_votes: Some(HashMap::from([
-                (0, att_data.clone()),
-                (1, att_data.clone()),
-                (2, att_data.clone()),
-            ])),
+            head_window: Some(window(
+                &[att_data.head.root],
+                &[
+                    (0, att_data.clone()),
+                    (1, att_data.clone()),
+                    (2, att_data.clone()),
+                ],
+            )),
         };
 
         let (score, _, new_head_voters) = projected
@@ -2016,7 +2189,7 @@ mod tests {
             ProposalInputs {
                 known_block_roots: &known_block_roots,
                 aggregated_payloads: &aggregated_payloads,
-                latest_head_votes: HashMap::new(),
+                head_window: HeadVoteWindow::default(),
             },
             ProposerConfig {
                 enable_proposer_aggregation: true,
@@ -2170,7 +2343,7 @@ mod tests {
                 ProposalInputs {
                     known_block_roots: &known_block_roots,
                     aggregated_payloads: &aggregated_payloads,
-                    latest_head_votes: HashMap::new(),
+                    head_window: HeadVoteWindow::default(),
                 },
                 ProposerConfig {
                     enable_proposer_aggregation: false,
@@ -2299,7 +2472,7 @@ mod tests {
             ProposalInputs {
                 known_block_roots: &known_block_roots,
                 aggregated_payloads: &aggregated_payloads,
-                latest_head_votes: HashMap::new(),
+                head_window: HeadVoteWindow::default(),
             },
             ProposerConfig {
                 enable_proposer_aggregation: false,
@@ -2608,7 +2781,7 @@ mod tests {
             ProposalInputs {
                 known_block_roots: &known_block_roots,
                 aggregated_payloads: &aggregated_payloads,
-                latest_head_votes: HashMap::new(),
+                head_window: HeadVoteWindow::default(),
             },
             ProposerConfig {
                 enable_proposer_aggregation: true,
@@ -2747,7 +2920,7 @@ mod tests {
             ProposalInputs {
                 known_block_roots: &known_block_roots,
                 aggregated_payloads: &aggregated_payloads,
-                latest_head_votes: HashMap::new(),
+                head_window: HeadVoteWindow::default(),
             },
             ProposerConfig {
                 enable_proposer_aggregation: true,

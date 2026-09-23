@@ -19,7 +19,9 @@ use tracing::{info, trace, warn};
 
 use crate::{
     GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT, MAX_ATTESTATIONS_DATA, SlotInterval,
-    block_builder::{PostBlockCheckpoints, ProposalInputs, ProposerConfig, build_block},
+    block_builder::{
+        HEAD_VOTE_WINDOW_BLOCKS, PostBlockCheckpoints, ProposalInputs, ProposerConfig, build_block,
+    },
     body_proof::{self, BodyProofBuffer, ChosenBody},
     metrics,
 };
@@ -969,11 +971,14 @@ pub(crate) fn produce_block_from_candidates(
         });
     }
 
-    // What the CHAIN carries. By the time this runs at interval 0, the
-    // slot's aggregates have already been promoted into the seen-votes map, so
-    // that map holds the very `AttestationData` these candidate bodies carry
-    // and would score every one of them at zero.
-    let latest_head_votes = store.extract_on_chain_votes();
+    // What the branch we are extending carries. By the time this runs at
+    // interval 0, the slot's aggregates have already been promoted into the
+    // seen-votes map, so that map holds the very `AttestationData` these
+    // candidate bodies carry and would score every one of them at zero. Read
+    // from `head_root` rather than kept as a running map, because a map fed by
+    // every block import cannot tell a vote this branch carries from one a
+    // sibling we abandoned carried.
+    let head_window = store.extract_head_vote_window(head_root, HEAD_VOTE_WINDOW_BLOCKS);
 
     body_proof::choose_body(
         &head_state,
@@ -981,7 +986,7 @@ pub(crate) fn produce_block_from_candidates(
         validator_index,
         head_root,
         candidates,
-        &latest_head_votes,
+        &head_window,
     )
 }
 
@@ -1025,19 +1030,22 @@ pub fn produce_block_with_signatures(
 
     let known_block_roots = store.get_block_roots().unwrap();
 
-    // The latest vote per validator the CHAIN already carries, so selection can
-    // value an entry for the head weight it would ADD and not only for the
-    // justification voters it brings.
+    // The recent blocks of the branch we are extending and the votes they
+    // carry, so selection can value an entry for the head weight it would ADD
+    // and not only for the justification voters it brings.
     //
     // Deliberately not `extract_latest_known_attestations`: that map is written
     // in lockstep with the aggregated-payload pool this block is built from, so
     // every entry would score zero new head voters and the axis would be dead.
-    let latest_head_votes = store.extract_on_chain_votes();
+    // And read from `head_root` rather than kept as a running map, because a
+    // map fed by every block import cannot tell a vote this branch carries from
+    // one a sibling we abandoned carried.
+    let head_window = store.extract_head_vote_window(head_root, HEAD_VOTE_WINDOW_BLOCKS);
 
     let inputs = ProposalInputs {
         known_block_roots: &known_block_roots,
         aggregated_payloads: &aggregated_payloads,
-        latest_head_votes,
+        head_window,
     };
 
     let (block, signatures, post_checkpoints) = {

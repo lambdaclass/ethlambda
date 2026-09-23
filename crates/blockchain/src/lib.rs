@@ -1102,11 +1102,13 @@ impl BlockChainServer {
         // Must be the same baseline selection uses. Against the seen-votes
         // map every candidate scores zero on both axes, so this would drop the
         // whole ring on precisely the slots the head-vote axis exists to serve.
-        let latest_head_votes = self.store.extract_on_chain_votes();
+        let head_window = self
+            .store
+            .extract_head_vote_window(head_root, block_builder::HEAD_VOTE_WINDOW_BLOCKS);
 
         let dropped = self
             .body_proof_candidates
-            .prune_scoreless(&head_state, &latest_head_votes);
+            .prune_scoreless(&head_state, &head_window);
         if dropped > 0 {
             info!(
                 dropped,

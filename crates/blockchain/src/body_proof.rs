@@ -14,14 +14,14 @@
 //! from gossip, and [`choose_body`] is how the slot's proposer picks one — or
 //! decides an empty body is worth more.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use ethlambda_crypto::SignerSet;
 use ethlambda_crypto::signature::ValidatorPublicKey;
 use ethlambda_state_transition::attestation_data_matches_chain;
-use ethlambda_storage::Store;
+use ethlambda_storage::{HeadVoteWindow, Store};
 use ethlambda_types::{
-    attestation::{AttestationData, validator_indices},
+    attestation::validator_indices,
     block::{
         AggregatedAttestations, Block, BlockBody, BlockBodyProof, ByteList512KiB,
         MultiMessageAggregate, MultiMessageAggregateError, SingleMessageAggregate,
@@ -69,10 +69,13 @@ pub(crate) fn build_body_proof(
     let inputs = block_builder::ProposalInputs {
         known_block_roots: &known_block_roots,
         aggregated_payloads: &aggregated_payloads,
-        // What the CHAIN carries, not what this node has seen: the pool this
-        // body is built from and the seen-votes map advance together, so
-        // scoring against the latter reports zero for every candidate.
-        latest_head_votes: store.extract_on_chain_votes(),
+        // What the head's own branch carries, not what this node has seen: the
+        // pool this body is built from and the seen-votes map advance together,
+        // so scoring against the latter reports zero for every candidate. Read
+        // from `parent_root` rather than from a running import-fed map, so a
+        // branch this node abandoned cannot suppress work on the one it kept.
+        head_window: store
+            .extract_head_vote_window(parent_root, block_builder::HEAD_VOTE_WINDOW_BLOCKS),
     };
 
     let (attestations, aggregates) =
@@ -274,7 +277,7 @@ pub(crate) fn choose_body(
     proposer_index: u64,
     parent_root: H256,
     candidates: &BodyProofBuffer,
-    latest_head_votes: &HashMap<u64, AttestationData>,
+    head_window: &HeadVoteWindow,
 ) -> Result<ChosenBody, StoreError> {
     metrics::observe_body_proof_candidates(candidates.len());
 
@@ -310,7 +313,7 @@ pub(crate) fn choose_body(
             metrics::inc_body_proof_rejected("off_chain_vote");
             continue;
         }
-        let voters = count_body_voters(head_state, &body, validator_count, latest_head_votes);
+        let voters = count_body_voters(head_state, &body, validator_count, head_window);
         let sealed = block_builder::seal_block(head_state, slot, proposer_index, parent_root, body);
         let (block, post) = match sealed {
             Ok(sealed) => sealed,
@@ -422,10 +425,10 @@ fn count_body_voters(
     head_state: &State,
     body: &BlockBody,
     validator_count: usize,
-    latest_head_votes: &HashMap<u64, AttestationData>,
+    head_window: &HeadVoteWindow,
 ) -> BodyVoters {
     let mut projected = block_builder::ProjectedState::from_head_state(head_state)
-        .with_head_votes(latest_head_votes.clone());
+        .with_head_window(head_window.clone());
     let mut counts = BodyVoters::default();
 
     for attestation in body.attestations.iter() {
@@ -544,7 +547,7 @@ impl BodyProofBuffer {
     pub(crate) fn prune_scoreless(
         &mut self,
         head_state: &State,
-        latest_head_votes: &HashMap<u64, AttestationData>,
+        head_window: &HeadVoteWindow,
     ) -> usize {
         let validator_count = head_state.validators.len();
         let before = self.candidates.len();
@@ -553,7 +556,7 @@ impl BodyProofBuffer {
                 head_state,
                 &candidate.body_proof.block_body,
                 validator_count,
-                latest_head_votes,
+                head_window,
             )
             .is_scoreless()
         });
@@ -576,6 +579,8 @@ impl BodyProofBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use ethlambda_types::{
         attestation::{AggregatedAttestation, AggregationBits, AttestationData},
@@ -710,14 +715,32 @@ mod tests {
             PROPOSER,
             head_root(),
             candidates,
-            &HashMap::new(),
+            &in_play(head_root()),
         )
         .expect("sealing an empty body always works")
     }
 
-    /// Fork choice's latest-vote map, holding `data` for each of `voters`.
-    fn latest_votes(voters: &[u64], data: &AttestationData) -> HashMap<u64, AttestationData> {
-        voters.iter().map(|v| (*v, data.clone())).collect()
+    /// A head-vote window in which `head` is in play and no block has carried
+    /// a vote yet, which is how the branch looks before any candidate lands.
+    ///
+    /// Scoring credits head votes only for an entry whose head is inside the
+    /// window, so a fixture that wants the votes to decide has to put the
+    /// head there. An empty `HeadVoteWindow::default()` would switch the head
+    /// axis off instead.
+    fn in_play(head: H256) -> HeadVoteWindow {
+        HeadVoteWindow {
+            roots: HashSet::from([head]),
+            votes: HashMap::new(),
+        }
+    }
+
+    /// A head-vote window whose blocks already carry `data` for each of
+    /// `voters`, with `data`'s head in play.
+    fn carried_votes(voters: &[u64], data: &AttestationData) -> HeadVoteWindow {
+        HeadVoteWindow {
+            roots: HashSet::from([data.head.root]),
+            votes: voters.iter().map(|v| (*v, data.clone())).collect(),
+        }
     }
 
     /// A state that already justified [`HEAD_SLOT`], its re-derived parent
@@ -826,7 +849,7 @@ mod tests {
             &state,
             &body,
             NUM_VALIDATORS,
-            &latest_votes(&[0, 1], &vote.data),
+            &carried_votes(&[0, 1], &vote.data),
         );
 
         assert_eq!(
@@ -851,7 +874,7 @@ mod tests {
             PROPOSER,
             parent_root,
             &candidates,
-            &HashMap::new(),
+            &in_play(parent_root),
         )
         .expect("sealing an empty body always works");
 
@@ -861,12 +884,12 @@ mod tests {
         );
     }
 
-    /// Once fork choice already holds those very votes — which is what a block
-    /// import does — the body adds nothing on either axis and loses to empty.
+    /// Once a block on this branch already carries those very votes, the body
+    /// adds nothing on either axis and loses to empty.
     #[test]
     fn choose_body_ignores_a_candidate_stale_on_both_axes() {
         let (state, parent_root, vote) = already_justified_fixture();
-        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let already_seen = carried_votes(&[0, 1], &vote.data);
         let mut candidates = BodyProofBuffer::default();
         candidates.push_local(candidate(vec![vote]));
 
@@ -889,7 +912,7 @@ mod tests {
     #[test]
     fn prune_scoreless_drops_a_candidate_that_adds_nothing() {
         let (state, _parent_root, vote) = already_justified_fixture();
-        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let already_seen = carried_votes(&[0, 1], &vote.data);
         let mut buffer = BodyProofBuffer::default();
         buffer.push_local(candidate(vec![vote]));
 
@@ -899,14 +922,14 @@ mod tests {
 
     #[test]
     fn prune_scoreless_keeps_a_candidate_whose_head_votes_are_new() {
-        let (state, _parent_root, vote) = already_justified_fixture();
+        let (state, parent_root, vote) = already_justified_fixture();
         let mut buffer = BodyProofBuffer::default();
         buffer.push_local(candidate(vec![vote]));
 
         assert_eq!(
-            buffer.prune_scoreless(&state, &HashMap::new()),
+            buffer.prune_scoreless(&state, &in_play(parent_root)),
             0,
-            "votes fork choice has not seen are still worth keeping"
+            "votes this branch does not carry yet are still worth keeping"
         );
         assert_eq!(buffer.len(), 1);
     }
@@ -916,7 +939,7 @@ mod tests {
     #[test]
     fn prune_scoreless_empties_a_full_ring_of_stale_candidates() {
         let (state, _parent_root, vote) = already_justified_fixture();
-        let already_seen = latest_votes(&[0, 1], &vote.data);
+        let already_seen = carried_votes(&[0, 1], &vote.data);
         let mut buffer = BodyProofBuffer::default();
         for _ in 0..MAX_BODY_PROOF_CANDIDATES {
             buffer.push_local(candidate(vec![vote.clone()]));

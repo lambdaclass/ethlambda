@@ -642,9 +642,10 @@ fn select_best_job(
     // existing blocks (head.slot / target.slot <= head_slot), so no
     // empty-slot padding beyond the tip is needed.
     let known_block_roots = store.get_block_roots().expect("block roots read works");
+    let head_root = store.head().expect("head read works");
     let mut extended_historical_block_hashes: Vec<H256> =
         head_state.historical_block_hashes.iter().copied().collect();
-    extended_historical_block_hashes.push(store.head().expect("head read works"));
+    extended_historical_block_hashes.push(head_root);
 
     // Seed the head votes too, not just the justification projection. Since a
     // vote for an already-justified target is no longer filtered out, its only
@@ -653,13 +654,17 @@ fn select_best_job(
     // of them, leaving the pool empty exactly on the slots where every pooled
     // vote names a settled target, which is the case this is meant to cover.
     //
-    // The baseline is what the CHAIN carries, not what this node has seen.
-    // Every aggregate this worker produces is applied back into the pool and
-    // the fork-choice vote map together (`apply_aggregated_group` on the actor
-    // thread, then the next promote moves both new->known), so scoring against
-    // the seen-votes map would report zero for the very groups just proved.
-    let projected = block_builder::ProjectedState::from_head_state(&head_state)
-        .with_head_votes(store.extract_on_chain_votes());
+    // The baseline is what the head's own branch carries, not what this node
+    // has seen. Every aggregate this worker produces is applied back into the
+    // pool and the fork-choice vote map together (`apply_aggregated_group` on
+    // the actor thread, then the next promote moves both new->known), so
+    // scoring against the seen-votes map would report zero for the very groups
+    // just proved. Reading from `head_root` rather than from a running
+    // import-fed map is what keeps a branch this node abandoned from
+    // suppressing work on the one it kept.
+    let projected = block_builder::ProjectedState::from_head_state(&head_state).with_head_window(
+        store.extract_head_vote_window(head_root, block_builder::HEAD_VOTE_WINDOW_BLOCKS),
+    );
 
     // One round: the store is re-read before the next job, so a same-target
     // candidate re-tiers against the aggregate this one produced (once
@@ -826,7 +831,7 @@ fn pick_best_candidate(
         }
 
         // Head votes ARE scored here: the projection above is seeded from
-        // `extract_on_chain_votes`. So this skip now means "adds nothing on
+        // `extract_head_vote_window`. So this skip now means "adds nothing on
         // EITHER axis" rather than "adds no justification voters", and a group
         // whose target is already settled survives on its head votes alone.
         let Some((score, _new_voters, new_head_voters)) =
@@ -1783,6 +1788,15 @@ mod tests {
         }
     }
 
+    /// The branch baseline `snapshot_aggregation_inputs` scores against, read
+    /// the same way the call site reads it.
+    fn head_window(store: &Store) -> ethlambda_storage::HeadVoteWindow {
+        store.extract_head_vote_window(
+            store.head().expect("head root"),
+            block_builder::HEAD_VOTE_WINDOW_BLOCKS,
+        )
+    }
+
     fn new_test_store(head_state: State) -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
         Store::from_anchor_state(backend, head_state, DEFAULT_MILLISECONDS_PER_SLOT)
@@ -2488,7 +2502,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
-            head_votes: None,
+            head_window: None,
         };
 
         let (picked_root, score, _head_voters) = pick_best_candidate(
@@ -2581,7 +2595,7 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
-            head_votes: None,
+            head_window: None,
         };
 
         // Round 1: A (6 new voters) outranks B (2 new voters); both Build tier.
@@ -2722,19 +2736,20 @@ mod tests {
     /// Regression guard for the CALL SITE, not the accessor.
     ///
     /// `snapshot_aggregation_inputs` must score head votes against the votes
-    /// the CHAIN carries (`extract_on_chain_votes`), never against the votes
-    /// this node has merely seen (`extract_latest_known_attestations`). The two
-    /// look interchangeable and both compile, but the seen-votes map advances
-    /// in lockstep with the very pool these jobs are selected from
-    /// (`insert_new_aggregated_payload` writes `new_votes` + `new_payloads`,
-    /// then `promote_new_aggregated_payloads` drains both into their `known`
+    /// the head's own branch carries (`extract_head_vote_window`), never
+    /// against the votes this node has merely seen
+    /// (`extract_latest_known_attestations`). The two look interchangeable and
+    /// both compile, but the seen-votes map advances in lockstep with the very
+    /// pool these jobs are selected from (`insert_new_aggregated_payload`
+    /// writes `new_votes` + `new_payloads`, then
+    /// `promote_new_aggregated_payloads` drains both into their `known`
     /// counterparts), so scoring against it reports zero for every group and
     /// silently kills the whole head-vote axis. That shipped twice.
     ///
     /// So: promote a payload for this exact attestation, which populates
-    /// `known_votes` while leaving `on_chain_votes` empty. A job must still be
-    /// selected. Swapping the call site back to the seen-votes map makes this
-    /// assertion fail, which is the entire point of the test.
+    /// `known_votes` while leaving the branch baseline empty. A job must still
+    /// be selected. Swapping the call site back to the seen-votes map makes
+    /// this assertion fail, which is the entire point of the test.
     #[test]
     fn snapshot_scores_head_votes_against_the_chain_not_against_seen_votes() {
         const NUM_VALIDATORS: usize = 10;
@@ -2758,6 +2773,10 @@ mod tests {
             FINALIZED_SLOT,
             TARGET_SLOT,
         );
+        // The votes below name `hashes[0]` as their head, so that block has to
+        // sit inside the head-vote window: an entry whose head has aged out of
+        // it scores zero on this axis by design.
+        head_state.latest_block_header.parent_root = hashes[0];
         let mut store = new_test_store(head_state);
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
 
@@ -2781,7 +2800,7 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 1, dummy_sig());
 
         // Put this very vote into the SEEN map, the way the worker's own output
-        // lands there, while leaving the on-chain map untouched.
+        // lands there, while leaving the branch baseline untouched.
         let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
         bits.set(0, true).unwrap();
         bits.set(1, true).unwrap();
@@ -2792,8 +2811,9 @@ mod tests {
             "fixture must actually populate the seen-votes map"
         );
         assert!(
-            store.extract_on_chain_votes().is_empty(),
-            "fixture must leave the on-chain map empty: no block carried this"
+            head_window(&store).votes.is_empty(),
+            "fixture must leave the branch baseline empty: no block on this \
+             branch carried the vote"
         );
 
         assert!(
@@ -2804,13 +2824,18 @@ mod tests {
     }
 
     /// The suppression direction, which the other tests never exercise: once a
-    /// block HAS carried the vote, the group is worth nothing on either axis
-    /// and must not become a job.
+    /// block ON THIS BRANCH has carried the vote, the group is worth nothing on
+    /// either axis and must not become a job.
     ///
     /// Without this, "always selects" and "correctly selects" look identical:
-    /// an empty on-chain baseline makes every group score its full coverage, so
-    /// a test that only ever asserts `is_some()` passes even if the baseline is
+    /// an empty baseline makes every group score its full coverage, so a test
+    /// that only ever asserts `is_some()` passes even if the baseline is
     /// ignored outright.
+    ///
+    /// The carrier is the head block's parent rather than a loose sibling,
+    /// which is the whole point of a branch-relative baseline: a block the head
+    /// does not descend from must NOT suppress anything (covered at the
+    /// accessor by `head_window_votes_ignore_a_block_on_an_abandoned_branch`).
     #[test]
     fn select_skips_a_group_whose_vote_the_chain_already_carries() {
         const NUM_VALIDATORS: usize = 10;
@@ -2819,23 +2844,6 @@ mod tests {
         const TARGET_SLOT: u64 = 12;
 
         let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
-        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
-        head_state.latest_finalized = Checkpoint {
-            root: hashes[FINALIZED_SLOT as usize],
-            slot: FINALIZED_SLOT,
-        };
-        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
-            &mut head_state.justified_slots,
-            FINALIZED_SLOT,
-            TARGET_SLOT,
-        );
-        ethlambda_state_transition::justified_slots_ops::set_justified(
-            &mut head_state.justified_slots,
-            FINALIZED_SLOT,
-            TARGET_SLOT,
-        );
-        let mut store = new_test_store(head_state);
-        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
 
         let att_data = AttestationData {
             slot: TARGET_SLOT,
@@ -2852,15 +2860,12 @@ mod tests {
                 slot: 0,
             },
         };
-        let hashed = HashedAttestationData::new(att_data.clone());
-        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
-        store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        // Now put this exact vote ON CHAIN for both participants.
+        // The block that puts this exact vote on chain, for both participants.
         let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
         bits.set(0, true).unwrap();
         bits.set(1, true).unwrap();
-        let block = SignedBlock {
+        let carrier = SignedBlock {
             message: Block {
                 slot: 1,
                 proposer_index: 0,
@@ -2869,7 +2874,7 @@ mod tests {
                 body: BlockBody {
                     attestations: vec![ethlambda_types::attestation::AggregatedAttestation {
                         aggregation_bits: bits,
-                        data: att_data,
+                        data: att_data.clone(),
                     }]
                     .try_into()
                     .unwrap(),
@@ -2877,22 +2882,54 @@ mod tests {
             },
             proof: BlockProof::default(),
         };
-        let block_root = {
+        let carrier_root = {
             use ethlambda_types::primitives::HashTreeRoot as _;
-            block.message.hash_tree_root()
+            carrier.message.hash_tree_root()
         };
+
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        // The head descends from the carrier, and reads back as an empty-bodied
+        // block so the window walk can step through it to reach the carrier.
+        head_state.latest_block_header.parent_root = carrier_root;
+        head_state.latest_block_header.body_root = {
+            use ethlambda_types::primitives::HashTreeRoot as _;
+            BlockBody::default().hash_tree_root()
+        };
+
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
         store
-            .insert_signed_block(block_root, block)
+            .insert_signed_block(carrier_root, carrier)
             .expect("insert block carrying the vote");
+
+        let hashed = HashedAttestationData::new(att_data);
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed, 1, dummy_sig());
+
         assert_eq!(
-            store.extract_on_chain_votes().len(),
+            head_window(&store).votes.len(),
             2,
-            "fixture must actually put the vote on chain"
+            "fixture must actually put the vote on the head's branch"
         );
 
         assert!(
             select_best_job(&store, 999, JobPolicy::Open, vacuous_window_config()).is_none(),
-            "the chain already carries this vote, so it adds nothing on either axis"
+            "this branch already carries the vote, so it adds nothing on either \
+             axis"
         );
     }
 
@@ -2928,6 +2965,10 @@ mod tests {
             FINALIZED_SLOT,
             TARGET_SLOT,
         );
+        // The votes below name `hashes[0]` as their head, so that block has to
+        // sit inside the head-vote window: an entry whose head has aged out of
+        // it scores zero on this axis by design.
+        head_state.latest_block_header.parent_root = hashes[0];
         let mut store = new_test_store(head_state);
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
 
