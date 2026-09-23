@@ -63,7 +63,12 @@ pub(crate) fn build_body_proof(
     let head_state = store
         .get_state(&parent_root)
         .expect("head state read works")?;
-    let aggregated_payloads = store.known_aggregated_payloads();
+    // Both buffers, not just the known one. This runs right after the
+    // head-update promotion, and the aggregate that takes the slot's votes past
+    // 2/3 usually lands in the new buffer a fraction of a second later: packing
+    // from the known buffer alone carried those votes short of the threshold and
+    // justified every target one block late.
+    let aggregated_payloads = store.new_and_known_aggregated_payloads();
     let known_block_roots = store.get_block_roots().expect("block roots read works");
 
     let inputs = block_builder::ProposalInputs {

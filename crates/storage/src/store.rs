@@ -1671,6 +1671,44 @@ impl Store {
             .collect()
     }
 
+    /// Snapshot of the new AND known payloads, merged per data root: the same
+    /// shape as [`Self::known_aggregated_payloads`], with a data root's new
+    /// proofs ahead of its known ones (the priority order
+    /// [`Self::existing_proofs_for_data`] uses).
+    ///
+    /// For building a candidate block body off the promotion grid. The body is
+    /// packed after the head-update promotion, and the aggregate that carries a
+    /// slot's votes past 2/3 routinely lands in the new buffer just after it, so
+    /// reading the known buffer alone would pack the narrower proof that
+    /// preceded it and leave the slot one block short of justification. Every
+    /// proof in either buffer was verified or produced locally before it was
+    /// stored, so the new buffer is as safe to pack as the known one.
+    ///
+    /// A proof can sit in both buffers (the same aggregate received again after
+    /// its first copy was promoted). That is harmless to selection: a duplicate
+    /// adds no coverage, so the greedy pick never takes it.
+    pub fn new_and_known_aggregated_payloads(
+        &self,
+    ) -> HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> {
+        let mut merged: HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> = self
+            .new_payloads
+            .lock()
+            .unwrap()
+            .data
+            .iter()
+            .map(|(root, entry)| (*root, (entry.data.clone(), entry.proofs.clone())))
+            .collect();
+        let known = self.known_payloads.lock().unwrap();
+        for (root, entry) in &known.data {
+            merged
+                .entry(*root)
+                .or_insert_with(|| (entry.data.clone(), Vec::new()))
+                .1
+                .extend(entry.proofs.iter().cloned());
+        }
+        merged
+    }
+
     /// Combined proof count for a data_root across new and known buffers.
     ///
     /// Cheap check (no cloning) to short-circuit before calling the more
@@ -2897,6 +2935,54 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A body built after the promotion must still see what landed in the new
+    /// buffer since: one data root spanning both buffers merges with its new
+    /// proof first, and a root present in only one buffer comes through intact.
+    #[test]
+    fn new_and_known_payloads_merge_both_buffers_new_first() {
+        let mut store = Store::test_store();
+        let shared = make_att_data(1);
+        let known_only = make_att_data(2);
+        let new_only = make_att_data(3);
+
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(shared.clone()),
+            make_proof_for_validator(0),
+        );
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(known_only.clone()),
+            make_proof_for_validator(1),
+        );
+        store.promote_new_aggregated_payloads();
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(shared.clone()),
+            make_proof_for_validators(&[2, 3]),
+        );
+        store.insert_new_aggregated_payload(
+            HashedAttestationData::new(new_only.clone()),
+            make_proof_for_validator(4),
+        );
+
+        let merged = store.new_and_known_aggregated_payloads();
+        assert_eq!(merged.len(), 3);
+
+        let participants = |data: &AttestationData| -> Vec<Vec<u64>> {
+            merged[&data.hash_tree_root()]
+                .1
+                .iter()
+                .map(|proof| proof.participant_indices().collect())
+                .collect()
+        };
+        assert_eq!(participants(&shared), vec![vec![2, 3], vec![0]]);
+        assert_eq!(participants(&known_only), vec![vec![1]]);
+        assert_eq!(participants(&new_only), vec![vec![4]]);
+        assert_eq!(merged[&shared.hash_tree_root()].0, shared);
+
+        // A read, not a promotion: both buffers keep what they held.
+        assert_eq!(store.new_payloads.lock().unwrap().len(), 2);
+        assert_eq!(store.known_payloads.lock().unwrap().len(), 2);
     }
 
     #[test]
