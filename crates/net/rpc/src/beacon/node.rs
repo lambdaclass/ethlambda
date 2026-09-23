@@ -17,7 +17,12 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .route("/eth/v1/node/version", get(move || get_version(version)))
         .route(
             "/eth/v1/node/identity",
-            get(move || get_identity(peer_id.clone())),
+            get(move |identity: Option<Extension<crate::BeaconIdentity>>| {
+                get_identity(
+                    peer_id.clone(),
+                    identity.map(|Extension(identity)| identity),
+                )
+            }),
         )
 }
 
@@ -69,18 +74,21 @@ async fn get_version(version: &'static str) -> Response {
     crate::json_response(serde_json::json!({ "data": { "version": version } }))
 }
 
-async fn get_identity(peer_id: String) -> Response {
-    // `enr` and the two address lists are empty, which is not spec-valid: the
-    // ENR is built for discv5 and owned by the P2P actor, and `BuiltSwarm`
-    // hands `run_node` only a `local_peer_id`. Serving the record means
-    // widening the `ethlambda-p2p` surface and threading it through startup,
-    // which is a change of its own. Recorded in docs/spec_deviations.md.
+/// `GET /eth/v1/node/identity`: the peer id, the node's ENR, and the
+/// multiaddrs it listens on, which is how a peer that reads this endpoint (a
+/// devnet orchestrator wiring bootnodes, say) dials it.
+///
+/// The addresses are only as good as `--discovery.advertise-ip`: without it the
+/// node does not know the address peers reach it on, so the lists are empty and
+/// the ENR carries no IP. `metadata` is still a placeholder.
+async fn get_identity(peer_id: String, identity: Option<crate::BeaconIdentity>) -> Response {
+    let identity = identity.unwrap_or_default();
     crate::json_response(serde_json::json!({
         "data": {
             "peer_id": peer_id,
-            "enr": "",
-            "p2p_addresses": [],
-            "discovery_addresses": [],
+            "enr": identity.enr,
+            "p2p_addresses": identity.p2p_addresses,
+            "discovery_addresses": identity.discovery_addresses,
             "metadata": {
                 "seq_number": "0",
                 "attnets": "0x0000000000000000",
@@ -158,13 +166,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn identity_carries_the_peer_id_and_empty_network_fields() {
+    async fn identity_without_an_identity_carries_the_peer_id_and_empty_network_fields() {
         let json = body_json(get("/eth/v1/node/identity").await).await;
         assert_eq!(json["data"]["peer_id"], "test-peer");
-        // Deliberately empty, and not spec-valid; see docs/spec_deviations.md.
         assert_eq!(json["data"]["enr"], "");
         assert_eq!(json["data"]["p2p_addresses"], serde_json::json!([]));
-        assert_eq!(json["data"]["discovery_addresses"], serde_json::json!([]));
         assert_eq!(json["data"]["metadata"]["seq_number"], "0");
+    }
+
+    #[tokio::test]
+    async fn identity_reports_the_enr_and_listen_addresses() {
+        let fixture = beacon_fixture(ANCHOR_SLOT);
+        let identity = crate::BeaconIdentity {
+            enr: "enr:-abc".to_string(),
+            p2p_addresses: vec!["/ip4/10.0.0.1/tcp/9001/p2p/test-peer".to_string()],
+            discovery_addresses: vec!["/ip4/10.0.0.1/udp/9000/p2p/test-peer".to_string()],
+        };
+        let app = routes("ethlambda/test", "test-peer".into())
+            .with_state(fixture.store)
+            .layer(Extension(identity));
+        let request = Request::builder()
+            .uri("/eth/v1/node/identity")
+            .body(Body::empty())
+            .unwrap();
+        let json = body_json(app.oneshot(request).await.unwrap()).await;
+        assert_eq!(json["data"]["enr"], "enr:-abc");
+        assert_eq!(
+            json["data"]["p2p_addresses"][0],
+            "/ip4/10.0.0.1/tcp/9001/p2p/test-peer"
+        );
+        assert_eq!(
+            json["data"]["discovery_addresses"][0],
+            "/ip4/10.0.0.1/udp/9000/p2p/test-peer"
+        );
     }
 }
