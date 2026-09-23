@@ -157,9 +157,11 @@ unset). A proof outside the window still counts if it partly overlaps, but earns
 for its in-window share, so aggregators with different windows tend to land on different
 children without anyone being excluded from merging.
 
-The width is derived, not chosen: wide enough to hold two proofs at the reach of the
-aggregator's *anchor*, capped at the committee count, so it only widens once a data root's
-proof has actually climbed. The anchor is the largest-coverage proof in the candidate's pool
+The width is derived, not chosen: wide enough to hold `--max-aggregation-children` proofs (two
+by default, a binary merge) at the reach of the aggregator's *anchor*, capped at the committee
+count, so it only widens once a data root's proof has actually climbed. The width scales with
+the fan-in because selection only credits in-window coverage: a window sized for two proofs
+would leave every further child scoring zero. The anchor is the largest-coverage proof in the candidate's pool
 that touches the aggregator's own duty subnet. Picking it by coverage rather than by reach
 keeps a sparse proof, one validator in each of many subnets, from setting the width for
 everybody; requiring it to touch the duty subnet means "no anchor" says "no peer has covered

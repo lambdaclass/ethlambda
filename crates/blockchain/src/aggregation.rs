@@ -339,6 +339,8 @@ pub(crate) struct WorkerConfig {
     /// Whether to sit out candidates whose level another duty subnet owns
     /// this slot. See [`owns_width`].
     pub(crate) skip_redundant_aggregation: bool,
+    /// Most existing proofs one aggregation job may merge.
+    pub(crate) max_aggregation_children: usize,
     /// Body-packing policy, shared with the proposer path.
     pub(crate) proposer_config: ProposerConfig,
 }
@@ -383,9 +385,10 @@ enum WorkerJob {
     BodyProof { slot: u64 },
 }
 
-/// The aggregator's subnet-window duty, as read by [`select_best_job`].
+/// How the aggregator picks children for a job, as read by
+/// [`select_best_job`]: its subnet-window duty and the merge fan-in.
 ///
-/// Grouped rather than passed as three loose arguments, matching
+/// Grouped rather than passed as loose arguments, matching
 /// `BlockChainConfig` and `ProposerConfig`.
 #[derive(Clone, Copy, Debug)]
 pub struct AggregationWindowConfig {
@@ -398,6 +401,9 @@ pub struct AggregationWindowConfig {
     /// this slot, trading coverage overlap for less duplicated prover work.
     /// See [`owns_width`].
     pub skip_redundant: bool,
+    /// Most existing proofs one job may merge (`--max-aggregation-children`).
+    /// See [`DEFAULT_MAX_AGGREGATION_CHILDREN`].
+    pub max_children: usize,
 }
 
 /// What the worker is allowed to pick up, given where the slot is.
@@ -498,7 +504,7 @@ fn window_for_candidate(
         duty_subnet,
         config.committee_count,
     );
-    let width = window_width(reach, config.committee_count);
+    let width = window_width(reach, config.committee_count, config.max_children);
     if config.skip_redundant && !owns_width(duty_subnet, current_slot, width) {
         return None;
     }
@@ -943,6 +949,7 @@ fn resolve_job_with_window_fallback(
         known_proofs,
         validators,
         window,
+        config.max_children,
     );
     if primary.is_some() || config.skip_redundant {
         return primary;
@@ -958,6 +965,7 @@ fn resolve_job_with_window_fallback(
         known_proofs,
         validators,
         &full,
+        config.max_children,
     );
     if recovered.is_some() {
         metrics::inc_aggregation_window_fallback();
@@ -972,7 +980,7 @@ fn resolve_job_with_window_fallback(
 ///    their validator ids.
 /// 2. Runs [`select_proofs_greedily`] seeded with that `covered` set so a
 ///    chosen child only adds coverage beyond the raw sigs; capped at
-///    [`MAX_AGGREGATION_CHILDREN`].
+///    `max_children`.
 /// 3. Trims any raw sig whose validator id ended up in the chosen children's
 ///    participant union. This is not just an efficiency win: `aggregate_mixed`
 ///    must never receive a validator both as a raw participant and inside a
@@ -988,6 +996,7 @@ fn resolve_job(
     known_proofs: &[SingleMessageAggregate],
     validators: &[Validator],
     window: &SubnetWindow,
+    max_children: usize,
 ) -> Option<AggregationJob> {
     let data_root = hashed.root();
     let mut raw_by_id: HashMap<u64, (ValidatorPublicKey, ValidatorSignature)> = HashMap::new();
@@ -1002,7 +1011,8 @@ fn resolve_job(
     }
     let seed_covered: HashSet<u64> = raw_by_id.keys().copied().collect();
 
-    let (child_proofs, _) = select_proofs_greedily(new_proofs, known_proofs, seed_covered, window);
+    let (child_proofs, _) =
+        select_proofs_greedily(new_proofs, known_proofs, seed_covered, window, max_children);
     let (children, accepted_child_ids) = resolve_child_pubkeys(&child_proofs, validators);
     let child_id_set: HashSet<u64> = accepted_child_ids.iter().copied().collect();
 
@@ -1263,11 +1273,15 @@ impl SubnetWindow {
     }
 }
 
-/// The window width for an anchor proof of reach `anchor_reach`.
+/// The window width for an anchor proof of reach `anchor_reach`, for jobs that
+/// merge up to `fan_in` children.
 ///
-/// Wide enough to hold two proofs at the anchor's level, capped at the
+/// Wide enough to hold `fan_in` proofs at the anchor's level, capped at the
 /// committee count, so the window only widens after the pool has actually
-/// climbed. A reach of 0 means no anchor was found, so there is nothing to
+/// climbed. The width has to track the fan-in: selection scores a proof only
+/// for its in-window coverage, so a window sized for two proofs would leave
+/// every child past the second scoring zero, and raising the cap alone would
+/// change nothing. A reach of 0 means no anchor was found, so there is nothing to
 /// merge on our subnet and the window sits at its narrowest, leaving the
 /// aggregator to its own raw signatures. The current slot's own candidate is
 /// the common case of this, since nothing has been published for it yet (see
@@ -1277,11 +1291,13 @@ impl SubnetWindow {
 /// windows nest, so "use the widest window that yields a viable job" would
 /// collapse to the full committee set for every aggregator the first time a
 /// data root is aggregated.
-pub(crate) fn window_width(anchor_reach: u64, committee_count: u64) -> u64 {
+pub(crate) fn window_width(anchor_reach: u64, committee_count: u64, fan_in: usize) -> u64 {
     if committee_count == 0 || anchor_reach == 0 {
         return 1;
     }
-    anchor_reach.saturating_mul(2).min(committee_count)
+    anchor_reach
+        .saturating_mul(fan_in as u64)
+        .min(committee_count)
 }
 
 /// The reach of the proof this aggregator anchors its window on: the
@@ -1369,10 +1385,20 @@ pub(crate) fn owns_width(duty_subnet: u64, slot: u64, width: u64) -> bool {
     duty_subnet % width == slot % width
 }
 
-/// Maximum number of existing proofs reused as children in a single
-/// aggregation job. Recursive aggregation is costly, so we limit the
-/// number of children to avoid unbounded aggregation times.
-const MAX_AGGREGATION_CHILDREN: usize = 2;
+/// Default number of existing proofs reused as children in a single
+/// aggregation job (`--max-aggregation-children`).
+///
+/// Recursive aggregation is costly, and a job's cost grows with its children,
+/// so the default is a binary merge: small, predictable proof times, at the
+/// price of one merge round per doubling of coverage. A wider fan-in reaches
+/// full coverage in fewer rounds but makes each round slower, and it can never
+/// exceed [`ethlambda_crypto::MAX_AGGREGATION_CHILDREN`], leanVM's own limit.
+pub const DEFAULT_MAX_AGGREGATION_CHILDREN: usize = 2;
+
+/// Smallest usable fan-in. A job made only of existing proofs needs at least
+/// two of them (a lone child is already a valid proof), so a limit of one would
+/// stop proofs from ever merging and pin every aggregate at its first width.
+pub const MIN_MAX_AGGREGATION_CHILDREN: usize = 2;
 
 /// Greedy set-cover selection of proofs, scored through the aggregator's
 /// subnet window.
@@ -1393,7 +1419,7 @@ const MAX_AGGREGATION_CHILDREN: usize = 2;
 /// paid again for coverage an earlier one already secured, whichever side of
 /// the window it sits on.
 ///
-/// Caps the number of proofs selected at [`MAX_AGGREGATION_CHILDREN`].
+/// Caps the number of proofs selected at `max_children`.
 ///
 /// Hands back borrows of the input proofs rather than clones: a proof carries
 /// its `ByteList512KiB` bytes, and [`resolve_child_pubkeys`] clones those once
@@ -1405,6 +1431,7 @@ fn select_proofs_greedily<'a>(
     known_proofs: &'a [SingleMessageAggregate],
     seed_covered: HashSet<u64>,
     window: &SubnetWindow,
+    max_children: usize,
 ) -> (Vec<&'a SingleMessageAggregate>, HashSet<u64>) {
     let mut selected: Vec<&'a SingleMessageAggregate> = Vec::new();
     let mut covered: HashSet<u64> = seed_covered;
@@ -1412,7 +1439,7 @@ fn select_proofs_greedily<'a>(
     for proof_set in [new_proofs, known_proofs] {
         let mut remaining: Vec<&SingleMessageAggregate> = proof_set.iter().collect();
 
-        while selected.len() < MAX_AGGREGATION_CHILDREN && !remaining.is_empty() {
+        while selected.len() < max_children && !remaining.is_empty() {
             // A zero-scoring best means nothing left in this set adds
             // in-window coverage, so the set is exhausted.
             let Some((best_idx, _)) = remaining
@@ -1437,7 +1464,7 @@ fn select_proofs_greedily<'a>(
             covered.extend(new_coverage);
         }
 
-        if selected.len() >= MAX_AGGREGATION_CHILDREN {
+        if selected.len() >= max_children {
             break;
         }
     }
@@ -1704,6 +1731,7 @@ fn next_job(
         duty_subnet: config.aggregation_duty_subnet,
         committee_count: config.attestation_committee_count,
         skip_redundant: config.skip_redundant_aggregation,
+        max_children: config.max_aggregation_children,
     };
 
     select_best_job(store, slot, policy, window_config)
@@ -1838,6 +1866,7 @@ mod tests {
             duty_subnet: 0,
             committee_count: 1,
             skip_redundant: false,
+            max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
         }
     }
 
@@ -1880,21 +1909,32 @@ mod tests {
     /// reach, capped at the committee count. An empty pool starts at 1.
     #[test]
     fn window_width_doubles_the_pools_best_reach() {
-        assert_eq!(window_width(0, 4), 1, "empty pool");
-        assert_eq!(window_width(1, 4), 2);
-        assert_eq!(window_width(2, 4), 4);
-        assert_eq!(window_width(4, 4), 4, "capped at the committee count");
+        assert_eq!(window_width(0, 4, 2), 1, "empty pool");
+        assert_eq!(window_width(1, 4, 2), 2);
+        assert_eq!(window_width(2, 4, 2), 4);
+        assert_eq!(window_width(4, 4, 2), 4, "capped at the committee count");
 
         // Non-power-of-two committee counts need no special handling.
-        assert_eq!(window_width(1, 6), 2);
-        assert_eq!(window_width(2, 6), 4);
-        assert_eq!(window_width(4, 6), 6);
-        assert_eq!(window_width(2, 7), 4);
-        assert_eq!(window_width(4, 7), 7);
+        assert_eq!(window_width(1, 6, 2), 2);
+        assert_eq!(window_width(2, 6, 2), 4);
+        assert_eq!(window_width(4, 6, 2), 6);
+        assert_eq!(window_width(2, 7, 2), 4);
+        assert_eq!(window_width(4, 7, 2), 7);
 
         // A single committee pins the width at 1, which is also the whole set.
-        assert_eq!(window_width(0, 1), 1);
-        assert_eq!(window_width(1, 1), 1);
+        assert_eq!(window_width(0, 1, 2), 1);
+        assert_eq!(window_width(1, 1, 2), 1);
+    }
+
+    /// A wider fan-in widens the window with it, or the extra children would
+    /// all sit outside the window and score nothing.
+    #[test]
+    fn window_width_holds_fan_in_proofs_of_the_anchors_reach() {
+        assert_eq!(window_width(1, 8, 4), 4);
+        assert_eq!(window_width(2, 8, 4), 8);
+        assert_eq!(window_width(1, 8, 8), 8, "one round spans every subnet");
+        assert_eq!(window_width(3, 8, 4), 8, "capped at the committee count");
+        assert_eq!(window_width(0, 8, 8), 1, "no anchor still floors at 1");
     }
 
     /// The anchor is the largest-coverage proof touching the duty subnet, so
@@ -1914,6 +1954,7 @@ mod tests {
                     duty_subnet,
                     committee_count: 4,
                     skip_redundant: false,
+                    max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
                 };
                 window_for_candidate(&pool, &[], WINDOW_TEST_SLOT, config)
                     .expect("no rotation without the flag")
@@ -1946,7 +1987,7 @@ mod tests {
             1,
             "the denser proof anchors"
         );
-        assert_eq!(window_width(anchor_reach(&pool, &[], 0, 4), 4), 2);
+        assert_eq!(window_width(anchor_reach(&pool, &[], 0, 4), 4, 2), 2);
 
         // Subnet 1 is only in the sparse proof, so there it does set the width.
         assert_eq!(anchor_reach(&pool, &[], 1, 4), 4);
@@ -1960,7 +2001,7 @@ mod tests {
             SingleMessageAggregate::empty(make_bits(&[1, 5])),
         ];
         assert_eq!(anchor_reach(&pool, &[], 2, 4), 0);
-        assert_eq!(window_width(0, 4), 1, "which floors the window");
+        assert_eq!(window_width(0, 4, 2), 1, "which floors the window");
     }
 
     /// A coverage tie falls to the larger reach, so the width does not depend
@@ -2008,6 +2049,7 @@ mod tests {
                 duty_subnet,
                 committee_count: 3,
                 skip_redundant: true,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             window_for_candidate(&pool, &[], slot, config)
         };
@@ -2086,8 +2128,8 @@ mod tests {
             Some((3, 0)),
             "every non-empty proof anchors, at no reach"
         );
-        assert_eq!(window_width(0, 0), 1);
-        assert_eq!(window_width(5, 0), 1);
+        assert_eq!(window_width(0, 0, 2), 1);
+        assert_eq!(window_width(5, 0, 2), 1);
     }
 
     /// A start at or past the committee count is folded back into range, so
@@ -2122,7 +2164,13 @@ mod tests {
         let window = SubnetWindow::full(4);
 
         let pool = [small, large];
-        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
+        let (selected, covered) = select_proofs_greedily(
+            &pool,
+            &[],
+            HashSet::new(),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert_eq!(selected.len(), 2);
         assert_eq!(
@@ -2131,6 +2179,31 @@ mod tests {
             "the larger proof is picked first"
         );
         assert_eq!(covered, HashSet::from([0, 1, 2, 3]));
+    }
+
+    /// The fan-in is a parameter, not a constant: the same pool of disjoint
+    /// proofs yields as many children as the cap allows and no more, and the
+    /// cap spans the new and known sets together.
+    #[test]
+    fn select_proofs_greedily_honors_the_configured_fan_in() {
+        let new_pool: Vec<_> = (0..3)
+            .map(|v| SingleMessageAggregate::empty(make_bits(&[v])))
+            .collect();
+        let known_pool: Vec<_> = (3..6)
+            .map(|v| SingleMessageAggregate::empty(make_bits(&[v])))
+            .collect();
+        let window = SubnetWindow::full(8);
+
+        for (cap, want) in [(2, 2), (4, 4), (6, 6), (16, 6)] {
+            let (selected, covered) =
+                select_proofs_greedily(&new_pool, &known_pool, HashSet::new(), &window, cap);
+            assert_eq!(selected.len(), want, "cap {cap}");
+            assert_eq!(
+                covered.len(),
+                want,
+                "cap {cap}: disjoint proofs, one voter each"
+            );
+        }
     }
 
     /// A proof whose participants all sit outside the window scores zero and
@@ -2142,7 +2215,13 @@ mod tests {
         let window = SubnetWindow::new(0, 2, 4);
 
         let pool = [outside];
-        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
+        let (selected, covered) = select_proofs_greedily(
+            &pool,
+            &[],
+            HashSet::new(),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert!(selected.is_empty(), "nothing in the window to gain");
         assert!(covered.is_empty());
@@ -2160,7 +2239,13 @@ mod tests {
         let window = SubnetWindow::new(0, 2, 4);
 
         let pool = [straddling];
-        let (selected, covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
+        let (selected, covered) = select_proofs_greedily(
+            &pool,
+            &[],
+            HashSet::new(),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert_eq!(selected.len(), 1, "picked for its in-window half");
         assert_eq!(
@@ -2182,7 +2267,13 @@ mod tests {
         let window = SubnetWindow::new(0, 2, 4);
 
         let pool = [wide, narrow];
-        let (selected, _covered) = select_proofs_greedily(&pool, &[], HashSet::new(), &window);
+        let (selected, _covered) = select_proofs_greedily(
+            &pool,
+            &[],
+            HashSet::new(),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert_eq!(
             selected.len(),
@@ -2207,7 +2298,13 @@ mod tests {
         let window = SubnetWindow::new(0, 2, 4);
 
         let pool = [proof];
-        let (selected, _covered) = select_proofs_greedily(&pool, &[], HashSet::from([0]), &window);
+        let (selected, _covered) = select_proofs_greedily(
+            &pool,
+            &[],
+            HashSet::from([0]),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert!(selected.is_empty());
     }
@@ -2225,8 +2322,13 @@ mod tests {
 
         let new_pool = [new_outside];
         let known_pool = [known_inside];
-        let (selected, covered) =
-            select_proofs_greedily(&new_pool, &known_pool, HashSet::new(), &window);
+        let (selected, covered) = select_proofs_greedily(
+            &new_pool,
+            &known_pool,
+            HashSet::new(),
+            &window,
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
+        );
 
         assert_eq!(selected.len(), 1);
         assert_eq!(
@@ -2328,6 +2430,7 @@ mod tests {
             &[],
             &validators,
             &vacuous_window(),
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
         )
         .expect("raw {0,1} plus a filling child for {2} should be viable");
 
@@ -2360,6 +2463,7 @@ mod tests {
             &[],
             &validators,
             &vacuous_window(),
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
         )
         .expect("raw {0,1,2} plus a child for {2,3,4} should be viable");
 
@@ -2388,6 +2492,7 @@ mod tests {
             &[],
             &validators,
             &vacuous_window(),
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
         );
         assert!(resolved.is_none());
     }
@@ -2407,6 +2512,7 @@ mod tests {
             &[],
             &validators,
             &vacuous_window(),
+            DEFAULT_MAX_AGGREGATION_CHILDREN,
         )
         .expect("two children with no raw sigs should be viable");
 
@@ -3154,6 +3260,7 @@ mod tests {
                 duty_subnet,
                 committee_count: 4,
                 skip_redundant: false,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
                 .expect("a payload-only merge is viable")
@@ -3189,6 +3296,7 @@ mod tests {
                 duty_subnet,
                 committee_count: COMMITTEE_COUNT,
                 skip_redundant: false,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
                 .expect("a payload-only merge is viable")
@@ -3262,6 +3370,7 @@ mod tests {
                 duty_subnet,
                 committee_count: COMMITTEE_COUNT,
                 skip_redundant: false,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
                 .expect("a payload-only merge is viable")
@@ -3323,6 +3432,7 @@ mod tests {
                 duty_subnet,
                 committee_count: 4,
                 skip_redundant,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
                 .map(|job| job.hashed.data().slot)
@@ -3366,6 +3476,7 @@ mod tests {
                 duty_subnet,
                 committee_count: 4,
                 skip_redundant: true,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
         };
@@ -3423,6 +3534,7 @@ mod tests {
             duty_subnet: 0,
             committee_count: COMMITTEE_COUNT,
             skip_redundant: false,
+            max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
         };
 
         let job = select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config).expect(
@@ -3522,6 +3634,7 @@ mod tests {
                 duty_subnet,
                 committee_count: 1,
                 skip_redundant: false,
+                max_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             };
             select_best_job(&store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
                 .expect("a payload-only merge is viable")
@@ -3703,6 +3816,7 @@ mod tests {
             subscribed_subnets: HashSet::from([0, 1]),
             aggregation_duty_subnet: 0,
             skip_redundant_aggregation: false,
+            max_aggregation_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
             proposer_config: ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: 1,

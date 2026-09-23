@@ -74,6 +74,9 @@ pub struct BlockChainConfig {
     /// subnet owns in the slot, trading window overlap for less duplicated prover
     /// work.
     pub skip_redundant_aggregation: bool,
+    /// Most existing proofs one aggregation job may merge. See
+    /// [`aggregation::DEFAULT_MAX_AGGREGATION_CHILDREN`].
+    pub max_aggregation_children: usize,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -261,6 +264,7 @@ impl BlockChain {
             subscribed_subnets,
             aggregation_duty_subnet,
             skip_redundant_aggregation,
+            max_aggregation_children,
             proposer_config,
         } = config;
 
@@ -294,6 +298,7 @@ impl BlockChain {
             subscribed_subnets,
             aggregation_duty_subnet,
             skip_redundant_aggregation,
+            max_aggregation_children,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -397,6 +402,10 @@ pub struct BlockChainServer {
     /// subnet owns this slot, trading window overlap for less duplicated
     /// prover work. See [`aggregation::owns_width`] for the rotation.
     skip_redundant_aggregation: bool,
+
+    /// Most existing proofs one aggregation job may merge. Only the worker
+    /// reads it; held here because the worker is spawned from `on_started`.
+    max_aggregation_children: usize,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -1517,6 +1526,7 @@ impl BlockChainServer {
                 subscribed_subnets: self.subscribed_subnets.clone(),
                 aggregation_duty_subnet: self.aggregation_duty_subnet,
                 skip_redundant_aggregation: self.skip_redundant_aggregation,
+                max_aggregation_children: self.max_aggregation_children,
                 proposer_config: self.proposer_config,
             },
         ));

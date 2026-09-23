@@ -122,6 +122,26 @@ pub(crate) struct NodeOptions {
     /// node that is down or late.
     #[arg(long, default_value = "false", requires = "is_aggregator")]
     pub(crate) skip_redundant_aggregation: bool,
+    /// Most existing proofs one recursive aggregation job may merge.
+    ///
+    /// The default is a binary merge: each job is cheap and predictable, and
+    /// coverage roughly doubles per merge round. A wider fan-in reaches full
+    /// coverage in fewer rounds, but each job takes longer, and the worker is
+    /// single-threaded, so one long job also delays everything queued behind
+    /// it, including the next slot's candidate body.
+    ///
+    /// At least 2 (a job of existing proofs alone needs two to merge) and at
+    /// most leanVM's recursion limit, beyond which the prover rejects the job.
+    #[arg(
+        long,
+        default_value_t = ethlambda_blockchain::aggregation::DEFAULT_MAX_AGGREGATION_CHILDREN as u64,
+        value_parser = clap::value_parser!(u64).range(
+            ethlambda_blockchain::aggregation::MIN_MAX_AGGREGATION_CHILDREN as u64
+                ..=ethlambda_crypto::MAX_AGGREGATION_CHILDREN as u64
+        ),
+        requires = "is_aggregator"
+    )]
+    pub(crate) max_aggregation_children: u64,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
@@ -315,6 +335,14 @@ mod tests {
     /// `NodeOptions` is a `clap::Args` group rather than a parser of its own,
     /// so this parses through the real dispatch, as the binary does.
     fn parse(extra: &[&str]) -> NodeOptions {
+        match try_parse(extra).expect("node options parse") {
+            Command::Node(options) => options,
+            other => panic!("expected a node invocation, got {other:?}"),
+        }
+    }
+
+    /// [`parse`] without the unwrap, for tests that expect a rejection.
+    fn try_parse(extra: &[&str]) -> Result<Command, clap::Error> {
         let mut argv = vec![
             "ethlambda",
             "--genesis",
@@ -333,10 +361,7 @@ mod tests {
             "ethlambda_0",
         ];
         argv.extend_from_slice(extra);
-        match try_parse_from(argv).expect("node options parse") {
-            Command::Node(options) => options,
-            other => panic!("expected a node invocation, got {other:?}"),
-        }
+        try_parse_from(argv)
     }
 
     /// `--discovery.enable` on its own has to work: a default that is never
@@ -377,6 +402,28 @@ mod tests {
                 "the message must name the offending flag, got: {err}"
             );
         }
+    }
+
+    /// The fan-in defaults to a binary merge and accepts exactly the range the
+    /// worker can use: two children at least, leanVM's recursion limit at most.
+    #[test]
+    fn max_aggregation_children_is_bounded_to_what_leanvm_accepts() {
+        use ethlambda_blockchain::aggregation::{
+            DEFAULT_MAX_AGGREGATION_CHILDREN, MIN_MAX_AGGREGATION_CHILDREN,
+        };
+        use ethlambda_crypto::MAX_AGGREGATION_CHILDREN;
+
+        let default = parse(&["--is-aggregator"]).max_aggregation_children;
+        assert_eq!(default, DEFAULT_MAX_AGGREGATION_CHILDREN as u64);
+
+        let at = |n: usize| {
+            let n = n.to_string();
+            try_parse(&["--is-aggregator", "--max-aggregation-children", &n])
+        };
+        assert!(at(MIN_MAX_AGGREGATION_CHILDREN).is_ok());
+        assert!(at(MAX_AGGREGATION_CHILDREN).is_ok());
+        assert!(at(MIN_MAX_AGGREGATION_CHILDREN - 1).is_err());
+        assert!(at(MAX_AGGREGATION_CHILDREN + 1).is_err());
     }
 
     /// `--api-port` and `--metrics-port` sharing one number is supported (the

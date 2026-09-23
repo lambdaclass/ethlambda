@@ -46,6 +46,11 @@ pub mod signature;
 #[cfg(feature = "shadow-integration")]
 pub mod shadow_cost;
 
+/// Most child proofs a single leanVM aggregation accepts (its recursion
+/// limit). A merge naming more is rejected outright rather than degraded, so
+/// any configurable fan-in must be bounded by this.
+pub const MAX_AGGREGATION_CHILDREN: usize = leanvm::MAX_RECURSIONS;
+
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 

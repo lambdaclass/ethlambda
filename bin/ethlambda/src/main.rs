@@ -343,6 +343,8 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         subscribed_subnets: subscribed_subnets.clone(),
         aggregation_duty_subnet,
         skip_redundant_aggregation: options.skip_redundant_aggregation,
+        // Bounded by the CLI parser to leanVM's recursion limit, so it fits.
+        max_aggregation_children: options.max_aggregation_children as usize,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
