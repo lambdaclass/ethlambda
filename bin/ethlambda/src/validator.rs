@@ -27,6 +27,9 @@ pub(crate) struct ValidatorOptions {
     pub(crate) beacon_nodes: Vec<String>,
 
     /// Directory holding the EIP-2335 keystores and `validator_definitions.yml`.
+    /// Without that file, keystores in the Lighthouse layout
+    /// (`<0xpubkey>/voting-keystore.json`, password in
+    /// `--secrets-dir/<0xpubkey>`) are discovered and the file is written.
     #[arg(long)]
     pub(crate) validators_dir: PathBuf,
 
