@@ -337,6 +337,27 @@ and `lean_state_write_seconds` says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.
 
+### Beacon Committee Cache
+
+`ethlambda beacon` derives an epoch's attester committees with one whole-epoch
+shuffle and keeps the result in the chain actor's `CommitteeCache`, keyed by
+epoch and the block that decided the shuffling. See `CommitteeCache` in
+`crates/blockchain/state_transition/src/beacon/helpers/accessors.rs`. This is
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCache::committees` call: the state transition's and fork choice's attestation processing | result=hit,miss,unkeyable |
+
+**Read the miss rate against the epoch rate, not the hit rate.** A follower on
+one chain misses about once per epoch, when the first block of a new epoch asks
+for that epoch's shuffling, and hits on everything else. Misses that track
+imports instead mean entries are being evicted and rebuilt, which happens when
+more branches are being imported at once than the cache has room for; each miss
+is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
+is a lookup the cache could not key at all, mostly the genesis state asking
+about its own first epochs, and should be zero on a checkpoint-synced follower.
+
 ### Data Column Sidecars (Fulu DAS)
 
 `ethlambda beacon` is a fulu data-availability-sampling custodian: it derives

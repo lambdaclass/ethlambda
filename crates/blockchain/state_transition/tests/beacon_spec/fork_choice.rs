@@ -388,6 +388,9 @@ fn block_blob_evidence(case: &Case, step: &Step) -> Result<DataAvailability, Str
 /// attestation and attester slashing carried in its body. See the module
 /// documentation for why the slashing half belongs here even though the
 /// format's own README omits it.
+///
+/// `committees` is the case's one [`CommitteeCache`], shared by every step as
+/// the node's chain actor shares its own across imports; see [`run_case`].
 fn apply_block(
     store: &mut Store,
     case: &Case,
@@ -395,6 +398,7 @@ fn apply_block(
     name: &str,
     expect_valid: bool,
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<(), String> {
     let signed_block = decode_signed_block(case, name)?;
 
@@ -425,7 +429,7 @@ fn apply_block(
             config,
             &blob_evidence,
             &fork_choice::PayloadValidity::NotRequired,
-            &mut CommitteeCache::default(),
+            committees,
         ),
         expect_valid,
     ) {
@@ -442,14 +446,9 @@ fn apply_block(
     }
 
     for attestation in &attestations {
-        fork_choice::on_attestation(
-            store,
-            attestation,
-            true,
-            config,
-            &mut CommitteeCache::default(),
-        )
-        .map_err(|err| format!("on_attestation for an attestation carried in {name}: {err:?}"))?;
+        fork_choice::on_attestation(store, attestation, true, config, committees).map_err(
+            |err| format!("on_attestation for an attestation carried in {name}: {err:?}"),
+        )?;
     }
     for attester_slashing in &attester_slashings {
         fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {
@@ -468,6 +467,7 @@ fn apply_execution_step(
     case: &Case,
     step: &Step,
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<(), String> {
     if let Some(time) = step.tick {
         if !step.valid {
@@ -485,19 +485,13 @@ fn apply_execution_step(
     }
 
     if let Some(name) = &step.block {
-        return apply_block(store, case, step, name, step.valid, config);
+        return apply_block(store, case, step, name, step.valid, config, committees);
     }
 
     if let Some(name) = &step.attestation {
         let attestation = decode_attestation(case, name)?;
         return match (
-            fork_choice::on_attestation(
-                store,
-                &attestation,
-                false,
-                config,
-                &mut CommitteeCache::default(),
-            ),
+            fork_choice::on_attestation(store, &attestation, false, config, committees),
             step.valid,
         ) {
             (Ok(()), false) => Err(format!(
@@ -718,6 +712,15 @@ pub(super) fn apply_checks(
 /// untouched but a call that unexpectedly succeeds (or fails) leaves it in a
 /// state the fixture's remaining steps were never written to expect; nothing
 /// past that point would be checking anything meaningful.
+///
+/// One [`CommitteeCache`] serves the whole case, the way the node's chain
+/// actor holds one across every import, rather than a fresh one per call.
+/// The fixtures build sibling branches on purpose, and sharing is what puts
+/// the cache's key to the test: two states from different branches that
+/// agree on an epoch's deciding block share its entry, and if the key ever
+/// named a shuffling one of them does not actually have, a committee here
+/// would come out wrong and the case would fail. A fresh cache per call would
+/// pass whatever the key did.
 fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let anchor_state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("anchor_state"))
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
@@ -727,11 +730,12 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
+    let mut committees = CommitteeCache::default();
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
             Some(checks) => apply_checks(&mut store, checks, config),
-            None => apply_execution_step(&mut store, case, step, config),
+            None => apply_execution_step(&mut store, case, step, config, &mut committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
     }

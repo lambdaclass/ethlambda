@@ -45,6 +45,23 @@ pub fn inc_finalizations(result: &str) {
     LEAN_FINALIZATIONS_TOTAL.with_label_values(&[result]).inc();
 }
 
+static LEAN_BEACON_COMMITTEE_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_committee_cache_lookups_total",
+        "Beacon committee shuffling lookups, by whether the committee cache served them",
+        &["result"]
+    )
+    .unwrap()
+});
+
+/// Count one `CommitteeCache` lookup: `hit`, `miss` (a whole-epoch shuffle
+/// was built and cached), or `unkeyable` (built for one caller, not cached).
+pub fn inc_committee_cache_lookups(result: &str) {
+    LEAN_BEACON_COMMITTEE_CACHE_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "lean_state_transition_time_seconds",

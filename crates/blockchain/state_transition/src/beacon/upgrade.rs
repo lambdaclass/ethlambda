@@ -57,11 +57,11 @@ fn translate_participation(
     post: &mut BeaconState,
     pending_attestations: &[phase0::PendingAttestation],
 ) -> Result<()> {
-    // The upgrade's own cache, not one threaded in from the caller: every
-    // attestation here targets the epoch the upgrade happens at, so they share
-    // one shuffling between them, and a fork transition runs once per network
-    // rather than once per block. Nothing outside this loop needs it
-    // afterwards.
+    // The upgrade's own cache, not one threaded in from the caller: these are
+    // the pre-state's `previous_epoch_attestations`, so every one of them
+    // targets the epoch before the fork and they share that one shuffling
+    // between them, and a fork transition runs once per network rather than
+    // once per block. Nothing outside this loop needs it afterwards.
     let mut committees = CommitteeCache::default();
 
     for attestation in pending_attestations {

@@ -37,12 +37,10 @@ use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
-    get_committee_count_per_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
+    get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
-use crate::beacon::helpers::attestation::{
-    get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
-};
+use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::math::integer_squareroot;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::mutators::{
@@ -310,15 +308,16 @@ pub fn process_attestation(
         min_slot <= state.slot(),
         "data.slot + MIN_ATTESTATION_INCLUSION_DELAY <= state.slot",
     )?;
+    // The committee count read off the shared shuffling rather than through
+    // `get_committee_count_per_slot`, which would scan the whole registry per
+    // attestation for the same value.
+    let epoch_committees = committees.committees(state, data.target.epoch);
     verify(
-        data.index < get_committee_count_per_slot(state, data.target.epoch),
+        data.index < epoch_committees.committees_per_slot(),
         "data.index < get_committee_count_per_slot(state, data.target.epoch)",
     )?;
 
-    let committee_len = committees
-        .committees(state, data.target.epoch)
-        .committee(data.slot, data.index)?
-        .len();
+    let committee_len = epoch_committees.committee(data.slot, data.index)?.len();
     verify(
         attestation.aggregation_bits.len() == committee_len,
         "len(attestation.aggregation_bits) == len(committee)",
@@ -338,7 +337,11 @@ pub fn process_attestation(
 
     // Read phase: for every attester, decide which flags this attestation
     // newly satisfies and add up the proposer's reward for granting them.
-    let attesting_indices = get_attesting_indices(state, attestation, committees)?;
+    //
+    // `indexed_attestation`'s indices rather than a second
+    // `get_attesting_indices` call, for the reason given on the same line in
+    // `electra::process_attestation`.
+    let attesting_indices = indexed_attestation.attesting_indices.to_vec();
     let current_epoch_target = data.target.epoch == current_epoch;
     // Through the fork-generic accessor, not a projection to a concrete
     // `altair::BeaconState`. The participation lists are unchanged from altair

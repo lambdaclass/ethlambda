@@ -30,10 +30,12 @@ use crate::beacon::{bls, constants};
 /// registry, so walking it in position order yields attesters in shuffle order,
 /// which is almost never ascending.
 ///
-/// `committees` supplies the slot's shuffling. Only one committee is read per
-/// attestation here, so a caller handling a single attestation loses nothing by
-/// passing a fresh [`CommitteeCache`]; the reuse this parameter exists for is
-/// across the many attestations a block carries. See [`CommitteeCache`].
+/// `committees` supplies the slot's shuffling, derived for the whole epoch at
+/// once. That pays off across the many attestations a block carries, which is
+/// the reuse this parameter exists for, but it is more work than one
+/// committee's own derivation: a caller with a single attestation and no cache
+/// to share it through pays for the whole epoch to read one committee of it.
+/// See [`CommitteeCache`].
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &Attestation,

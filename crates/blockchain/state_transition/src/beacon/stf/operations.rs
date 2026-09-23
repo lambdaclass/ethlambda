@@ -23,8 +23,7 @@ use crate::beacon::containers::shared::{
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_committee_count_per_slot, get_current_epoch,
-    get_domain, get_previous_epoch,
+    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{
@@ -297,15 +296,16 @@ pub fn process_attestation(
         min_slot <= state.slot() && state.slot() <= max_slot,
         "data.slot + MIN_ATTESTATION_INCLUSION_DELAY <= state.slot <= data.slot + SLOTS_PER_EPOCH",
     )?;
+    // The committee count read off the shared shuffling rather than through
+    // `get_committee_count_per_slot`, which would scan the whole registry per
+    // attestation for the same value.
+    let epoch_committees = committees.committees(state, data.target.epoch);
     verify(
-        data.index < get_committee_count_per_slot(state, data.target.epoch),
+        data.index < epoch_committees.committees_per_slot(),
         "data.index < get_committee_count_per_slot(state, data.target.epoch)",
     )?;
 
-    let committee_len = committees
-        .committees(state, data.target.epoch)
-        .committee(data.slot, data.index)?
-        .len();
+    let committee_len = epoch_committees.committee(data.slot, data.index)?.len();
     verify(
         attestation.aggregation_bits.len() == committee_len,
         "len(attestation.aggregation_bits) == len(committee)",

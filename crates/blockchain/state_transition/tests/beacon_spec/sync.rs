@@ -127,7 +127,13 @@ fn seeded_validity(store: &Store, block: &SignedBeaconBlock) -> PayloadValidity 
 
 /// Applies one non-`checks` step, dispatching on which of [`Step::tick`],
 /// [`Step::block_hash`] or [`Step::block`] is set.
-fn apply_step(store: &mut Store, case: &Case, step: &Step, config: &Config) -> Result<(), String> {
+fn apply_step(
+    store: &mut Store,
+    case: &Case,
+    step: &Step,
+    config: &Config,
+    committees: &mut CommitteeCache,
+) -> Result<(), String> {
     if let Some(time) = step.tick {
         fork_choice::on_tick(store, time, config);
         return Ok(());
@@ -151,7 +157,7 @@ fn apply_step(store: &mut Store, case: &Case, step: &Step, config: &Config) -> R
     }
 
     if let Some(name) = &step.block {
-        return apply_block(store, case, name, step.valid, config);
+        return apply_block(store, case, name, step.valid, config, committees);
     }
 
     Err("a step carried no kind this runner handles".to_string())
@@ -171,6 +177,7 @@ fn apply_block(
     name: &str,
     expect_valid: bool,
     config: &Config,
+    committees: &mut CommitteeCache,
 ) -> Result<(), String> {
     let signed_block = super::fork_choice::decode_signed_block(case, name)?;
     let validity = seeded_validity(store, &signed_block);
@@ -185,7 +192,7 @@ fn apply_block(
             config,
             &fork_choice::DataAvailability::NotRequired,
             &validity,
-            &mut CommitteeCache::default(),
+            committees,
         ),
         expect_valid,
     ) {
@@ -202,14 +209,9 @@ fn apply_block(
     }
 
     for attestation in &attestations {
-        fork_choice::on_attestation(
-            store,
-            attestation,
-            true,
-            config,
-            &mut CommitteeCache::default(),
-        )
-        .map_err(|err| format!("on_attestation for an attestation carried in {name}: {err:?}"))?;
+        fork_choice::on_attestation(store, attestation, true, config, committees).map_err(
+            |err| format!("on_attestation for an attestation carried in {name}: {err:?}"),
+        )?;
     }
     for attester_slashing in &attester_slashings {
         fork_choice::on_attester_slashing(store, attester_slashing).map_err(|err| {
@@ -222,6 +224,10 @@ fn apply_block(
 
 /// Builds the store from the case's anchor and applies every entry of
 /// `steps.yaml` in order, stopping at the first one that fails.
+///
+/// One [`CommitteeCache`] for the whole case, for the reason the fork-choice
+/// runner's own `run_case` gives: this case builds two chains on purpose, so
+/// sharing is what tests the cache's key.
 fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let anchor_state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("anchor_state"))
         .map_err(|err| format!("decoding anchor_state: {err:?}"))?;
@@ -231,11 +237,12 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
+    let mut committees = CommitteeCache::default();
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
             Some(checks) => super::fork_choice::apply_checks(&mut store, checks, config),
-            None => apply_step(&mut store, case, step, config),
+            None => apply_step(&mut store, case, step, config, &mut committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
     }

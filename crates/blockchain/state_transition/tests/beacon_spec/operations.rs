@@ -123,6 +123,10 @@ fn apply(
     state: &mut BeaconState,
     config: &Config,
 ) -> Result<(), String> {
+    // Only the `attestation` handler reads this. Bound up here so each of its
+    // calls fits on one line; a case processes a single attestation, so there
+    // is nothing for the cache to share between calls.
+    let mut committees = CommitteeCache::default();
     let outcome = match handler {
         // Every fork's own `BeaconBlock` carries a different concrete body
         // (altair's adds a sync aggregate, bellatrix's an execution payload,
@@ -205,36 +209,27 @@ fn apply(
             // Phase0 defers every attestation's reward to the epoch boundary.
             ForkName::Phase0 => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                operations::process_attestation(
-                    state,
-                    &attestation,
-                    config,
-                    &mut CommitteeCache::default(),
-                )
+                operations::process_attestation(state, &attestation, config, &mut committees)
             }
             // Altair scores an attestation immediately instead, and neither
             // bellatrix's nor capella's specification lists a further change,
             // so altair's own function serves both.
             ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                altair_stf::process_attestation(state, &attestation, &mut CommitteeCache::default())
+                altair_stf::process_attestation(state, &attestation, &mut committees)
             }
             // Deneb widens the inclusion window and the timely-target
             // condition (EIP-7045); the container is still phase0's.
             ForkName::Deneb => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                deneb_stf::process_attestation(state, &attestation, &mut CommitteeCache::default())
+                deneb_stf::process_attestation(state, &attestation, &mut committees)
             }
             // Electra reshapes the container itself (EIP-7549's
             // `committee_bits`), and fulu's specification makes no further
             // change to either the container or the function.
             ForkName::Electra | ForkName::Fulu => {
                 let attestation: electra::Attestation = case.ssz("attestation");
-                electra_stf::process_attestation(
-                    state,
-                    &attestation,
-                    &mut CommitteeCache::default(),
-                )
+                electra_stf::process_attestation(state, &attestation, &mut committees)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
         },

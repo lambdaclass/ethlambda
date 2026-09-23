@@ -135,6 +135,10 @@ fn apply_blocks(
     // boundary.
     let mut previous_state_root = None;
 
+    // One cache across the case's blocks, as the node holds one across its
+    // imports, so consecutive blocks of an epoch share its shuffling.
+    let mut committees = CommitteeCache::default();
+
     for index in 0..meta.blocks_count {
         let fork = if index < first_post_fork_index {
             pre_fork
@@ -150,15 +154,8 @@ fn apply_blocks(
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(
-            state,
-            &block,
-            true,
-            &config,
-            &engine,
-            &mut CommitteeCache::default(),
-        )
-        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(state, &block, true, &config, &engine, &mut committees)
+            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }

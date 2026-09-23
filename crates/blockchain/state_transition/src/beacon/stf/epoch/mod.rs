@@ -27,9 +27,10 @@ use crate::beacon::containers::{BeaconState, HistoricalBatch};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    get_block_root, get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
-    get_total_balance,
+    CommitteeCache, get_block_root, get_block_root_at_slot, get_current_epoch, get_previous_epoch,
+    get_randao_mix, get_total_balance,
 };
+use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
@@ -186,20 +187,35 @@ pub fn get_matching_head_attestations(
 ///
 /// Sorted and deduplicated, since callers use it both as a set and to index the
 /// registry in order.
+///
+/// Every attestation's committee comes out of one [`CommitteeCache`] held for
+/// this call, so a pending-attestation list, which belongs to a single epoch,
+/// costs one shuffling however many attestations it holds. A caller asking
+/// about several lists (or single attestations) of one epoch in turn should
+/// hold its own cache across them and call `unslashed_attesting_indices`
+/// instead.
 pub fn get_unslashed_attesting_indices(
     state: &BeaconState,
     attestations: &[PendingAttestation],
 ) -> Result<Vec<ValidatorIndex>> {
+    unslashed_attesting_indices(state, attestations, &mut CommitteeCache::default())
+}
+
+/// [`get_unslashed_attesting_indices`], drawing committees from a cache the
+/// caller holds across calls.
+pub(crate) fn unslashed_attesting_indices(
+    state: &BeaconState,
+    attestations: &[PendingAttestation],
+    committees: &mut CommitteeCache,
+) -> Result<Vec<ValidatorIndex>> {
     let mut indices = Vec::new();
     for attestation in attestations {
-        let committee = crate::beacon::helpers::accessors::get_beacon_committee(
-            state,
-            attestation.data.slot,
-            attestation.data.index,
-        )?;
-        for (position, index) in committee.into_iter().enumerate() {
+        let slot = attestation.data.slot;
+        let epoch_committees = committees.committees(state, compute_epoch_at_slot(slot));
+        let committee = epoch_committees.committee(slot, attestation.data.index)?;
+        for (position, index) in committee.iter().enumerate() {
             if attestation.aggregation_bits.get(position).unwrap_or(false) {
-                indices.push(index);
+                indices.push(*index);
             }
         }
     }

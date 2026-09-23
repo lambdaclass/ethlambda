@@ -41,7 +41,8 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{
-    get_current_epoch, get_previous_epoch, get_total_active_balance, get_total_balance,
+    CommitteeCache, get_current_epoch, get_previous_epoch, get_total_active_balance,
+    get_total_balance,
 };
 use crate::beacon::helpers::finality::{
     get_eligible_validator_indices, get_finality_delay, is_in_inactivity_leak,
@@ -53,7 +54,7 @@ use crate::beacon::primitives::{Gwei, ValidatorIndex};
 
 use super::{
     get_matching_head_attestations, get_matching_source_attestations,
-    get_matching_target_attestations, get_unslashed_attesting_indices,
+    get_matching_target_attestations, get_unslashed_attesting_indices, unslashed_attesting_indices,
 };
 
 // ---------------------------------------------------------------------------
@@ -174,24 +175,34 @@ pub fn get_inclusion_delay_deltas(
     let matching_source_attestations =
         get_matching_source_attestations(state, get_previous_epoch(state))?;
 
-    for index in get_unslashed_attesting_indices(state, &matching_source_attestations)? {
-        // `PendingAttestation` shares `Attestation`'s `data`/`aggregation_bits`
-        // shape but is a distinct container type, so membership is checked by
-        // asking for the unslashed attesters of a single-attestation slice
-        // rather than by re-deriving the committee lookup directly. `index` is
-        // already known unslashed (it came from the call above), so this
-        // agrees with the specification's plain "index in
-        // get_attesting_indices(state, a)" check.
-        let mut candidates = Vec::new();
-        for attestation in &matching_source_attestations {
-            let attesters =
-                get_unslashed_attesting_indices(state, std::slice::from_ref(attestation))?;
-            if attesters.binary_search(&index).is_ok() {
-                candidates.push(attestation);
-            }
-        }
-        let attestation = candidates
-            .into_iter()
+    // `PendingAttestation` shares `Attestation`'s `data`/`aggregation_bits`
+    // shape but is a distinct container type, so membership is checked by
+    // asking for the unslashed attesters of a single-attestation slice rather
+    // than by re-deriving the committee lookup directly. Every `index` below
+    // is already known unslashed (it comes from the union over the same
+    // attestations), so this agrees with the specification's plain "index in
+    // get_attesting_indices(state, a)" check.
+    //
+    // Computed once per attestation up front rather than once per (attester,
+    // attestation) pair inside the loop, where the specification writes it:
+    // the answer does not depend on `index`, and every attestation here
+    // belongs to the previous epoch, so one cache serves all of them one
+    // shuffling.
+    let mut committees = CommitteeCache::default();
+    let attesters_per_attestation = matching_source_attestations
+        .iter()
+        .map(|attestation| {
+            unslashed_attesting_indices(state, std::slice::from_ref(attestation), &mut committees)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for index in unslashed_attesting_indices(state, &matching_source_attestations, &mut committees)?
+    {
+        let attestation = matching_source_attestations
+            .iter()
+            .zip(&attesters_per_attestation)
+            .filter(|(_, attesters)| attesters.binary_search(&index).is_ok())
+            .map(|(attestation, _)| attestation)
             .min_by_key(|attestation| attestation.inclusion_delay)
             .ok_or(Error::SpecAssert(
                 "an unslashed source attester attests in at least one matching source attestation",

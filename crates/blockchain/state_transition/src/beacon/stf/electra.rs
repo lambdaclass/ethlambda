@@ -736,7 +736,7 @@ pub fn process_attestation(
     //
     // Not a second `get_attesting_indices(state, attestation)` call: that
     // would recompute exactly what `get_indexed_attestation` above already
-    // did (including its own `EpochCommittees`, another active-set scan) to
+    // did (walking every named committee and sorting the result again) to
     // fill `indexed_attestation.attesting_indices`, for the same attestation
     // against the same unmutated `state`. `AttestingIndices` derefs to
     // `&[ValidatorIndex]`, already sorted by `get_attesting_indices`, so this

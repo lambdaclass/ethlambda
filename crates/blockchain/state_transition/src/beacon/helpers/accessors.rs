@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
-use crate::beacon::error::Result;
+use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
@@ -22,7 +22,7 @@ use super::misc::{
     compute_domain, compute_epoch_at_slot, compute_start_slot_at_epoch, fork_version_at_epoch,
 };
 use super::predicates::is_active_validator;
-use super::shuffling::compute_shuffled_indices;
+use super::shuffling::{compute_committee, shuffle_list};
 
 /// The epoch the state is currently in.
 pub fn get_current_epoch(state: &BeaconState) -> Epoch {
@@ -150,18 +150,19 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 ///
 /// [`super::shuffling::compute_committee`] derives a committee by shuffling
 /// each of its positions individually, which repeats the same rounds of
-/// hashing once per member. [`super::shuffling::compute_shuffled_indices`]
-/// computes the whole epoch's permutation in one pass instead, at which point
-/// the committee at any `(slot, index)` is a contiguous slice of it: this
-/// stores the active set *through* that permutation, so [`Self::committee`]
-/// hashes nothing at all and allocates nothing beyond the caller's own copy.
+/// hashing once per member. [`super::shuffling::shuffle_list`] shuffles the
+/// whole active set in one pass instead, in place, at which point the
+/// committee at any `(slot, index)` is a contiguous slice of it, so
+/// [`Self::committee`] hashes nothing at all and allocates nothing beyond the
+/// caller's own copy.
 ///
 /// That is also why building one of these is worth it only when several
-/// committees will follow: the whole-epoch permutation costs about eight
-/// times a single committee's own shuffle, and repays that from the second
-/// committee on. [`get_beacon_committee`] builds a fresh one per call and so
-/// pays it every time; a caller that wants more than one committee of an
-/// epoch should hold a [`CommitteeCache`] instead.
+/// committees will follow: the whole-epoch permutation moves every active
+/// validator through every round, where one committee's per-member shuffle
+/// touches that committee's members alone, so a single lookup costs more
+/// this way than through [`get_beacon_committee`], which keeps the per-member
+/// derivation for exactly that case. A caller that wants more than one
+/// committee of an epoch should hold a [`CommitteeCache`] instead.
 ///
 /// # Why the active set is not memoized on `epoch` or `seed` alone
 ///
@@ -176,6 +177,9 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// cross-call cache therefore has to key on the state's *history*, which is
 /// what [`CommitteeCache`] does; see [`ShufflingId`].
 pub struct EpochCommittees {
+    /// The epoch these committees belong to, which [`Self::committee`] holds
+    /// every `slot` it is asked about against.
+    epoch: Epoch,
     /// The epoch's active validators, in shuffled order: position `p` of the
     /// epoch-wide permutation holds `shuffled[p]`. A committee is a
     /// contiguous run of this, which is what makes [`Self::committee`] a
@@ -186,25 +190,18 @@ pub struct EpochCommittees {
 
 impl EpochCommittees {
     /// Scans `state`'s active set for `epoch` once, derives the committee
-    /// count and shuffle seed from it, and applies the epoch's permutation to
-    /// that set.
+    /// count and shuffle seed from it, and shuffles that set in place.
     pub fn new(state: &BeaconState, epoch: Epoch) -> Self {
         let active_indices = get_active_validator_indices(state, epoch);
         let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
         let seed = get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER);
-
-        // `compute_shuffled_indices` returns a permutation of
-        // `0..active_indices.len()`, so every position it yields is in range
-        // and the index below cannot panic. Written as an index rather than a
-        // `get` for that reason: a fallible form would have to invent an
-        // error case the permutation's own definition rules out.
-        let permutation = compute_shuffled_indices(active_indices.len() as u64, seed);
-        let shuffled = permutation
-            .iter()
-            .map(|position| active_indices[*position as usize])
-            .collect();
+        // The active set's own buffer becomes the shuffled set, so a build
+        // holds one validator-sized list at a time, not a permutation and a
+        // gathered copy beside it.
+        let shuffled = shuffle_list(active_indices, seed);
 
         Self {
+            epoch,
             shuffled,
             committees_per_slot,
         }
@@ -217,22 +214,37 @@ impl EpochCommittees {
         self.committees_per_slot
     }
 
-    /// The committee at `slot` (which must fall in this epoch) with `index`.
+    /// The committee at `slot` with `index`.
     ///
     /// The same members [`get_beacon_committee`] returns, in the same order,
     /// as a slice of the stored permutation rather than a fresh `Vec`.
+    ///
+    /// Rejects a `slot` outside the epoch this was built for. The per-member
+    /// derivation cannot get that wrong, since it derives the epoch from the
+    /// slot; this type is built for an epoch its caller names separately, and
+    /// is shared across calls through [`CommitteeCache`], so a mismatch would
+    /// otherwise slice another epoch's shuffle at this slot's offset and hand
+    /// back a wrong committee instead of an error.
     ///
     /// Rejects an out-of-range `index` rather than returning an empty or
     /// truncated slice, which is the verdict the per-member derivation
     /// reaches too: it would ask
     /// [`super::shuffling::compute_shuffled_index`] for a position at or past
     /// the active-set size, and that fails its own `index < index_count`
-    /// assertion.
+    /// assertion. That includes an `index` large enough to overflow the
+    /// committee number; see [`committee_number`].
     pub fn committee(&self, slot: Slot, index: CommitteeIndex) -> Result<&[ValidatorIndex]> {
-        let count = self.committees_per_slot * preset::SLOTS_PER_EPOCH;
-        crate::beacon::verify(count > 0, "count > 0")?;
+        crate::beacon::verify(
+            compute_epoch_at_slot(slot) == self.epoch,
+            "compute_epoch_at_slot(slot) == epoch",
+        )?;
 
-        let committee_index = (slot % preset::SLOTS_PER_EPOCH) * self.committees_per_slot + index;
+        // No `count > 0` check, unlike `compute_committee`: `committees_per_slot`
+        // comes from `committee_count_per_slot`, which never returns less than
+        // one, so `count` is at least `SLOTS_PER_EPOCH` and the divisions below
+        // cannot divide by zero.
+        let count = self.committees_per_slot * preset::SLOTS_PER_EPOCH;
+        let committee_index = committee_number(slot, self.committees_per_slot, index)?;
         crate::beacon::verify(committee_index < count, "index < count")?;
 
         let total = self.shuffled.len() as u64;
@@ -275,6 +287,18 @@ impl std::fmt::Debug for EpochCommittees {
 /// Epoch and decision root together are what makes a cross-state cache sound
 /// where `epoch` or `seed` alone would not be; see [`EpochCommittees`] for
 /// what goes wrong with those.
+///
+/// # Epochs 0 and 1
+///
+/// Neither has an `E - 2` to end, so both take the genesis block, at slot 0,
+/// as their deciding block, which is what lighthouse's saturating decision
+/// slot does too. Nothing after genesis can reach either input for them.
+/// Their seeds read the two RANDAO mixes just below
+/// `EPOCHS_PER_HISTORICAL_VECTOR`, which no block writes until the chain is
+/// nearly that many epochs old, and by then slot 0 has long left every
+/// state's `SLOTS_PER_HISTORICAL_ROOT` window, so the key can no longer be
+/// named. A change to the active set made at any epoch lands at least
+/// `MAX_SEED_LOOKAHEAD` epochs later, which is past both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShufflingId {
     epoch: Epoch,
@@ -283,15 +307,17 @@ struct ShufflingId {
 
 impl ShufflingId {
     /// The id of `epoch`'s shuffling as `state` sees it, or `None` if `state`
-    /// cannot name the deciding block: the epoch is close enough to genesis
-    /// that no slot precedes it, or the deciding slot has fallen out of the
-    /// state's `SLOTS_PER_HISTORICAL_ROOT` window.
+    /// cannot name the deciding block: the state is not yet past the deciding
+    /// slot (the genesis state, asked about its own first epochs, is the case
+    /// that reaches this), or the deciding slot has fallen out of the state's
+    /// `SLOTS_PER_HISTORICAL_ROOT` window.
     ///
     /// `None` is not a failure. It means this lookup cannot be keyed, so the
-    /// caller derives the committees without caching them, which is what every
-    /// caller did before this type existed.
+    /// caller derives the committees for itself alone, without caching them.
     fn new(state: &BeaconState, epoch: Epoch) -> Option<Self> {
-        let decision_slot = compute_start_slot_at_epoch(epoch.checked_sub(1)?).checked_sub(1)?;
+        // Saturating, so that epochs 0 and 1 land on the genesis block's slot;
+        // see this type's documentation for why that is sound.
+        let decision_slot = compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1);
         let decision_root = get_block_root_at_slot(state, decision_slot).ok()?;
         Some(Self {
             epoch,
@@ -302,13 +328,32 @@ impl ShufflingId {
 
 /// How many distinct shufflings stay resident in a [`CommitteeCache`].
 ///
-/// Two, which is what processing one block actually needs: every fork's
-/// `process_attestation` accepts an attestation whose target is the current or
-/// the previous epoch and no other, and fork choice replays that same block's
-/// attestations against the same two. A third entry would only ever hold a
-/// sibling branch's shuffling, and an entry is one `u64` per active validator,
-/// about 19 MB at mainnet's ~2.4M.
-const COMMITTEE_CACHE_CAPACITY: usize = 2;
+/// One block needs a pair: every fork's `process_attestation` accepts an
+/// attestation whose target is the current or the previous epoch and no other,
+/// and fork choice replays that same block's attestations against the same
+/// pair. The rest of the room is for forks. Two branches that disagree on an
+/// epoch's deciding block have different shufflings for it, so importing their
+/// blocks in turn needs both branches' pairs resident at once: with room for
+/// only one, each import would evict the entry the other branch's next import
+/// asks for, and rebuild its own. A split that outlives an epoch, or one
+/// between more than two branches, needs room for more pairs still.
+///
+/// Tuned rather than derived. An entry is one `u64` per active validator,
+/// about 19 MB at mainnet's ~2.4M, so this trades memory for how many
+/// concurrent branches import without rebuilding; lighthouse's own default
+/// (`DEFAULT_CACHE_SIZE` in its `shuffling_cache.rs`) is larger. It must exceed
+/// [`HEAD_SHUFFLINGS`], which eviction never drops, so that a miss always has
+/// an entry it may evict; that is checked at compile time below.
+const COMMITTEE_CACHE_CAPACITY: usize = 8;
+
+/// How many of the canonical head's shufflings [`CommitteeCache::update_head`]
+/// pins: its previous, current, and next epochs'.
+const HEAD_SHUFFLINGS: usize = 3;
+
+const _: () = assert!(
+    COMMITTEE_CACHE_CAPACITY > HEAD_SHUFFLINGS,
+    "the cache must hold at least one shuffling the head does not pin"
+);
 
 /// [`EpochCommittees`] shared across the calls asking for the same epoch's
 /// committees, so a block's attestations derive each epoch's shuffling once
@@ -318,19 +363,37 @@ const COMMITTEE_CACHE_CAPACITY: usize = 2;
 /// fork choice, rather than kept in a global or rebuilt inside each helper:
 /// which shufflings are worth keeping resident, and how much memory that may
 /// cost, is the owner's decision and not something a leaf helper can answer. A
-/// caller with no cache of its own (a fixture runner, a one-off lookup) passes
-/// a fresh [`CommitteeCache::default`] and gets exactly the behaviour that
-/// existed before this type: derive, use, drop.
+/// caller with no cache of its own (a one-off lookup, a helper walking a batch
+/// of attestations for a single epoch) holds a fresh
+/// [`CommitteeCache::default`] for as long as that work lasts: each shuffling
+/// it needs is derived once, shared across the batch, and dropped with the
+/// cache. A caller wanting a single committee and nothing else is better
+/// served by [`get_beacon_committee`], which does not shuffle the whole epoch.
 ///
 /// Entries are keyed by [`ShufflingId`], which is what keeps sharing sound
 /// across states; see that type for why an epoch number alone would not be.
+///
+/// # Eviction
+///
+/// Lighthouse's rule (`ShufflingCache::prune_cache`): a miss on a full cache
+/// drops the entry for the oldest epoch, but never one of the shufflings the
+/// canonical head pins through [`Self::update_head`]. Oldest-first rather than
+/// least-recently-used because an older epoch's shuffling is less likely to be
+/// asked for again than a newer one's, whichever branch either belongs to,
+/// while the head's are the ones its next block is certain to ask for. Every
+/// lookup is counted in `lean_beacon_committee_cache_lookups_total`, whose
+/// misses are what show whether the capacity is holding up.
 #[derive(Debug, Default)]
 pub struct CommitteeCache {
-    /// Newest-used entry last, so eviction on a miss always drops index `0`:
-    /// an ordinary least-recently-used cache, linear-scanned rather than
-    /// hash-indexed because [`COMMITTEE_CACHE_CAPACITY`] is 2 and a `HashMap`
-    /// would be more machinery than the two comparisons it replaces.
+    /// Resident shufflings in insertion order, which breaks ties between
+    /// entries of the same epoch. Linear-scanned rather than hash-indexed
+    /// because [`COMMITTEE_CACHE_CAPACITY`] is small enough that a `HashMap`
+    /// would be more machinery than the comparisons it replaces.
     entries: Vec<(ShufflingId, Arc<EpochCommittees>)>,
+    /// The block [`Self::update_head`] was last given, and the shufflings it
+    /// pinned for it. `None` until the owner reports a head, and for a cache
+    /// nobody reports one to, which then evicts on epoch alone.
+    head: Option<(Root, [Option<ShufflingId>; HEAD_SHUFFLINGS])>,
 }
 
 impl CommitteeCache {
@@ -346,22 +409,68 @@ impl CommitteeCache {
         let Some(id) = ShufflingId::new(state, epoch) else {
             // Unkeyable: derive it for this caller alone rather than risk
             // serving it to a state whose history was never compared.
+            crate::metrics::inc_committee_cache_lookups("unkeyable");
             return Arc::new(EpochCommittees::new(state, epoch));
         };
 
-        if let Some(position) = self.entries.iter().position(|(cached, _)| *cached == id) {
-            let entry = self.entries.remove(position);
-            let committees = Arc::clone(&entry.1);
-            self.entries.push(entry);
-            return committees;
+        if let Some((_, committees)) = self.entries.iter().find(|(cached, _)| *cached == id) {
+            crate::metrics::inc_committee_cache_lookups("hit");
+            return Arc::clone(committees);
         }
 
+        crate::metrics::inc_committee_cache_lookups("miss");
         let committees = Arc::new(EpochCommittees::new(state, epoch));
         if self.entries.len() >= COMMITTEE_CACHE_CAPACITY {
-            self.entries.remove(0);
+            self.evict_one();
         }
         self.entries.push((id, Arc::clone(&committees)));
         committees
+    }
+
+    /// The block root last passed to [`Self::update_head`], so the owner can
+    /// skip re-pinning a head that has not moved.
+    pub fn head_root(&self) -> Option<Root> {
+        self.head.as_ref().map(|(root, _)| *root)
+    }
+
+    /// Pins the shufflings the canonical head's children will ask for, so
+    /// eviction never drops them: `head_state`'s previous, current, and next
+    /// epochs'. `head_state` must be block `head_root`'s post-state.
+    ///
+    /// The ids come from `head_state`'s own `block_roots`, the way every
+    /// lookup computes its own. Each epoch's deciding slot falls before the
+    /// head's slot, and a descendant of the head inherits every root below
+    /// that slot unchanged, so a lookup from any state built on the head names
+    /// exactly these ids. Only the pinning is replaced here: whatever the
+    /// previous head pinned stays resident until an insertion evicts it on
+    /// epoch like any other entry.
+    pub fn update_head(&mut self, head_root: Root, head_state: &BeaconState) {
+        let current = get_current_epoch(head_state);
+        let epochs = [get_previous_epoch(head_state), current, current + 1];
+        let ids = epochs.map(|epoch| ShufflingId::new(head_state, epoch));
+        self.head = Some((head_root, ids));
+    }
+
+    /// Drops the entry for the oldest epoch the head does not pin, the
+    /// earliest inserted among entries of the same epoch.
+    fn evict_one(&mut self) {
+        let pinned = |id: &ShufflingId| {
+            self.head
+                .as_ref()
+                .is_some_and(|(_, ids)| ids.contains(&Some(*id)))
+        };
+        let victim = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, _))| !pinned(id))
+            .min_by_key(|(_, (id, _))| id.epoch)
+            .map(|(position, _)| position);
+        // Always `Some` when the cache is full: the head pins at most
+        // `HEAD_SHUFFLINGS` entries, and the capacity is asserted to exceed it.
+        if let Some(position) = victim {
+            self.entries.remove(position);
+        }
     }
 }
 
@@ -371,20 +480,49 @@ impl CommitteeCache {
 /// committee of that epoch, so the committee index is a position within that
 /// single split rather than an independent draw.
 ///
-/// Builds a fresh [`EpochCommittees`] per call and drops it, so this is the
-/// right call only for a caller wanting one committee and no more. Anything
-/// deriving several committees of an epoch, or several epochs' worth over
-/// time, should hold a [`CommitteeCache`] and go through
-/// [`CommitteeCache::committees`]; see [`EpochCommittees`] for what the
-/// difference costs.
+/// The specification's own per-member derivation: one active-set scan, then
+/// one `SHUFFLE_ROUND_COUNT`-round shuffle for each member of this committee
+/// alone. That is the cheapest way to get one committee and the most
+/// expensive way to get many, so anything deriving several committees of an
+/// epoch should hold a [`CommitteeCache`] and go through
+/// [`CommitteeCache::committees`] instead; see [`EpochCommittees`] for what
+/// the difference costs.
+///
+/// Kept apart from [`EpochCommittees`] rather than built on it, so the tests
+/// holding that type to this function compare two independent derivations
+/// of the same committee.
 pub fn get_beacon_committee(
     state: &BeaconState,
     slot: Slot,
     index: CommitteeIndex,
 ) -> Result<Vec<ValidatorIndex>> {
-    Ok(EpochCommittees::new(state, compute_epoch_at_slot(slot))
-        .committee(slot, index)?
-        .to_vec())
+    let epoch = compute_epoch_at_slot(slot);
+    let active_indices = get_active_validator_indices(state, epoch);
+    let committees_per_slot = committee_count_per_slot(active_indices.len() as u64);
+    compute_committee(
+        &active_indices,
+        get_seed(state, epoch, constants::DOMAIN_BEACON_ATTESTER),
+        committee_number(slot, committees_per_slot, index)?,
+        committees_per_slot * preset::SLOTS_PER_EPOCH,
+    )
+}
+
+/// Which of its epoch's committees `index` at `slot` names:
+/// `(slot % SLOTS_PER_EPOCH) * committees_per_slot + index`, the position
+/// the specification's `get_beacon_committee` hands `compute_committee`.
+///
+/// The addition is checked because nothing upstream bounds `index`: fork
+/// choice's `on_attestation` reaches here with a gossip attestation's own
+/// `data.index`. The specification's `uint64` arithmetic raises on that
+/// overflow, where a release build would wrap it into a valid committee
+/// number and return a real committee. The product needs no check, being at
+/// most `SLOTS_PER_EPOCH * MAX_COMMITTEES_PER_SLOT`.
+fn committee_number(slot: Slot, committees_per_slot: u64, index: CommitteeIndex) -> Result<u64> {
+    ((slot % preset::SLOTS_PER_EPOCH) * committees_per_slot)
+        .checked_add(index)
+        .ok_or(Error::ArithmeticOverflow(
+            "(slot % SLOTS_PER_EPOCH) * committees_per_slot + index",
+        ))
 }
 
 /// The proposer for the state's current slot, dispatching on fork for the
@@ -466,8 +604,8 @@ pub fn get_domain(state: &BeaconState, domain_type: DomainType, epoch: Option<Ep
 
 #[cfg(test)]
 mod tests {
-    use super::super::shuffling::compute_committee;
     use super::*;
+    use crate::beacon::helpers::test_state::with_validators;
 
     #[test]
     fn previous_epoch_is_clamped_at_genesis() {
@@ -509,38 +647,52 @@ mod tests {
     }
 
     /// The whole-epoch permutation must place each committee exactly where the
-    /// specification's own per-member derivation does. Both forms are in the
-    /// tree ([`compute_committee`] is still the specification's spelling), so
-    /// this pins them to each other rather than to a recorded expectation: a
-    /// divergence here is a consensus split, and it would not show up as a
-    /// panic or an out-of-range index, only as a different committee.
+    /// specification's own per-member derivation does. [`get_beacon_committee`]
+    /// still derives committees that way, so this pins the two to each other
+    /// rather than to a recorded expectation: a divergence here is a consensus
+    /// split, and it would not show up as a panic or an out-of-range index,
+    /// only as a different committee.
+    ///
+    /// Run at two registry sizes, neither a multiple of the epoch's committee
+    /// count, so the split's rounding puts committees of different lengths side
+    /// by side; and the larger past the size that gives each slot more than one
+    /// committee. An even split with one committee per slot would leave both of
+    /// those boundary computations untested.
     #[test]
     fn sliced_committees_match_the_per_member_derivation() {
-        let count = 64;
-        let state = crate::beacon::helpers::test_state::with_validators(count);
-        let epoch = get_current_epoch(&state);
-        let committees = EpochCommittees::new(&state, epoch);
+        let several_per_slot = preset::SLOTS_PER_EPOCH * preset::TARGET_COMMITTEE_SIZE * 2 + 1;
 
-        let active_indices = get_active_validator_indices(&state, epoch);
-        let seed = get_seed(&state, epoch, constants::DOMAIN_BEACON_ATTESTER);
-        let per_slot = committees.committees_per_slot();
-
-        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
-            let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
-            for index in 0..per_slot {
-                let expected = compute_committee(
-                    &active_indices,
-                    seed,
-                    (slot % preset::SLOTS_PER_EPOCH) * per_slot + index,
-                    per_slot * preset::SLOTS_PER_EPOCH,
-                )
-                .unwrap();
-                assert_eq!(
-                    committees.committee(slot, index).unwrap(),
-                    expected.as_slice(),
-                    "slot {slot}, committee {index}"
+        for count in [100, several_per_slot as usize] {
+            let state = with_validators(count);
+            let epoch = get_current_epoch(&state);
+            let committees = EpochCommittees::new(&state, epoch);
+            let per_slot = committees.committees_per_slot();
+            if count as u64 == several_per_slot {
+                assert!(
+                    per_slot > 1,
+                    "{count} validators gave one committee per slot"
                 );
             }
+
+            let mut lengths = Vec::new();
+            for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+                let slot = compute_start_slot_at_epoch(epoch) + slot_offset;
+                for index in 0..per_slot {
+                    let sliced = committees.committee(slot, index).unwrap();
+                    let expected = get_beacon_committee(&state, slot, index).unwrap();
+                    assert_eq!(
+                        sliced,
+                        expected.as_slice(),
+                        "{count} validators, slot {slot}, committee {index}"
+                    );
+                    lengths.push(sliced.len());
+                }
+            }
+            assert_ne!(
+                lengths.iter().min(),
+                lengths.iter().max(),
+                "{count} validators split evenly, so the rounding went untested"
+            );
         }
     }
 
@@ -556,7 +708,7 @@ mod tests {
     /// the end of the epoch.
     #[test]
     fn a_committee_index_past_the_epoch_is_rejected() {
-        let state = crate::beacon::helpers::test_state::with_validators(64);
+        let state = with_validators(64);
         let epoch = get_current_epoch(&state);
         let committees = EpochCommittees::new(&state, epoch);
         let slot = compute_start_slot_at_epoch(epoch);
@@ -574,16 +726,48 @@ mod tests {
         );
     }
 
+    /// An `index` chosen so that the committee number wraps to exactly zero:
+    /// unchecked, a release build would return the epoch's first committee for
+    /// it, where the specification's `uint64` arithmetic raises. Nothing
+    /// upstream bounds `index` on fork choice's gossip path, so this is an
+    /// attacker's choice to make, and both derivations must refuse it.
+    #[test]
+    fn a_committee_number_that_would_wrap_is_rejected() {
+        let state = with_validators(64);
+        let epoch = get_current_epoch(&state);
+        let committees = EpochCommittees::new(&state, epoch);
+        let last_slot = compute_start_slot_at_epoch(epoch) + preset::SLOTS_PER_EPOCH - 1;
+        let per_slot = committees.committees_per_slot();
+        let wraps_to_zero = 0u64.wrapping_sub((preset::SLOTS_PER_EPOCH - 1) * per_slot);
+
+        assert!(committees.committee(last_slot, wraps_to_zero).is_err());
+        assert!(get_beacon_committee(&state, last_slot, wraps_to_zero).is_err());
+    }
+
+    /// A slot outside the epoch an [`EpochCommittees`] was built for is an
+    /// error, not a slice of the wrong epoch's shuffle at that slot's offset.
+    #[test]
+    fn a_slot_from_another_epoch_is_rejected() {
+        let state = with_validators(64);
+        let epoch = get_current_epoch(&state);
+        let committees = EpochCommittees::new(&state, epoch);
+        let next_epoch_slot = compute_start_slot_at_epoch(epoch + 1);
+        let previous_epoch_slot = compute_start_slot_at_epoch(epoch) - 1;
+
+        assert!(committees.committee(next_epoch_slot, 0).is_err());
+        assert!(committees.committee(previous_epoch_slot, 0).is_err());
+    }
+
     /// A second lookup of the same `(state, epoch)` must serve the first
     /// lookup's `EpochCommittees`, which is the whole point of the type: the
     /// shuffling is what an import spends its time on, and every attestation in
     /// a block asks for the same one.
     #[test]
     fn a_repeat_lookup_is_served_from_the_cache() {
-        // Far enough in that the state can name epoch `slot`'s deciding block:
-        // the genesis-adjacent epochs cannot be keyed at all, which
+        // Far enough in that the state can name epoch `slot`'s deciding block;
+        // the genesis state cannot key its own epochs, which
         // `an_unkeyable_epoch_is_not_cached` covers separately.
-        let mut state = crate::beacon::helpers::test_state::with_validators(64);
+        let mut state = with_validators(64);
         *state.slot_mut() = preset::SLOTS_PER_EPOCH * 4;
         let epoch = get_current_epoch(&state);
         let mut cache = CommitteeCache::default();
@@ -597,24 +781,22 @@ mod tests {
         );
     }
 
-    /// Distinct epochs are distinct keys, and the cache must not grow past its
-    /// capacity as they accumulate: an entry is one `u64` per active validator,
-    /// so an unbounded cache would outgrow the state it was derived from.
+    /// Distinct `(epoch, decision root)` pairs are distinct keys, and the cache
+    /// must not grow past its capacity as they accumulate: an entry is one
+    /// `u64` per active validator, so an unbounded cache would outgrow the
+    /// state it was derived from.
     #[test]
     fn the_cache_stays_within_its_capacity_bound() {
-        // `2..=current` are all keyable at this slot, and differ in epoch, so
-        // each is a distinct entry: `current` is chosen to give more of them
-        // than the cache is allowed to hold.
-        let mut state = crate::beacon::helpers::test_state::with_validators(64);
-        *state.slot_mut() = preset::SLOTS_PER_EPOCH * (COMMITTEE_CACHE_CAPACITY as u64 + 3);
-        let current = get_current_epoch(&state);
         let mut cache = CommitteeCache::default();
 
-        for epoch in 2..=current {
+        for n in 0..COMMITTEE_CACHE_CAPACITY + 5 {
+            let (branch, epoch) = nth_key(n);
+            let state = state_on_branch(branch, LOOKUP_EPOCH);
             cache.committees(&state, epoch);
-            assert!(
-                !cache.entries.is_empty(),
-                "epoch {epoch} was not keyable, so this asserts nothing about capacity"
+            assert_eq!(
+                cache.entries.last().map(|(id, _)| *id),
+                Some(ShufflingId::new(&state, epoch).expect("keyable by construction")),
+                "key {n} was not stored, so this asserts nothing about capacity"
             );
             assert!(
                 cache.entries.len() <= COMMITTEE_CACHE_CAPACITY,
@@ -624,14 +806,140 @@ mod tests {
         }
     }
 
+    /// A miss on a full cache drops the entry for the oldest epoch, not the
+    /// first one inserted: the fill below inserts its newest epoch first, so
+    /// the two rules disagree about which entry goes.
+    #[test]
+    fn a_miss_evicts_the_oldest_epoch_first() {
+        let mut cache = CommitteeCache::default();
+        let mut inserted = Vec::new();
+        for n in 0..COMMITTEE_CACHE_CAPACITY {
+            let (branch, epoch) = nth_key(n);
+            let state = state_on_branch(branch, LOOKUP_EPOCH);
+            cache.committees(&state, epoch);
+            inserted.push(ShufflingId::new(&state, epoch).expect("keyable by construction"));
+        }
+        let oldest_epoch = inserted.iter().map(|id| id.epoch).min().unwrap();
+        let expected_victim = *inserted.iter().find(|id| id.epoch == oldest_epoch).unwrap();
+        assert_ne!(
+            expected_victim, inserted[0],
+            "the fill did not separate epoch order from insertion order"
+        );
+
+        cache.committees(&state_on_branch(u8::MAX, LOOKUP_EPOCH), LOOKUP_EPOCH);
+
+        let resident: Vec<ShufflingId> = cache.entries.iter().map(|(id, _)| *id).collect();
+        assert!(
+            !resident.contains(&expected_victim),
+            "the oldest epoch's entry survived: {resident:?}"
+        );
+        for id in inserted.iter().filter(|id| **id != expected_victim) {
+            assert!(resident.contains(id), "{id:?} was evicted instead");
+        }
+    }
+
+    /// The head's previous, current, and next shufflings survive any number of
+    /// misses, even when they are the oldest entries resident, which is
+    /// exactly what the epoch rule would otherwise drop first. The pins are
+    /// computed from the head's own state and matched against lookups from a
+    /// later state on the same branch, which is also what shows the two agree
+    /// on the ids.
+    #[test]
+    fn the_heads_shufflings_are_never_evicted() {
+        let head_epoch = *keyable_epochs().start() + 1;
+        let head_state = state_on_branch(1, head_epoch);
+        let head_root = Root::repeat_byte(0xaa);
+        let mut cache = CommitteeCache::default();
+        cache.update_head(head_root, &head_state);
+        assert_eq!(cache.head_root(), Some(head_root));
+        let pinned: Vec<ShufflingId> = [head_epoch - 1, head_epoch, head_epoch + 1]
+            .into_iter()
+            .map(|epoch| ShufflingId::new(&head_state, epoch).expect("keyable by construction"))
+            .collect();
+
+        for n in 0..COMMITTEE_CACHE_CAPACITY * 3 {
+            let (branch, epoch) = nth_key(n);
+            cache.committees(&state_on_branch(branch, LOOKUP_EPOCH), epoch);
+        }
+
+        let resident: Vec<ShufflingId> = cache.entries.iter().map(|(id, _)| *id).collect();
+        for id in &pinned {
+            assert!(
+                resident.contains(id),
+                "pinned {id:?} was evicted: {resident:?}"
+            );
+        }
+        assert!(cache.entries.len() <= COMMITTEE_CACHE_CAPACITY);
+    }
+
+    /// The epoch the cache tests look up from.
+    const LOOKUP_EPOCH: Epoch = 9;
+
+    /// Epochs a state at [`LOOKUP_EPOCH`] can key under either preset. The
+    /// minimal preset's `SLOTS_PER_HISTORICAL_ROOT` window reaches back only a
+    /// few epochs, and a key needs its deciding slot inside it, so this is
+    /// narrower than the mainnet preset alone would allow.
+    fn keyable_epochs() -> std::ops::RangeInclusive<Epoch> {
+        LOOKUP_EPOCH - 6..=LOOKUP_EPOCH + 1
+    }
+
+    /// A state at `epoch`'s first slot whose every block root is `branch`'s
+    /// marker, so two branches key every epoch under different deciding
+    /// roots: distinct entries without needing distinct epochs, which the
+    /// minimal preset's short window has too few of to overfill the cache.
+    fn state_on_branch(branch: u8, epoch: Epoch) -> BeaconState {
+        let mut state = with_validators(64);
+        *state.slot_mut() = compute_start_slot_at_epoch(epoch);
+        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+            state.block_roots_mut()[slot] = Root::repeat_byte(branch);
+        }
+        state
+    }
+
+    /// The `n`-th `(branch, epoch)` key the cache tests insert: every keyable
+    /// epoch newest first, then the same again on the next branch. Starting
+    /// from the newest epoch is what makes eviction by epoch and eviction by
+    /// insertion order pick different entries.
+    fn nth_key(n: usize) -> (u8, Epoch) {
+        let epochs: Vec<Epoch> = keyable_epochs().rev().collect();
+        let branch = u8::try_from(n / epochs.len() + 1).expect("few enough keys");
+        (branch, epochs[n % epochs.len()])
+    }
+
+    /// Past slot 0, epochs 0 and 1 are keyed like any other, on the genesis
+    /// block's root, so the chain's first attestations share a shuffling
+    /// rather than each deriving its own. A state that descends from a
+    /// different genesis block must not be served that entry.
+    #[test]
+    fn the_first_two_epochs_are_keyed_on_the_genesis_block() {
+        let state = with_validators(64);
+        let mut cache = CommitteeCache::default();
+
+        for epoch in [constants::GENESIS_EPOCH, constants::GENESIS_EPOCH + 1] {
+            let first = cache.committees(&state, epoch);
+            let second = cache.committees(&state, epoch);
+            assert!(Arc::ptr_eq(&first, &second), "epoch {epoch} was not cached");
+        }
+
+        let genesis_epoch = cache.committees(&state, constants::GENESIS_EPOCH);
+        let mut other_genesis = state.clone();
+        other_genesis.block_roots_mut()[0] = Root::repeat_byte(0x01);
+        let other = cache.committees(&other_genesis, constants::GENESIS_EPOCH);
+        assert!(
+            !Arc::ptr_eq(&genesis_epoch, &other),
+            "a state from another genesis block was served this one's shuffling"
+        );
+    }
+
     /// An epoch whose deciding block the state cannot name is derived but not
-    /// stored. Genesis is the case that reaches this in practice: there is no
-    /// slot before epoch 0, so there is no root to key on, and serving such a
-    /// lookup from a key it does not really have is exactly the unsoundness
-    /// [`ShufflingId`] exists to prevent.
+    /// stored. Genesis is the case that reaches this in practice: the genesis
+    /// state sits at slot 0, which is the deciding slot of its own first two
+    /// epochs, and a state cannot name the root of the slot it is at. Serving
+    /// such a lookup from a key it does not really have is exactly the
+    /// unsoundness [`ShufflingId`] exists to prevent.
     #[test]
     fn an_unkeyable_epoch_is_not_cached() {
-        let mut state = crate::beacon::helpers::test_state::with_validators(64);
+        let mut state = with_validators(64);
         *state.slot_mut() = 0;
         let mut cache = CommitteeCache::default();
 

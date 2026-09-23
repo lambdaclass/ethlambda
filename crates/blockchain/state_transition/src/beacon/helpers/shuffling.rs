@@ -9,7 +9,9 @@
 //! The cost is that shuffling one index runs `SHUFFLE_ROUND_COUNT` rounds of
 //! hashing, so computing a whole committee this way rehashes the same rounds
 //! repeatedly. That is the specification's own formulation and what the fixtures
-//! pin down, so it is what this implements.
+//! pin down, so [`compute_shuffled_index`] and [`compute_committee`] implement it
+//! as written. [`shuffle_list`] computes the same permutation for a whole list at
+//! once, which is what deriving every committee of an epoch actually wants.
 
 use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
@@ -59,76 +61,101 @@ pub fn compute_shuffled_index(index: u64, index_count: u64, seed: Bytes32) -> Re
     Ok(index)
 }
 
-/// The whole-list form of [`compute_shuffled_index`]: `result[p]` equals
-/// `compute_shuffled_index(p, index_count, seed).unwrap()` for every `p` in
-/// `0..index_count`, computed together instead of one call per `p`.
+/// The whole-list form of [`compute_shuffled_index`], applied to `list`:
+/// position `i` of the result holds `list[compute_shuffled_index(i, n, seed)]`
+/// for every `i` in `0..n`, where `n` is `list.len()`. That is the order
+/// [`compute_committee`] reads its `indices` in, so shuffling an epoch's active
+/// set through this once lays out every committee of the epoch as a contiguous
+/// run of the result.
 ///
-/// [`compute_shuffled_index`] rehashes from scratch for every position it is
-/// asked about: `SHUFFLE_ROUND_COUNT` pivot hashes, and for each round a fresh
-/// 256-position "source" window hash even though the caller only ever reads
-/// one bit out of it. Asked about the same `(seed, index_count)` many times,
-/// which is exactly what one epoch's worth of
-/// [`super::accessors::get_beacon_committee`] calls does, that repeats the
-/// same rounds of hashing once per position instead of once per epoch.
+/// Shuffles `list` in place and hands the same buffer back, so the caller's
+/// active set becomes the shuffled set with no second list alongside it.
 ///
-/// This instead processes one round across every position at a time: one
-/// pivot hash, then one source hash per 256-position window
-/// (`index_count.div_ceil(256)` of them, since a permutation of `index_count`
-/// positions covers every window at least once, so precomputing all of them
-/// up front costs no more than the minimum any position in that window would
-/// need) rather than one source hash per position queried, however many of
-/// those there turn out to be.
+/// # How
 ///
-/// Verified against [`compute_shuffled_index`] directly, over a range of
-/// sizes and seeds including the 0-, 1-, and 2-element edge cases, by
-/// [`tests::whole_list_shuffle_matches_the_per_index_shuffle`]: the two must
-/// compute the same permutation, since this is a performance change to how
-/// the permutation is derived and not a change to what the permutation is.
-pub fn compute_shuffled_indices(index_count: u64, seed: Bytes32) -> Vec<u64> {
-    let n = index_count;
-    let mut positions: Vec<u64> = (0..n).collect();
+/// Each swap-or-not round is an involution on positions: it pairs `i` with
+/// `(pivot - i) mod n`, and swaps a pair when the round's source bit at the
+/// higher of the two positions is set. So a round needs one decision per
+/// *pair*, not per position, and the pairs split into two runs that can each
+/// be walked in order: `i + j = pivot` for `i, j` in `0..=pivot`, and
+/// `i + j = pivot + n` for `i, j` in `pivot + 1..n`. Each run is walked from
+/// its outer ends inward, with `j` the higher member, stepping down: the
+/// source hash covers a 256-position window, so `j` rehashes only on crossing
+/// into the next window down, and reloads its byte only every eighth
+/// position. Self-paired positions (`i == j`) are fixed points and never
+/// visited.
+///
+/// Rounds run last to first. [`compute_shuffled_index`] applies round `0`
+/// first to an *index*, so gathering a *list* through the same rounds has to
+/// apply them in the opposite order for position `i` to end up holding
+/// `list[compute_shuffled_index(i)]`.
+///
+/// The algorithm is protolambda's, as lighthouse ships it in
+/// `swap_or_not_shuffle::shuffle_list` with `forwards = false`. Verified
+/// position by position against [`compute_shuffled_index`] by
+/// [`tests::whole_list_shuffle_matches_the_per_index_shuffle`]: a mistake in
+/// the pairing would still yield *a* permutation, quietly wrong, rather than a
+/// panic.
+pub fn shuffle_list(mut list: Vec<ValidatorIndex>, seed: Bytes32) -> Vec<ValidatorIndex> {
+    let n = list.len();
     if n < 2 {
-        // `compute_shuffled_index` would divide by `n` immediately below; for
-        // `n == 1` every round's pivot, flip, and bit computation is moot
-        // anyway, since the only valid index always flips to itself. `n == 0`
-        // has no valid index at all, so the empty permutation is the only
-        // sensible answer.
-        return positions;
+        // No pair to swap. `compute_shuffled_index` would also divide by `n`
+        // below, and for `n == 1` the only position always flips to itself.
+        return list;
     }
 
-    let window_count = n.div_ceil(256) as usize;
-    let mut window_hashes: Vec<Bytes32> = Vec::with_capacity(window_count);
+    // `seed || round || window`, the layout both of the specification's hash
+    // inputs share: the pivot hashes the first 33 bytes, a source window all
+    // 37. Written once per round and patched per window, rather than rebuilt.
+    let mut input = [0u8; 37];
+    input[..32].copy_from_slice(&seed.0);
+    let source = |input: &mut [u8; 37], position: usize| {
+        // `position` is below `VALIDATOR_REGISTRY_LIMIT`, so its window number
+        // fits the specification's `uint32`.
+        input[33..].copy_from_slice(&((position / 256) as u32).to_le_bytes());
+        hash(&input[..]).0
+    };
 
-    for round in 0..preset::SHUFFLE_ROUND_COUNT {
-        let round_byte = round as u8;
+    for round in (0..preset::SHUFFLE_ROUND_COUNT).rev() {
+        input[32] = round as u8;
+        let pivot = (bytes_to_uint64(&hash(&input[..33]).0[0..8]) % n as u64) as usize;
 
-        let mut pivot_input = Vec::with_capacity(33);
-        pivot_input.extend_from_slice(&seed.0);
-        pivot_input.push(round_byte);
-        let pivot = bytes_to_uint64(&hash(&pivot_input).0[0..8]) % n;
-
-        window_hashes.clear();
-        for window in 0..window_count {
-            let mut source_input = Vec::with_capacity(37);
-            source_input.extend_from_slice(&seed.0);
-            source_input.push(round_byte);
-            source_input.extend_from_slice(&(window as u32).to_le_bytes());
-            window_hashes.push(hash(&source_input));
+        // Pairs `(i, pivot - i)`, `i` below the midpoint of `0..=pivot`.
+        let mut window = source(&mut input, pivot);
+        let mut byte = window[(pivot % 256) / 8];
+        for i in 0..pivot.div_ceil(2) {
+            let j = pivot - i;
+            if j % 256 == 255 {
+                window = source(&mut input, j);
+            }
+            if j % 8 == 7 {
+                byte = window[(j % 256) / 8];
+            }
+            if (byte >> (j % 8)) & 1 == 1 {
+                list.swap(i, j);
+            }
         }
 
-        for value in positions.iter_mut() {
-            let flip = (pivot + n - *value) % n;
-            let position = (*value).max(flip);
-            let window = &window_hashes[(position / 256) as usize];
-            let byte = window.0[((position % 256) / 8) as usize];
-            let bit = (byte >> (position % 8)) % 2;
-            if bit == 1 {
-                *value = flip;
+        // Pairs `(i, pivot + n - i)`, `i` from `pivot + 1` up to the midpoint
+        // of `pivot + 1..n`, so `j` walks down from `n - 1`.
+        let last = n - 1;
+        let mut window = source(&mut input, last);
+        let mut byte = window[(last % 256) / 8];
+        for (step, i) in (pivot + 1..(pivot + n).div_ceil(2)).enumerate() {
+            let j = last - step;
+            if j % 256 == 255 {
+                window = source(&mut input, j);
+            }
+            if j % 8 == 7 {
+                byte = window[(j % 256) / 8];
+            }
+            if (byte >> (j % 8)) & 1 == 1 {
+                list.swap(i, j);
             }
         }
     }
 
-    positions
+    list
 }
 
 /// The `index`-th of `count` committees drawn from `indices` under `seed`.
@@ -140,9 +167,17 @@ pub fn compute_committee(
 ) -> Result<Vec<ValidatorIndex>> {
     crate::beacon::verify(count > 0, "count > 0")?;
 
+    // Checked because `index` is only as bounded as the attestation it came
+    // from, and the specification's `uint64` arithmetic raises where a release
+    // build would wrap into a real committee's bounds.
+    let overflow = || Error::ArithmeticOverflow("len(indices) * (index + 1)");
     let total = indices.len() as u64;
-    let start = (total * index) / count;
-    let end = (total * (index + 1)) / count;
+    let start = total.checked_mul(index).ok_or_else(overflow)? / count;
+    let end = index
+        .checked_add(1)
+        .and_then(|past_index| total.checked_mul(past_index))
+        .ok_or_else(overflow)?
+        / count;
 
     let mut committee = Vec::with_capacity((end - start) as usize);
     for position in start..end {
@@ -296,20 +331,22 @@ mod tests {
         assert!(compute_proposer_index(&[], Bytes32::ZERO, 1, |_| Ok(1)).is_err());
     }
 
-    /// [`compute_shuffled_indices`] is a from-scratch reimplementation of the
-    /// same permutation [`compute_shuffled_index`] computes one position at a
-    /// time, sharing hashing across positions instead of repeating it. A bug
-    /// in the sharing would produce *a* permutation, quietly wrong, not a
-    /// panic or an out-of-range value, so this checks every position agrees
-    /// with the per-index function directly, across sizes small enough to be
-    /// exhaustive and large enough to cross several 256-position hash
-    /// windows, and across several seeds so no single seed's structure hides
-    /// a bug.
+    /// [`shuffle_list`] is a from-scratch reimplementation of the permutation
+    /// [`compute_shuffled_index`] computes one position at a time, walking each
+    /// round's swap pairs instead of each position. A bug in the pairing would
+    /// produce *a* permutation, quietly wrong, not a panic or an out-of-range
+    /// value, so this checks every position against the per-index function
+    /// directly, across sizes small enough to be exhaustive and large enough
+    /// to cross several 256-position hash windows, and across several seeds so
+    /// no single seed's pivots hide a bug.
     ///
-    /// Covers `index_count` 0, 1, and 2 explicitly (no shuffling, a
-    /// single-element no-op, and the smallest case with an actual swap to get
-    /// right), since those are exactly the sizes where an off-by-one in the
-    /// pairing or the early-return guard would show up.
+    /// The list shuffled is not `0..n` but values distinct from their own
+    /// positions, so a result that permuted positions the wrong way round
+    /// (scattering `list[i]` to `compute_shuffled_index(i)` rather than
+    /// gathering from it) cannot pass by coincidence. Covers 0, 1, and 2
+    /// explicitly (nothing to shuffle, a single fixed point, and the smallest
+    /// real swap), and sizes on both sides of a window boundary, where an
+    /// off-by-one in the rehash condition would show up.
     #[test]
     fn whole_list_shuffle_matches_the_per_index_shuffle() {
         let seeds = [
@@ -319,23 +356,20 @@ mod tests {
             Bytes32::repeat_byte(0x17),
         ];
         let sizes = [
-            0u64, 1, 2, 3, 4, 5, 16, 25, 100, 255, 256, 257, 511, 512, 1000,
+            0u64, 1, 2, 3, 4, 5, 16, 25, 100, 255, 256, 257, 511, 512, 1000, 1023, 1024, 1025, 2049,
         ];
 
         for seed in seeds {
             for &count in &sizes {
-                let whole_list = compute_shuffled_indices(count, seed);
-                assert_eq!(
-                    whole_list.len(),
-                    count as usize,
-                    "count={count}, seed={seed:?}"
-                );
+                let list: Vec<ValidatorIndex> = (0..count).map(|i| i * 3 + 7).collect();
+                let shuffled = shuffle_list(list.clone(), seed);
+                assert_eq!(shuffled.len(), list.len(), "count={count}, seed={seed:?}");
 
                 for position in 0..count {
-                    let expected = compute_shuffled_index(position, count, seed)
+                    let source = compute_shuffled_index(position, count, seed)
                         .expect("position is in range by construction");
                     assert_eq!(
-                        whole_list[position as usize], expected,
+                        shuffled[position as usize], list[source as usize],
                         "count={count}, seed={seed:?}, position={position}"
                     );
                 }
@@ -347,9 +381,9 @@ mod tests {
     fn empty_shuffle_has_no_positions() {
         // `compute_shuffled_index` has no valid input at all when
         // `index_count` is 0 (every index is out of range), so the whole-list
-        // form's only sensible answer is the empty permutation, checked here
-        // rather than folded into the sweep above since there is no per-index
-        // call to compare it against.
-        assert!(compute_shuffled_indices(0, Bytes32::ZERO).is_empty());
+        // form's only sensible answer is the empty list, checked here rather
+        // than folded into the sweep above since there is no per-index call to
+        // compare it against.
+        assert!(shuffle_list(Vec::new(), Bytes32::ZERO).is_empty());
     }
 }

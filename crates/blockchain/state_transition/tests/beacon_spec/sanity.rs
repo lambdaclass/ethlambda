@@ -47,6 +47,10 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
     // `check_transition` hashes is the specification's own state.
     let mut previous_state_root = None;
 
+    // One cache across the case's blocks, as the node holds one across its
+    // imports, so consecutive blocks of an epoch share its shuffling.
+    let mut committees = CommitteeCache::default();
+
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
         let block = SignedBeaconBlock::from_ssz(case.fork, &bytes)
@@ -56,15 +60,8 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(
-            state,
-            &block,
-            true,
-            config,
-            &engine,
-            &mut CommitteeCache::default(),
-        )
-        .map_err(|err| format!("block {index} rejected: {err:?}"))?;
+        stf::state_transition(state, &block, true, config, &engine, &mut committees)
+            .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());
     }

@@ -11,7 +11,7 @@ use ethlambda_state_transition::beacon::helpers::accessors::{
 use ethlambda_state_transition::beacon::helpers::misc::compute_signing_root;
 use ethlambda_state_transition::beacon::{bls, stf};
 use ethlambda_state_transition::is_proposer;
-use ethlambda_storage::{ALL_TABLES, Chain, Store};
+use ethlambda_storage::{ALL_TABLES, CacheKey, Chain, Store};
 use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
@@ -530,7 +530,9 @@ pub struct BlockChainServer {
     /// ~2.4M validators an import that derives one per attestation per pass
     /// spends most of its time doing nothing else. Keyed so that only states
     /// that really do agree on an epoch's committees share an entry; see
-    /// `CommitteeCache`. Always empty on lean, which has no beacon committees.
+    /// `CommitteeCache`. The actor also tells it which shufflings the head
+    /// needs, so eviction spares them; see [`Self::pin_head_shufflings`].
+    /// Always empty on lean, which has no beacon committees.
     committees: CommitteeCache,
 
     /// The lean-only or beacon-only half of this actor's state. See
@@ -2187,7 +2189,31 @@ impl BlockChainServer {
         if let Some((head_slot, _)) = self.store.beacon_head() {
             metrics::update_head_slot(head_slot);
         }
+        self.pin_head_shufflings();
         timings
+    }
+
+    /// Point the committee cache's eviction at the head fork choice just
+    /// recorded, so the shufflings that head's children will ask for are
+    /// never the ones a full cache drops; see `CommitteeCache::update_head`.
+    ///
+    /// Reads the head's post-state from the store's state cache only, never
+    /// reconstructing it: pinning only steers which entry a full cache evicts,
+    /// and the head is almost always a block this node just imported, whose
+    /// post-state `insert_state` left resident. A head whose state is no
+    /// longer cached (a reorg back to an old block) keeps the previous head's
+    /// pinning until a later head is resident, which at worst lets one of its
+    /// shufflings be evicted and rebuilt, never serves a wrong committee.
+    fn pin_head_shufflings(&mut self) {
+        let Some((_, head_root)) = self.store.beacon_head() else {
+            return;
+        };
+        if self.committees.head_root() == Some(head_root) {
+            return;
+        }
+        if let Some(head_state) = self.store.cached_state(CacheKey::BlockState(head_root)) {
+            self.committees.update_head(head_root, &head_state);
+        }
     }
 
     /// Tell the execution client where the chain's head, safe and finalized
