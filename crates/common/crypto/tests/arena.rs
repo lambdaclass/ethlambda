@@ -24,7 +24,7 @@ fn keypair_and_signature(
 
     let (sk, pk) =
         key_gen_from_seed(seed_bytes, first_slot, first_slot + 63).expect("valid slot range");
-    let sig = xmss::sign(&mut leanvm::rand::rng(), &sk, &message.0, signing_slot).expect("sign");
+    let sig = xmss::sign(&sk, &message.0, signing_slot).expect("sign");
 
     (
         ValidatorPublicKey::from_bytes(&pk.as_ssz_bytes()).unwrap(),

@@ -172,7 +172,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -183,7 +183,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1868,7 +1868,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2507,7 +2507,7 @@ checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 [[package]]
 name = "fiat_shamir"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "parallel",
  "primitives",
@@ -2545,7 +2545,7 @@ dependencies = [
 [[package]]
 name = "flock"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "fiat_shamir",
  "parallel",
@@ -3715,7 +3715,7 @@ checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 [[package]]
 name = "lean_compiler"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "lean_vm",
  "primitives",
@@ -3724,7 +3724,7 @@ dependencies = [
 [[package]]
 name = "lean_da"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "fiat_shamir",
  "parallel",
@@ -3737,7 +3737,7 @@ dependencies = [
 [[package]]
 name = "lean_vm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "fiat_shamir",
  "flock",
@@ -3751,7 +3751,7 @@ dependencies = [
 [[package]]
 name = "leanvm"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "clap",
  "lean_da",
@@ -4939,7 +4939,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5127,7 +5127,7 @@ dependencies = [
 [[package]]
 name = "parallel"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "libc",
 ]
@@ -5198,7 +5198,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 [[package]]
 name = "pcs"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "fiat_shamir",
  "parallel",
@@ -5435,7 +5435,7 @@ dependencies = [
 [[package]]
 name = "primitives"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "libc",
  "parallel",
@@ -5884,7 +5884,7 @@ dependencies = [
 [[package]]
 name = "rec_aggregation"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "bincode",
  "flock",
@@ -6221,7 +6221,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6706,7 +6706,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6766,7 +6766,7 @@ dependencies = [
 [[package]]
 name = "sphincs"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "parallel",
  "primitives",
@@ -6954,7 +6954,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7753,7 +7753,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8257,7 +8257,7 @@ dependencies = [
 [[package]]
 name = "xmss"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "ethereum_ssz",
  "parallel",
@@ -8426,7 +8426,7 @@ dependencies = [
 [[package]]
 name = "zk_alloc"
 version = "0.1.0"
-source = "git+https://github.com/leanEthereum/leanVM.git?rev=362a7c9b58ca29f8d57fb788ad6064b01e87deaa#362a7c9b58ca29f8d57fb788ad6064b01e87deaa"
+source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
 dependencies = [
  "libc",
 ]

@@ -82,7 +82,7 @@ hash_function: BLAKE2s
 encoding: TargetSum
 pubkey_bytes: 32
 lifetime: 4294967296
-leanvm_rev: 362a7c9b58ca29f8d57fb788ad6064b01e87deaa
+leanvm_rev: 48a904208d682848dac0e18ef8b01ebfc40df9ad
 log_num_active_epochs: 18
 num_active_epochs: 262144
 num_validators: 3

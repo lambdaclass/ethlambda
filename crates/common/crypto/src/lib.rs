@@ -9,19 +9,22 @@
 //! one slot) and Type-2 proofs (several messages merged); both travel without their
 //! participant pubkeys, which a receiver rebuilds from its own validator registry.
 //!
-//! # One aggregate type, grouped by slot
+//! # One aggregate type, grouped by `(epoch, message)`
 //!
 //! leanVM has a single `AggregateSignature`, whose XMSS claims are grouped by
-//! epoch: one [`XmssGroup`] per slot, carrying the one message signed at it and
-//! the group's strictly sorted, deduplicated keys. Type-1 and Type-2 are the
-//! same object here, one group versus several, and the wrappers below only
-//! differ in how many groups they build.
+//! `(epoch, message)`. This crate builds the same grouping: one [`XmssGroup`]
+//! per distinct pair, carrying that pair's strictly sorted, deduplicated keys.
+//! Type-1 and Type-2 are the same object here, one group versus several, and
+//! the wrappers below only differ in how many groups they build.
 //!
 //! Two consequences run through everything in this module:
 //!
-//! - **A slot carries one message.** Several distinct `AttestationData` at one
-//!   slot have no representation inside a single aggregate; that is
-//!   [`ConflictingMessages`].
+//! - **A slot can carry several messages.** Validators attest moments apart and
+//!   can see justification advance in between, so two distinct `AttestationData`
+//!   at one slot is ordinary rather than equivocation, and a proposer packs
+//!   both. Each pair is its own group, and the groups are ordered on the whole
+//!   pair: with two of them at one slot, ordering on the epoch alone would
+//!   rebuild a different signer set and fail a valid proof.
 //! - **The binding travels out of band.** The without-pubkeys wire form carries
 //!   neither the keys nor the `(slot, message)` pairs, so a decode has to
 //!   rebuild the whole signer set from the caller's own view of it (a
@@ -118,17 +121,6 @@ impl SignerSet {
     }
 }
 
-/// Two claims at one slot carrying different messages.
-///
-/// leanVM keys an aggregate's XMSS groups by epoch, so inside one proof the
-/// message is a function of the slot. Nothing in this crate can work around it:
-/// the group holds a single message, so the second claim has nowhere to go.
-#[derive(Debug, Clone, Copy, Error)]
-#[error("slot {slot} carries two different messages in one aggregate")]
-pub struct ConflictingMessages {
-    pub slot: u32,
-}
-
 /// Error type for signature aggregation operations.
 #[derive(Debug, Error)]
 pub enum AggregationError {
@@ -150,9 +142,6 @@ pub enum AggregationError {
     #[error("need at least 2 children for recursive aggregation, got {0}")]
     InsufficientChildren(usize),
 
-    #[error(transparent)]
-    ConflictingMessages(#[from] ConflictingMessages),
-
     #[error("split-by-message target not found in the aggregate's signer set")]
     UnknownMessage,
 
@@ -171,9 +160,6 @@ pub enum VerificationError {
 
     #[error("verification failed: {0}")]
     VerificationFailed(String),
-
-    #[error(transparent)]
-    ConflictingMessages(#[from] ConflictingMessages),
 }
 
 // =====================================================================
@@ -182,29 +168,24 @@ pub enum VerificationError {
 
 /// The signer set leanVM binds, built from the caller's view of the claims.
 ///
-/// One group per slot, holding that slot's message and its keys strictly sorted
-/// and deduplicated, with the groups themselves sorted by slot. Claims sharing a
-/// slot merge into one group, so their keys are unioned; claims sharing a slot
-/// under different messages are [`ConflictingMessages`].
+/// One group per `(slot, message)` pair, holding that pair's keys strictly
+/// sorted and deduplicated, with the groups themselves sorted on the pair.
+/// Claims sharing a pair merge into one group, so their keys are unioned; two
+/// messages at one slot are two groups, which is what a block carries whenever
+/// validators disagree inside a slot.
 ///
-/// Getting this structure wrong is not caught at decode: it changes the digest
+/// Getting the membership wrong is not caught at decode: it changes the digest
 /// the proof is checked against, so it surfaces as a verification failure.
-fn wire_keys(components: &[SignerSet]) -> Result<SignatureClaims, ConflictingMessages> {
+/// Getting the order wrong is caught, as a decode failure on a valid proof.
+fn wire_keys(components: &[SignerSet]) -> SignatureClaims {
     let mut groups: Vec<XmssClaimGroup> = Vec::with_capacity(components.len());
     for component in components {
         let keys = component.public_keys.iter().map(|pk| pk.as_inner().clone());
         match groups
             .iter_mut()
-            .find(|group| group.epoch == component.slot)
+            .find(|group| group.epoch == component.slot && group.message == component.message.0)
         {
-            Some(group) => {
-                if group.message != component.message.0 {
-                    return Err(ConflictingMessages {
-                        slot: component.slot,
-                    });
-                }
-                group.keys.extend(keys);
-            }
+            Some(group) => group.keys.extend(keys),
             None => groups.push(XmssClaimGroup {
                 epoch: component.slot,
                 message: component.message.0,
@@ -215,11 +196,16 @@ fn wire_keys(components: &[SignerSet]) -> Result<SignatureClaims, ConflictingMes
     for group in &mut groups {
         sort_dedup(&mut group.keys);
     }
-    groups.sort_unstable_by_key(|group| group.epoch);
-    Ok(SignatureClaims {
+    // leanVM wants the groups strictly increasing on `(epoch, message)`, and a
+    // slot can hold two of them, so the message is load-bearing in the order:
+    // ordering on the epoch alone leaves such a pair in the caller's order, and
+    // leanVM turns that away at decode as a malformed signer set, on a proof
+    // that is perfectly valid.
+    groups.sort_unstable_by_key(|group| (group.epoch, group.message));
+    SignatureClaims {
         xmss: groups,
         sphincs: Vec::new(),
-    })
+    }
 }
 
 /// [`wire_keys`] for a single claim, which cannot conflict with itself.
@@ -287,9 +273,9 @@ fn compress_to_byte_list(sig: &EthereumProof) -> Result<ByteList512KiB, Aggregat
 
 /// leanVM's aggregation errors, kept as their own text.
 ///
-/// They cover both proving failures and malformed requests (a slot carrying two
-/// messages, a child that does not verify, too many children); the message says
-/// which, and no caller here branches on the distinction.
+/// They cover both proving failures and malformed requests (a child that does
+/// not verify, too many children); the message says which, and no caller here
+/// branches on the distinction.
 fn aggregation_failed(err: leanvm::AggregationError) -> AggregationError {
     AggregationError::ProverFailure(err.to_string())
 }
@@ -475,11 +461,13 @@ pub fn verify_aggregated_signature(
 /// `to_bytes_without_pubkeys()` form of an aggregate over exactly that claim.
 ///
 /// The returned blob is the `to_bytes_without_pubkeys()` form of the merged
-/// aggregate, whose signer set is the union of the claims grouped by slot. A
-/// verifier decoding it back needs the same claims, in any order.
+/// aggregate, whose signer set is the union of the claims grouped by
+/// `(slot, message)`. A verifier decoding it back needs the same claims, in any
+/// order: [`wire_keys`] puts them back into leanVM's order.
 ///
-/// Two claims at one slot under different messages cannot be merged at all:
-/// leanVM rejects the pair rather than producing a proof (see the module docs).
+/// Two claims at one slot under different messages merge like any other pair,
+/// each into its own group. That is what a block carries whenever validators
+/// disagree inside a slot, so it is the ordinary case, not an edge one.
 pub fn merge_type_1s_into_type_2(
     type_1s: Vec<(SignerSet, ByteList512KiB)>,
 ) -> Result<ByteList512KiB, AggregationError> {
@@ -522,9 +510,9 @@ pub fn merge_type_1s_into_type_2(
 
 /// Verify a Type-2 merged proof against the claims the caller expects it to carry.
 ///
-/// The claims are rebuilt from the block body, grouped by slot into the signer
-/// set the proof's digest commits to, so a proof over other keys, other
-/// messages or other slots fails the SNARK verifier.
+/// The claims are rebuilt from the block body, grouped by `(slot, message)`
+/// into the signer set the proof's digest commits to, so a proof over other
+/// keys, other messages or other slots fails the SNARK verifier.
 pub fn verify_type_2_signature(
     proof_data: &[u8],
     components: &[SignerSet],
@@ -534,7 +522,7 @@ pub fn verify_type_2_signature(
         return Ok(());
     }
 
-    let keys = wire_keys(components)?;
+    let keys = wire_keys(components);
     let sig = EthereumProof::from_bytes_without_pubkeys(proof_data, keys)
         .map_err(|_| VerificationError::DeserializationFailed)?;
 
@@ -566,12 +554,12 @@ pub fn split_type_2_by_message(
         ));
     }
 
-    let keys = wire_keys(components)?;
+    let keys = wire_keys(components);
     let type_2 = EthereumProof::from_bytes_without_pubkeys(proof_data, keys)
         .map_err(|_| AggregationError::DeserializationFailed)?;
 
-    // A slot carries one message, so a message that appears at all appears in
-    // exactly one group unless two slots signed the very same bytes.
+    // Groups are keyed on `(epoch, message)`, so a message that appears at all
+    // appears in exactly one group unless two slots signed the very same bytes.
     let mut matches = type_2
         .xmss_signers()
         .iter()
@@ -623,8 +611,7 @@ mod tests {
         let (sk, pk) =
             key_gen_from_seed(seed_bytes, first_slot, first_slot + 63).expect("valid slot range");
 
-        let sig =
-            xmss::sign(&mut leanvm::rand::rng(), &sk, &message.0, signing_slot).expect("sign");
+        let sig = xmss::sign(&sk, &message.0, signing_slot).expect("sign");
 
         // Convert to ethlambda types via SSZ wire bytes.
         let validator_pk = ValidatorPublicKey::from_bytes(&pk.as_ssz_bytes()).unwrap();
@@ -660,10 +647,10 @@ mod tests {
     }
 
     /// The claim list a decode rebuilds has to match what was aggregated, and
-    /// the shapes leanVM's signer set requires are this wrapper's job: one
-    /// group per slot, keys sorted and deduplicated, groups sorted by slot.
+    /// the shapes leanVM's signer set requires are this wrapper's job: one group
+    /// per `(slot, message)`, keys sorted and deduplicated, groups sorted.
     #[test]
-    fn wire_keys_groups_by_slot_and_sorts() {
+    fn wire_keys_unions_keys_sharing_a_group_and_sorts() {
         let pk = |byte: u8| {
             ValidatorPublicKey::from_bytes(&[byte; 32]).expect("any 32 bytes decode as a pubkey")
         };
@@ -676,7 +663,7 @@ mod tests {
             SignerSet::new(msg_a, 4, vec![pk(2)]),
             SignerSet::new(msg_b, 9, vec![pk(1), pk(2)]),
         ];
-        let claims = wire_keys(&components).expect("one message per slot");
+        let claims = wire_keys(&components);
         let groups = &claims.xmss;
 
         assert!(claims.sphincs.is_empty(), "ethlambda signs XMSS only");
@@ -693,17 +680,46 @@ mod tests {
         );
     }
 
-    /// Distinct `AttestationData` at one slot cannot share an aggregate, so the
-    /// wrapper says so instead of handing leanVM a set it cannot represent.
+    /// Two validators disagreeing inside one slot is routine, not equivocation:
+    /// they attest moments apart and justification can advance in between, so a
+    /// proposer packing that slot has two distinct `AttestationData` to carry.
+    /// leanVM keys its groups on `(epoch, message)` and takes both, so the
+    /// wrapper builds both groups instead of rejecting the pair.
     #[test]
-    fn wire_keys_rejects_two_messages_at_one_slot() {
-        let pk = ValidatorPublicKey::from_bytes(&[7u8; 32]).expect("32 bytes decode");
+    fn wire_keys_keeps_two_messages_at_one_slot() {
+        let pk = |byte: u8| {
+            ValidatorPublicKey::from_bytes(&[byte; 32]).expect("any 32 bytes decode as a pubkey")
+        };
+        let msg_low = H256::from([0x11u8; 32]);
+        let msg_high = H256::from([0x22u8; 32]);
+
+        // Slot 6 under two messages, larger message first, plus a later slot: no
+        // part of the expected order is the input order.
         let components = vec![
-            SignerSet::new(H256::from([1u8; 32]), 6, vec![pk.clone()]),
-            SignerSet::new(H256::from([2u8; 32]), 6, vec![pk]),
+            SignerSet::new(msg_high, 6, vec![pk(9)]),
+            SignerSet::new(msg_low, 6, vec![pk(4), pk(2)]),
+            SignerSet::new(msg_low, 8, vec![pk(1)]),
         ];
-        let err = wire_keys(&components).expect_err("one slot, two messages");
-        assert_eq!(err.slot, 6);
+        let claims = wire_keys(&components);
+        let groups = &claims.xmss;
+
+        let shape: Vec<(u32, [u8; 32])> = groups
+            .iter()
+            .map(|group| (group.epoch, group.message))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(6, msg_low.0), (6, msg_high.0), (8, msg_low.0)],
+            "one group per (slot, message), strictly increasing on the pair"
+        );
+        // The digest is over this structure, so each claim's keys have to land in
+        // its own group and nowhere else.
+        let sizes: Vec<usize> = groups.iter().map(|group| group.keys.len()).collect();
+        assert_eq!(
+            sizes,
+            vec![2, 1, 1],
+            "keys follow their own (slot, message)"
+        );
     }
 
     #[test]
@@ -864,5 +880,47 @@ mod tests {
             split_type_2_by_message(merged.iter().as_slice(), &components, &msg_a).expect("split");
 
         verify_aggregated_signature(&split, vec![pk_a], &msg_a, slot_a).expect("verify split");
+    }
+
+    /// The interop case, end to end: one slot, two validators, two different
+    /// messages. The build path has always allowed it, since it hands leanVM one
+    /// claim at a time and leanVM groups by `(epoch, message)`; this pins the
+    /// verify path to the same reading, digest included.
+    ///
+    /// The claims are handed over with the larger message first, the way a block
+    /// body orders them: nothing about a block sorts its attestations. Only the
+    /// `(epoch, message)` sort inside [`wire_keys`] puts them back in leanVM's
+    /// canonical order. Sorting on the epoch alone leaves this pair as it came
+    /// in, and the decode then turns a perfectly valid proof away.
+    #[test]
+    #[ignore = "too slow"]
+    fn test_type_2_two_messages_at_one_slot_round_trip() {
+        init();
+        let msg_low = H256::from([0x11u8; 32]);
+        let msg_high = H256::from([0x22u8; 32]);
+        let slot: u32 = 9;
+
+        // Two keys, so neither signs twice at one slot: XMSS one-time-signature
+        // safety is per key, and two validators disagreeing reuses nothing.
+        let (pk_low, sig_low) = generate_keypair_and_sign(201, 5, slot, &msg_low);
+        let (pk_high, sig_high) = generate_keypair_and_sign(202, 5, slot, &msg_high);
+
+        let p_low =
+            aggregate_signatures(vec![pk_low.clone()], vec![sig_low], &msg_low, slot).unwrap();
+        let p_high =
+            aggregate_signatures(vec![pk_high.clone()], vec![sig_high], &msg_high, slot).unwrap();
+
+        let components = vec![
+            claim(msg_high, slot, &pk_high),
+            claim(msg_low, slot, &pk_low),
+        ];
+        let merged = merge_type_1s_into_type_2(vec![
+            (components[0].clone(), p_high),
+            (components[1].clone(), p_low),
+        ])
+        .expect("merge");
+
+        verify_type_2_signature(merged.iter().as_slice(), &components)
+            .expect("verify type-2 over two messages at one slot");
     }
 }
