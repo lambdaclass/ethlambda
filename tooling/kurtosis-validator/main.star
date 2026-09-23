@@ -1,0 +1,178 @@
+# A devnet from ethpandaops/ethereum-package, plus `ethlambda validator`.
+#
+# ethereum-package has no ethlambda client type, so this wraps it: run the
+# devnet exactly as the package would, then add the ethlambda validator client
+# as one more service in the same enclave, pointed at the first participant's
+# beacon node over the enclave network.
+#
+# # Whose keys the ethlambda validator signs with
+#
+# Keys that are in genesis but that no validator client in the devnet holds.
+# `network_params.preregistered_validator_count` is set above the participants'
+# total, so the genesis state registers the extra keys while ethereum-package
+# generates keystores only for the participants' ranges. This package derives
+# the tail range itself, from the same mnemonic, with the same tool.
+#
+# That exclusivity is not optional. The ethlambda validator client keeps no
+# slashing-protection record, so a key held by it and by any other client would
+# be signed twice every slot.
+
+ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
+
+# ethereum-package's own default, so the derived keys match its genesis unless
+# the args override the mnemonic.
+DEFAULT_MNEMONIC = "giant issue aisle success illegal bike spike question tent bar rely arctic volcano long crawl hungry vocal artwork sniff fantasy very lucky have athlete"
+
+KEYS_ARTIFACT = "ethlambda-validator-keys"
+KEYS_MOUNT = "/keys"
+METRICS_PORT = 5064
+
+
+def run(plan, args={}):
+    vc = args.get("ethlambda_validator", {})
+    devnet_args = {k: v for k, v in args.items() if k != "ethlambda_validator"}
+
+    network_params = devnet_args.get("network_params", {})
+    # One entry per participant ethereum-package will start, in its order:
+    # `count` expands one config entry into several identical participants.
+    keys_per_participant = []
+    for participant in devnet_args.get("participants", []):
+        keys = participant.get(
+            "validator_count", network_params.get("num_validator_keys_per_node", 128)
+        )
+        keys_per_participant += [keys] * participant.get("count", 1)
+    participants_total = 0
+    for keys in keys_per_participant:
+        participants_total += keys
+    genesis_total = network_params.get("preregistered_validator_count", 0)
+    if genesis_total <= participants_total:
+        fail(
+            (
+                "network_params.preregistered_validator_count ({}) must exceed the "
+                + "participants' validators ({}), or there are no keys left for the "
+                + "ethlambda validator that another client does not already hold"
+            ).format(genesis_total, participants_total)
+        )
+
+    first = vc.get("first_index", participants_total)
+    last = vc.get("last_index", genesis_total)  # exclusive
+    if first < participants_total or last > genesis_total or first >= last:
+        fail(
+            "ethlambda_validator keys [{}, {}) must lie within the unassigned range [{}, {})".format(
+                first, last, participants_total, genesis_total
+            )
+        )
+
+    output = ethereum_package.run(plan, devnet_args)
+    beacon_url = output.all_participants[0].cl_context.beacon_http_url
+
+    name = vc.get("name", "ethlambda-vc")
+    if "dora" in devnet_args.get("additional_services", []):
+        label_in_dora(plan, first, last, name)
+
+    mnemonic = network_params.get("preregistered_validator_keys_mnemonic", DEFAULT_MNEMONIC)
+    derive_keys(plan, mnemonic, first, last)
+
+    cmd = [
+        "validator",
+        "--beacon-nodes",
+        beacon_url,
+        "--validators-dir",
+        KEYS_MOUNT + "/validators",
+        "--secrets-dir",
+        KEYS_MOUNT + "/raw/secrets",
+        "--http-address",
+        "0.0.0.0",
+        "--metrics-port",
+        str(METRICS_PORT),
+        "--graffiti",
+        vc.get("graffiti", name),
+    ]
+    fee_recipient = vc.get("suggested_fee_recipient", "")
+    if fee_recipient:
+        cmd += ["--suggested-fee-recipient", fee_recipient]
+
+    plan.add_service(
+        name="vc-ethlambda",
+        config=ServiceConfig(
+            image=vc.get("image", "ghcr.io/lambdaclass/ethlambda:validator-local"),
+            cmd=cmd,
+            files={KEYS_MOUNT: KEYS_ARTIFACT},
+            ports={
+                "metrics": PortSpec(
+                    number=METRICS_PORT, transport_protocol="TCP", application_protocol="http"
+                ),
+            },
+        ),
+    )
+
+    plan.print(
+        "ethlambda validator signs for validators [{}, {}) via {}".format(first, last, beacon_url)
+    )
+    return output
+
+
+def derive_keys(plan, mnemonic, first, last):
+    """Derive keystores for [first, last) and the definitions file the client reads.
+
+    The same tool and flags ethereum-package uses for its own participants, so
+    these are the keys its genesis registered at those indices. `--insecure`
+    picks a cheap KDF, which matters on startup: the real one takes seconds per
+    key.
+    """
+    # One line, with the commands chained by `&&`. Kurtosis passes the script
+    # through in a way that breaks a multi-line `for ... do ... done` loop (a
+    # launch failed with `Syntax error: ";" unexpected`), so nothing here may
+    # depend on a newline surviving. The printf format is single-quoted so its
+    # `\n` reaches printf rather than the shell.
+    definition = (
+        "printf -- '- enabled: true\\n  voting_public_key: \"%s\"\\n"
+        + "  voting_keystore_path: {m}/raw/keys/%s/voting-keystore.json\\n"
+        + "  voting_keystore_password_path: {m}/raw/secrets/%s\\n'"
+        + ' "$pubkey" "$pubkey" "$pubkey" >> /out/validators/validator_definitions.yml'
+    ).format(m=KEYS_MOUNT)
+    script = " && ".join(
+        [
+            (
+                "/app/eth2-val-tools keystores --insecure --prysm-pass unused --out-loc /out/raw"
+                + ' --source-mnemonic "{}" --source-min {} --source-max {}'
+            ).format(mnemonic, first, last),
+            "mkdir -p /out/validators",
+            'for dir in /out/raw/keys/*; do pubkey=$(basename "$dir"); ' + definition + "; done",
+            'echo "derived $(ls /out/raw/keys | wc -l) keys"',
+        ]
+    )
+
+    plan.run_sh(
+        name="ethlambda-validator-key-derivation",
+        description="Deriving the ethlambda validator's keys [{}, {})".format(first, last),
+        image="protolambda/eth2-val-tools:latest",
+        run=script,
+        store=[StoreSpec(src="/out", name=KEYS_ARTIFACT)],
+    )
+
+
+def label_in_dora(plan, first, last, name):
+    """Name the ethlambda validator's range in Dora.
+
+    Dora labels validators from one file ethereum-package writes, listing only
+    its own participants, so without this our range shows as bare indices and
+    nothing on screen says ethlambda signed those blocks. Dora reads the file at
+    startup, so it is appended to and Dora restarted; a container restart keeps
+    its filesystem, so the edit survives.
+    """
+    plan.exec(
+        service_name="dora",
+        description="Naming validators [{}, {}) {} in Dora".format(first, last, name),
+        recipe=ExecRecipe(
+            command=[
+                "sh",
+                "-c",
+                "echo '{}-{}: {}' >> /validator-ranges/validator-ranges.yaml".format(
+                    first, last - 1, name
+                ),
+            ]
+        ),
+    )
+    plan.stop_service(name="dora", description="Restarting Dora to load the new name")
+    plan.start_service(name="dora", description="Restarting Dora to load the new name")

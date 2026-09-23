@@ -8,19 +8,22 @@
 | `ethlambda beacon <flags>` | The Ethereum Beacon Chain, as a gossip follower |
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
-`ethlambda benchmark` is the third subcommand and follows no chain: it is the
-offline benchmarking harness, covering block building (`benchmark synthetic`,
-run through `make bench`) and block import (`benchmark import fetch` /
+Two subcommands follow no chain. `ethlambda benchmark` is the offline
+benchmarking harness, covering block building (`benchmark synthetic`, run
+through `make bench`) and block import (`benchmark import fetch` /
 `benchmark import replay`). See [`benchmarking.md`](./benchmarking.md) for
-what each workload measures; `benchmark import`'s flags are at the end of this
-file. Everything else below is about the two subcommands that follow a chain.
+what each workload measures; `benchmark import`'s flags are in
+[their own section](#benchmark-import-flags) below. `ethlambda validator` is
+the validator client: a separate process that holds keys and performs duties
+against a beacon node over the standard REST API, documented in
+[its own section](#validator-flags) below.
 
 ## `node` is the default
 
 clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not `node`, `beacon`, `benchmark`,
-`help`, `-h`, `--help`, `-V`, or `--version`, then `node` is inserted ahead of
-it. The function is `inject_default_subcommand` in
+`validator`, `help`, `-h`, `--help`, `-V`, or `--version`, then `node` is
+inserted ahead of it. The function is `inject_default_subcommand` in
 `bin/ethlambda/src/command.rs`. Every subcommand has to be listed there: a
 missing one would have `node` inserted ahead of it and become unreachable.
 
@@ -241,6 +244,121 @@ carries it as an `Option` and the shared shutdown skips it.
 
 Not implemented here: block import and fork choice past the anchor. A decoded
 block is logged and dropped.
+
+## `validator` flags
+
+`ethlambda validator` is not a node. It binds no libp2p port, opens no
+database, runs no discovery and follows no chain: it holds validator keys and
+performs duties against a beacon node's standard REST API. It works against any
+conformant beacon node, this repository's `beacon` subcommand or another
+implementation's, so none of the [common flags](#common-flags) apply to it.
+
+> **It keeps no slashing-protection record.** Read
+> [Spec Deviations](./spec_deviations.md#the-validator-client-keeps-no-slashing-protection-record)
+> before running it with keys that hold real stake. In short: do not run these
+> keys in any other client while this one runs, and treat a restart with the
+> same care as a manual key move. The client repeats this warning at startup.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--beacon-nodes` | required | Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing |
+| `--validators-dir` | required | Directory holding the EIP-2335 keystores and `validator_definitions.yml` |
+| `--secrets-dir` | required | Directory holding one password file per keystore, named after the validator's public key |
+| `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
+| `--metrics-port` | `5064` | Prometheus metrics port |
+| `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
+| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
+| `--graffiti` | empty | Text for the graffiti field of proposed blocks. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer |
+| `--enable-keymanager` | off | Serve the keymanager API. Off by default because it mutates key material |
+
+### What it does today
+
+Attestations, block proposals and attestation aggregation.
+
+Each epoch it resolves its validators' indices, fetches their attester duties
+for this epoch and the next, fetches this epoch's proposer duties, subscribes
+to the committee subnets the attester duties need, and registers its fee
+recipient with the beacon node. The subscription also tells the node which
+committees this client will aggregate for, which it has to know in advance so
+it can collect the votes.
+
+Each slot it wakes at the boundary. If one of its validators proposes that
+slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
+the block is for the slot and proposer it asked about, signs it and publishes
+it. One third into the slot it fetches the attestation data, signs for every
+validator due that slot, and submits the batch. Two thirds in, for any duty it
+was selected to aggregate, it asks the node for the aggregate covering that
+committee's votes on the data it just signed, wraps it with the selection proof
+and publishes it.
+
+Aggregation is not a choice. A validator signs the slot under a dedicated
+domain, and whether the hash of that signature divides evenly by a modulus from
+the committee's size decides it. Signatures are deterministic, so a validator
+gets one answer per slot, cannot search for a better one, and cannot decline:
+the beacon node checks the same thing when the aggregate arrives.
+
+Proposals are bounded by that one-third mark rather than by the end of the
+slot. The specification defines no block-production deadline; the nearest thing
+it defines is the point attesters stop waiting for a block, which is the same
+instant. A proposal still running then has already lost most of the block's
+value, and every second past it comes out of this client's own attestations, so
+it is abandoned and the slot's attesters still vote.
+
+Electra is the earliest fork it will propose under. A deneb block body has one
+field fewer than an electra one, so it would need a container pair of its own,
+and it would buy nothing: the attestations this client submits are electra's
+`SingleAttestation`, which has no earlier form, so a pre-electra chain is one it
+cannot serve whatever it does with blocks. A block from any earlier fork is
+refused by name rather than failing to decode.
+
+Blocks are fetched and published as SSZ rather than JSON. Signing a block means
+computing its `hash_tree_root`, which only the typed container can give; a
+hand-written JSON mapping of an execution payload would be a large surface on
+which a single wrong field silently produces a signature over the wrong block.
+
+Not implemented: the builder flow and blinded blocks (the client asks for an
+unblinded block and refuses a blinded one), sync-committee duties, voluntary
+exits, doppelganger protection and remote signing.
+
+### Duty offsets come from the network
+
+The slot length and the two duty offsets are read from the beacon node's
+`/eth/v1/config/spec`, not divided out of a compiled-in constant. The
+specification states them as `SLOT_DURATION_MS` plus basis points of it,
+`ATTESTATION_DUE_BPS` and `AGGREGATE_DUE_BPS`, which on mainnet's 12-second slot
+work out at 3999 ms and 8000 ms.
+
+`SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
+a fallback, since deployed nodes still send it. A node sending both is required
+to agree with itself.
+
+### Proposer duties are less durable than attester ones
+
+Worth knowing if a proposal is ever missed after a reorg. An attester schedule
+depends on the block two epochs back and survives anything shallower; a
+proposer schedule depends on the block one epoch back, so a reorg that leaves
+attester duties untouched can still move a proposer between slots. This client
+fetches proposer duties once per epoch, at the boundary, so a reorg inside the
+epoch is not picked up until the next one.
+
+### The keymanager API
+
+Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
+`DELETE /eth/v1/keystores`, authenticated with a bearer token read from
+`api-token.txt` in the validators directory and generated there on first start
+if absent. The token file is written `0600` and a file too short to be a real
+token is refused rather than accepted.
+
+The specification requires TLS. This binds to `--http-address`, loopback by
+default; exposing it further means putting a TLS terminator in front.
+
+### Metrics
+
+Served on `--metrics-port`, prefixed `ethlambda_validator_` rather than the
+`lean_` used elsewhere in this repository, since this process follows the
+beacon chain. Every series is registered at startup so it reads zero rather
+than being absent before its first event, which is what lets an alert fire on
+"attestations stopped". See [Metrics](./metrics.md#validator-client).
 
 ## `benchmark import` flags
 

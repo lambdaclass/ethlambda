@@ -424,6 +424,63 @@ Observability into how many validators/subnets are covered by the attestations t
 
 ✅(*) **Partial support**: These metrics are implemented but not collected "on scrape" as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.
 
+## Validator client
+
+Served by `ethlambda validator` on its own `--metrics-port`, separate from the
+node's. Prefixed `ethlambda_validator_` rather than `lean_`, because this
+process follows the beacon chain and a `lean_` series here would be misleading
+on a shared dashboard.
+
+Every series is registered at startup rather than on first use, so each reads
+zero from the moment the process is up. That matters for alerting: a rule on
+"attestations stopped" cannot fire against a series that does not exist yet,
+and absent is not the same as zero.
+
+| Metric | Type | Description |
+|---|---|---|
+| `ethlambda_validator_validators_loaded` | Gauge | Validator keys loaded from the keystores |
+| `ethlambda_validator_validators_resolved` | Gauge | Loaded keys that have an index on chain, out of `validators_loaded`. A persistent gap means validators are deposited but not yet activated |
+| `ethlambda_validator_duties_held` | Gauge | Attester duties currently scheduled |
+| `ethlambda_validator_attestations_published_total` | Counter | Attestations a beacon node accepted |
+| `ethlambda_validator_attestation_failures_total` | Counter | Slots whose attestation duty failed and returned |
+| `ethlambda_validator_attestation_deadline_missed_total` | Counter | Slots whose duty never returned in time and was abandoned. Points at a slow or hung beacon node rather than a rejected attestation |
+| `ethlambda_validator_attestations_refused_total` | Counter | Signatures deliberately not attempted, because this process had already signed a conflicting attestation for that validator. Should normally read zero |
+| `ethlambda_validator_signing_failures_total` | Counter | Signatures attempted and failed |
+| `ethlambda_validator_blocks_proposed_total` | Counter | Blocks signed and accepted by a beacon node |
+| `ethlambda_validator_blocks_broadcast_not_imported_total` | Counter | Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of `blocks_proposed_total`, not a failure: the block reached the network. Points at that node's execution layer |
+| `ethlambda_validator_blocks_refused_total` | Counter | Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero |
+| `ethlambda_validator_block_proposal_failures_total` | Counter | Proposal duties that did not end in a published block, including ones abandoned for overrunning |
+| `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
+| `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
+| `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |
+| `ethlambda_validator_block_publication_delay_seconds` | Histogram | Slot start to block accepted. Its buckets are tighter than the attestation histogram's, because a block is due at the slot boundary rather than a third of the way in |
+| `ethlambda_validator_beacon_node_available` | Gauge | 1 when a beacon node answered the last duty refresh or attestation |
+| `ethlambda_validator_signing_duration_seconds` | Histogram | Time to sign one slot's batch, store read lock included |
+| `ethlambda_validator_publication_delay_seconds` | Histogram | Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset |
+
+Three of these distinguish failures that look alike on a dashboard but have
+different causes, and the distinction is the reason they are separate series:
+`attestation_failures_total` is a duty that ran and failed,
+`attestation_deadline_missed_total` is one that never finished, and
+`attestations_refused_total` is one deliberately not attempted. A rise in the
+second points at the beacon nodes; a rise in the third points at the clock or
+the duty schedule and is worth investigating even though the attestation was
+correctly suppressed.
+
+The proposal series split the same way, plus one that is neither a success nor
+a failure. `blocks_proposed_total` counts blocks a node accepted;
+`block_proposal_failures_total` counts duties that produced none;
+`blocks_refused_total` counts blocks deliberately not signed. Between them,
+`blocks_broadcast_not_imported_total` counts blocks that did reach the network
+but that the node answering could not import, which is a beacon-node fault
+rather than a validator one and is why it is not folded into either.
+
+Two series should read zero for the life of a healthy deployment, and are the
+ones worth alerting on at any non-zero value rather than on a rate:
+`attestations_refused_total` and `blocks_refused_total` mean this client's own
+guards caught a duty they judged unsafe, and `fee_recipient_mismatches_total`
+means blocks are being proposed that pay someone else.
+
 ## Troubleshooting
 
 ### Docker Desktop on MacOS

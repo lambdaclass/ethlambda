@@ -1,12 +1,13 @@
 //! Sub-command definition and dispatch.
 //!
-//! `node`, `beacon` and `benchmark` are ordinary clap sub-commands, so clap
-//! owns their help, usage lines and error messages. The one thing clap cannot
-//! express is a *default* sub-command, and the node needs one: the Dockerfile,
-//! lean-quickstart, the hive shim and the devnet skills all invoke the binary as
-//! a bare list of node flags, from before there was anything else to run. That
-//! form keeps working because a missing sub-command is filled in as `node`
-//! before parsing — see [`default_subcommand`].
+//! `node`, `beacon`, `benchmark` and `validator` are ordinary clap
+//! sub-commands, so clap owns their help, usage lines and error messages. The
+//! one thing clap cannot express is a *default* sub-command, and the node
+//! needs one: the Dockerfile, lean-quickstart, the hive shim and the devnet
+//! skills all invoke the binary as a bare list of node flags, from before
+//! there was anything else to run. That form keeps working because a missing
+//! sub-command is filled in as `node` before parsing — see
+//! [`default_subcommand`].
 
 use std::ffi::OsString;
 
@@ -25,6 +26,7 @@ const EXPLICIT: &[&str] = &[
     NODE,
     BEACON,
     BENCHMARK,
+    VALIDATOR,
     "help",
     "-h",
     "--help",
@@ -35,6 +37,7 @@ const EXPLICIT: &[&str] = &[
 const NODE: &str = "node";
 const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
+const VALIDATOR: &str = "validator";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -71,6 +74,8 @@ pub(crate) enum Command {
     Beacon(BeaconOptions),
     /// Benchmark block building offline against a controlled workload.
     Benchmark(BenchmarkOptions),
+    /// Run the beacon-chain validator client against a beacon node's HTTP API.
+    Validator(crate::validator::ValidatorOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -160,6 +165,38 @@ mod tests {
             Command::Node(options) => options,
             other => panic!("expected a node invocation, got {other:?}"),
         }
+    }
+
+    /// `validator` must be in `EXPLICIT`. Without it, `default_subcommand`
+    /// inserts `node` ahead of the first token and the invocation parses as
+    /// `ethlambda node validator`, which fails with a confusing message about
+    /// node flags rather than about the validator.
+    #[test]
+    fn the_validator_subcommand_is_not_given_a_default() {
+        let args = [
+            "ethlambda",
+            "validator",
+            "--beacon-nodes",
+            "http://localhost:5052",
+            "--validators-dir",
+            "/tmp/validators",
+            "--secrets-dir",
+            "/tmp/secrets",
+        ];
+        let command = try_parse_from(args.iter().map(OsString::from)).expect("invocation parses");
+        let options = match command {
+            Command::Validator(options) => options,
+            other => panic!("expected a validator invocation, got {other:?}"),
+        };
+        assert_eq!(options.beacon_nodes, vec!["http://localhost:5052"]);
+        assert_eq!(options.validators_dir, PathBuf::from("/tmp/validators"));
+    }
+
+    /// The historical flat form must keep working, unchanged.
+    #[test]
+    fn the_flat_node_form_still_parses_after_adding_validator() {
+        let options = node_options(FLAT);
+        assert_eq!(options.lean.node_id, "ethlambda_0");
     }
 
     #[test]

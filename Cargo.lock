@@ -1929,6 +1929,7 @@ dependencies = [
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
+ "ethlambda-validator",
  "eyre",
  "hex",
  "libc",
@@ -2169,6 +2170,42 @@ dependencies = [
  "serde_yaml_ng",
  "sha2",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ethlambda-validator"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum",
+ "blst",
+ "ctr",
+ "ethlambda-metrics",
+ "ethlambda-types",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "libc",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "pbkdf2",
+ "reqwest",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5593,6 +5630,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pem"
 version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6750,6 +6797,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+dependencies = [
+ "pbkdf2",
+ "salsa20",
+ "sha2",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7840,6 +7898,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8838,6 +8905,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

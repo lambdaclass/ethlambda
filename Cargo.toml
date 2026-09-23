@@ -15,6 +15,7 @@ members = [
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
+    "crates/validator",
 ]
 
 [workspace.package]
@@ -76,6 +77,7 @@ ethlambda-engine = { path = "crates/net/engine" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+ethlambda-validator = { path = "crates/validator" }
 
 tracing = "0.1"
 thiserror = "2.0.9"

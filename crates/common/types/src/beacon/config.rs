@@ -864,6 +864,24 @@ impl Config {
         self
     }
 
+    /// Override one fork's version, for a network whose schedule differs from
+    /// mainnet's. Phase0's version is `genesis_fork_version` and is set there.
+    pub fn with_fork_version(mut self, fork: ForkName, version: Version) -> Self {
+        match fork {
+            ForkName::Phase0 => self.genesis_fork_version = version,
+            ForkName::Altair => self.altair_fork_version = version,
+            ForkName::Bellatrix => self.bellatrix_fork_version = version,
+            ForkName::Capella => self.capella_fork_version = version,
+            ForkName::Deneb => self.deneb_fork_version = version,
+            ForkName::Electra => self.electra_fork_version = version,
+            ForkName::Fulu => self.fulu_fork_version = version,
+            // Matches `fork_version`'s own arm: reaching this means a caller
+            // dispatched on the wrong chain, which is a bug in the caller.
+            ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),
+        }
+        self
+    }
+
     /// The blob parameters in effect at `epoch`, as
     /// `(epoch, max_blobs_per_block)`, from fulu's [`Self::blob_schedule`].
     ///

@@ -1,25 +1,24 @@
 //! Slot and epoch arithmetic, signing domains, and merkle branch verification.
 //!
 //! These are the helpers that depend on nothing but their arguments, so unlike
-//! the accessors in [`super::accessors`] they never take a state.
+//! the accessors in [`super::accessors`] they never take a state. Slot/epoch
+//! arithmetic and the signing domains now live in `ethlambda-types` and are
+//! re-exported below at their old path. What is still implemented here is
+//! merkle branch verification, which needs this crate's `hash`, and
+//! [`compute_activation_exit_epoch`], which reads this crate's preset.
 
-use crate::beacon::constants;
-use crate::beacon::containers::shared::SigningData;
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
-use crate::beacon::primitives::{
-    Bytes32, Domain, DomainType, Epoch, HashTreeRoot as _, Root, Slot, Version,
+use crate::beacon::primitives::{Bytes32, Epoch, Root};
+
+// Relocated to `ethlambda-types` so that consumers which only sign or verify a
+// message can reach them without this crate's `blst`, `c-kzg` and RocksDB
+// dependencies. Re-exported at the old path so every use site inside this
+// module is unchanged.
+pub use ethlambda_types::beacon::signing::{
+    compute_deposit_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
+    compute_start_slot_at_epoch, fork_version_at_epoch,
 };
-
-/// The epoch containing `slot`.
-pub fn compute_epoch_at_slot(slot: Slot) -> Epoch {
-    slot / preset::SLOTS_PER_EPOCH
-}
-
-/// The first slot of `epoch`.
-pub fn compute_start_slot_at_epoch(epoch: Epoch) -> Slot {
-    epoch * preset::SLOTS_PER_EPOCH
-}
 
 /// The epoch at which an activation or exit initiated during `epoch` takes
 /// effect.
@@ -37,32 +36,6 @@ pub fn compute_activation_exit_epoch(epoch: Epoch) -> Epoch {
 // turn; re-exported here at its old path, since every signing domain below is
 // built from it.
 pub use ethlambda_types::beacon::fork_digest::compute_fork_data_root;
-
-/// The signing domain for a message type on a particular fork and chain.
-///
-/// The domain is the four-byte domain type followed by the first 28 bytes of the
-/// fork data root, so it fits in 32 bytes while still committing to both.
-pub fn compute_domain(
-    domain_type: DomainType,
-    fork_version: Version,
-    genesis_validators_root: Root,
-) -> Domain {
-    let fork_data_root = compute_fork_data_root(fork_version, genesis_validators_root);
-    let mut domain = [0u8; 32];
-    domain[..4].copy_from_slice(&domain_type);
-    domain[4..].copy_from_slice(&fork_data_root.0[..28]);
-    domain
-}
-
-/// The root a signature is actually computed over: the message's root combined
-/// with its domain.
-pub fn compute_signing_root(object_root: Root, domain: Domain) -> Root {
-    SigningData {
-        object_root,
-        domain,
-    }
-    .hash_tree_root()
-}
 
 /// Whether `leaf` at `index` is proven by `branch` against `root`.
 ///
@@ -93,83 +66,9 @@ pub fn is_valid_merkle_branch(
     value == root
 }
 
-/// The fork version in effect at `epoch`, given the state's fork schedule.
-///
-/// A message signed just before a fork boundary must still verify just after it,
-/// which is why the state keeps the previous version at all.
-pub fn fork_version_at_epoch(
-    fork: &crate::beacon::containers::shared::Fork,
-    epoch: Epoch,
-) -> Version {
-    if epoch < fork.epoch {
-        fork.previous_version
-    } else {
-        fork.current_version
-    }
-}
-
-/// The domain for a deposit signature.
-///
-/// Deposits are the one message signed under a genesis-independent domain, since
-/// a deposit has to be valid before the chain it funds has started, so it cannot
-/// commit to a genesis validators root.
-pub fn compute_deposit_domain(genesis_fork_version: Version) -> Domain {
-    compute_domain(constants::DOMAIN_DEPOSIT, genesis_fork_version, Root::ZERO)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon::containers::shared::Fork;
-
-    #[test]
-    fn slot_and_epoch_arithmetic_round_trips() {
-        for epoch in 0u64..5 {
-            let start = compute_start_slot_at_epoch(epoch);
-            assert_eq!(compute_epoch_at_slot(start), epoch);
-            // The last slot of an epoch still belongs to it.
-            assert_eq!(
-                compute_epoch_at_slot(start + preset::SLOTS_PER_EPOCH - 1),
-                epoch
-            );
-        }
-    }
-
-    #[test]
-    fn domain_carries_the_type_then_the_fork_data_prefix() {
-        let domain = compute_domain(
-            constants::DOMAIN_BEACON_ATTESTER,
-            [1, 0, 0, 0],
-            Root::repeat_byte(9),
-        );
-        assert_eq!(&domain[..4], &constants::DOMAIN_BEACON_ATTESTER);
-
-        let fork_data_root = compute_fork_data_root([1, 0, 0, 0], Root::repeat_byte(9));
-        assert_eq!(&domain[4..], &fork_data_root.0[..28]);
-    }
-
-    #[test]
-    fn domain_separates_forks_and_chains() {
-        let a = compute_domain(constants::DOMAIN_RANDAO, [1, 0, 0, 0], Root::ZERO);
-        let b = compute_domain(constants::DOMAIN_RANDAO, [2, 0, 0, 0], Root::ZERO);
-        let c = compute_domain(constants::DOMAIN_RANDAO, [1, 0, 0, 0], Root::repeat_byte(1));
-        assert_ne!(
-            a, b,
-            "a different fork version must give a different domain"
-        );
-        assert_ne!(a, c, "a different chain must give a different domain");
-    }
-
-    #[test]
-    fn fork_version_switches_at_the_boundary() {
-        let fork = Fork {
-            previous_version: [1, 0, 0, 0],
-            current_version: [2, 0, 0, 0],
-            epoch: 10,
-        };
-        assert_eq!(fork_version_at_epoch(&fork, 9), [1, 0, 0, 0]);
-        assert_eq!(fork_version_at_epoch(&fork, 10), [2, 0, 0, 0]);
-    }
 
     #[test]
     fn merkle_branch_verifies_only_at_its_own_index() {

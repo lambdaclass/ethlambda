@@ -5,6 +5,7 @@ mod cli;
 mod command;
 mod fd_limit;
 mod network;
+mod validator;
 mod version;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
@@ -98,6 +99,10 @@ fn main() -> eyre::Result<()> {
         Command::Benchmark(options) => {
             init_benchmark_logging()?;
             benchmark::run(options)
+        }
+        Command::Validator(options) => {
+            init_node_logging()?;
+            validator::run(options)
         }
     }
 }
