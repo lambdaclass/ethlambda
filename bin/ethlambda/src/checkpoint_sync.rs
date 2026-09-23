@@ -248,7 +248,7 @@ pub enum CheckpointSyncError {
 /// failing fast if the connection stalls. A plain total timeout would
 /// disconnect even for valid downloads if the state is simply too large to
 /// transfer within the time limit.
-fn build_client() -> Result<Client, CheckpointSyncError> {
+pub(crate) fn build_client() -> Result<Client, CheckpointSyncError> {
     Ok(Client::builder()
         .connect_timeout(CHECKPOINT_CONNECT_TIMEOUT)
         .read_timeout(CHECKPOINT_READ_TIMEOUT)

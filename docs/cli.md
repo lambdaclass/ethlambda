@@ -9,8 +9,11 @@
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
 `ethlambda benchmark` is the third subcommand and follows no chain: it is the
-offline block-building harness, run through `make bench`. Everything below is
-about the two that do.
+offline benchmarking harness, covering block building (`benchmark synthetic`,
+run through `make bench`) and block import (`benchmark import fetch` /
+`benchmark import replay`). See [`benchmarking.md`](./benchmarking.md) for
+what each workload measures; `benchmark import`'s flags are at the end of this
+file. Everything else below is about the two subcommands that follow a chain.
 
 ## `node` is the default
 
@@ -238,3 +241,31 @@ carries it as an `Option` and the shared shutdown skips it.
 
 Not implemented here: block import and fork choice past the anchor. A decoded
 block is logged and dropped.
+
+## `benchmark import` flags
+
+Neither sub-command follows a chain; see [`benchmarking.md`](./benchmarking.md#import-workload)
+for what the workload measures and why it exists.
+
+### `benchmark import fetch`
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--url` | required | Base URL of the source beacon node, e.g. `http://127.0.0.1:5052` |
+| `--from` | required | First slot of the range, and its first sample, so it must hold a block. The anchor is the block at the first slot of the epoch before it; the blocks in between are fetched too, and replayed as unsampled warm-up |
+| `--to` | required | Last slot of the range, inclusive. May not pass the source's head. Otherwise not capped: `fetch` streams, so a long range costs disk and time but not memory |
+| `--corpus` | required | Corpus directory to create |
+| `--force` | `false` | Replace an existing corpus in that directory |
+| `--network` | `mainnet` | Which network the source follows |
+
+### `benchmark import replay`
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--corpus` | required | Corpus directory written by `fetch` |
+| `--network` | `mainnet` | Which network the corpus belongs to. Checked against the manifest's recorded genesis validators root before anything is built |
+| `--data-dir` | required | Where to build the replay's RocksDB store. A real backend rather than the in-memory one, since state persistence is part of what is measured |
+| `--force` | `false` | Replace an existing store in that directory |
+| `--safe-slots-to-import-optimistically` | the specification's own value | How far behind the wall clock a block must be before it may be imported optimistically on age alone. Exposed for parity with `beacon`'s own flag of the same name; a corpus replay never sees the merge transition block it gates |
+| `--format` | `human` | `human` or `json` |
+| `--output` | none | Also write the JSON report to this file |

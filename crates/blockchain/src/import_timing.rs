@@ -216,8 +216,10 @@ impl ImportTimings {
     /// The `source` label this block reports under, or `None` for a block
     /// that is not reported at all.
     ///
-    /// Two values reach the metric, `gossip` and `sync`, and the two that do
-    /// not are deliberate.
+    /// Two values reach the metric on a node, `gossip` and `sync`, and the two
+    /// that do not are deliberate. A third, `replay`, only ever appears in the
+    /// offline import benchmark's own process, which reads its per-phase
+    /// numbers back from these observations.
     ///
     /// [`BlockSource::Deferred`] never appears. It says how a block reached
     /// the actor this time, not how it reached the node, and a deferred block
@@ -235,6 +237,7 @@ impl ImportTimings {
         match self.source {
             Some(BlockSource::Gossip) => Some("gossip"),
             Some(BlockSource::Sync) => Some("sync"),
+            Some(BlockSource::Replay) => Some("replay"),
             Some(BlockSource::Deferred) | None => None,
         }
     }
@@ -246,6 +249,7 @@ impl ImportTimings {
             Some(BlockSource::Gossip) => "gossip",
             Some(BlockSource::Sync) => "sync",
             Some(BlockSource::Deferred) => "deferred",
+            Some(BlockSource::Replay) => "replay",
             None => "local",
         }
     }
@@ -597,6 +601,7 @@ impl CascadeTimings {
         let source = match self.source {
             Some(BlockSource::Gossip) => "gossip",
             Some(BlockSource::Sync) => "sync",
+            Some(BlockSource::Replay) => "replay",
             // Same two exclusions a block's own sections make; see
             // `ImportTimings::source_label`.
             Some(BlockSource::Deferred) | None => return,

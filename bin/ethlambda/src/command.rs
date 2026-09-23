@@ -277,6 +277,39 @@ mod tests {
     }
 
     #[test]
+    fn the_import_workload_parses_both_phases() {
+        let fetch = try_parse_from([
+            "ethlambda",
+            "benchmark",
+            "import",
+            "fetch",
+            "--url",
+            "http://127.0.0.1:5052",
+            "--from",
+            "100",
+            "--to",
+            "200",
+            "--corpus",
+            "/tmp/c",
+        ])
+        .expect("fetch parses");
+        assert!(matches!(fetch, Command::Benchmark(_)));
+
+        let replay = try_parse_from([
+            "ethlambda",
+            "benchmark",
+            "import",
+            "replay",
+            "--corpus",
+            "/tmp/c",
+            "--data-dir",
+            "/tmp/d",
+        ])
+        .expect("replay parses");
+        assert!(matches!(replay, Command::Benchmark(_)));
+    }
+
+    #[test]
     fn bare_invocation_asks_for_a_sub_command() {
         // Nothing to default: clap prints the top-level help, which lists the
         // sub-commands, rather than a missing-argument list for one of them.

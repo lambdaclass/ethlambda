@@ -681,14 +681,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
-        } => BlockChain::spawn_beacon(
-            setup.store,
-            sync_status,
-            events,
-            custody_columns,
-            engine,
-            safe_slots_to_import_optimistically,
-        ),
+        } => {
+            check_custody_set(&custody_columns)?;
+            BlockChain::spawn_beacon(
+                setup.store,
+                sync_status,
+                events,
+                custody_columns,
+                engine,
+                safe_slots_to_import_optimistically,
+            )
+        }
     };
 
     let p2p_ref = p2p.actor_ref();
@@ -717,6 +720,20 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         shutdown,
     })
     .await;
+    Ok(())
+}
+
+/// Reject a beacon node with no custody set before it spawns.
+///
+/// `data_availability_for` used to refuse this per block. It cannot any more:
+/// the replay benchmark is a legitimate caller with an empty set, and the
+/// actor cannot tell the two apart. A node can, here, once, at startup.
+fn check_custody_set(custody_columns: &[u64]) -> eyre::Result<()> {
+    eyre::ensure!(
+        !custody_columns.is_empty(),
+        "beacon node computed an empty custody set; it would treat every fulu \
+         block as available without checking a column"
+    );
     Ok(())
 }
 
@@ -1932,6 +1949,20 @@ validators:
             .or(file.config.attestation_committee_count)
             .unwrap_or(1);
         assert_eq!(resolved, 1);
+    }
+
+    #[test]
+    fn a_beacon_node_refuses_an_empty_custody_set() {
+        // The per-block fence moved here. A node that reached the actor with
+        // no custody set would treat every fulu block as available without
+        // ever checking a column.
+        let err = check_custody_set(&[]).expect_err("an empty set must not start a node");
+        assert!(
+            err.to_string().contains("custody"),
+            "the error names what is wrong: {err}"
+        );
+
+        check_custody_set(&[0, 1, 2]).expect("a real custody set starts a node");
     }
 
     /// Slot of the anchor seeded into the test DB. Any non-zero slot works: a

@@ -1,16 +1,23 @@
-# Benchmarking block building
+# Benchmarking
 
-`ethlambda benchmark` measures block building the way the node performs it when
-it proposes, against a reproducible synthetic workload, with no devnet running.
+`ethlambda benchmark` measures two things the node does in production, each
+against a reproducible offline workload, with no devnet running:
 
-Block building is otherwise only observable through the Prometheus histograms a
-live node exports. Those are noisy, depend on whatever the network happened to
-be doing, and cannot be diffed against a baseline — which makes them a poor
-instrument for tracking performance. The benchmark
-trades network realism for repeatability: the same parameters produce the same
-blocks every run, so two reports differ only where the code differs.
+- **`synthetic`**: block building, the way the node performs it when it
+  proposes, on a synthetic in-memory chain built for the run.
+- **`import`**: block import, replaying a corpus of real blocks through the
+  node's own import path. See [Import workload](#import-workload) below.
 
-## Running it
+Both are otherwise only observable through the Prometheus histograms a live
+node exports. Those are noisy, depend on whatever the network happened to be
+doing, and cannot be diffed against a baseline, which makes them a poor
+instrument for tracking performance. Each benchmark trades some realism for
+repeatability: the same parameters (or the same corpus) produce the same
+result every run, so two reports differ only where the code differs.
+
+## Synthetic workload (block building)
+
+### Running it
 
 ```bash
 make bench                                  # defaults, mock crypto
@@ -50,7 +57,7 @@ second, which is why CI can afford to run one on every pull request.
 Logs go to stderr and the report to stdout, so `--format json` pipes straight
 into `jq`.
 
-## What it measures
+### What it measures
 
 Each iteration enters `produce_block_with_signatures` and then `seal_block` —
 the same functions `BlockChainServer::propose_block` calls — and the harness
@@ -91,7 +98,7 @@ part. Nothing is added to the hot path for the benchmark's benefit. The harness
 asserts each phase was observed exactly once per build and fails the run
 otherwise, because a mis-attributed report is worse than no report.
 
-## Reading a report
+### Reading a report
 
 ```
 Block-building benchmark — synthetic workload (real crypto)
@@ -130,7 +137,7 @@ sequence unchanged, it changed only speed and not which attestations were
 selected. If the roots move, the change altered block contents and the timing
 comparison means something different than intended.
 
-## Comparing two runs
+### Comparing two runs
 
 Same seed and same parameters produce identical root sequences, so a baseline
 and a candidate can be diffed directly. The header line exists to tell you when
@@ -146,18 +153,183 @@ they *cannot* be compared:
 
 Two reports that disagree on any of those are not measuring the same thing.
 
-## Limitations
+### Limitations
 
-- **Synthetic workloads only.** Replaying a real datadir is not implemented, so
-  results reflect a synthetic chain rather than a deep production state.
+- **Synthetic chain, not a production state.** This workload builds on a
+  genesis constructed for the run, not a deep chain. The [import
+  workload](#import-workload) below covers real production states instead, by
+  replaying real blocks rather than building synthetic ones.
 - **Short-lived keys.** Real-mode XMSS keys are generated for exactly the slots
   the run signs, so key generation is cheap but the OTS window advancement a
   long-lived validator key performs every 65,536 slots is never exercised.
 - **Mock mode skips the seal.** Without keys there is nothing to sign, so the
   three seal phases only appear in real runs.
 
-## In CI
+### In CI
 
 The Test job runs a short mock benchmark and asserts the JSON report's shape
 (`schema_version`, one sample per iteration). It costs seconds, and it means a
 change to the report contract cannot land unnoticed.
+
+## Import workload
+
+`ethlambda benchmark import` measures block import: the state transition,
+attestation processing, persistence and fork-choice work a node does for every
+block it receives, whether proposed locally or gossiped in. It replays a
+corpus of real blocks through the node's own import path, offline.
+
+### Why a corpus
+
+Measuring import on a live mainnet follower is possible, but the numbers it
+produces are hard to trust:
+
+- Each comparison leg needs a restart, so a run costs about ten minutes before
+  a single block is measured.
+- The denominator moves between legs. How much of that ten minutes was spent
+  actually importing, versus holding a block for data availability or waiting
+  on a column fetch, differs run to run with whatever the network happened to
+  be doing.
+- A live follower's process is not only importing. It is simultaneously
+  serving gossip, req/resp, discovery and column custody, all competing for
+  the same CPU the import path is trying to use.
+
+The work being measured, one block's state transition and its consequences, is
+deterministic. Capturing a range of real blocks once and replaying it offline
+removes all three problems: no restart between legs, no held-block noise in
+the denominator, and nothing else running in the process.
+
+### The two phases
+
+**`fetch`** pulls a slot range from a running beacon node's standard Beacon
+API into a corpus directory: a manifest, the anchor state and block the range
+builds on, and one SSZ file per non-empty slot from the anchor to the end of
+the range. The anchor sits on the first slot of an epoch (see
+[Requirements and limits](#requirements-and-limits)), so the blocks between it
+and `--from` are fetched too, and recorded as warm-up blocks the replay imports
+without sampling. It prints a progress line to stderr every hundred slots.
+
+A 404 from the Beacon API means an empty slot, a slot past the source's head, or
+one before its history, and `fetch` cannot tell those apart from the status
+alone. So it refuses a `--to` past the source's head, and checks that every
+block names the previous one as its parent: a block missing from the middle of
+the range, or a reorg between two requests, stops the fetch instead of turning
+into a replay that fails many minutes later. A fetch that fails removes the
+corpus directory if it was the one that created it.
+
+```bash
+ethlambda benchmark import fetch \
+  --url http://127.0.0.1:5052 \
+  --from 9123456 --to 9133456 \
+  --corpus ./corpus/9123456-9133456 \
+  --network mainnet
+```
+
+**`replay`** drives that corpus's blocks, in manifest order, through
+`BlockChainServer::import_block` on a freshly bootstrapped RocksDB store, and
+reports per-block, per-phase timings for the blocks in the range. Each block
+prints a progress line to stderr as it imports, since a mainnet block takes
+seconds and a long corpus would otherwise run silent for hours.
+
+```bash
+ethlambda benchmark import replay \
+  --corpus ./corpus/9123456-9133456 \
+  --data-dir ./replay-data \
+  --network mainnet \
+  --format json --output report.json
+```
+
+### What is measured
+
+The measured span is one `BlockChainServer::import_block` call per block, the
+same `on_block` entry a live node's own cascade uses. That covers the state
+transition, block-borne attestation processing, state persistence to RocksDB,
+and the beacon head recomputation: `on_block` recomputes the head itself after
+every import rather than waiting for a tick to do it, so that cost is inside
+the span too.
+
+Per-block, per-phase numbers come from the `lean_block_import_phase_seconds`
+histogram, read before and after each import the same way the synthetic
+workload reads its own histogram. A replayed block reports under
+`source="replay"`, a label no node ever writes, so it reaches the histogram
+without passing for a gossip or sync arrival. The phases are the
+`BLOCK_IMPORT_PHASES` labels: `decode`, `queue`, `defer`, `admit`, `guards`,
+`preamble`, `parent_wait`, `cascade_wait`, `da_check`, `columns_wait`, `engine`,
+`verify_struct`, `verify_crypto`, `stf`, `db_write`, `fc_head`, `block_atts`;
+plus the per-arrival sections that are not spans around the others, `prune`,
+`get_head` and `fcu`, since each `import_block` call is one arrival. `get_head`
+is where the head recomputation after every import is charged.
+
+### What is excluded, and why
+
+Replay runs nothing that a corpus already answers for:
+
+- **No execution client**, so `engine` reports a near-zero section with nothing
+  to call and `fcu` never runs. On a live follower paired with one, `engine` was
+  31ms p50, about 0.5% of an import; a replay's numbers are complete without it.
+- **An empty custody set**, so `columns_wait` never runs and no block is ever
+  held waiting on data availability. A corpus supplies every block directly;
+  there are no columns to wait for.
+- **No gossip, req/resp or discovery.** `replay` drives `import_block`
+  directly on the caller's task: no mailbox, no tick loop, no p2p, so none of
+  that traffic competes with import for CPU.
+
+A phase that did not run on a given block is **absent from that block's
+report, not zero**. That is what keeps a phase that genuinely took no time
+distinguishable from one that never ran at all.
+
+### Requirements and limits
+
+- **The anchor sits on the first slot of an epoch.** Fork choice makes the
+  anchor its finalized checkpoint at the anchor state's own epoch, and every
+  import walks back to that epoch's first slot to find the checkpoint's block.
+  From an anchor past that slot the walk steps below the anchor, onto a block
+  the store never held, and the first import fails with
+  `spec assertion failed: root in store.blocks`. So `fetch` anchors on the
+  block at the first slot of the epoch holding `--from - 1`, stepping back an
+  epoch at a time while that slot is empty, and fetches that block's own
+  post-state. `replay` refuses a corpus whose anchor is anywhere else, which
+  only a corpus fetched before this rule can have.
+- **The source node must still hold a state at the anchor slot.** Most beacon
+  nodes serve only recent states, so an old range fails at `fetch` with a 404
+  naming the state endpoint it tried.
+- **The range is deliberately not capped.** `fetch` streams: the anchor state
+  is the only state it ever holds, decoded once to read the genesis
+  fingerprint, written to disk and dropped before the block loop starts, and
+  each block is written as its response completes rather than accumulated. A
+  long range costs disk and time, not memory.
+- **A replay's RAM floor is the store's own state cache.** `replay` shares the
+  same `STATE_CACHE_CAPACITY`-bounded LRU (32 states) every node runs with,
+  which at 2.4M validators is roughly 11 GB. That ceiling belongs to the
+  store, not to this harness.
+- **`--network` selects the decoder, not just a genesis check.**
+  `decode_block` resolves each block's fork from its own slot through that
+  network's fork schedule, so replaying against the wrong network can decode a
+  block at the wrong fork. The manifest records the genesis validators root
+  the corpus was fetched against, and `replay` refuses a mismatch against
+  `--network` before decoding a single block.
+
+### How to A/B two revisions
+
+Fetch one corpus, then replay it twice, once per revision, against separate
+`--data-dir`s:
+
+```bash
+ethlambda benchmark import replay --corpus ./corpus/9123456-9133456 \
+  --data-dir ./replay-baseline --format json --output baseline.json
+
+ethlambda benchmark import replay --corpus ./corpus/9123456-9133456 \
+  --data-dir ./replay-candidate --format json --output candidate.json
+```
+
+The corpus is the fixed input both legs share, so `baseline.json` and
+`candidate.json` differ only where the code differs. `--format json --output
+<file>` is what makes that diffable; the human table on stdout is for reading
+a single run, not for diffing two.
+
+### Determinism
+
+Two replays of one corpus, on the same revision, import identical block roots
+in the same order. Each sample's `block_root` is a per-block checksum for
+exactly that: if a change alters the sequence of roots a corpus produces, it
+changed what got imported, not just how fast, and a timing comparison against
+that run means something different than intended.

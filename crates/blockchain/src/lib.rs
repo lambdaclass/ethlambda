@@ -666,7 +666,7 @@ enum ImportError {
 /// forever, inside `run_import_cascade`'s synchronous loop, with no yield
 /// point and a duplicate column fetch to peers on every turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImportOutcome {
+pub enum ImportOutcome {
     /// A post-state now exists under the block's root, whether this call
     /// wrote it or it already had one. Safe to unblock anything pending on
     /// this root.
@@ -758,23 +758,16 @@ fn data_availability_for(
                 return Some(fork_choice::DataAvailability::NotRequired);
             }
 
-            // Defensive: `das::custody_columns` never returns an empty set, so
-            // this is unreachable through the current wiring, but nothing
-            // enforces that at the type level. Falling through with an empty
-            // slice would make the presence check below vacuously true and
-            // the resulting `Columns(vec![])` vacuously available to
-            // `is_data_available_columns`, together admitting any
-            // commitments with no column ever checked — exactly what this
-            // gate exists to prevent.
-            if custody_columns.is_empty() {
-                error!(
-                    block_root = %ShortRoot(&block.message_hash_tree_root().0),
-                    "Refusing to treat a fulu block as available: this node's \
-                     custody set is empty while the data-availability gate is on"
-                );
-                return None;
-            }
-
+            // An empty custody set means there is nothing outstanding, not
+            // that the question is unanswerable: `custody_columns_present`
+            // below is vacuously true and the resulting `Columns(vec![])` is
+            // vacuously available, which is the right answer for a caller
+            // that supplied every block itself. Only the replay harness
+            // (`BlockChainServer::for_replay`) is in that position. A node
+            // cannot be: `run_node` asserts a non-empty set before spawning,
+            // `MainnetOptions::custody_group_count` floors at
+            // `CUSTODY_REQUIREMENT`, and `das::custody_columns` never returns
+            // an empty set.
             let slot = block.slot();
             let block_root = block.message_hash_tree_root();
 
@@ -1838,6 +1831,74 @@ impl BlockChainServer {
         // to the section it follows rather than to sections of its own.
         timings.absorb_tail(Instant::now());
         (timings, Ok(outcome))
+    }
+
+    /// Build an unspawned server for offline replay.
+    ///
+    /// No mailbox, no tick loop, no p2p: the caller drives every import
+    /// itself with [`Self::import_block`], on its own task. Every field is
+    /// what `start_actor` would give it, with three deliberate differences:
+    /// `p2p` is `None` (every use of it is guarded, so nothing here needs a
+    /// stub), the custody set is empty (a corpus supplies every block, so
+    /// there are no columns to wait on; see `data_availability_for`), and no
+    /// first tick is armed.
+    ///
+    /// The store clock is not placed here. Fork choice rejects a block from
+    /// the future, and a beacon store's clock starts at zero, so the caller
+    /// sets it per block through its own `Store` clone: the clock is a row in
+    /// the shared backend's metadata, not per-handle state.
+    pub fn for_replay(
+        store: Store,
+        engine: Option<EngineClient>,
+        safe_slots_to_import_optimistically: u64,
+    ) -> Self {
+        assert_eq!(
+            store.chain(),
+            Chain::Beacon,
+            "BlockChainServer::for_replay requires a beacon store"
+        );
+
+        Self {
+            store,
+            p2p: None,
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            blocks_awaiting_columns: HashMap::new(),
+            held_timings: HashMap::new(),
+            sidecars_awaiting_parent: HashMap::new(),
+            custody_columns: Vec::new(),
+            engine,
+            safe_slots_to_import_optimistically,
+            last_tick_instant: None,
+            sync_status: SyncStatusTracker::new(false),
+            sync_status_controller: SyncStatusController::default(),
+            events: EventBus::default(),
+            duties: ChainDuties::Beacon,
+            committees: CommitteeCache::default(),
+        }
+    }
+
+    /// Import one block on the caller's task.
+    ///
+    /// [`ImportOutcome::Imported`] means a post-state now exists under the
+    /// block's root; `Held` means none does; `None` means the block was
+    /// rejected. That return value is the completion signal, so no caller
+    /// needs to subscribe to the event bus and time out.
+    ///
+    /// Timed with [`ImportTimings::starting_now`], which is what that
+    /// constructor documents for a block entering from storage rather than
+    /// the wire, and tagged [`BlockSource::Replay`]. The tag is what gets the
+    /// sections published at all (a sourceless import publishes nothing, and
+    /// the replay harness reads its phases back from the histogram), and it
+    /// keeps them under a label of their own: a replayed block crossed no
+    /// wire, so its zero decode section folded into `gossip` or `sync` would
+    /// understate either one.
+    pub async fn import_block(&mut self, block: SignedBeaconBlock) -> Option<ImportOutcome> {
+        let timings = ImportTimings {
+            source: Some(BlockSource::Replay),
+            ..ImportTimings::starting_now()
+        };
+        self.on_block(block, timings).await
     }
 
     /// Process a newly received block, whichever chain it belongs to.
@@ -4836,6 +4897,32 @@ mod tests {
             data_availability_for(&store, &block, &CUSTODY).unwrap(),
             fork_choice::DataAvailability::Columns(sidecars) if sidecars.len() == 2
         ));
+    }
+
+    #[test]
+    fn an_empty_custody_set_means_nothing_to_wait_for() {
+        // The replay harness is the one legitimate caller with no custody set:
+        // it supplies every block itself and has no columns to wait on. The
+        // invariant that a real node custodies a non-empty set is enforced
+        // where a node is configured, not re-derived per block.
+        //
+        // With no column to require, `custody_columns_present` is vacuously
+        // true and the collected evidence is `Columns(vec![])` rather than
+        // `NotRequired`: the commitments are still there, so this is "nothing
+        // outstanding", not "no check needed", but the two are equally
+        // admissible to `is_data_available_columns`.
+        let store = beacon_store(0, 0);
+        let block = fulu_block_with_commitments(&store, 1);
+
+        let evidence = data_availability_for(&store, &block, &[]);
+
+        assert!(
+            matches!(
+                evidence,
+                Some(fork_choice::DataAvailability::Columns(sidecars)) if sidecars.is_empty()
+            ),
+            "an empty custody set has nothing outstanding, so the block is admissible"
+        );
     }
 
     #[test]

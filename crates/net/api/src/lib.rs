@@ -73,6 +73,16 @@ pub enum BlockSource {
     /// a held block out of the timeliness measurements its first arrival
     /// already fed.
     Deferred,
+    /// Read from a corpus by the offline import benchmark
+    /// (`ethlambda benchmark import replay`).
+    ///
+    /// The p2p layer never sends this one either. It exists so a replayed
+    /// block's import sections are published under a label of their own:
+    /// with no source at all they would not be published, and the harness
+    /// reads its per-phase numbers from exactly those observations, while
+    /// under `gossip` or `sync` they would pass for arrivals that crossed a
+    /// wire.
+    Replay,
 }
 
 /// When a block's payload reached this node.
