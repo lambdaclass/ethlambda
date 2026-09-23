@@ -285,23 +285,6 @@ from the Beacon API, and no other way.
   (a member asked after a restart answers `payload_present = false` for an
   envelope that arrived before it), and the next slot's record starts fresh.
 
-## `/eth/v1/node/identity` reports no ENR
-
-The endpoint's `enr`, `p2p_addresses` and `discovery_addresses` are empty
-rather than populated, which is not spec-valid.
-
-- **ethlambda:** `get_identity` (`crates/net/rpc/src/beacon/node.rs`) reports
-  `peer_id` and a placeholder `metadata` block and nothing else. The ENR is
-  built for discv5 and owned by the P2P actor; `BuiltSwarm` hands `run_node`
-  only a `local_peer_id`, so serving the record means widening the
-  `ethlambda-p2p` surface and threading it through startup.
-- **Beacon API:** `enr` is the node's base64 ENR and the two lists are its
-  libp2p multiaddrs.
-- **Consequence:** a consumer reading `enr` to dial this node gets an empty
-  string rather than a record, so peer discovery through this endpoint does not
-  work. Everything that reads `peer_id` is unaffected. Out of scope for the
-  change that added the Beacon API surface; a follow-up exposes the record.
-
 ## Sync duties are not served for a period before the head's
 
 `POST /eth/v1/validator/duties/sync/{epoch}` refuses a period before the head
