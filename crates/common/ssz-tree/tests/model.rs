@@ -10,11 +10,11 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
-use ethlambda_ssz_tree::{List, UpdateMap, Value, VecMap, Vector};
-use libssz::{SszDecode as _, SszEncode as _};
+use ethlambda_ssz_tree::{List, ProgressiveList, UpdateMap, Value, VecMap, Vector};
+use libssz::{DecodeError, SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher};
-use libssz_types::{SszList, SszVector};
+use libssz_types::{ProgressiveList as RefProgressiveList, SszList, SszVector};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -520,4 +520,370 @@ proptest! {
     ) {
         rebase_shrunk::<Item, 33, BTreeMap<usize, Item>>(orig_values, extra, hash_orig_first, hash_base_first)?;
     }
+}
+
+// ── ProgressiveList: parity with libssz_types::ProgressiveList (EIP-7916) ──
+
+/// Everything observable about `list` agrees with libssz's
+/// `ProgressiveList` over `model`.
+fn check_progressive_matches<T, U>(list: &ProgressiveList<T, U>, model: &[T])
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let reference = RefProgressiveList::from(model.to_vec());
+    assert_eq!(list.len(), model.len());
+    for (index, value) in model.iter().enumerate() {
+        assert_eq!(list.get(index), Some(value), "index {index}");
+    }
+    assert_eq!(list.get(model.len()), None);
+    assert_eq!(list.to_vec(), model);
+    assert_eq!(list.iter().len(), model.len());
+    assert_eq!(root(list), root(&reference));
+    let bytes = list.to_ssz();
+    assert_eq!(bytes, reference.to_ssz());
+    let decoded = ProgressiveList::<T, U>::from_ssz_bytes(&bytes).expect("round trip");
+    assert_eq!(root(&decoded), root(&reference));
+}
+
+fn run_progressive<T, U>(initial: Vec<T>, ops: Vec<Op<T>>)
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let mut list = ProgressiveList::<T, U>::from(initial.clone());
+    let mut model = initial;
+    check_progressive_matches(&list, &model);
+    for op in ops {
+        match op {
+            Op::Push(value) => {
+                list.push(value.clone())
+                    .expect("a progressive list has no limit");
+                model.push(value);
+            }
+            Op::Set(index, value) if !model.is_empty() => {
+                let index = index % model.len();
+                list[index] = value.clone();
+                model[index] = value;
+            }
+            Op::Set(..) => {}
+            Op::Apply => list.apply_updates(),
+        }
+        check_progressive_matches(&list, &model);
+    }
+}
+
+proptest! {
+    // Packed: 4 per chunk, so subtrees start at elements 0, 4, 20, 84, 340.
+    #[test]
+    fn progressive_u64(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
+        run_progressive::<u64, VecMap<u64>>(initial, ops);
+    }
+    // Composite: one per chunk, subtrees start at 0, 1, 5, 21, 85.
+    #[test]
+    fn progressive_item(initial in vec(item(), 0..100), ops in ops(item())) {
+        run_progressive::<Item, BTreeMap<usize, Item>>(initial, ops);
+    }
+    // Variable-size elements: the offset table spans every subtree.
+    #[test]
+    fn progressive_blob(initial in vec(blob(), 0..30), ops in ops(blob())) {
+        run_progressive::<Blob, VecMap<Blob>>(initial, ops);
+    }
+}
+
+#[test]
+fn progressive_boundaries_hash_like_libssz() {
+    // 0, 1, 5, 21, 85, 341 are the composite subtree boundaries (packed u64
+    // boundaries are 4, 20, 84, 340); 6, 22, 86, 342 are one past each of
+    // those, so a subtree that has just opened with a single element is
+    // exercised too, not only subtrees that are exactly full or exactly one
+    // short.
+    for len in [0usize, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86, 340, 341, 342] {
+        let values: Vec<u64> = (0..len as u64).collect();
+        check_progressive_matches(&ProgressiveList::<u64>::from(values.clone()), &values);
+        let items: Vec<[u8; 32]> = (0..len).map(|i| [i as u8; 32]).collect();
+        check_progressive_matches(&ProgressiveList::<[u8; 32]>::from(items.clone()), &items);
+    }
+}
+
+// ── ProgressiveList: iter_from ──
+
+#[test]
+fn progressive_iter_from_starts_at_the_given_index() {
+    // u64 packed boundaries: subtrees start at elements 0, 4, 20, 84, 340.
+    let values: Vec<u64> = (0..50).collect();
+    let list = ProgressiveList::<u64>::from(values.clone());
+
+    // Mid-subtree: inside subtree 2, which spans elements 20..84.
+    assert_eq!(
+        list.iter_from(30).copied().collect::<Vec<_>>(),
+        values[30..]
+    );
+    // Exactly at a subtree boundary: the first element of the next subtree.
+    assert_eq!(list.iter_from(4).copied().collect::<Vec<_>>(), values[4..]);
+    assert_eq!(
+        list.iter_from(20).copied().collect::<Vec<_>>(),
+        values[20..]
+    );
+    // At and past the end.
+    assert_eq!(list.iter_from(50).count(), 0);
+    assert_eq!(list.iter_from(100).count(), 0);
+    assert_eq!(list.iter().len(), 50);
+}
+
+// ── ProgressiveList: decode errors ──
+
+#[test]
+fn progressive_decode_rejects_a_length_not_a_multiple_of_the_element_size() {
+    let bytes = vec![0u8; 7]; // u64 is 8 bytes wide; 7 does not divide evenly.
+    let err = ProgressiveList::<u64>::from_ssz_bytes(&bytes).unwrap_err();
+    assert_eq!(
+        err,
+        DecodeError::InvalidByteLength {
+            expected: 8,
+            got: 7
+        }
+    );
+}
+
+#[test]
+fn progressive_decode_rejects_a_bad_offset_table_for_variable_size_elements() {
+    // First offset is 5, not a multiple of 4: the same bad input list.rs's
+    // own `decoding_a_first_offset_that_is_not_a_multiple_of_four_is_rejected_like_ssz_list`
+    // uses.
+    let bytes = vec![5u8, 0, 0, 0, 0];
+    let ours = ProgressiveList::<Blob>::from_ssz_bytes(&bytes).unwrap_err();
+    let reference = RefProgressiveList::<Blob>::from_ssz_bytes(&bytes).unwrap_err();
+    assert_eq!(ours, reference);
+}
+
+#[test]
+fn progressive_decode_reports_the_first_bad_fixed_size_element_not_the_last() {
+    // Two invalid `bool` bytes (neither 0 nor 1). The non-fused `map_while`
+    // bug this guards against (see the `.fuse()` comment in
+    // progressive_list.rs) would keep decoding past the first bad byte and
+    // surface the second failure instead of the first.
+    let bytes = vec![1u8, 2, 1, 3, 1];
+    let ours = ProgressiveList::<bool>::from_ssz_bytes(&bytes).unwrap_err();
+    let reference = RefProgressiveList::<bool>::from_ssz_bytes(&bytes).unwrap_err();
+    assert_eq!(ours, reference);
+    assert_eq!(ours, DecodeError::InvalidBooleanByte(2));
+}
+
+// ── ProgressiveList: rebase ──
+
+/// Applies `ops` to `list`, keeping `model` in sync. Mirrors `apply_ops`,
+/// unlike `run_progressive`, makes no assertions: only the final state
+/// matters to the rebase property.
+fn apply_progressive_ops<T, U>(
+    list: &mut ProgressiveList<T, U>,
+    model: &mut Vec<T>,
+    ops: Vec<Op<T>>,
+) where
+    T: Value,
+    U: UpdateMap<T>,
+{
+    for op in ops {
+        match op {
+            Op::Push(value) => {
+                list.push(value.clone())
+                    .expect("a progressive list has no limit");
+                model.push(value);
+            }
+            Op::Set(index, value) => {
+                if !model.is_empty() {
+                    let index = index % model.len();
+                    *list.get_mut(index).unwrap() = value.clone();
+                    model[index] = value;
+                }
+            }
+            Op::Apply => list.apply_updates(),
+        }
+    }
+}
+
+/// After `orig.rebase_on(base)`: `orig`'s elements are unchanged and its root
+/// matches a fresh `libssz_types::ProgressiveList` model of them; `base` is
+/// untouched (elements and root); and if the two hold equal elements (so the
+/// same number of subtrees too), `orig` shares every one of `base`'s
+/// subtrees. `ProgressiveList::ptr_eq` only compares the whole list (per-
+/// subtree sharing is not part of the public API), so unequal subtree counts
+/// are not otherwise observable here; the deterministic test below checks
+/// that case a different way.
+fn check_progressive_rebase<T, U>(
+    orig: &mut ProgressiveList<T, U>,
+    orig_model: &[T],
+    base: &ProgressiveList<T, U>,
+    base_model: &[T],
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    orig.rebase_on(base);
+
+    prop_assert_eq!(orig.to_vec(), orig_model.to_vec());
+    let orig_reference = RefProgressiveList::from(orig_model.to_vec());
+    prop_assert_eq!(root(orig), root(&orig_reference));
+
+    prop_assert_eq!(base.to_vec(), base_model.to_vec());
+    let base_reference = RefProgressiveList::from(base_model.to_vec());
+    prop_assert_eq!(root(base), root(&base_reference));
+
+    if orig_model == base_model {
+        prop_assert!(orig.ptr_eq(base));
+    }
+    Ok(())
+}
+
+/// `orig` derived from `base` by a random edit sequence, so `base` ends up
+/// with fewer (or equal) subtrees than `orig`: `Op::Push` only grows,
+/// `Op::Set` never removes a subtree.
+fn progressive_rebase_grown<T, U>(
+    base_values: Vec<T>,
+    ops: Vec<Op<T>>,
+    hash_base_first: bool,
+    hash_orig_first: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let base = ProgressiveList::<T, U>::from(base_values.clone());
+    if hash_base_first {
+        root(&base);
+    }
+
+    let mut orig = base.clone();
+    let mut orig_model = base_values.clone();
+    apply_progressive_ops(&mut orig, &mut orig_model, ops);
+    orig.apply_updates();
+
+    // Round-trip through SSZ bytes: a freshly decoded list shares nothing
+    // with `base`'s allocation, so any sharing the rebase produces comes
+    // from its own content-equality walk.
+    let bytes = orig.to_ssz();
+    let mut orig = ProgressiveList::<T, U>::from_ssz_bytes(&bytes).unwrap();
+    if hash_orig_first {
+        root(&orig);
+    }
+
+    check_progressive_rebase(&mut orig, &orig_model, &base, &base_values)
+}
+
+/// `base` derived from `orig` by pushing more elements onto a copy, so `base`
+/// ends up with more (or equal) subtrees than `orig`.
+fn progressive_rebase_shrunk<T, U>(
+    orig_values: Vec<T>,
+    extra: Vec<T>,
+    hash_orig_first: bool,
+    hash_base_first: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let built = ProgressiveList::<T, U>::from(orig_values.clone());
+    let bytes = built.to_ssz();
+    let mut orig = ProgressiveList::<T, U>::from_ssz_bytes(&bytes).unwrap();
+    if hash_orig_first {
+        root(&orig);
+    }
+
+    let mut base = ProgressiveList::<T, U>::from(orig_values.clone());
+    let mut base_model = orig_values.clone();
+    for value in extra {
+        base.push(value.clone())
+            .expect("a progressive list has no limit");
+        base_model.push(value);
+    }
+    base.apply_updates();
+    if hash_base_first {
+        root(&base);
+    }
+
+    check_progressive_rebase(&mut orig, &orig_values, &base, &base_model)
+}
+
+proptest! {
+    #[test]
+    fn progressive_u64_rebase_grown(
+        base_values in vec(zero_prone_u64(), 0..400),
+        ops in ops(zero_prone_u64()),
+        hash_base_first in any::<bool>(),
+        hash_orig_first in any::<bool>(),
+    ) {
+        progressive_rebase_grown::<u64, VecMap<u64>>(base_values, ops, hash_base_first, hash_orig_first)?;
+    }
+
+    #[test]
+    fn progressive_u64_rebase_shrunk(
+        orig_values in vec(zero_prone_u64(), 0..400),
+        extra in vec(zero_prone_u64(), 0..400),
+        hash_orig_first in any::<bool>(),
+        hash_base_first in any::<bool>(),
+    ) {
+        progressive_rebase_shrunk::<u64, VecMap<u64>>(orig_values, extra, hash_orig_first, hash_base_first)?;
+    }
+
+    #[test]
+    fn progressive_item_rebase_grown(
+        base_values in vec(item(), 0..100),
+        ops in ops(item()),
+        hash_base_first in any::<bool>(),
+        hash_orig_first in any::<bool>(),
+    ) {
+        progressive_rebase_grown::<Item, BTreeMap<usize, Item>>(base_values, ops, hash_base_first, hash_orig_first)?;
+    }
+
+    #[test]
+    fn progressive_item_rebase_shrunk(
+        orig_values in vec(item(), 0..100),
+        extra in vec(item(), 0..100),
+        hash_orig_first in any::<bool>(),
+        hash_base_first in any::<bool>(),
+    ) {
+        progressive_rebase_shrunk::<Item, BTreeMap<usize, Item>>(orig_values, extra, hash_orig_first, hash_base_first)?;
+    }
+}
+
+/// `rebase_on` reads a subtree's *committed* content only. A pending push
+/// that has just opened a new subtree (buffered, not yet folded into that
+/// subtree's own tree) contributes nothing to share until `apply_updates`
+/// runs. `orig` has the same subtree count as `base` (341 elements too), so
+/// `rebase_on`'s positional zip actually reaches the pending subtree rather
+/// than stopping short at `orig`'s length; its own value there differs from
+/// `base`'s pending one, so adopting it (a bug) would be observable. `base`
+/// is `&Self`, so rebasing another list onto it cannot change it either. A
+/// second rebase, after `base.apply_updates()` makes the two lists equal
+/// again, shows sharing resumes once there is something committed to share.
+#[test]
+fn progressive_rebase_ignores_a_pending_push_into_a_new_subtree() {
+    // u64 packs 4 per chunk; 340 elements exactly fill subtrees 0..3
+    // (capacities 4, 16, 64, 256), so a 341st element opens subtree 4.
+    let full: Vec<u64> = (0..340).collect();
+    let mut base = ProgressiveList::<u64>::from(full.clone());
+    base.push(9999).expect("a progressive list has no limit"); // buffered
+
+    let mut orig_values = full.clone();
+    orig_values.push(1111); // differs from base's pending 9999
+    let mut orig = ProgressiveList::<u64>::from(orig_values.clone());
+    orig.rebase_on(&base);
+
+    assert_eq!(orig.to_vec(), orig_values);
+    assert_eq!(
+        root(&orig),
+        root(&RefProgressiveList::from(orig_values.clone()))
+    );
+    let mut base_expected = full.clone();
+    base_expected.push(9999);
+    assert_eq!(base.to_vec(), base_expected);
+
+    // Once the pending write is folded in, the two lists have the same
+    // shape and content again, so a fresh rebase reclaims every subtree,
+    // including the one that was pending above.
+    base.apply_updates();
+    let mut orig = ProgressiveList::<u64>::from(base_expected);
+    orig.rebase_on(&base);
+    assert!(orig.ptr_eq(&base));
 }
