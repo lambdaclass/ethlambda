@@ -645,10 +645,12 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   catch-all `_`, so a real new fork still breaks every match that must grow one.
 - **Needs mutable element access on `SszList`/`SszVector`**, which no published
   libssz release has yet. Nothing extra is required here: the workspace already
-  tracks all four libssz crates from git at `36802dd` for the beacon containers
+  tracks all four libssz crates from git at `5cb1437` for the beacon containers
   in `ethlambda-types` (see the section above), and that rev is the `0.3.0`
-  release plus the single commit adding `DerefMut`/`IndexMut`
-  (lambdaclass/libssz#33). This module needs that commit for the same reason.
+  release plus `DerefMut`/`IndexMut` on `SszList` (lambdaclass/libssz#33),
+  `as_chunks` in the merkleize fold loop (#35), and the same `DerefMut`/
+  `IndexMut` for `ProgressiveList` (#37, an unmerged PR branch head for now).
+  This module needs the `SszList` commit (#33) for the same reason.
 - **Status:** all seven forks (phase0 through fulu) have containers, fork
   upgrades, state transitions, and epoch processing. Every fixture case passes
   on both presets: mainnet is 5705 cases and minimal 40009. The crate's lib
