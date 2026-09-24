@@ -446,6 +446,19 @@ impl BlockChainServer {
                         EarlyAggregationCheck,
                     );
                 }
+
+                // Warm the XMSS signing caches for the next slot so the signing
+                // paths don't have to, now that this slot's attestations are
+                // signed: a key caches one bottom subtree, so warming any earlier
+                // evicts the subtree this slot's attestation signs with whenever
+                // the two slots straddle a subtree boundary. This lands before
+                // interval 4 signs the next slot's block. A skipped interval-1
+                // tick costs only latency, since `sign` rebuilds the subtree
+                // itself on a miss.
+                let next_slot = slot + 1;
+                let proposer = self.get_our_proposer(next_slot);
+                self.key_manager
+                    .prepare_keys_for(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====
@@ -464,19 +477,6 @@ impl BlockChainServer {
                 } else {
                     metrics::inc_aggregator_skipped_not_aggregator();
                 }
-
-                // Warm the XMSS signing caches for the next slot so the signing
-                // paths don't have to, now that this slot's attestations are
-                // signed: a key caches one bottom subtree, so warming before
-                // interval 1 evicts the subtree this slot's attestation signs
-                // with whenever the two slots straddle a subtree boundary. This
-                // lands before interval 4 signs the next slot's block. A skipped
-                // interval-2 tick costs only latency, since `sign` rebuilds the
-                // subtree itself on a miss.
-                let next_slot = slot + 1;
-                let proposer = self.get_our_proposer(next_slot);
-                self.key_manager
-                    .prepare_keys_for(next_slot as u32, proposer);
             }
 
             // ==== interval 3 ====
