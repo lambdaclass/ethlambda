@@ -34,6 +34,9 @@ target
 # Beacon Chain spec test fixtures, downloaded by `make consensus-spec-tests`
 /consensus-spec-tests
 
+# BLS and KZG test vectors, downloaded by `make cryptography-specs`
+/cryptography-specs
+
 # The gossip validation vectors, from a newer release, downloaded by
 # `make consensus-spec-gossip-tests`
 /consensus-spec-tests-gossip
