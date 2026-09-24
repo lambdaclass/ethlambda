@@ -756,8 +756,11 @@ pub fn mark_validated(store: &mut Store, root: Root) {
     // With a healthy execution client nothing is optimistic, and the walk below
     // would exit on its own first iteration. Ask that before paying for
     // `block_index`, which is an uncached prefix scan of the whole `LiveChain`
-    // table (never pruned on beacon) plus a map build, on a path that runs once
-    // per imported block and once per `forkchoiceUpdated`.
+    // table plus a map build, on a path that runs once per imported block and
+    // once per `forkchoiceUpdated`. The table holds the unfinalized window
+    // (each finalization advance prunes it below the finalized block's own
+    // slot), which still grows with every block for as long as finality
+    // stalls.
     if !store.has_beacon_optimistic_roots() {
         return;
     }
@@ -2149,8 +2152,12 @@ pub fn validate_on_attestation(
 /// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
 /// shape) for the reason [`filter_block_tree`] does: a caller validating every
 /// attestation carried in one block ([`on_block_attestation`]) would otherwise
-/// re-scan `Table::LiveChain` once per attestation, and that table grows one
-/// row per imported block on a chain whose blocks are never pruned from it.
+/// re-scan `Table::LiveChain` once per attestation, and that table holds a
+/// row per imported block in the unfinalized window: the beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints)
+/// prunes it below the finalized block's own slot on each finalization
+/// advance, so its size follows the distance from the finalized block to the
+/// head, and grows with every block while finality stalls.
 fn validate_on_attestation_indexed(
     store: &Store,
     data: AttestationData,
