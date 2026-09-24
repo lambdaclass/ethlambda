@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::thread;
 use std::time::Instant;
 
 use ethlambda_crypto::signature::{ValidatorSecretKey, ValidatorSignature};
@@ -38,6 +40,30 @@ pub struct KeyManager {
     keys: HashMap<u64, ValidatorKeyPair>,
 }
 
+/// Which of a validator's two XMSS keys: each signs one kind of message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRole {
+    Attestation,
+    Proposal,
+}
+
+impl KeyRole {
+    /// Lowercase name, as it appears in key file names.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Attestation => "attestation",
+            Self::Proposal => "proposal",
+        }
+    }
+}
+
+/// Fewest keys worth a helper thread of [`KeyManager::prepare_keys_for`].
+///
+/// leanVM rebuilds a subtree sequentially, so the only parallelism is across
+/// keys. A batch this size still has a few rebuilds to spread its spawn cost
+/// over, and a key set no larger than one batch warms without spawning.
+const MIN_KEYS_PER_WARM_THREAD: usize = 4;
+
 impl KeyManager {
     pub fn new(keys: HashMap<u64, ValidatorKeyPair>) -> Self {
         Self { keys }
@@ -48,21 +74,48 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Warms every validator's signing cache for `slot`.
+    /// Warms the signing caches the duties at `slot` sign with: every
+    /// attestation key, plus `proposer`'s proposal key when one of our
+    /// validators proposes at `slot`.
     ///
     /// Pure latency shifting: the key rebuilds the same bottom Merkle subtree
     /// inside `sign` on a miss, so this only moves that cost off the duty's
-    /// critical path. Called one slot ahead, so a miss here is not yet a
-    /// failure to sign.
-    pub fn prepare_keys_for(&self, slot: u32) {
-        for (validator_id, key_pair) in &self.keys {
-            let _ = prepare_key(&key_pair.attestation_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to warm attestation key signing cache"),
-            );
-            let _ = prepare_key(&key_pair.proposal_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to warm proposal key signing cache"),
-            );
-        }
+    /// critical path. A key caches a single subtree, though, so warming it
+    /// evicts the subtree an earlier slot signs with whenever the two slots
+    /// straddle a subtree boundary. Call this only once nothing is left to sign
+    /// before `slot`, or that signature rebuilds the evicted subtree on its own
+    /// critical path.
+    ///
+    /// The other proposal keys are left cold: nothing signs with them before
+    /// their own turn to propose, and warming all of them rebuilds one subtree
+    /// per validator at every boundary.
+    ///
+    /// Blocks until every key is warm, with the rebuilds spread over at most
+    /// one thread per core (see [`for_each_batched`]). Each key knows which
+    /// subtree it holds and rebuilds only on a miss, so a repeat call for a
+    /// slot already warmed costs a lock per key and the thread spawns.
+    pub fn prepare_keys_for(&self, slot: u32, proposer: Option<u64>) {
+        let keys = self.keys_to_warm(proposer);
+        let start = Instant::now();
+        let max_threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        for_each_batched(&keys, max_threads, |&(validator_id, role, key)| {
+            prepare_key(validator_id, role, key, slot)
+        });
+        trace!(slot, keys = keys.len(), elapsed = ?start.elapsed(), "Warmed XMSS signing caches");
+    }
+
+    /// The keys [`Self::prepare_keys_for`] warms: every attestation key, then
+    /// `proposer`'s proposal key if that validator is ours.
+    fn keys_to_warm(&self, proposer: Option<u64>) -> Vec<(u64, KeyRole, &ValidatorSecretKey)> {
+        let attestation_keys = self
+            .keys
+            .iter()
+            .map(|(&id, pair)| (id, KeyRole::Attestation, &pair.attestation_key));
+        let proposal_key = proposer.and_then(|id| {
+            let pair = self.keys.get(&id)?;
+            Some((id, KeyRole::Proposal, &pair.proposal_key))
+        });
+        attestation_keys.chain(proposal_key).collect()
     }
 
     /// Signs an attestation using the validator's attestation key.
@@ -162,16 +215,56 @@ fn signable_at(
 }
 
 /// Warm one key's signing cache, timing the miss that rebuilds a subtree.
-fn prepare_key(key: &ValidatorSecretKey, slot: u32) -> Result<(), KeyManagerError> {
+///
+/// A failure only warns: `sign` rebuilds the subtree itself on a miss.
+fn prepare_key(validator_id: u64, role: KeyRole, key: &ValidatorSecretKey, slot: u32) {
     let start = Instant::now();
-    key.prepare(slot)
-        .map_err(|err| KeyManagerError::SigningError(err.to_string()))?;
-    trace!(slot, elapsed = ?start.elapsed(), "Warmed XMSS signing cache");
-    Ok(())
+    let result = key.prepare(slot);
+    let elapsed = start.elapsed();
+    let _ = result
+        .inspect(|()| trace!(slot, validator_id, ?role, ?elapsed, "Prepared XMSS key"))
+        .inspect_err(
+            |err| warn!(slot, validator_id, ?role, %err, "Failed to warm XMSS signing cache"),
+        );
+}
+
+/// Runs `f` on every item, in batches of at least [`MIN_KEYS_PER_WARM_THREAD`]
+/// items spread over at most `max_threads` threads, and returns once all are
+/// done.
+///
+/// The calling thread takes the first batch, so a single batch spawns nothing.
+/// A batch whose thread cannot be spawned also runs on the calling thread,
+/// which costs latency instead of panicking the caller.
+fn for_each_batched<T: Sync>(items: &[T], max_threads: usize, f: impl Fn(&T) + Sync) {
+    let batch_len = items
+        .len()
+        .div_ceil(max_threads.max(1))
+        .max(MIN_KEYS_PER_WARM_THREAD);
+    let mut batches = items.chunks(batch_len);
+    let Some(first) = batches.next() else {
+        return;
+    };
+    let f = &f;
+    thread::scope(|scope| {
+        let mut inline = vec![first];
+        for batch in batches {
+            let spawned = thread::Builder::new()
+                .name("xmss-warm".into())
+                .spawn_scoped(scope, move || batch.iter().for_each(f));
+            if let Err(err) = spawned {
+                warn!(%err, "Failed to spawn an XMSS warm thread, warming its keys inline");
+                inline.push(batch);
+            }
+        }
+        inline.into_iter().flatten().for_each(f);
+    });
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
     use super::*;
 
     #[test]
@@ -205,5 +298,113 @@ mod tests {
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))
         ));
+    }
+
+    /// A key manager for validators `0..count`, each key covering slots 0 and
+    /// 1 only, which keeps generation cheap.
+    fn tiny_key_manager(count: u64) -> KeyManager {
+        // Seeded from the whole `(id, role)` pair, so no two keys share a seed.
+        let key = |id: u64, role: KeyRole| {
+            let mut seed = [0; 32];
+            seed[..8].copy_from_slice(&id.to_le_bytes());
+            seed[8] = role as u8;
+            ValidatorSecretKey::generate_from_seed(seed, 0..=1).unwrap()
+        };
+        let keys = (0..count)
+            .map(|id| {
+                let pair = ValidatorKeyPair {
+                    attestation_key: key(id, KeyRole::Attestation),
+                    proposal_key: key(id, KeyRole::Proposal),
+                };
+                (id, pair)
+            })
+            .collect();
+        KeyManager::new(keys)
+    }
+
+    fn warmed(key_manager: &KeyManager, proposer: Option<u64>) -> Vec<(u64, KeyRole)> {
+        let mut entries: Vec<_> = key_manager
+            .keys_to_warm(proposer)
+            .into_iter()
+            .map(|(id, role, _)| (id, role))
+            .collect();
+        entries.sort_by_key(|&(id, role)| (role == KeyRole::Proposal, id));
+        entries
+    }
+
+    #[test]
+    fn keys_to_warm_takes_every_attestation_key_and_only_the_proposers_proposal_key() {
+        let key_manager = tiny_key_manager(3);
+        let attestation_keys: Vec<_> = (0..3).map(|id| (id, KeyRole::Attestation)).collect();
+
+        assert_eq!(warmed(&key_manager, None), attestation_keys);
+
+        let mut with_proposer = attestation_keys.clone();
+        with_proposer.push((1, KeyRole::Proposal));
+        assert_eq!(warmed(&key_manager, Some(1)), with_proposer);
+
+        // A proposer that is not one of ours adds nothing.
+        assert_eq!(warmed(&key_manager, Some(99)), attestation_keys);
+    }
+
+    /// Runs [`for_each_batched`] over `0..len` and returns, per item, the
+    /// threads that visited it.
+    fn visits(len: usize, max_threads: usize) -> Vec<Vec<thread::ThreadId>> {
+        let items: Vec<usize> = (0..len).collect();
+        let visits = Mutex::new(vec![Vec::new(); len]);
+        for_each_batched(&items, max_threads, |&item| {
+            visits.lock().unwrap()[item].push(thread::current().id());
+        });
+        visits.into_inner().unwrap()
+    }
+
+    #[test]
+    fn for_each_batched_visits_every_item_once() {
+        let batch = MIN_KEYS_PER_WARM_THREAD;
+        for len in [0, 1, batch, batch + 1, 3 * batch + 1, 40] {
+            for max_threads in [0, 1, 3, 64] {
+                let visits = visits(len, max_threads);
+                assert!(
+                    visits.iter().all(|threads| threads.len() == 1),
+                    "len {len}, max_threads {max_threads}: {visits:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_each_batched_caps_threads_and_keeps_one_batch_inline() {
+        let batch = MIN_KEYS_PER_WARM_THREAD;
+        let threads_used = |len, max_threads| -> HashSet<_> {
+            visits(len, max_threads).into_iter().flatten().collect()
+        };
+
+        // One batch's worth runs on the calling thread alone.
+        let caller = HashSet::from([thread::current().id()]);
+        assert_eq!(threads_used(batch, 64), caller);
+        // More batches than threads: the batches grow instead.
+        assert_eq!(threads_used(40, 3).len(), 3);
+        // Fewer batches than threads: one thread per batch.
+        assert_eq!(threads_used(3 * batch, 64).len(), 3);
+    }
+
+    #[test]
+    fn prepare_keys_for_leaves_every_key_signable() {
+        // More keys than one batch holds, so the warm spans several threads.
+        let count = 2 * MIN_KEYS_PER_WARM_THREAD as u64 + 1;
+        let mut key_manager = tiny_key_manager(count);
+
+        key_manager.prepare_keys_for(1, Some(0));
+        key_manager.prepare_keys_for(1, Some(0));
+        // A slot outside every key's range only warns.
+        key_manager.prepare_keys_for(7, None);
+
+        let message = H256::default();
+        for id in 0..count {
+            key_manager
+                .sign_with_attestation_key(id, 1, &message)
+                .unwrap();
+        }
+        key_manager.sign_block_root(0, 1, &message).unwrap();
     }
 }
