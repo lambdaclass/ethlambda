@@ -38,6 +38,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: ./.github/actions/free-disk
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
         with:
@@ -83,6 +85,8 @@ jobs:
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -154,6 +158,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: ./.github/actions/free-disk
+
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
         with:
@@ -174,6 +180,8 @@ jobs:
     runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -249,6 +257,8 @@ jobs:
       CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
