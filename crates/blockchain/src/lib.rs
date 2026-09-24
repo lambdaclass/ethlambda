@@ -185,16 +185,7 @@ impl BlockChain {
         let genesis_time = time_config.genesis_time;
         let key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Warm the XMSS signing caches for the current slot before the first tick.
-        // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap the first duty will be at. No proposal key: the current
-        // slot's block was due at the previous slot's interval 4, before we started.
-        let now_ms = unix_now_ms();
-        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot) as u32;
-        key_manager.prepare_keys_for(current_slot, None);
-
-        let handle = BlockChainServer {
+        let server = BlockChainServer {
             store,
             p2p: None,
             key_manager,
@@ -212,8 +203,40 @@ impl BlockChain {
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+        };
+
+        // Warm the XMSS signing caches for the next duties before the first
+        // tick, which fires right away and runs the current interval's duty.
+        // store.time() doesn't work here: after an offline gap it lags
+        // wall-clock by exactly the gap the first duty will be at.
+        let ms_since_genesis = unix_now_ms().saturating_sub(time_config.genesis_time_ms());
+        let current_slot = ms_since_genesis / time_config.milliseconds_per_slot;
+        match SlotInterval::from_ms_since_genesis(ms_since_genesis, &time_config) {
+            // The first tick still attests at the current slot. No proposal
+            // key: the current slot's block was due at the previous slot's
+            // interval 4, before we started, and the interval-1 tick warms the
+            // next slot's.
+            SlotInterval::BlockPublication | SlotInterval::AttestationProduction => {
+                server
+                    .key_manager
+                    .prepare_keys_for(current_slot as u32, None);
+            }
+            // This slot's attestations are behind us, so the next signatures
+            // are the next slot's block, built at this slot's interval 4, and
+            // that slot's attestations.
+            SlotInterval::Aggregation
+            | SlotInterval::SafeTargetUpdate
+            | SlotInterval::EndOfSlot => {
+                let num_validators = server.store.head_state().validators.len() as u64;
+                let next_slot = current_slot + 1;
+                let proposer = server.get_our_proposer(next_slot, num_validators);
+                server
+                    .key_manager
+                    .prepare_keys_for(next_slot as u32, proposer);
+            }
         }
-        .start();
+
+        let handle = server.start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -344,8 +367,10 @@ impl BlockChainServer {
         }
 
         // Fail fast: a state with zero validators is invalid and would cause
-        // panics in proposer selection and attestation processing.
-        if self.store.head_state().validators.is_empty() {
+        // panics in proposer selection and attestation processing. Read once
+        // per tick, since `head_state` clones the whole state.
+        let num_validators = self.store.head_state().validators.len() as u64;
+        if num_validators == 0 {
             error!("Head state has no validators, skipping tick");
             return;
         }
@@ -383,7 +408,7 @@ impl BlockChainServer {
         // Whether one of our validators proposes this slot. Drives the store's
         // interval-0 attestation acceptance.
         let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
-            .then(|| self.get_our_proposer(slot))
+            .then(|| self.get_our_proposer(slot, num_validators))
             .flatten()
             .is_some();
 
@@ -457,7 +482,7 @@ impl BlockChainServer {
                 // itself on a miss. Runs off the actor so a subtree boundary
                 // doesn't stall the tick.
                 let next_slot = slot + 1;
-                let proposer = self.get_our_proposer(next_slot);
+                let proposer = self.get_our_proposer(next_slot, num_validators);
                 self.key_manager
                     .prepare_keys_in_background(next_slot as u32, proposer);
             }
@@ -497,7 +522,7 @@ impl BlockChainServer {
             SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
-                    .get_our_proposer(next_slot)
+                    .get_our_proposer(next_slot, num_validators)
                     .filter(|_| self.sync_status.duties_allowed());
 
                 if let Some(validator_id) = next_proposer {
@@ -546,8 +571,9 @@ impl BlockChainServer {
 
         // Limit ourselves to a single round of aggregation if we propose next round.
         // This buys us time to build the block before the next slot's interval-0 tick.
+        let num_validators = self.store.head_state().validators.len() as u64;
         let next_proposer = self
-            .get_our_proposer(slot + 1)
+            .get_our_proposer(slot + 1, num_validators)
             .filter(|_| self.sync_status.duties_allowed());
         let max_jobs = if next_proposer.is_some() {
             1
@@ -697,10 +723,7 @@ impl BlockChainServer {
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
-    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = self.store.head_state();
-        let num_validators = head_state.validators.len() as u64;
-
+    fn get_our_proposer(&self, slot: u64, num_validators: u64) -> Option<u64> {
         self.key_manager
             .validator_ids()
             .into_iter()

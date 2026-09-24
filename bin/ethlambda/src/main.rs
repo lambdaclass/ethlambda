@@ -38,7 +38,7 @@ use cli::NodeOptions;
 use command::Command;
 
 use ethlambda_blockchain::block_builder::ProposerConfig;
-use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
@@ -619,18 +619,12 @@ where
     Ok(pubkey)
 }
 
-#[derive(Debug)]
-enum ValidatorKeyRole {
-    Attestation,
-    Proposal,
-}
-
 /// Classify a privkey file as attestation or proposal based on the filename.
 ///
 /// Matches zeam's (`pkgs/cli/src/node.zig:540`) and lantern's
 /// (`client_keys.c:606`) routing, which lets all three clients share the
 /// `lean-quickstart` generator output unchanged.
-fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
+fn classify_role(file: &Path) -> Result<KeyRole, String> {
     let name = file
         .file_name()
         .and_then(|n| n.to_str())
@@ -638,8 +632,8 @@ fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
     let is_attester = name.contains("attester");
     let is_proposer = name.contains("proposer");
     match (is_attester, is_proposer) {
-        (true, false) => Ok(ValidatorKeyRole::Attestation),
-        (false, true) => Ok(ValidatorKeyRole::Proposal),
+        (true, false) => Ok(KeyRole::Attestation),
+        (false, true) => Ok(KeyRole::Proposal),
         (false, false) => Err(format!(
             "filename '{name}' must contain 'attester' or 'proposer'"
         )),
@@ -695,8 +689,8 @@ fn read_validator_keys(
         let path = resolve_path(&entry.privkey_file);
         let slots = grouped.entry(entry.index).or_default();
         let target = match role {
-            ValidatorKeyRole::Attestation => &mut slots.attestation,
-            ValidatorKeyRole::Proposal => &mut slots.proposal,
+            KeyRole::Attestation => &mut slots.attestation,
+            KeyRole::Proposal => &mut slots.proposal,
         };
         if target.is_some() {
             eyre::bail!("validator {}: duplicate {role:?} entry", entry.index);

@@ -1981,7 +1981,6 @@ dependencies = [
  "hex",
  "libssz",
  "libssz-types",
- "rayon",
  "serde",
  "spawned-concurrency",
  "thiserror 2.0.18",

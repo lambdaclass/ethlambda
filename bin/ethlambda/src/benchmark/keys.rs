@@ -11,29 +11,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use ethlambda_blockchain::key_manager::{KeyManager, ValidatorKeyPair};
+use ethlambda_blockchain::key_manager::{KeyManager, KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_types::state::ValidatorPubkeyBytes;
 use eyre::WrapErr as _;
 use rayon::prelude::*;
 
 const PUBKEY_LEN: usize = size_of::<ValidatorPubkeyBytes>();
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u64)]
-enum Role {
-    Attestation = 0,
-    Proposal = 1,
-}
-
-impl Role {
-    fn tag(self) -> &'static str {
-        match self {
-            Role::Attestation => "attestation",
-            Role::Proposal => "proposal",
-        }
-    }
-}
 
 struct Key {
     pubkey: ValidatorPubkeyBytes,
@@ -75,8 +59,8 @@ impl KeySet {
         // Every key is independent and deterministic in (seed, index, role), so
         // they are produced in parallel; `collect` keeps the job order.
         let start = Instant::now();
-        let jobs: Vec<(u64, Role)> = (0..num_validators)
-            .flat_map(|index| [(index, Role::Attestation), (index, Role::Proposal)])
+        let jobs: Vec<(u64, KeyRole)> = (0..num_validators)
+            .flat_map(|index| [(index, KeyRole::Attestation), (index, KeyRole::Proposal)])
             .collect();
         let keys: Vec<Key> = jobs
             .into_par_iter()
@@ -118,7 +102,7 @@ impl KeySet {
 fn load_or_generate(
     seed: u64,
     index: u64,
-    role: Role,
+    role: KeyRole,
     num_active_epochs: usize,
     cache: Option<&Path>,
 ) -> eyre::Result<Key> {
@@ -126,7 +110,7 @@ fn load_or_generate(
         dir.join(format!(
             "xmss-{}-seed{seed}-v{index}-{}-w{num_active_epochs}.bin",
             env!("ETHLAMBDA_LEANVM_REV"),
-            role.tag()
+            role.name()
         ))
     });
     if let Some(file) = &file
@@ -135,7 +119,13 @@ fn load_or_generate(
         return load_cached(file);
     }
 
-    let key_seed = seed ^ (index << 1 | role as u64).rotate_left(32);
+    // Spelled out rather than `role as u64`, so reordering `KeyRole` cannot
+    // change the keys a seed derives.
+    let role_bit = match role {
+        KeyRole::Attestation => 0,
+        KeyRole::Proposal => 1,
+    };
+    let key_seed = seed ^ (index << 1 | role_bit).rotate_left(32);
     // leanVM seeds a key with 32 bytes; the run's `u64` fills the low end and
     // the rest stays zero, which keeps the derivation reproducible without
     // pretending to more entropy than the seed carries.
@@ -198,13 +188,13 @@ mod tests {
 
     #[test]
     fn keys_are_deterministic_per_seed_and_distinct_per_role() {
-        let a = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
-        let b = load_or_generate(7, 3, Role::Attestation, 2, None).unwrap();
+        let a = load_or_generate(7, 3, KeyRole::Attestation, 2, None).unwrap();
+        let b = load_or_generate(7, 3, KeyRole::Attestation, 2, None).unwrap();
         assert_eq!(a.pubkey, b.pubkey);
         assert_eq!(a.secret.to_bytes().unwrap(), b.secret.to_bytes().unwrap());
-        let proposal = load_or_generate(7, 3, Role::Proposal, 2, None).unwrap();
+        let proposal = load_or_generate(7, 3, KeyRole::Proposal, 2, None).unwrap();
         assert_ne!(a.pubkey, proposal.pubkey);
-        let other_seed = load_or_generate(8, 3, Role::Attestation, 2, None).unwrap();
+        let other_seed = load_or_generate(8, 3, KeyRole::Attestation, 2, None).unwrap();
         assert_ne!(a.pubkey, other_seed.pubkey);
     }
 
