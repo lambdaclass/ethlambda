@@ -660,10 +660,12 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   upgrades, state transitions, and epoch processing. As of the v1.6.1 fixture
   pin, every case passed on both presets: mainnet is 5705 cases and minimal
   40009. The v1.7.0-beta.2 bump adds failures the fixture release itself
-  brought: the new `networking/gossip_*` format, `ssz_static` cases for
-  `NewPayloadRequest` and the four new `PartialDataColumn*` containers, a
-  fork-choice rule change, and one `transition` case, each fixed by the
-  commits that follow the bump. The crate's lib
+  brought: `ssz_static` cases for `NewPayloadRequest` and the four new
+  `PartialDataColumn*` containers, a fork-choice rule change, and one
+  `transition` case, each fixed by the commits that follow the bump. (The
+  bump's new `networking/gossip_*` format is already handled: the gossip
+  validation vectors come from this same tree now, not the separate
+  v1.7.0-beta.1 download #38 used to fetch.) The crate's lib
   target holds 200 tests with `beacon-spec-tests` on, 185 plus 15 ignored
   without; both figures cover lean's own unit tests as well, since the two
   chains now share one lib target. Fork choice is fixture-verified too: 150 mainnet

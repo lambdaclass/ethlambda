@@ -157,23 +157,6 @@ pub fn collect_crypto(kind: &str, fork_of: impl Fn(&str) -> ForkName) -> Vec<(St
     out
 }
 
-/// The root of the gossip vector tree.
-///
-/// The gossip vectors ship in a newer release than [`fixture_root`]'s, so they
-/// live in a tree of their own; see `CONSENSUS_SPEC_GOSSIP_TESTS_VERSION` in
-/// the Makefile. Panics when absent, for the same reason [`fixture_root`] does.
-pub fn gossip_fixture_root() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../consensus-spec-tests-gossip")
-        .join("tests");
-    assert!(
-        root.is_dir(),
-        "gossip test fixtures are missing from {}; run `make consensus-spec-gossip-tests`",
-        root.display()
-    );
-    root
-}
-
 /// One fixture case: a directory of input and expected-output files.
 #[derive(Debug, Clone)]
 pub struct Case {
@@ -273,11 +256,6 @@ impl Case {
 /// upstream release that adds a fork does not break the build.
 pub fn collect(config: &str, runner: &str, handler: &str) -> Vec<Case> {
     collect_in(&fixture_root(), config, runner, handler)
-}
-
-/// Cases for one handler of the `networking` runner, from the gossip tree.
-pub fn collect_gossip(config: &str, handler: &str) -> Vec<Case> {
-    collect_in(&gossip_fixture_root(), config, "networking", handler)
 }
 
 /// [`collect`] over any fixture tree laid out like the release tarballs.

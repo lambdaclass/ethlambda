@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests consensus-spec-gossip-tests cryptography-specs docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests cryptography-specs docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -50,10 +50,10 @@ BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_te
 # concurrently and each downloads only the trees its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
-test-beacon-mainnet: consensus-spec-tests consensus-spec-gossip-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
+test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
 	$(BEACON_TEST) --features beacon-spec-tests
 
-test-beacon-minimal: consensus-spec-tests consensus-spec-gossip-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
+test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal
 
 # Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
@@ -183,46 +183,6 @@ $(CONSENSUS_SPEC_TESTS_STAMP):
 		trap 'rm -rf "$$tmpdir"' EXIT; \
 		curl -L -f -o "$$tmpdir/$$config.tar.gz" "$(CONSENSUS_SPEC_TESTS_BASE_URL)/$$config.tar.gz" || exit 1; \
 		tar -xzf "$$tmpdir/$$config.tar.gz" -C consensus-spec-tests || exit 1; \
-		rm -rf "$$tmpdir"; \
-	done
-	@touch $@
-
-# The gossip validation vectors (`networking/gossip_*`) first ship in a
-# pre-release, so they come from a tree of their own rather than moving the pin
-# above. Only fulu's block, column, aggregate and attestation handlers are
-# extracted, since those are the topics this node validates; the rest of each
-# tarball is never unpacked. Fold this back into the main tree once that
-# release is final.
-CONSENSUS_SPEC_GOSSIP_TESTS_VERSION ?= v1.7.0-beta.1
-CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)
-# Follows CONSENSUS_SPEC_TESTS_CONFIGS, so narrowing that one narrows this too.
-# `general` is dropped because it has no `networking` runner: naming its
-# members would fail the extraction.
-CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS = $(filter-out general,$(CONSENSUS_SPEC_TESTS_CONFIGS))
-CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar gossip_beacon_aggregate_and_proof gossip_beacon_attestation
-# Includes the handler list, not just the version and configs: growing the
-# list must re-extract an existing tree, which a stamp keyed on version and
-# configs alone would not notice, since neither of those changed.
-CONSENSUS_SPEC_GOSSIP_TESTS_STAMP=consensus-spec-tests-gossip/.version-$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS)))-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS)))
-
-consensus-spec-gossip-tests: $(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP) ## ⬇️ Download the gossip validation spec test fixtures
-
-# Member directories are named exactly rather than globbed: GNU tar needs
-# `--wildcards` for a pattern and BSD tar rejects that flag, while a plain
-# directory name extracts its whole subtree on both.
-$(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP):
-	@rm -rf consensus-spec-tests-gossip
-	@mkdir -p consensus-spec-tests-gossip
-	@for config in $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS); do \
-		echo "Downloading $$config gossip test fixtures ($(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION))"; \
-		tmpdir=$$(mktemp -d); \
-		trap 'rm -rf "$$tmpdir"' EXIT; \
-		curl -L -f -o "$$tmpdir/$$config.tar.gz" "$(CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL)/$$config.tar.gz" || exit 1; \
-		members=""; \
-		for handler in $(CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS); do \
-			members="$$members tests/$$config/fulu/networking/$$handler"; \
-		done; \
-		tar -xzf "$$tmpdir/$$config.tar.gz" -C consensus-spec-tests-gossip $$members || exit 1; \
 		rm -rf "$$tmpdir"; \
 	done
 	@touch $@

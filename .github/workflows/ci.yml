@@ -289,9 +289,6 @@ jobs:
       - name: Download the BLS/KZG test vectors
         run: make cryptography-specs
 
-      - name: Download the gossip validation test fixtures
-        run: make consensus-spec-gossip-tests
-
       - name: Run the Beacon Chain spec tests
         run: make test-beacon-${{ matrix.preset }}
 
