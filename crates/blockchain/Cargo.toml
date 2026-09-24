@@ -27,7 +27,6 @@ spawned-concurrency.workspace = true
 tokio.workspace = true
 tokio-util = { version = "0.7", default-features = false }
 
-rayon.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
