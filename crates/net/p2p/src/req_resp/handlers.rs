@@ -1,14 +1,15 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use ethlambda_network_api::BlockSource;
 use ethlambda_storage::Store;
 use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use spawned_concurrency::tasks::{Context, send_after};
-use std::time::Duration;
 use tracing::{debug, error, trace, warn};
 
 use ethlambda_types::checkpoint::Checkpoint;
+use ethlambda_types::constants::{GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT};
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
@@ -161,6 +162,7 @@ async fn handle_status_request(
     peer: PeerId,
 ) {
     trace!(finalized_slot=%request.finalized.slot, head_slot=%request.head.slot, "Received status request from peer {peer}");
+    observe_peer_head(&server.store, &request, peer);
     let our_status = build_status(&server.store);
     let response = Response::success(ResponsePayload::Status(our_status));
     server.swarm_handle.send_response(channel, response);
@@ -169,26 +171,65 @@ async fn handle_status_request(
 async fn handle_status_response(server: &mut P2PServer, status: Status, peer: PeerId) {
     trace!(finalized_slot=%status.finalized.slot, head_slot=%status.head.slot, "Received status response from peer {peer}");
 
-    let our_head_slot = server.store.head_slot();
-    if status.head.slot <= our_head_slot {
+    let Some((start_slot, gap)) =
+        prepare_range_sync(&server.store, &mut server.range_sync_state, &status, peer)
+    else {
         return;
+    };
+
+    request_next_range_batch(server).await;
+    trace!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
+}
+
+/// Record a peer's head when it satisfies the same future bound as a block.
+fn observe_peer_head(store: &Store, status: &Status, peer: PeerId) -> bool {
+    let head_start_interval = status.head.slot.saturating_mul(INTERVALS_PER_SLOT);
+    let store_time = store.time().expect("store time exists");
+
+    if head_start_interval > store_time.saturating_add(GOSSIP_DISPARITY_INTERVALS) {
+        warn!(
+            %peer,
+            peer_head_slot = status.head.slot,
+            store_time,
+            "Ignoring peer status with a future head"
+        );
+        return false;
     }
-    let gap = status.head.slot - our_head_slot;
+
+    store.observe_block_slot(status.head.slot);
+    true
+}
+
+fn prepare_range_sync(
+    store: &Store,
+    range_sync_state: &mut Option<RangeSyncState>,
+    status: &Status,
+    peer: PeerId,
+) -> Option<(u64, u64)> {
+    if !observe_peer_head(store, status, peer) {
+        return None;
+    }
+
+    let local_head_slot = store.head_slot();
+    if status.head.slot <= local_head_slot {
+        return None;
+    }
+
+    let gap = status.head.slot - local_head_slot;
     debug!(
         %peer,
         peer_head_slot = status.head.slot,
-        local_head_slot = our_head_slot,
+        local_head_slot,
         slot_gap = gap,
         "Peer status head is ahead of local head"
     );
 
-    let start_slot = our_head_slot.saturating_add(1);
+    let start_slot = local_head_slot.saturating_add(1);
     let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
-
-    match &mut server.range_sync_state {
+    match range_sync_state {
         Some(state) => state.merge_peer(peer, status.head.slot, end_exclusive),
         None => {
-            server.range_sync_state = Some(RangeSyncState::new(
+            *range_sync_state = Some(RangeSyncState::new(
                 start_slot..end_exclusive,
                 peer,
                 status.head.slot,
@@ -196,8 +237,7 @@ async fn handle_status_response(server: &mut P2PServer, status: Status, peer: Pe
         }
     }
 
-    request_next_range_batch(server).await;
-    trace!(%peer, start_slot, gap, "Long-range sync: using BlocksByRange");
+    Some((start_slot, gap))
 }
 
 async fn handle_blocks_by_root_request(
@@ -607,6 +647,53 @@ mod tests {
             },
             proof: MultiMessageAggregate::default(),
         }
+    }
+
+    #[test]
+    fn peer_status_advances_latest_known_block_slot() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        store
+            .set_time(550 * INTERVALS_PER_SLOT)
+            .expect("set store time");
+        let status = Status {
+            finalized: Checkpoint::default(),
+            head: Checkpoint {
+                root: H256::ZERO,
+                slot: 550,
+            },
+        };
+
+        assert!(observe_peer_head(&store, &status, PeerId::random()));
+        assert_eq!(store.latest_known_block_slot(), 550);
+    }
+
+    #[test]
+    fn future_peer_status_does_not_start_range_sync() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let status = Status {
+            finalized: Checkpoint::default(),
+            head: Checkpoint {
+                root: H256::ZERO,
+                slot: 1,
+            },
+        };
+        let mut range_sync_state = None;
+
+        assert!(
+            prepare_range_sync(&store, &mut range_sync_state, &status, PeerId::random()).is_none()
+        );
+        assert!(range_sync_state.is_none());
+        assert_eq!(store.latest_known_block_slot(), 0);
     }
 
     #[test]

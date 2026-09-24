@@ -80,17 +80,10 @@ pub struct BlockChainConfig {
 // derives slots from `store.time()` and must not carry a second copy of a
 // consensus-critical constant.
 pub use ethlambda_types::block::MAX_ATTESTATIONS_DATA;
-pub use ethlambda_types::constants::{DEFAULT_MILLISECONDS_PER_SLOT, INTERVALS_PER_SLOT};
+pub use ethlambda_types::constants::{
+    DEFAULT_MILLISECONDS_PER_SLOT, GOSSIP_DISPARITY_INTERVALS, INTERVALS_PER_SLOT,
+};
 pub use sync_status::SyncStatusController;
-/// Future-slot tolerance for gossip attestations, expressed in intervals.
-///
-/// Bounds the clock skew the time check is willing to absorb when admitting a
-/// vote whose slot has not yet started locally. One interval is a fifth of the
-/// configured slot, the lean analogue of mainnet's
-/// `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
-///
-/// See: leanSpec PR #682.
-pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
@@ -188,9 +181,7 @@ impl BlockChain {
         // Catch XMSS keys up to the current slot before the first tick
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
         // exactly the gap we need to catch up through
-        let now_ms = unix_now_ms();
-        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot) as u32;
+        let current_slot = store.wall_clock_slot() as u32;
         key_manager.advance_keys_to(current_slot);
 
         let handle = BlockChainServer {
@@ -311,6 +302,18 @@ pub struct BlockChainServer {
     /// Chain-event publication bus. The actor is the sole publisher; consumers
     /// only subscribe, preserving the one-directional write flow.
     events: EventBus,
+}
+
+fn sync_status_from_store(
+    tracker: &mut SyncStatusTracker,
+    store: &Store,
+    current_slot: u64,
+) -> metrics::SyncStatus {
+    tracker.update(
+        current_slot,
+        store.head_slot(),
+        store.latest_known_block_slot(),
+    )
 }
 
 impl BlockChainServer {
@@ -890,9 +893,7 @@ impl BlockChainServer {
         }
         // Block import has no ready-made "now" slot like `on_tick`'s, so
         // compute the wall-clock slot fresh for the head-recency gate.
-        let time_config = *self.store.config();
-        let wall_clock_slot = unix_now_ms().saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot;
+        let wall_clock_slot = self.store.wall_clock_slot();
         pre_import.diff_and_emit(&self.store, &self.events, wall_clock_slot);
 
         metrics::update_head_slot(self.store.head_slot());
@@ -1214,15 +1215,7 @@ impl BlockChainServer {
     }
 
     fn update_sync_status(&mut self, current_slot: u64) {
-        let head_slot = self.store.head_slot();
-        let max_seen_slot = self
-            .store
-            .max_live_chain_slot()
-            .expect("max live chain slot exists")
-            .unwrap_or(head_slot);
-        let status = self
-            .sync_status
-            .update(current_slot, head_slot, max_seen_slot);
+        let status = sync_status_from_store(&mut self.sync_status, &self.store, current_slot);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
     }
@@ -1490,11 +1483,47 @@ impl Handler<AggregationDeadline> for BlockChainServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::{
+        block::{Block, BlockBody, MultiMessageAggregate},
+        state::State,
+    };
 
     const GENESIS_TIME: u64 = 1_000;
 
     fn config(milliseconds_per_slot: u64) -> ChainConfig {
         ChainConfig::new(GENESIS_TIME, milliseconds_per_slot)
+    }
+
+    #[test]
+    fn pending_block_marks_node_syncing_and_blocks_duties() {
+        let backend = std::sync::Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let pending = SignedBlock {
+            message: Block {
+                slot: 550,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let root = pending.message.hash_tree_root();
+        store
+            .insert_pending_block(root, pending)
+            .expect("insert pending block");
+        let mut tracker = SyncStatusTracker::default();
+
+        assert_eq!(
+            sync_status_from_store(&mut tracker, &store, 550),
+            metrics::SyncStatus::Syncing
+        );
+        assert!(!tracker.duties_allowed());
     }
 
     #[test]

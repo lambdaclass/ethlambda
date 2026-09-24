@@ -17,6 +17,14 @@ pub const FORK_DIGEST: &str = "12345678";
 /// see [`crate::chain_config::ChainConfig`].
 pub const INTERVALS_PER_SLOT: u64 = 5;
 
+/// Future-slot tolerance for gossip objects, expressed in intervals.
+///
+/// One interval is a fifth of the configured slot, the lean analogue of
+/// mainnet's `MAXIMUM_GOSSIP_CLOCK_DISPARITY`.
+///
+/// See: leanSpec PR #682.
+pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
+
 /// Slot duration used when the network's config file omits
 /// `MILLISECONDS_PER_SLOT`.
 ///

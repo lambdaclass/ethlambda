@@ -38,12 +38,7 @@ async fn get_syncing(
     State(store): State<Store>,
     Extension(sync_status): Extension<SyncStatusController>,
 ) -> impl IntoResponse {
-    let genesis_ms = store.config().genesis_time_ms();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(genesis_ms);
-    let wall_slot = now_ms.saturating_sub(genesis_ms) / store.config().milliseconds_per_slot;
+    let wall_slot = store.wall_clock_slot();
     let head_slot = store.head_slot();
     let sync_distance = wall_slot.saturating_sub(head_slot);
     let finalized_slot = store

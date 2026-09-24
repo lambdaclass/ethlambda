@@ -29,7 +29,6 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -772,12 +771,7 @@ async fn fetch_initial_state(
     // without `--checkpoint-sync-url` keeps the chain instead of writing a
     // slot-0 anchor over it.
     if let Some(store) = Store::from_db_state(backend.clone(), genesis)? {
-        let now_ms = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .expect("already past the unix epoch")
-            .as_millis() as u64;
-        let current_slot =
-            now_ms.saturating_sub(genesis.genesis_time * 1000) / genesis.milliseconds_per_slot;
+        let current_slot = store.wall_clock_slot();
         let head_slot = store.head_slot();
         let gap = current_slot.saturating_sub(head_slot);
         if gap <= MAX_RESUMABLE_DB_STATE_AGE {
@@ -1070,7 +1064,7 @@ validators:
     const UNREACHABLE_CHECKPOINT_URL: &str = "http://127.0.0.1:1";
 
     fn now_secs() -> u64 {
-        SystemTime::UNIX_EPOCH
+        std::time::SystemTime::UNIX_EPOCH
             .elapsed()
             .expect("already past the unix epoch")
             .as_secs()

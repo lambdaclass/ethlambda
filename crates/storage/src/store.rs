@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use lru::LruCache;
 
@@ -563,6 +565,11 @@ pub struct Store {
     /// LRU memoization of states by block root, shared across `Store` clones.
     /// Avoids reconstructing recent states from diffs on every read.
     state_cache: Arc<Mutex<LruCache<H256, State>>>,
+    /// Highest plausible block slot observed locally or advertised by a peer.
+    ///
+    /// This runtime-only high-water mark is shared across `Store` clones so the
+    /// networking actor can inform the blockchain actor's sync-duty gate.
+    latest_known_block_slot: Arc<AtomicU64>,
 }
 
 /// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
@@ -682,7 +689,10 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
+            latest_known_block_slot: Arc::new(AtomicU64::new(0)),
         };
+
+        store.observe_block_slot(store.head_slot());
 
         // Also compare against the finalized state: the persisted config
         // carries no validator registry, so the check above cannot catch a
@@ -819,6 +829,9 @@ impl Store {
                 GOSSIP_SIGNATURE_CAP,
             ))),
             state_cache: new_state_cache(),
+            latest_known_block_slot: Arc::new(AtomicU64::new(
+                anchor_state.latest_block_header.slot,
+            )),
         })
     }
 
@@ -861,6 +874,30 @@ impl Store {
     /// The current slot, derived from the store clock.
     pub fn current_slot(&self) -> u64 {
         self.time().expect("store time exists") / INTERVALS_PER_SLOT
+    }
+
+    /// Return the slot containing the current wall-clock time.
+    pub fn wall_clock_slot(&self) -> u64 {
+        let genesis_ms = self.config.genesis_time_ms();
+        let now_ms = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(genesis_ms);
+        now_ms.saturating_sub(genesis_ms) / self.config.milliseconds_per_slot
+    }
+
+    /// Record evidence that a block exists at `slot`.
+    ///
+    /// The marker is monotonic for the lifetime of the process and shared by
+    /// all clones of this store.
+    pub fn observe_block_slot(&self, slot: u64) {
+        self.latest_known_block_slot
+            .fetch_max(slot, Ordering::Relaxed);
+    }
+
+    /// Return the highest block slot observed during this process.
+    pub fn latest_known_block_slot(&self) -> u64 {
+        self.latest_known_block_slot.load(Ordering::Relaxed)
     }
 
     // ============ Config ============
@@ -1053,17 +1090,6 @@ impl Store {
             .collect())
     }
 
-    /// Return the highest slot in the live chain.
-    pub fn max_live_chain_slot(&self) -> Result<Option<u64>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
-            .map(|(key, _)| decode_slot_root_key(&key).0)
-            .max())
-    }
-
     /// Get all known block roots as HashSet.
     ///
     /// Useful for checking block existence without deserializing.
@@ -1210,8 +1236,9 @@ impl Store {
         signed_block: SignedBlock,
     ) -> Result<(), Error> {
         let mut batch = self.backend.begin_write().expect("write batch");
-        write_signed_block(batch.as_mut(), &root, signed_block);
+        let block = write_signed_block(batch.as_mut(), &root, signed_block);
         batch.commit().expect("commit");
+        self.observe_block_slot(block.slot);
         Ok(())
     }
 
@@ -1239,6 +1266,7 @@ impl Store {
             .expect("put non-finalized chain index");
 
         batch.commit().expect("commit");
+        self.observe_block_slot(block.slot);
         self.record_known_attestation_votes(&block.body.attestations);
         Ok(())
     }
@@ -1996,6 +2024,7 @@ mod tests {
                     GOSSIP_SIGNATURE_CAP,
                 ))),
                 state_cache: new_state_cache(),
+                latest_known_block_slot: Default::default(),
             }
         }
 
@@ -2012,11 +2041,26 @@ mod tests {
                     GOSSIP_SIGNATURE_CAP,
                 ))),
                 state_cache: new_state_cache(),
+                latest_known_block_slot: Default::default(),
             }
         }
     }
 
     // ============ Block Signature Pruning Tests ============
+
+    #[test]
+    fn observed_block_slot_is_shared_and_monotonic() {
+        let mut store = Store::test_store();
+        let reader = store.clone();
+
+        store
+            .insert_pending_block(root(42), signed_block(42, H256::ZERO))
+            .expect("insert pending block");
+        assert_eq!(reader.latest_known_block_slot(), 42);
+
+        store.observe_block_slot(7);
+        assert_eq!(reader.latest_known_block_slot(), 42);
+    }
 
     #[test]
     fn block_root_index_tracks_canonical_chain_across_reorgs() {
@@ -2096,6 +2140,7 @@ mod tests {
             .expect("get blocks by slot range");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].message.hash_tree_root(), block_root);
+        assert_eq!(restored.latest_known_block_slot(), 1);
     }
 
     #[test]
