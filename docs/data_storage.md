@@ -405,8 +405,10 @@ carries `signed_block_header.message.slot`, and the availability check and the
 held-block release path both start from the block itself — so the slot prefix
 costs nothing to supply.
 
-Sidecars are written on arrival, once `on_gossip_data_column` has verified
-one, rather than at block import. That ordering is what lets the availability
+Sidecars are written on arrival, once the p2p layer has verified one (gossip
+validation for a sidecar gossip accepted, the chain checks in
+`beacon::gossip::column::chain_checks` for any other), rather than at block
+import. That ordering is what lets the availability
 gate read a block's columns before the block itself is allowed to import (a
 column has to exist first for the gate to find it), and what lets a restart
 keep every sidecar this node already paid a KZG batch to verify rather than
@@ -434,11 +436,12 @@ the node runs unattended before a pruner exists.
 
 Same key and same encoding as `DataColumns`, holding sidecars that have **not
 been verified yet**. A sidecar lands here when its block's parent has no
-post-state for `on_gossip_data_column` to check the proposer against: the
-parent may still be in flight, or it may be a block the availability gate is
-itself holding. The specification's gossip rule for that case is `[IGNORE]`
-with an explicit licence to come back to it, so the sidecar is parked rather
-than dropped, and replayed when the parent gains a post-state.
+post-state for the chain checks to check the proposer against: the parent may
+still be in flight, or it may be a block the availability gate is itself
+holding. The specification's gossip rule for that case is `[IGNORE]` with an
+explicit licence to come back to it, so the sidecar is parked rather than
+dropped, and sent back through the chain checks when the parent gains a
+post-state.
 
 Two tables rather than one, and that is the whole point of this one. A parked
 sidecar has passed only the cheap structural checks — not its inclusion proof,
@@ -447,7 +450,7 @@ pays for them once rather than once per attempt. `data_column_indices_for`
 reads `DataColumns` and nothing else, and that read is what the data
 availability gate believes; an unverified row there would let a peer satisfy
 the gate with a column nothing ever judged. A row moves from here to
-`DataColumns` only by passing every check on replay.
+`DataColumns` only by passing every check when it is sent back.
 
 The chain actor keeps one key per parked row in memory
 (`sidecars_awaiting_parent`, keyed by the parent root it waits on) and the
@@ -457,16 +460,15 @@ chosen by whichever peer is gossiping.
 Nothing caps that queue. The finality sweep that evicts held blocks also
 deletes the rows of parked sidecars at or below the finalized slot, and that is
 the only thing reclaiming them, so it bounds how *long* a row lives but not how
-fast rows arrive. `on_gossip_data_column` does not require a sidecar's
-`parent_root` to name a block this node knows. A gossiped sidecar has had its
-header's signature checked against the head state before it gets this far,
-but only when a head state is already cached *and* the header's
-`proposer_index` names a validator in it: with no cached head state, or a
-proposer index that names none (`u64::MAX`, say), the p2p layer's gossip
-validation skips that check and a made-up header still reaches here. A
-sidecar fetched over req/resp skips gossip validation entirely, so a peer
-answering a fetch, or exploiting either gap in the gossip path, can still
-park rows as fast as it can invent a slot, proposer and index. Watch
+fast rows arrive. The chain checks do not require a sidecar's
+`parent_root` to name a block this node knows. Every parked sidecar, gossiped
+or fetched, has had its header's signature checked against the head state
+before it gets this far, but only when a head state is already cached *and*
+the header's `proposer_index` names a validator in it: with no cached head
+state, or a proposer index that names none (`u64::MAX`, say), the checks skip
+that step and a made-up header still reaches here. A peer exploiting either
+gap can still park rows as fast as it can invent a slot, proposer and index.
+Watch
 `lean_sidecars_awaiting_parent`: it is the only signal that this is
 happening, and unlike `DataColumns` these rows were written on a peer's
 say-so.

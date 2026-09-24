@@ -391,19 +391,21 @@ spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
-| `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On a gossiped or fetched sidecar clearing every check in `on_gossip_data_column` | | |
-| `lean_data_columns_rejected_total` | Counter | Sidecars the chain actor dropped, by reason | On each rejection in `on_gossip_data_column` | reason=malformed,finalized,future,finalized_ancestor,inclusion_proof,kzg,proposer | |
-| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
+| `lean_data_columns_stored_total` | Counter | Data column sidecars verified and written to `Table::DataColumns` | On the chain actor storing a sidecar the p2p layer verified | | |
+| `lean_data_columns_rejected_total` | Counter | Sidecars the p2p layer's chain checks dropped, by reason | On each drop in `beacon::column_checks`, except an already stored sidecar | reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal | |
+| `lean_data_column_kzg_verify_seconds` | Histogram | Time spent batch-verifying one sidecar's cells against its own commitments | On each KZG batch verification, in gossip validation or the chain checks | | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0 |
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 
-`lean_data_columns_rejected_total`'s reasons are the chain actor's own, one
-layer past gossip validation. A gossiped sidecar is judged first by the gossip
-rules and counted in `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`;
-`reason="malformed"` on this counter therefore fires almost exclusively for a
-*fetched* sidecar, which skips gossip validation and reaches the chain actor
-first.
+`lean_data_columns_rejected_total` counts the chain checks, which run in the
+p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
+gossiped one reported `Queue` or `Ignore(Overloaded)`, and a parked one sent
+back once its parent imported. A gossiped sidecar is judged first by the
+gossip rules and counted in
+`lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`; the reasons
+here are that counter's reason labels. The chain actor stores what reaches it
+without checking it again.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two

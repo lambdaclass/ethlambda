@@ -22,6 +22,17 @@ pub trait BlockChainToP2P: Send + Sync {
     ) -> Result<(), ActorError>;
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
+    /// Run the chain checks on sidecars the chain actor had parked, now that
+    /// their parent has a post-state.
+    ///
+    /// The chain actor keeps a sidecar without checking it, so it hands these
+    /// back rather than judging them itself: the p2p layer runs every column
+    /// check, off both actors, and sends the ones that pass back through
+    /// [`P2PToBlockChain::new_data_column_sidecars`].
+    fn check_data_column_sidecars(
+        &self,
+        sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
 }
 
 /// What one block is missing, from the chain actor's point of view.
@@ -175,11 +186,16 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         attestation: SignedAggregatedAttestation,
     ) -> Result<(), ActorError>;
-    /// Data column sidecars that passed the cheap, stateless checks.
+    /// Data column sidecars that passed every check: gossip's own, for one it
+    /// accepted, or the chain checks (`beacon::gossip::column::chain_checks`
+    /// in `ethlambda-state-transition`) for any other.
     ///
-    /// The expensive ones (the inclusion proof, the KZG batch) and the ones
-    /// needing state (the proposer, the header signature) run in the chain
-    /// actor, which is where the store and fork choice live.
+    /// The chain actor stores these without checking them again. That is the
+    /// point of running the checks in the p2p layer: a KZG batch and a BLS
+    /// verification per sidecar cost too much on the actor's single thread,
+    /// which also imports every block. Debug builds do check again, so a path
+    /// that sends a sidecar it never checked fails a test rather than reaching
+    /// the store.
     ///
     /// A batch rather than one sidecar, because every producer but gossip has
     /// a batch to hand: a `DataColumnsByRoot` answer carries every column of
@@ -189,9 +205,18 @@ pub trait P2PToBlockChain: Send + Sync {
     /// that drains a backlog. Gossip sends a batch of one.
     ///
     /// The subnet is not carried: the p2p actor has already checked that each
-    /// sidecar's own index maps to the subnet it arrived on, and nothing on
-    /// the far side would do anything with it but check that again.
+    /// gossiped sidecar's own index maps to the subnet it arrived on, and
+    /// nothing on the far side would do anything with it but check that
+    /// again.
     fn new_data_column_sidecars(&self, sidecars: Vec<DataColumnSidecar>) -> Result<(), ActorError>;
+    /// Data column sidecars the chain checks could not judge yet, because
+    /// their parent has no post-state: the chain actor parks them and sends
+    /// them back through [`BlockChainToP2P::check_data_column_sidecars`] once
+    /// the parent imports.
+    fn data_column_sidecars_awaiting_parent(
+        &self,
+        sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---

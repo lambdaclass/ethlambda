@@ -40,7 +40,8 @@ use either::Either;
 use ethlambda_network_api::{
     FetchRequest, InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
-        FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+        CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
+        PublishBlock,
     },
 };
 use ethlambda_state_transition::beacon::gossip::{SeenBlocks, SeenColumns};
@@ -175,6 +176,13 @@ const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
 /// message arriving with none free is ignored rather than queued. Revisit once
 /// `lean_beacon_gossip_validation_seconds` has data from a follower.
 const GOSSIP_VALIDATION_PERMITS: usize = 128;
+
+/// How many data column sidecars may be in the chain checks at once (see
+/// [`beacon::column_checks`]). A separate pool from
+/// [`GOSSIP_VALIDATION_PERMITS`], so a range batch's hundreds of sidecars
+/// cannot take every permit and leave gossip reporting `Overloaded`. A sidecar
+/// arriving with none free waits for one. Revisit with data, as for gossip.
+const COLUMN_CHECK_PERMITS: usize = 16;
 
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
 const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
@@ -891,6 +899,7 @@ impl P2P {
             gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 GOSSIP_VALIDATION_PERMITS,
             )),
+            column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
         };
         let handle = server.start();
         send_after(
@@ -972,6 +981,8 @@ pub struct P2PServer {
     pub(crate) seen_columns: SeenColumns,
     /// Permits for stateful gossip checks in flight on blocking threads.
     pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for data column chain checks in flight on blocking threads.
+    pub(crate) column_check_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl P2PServer {
@@ -1179,6 +1190,12 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
 impl Handler<FetchBlock> for P2PServer {
     async fn handle(&mut self, msg: FetchBlock, _ctx: &Context<Self>) {
         fetch_missing(self, msg.request).await;
+    }
+}
+
+impl Handler<CheckDataColumnSidecars> for P2PServer {
+    async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
+        beacon::column_checks::check_and_forward(self, msg.sidecars);
     }
 }
 
@@ -2198,6 +2215,9 @@ pub(crate) mod test_support {
             ),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
+            )),
+            column_check_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::COLUMN_CHECK_PERMITS,
             )),
         }
     }

@@ -29,6 +29,8 @@ pub enum Outcome {
     Accept,
     /// Do not propagate it, but hand the object to the chain, which parks it
     /// until what it is missing arrives: the specification's "MAY be queued".
+    /// A column passes [`column::chain_checks`] on the way, since the chain
+    /// keeps a column without checking it.
     Queue(QueueReason),
     /// Do not propagate it, and drop it. Not the sender's fault.
     Ignore(IgnoreReason),

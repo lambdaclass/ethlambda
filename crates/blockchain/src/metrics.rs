@@ -898,51 +898,16 @@ static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
     });
 
 // --- Data Column Sidecars ---
-
-/// Why `on_gossip_data_column` dropped a sidecar.
-///
-/// Gossip's own cheap checks (decode, subnet match, structural validity,
-/// seen-dedup) already ran in the p2p actor before a gossiped sidecar reaches
-/// this counter, so `"malformed"` fires almost exclusively for a fetched
-/// sidecar, which skips straight to the chain actor with none of them. Every
-/// other reason here is one only the store or fork choice can answer. Seeded
-/// at zero so a reason this node never fires is still visible on a
-/// dashboard.
-const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
-    "malformed",
-    "finalized",
-    "future",
-    "finalized_ancestor",
-    "inclusion_proof",
-    "kzg",
-    "proposer",
-];
-
-static LEAN_DATA_COLUMNS_REJECTED_TOTAL: std::sync::LazyLock<IntCounterVec> =
-    std::sync::LazyLock::new(|| {
-        register_int_counter_vec!(
-            "lean_data_columns_rejected_total",
-            "Gossiped data column sidecars the chain actor dropped, by reason",
-            &["reason"]
-        )
-        .unwrap()
-    });
+//
+// The sidecar checks run in the p2p layer, so their counters live there
+// (`lean_data_columns_rejected_total`) and in `ethlambda-state-transition`
+// (`lean_data_column_kzg_verify_seconds`). These are the chain actor's own.
 
 static LEAN_DATA_COLUMNS_STORED_TOTAL: std::sync::LazyLock<IntCounter> =
     std::sync::LazyLock::new(|| {
         register_int_counter!(
             "lean_data_columns_stored_total",
             "Data column sidecars verified and written to the store"
-        )
-        .unwrap()
-    });
-
-static LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS: std::sync::LazyLock<Histogram> =
-    std::sync::LazyLock::new(|| {
-        register_histogram!(
-            "lean_data_column_kzg_verify_seconds",
-            "Time spent batch-verifying one sidecar's cells against its own commitments",
-            vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
         )
         .unwrap()
     });
@@ -1074,14 +1039,8 @@ pub fn init() {
     for &reason in AGGREGATOR_SKIP_REASONS {
         LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
     }
-    // Data column sidecars: same zero-seeding treatment as the aggregator
-    // skip counter above.
-    std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_REJECTED_TOTAL);
-    for &reason in DATA_COLUMN_REJECT_REASONS {
-        LEAN_DATA_COLUMNS_REJECTED_TOTAL.with_label_values(&[reason]);
-    }
+    // Data column sidecars.
     std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_STORED_TOTAL);
-    std::sync::LazyLock::force(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS);
     LEAN_BLOCKS_HELD_FOR_COLUMNS.set(0);
 }
 
@@ -1399,34 +1358,9 @@ pub fn set_node_sync_status(status: SyncStatus) {
     }
 }
 
-/// Record why `on_gossip_data_column` dropped a sidecar. `reason` must be one
-/// of [`DATA_COLUMN_REJECT_REASONS`].
-pub fn inc_data_column_rejected(reason: &'static str) {
-    LEAN_DATA_COLUMNS_REJECTED_TOTAL
-        .with_label_values(&[reason])
-        .inc();
-}
-
-/// Test-only readback of [`inc_data_column_rejected`]'s counter, mirroring
-/// `ethlambda-p2p`'s own `data_column_fetch_failures_total`: the only way a
-/// test can tell which reason actually fired, rather than merely that the
-/// sidecar was dropped for *some* reason.
-#[cfg(test)]
-pub(crate) fn data_column_rejected_total(reason: &str) -> u64 {
-    LEAN_DATA_COLUMNS_REJECTED_TOTAL
-        .with_label_values(&[reason])
-        .get()
-}
-
 /// Increment the sidecars written to the store.
 pub fn inc_data_column_stored() {
     LEAN_DATA_COLUMNS_STORED_TOTAL.inc();
-}
-
-/// Start timing a sidecar's KZG cell-proof batch. Records duration when the
-/// guard is dropped.
-pub fn time_data_column_kzg_verify() -> TimingGuard {
-    TimingGuard::new(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS)
 }
 
 /// Mirror `blocks_awaiting_columns.len()`: called on both insertion and

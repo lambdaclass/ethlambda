@@ -2,14 +2,9 @@ use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as Engin
 use ethlambda_network_api::{
     BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest, InitP2P,
 };
-use ethlambda_state_transition::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
-use ethlambda_state_transition::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_domain,
-};
-use ethlambda_state_transition::beacon::helpers::misc::compute_signing_root;
-use ethlambda_state_transition::beacon::{bls, stf};
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, CacheKey, Chain, Store};
 use ethlambda_types::{
@@ -19,7 +14,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{BeaconState, SignedBeaconBlock, fulu},
+        containers::{SignedBeaconBlock, fulu},
         preset,
     },
     block::SignedBlock,
@@ -2558,7 +2553,7 @@ impl BlockChainServer {
 
                 // This root now has a post-state, which is the one thing every
                 // sidecar parked under it was waiting for.
-                self.drain_sidecars_awaiting_parent(block_root).await;
+                self.drain_sidecars_awaiting_parent(block_root);
 
                 Some(ImportOutcome::Imported)
             }
@@ -2909,149 +2904,64 @@ impl BlockChainServer {
         }
     }
 
-    /// Verify a sidecar against the chain and keep it, whether it arrived on
-    /// gossip or in answer to a fetch.
+    /// Keep sidecars the p2p layer has already checked.
     ///
-    /// Gossip's own cheap checks (decode, subnet match, structural validity,
-    /// seen-dedup) already ran in the p2p actor before a gossiped sidecar
-    /// reaches here. A fetched one skips straight to this method with none of
-    /// them, so the structural check is repeated first, rather than trusted
-    /// from the gossip path alone: c-kzg fails outright rather than returning
-    /// false on a length-mismatched batch, so skipping it would not have let
-    /// a bad sidecar through, but it would let a peer answering a fetch force
-    /// a full KZG batch on garbage that gossip rejects for free. Everything
-    /// after it needs the store: the parent must be known and its chain must
-    /// actually descend from the finalized checkpoint (not merely sit at a
-    /// slot above it — a state can stay cached for a block on a losing fork
-    /// long after finality passed it), the sidecar's slot must not be so far
-    /// ahead that advancing to it would be unbounded work, the header must be
-    /// signed by the slot's expected proposer, and the sidecar's commitments
-    /// must be the ones that block committed to. Only then is the KZG batch
-    /// worth paying for.
+    /// Nothing here judges them. Every rule ran in the p2p layer, off this
+    /// actor's single thread: gossip validation for a sidecar gossip
+    /// accepted, and the chain checks
+    /// (`ethlambda_state_transition::beacon::gossip::column::chain_checks`)
+    /// for any other. Those cost a KZG batch and a BLS verification per
+    /// sidecar, which on this thread delayed every block import behind them.
     ///
-    /// A rejected sidecar is dropped silently apart from a metric: neither
-    /// the gossip nor the fetch path can score the peer.
+    /// Debug builds run the chain checks once more, so a p2p path that
+    /// forwards a sidecar it never checked fails a test instead of reaching
+    /// the store. A sidecar that has become a duplicate or fallen below
+    /// finality since it was checked (an `Ignore`) is not a disagreement: the
+    /// verdict was right when it was given.
     ///
     /// Beacon-only: a lean node subscribes to no column subnet, so nothing
-    /// ever delivers this message there (see `Handler<NewDataColumnSidecars>`).
-    ///
-    /// `encoded` is the SSZ this sidecar was decoded from, when the caller
-    /// still has it. Only the replay path does: it just read those bytes back
-    /// out of `Table::PendingDataColumns`, and a sidecar carries a cell per
-    /// blob, so re-deriving them here to write the identical row into
-    /// `Table::DataColumns` would pay a full second SSZ pass for nothing — the
-    /// same waste [`Store::put_data_column_sidecar`] takes bytes rather than a
-    /// container to avoid.
-    async fn on_gossip_data_column(
-        &mut self,
-        sidecar: fulu::DataColumnSidecar,
-        encoded: Option<Vec<u8>>,
-    ) {
-        let header = sidecar.signed_block_header.message.clone();
-        let config = self.store.config();
-
-        if !fork_choice::verify_data_column_sidecar(&sidecar, &config) {
-            metrics::inc_data_column_rejected("malformed");
-            return;
+    /// ever delivers this message there.
+    async fn on_checked_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
+        for sidecar in sidecars {
+            #[cfg(debug_assertions)]
+            {
+                use ethlambda_state_transition::beacon::gossip::{
+                    Outcome,
+                    column::{ChainVerdict, chain_checks},
+                };
+                let verdict = chain_checks(&self.store, &sidecar, unix_now_ms());
+                assert!(
+                    matches!(
+                        verdict,
+                        ChainVerdict::Keep | ChainVerdict::Drop(Outcome::Ignore(_))
+                    ),
+                    "the p2p layer sent a data column sidecar the chain checks refuse: {verdict:?}"
+                );
+            }
+            self.keep_data_column(sidecar).await;
         }
+    }
 
-        let finalized_slot = self
-            .store
-            .latest_finalized()
-            .expect("finalized checkpoint exists")
-            .slot;
-        if header.slot <= finalized_slot {
-            metrics::inc_data_column_rejected("finalized");
-            return;
-        }
-
-        // Bounds `process_slots`, inside the proposer check below, to at most
-        // the unfinalized window: without this, a header naming a slot far
-        // beyond anything this chain has reached would make that call advance
-        // one slot at a time towards it, on the single-threaded actor that
-        // also runs every tick and every other import. `fork_choice::on_block`
-        // asserts the same inequality before its own `state_transition` call,
-        // for the same reason.
-        let current_slot = fork_choice::get_current_slot(&self.store, &config);
-        if header.slot > current_slot {
-            metrics::inc_data_column_rejected("future");
-            return;
-        }
-
-        // Already stored, so nothing past this point would change anything —
-        // and everything past this point is the expensive part: a full
-        // post-state read for the proposer check, the inclusion proof, the KZG
-        // batch and a signature verification.
-        //
-        // Not a rare case. The p2p layer asks for a span's columns alongside
-        // every `BeaconBlocksByRange` batch it plans, and consecutive batches
-        // plus a peer answering an overlapping span re-deliver sidecars this
-        // node already has, so during a backfill drain most arrivals are
-        // duplicates. Paying full verification for each of those is paid on
-        // the same single-threaded actor that runs the imports the backfill is
-        // waiting on, which is the one place it cannot be afforded.
+    /// Store a checked sidecar and release the held block it may complete.
+    async fn keep_data_column(&mut self, sidecar: fulu::DataColumnSidecar) {
+        let header = &sidecar.signed_block_header.message;
+        let slot = header.slot;
         let block_root = header.hash_tree_root();
+
+        // Two copies of one column can pass the checks at once (from gossip
+        // and from a fetch, say). The second write would store the same row
+        // and count it, and re-check the held block, for nothing.
         let stored = self
             .store
-            .data_column_indices_for(header.slot, &block_root)
+            .data_column_indices_for(slot, &block_root)
             .expect("DB read should succeed");
         if stored.contains(&sidecar.index) {
             return;
         }
 
-        // The proposer check below needs the parent's post-state to advance
-        // from. Not having one is a "not yet", never a "no": the parent may
-        // still be in flight, or — the case the availability gate creates on
-        // every held block — already in the store but withheld from
-        // `on_block`, which is what writes the post-state. Queue the sidecar
-        // against that parent instead of dropping it, exactly as the
-        // specification's `[IGNORE] ... MAY be queued for processing once the
-        // parent block is retrieved` allows, and replay it from
-        // `drain_sidecars_awaiting_parent` when the parent imports.
-        //
-        // Deliberately ahead of the inclusion-proof and KZG checks below, so a
-        // replay pays for them once rather than once per attempt.
-        let Ok(Some(parent_state)) = self.store.get_state(&header.parent_root) else {
-            self.queue_sidecar_awaiting_parent(block_root, sidecar);
-            return;
-        };
-
-        if !self.parent_is_on_the_finalized_chain(header.parent_root) {
-            metrics::inc_data_column_rejected("finalized_ancestor");
-            return;
-        }
-
-        if !fork_choice::verify_data_column_sidecar_inclusion_proof(&sidecar) {
-            metrics::inc_data_column_rejected("inclusion_proof");
-            return;
-        }
-
-        let kzg_result = {
-            let _timing = metrics::time_data_column_kzg_verify();
-            fork_choice::verify_data_column_sidecar_kzg_proofs(&sidecar)
-        };
-        match kzg_result {
-            Ok(true) => {}
-            Ok(false) => {
-                metrics::inc_data_column_rejected("kzg");
-                return;
-            }
-            Err(err) => {
-                trace!(?err, "Dropping a sidecar whose cells did not parse");
-                metrics::inc_data_column_rejected("kzg");
-                return;
-            }
-        }
-
-        if !self.header_is_signed_by_the_expected_proposer(&sidecar, &parent_state, &config) {
-            metrics::inc_data_column_rejected("proposer");
-            return;
-        }
-
-        let encoded = encoded.unwrap_or_else(|| sidecar.to_ssz());
         if let Err(err) =
             self.store
-                .put_data_column_sidecar(header.slot, &block_root, sidecar.index, encoded)
+                .put_data_column_sidecar(slot, &block_root, sidecar.index, sidecar.to_ssz())
         {
             error!(%err, "Failed to store a data column sidecar");
             return;
@@ -3062,76 +2972,42 @@ impl BlockChainServer {
         self.release_block_if_columns_complete(block_root).await;
     }
 
-    /// Whether `parent_root`'s chain actually descends from the finalized
-    /// checkpoint, not merely sits at a slot above it: `get_checkpoint_block`
-    /// walks its ancestry to the finalized epoch's boundary, and the result
-    /// must be the finalized root itself, not just any root that happens to
-    /// resolve. A state can stay cached for a block on a losing fork long
-    /// after finality passed it, which is exactly the case a slot-only
-    /// comparison would miss. Mirrors `fork_choice::on_block`'s own check,
-    /// over the same block index.
+    /// Park sidecars the chain checks found no parent post-state for, or send
+    /// them straight back to be checked if the parent has one by now.
     ///
-    /// A method of its own, separate from `on_gossip_data_column`'s other
-    /// inline checks, so a test can drive it against a hand-built block index
-    /// without needing a sidecar that also clears the inclusion proof, the
-    /// KZG batch and the proposer signature — the three checks after this one
-    /// in the real pipeline, none of which this check's own correctness has
-    /// anything to do with.
-    fn parent_is_on_the_finalized_chain(&self, parent_root: H256) -> bool {
-        let finalized_checkpoint = self.store.beacon_finalized_checkpoint();
-        let block_index = self.store.block_index();
-        matches!(
-            fork_choice::get_checkpoint_block(&block_index, parent_root, finalized_checkpoint.epoch),
-            Ok(root) if root == finalized_checkpoint.root
-        )
+    /// The second case is a race this actor has to close, because the checks
+    /// run elsewhere: the p2p layer looked for the parent's post-state, found
+    /// none and sent these, and if the parent imported in between, its
+    /// [`Self::drain_sidecars_awaiting_parent`] has already run and will not
+    /// run again, so a sidecar parked now would wait for nothing until
+    /// finality evicts it. Asked with the same `get_state` the checks use, so
+    /// a sidecar sent back is one they will find a parent state for.
+    fn park_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
+        let mut ready = Vec::new();
+        for sidecar in sidecars {
+            let parent_root = sidecar.signed_block_header.message.parent_root;
+            if matches!(self.store.get_state(&parent_root), Ok(Some(_))) {
+                ready.push(sidecar);
+                continue;
+            }
+            let block_root = sidecar.signed_block_header.message.hash_tree_root();
+            self.queue_sidecar_awaiting_parent(block_root, sidecar);
+        }
+        self.send_data_columns_for_checks(ready);
     }
 
-    /// Whether `sidecar`'s header names the slot's expected proposer and
-    /// carries their signature.
-    ///
-    /// Mirrors `stf::verify_block_signature`, adapted to a bare header: a
-    /// sidecar carries no block body, only the header the block committed to,
-    /// so the signing root is taken over that header's own root rather than a
-    /// whole block's. Reuses the same primitives that check does
-    /// (`get_domain`, `compute_signing_root`, `bls::verify`) rather than a
-    /// second copy of the BLS call, since no publicly reachable function
-    /// verifies a bare header's signature: the block path always has a whole
-    /// block to check, and the proposer-slashing path checks two headers it
-    /// already has a validator for.
-    ///
-    /// `parent_state` is cloned and advanced with `process_slots` rather than
-    /// mutated in place, the same way `compute_pulled_up_tip` clones out of
-    /// the store's `Arc` before running a throwaway transition: the store's
-    /// own cached entry for the parent must be left exactly as it was.
-    fn header_is_signed_by_the_expected_proposer(
-        &self,
-        sidecar: &fulu::DataColumnSidecar,
-        parent_state: &BeaconState,
-        config: &Config,
-    ) -> bool {
-        let header = &sidecar.signed_block_header.message;
-        let mut state = parent_state.clone();
-        if stf::process_slots(&mut state, header.slot, config).is_err() {
-            return false;
+    /// Hand sidecars to the p2p layer's chain checks, which send back the
+    /// ones that pass through `new_data_column_sidecars`.
+    fn send_data_columns_for_checks(&self, sidecars: Vec<fulu::DataColumnSidecar>) {
+        if sidecars.is_empty() {
+            return;
         }
-
-        let Ok(expected_proposer) = get_beacon_proposer_index(&state) else {
-            return false;
+        let Some(ref p2p) = self.p2p else {
+            return;
         };
-        if header.proposer_index != expected_proposer {
-            return false;
-        }
-
-        let Ok(proposer) = state.validator(header.proposer_index) else {
-            return false;
-        };
-        let domain = get_domain(&state, DOMAIN_BEACON_PROPOSER, None);
-        let signing_root = compute_signing_root(header.hash_tree_root(), domain);
-        bls::verify(
-            &proposer.pubkey,
-            signing_root,
-            &sidecar.signed_block_header.signature,
-        )
+        let _ = p2p.check_data_column_sidecars(sidecars).inspect_err(
+            |err| error!(%err, "Failed to send data column sidecars to the p2p layer for checks"),
+        );
     }
 
     /// Park `sidecar` against the parent root it could not be checked against.
@@ -3157,19 +3033,17 @@ impl BlockChainServer {
     /// grows is disk rather than this actor's memory.
     /// [`Self::evict_sidecars_awaiting_parent_at_or_below_finality`] is what
     /// bounds it, which bounds how *long* an entry lives but not how fast
-    /// they arrive: `on_gossip_data_column` does not require `parent_root` to
-    /// name a block this node knows. A gossiped sidecar reaching here has had
-    /// its header's signature checked against the head state by the p2p
-    /// layer's gossip validation (`queue_unless_forged`, in
+    /// they arrive: the chain checks do not require `parent_root` to name a
+    /// block this node knows. Every sidecar reaching here, gossiped or
+    /// fetched, has had its header's signature checked against the head state
+    /// by those checks (`queue_unless_forged`, in
     /// `ethlambda_state_transition::beacon::gossip::column`), but only when a
     /// head state is already cached *and* the header's `proposer_index` names
     /// a validator in it: with no cached head state, or a proposer index that
     /// names none (`u64::MAX`, say), that check is skipped and a made-up
-    /// header still reaches here and parks a row. A sidecar fetched over
-    /// req/resp skips gossip validation entirely and reaches this method with
-    /// none of that checked, so a peer answering a fetch, or exploiting either
-    /// gap in the gossip path, can still park rows as fast as it can invent a
-    /// slot, proposer and index, until finality catches up.
+    /// header still reaches here and parks a row. A peer exploiting either
+    /// gap can still park rows as fast as it can invent a slot, proposer and
+    /// index, until finality catches up.
     fn queue_sidecar_awaiting_parent(
         &mut self,
         block_root: H256,
@@ -3184,13 +3058,13 @@ impl BlockChainServer {
         };
 
         // A re-delivery of something already parked. The by-root and by-range
-        // fetch paths skip gossip validation entirely, so they never touch the
-        // p2p actor's `SeenColumns` (which in any case only records an Accept,
-        // never a park); a re-delivery reaching here is ordinary, and without
-        // this check the same column would take a second slot in the queue and
-        // leave a stale key behind after the first replay took its row. Asked
-        // before the write rather than left to the set below, because the
-        // write is what costs.
+        // fetch paths skip gossip's seen cache entirely, so they never touch
+        // the p2p actor's `SeenColumns` (which in any case only records an
+        // Accept, never a park); a re-delivery reaching here is ordinary, and
+        // without this check the same column would take a second slot in the
+        // queue and leave a stale key behind after the first replay took its
+        // row. Asked before the write rather than left to the set below,
+        // because the write is what costs.
         if self
             .sidecars_awaiting_parent
             .get(&parent_root)
@@ -3234,16 +3108,13 @@ impl BlockChainServer {
         metrics::set_sidecars_awaiting_parent(total as u64);
     }
 
-    /// Replay every sidecar parked against `block_root` now that it has a
-    /// post-state to be checked against.
+    /// Send every sidecar parked against `block_root` back to the p2p layer's
+    /// chain checks, now that it has a post-state to be checked against.
     ///
     /// Called from the one arm that means "this root now has a post-state".
-    /// The replay re-enters [`Self::on_gossip_data_column`], which may itself
-    /// release a held block and import it — reaching this function again for
-    /// *that* root. The recursion is bounded by the chain: each level consumes
-    /// one root's queue and no root regains one, since a root that has a
-    /// post-state never queues against itself again.
-    async fn drain_sidecars_awaiting_parent(&mut self, block_root: H256) {
+    /// The ones that pass come back through `new_data_column_sidecars` as a
+    /// new message, so nothing here re-enters the import path.
+    fn drain_sidecars_awaiting_parent(&mut self, block_root: H256) {
         let Some(parked_columns) = self.sidecars_awaiting_parent.remove(&block_root) else {
             return;
         };
@@ -3254,11 +3125,12 @@ impl BlockChainServer {
         );
         self.publish_sidecars_awaiting_parent();
 
+        let mut sidecars = Vec::with_capacity(parked_columns.len());
         for parked in parked_columns {
             // Taken, not read: the row has served its purpose either way. A
-            // replay that passes writes the sidecar to `DataColumns`, and one
-            // that fails a check has judged it, so neither leaves anything
-            // worth keeping here.
+            // replay that passes is written to `DataColumns`, and one that
+            // fails a check has been judged, so neither leaves anything worth
+            // keeping here.
             let encoded = match self.store.take_pending_data_column_sidecar(
                 parked.slot,
                 &parked.block_root,
@@ -3287,12 +3159,9 @@ impl BlockChainServer {
                 );
                 continue;
             };
-            // Handed back the bytes it was decoded from: a replay that passes
-            // every check writes this same row into `Table::DataColumns`, and
-            // re-encoding it there would be a second full SSZ pass over a
-            // sidecar carrying a cell per blob.
-            self.on_gossip_data_column(sidecar, Some(encoded)).await;
+            sidecars.push(sidecar);
         }
+        self.send_data_columns_for_checks(sidecars);
     }
 
     /// Drop parked sidecars whose block finality has superseded.
@@ -3301,7 +3170,7 @@ impl BlockChainServer {
     /// run beside it, for the same reason: a parent root that never arrives
     /// would otherwise pin its children's sidecars for this node's whole
     /// uptime. A sidecar at or below the finalized slot can never be needed
-    /// again, since `on_gossip_data_column` would reject it outright now.
+    /// again, since the chain checks would drop it outright now.
     fn evict_sidecars_awaiting_parent_at_or_below_finality(&mut self) {
         if self.sidecars_awaiting_parent.is_empty() {
             return;
@@ -3444,19 +3313,7 @@ impl BlockChainServer {
         // pending children still cascade through `run_import_cascade`'s loop
         // rather than growing the stack.
         //
-        // This *is* reachable from inside that loop, through
-        // `process_or_pend_block` -> `drain_sidecars_awaiting_parent` ->
-        // `on_gossip_data_column`, which is why the future is boxed: the cycle
-        // is `on_block` -> ... -> `on_block`, and an `async fn` whose future
-        // contains itself has no finite size. Boxing puts one heap allocation
-        // on an edge taken once per released block, not per block imported.
-        //
-        // Re-entry terminates because it strictly consumes state:
-        // `drain_sidecars_awaiting_parent` removes the queue entry before
-        // replaying it, and `release_block_if_columns_complete` removes the
-        // hold before re-importing, so no block or sidecar can drive this edge
-        // twice.
-        let outcome = Box::pin(self.on_block(block, timings)).await;
+        let outcome = self.on_block(block, timings).await;
 
         // The re-import can fail for a reason that has nothing to do with
         // columns: no verdict from the execution client, or a `NOT_VALIDATED`
@@ -3624,7 +3481,8 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    NewAggregatedAttestation, NewAttestation, NewBlock, NewDataColumnSidecars,
+    DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBlock,
+    NewDataColumnSidecars,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3781,9 +3639,13 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
     async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
-        for sidecar in msg.sidecars {
-            self.on_gossip_data_column(sidecar, None).await;
-        }
+        self.on_checked_data_columns(msg.sidecars).await;
+    }
+}
+
+impl Handler<DataColumnSidecarsAwaitingParent> for BlockChainServer {
+    async fn handle(&mut self, msg: DataColumnSidecarsAwaitingParent, _ctx: &Context<Self>) {
+        self.park_data_columns(msg.sidecars);
     }
 }
 
@@ -3913,7 +3775,7 @@ mod tests {
     use ethlambda_state_transition::beacon::fork_choice::seconds_to_milliseconds;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{deneb, electra, phase0, shared};
+    use ethlambda_types::beacon::containers::{BeaconState, deneb, electra, phase0, shared};
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::checkpoint::Checkpoint;
@@ -4191,12 +4053,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // on_gossip_data_column reject paths
+    // Data column sidecars: keeping, parking and replaying them
     //
-    // Both call the method directly on a plain `BlockChainServer`, built the
-    // way `start_actor` builds one but never spawned: there is no mailbox to
-    // drive, and the checks under test run before anything here would need
-    // one.
+    // These call the methods directly on a plain `BlockChainServer`, built
+    // the way `start_actor` builds one but never spawned: there is no mailbox
+    // to drive. The checks themselves run in the p2p layer and are tested
+    // with `beacon::gossip::column`.
     // -----------------------------------------------------------------
 
     fn beacon_server(store: Store) -> BlockChainServer {
@@ -4222,9 +4084,9 @@ mod tests {
 
     /// A sidecar naming `slot` and `parent_root`, structurally valid enough to
     /// clear `verify_data_column_sidecar` (one commitment, one proof, one
-    /// column cell, all the same length) so the reject paths under test are
-    /// reached at all now that check runs first; every other field is its
-    /// type's default, since none of those paths reads past the header.
+    /// column cell, all the same length), so the chain checks judge it on its
+    /// parent rather than its shape; every other field is its type's default,
+    /// since nothing under test reads past the header.
     fn sidecar_at(slot: u64, parent_root: H256) -> fulu::DataColumnSidecar {
         let cell: fulu::Cell = libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL])
             .expect("exact cell size");
@@ -4283,9 +4145,9 @@ mod tests {
     }
 
     /// A structurally minimal phase0 state, good for nothing but existing.
-    /// The finalized-ancestor check under test never reads a state's
-    /// contents, only whether `Store::get_state` finds one at all, so this
-    /// only needs to satisfy the type checker and `Store::insert_state`.
+    /// The parent check under test never reads a state's contents, only
+    /// whether `Store::get_state` finds one at all, so this only needs to
+    /// satisfy the type checker and `Store::insert_state`.
     ///
     /// `latest_block_header.parent_root` is set to a root nothing else in a
     /// test ever writes, so `Store::block_entry` reports it unknown and
@@ -4331,135 +4193,6 @@ mod tests {
             current_justified_checkpoint: Default::default(),
             finalized_checkpoint: Default::default(),
         })
-    }
-
-    #[tokio::test]
-    async fn a_data_column_sidecar_naming_a_parent_off_the_finalized_chain_is_dropped() {
-        // Two blocks hung off two different, unrelated roots: `rogue_child`'s
-        // own parent (`rogue_root`) resolves cleanly to slot 0 during the
-        // ancestry walk, so `get_checkpoint_block` returns `Ok(rogue_root)`
-        // rather than an error — and `rogue_root` is not the finalized root,
-        // which is `beacon_store`'s anchor (`H256::ZERO`). That distinction is
-        // the point: a bug that accepted any `Ok(_)` result, rather than
-        // checking it names the finalized root specifically, would pass this
-        // test's "unknown parent" sibling but not this one.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        let rogue_root = H256::repeat_byte(0xa0);
-        let rogue_child = H256::repeat_byte(0xa1);
-        store
-            .insert_signed_block(rogue_root, bare_block(0, H256::repeat_byte(0xff)))
-            .expect("insert");
-        store
-            .insert_signed_block(rogue_child, bare_block(10, rogue_root))
-            .expect("insert");
-        store
-            .insert_state(rogue_child, bare_state())
-            .expect("insert");
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 11 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-
-        let mut server = beacon_server(store);
-        let sidecar = sidecar_at(11, rogue_child);
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.on_gossip_data_column(sidecar, None).await;
-
-        assert_eq!(
-            server
-                .store
-                .data_column_indices_for(11, &block_root)
-                .unwrap(),
-            Vec::<u64>::new()
-        );
-    }
-
-    // The end-to-end test above shows the sidecar never gets stored, but it
-    // cannot tell *why*: the inclusion proof, KZG batch and proposer checks
-    // that run after `parent_is_on_the_finalized_chain` would reject this
-    // particular sidecar on their own regardless, since it carries no real
-    // commitments or signature. A bug that made the check under test always
-    // return `true` would still pass that test. These two drive the method
-    // directly, with no sidecar involved, so they catch exactly that bug.
-
-    #[test]
-    fn a_root_off_the_finalized_chain_is_not_on_it() {
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        let rogue_root = H256::repeat_byte(0xa0);
-        let rogue_child = H256::repeat_byte(0xa1);
-        store
-            .insert_signed_block(rogue_root, bare_block(0, H256::repeat_byte(0xff)))
-            .expect("insert");
-        store
-            .insert_signed_block(rogue_child, bare_block(10, rogue_root))
-            .expect("insert");
-        let server = beacon_server(store);
-
-        assert!(!server.parent_is_on_the_finalized_chain(rogue_child));
-    }
-
-    #[test]
-    fn the_finalized_root_itself_is_on_the_finalized_chain() {
-        // `beacon_store` seeds the anchor as the finalized checkpoint but,
-        // unlike the real bootstrap path (`fork_choice`'s own
-        // `get_forkchoice_store`), writes no block for it, so the block index
-        // needs one here or `get_ancestor` has nothing to look up at all. The
-        // parent named is never read: block 0's own slot already satisfies
-        // the walk's stopping condition before it would be.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        store
-            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
-            .expect("insert");
-        let server = beacon_server(store);
-
-        // The ancestry walk starts already at the target slot and returns
-        // immediately without a single hop, the case `a_root_off...` above
-        // does not exercise at all.
-        assert!(server.parent_is_on_the_finalized_chain(H256::ZERO));
-    }
-
-    #[tokio::test]
-    async fn a_data_column_sidecar_at_or_below_the_finalized_slot_is_dropped() {
-        let store = beacon_store(GENESIS_TIME, 100);
-        let mut server = beacon_server(store);
-        let sidecar = sidecar_at(100, H256::repeat_byte(1));
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.on_gossip_data_column(sidecar, None).await;
-
-        assert_eq!(
-            server
-                .store
-                .data_column_indices_for(100, &block_root)
-                .unwrap(),
-            Vec::<u64>::new()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_data_column_sidecar_from_a_future_slot_is_dropped() {
-        // `store.time` starts at zero (see `Store::init_beacon`), which reads
-        // as slot zero on beacon, so any positive slot is "future" here
-        // without needing to advance it. This is the check that keeps a
-        // maliciously large `header.slot` from driving `process_slots`, in
-        // the proposer check further down `on_gossip_data_column`, one slot
-        // at a time towards it on the actor's own thread.
-        let store = beacon_store(GENESIS_TIME, 0);
-        let mut server = beacon_server(store);
-        let sidecar = sidecar_at(5, H256::repeat_byte(1));
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.on_gossip_data_column(sidecar, None).await;
-
-        assert_eq!(
-            server
-                .store
-                .data_column_indices_for(5, &block_root)
-                .unwrap(),
-            Vec::<u64>::new()
-        );
     }
 
     #[test]
@@ -4512,58 +4245,115 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn a_sidecar_this_node_already_holds_costs_nothing_to_receive_again() {
-        // The p2p layer pulls each range batch's columns alongside its
-        // blocks, and consecutive batches overlap, so during a drain most
-        // arrivals are already in the store. They must
-        // stop at the cheap presence check, before the full post-state read
-        // that the proposer check needs, or they starve the imports the drain
-        // is waiting on. Parking is the observable proxy for "went further":
-        // this sidecar's parent has no state, so an arrival that got past the
-        // presence check would be parked.
+    /// Every `BlockChainToP2P` message the chain actor sends, kept for a test
+    /// to read back. Only `check_data_column_sidecars` is recorded: nothing
+    /// under test here sends the others.
+    #[derive(Default)]
+    struct RecordingP2P {
+        checks: std::sync::Mutex<Vec<Vec<fulu::DataColumnSidecar>>>,
+    }
+
+    impl ethlambda_network_api::BlockChainToP2P for RecordingP2P {
+        fn publish_block(
+            &self,
+            _block: ethlambda_types::block::SignedBlock,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn publish_attestation(
+            &self,
+            _attestation: ethlambda_types::attestation::SignedAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn publish_aggregated_attestation(
+            &self,
+            _attestation: ethlambda_types::attestation::SignedAggregatedAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn fetch_block(
+            &self,
+            _request: FetchRequest,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn check_data_column_sidecars(
+            &self,
+            sidecars: Vec<fulu::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.checks.lock().unwrap().push(sidecars);
+            Ok(())
+        }
+    }
+
+    /// `beacon_server(store)` with a [`RecordingP2P`] wired in as its p2p ref.
+    fn beacon_server_recording(store: Store) -> (BlockChainServer, Arc<RecordingP2P>) {
+        let p2p = Arc::new(RecordingP2P::default());
+        let mut server = beacon_server(store);
+        server.p2p = Some(p2p.clone());
+        (server, p2p)
+    }
+
+    /// A beacon store whose clock reads slot 10, so a sidecar at slot 10 is
+    /// neither future nor finalized.
+    fn beacon_store_at_slot_10() -> Store {
         let mut store = beacon_store(GENESIS_TIME, 0);
         store
             .set_time_ms(seconds_to_milliseconds(
                 GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
             ))
             .unwrap();
-        let mut server = beacon_server(store);
-        let sidecar = sidecar_at(10, H256::repeat_byte(9));
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-        server
-            .store
-            .put_data_column_sidecar(10, &block_root, sidecar.index, sidecar.to_ssz())
-            .unwrap();
-
-        server.on_gossip_data_column(sidecar, None).await;
-
-        assert!(
-            server.sidecars_awaiting_parent.is_empty(),
-            "a sidecar already in the store must not be parked, verified or stored again"
-        );
+        store
     }
 
     #[tokio::test]
-    async fn a_data_column_sidecar_naming_a_parent_with_no_state_is_parked_not_dropped() {
+    async fn a_checked_sidecar_is_stored_as_it_is() {
+        // Nothing on this path judges the sidecar (that is the p2p layer's
+        // job), so storing it is the whole contract. `keep_data_column`
+        // rather than `on_checked_data_columns`, since this placeholder
+        // sidecar would fail the debug-build re-check.
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let sidecar = sidecar_at(10, H256::repeat_byte(9));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.keep_data_column(sidecar).await;
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(10, &block_root)
+                .expect("DB read should succeed"),
+            vec![0]
+        );
+    }
+
+    /// The debug-build safety net: a sidecar the p2p layer forwarded as
+    /// checked, but that the chain checks would not have kept, stops the
+    /// actor rather than reaching the store. Release builds skip the re-check
+    /// and store it.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "the chain checks refuse")]
+    async fn a_sidecar_the_p2p_layer_never_checked_fails_the_debug_recheck() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        // Its parent has no state, so the chain checks would park it, never
+        // keep it.
+        let sidecar = sidecar_at(10, H256::repeat_byte(9));
+
+        server.on_checked_data_columns(vec![sidecar]).await;
+    }
+
+    #[test]
+    fn a_data_column_sidecar_naming_a_parent_with_no_state_is_parked_not_stored() {
         // `beacon_store` writes no anchor state (see its own doc comment), so
         // any parent root at all is unknown here, including the anchor's own.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        // `store.time` starts at zero, which reads as slot zero on beacon
-        // (`get_slots_since_genesis` saturates instead of going negative), so
-        // slot 10 would otherwise be rejected as a future slot before the
-        // parent check under test ever ran.
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
+        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
         let parent_root = H256::repeat_byte(9);
         let sidecar = sidecar_at(10, parent_root);
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.on_gossip_data_column(sidecar, None).await;
+        server.park_data_columns(vec![sidecar]);
 
         // Not stored: it has not been checked, so it has not been accepted.
         assert_eq!(
@@ -4584,60 +4374,70 @@ mod tests {
                 .map(HashSet::len),
             Some(1)
         );
+        assert!(p2p.checks.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
-    async fn a_parked_sidecar_is_replayed_once_its_parent_gains_a_post_state() {
-        // The deadlock this closes, in miniature: while the parent has no
-        // post-state every sidecar under it parks, and if parking were the end
-        // of the story the queue would only ever grow. What breaks the cycle
-        // is that gaining a post-state releases them.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
+    #[test]
+    fn a_sidecar_whose_parent_imported_meanwhile_goes_back_for_checks_not_into_the_queue() {
+        // The race the p2p layer's checks open: they found no parent state,
+        // then the parent imported and drained its (still empty) queue before
+        // this message arrived. Parking it now would strand it until
+        // finality, since that parent never drains again.
+        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
         let parent_root = H256::repeat_byte(9);
-
-        server
-            .on_gossip_data_column(sidecar_at(10, parent_root), None)
-            .await;
-        assert!(server.sidecars_awaiting_parent.contains_key(&parent_root));
-
-        // What an import writes, and the only thing the parent check reads.
         server
             .store
             .insert_state(parent_root, bare_state())
             .expect("insert");
-        server.drain_sidecars_awaiting_parent(parent_root).await;
+        let sidecar = sidecar_at(10, parent_root);
 
-        // Gone from the queue, and not re-parked: the replay got past the
-        // check that had stopped it. Whether it then passes the inclusion
-        // proof and KZG batch is not this function's business — a placeholder
-        // sidecar fails those by construction — but it was re-judged rather
-        // than dropped, which is the whole contract.
-        assert!(!server.sidecars_awaiting_parent.contains_key(&parent_root));
+        server.park_data_columns(vec![sidecar.clone()]);
+
+        assert!(server.sidecars_awaiting_parent.is_empty());
+        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
     }
 
-    #[tokio::test]
-    async fn a_parked_sidecar_holds_its_bytes_on_disk_and_not_in_the_queue() {
-        // The queue's size is chosen by whoever is gossiping, so what it holds
-        // per entry is the thing that has to stay small: a key, not a cell per
-        // blob.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
+    #[test]
+    fn a_parked_sidecar_goes_back_for_checks_once_its_parent_gains_a_post_state() {
+        // The deadlock this closes, in miniature: while the parent has no
+        // post-state every sidecar under it parks, and if parking were the end
+        // of the story the queue would only ever grow. What breaks the cycle
+        // is that gaining a post-state releases them, to the p2p layer's
+        // checks, since this actor no longer judges a sidecar itself.
+        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
         let parent_root = H256::repeat_byte(9);
         let sidecar = sidecar_at(10, parent_root);
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.on_gossip_data_column(sidecar, None).await;
+        server.park_data_columns(vec![sidecar.clone()]);
+        assert!(server.sidecars_awaiting_parent.contains_key(&parent_root));
+
+        server.drain_sidecars_awaiting_parent(parent_root);
+
+        // Gone from the queue and from `PendingDataColumns`, and handed to
+        // the checks exactly as it was parked.
+        assert!(!server.sidecars_awaiting_parent.contains_key(&parent_root));
+        assert!(
+            server
+                .store
+                .take_pending_data_column_sidecar(10, &block_root, 0)
+                .expect("DB read should succeed")
+                .is_none()
+        );
+        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+    }
+
+    #[test]
+    fn a_parked_sidecar_holds_its_bytes_on_disk_and_not_in_the_queue() {
+        // The queue's size is chosen by whoever is gossiping, so what it holds
+        // per entry is the thing that has to stay small: a key, not a cell per
+        // blob.
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let parent_root = H256::repeat_byte(9);
+        let sidecar = sidecar_at(10, parent_root);
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.park_data_columns(vec![sidecar]);
 
         assert_eq!(
             server.sidecars_awaiting_parent.get(&parent_root),
@@ -4657,23 +4457,17 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_parked_sidecar_does_not_satisfy_the_availability_gate() {
+    #[test]
+    fn a_parked_sidecar_does_not_satisfy_the_availability_gate() {
         // Why the parked rows get a table of their own. Nothing has judged a
         // parked sidecar's inclusion proof, its KZG batch or its proposer
         // signature, so a peer that could get one counted as custodied would
         // be able to release a held block with a column it invented.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
+        let mut server = beacon_server(beacon_store_at_slot_10());
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.on_gossip_data_column(sidecar, None).await;
+        server.park_data_columns(vec![sidecar]);
 
         assert_eq!(
             server
@@ -4685,28 +4479,18 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_sidecar_parked_twice_takes_one_slot_in_the_queue() {
-        // The by-root and by-range fetch paths skip gossip validation
+    #[test]
+    fn a_sidecar_parked_twice_takes_one_slot_in_the_queue() {
+        // The by-root and by-range fetch paths skip gossip's seen cache
         // entirely, so nothing between them and this actor dedups a
         // re-delivery while the parent is still stateless; it is ordinary. A
         // second entry would leave a key with no row behind it once the
         // first replay took it.
-        let mut store = beacon_store(GENESIS_TIME, 0);
-        store
-            .set_time_ms(seconds_to_milliseconds(
-                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
-            ))
-            .unwrap();
-        let mut server = beacon_server(store);
+        let mut server = beacon_server(beacon_store_at_slot_10());
         let parent_root = H256::repeat_byte(9);
 
-        server
-            .on_gossip_data_column(sidecar_at(10, parent_root), None)
-            .await;
-        server
-            .on_gossip_data_column(sidecar_at(10, parent_root), None)
-            .await;
+        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
+        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
 
         assert_eq!(
             server
@@ -4719,11 +4503,11 @@ mod tests {
 
     #[test]
     fn parked_sidecars_are_dropped_once_finality_passes_their_slot() {
-        // Populated directly rather than through `on_gossip_data_column`: a
-        // sidecar at or below the finalized slot is refused by that function's
-        // own earlier check, so the only way to observe the sweep is to park
-        // one behind its back. The finalized slot is fixed at init, so the
-        // store carries it rather than the test moving it.
+        // Populated directly rather than through `park_data_columns`: the
+        // chain checks refuse a sidecar at or below the finalized slot before
+        // it could ever be parked, so the only way to observe the sweep is to
+        // park one behind their back. The finalized slot is fixed at init, so
+        // the store carries it rather than the test moving it.
         let mut server = beacon_server(beacon_store(GENESIS_TIME, 10));
         let superseded = H256::repeat_byte(1);
         let still_wanted = H256::repeat_byte(2);
@@ -4746,36 +4530,6 @@ mod tests {
         // a parent that may yet show up.
         assert!(!server.sidecars_awaiting_parent.contains_key(&superseded));
         assert!(server.sidecars_awaiting_parent.contains_key(&still_wanted));
-    }
-
-    #[tokio::test]
-    async fn a_structurally_malformed_sidecar_is_dropped_before_any_store_lookup() {
-        // What a fetched sidecar used to skip: `on_gossip_data_column` now
-        // runs `verify_data_column_sidecar` itself, so a peer answering a
-        // fetch with garbage cannot force the expensive checks (parent
-        // lookup, finalized-ancestor walk, KZG batch) the way it could
-        // before this ran here too. Zero commitments is what the check
-        // itself calls out as invalid ("a sidecar for zero blobs"), so
-        // clearing the field `sidecar_at` otherwise populates is enough to
-        // trigger it, on a store and slot that would otherwise clear every
-        // check after it.
-        let store = beacon_store(GENESIS_TIME, 0);
-        let mut server = beacon_server(store);
-        let mut sidecar = sidecar_at(10, H256::ZERO);
-        sidecar.kzg_commitments = Default::default();
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        let before = metrics::data_column_rejected_total("malformed");
-        server.on_gossip_data_column(sidecar, None).await;
-
-        assert_eq!(
-            server
-                .store
-                .data_column_indices_for(10, &block_root)
-                .unwrap(),
-            Vec::<u64>::new()
-        );
-        assert_eq!(metrics::data_column_rejected_total("malformed"), before + 1);
     }
 
     // -----------------------------------------------------------------

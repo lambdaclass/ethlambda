@@ -35,6 +35,7 @@ use super::{
     messages::{ResponseCode, error_message},
 };
 use crate::beacon::BeaconWire;
+use crate::beacon::column_checks;
 use crate::beacon::decode::decode_data_column_sidecar;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{
@@ -2113,17 +2114,14 @@ pub async fn request_beacon_block_by_root(
     Some(request_id)
 }
 
-/// Take delivery of a `DataColumnsByRoot` response and forward every sidecar
-/// it carried to the chain actor through `new_data_column_sidecars`, exactly
-/// the path a gossiped sidecar takes. The specification requires a sidecar
+/// Take delivery of a `DataColumnsByRoot` response and run every sidecar it
+/// carried through the chain checks (`beacon::column_checks`), which send the
+/// chain actor the ones that pass. The specification requires a sidecar
 /// obtained by any other means to be treated as if it had arrived on gossip;
-/// routing every fetched sidecar into the same entry point, with the same
-/// full verification (structural validity, inclusion proof, KZG batch,
-/// proposer, header signature) running on the far side, is what makes that
-/// true rather than merely intended. Structural validity runs there rather
-/// than here: gossip's own copy of that check stays where it is too, ahead
-/// of the mailbox hop it saves, but the fetch path has no such hop to save
-/// and gains nothing from a second copy of the check.
+/// the chain checks are gossip's rules less the two that only mean something
+/// on a topic (the subnet and the seen cache), and the chain actor keeps what
+/// reaches it without checking it again, so they are the only checks a
+/// fetched sidecar gets.
 ///
 /// Unlike a block-by-root answer, which names exactly one document that
 /// either matches the requested root or doesn't, the specification permits a
@@ -2147,7 +2145,7 @@ pub async fn request_beacon_block_by_root(
 /// A sidecar outside the requested span is dropped on its own rather than
 /// failing the batch, the same way a block outside its range is: the rest of
 /// the answer may still be what was asked for. Every other check is the chain
-/// actor's, which runs the same `on_gossip_data_column` a gossiped sidecar
+/// checks' (`beacon::column_checks`), the same ones a fetched-by-root sidecar
 /// passes through.
 async fn handle_data_column_sidecars_range_response(
     server: &mut P2PServer,
@@ -2159,10 +2157,10 @@ async fn handle_data_column_sidecars_range_response(
     let received = sidecars.len();
     trace!(%peer, start_slot, end_slot, received, "Received DataColumnsByRange response");
 
-    let Some(ref blockchain) = server.blockchain else {
+    if server.blockchain.is_none() {
         debug!(%peer, "No blockchain handler available");
         return;
-    };
+    }
 
     let in_range: Vec<DataColumnSidecar> = sidecars
         .into_iter()
@@ -2179,18 +2177,12 @@ async fn handle_data_column_sidecars_range_response(
         return;
     }
 
-    // One message for the whole batch. A range answer is the largest batch
-    // this node ever takes delivery of, and it arrives precisely when the
-    // chain actor is busiest draining a backlog, so a message per sidecar
-    // would put that many mailbox hops between the answer and the imports
-    // waiting on it.
-    let count = in_range.len();
-    if let Err(err) = blockchain.new_data_column_sidecars(in_range) {
-        error!(
-            %err, %peer, start_slot, end_slot, count,
-            "Failed to forward ranged data column sidecars to blockchain"
-        );
-    }
+    // One batch through the checks, which forward what passes as one
+    // message. A range answer is the largest batch this node ever takes
+    // delivery of, and it arrives precisely when the chain actor is busiest
+    // draining a backlog, so a message per sidecar would put that many
+    // mailbox hops between the answer and the imports waiting on it.
+    column_checks::check_and_forward(server, in_range);
 }
 
 async fn handle_data_column_sidecars_response(
@@ -2214,18 +2206,12 @@ async fn handle_data_column_sidecars_response(
     // the entry rather than triggering a same-lookup retry for the rest.
     server.pending_column_requests.remove(&block_root);
 
-    let Some(ref blockchain) = server.blockchain else {
+    if server.blockchain.is_none() {
         debug!(%peer, %block_root, "No blockchain handler available");
         return;
-    };
-
-    let count = sidecars.len();
-    if let Err(err) = blockchain.new_data_column_sidecars(sidecars) {
-        error!(
-            %err, %peer, %block_root, count,
-            "Failed to forward fetched data column sidecars to blockchain"
-        );
     }
+
+    column_checks::check_and_forward(server, sidecars);
 }
 
 /// Take delivery of a range answer, checking it against what was asked for,
@@ -2400,6 +2386,9 @@ mod tests {
             ),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
+            )),
+            column_check_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::COLUMN_CHECK_PERMITS,
             )),
         }
     }

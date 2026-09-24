@@ -21,6 +21,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{error, warn};
 
+use crate::beacon::column_checks;
 use crate::{P2PServer, metrics};
 
 /// Which gossip message a verdict is for.
@@ -76,8 +77,15 @@ impl Validated {
         }
     }
 
-    /// Hand this object to the chain actor.
-    fn forward(self, server: &P2PServer, received_at: Instant) {
+    /// Hand this object on towards the chain actor, given its gossip
+    /// `outcome`.
+    ///
+    /// A block goes straight to the chain actor whatever the outcome, since
+    /// its import runs the state transition, which judges it again. A column
+    /// goes straight there only on `Accept`: the chain actor keeps a column
+    /// without checking it, so one gossip did not finish judging goes through
+    /// [`column_checks`] first.
+    fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -94,11 +102,12 @@ impl Validated {
                     .new_block(*block, BlockSource::Gossip, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip block"));
             }
-            Self::Column(sidecar) => {
+            Self::Column(sidecar) if outcome == Outcome::Accept => {
                 let _ = blockchain
                     .new_data_column_sidecars(vec![*sidecar])
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
+            Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
         }
     }
 }
@@ -163,13 +172,13 @@ impl Handler<GossipVerdict> for P2PServer {
         let outcome = settle(self, outcome, &object);
         let received_at = id.received_at;
         if report(self, id, outcome) {
-            object.forward(self, received_at);
+            object.forward(self, received_at, outcome);
         }
     }
 }
 
-/// How an outcome maps onto gossipsub, and whether the chain actor still gets
-/// the object.
+/// How an outcome maps onto gossipsub, and whether the object still goes on
+/// towards the chain actor (see [`Validated::forward`] for the route).
 pub(crate) fn disposition(outcome: Outcome) -> (MessageAcceptance, bool) {
     match outcome {
         Outcome::Accept => (MessageAcceptance::Accept, true),
@@ -180,7 +189,7 @@ pub(crate) fn disposition(outcome: Outcome) -> (MessageAcceptance, bool) {
 }
 
 /// Report `outcome` for `id` to gossipsub and the metrics. Returns whether
-/// the object goes on to the chain actor.
+/// the object goes on towards the chain actor.
 pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool {
     let (acceptance, forward) = disposition(outcome);
     let (outcome_label, reason) = outcome.labels();
@@ -204,12 +213,12 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 ///
 /// With every permit taken, the object is reported `Ignore(Overloaded)`
 /// instead of queued: queueing it would only make its verdict later than
-/// gossipsub's cache can wait for, so it never propagates unvalidated. The
-/// chain actor still gets it, though: every gossip object reached the actor
-/// before gossip validation existed, and the actor runs its own checks on
-/// import regardless of what gossip decided. Dropping it here instead would
-/// leave the actor to learn of it only through a child's by-root fetch or
-/// range sync, both far slower than gossip.
+/// gossipsub's cache can wait for, so it never propagates unvalidated. It
+/// still goes on towards the chain actor, though: a block to an import that
+/// runs the state transition regardless of what gossip decided, a column to
+/// [`column_checks`] (see [`Validated::forward`]). Dropping it here instead
+/// would leave the actor to learn of it only through a child's by-root fetch
+/// or range sync, both far slower than gossip.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
@@ -218,8 +227,9 @@ pub(crate) fn spawn_stateful_checks(
 ) {
     let Ok(permit) = server.gossip_validation_permits.clone().try_acquire_owned() else {
         let received_at = id.received_at;
-        report(server, id, Outcome::Ignore(IgnoreReason::Overloaded));
-        object.forward(server, received_at);
+        let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
+        report(server, id, outcome);
+        object.forward(server, received_at, outcome);
         return;
     };
     let store = server.store.clone();

@@ -406,6 +406,52 @@ static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyL
     .unwrap()
 });
 
+/// Every reason `beacon::column_checks` can count a sidecar under: the
+/// `Outcome` reason labels `column::chain_checks` drops with, less
+/// `already_stored`, which is a duplicate rather than a rejection. Seeded at
+/// zero by [`init`], so a reason this node never fires is still visible on a
+/// dashboard.
+const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
+    "malformed",
+    "future_slot",
+    "finalized",
+    "not_after_parent",
+    "unknown_proposer",
+    "bad_signature",
+    "wrong_proposer",
+    "finalized_not_ancestor",
+    "parent_not_ready",
+    "inclusion_proof",
+    "kzg",
+    "internal",
+];
+
+static LEAN_DATA_COLUMNS_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_data_columns_rejected_total",
+        "Data column sidecars the chain checks dropped, by reason (gossip verdicts are counted by lean_beacon_gossip_validation_total)",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Count one sidecar the chain checks dropped. `reason` is one of
+/// [`DATA_COLUMN_REJECT_REASONS`].
+pub fn inc_data_column_rejected(reason: &str) {
+    LEAN_DATA_COLUMNS_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Register the metrics that should be visible before their first
+/// observation.
+pub fn init() {
+    LazyLock::force(&LEAN_DATA_COLUMNS_REJECTED_TOTAL);
+    for &reason in DATA_COLUMN_REJECT_REASONS {
+        LEAN_DATA_COLUMNS_REJECTED_TOTAL.with_label_values(&[reason]);
+    }
+}
+
 /// Count one beacon gossip verdict and how long it took from arrival.
 pub fn observe_beacon_gossip_verdict(
     kind: &str,

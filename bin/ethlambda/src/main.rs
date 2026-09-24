@@ -261,6 +261,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
+    ethlambda_p2p::metrics::init();
+    ethlambda_state_transition::metrics::init();
     ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
     ethlambda_blockchain::metrics::set_node_start_time();
 

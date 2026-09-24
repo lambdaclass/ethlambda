@@ -120,3 +120,28 @@ pub fn time_block_processing() -> TimingGuard {
 pub fn time_attestations_processing() -> TimingGuard {
     TimingGuard::new(&LEAN_STATE_TRANSITION_ATTESTATIONS_PROCESSING_TIME_SECONDS)
 }
+
+static LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_data_column_kzg_verify_seconds",
+        "Time spent batch-verifying one sidecar's cells against its own commitments",
+        vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .unwrap()
+});
+
+/// Start timing a sidecar's KZG cell-proof batch. Records duration when the
+/// guard is dropped.
+///
+/// Here rather than beside the rest of the column metrics, because the batch
+/// runs inside `beacon::gossip::column`'s rules, which both the gossip path
+/// and the p2p layer's chain checks call.
+pub fn time_data_column_kzg_verify() -> TimingGuard {
+    TimingGuard::new(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS)
+}
+
+/// Register the metrics above that should be visible before their first
+/// observation.
+pub fn init() {
+    LazyLock::force(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS);
+}
