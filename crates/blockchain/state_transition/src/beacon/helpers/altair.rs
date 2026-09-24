@@ -40,6 +40,7 @@ use crate::beacon::containers::{BeaconState, altair};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
 
@@ -157,7 +158,12 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         ForkName::Electra | ForkName::Fulu => {
             crate::beacon::helpers::electra::get_next_sync_committee_indices(state)?
         }
-        _ => get_next_sync_committee_indices(state)?,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => get_next_sync_committee_indices(state)?,
+        ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),
     };
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in &indices {

@@ -309,7 +309,12 @@ fn decode_attestation(case: &Case, name: &str) -> Result<fork_choice::Attestatio
         ForkName::Electra | ForkName::Fulu => {
             Ok(fork_choice::Attestation::Electra(decode(case, name)?))
         }
-        _ => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
+        ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
 
@@ -323,7 +328,12 @@ fn decode_attester_slashing(
         ForkName::Electra | ForkName::Fulu => {
             Ok(fork_choice::AttesterSlashing::Electra(decode(case, name)?))
         }
-        _ => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
+        ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
 

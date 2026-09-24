@@ -371,11 +371,12 @@ fn apply(
                     let body: electra::BeaconBlockBody = case.ssz("body");
                     fulu_stf::process_execution_payload(state, &body, config, &engine)
                 }
-                other => {
+                fork @ (ForkName::Phase0 | ForkName::Altair) => {
                     return Err(format!(
-                        "execution_payload has no handler for fork `{other}`"
+                        "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
+                ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
             }
         }
         // New in capella, named `address_change` in the fixture tree even
@@ -412,7 +413,10 @@ fn apply(
                 let payload: deneb::ExecutionPayload = case.ssz("execution_payload");
                 electra_stf::process_withdrawals(state, &payload)
             }
-            other => return Err(format!("withdrawals has no handler for fork `{other}`")),
+            fork @ (ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix) => {
+                return Err(format!("withdrawals has no handler for fork `{fork}`"));
+            }
+            ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // All three are new in electra, alongside `withdrawals`; fulu's
         // specification lists none of them as modified, so electra's own

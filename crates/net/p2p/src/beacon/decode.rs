@@ -200,11 +200,20 @@ pub fn decode_aggregate_and_proof(
     bytes: &[u8],
 ) -> Result<SignedAggregateAndProof, DecodeError> {
     let fork = fork_at_slot(config, aggregate_slot(bytes)?);
-    if fork >= ForkName::Electra {
-        electra::SignedAggregateAndProof::from_ssz_bytes(bytes)
-            .map(SignedAggregateAndProof::Electra)
-    } else {
-        phase0::SignedAggregateAndProof::from_ssz_bytes(bytes).map(SignedAggregateAndProof::Phase0)
+    match fork {
+        ForkName::Electra | ForkName::Fulu => {
+            electra::SignedAggregateAndProof::from_ssz_bytes(bytes)
+                .map(SignedAggregateAndProof::Electra)
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => phase0::SignedAggregateAndProof::from_ssz_bytes(bytes)
+            .map(SignedAggregateAndProof::Phase0),
+        ForkName::Lean => {
+            unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
+        }
     }
     .map_err(|_| DecodeError::Ssz)
 }
@@ -270,10 +279,20 @@ pub fn decode_gossip(
             .map(|value| BeaconGossip::AggregateAndProof(Box::new(value))),
         topics::ATTESTER_SLASHING => {
             let fork = fork_at_slot(config, attester_slashing_slot(bytes)?);
-            let decoded = if fork >= ForkName::Electra {
-                electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
-            } else {
-                phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
+            let decoded = match fork {
+                ForkName::Electra | ForkName::Fulu => {
+                    electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
+                }
+                ForkName::Phase0
+                | ForkName::Altair
+                | ForkName::Bellatrix
+                | ForkName::Capella
+                | ForkName::Deneb => {
+                    phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
+                }
+                ForkName::Lean => {
+                    unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
+                }
             };
             decoded
                 .map(|value| BeaconGossip::AttesterSlashing(Box::new(value)))

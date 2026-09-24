@@ -8,6 +8,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::FAR_FUTURE_EPOCH;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::error::{Error, Result};
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ValidatorIndex};
 
@@ -142,7 +143,12 @@ fn initiate_validator_exit_for_fork(
         ForkName::Electra | ForkName::Fulu => {
             crate::beacon::helpers::electra::initiate_validator_exit(state, index, config)
         }
-        _ => initiate_validator_exit(state, index, config),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => initiate_validator_exit(state, index, config),
+        ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
     }
 }
 

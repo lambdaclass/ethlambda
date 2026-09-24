@@ -48,7 +48,7 @@ use ethlambda_state_transition::beacon::containers::BeaconState;
 use ethlambda_state_transition::beacon::stf::epoch;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_all_handlers};
+use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
 
 /// Runs the single epoch-processing step the handler names.
 fn apply(
@@ -77,7 +77,13 @@ fn apply(
         // its own step.
         "rewards_and_penalties" => match fork {
             ForkName::Phase0 => epoch::rewards::process_rewards_and_penalties(state, config),
-            _ => epoch::altair::process_rewards_and_penalties(state, config),
+            ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => epoch::altair::process_rewards_and_penalties(state, config),
+            ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
         // internally, by fork, inside `process_registry_updates` itself, so
@@ -92,7 +98,12 @@ fn apply(
             ForkName::Electra | ForkName::Fulu => {
                 epoch::electra::process_registry_updates(state, config)
             }
-            _ => epoch::registry::process_registry_updates(state, config),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => epoch::registry::process_registry_updates(state, config),
+            ForkName::Lean => lean_is_not_a_fixture_fork("registry_updates"),
         },
         // Altair's and bellatrix's own changes here are scoped to the
         // proportional multiplier `registry::process_slashings` already selects
@@ -105,7 +116,12 @@ fn apply(
         // own constant.
         "slashings" => match fork {
             ForkName::Electra | ForkName::Fulu => epoch::electra::process_slashings(state, config),
-            _ => epoch::registry::process_slashings(state, config),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => epoch::registry::process_slashings(state, config),
+            ForkName::Lean => lean_is_not_a_fixture_fork("slashings"),
         },
         "eth1_data_reset" => epoch::process_eth1_data_reset(state),
         // Phase0 through deneb round each validator toward the single ceiling
@@ -117,7 +133,12 @@ fn apply(
             ForkName::Electra | ForkName::Fulu => {
                 epoch::electra::process_effective_balance_updates(state)
             }
-            _ => epoch::process_effective_balance_updates(state),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => epoch::process_effective_balance_updates(state),
+            ForkName::Lean => lean_is_not_a_fixture_fork("effective_balance_updates"),
         },
         "slashings_reset" => epoch::process_slashings_reset(state),
         "randao_mixes_reset" => epoch::process_randao_mixes_reset(state),

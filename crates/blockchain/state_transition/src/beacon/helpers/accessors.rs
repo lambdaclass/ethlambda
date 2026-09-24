@@ -19,6 +19,7 @@ use crate::beacon::containers::BeaconState;
 use crate::beacon::error::Result;
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     Bytes32, CommitteeIndex, Domain, DomainType, Epoch, Gwei, Root, Slot, ValidatorIndex,
@@ -358,8 +359,15 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
     // than a shuffle run now. See `crate::beacon::helpers::fulu`'s own module docs for
     // why a seed, and therefore a proposer, is only ever knowable that far
     // ahead of time in the first place.
-    if state.fork_name() == ForkName::Fulu {
-        return super::fulu::get_beacon_proposer_index(state);
+    match state.fork_name() {
+        ForkName::Fulu => return super::fulu::get_beacon_proposer_index(state),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra => {}
+        ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 
     let epoch = get_current_epoch(state);
@@ -371,17 +379,22 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
     let seed = hash(&input);
 
     let indices = get_active_validator_indices(state, epoch);
-    if state.fork_name() == ForkName::Electra {
-        super::electra::compute_proposer_index(&indices, seed, |index| {
+    match state.fork_name() {
+        ForkName::Electra => super::electra::compute_proposer_index(&indices, seed, |index| {
             Ok(state.validator(index)?.effective_balance)
-        })
-    } else {
-        super::shuffling::compute_proposer_index(
+        }),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => super::shuffling::compute_proposer_index(
             &indices,
             seed,
             preset::MAX_EFFECTIVE_BALANCE,
             |index| Ok(state.validator(index)?.effective_balance),
-        )
+        ),
+        ForkName::Fulu => unreachable!("Fulu returns via the dispatch match above"),
+        ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 }
 
