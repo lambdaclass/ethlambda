@@ -479,11 +479,12 @@ impl BlockChainServer {
                 // the two slots straddle a subtree boundary. This lands before
                 // interval 4 signs the next slot's block. A skipped interval-1
                 // tick costs only latency, since `sign` rebuilds the subtree
-                // itself on a miss.
+                // itself on a miss. Runs off the actor so a subtree boundary
+                // doesn't stall the tick.
                 let next_slot = slot + 1;
                 let proposer = self.get_our_proposer(next_slot, num_validators);
                 self.key_manager
-                    .prepare_keys_for(next_slot as u32, proposer);
+                    .prepare_keys_in_background(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====

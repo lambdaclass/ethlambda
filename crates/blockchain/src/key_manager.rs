@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
-use std::thread;
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use ethlambda_crypto::signature::{ValidatorSecretKey, ValidatorSignature};
@@ -37,7 +38,10 @@ pub struct ValidatorKeyPair {
 /// Each validator has two independent XMSS keys: one for attestation signing
 /// and one for block proposal signing.
 pub struct KeyManager {
-    keys: HashMap<u64, ValidatorKeyPair>,
+    /// Shared so a background warm can hold the keys while the actor signs.
+    keys: HashMap<u64, Arc<ValidatorKeyPair>>,
+    /// The in-flight [`Self::prepare_keys_in_background`] thread, if any.
+    warm_worker: Option<JoinHandle<()>>,
 }
 
 /// Which of a validator's two XMSS keys: each signs one kind of message.
@@ -57,6 +61,9 @@ impl KeyRole {
     }
 }
 
+/// A key to warm: the validator, which of its keys, and its shared key pair.
+type WarmEntry = (u64, KeyRole, Arc<ValidatorKeyPair>);
+
 /// Fewest keys worth a helper thread of [`KeyManager::prepare_keys_for`].
 ///
 /// leanVM rebuilds a subtree sequentially, so the only parallelism is across
@@ -66,7 +73,14 @@ const MIN_KEYS_PER_WARM_THREAD: usize = 4;
 
 impl KeyManager {
     pub fn new(keys: HashMap<u64, ValidatorKeyPair>) -> Self {
-        Self { keys }
+        let keys = keys
+            .into_iter()
+            .map(|(id, pair)| (id, Arc::new(pair)))
+            .collect();
+        Self {
+            keys,
+            warm_worker: None,
+        }
     }
 
     /// Returns a list of all registered validator IDs.
@@ -95,25 +109,51 @@ impl KeyManager {
     /// subtree it holds and rebuilds only on a miss, so a repeat call for a
     /// slot already warmed costs a lock per key and the thread spawns.
     pub fn prepare_keys_for(&self, slot: u32, proposer: Option<u64>) {
+        warm_keys(slot, &self.keys_to_warm(proposer));
+    }
+
+    /// Same warm as [`Self::prepare_keys_for`], on a background thread, so the
+    /// caller does not wait out the subtree rebuilds at a boundary.
+    ///
+    /// Safe to overlap with signing: a key's cache sits behind a lock that
+    /// `sign` also takes, so a signature racing the warm of the same key waits
+    /// for that rebuild and reuses it instead of rebuilding again. The
+    /// eviction rule of [`Self::prepare_keys_for`] still applies to when this
+    /// is called.
+    ///
+    /// Skips the warm while the previous one is still running, and warns
+    /// instead of failing when the thread cannot be spawned: either way the
+    /// only cost is latency, since `sign` rebuilds a missing subtree itself.
+    pub fn prepare_keys_in_background(&mut self, slot: u32, proposer: Option<u64>) {
+        if let Some(worker) = self.warm_worker.take() {
+            if !worker.is_finished() {
+                warn!(slot, "Previous XMSS warm still running, skipping this one");
+                self.warm_worker = Some(worker);
+                return;
+            }
+            let _ = worker
+                .join()
+                .inspect_err(|_| warn!("XMSS warm thread panicked"));
+        }
+
         let keys = self.keys_to_warm(proposer);
-        let start = Instant::now();
-        let max_threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-        for_each_batched(&keys, max_threads, |&(validator_id, role, key)| {
-            prepare_key(validator_id, role, key, slot)
-        });
-        trace!(slot, keys = keys.len(), elapsed = ?start.elapsed(), "Warmed XMSS signing caches");
+        self.warm_worker = thread::Builder::new()
+            .name("xmss-warm".to_string())
+            .spawn(move || warm_keys(slot, &keys))
+            .inspect_err(|err| warn!(slot, %err, "Failed to spawn XMSS warm thread"))
+            .ok();
     }
 
     /// The keys [`Self::prepare_keys_for`] warms: every attestation key, then
     /// `proposer`'s proposal key if that validator is ours.
-    fn keys_to_warm(&self, proposer: Option<u64>) -> Vec<(u64, KeyRole, &ValidatorSecretKey)> {
+    fn keys_to_warm(&self, proposer: Option<u64>) -> Vec<WarmEntry> {
         let attestation_keys = self
             .keys
             .iter()
-            .map(|(&id, pair)| (id, KeyRole::Attestation, &pair.attestation_key));
+            .map(|(&id, pair)| (id, KeyRole::Attestation, Arc::clone(pair)));
         let proposal_key = proposer.and_then(|id| {
             let pair = self.keys.get(&id)?;
-            Some((id, KeyRole::Proposal, &pair.proposal_key))
+            Some((id, KeyRole::Proposal, Arc::clone(pair)))
         });
         attestation_keys.chain(proposal_key).collect()
     }
@@ -212,6 +252,21 @@ fn signable_at(
         range.start(),
         range.end()
     )))
+}
+
+/// Warm `keys` for `slot`, spreading the rebuilds over at most one thread per
+/// core (see [`for_each_batched`]), and return once all are done.
+fn warm_keys(slot: u32, keys: &[WarmEntry]) {
+    let start = Instant::now();
+    let max_threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    for_each_batched(keys, max_threads, |(validator_id, role, pair)| {
+        let key = match role {
+            KeyRole::Attestation => &pair.attestation_key,
+            KeyRole::Proposal => &pair.proposal_key,
+        };
+        prepare_key(*validator_id, *role, key, slot)
+    });
+    trace!(slot, keys = keys.len(), elapsed = ?start.elapsed(), "Warmed XMSS signing caches");
 }
 
 /// Warm one key's signing cache, timing the miss that rebuilds a subtree.
@@ -405,6 +460,32 @@ mod tests {
                 .sign_with_attestation_key(id, 1, &message)
                 .unwrap();
         }
+        key_manager.sign_block_root(0, 1, &message).unwrap();
+    }
+
+    #[test]
+    fn prepare_keys_in_background_warms_without_blocking_signing() {
+        let count = 2 * MIN_KEYS_PER_WARM_THREAD as u64 + 1;
+        let mut key_manager = tiny_key_manager(count);
+
+        key_manager.prepare_keys_in_background(1, Some(0));
+        // Signing while the warm may still be running waits on the key's cache
+        // lock rather than failing.
+        let message = H256::default();
+        key_manager
+            .sign_with_attestation_key(count - 1, 1, &message)
+            .unwrap();
+
+        key_manager
+            .warm_worker
+            .take()
+            .expect("warm thread spawned")
+            .join()
+            .expect("warm thread finished cleanly");
+
+        // A later call spawns a fresh warm once the previous one is done.
+        key_manager.prepare_keys_in_background(1, Some(0));
+        assert!(key_manager.warm_worker.is_some());
         key_manager.sign_block_root(0, 1, &message).unwrap();
     }
 }
