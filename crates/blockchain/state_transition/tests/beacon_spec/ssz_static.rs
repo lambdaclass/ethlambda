@@ -278,6 +278,25 @@ pub fn trials() -> Vec<Trial> {
                     check::<deneb::ExecutionPayloadHeader>(case)
                 }
 
+                // What `process_execution_payload` hands the execution engine
+                // to validate a proposed payload. Each fork whose own
+                // ExecutionPayload differs in shape needs its own type here,
+                // same as the ExecutionPayload arms above; fulu's payload is
+                // unchanged from electra's, so electra's request type covers
+                // both forks' cases.
+                "NewPayloadRequest" if fork == ForkName::Bellatrix => {
+                    check::<bellatrix::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork == ForkName::Capella => {
+                    check::<capella::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork == ForkName::Deneb => {
+                    check::<deneb::NewPayloadRequest>(case)
+                }
+                "NewPayloadRequest" if fork >= ForkName::Electra => {
+                    check::<electra::NewPayloadRequest>(case)
+                }
+
                 // Transcribed from fork-choice.md rather than beacon-chain.md, and
                 // unchanged since the merge introduced it, so one type covers
                 // every fork that carries it.
@@ -332,6 +351,23 @@ pub fn trials() -> Vec<Trial> {
                 "MatrixEntry" if fork == ForkName::Fulu => check::<fulu::MatrixEntry>(case),
                 "DataColumnsByRootIdentifier" if fork == ForkName::Fulu => {
                     check::<fulu::DataColumnsByRootIdentifier>(case)
+                }
+
+                // Partial columns (gossipsub's Partial Message Extension) are
+                // fulu-only too, and transcribed from the same
+                // `partial-columns/p2p-interface.md` rather than
+                // `beacon-chain.md`.
+                "PartialDataColumnSidecar" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnSidecar>(case)
+                }
+                "PartialDataColumnPartsMetadata" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnPartsMetadata>(case)
+                }
+                "PartialDataColumnHeader" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnHeader>(case)
+                }
+                "PartialDataColumnGroupID" if fork == ForkName::Fulu => {
+                    check::<fulu::PartialDataColumnGroupID>(case)
                 }
 
                 // No arm matched, so this crate has no container for this
