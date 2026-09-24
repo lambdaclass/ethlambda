@@ -44,7 +44,12 @@ pub struct NewPayloadRequest<'a> {
 pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadRequest<'_>> {
     let inner = match block {
         SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner) => inner,
-        _ => return None,
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Lean(_) => return None,
     };
 
     let versioned_hashes = inner

@@ -142,7 +142,13 @@ impl ForkName {
     pub const fn snapshot_interval(self) -> u64 {
         match self {
             ForkName::Lean => LEAN_SNAPSHOT_INTERVAL,
-            _ => BEACON_SNAPSHOT_INTERVAL,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => BEACON_SNAPSHOT_INTERVAL,
         }
     }
 

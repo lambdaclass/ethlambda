@@ -110,7 +110,13 @@ pub fn process_justification_and_finalization(
 ) -> Result<()> {
     match state.fork_name() {
         ForkName::Phase0 => justification::process_justification_and_finalization(state, config),
-        _ => altair::process_justification_and_finalization(state),
+        ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu => altair::process_justification_and_finalization(state),
+        ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }
 

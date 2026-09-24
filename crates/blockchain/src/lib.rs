@@ -783,7 +783,16 @@ fn data_availability_for(
 
             Some(fork_choice::DataAvailability::Columns(sidecars))
         }
-        _ => Some(fork_choice::DataAvailability::NotRequired),
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_) => Some(fork_choice::DataAvailability::NotRequired),
+        // `process_block` dispatches a lean block to `store::on_block` before
+        // this function is ever reached, so this arm is never observed for
+        // one; named on its own rather than folded into the group above so
+        // this value is not read as a claim about lean blocks' own
+        // availability.
+        SignedBeaconBlock::Lean(_) => Some(fork_choice::DataAvailability::NotRequired),
     }
 }
 

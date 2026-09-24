@@ -2353,7 +2353,11 @@ pub fn on_block(
                 "is_data_available(hash_tree_root(block))",
             )?;
         }
-        _ => {}
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_) => {}
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     }
 
     // Check the block is valid and compute the post-state. The engine's answer
