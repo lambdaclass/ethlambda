@@ -51,7 +51,8 @@ Correctness is defined by the released spec test fixtures, pinned in the
 ## Running the tests
 
 ```bash
-make consensus-spec-tests   # download the fixture tarballs (about 2.2 GB)
+make consensus-spec-tests   # download the fixture tarballs (mainnet and minimal)
+make cryptography-specs     # download the BLS/KZG test vectors
 make test-beacon            # build and test once per preset
 ```
 
@@ -60,11 +61,14 @@ make test-beacon            # build and test once per preset
 which is what CI does: the presets get a job each, so the two build and run
 concurrently instead of end to end.
 
-A run reads its own preset's tree plus `general`, the preset-independent BLS and
-KZG vectors, and opens nothing else. `CONSENSUS_SPEC_TESTS_CONFIGS` narrows the
-download to that, and CI sets it, which takes roughly 1.25 GB of tarballs down to
-0.8 GB for mainnet and 0.6 GB for minimal. Locally the default fetches all three,
-so both presets can be run without re-downloading.
+A run reads its own preset's tree and opens nothing else.
+`CONSENSUS_SPEC_TESTS_CONFIGS` narrows the download to that, and CI sets it.
+Locally the default fetches both, so both presets can be run without
+re-downloading. The BLS and KZG vectors are a separate, preset-independent
+download: consensus-specs shipped them itself, under a `general` config,
+through v1.7.0-alpha.12, but v1.7.0-alpha.13 (consensus-specs #5398) moved them
+to `ethereum/cryptography-specs`, which `make cryptography-specs` fetches into
+its own `cryptography-specs/` tree.
 
 The download is stamped with the release it came from and the configs it holds
 (`consensus-spec-tests/.version-<version>-<configs>`), so changing either wipes
@@ -319,9 +323,11 @@ Two details worth knowing:
 ## Fixture suites
 
 `consensus-spec-tests/tests/<config>/<fork>/<runner>/<handler>/<suite>/<case>/`,
-where `<config>` is `general` for the configuration-independent suites and the
-preset name otherwise. Container files are `.ssz_snappy`: SSZ compressed with
-*raw* snappy, not the framed format.
+where `<config>` is the preset name. Container files are `.ssz_snappy`: SSZ
+compressed with *raw* snappy, not the framed format. The BLS and KZG vectors
+live in a separate tree, `cryptography-specs/tests/<kind>/<handler>/<case>/`,
+flatter still: no fork and no suite level, since neither is preset- or
+fork-dependent.
 
 Runners discover their cases from disk rather than listing them, so a fixture
 release that adds cases needs no code change. Two properties are deliberate: a
@@ -391,12 +397,20 @@ Two things that arrangement has to be careful about:
 ## Status
 
 All seven forks, phase0 through fulu, have containers, fork upgrades, state
-transitions, and epoch processing. Every fixture case passes on both presets:
+transitions, and epoch processing. As of the v1.6.1 fixture pin, every case
+passed on both presets:
 
 | Preset | Fixture cases | Ignored | Lib tests |
 |--------|---------------|---------|-----------|
 | mainnet | 5705, all green | 152 | 195 |
 | minimal | 40009, all green | 3692 | 196 |
+
+The v1.7.0-beta.2 bump (see "Fixture suites" below) adds failures the fixture
+release itself brought rather than any change here: the whole new `networking/gossip_*`
+format, `ssz_static` cases for `NewPayloadRequest` and the four new
+`PartialDataColumn*` containers, a fork-choice rule change, and one
+`transition` case. The commits after the bump fix each in turn; this table is
+stale until they land.
 
 The lib counts were 244 and 245 while the containers, presets, configuration and
 primitives were defined here. Their 48 unit tests moved with them and run in
@@ -414,7 +428,7 @@ deliberate exclusions:
 - `LightClient*` containers under `ssz_static`, 5 container types across altair
   through fulu. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
-- The `gloas` and `eip7805` fixture trees, one ignored entry each. See
+- The `gloas` and `heze` fixture trees, one ignored entry each. See
   "Accounting for every fork directory" below.
 
 ## Accounting for every fork directory
@@ -424,11 +438,10 @@ a name that does not parse is skipped. That skip is silent in a way the
 `HIGHEST_IMPLEMENTED_FORK` gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.
 
-The release does ship two such trees. `gloas` is the fork after fulu, and
-`eip7805` is not a fork in the sequence at all, being one of the per-EIP trees
-generated against a variant of some fork's rules. Between them they hold 1898
-mainnet and 17539 minimal cases, all of which were previously dropped without a
-trace, which is the opposite of what this harness promises.
+The release does ship two such trees. `gloas` and `heze` are the two forks
+after fulu, in that order. Between them they hold 3068 mainnet and 21137
+minimal cases, all of which were previously dropped without a trace, which is
+the opposite of what this harness promises.
 
 So `UNMODELED_FORKS` names them, each reports as one ignored test, and
 `fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
@@ -437,8 +450,8 @@ forces a decision instead of quietly widening the gap.
 
 | Suite | Covers |
 |-------|--------|
-| `general/bls` | Cryptography, fork- and preset-independent |
-| `general/kzg` | Cryptography, fork- and preset-independent |
+| `bls` (`cryptography-specs`) | Cryptography, fork- and preset-independent |
+| `kzg` (`cryptography-specs`) | Cryptography, fork- and preset-independent |
 | `ssz_static` | Every fork's containers |
 | `shuffling` | Committee helpers |
 | `operations`, `epoch_processing` | Every fork's operation and epoch sub-function |

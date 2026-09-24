@@ -7,16 +7,25 @@
 //!
 //! # Layout
 //!
-//! The three release tarballs all unpack to `tests/<config>/...`, so they extract
-//! into one directory:
+//! The two release tarballs (mainnet, minimal) both unpack to
+//! `tests/<config>/...`, so they extract into one directory:
 //!
 //! ```text
 //! consensus-spec-tests/tests/<config>/<fork>/<runner>/<handler>/<suite>/<case>/
 //! ```
 //!
-//! `<config>` is `general` for the configuration-independent suites (BLS, KZG),
-//! and the preset name otherwise. Since the preset is compiled in, a test run
-//! walks only the tree matching its own build.
+//! `<config>` is the preset name. Since the preset is compiled in, a test run
+//! walks only the tree matching its own build. The BLS and KZG vectors are a
+//! separate, preset-independent download (`make cryptography-specs`; see
+//! [`crypto_root`]), in a flatter layout with no fork or suite level:
+//!
+//! ```text
+//! cryptography-specs/tests/<kind>/<handler>/<case>/
+//! ```
+//!
+//! consensus-specs shipped these itself, under a `general` config, through
+//! v1.7.0-alpha.12; v1.7.0-alpha.13 (consensus-specs #5398) moved them to
+//! `ethereum/cryptography-specs` instead, and `general` is gone from this tree.
 //!
 //! # File formats
 //!
@@ -89,6 +98,63 @@ pub fn fixture_root() -> PathBuf {
         root.display()
     );
     root
+}
+
+/// The root of the BLS and KZG vectors, a download of their own
+/// (`make cryptography-specs`) since consensus-specs moved them out in
+/// v1.7.0-alpha.13.
+pub fn crypto_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../cryptography-specs")
+        .join("tests");
+    assert!(
+        root.is_dir(),
+        "BLS/KZG vectors are missing from {}; run `make cryptography-specs`",
+        root.display()
+    );
+    root
+}
+
+/// Every case under `cryptography-specs/tests/<kind>`, paired with its handler.
+///
+/// The layout is flat, `<kind>/<handler>/<case>/data.yaml`, with no fork or
+/// suite level. `fork_of` supplies the fork each handler's function belongs
+/// to, so a case still has one for [`Case::in_scope`]. The handler goes in
+/// [`Case::suite`], which makes [`Case::id`] read `<fork>/<kind>/<handler>/<case>`.
+/// Files beside the case directories (`format.md` on cryptography-specs
+/// master) are skipped.
+pub fn collect_crypto(kind: &str, fork_of: impl Fn(&str) -> ForkName) -> Vec<(String, Case)> {
+    let mut out = Vec::new();
+    for handler_entry in read_dir_sorted(&crypto_root().join(kind)) {
+        if !handler_entry.path().is_dir() {
+            continue;
+        }
+        let handler = handler_entry.file_name().to_string_lossy().into_owned();
+        let fork = fork_of(&handler);
+        for case_entry in read_dir_sorted(&handler_entry.path()) {
+            if !case_entry.path().is_dir() {
+                continue;
+            }
+            out.push((
+                handler.clone(),
+                // `suite: handler.clone()` is what makes `Case::id()` read
+                // `<fork>/<kind>/<handler>/<case>` for one of these cases:
+                // `id()` climbs two directories above `self.path` (the case
+                // directory) and calls what it finds there `handler`, which
+                // for a crypto case is actually `kind` (`crypto_root().join(kind)`
+                // is two levels up from a case). Putting the real handler name
+                // in `suite` instead is what lines the two up; changing either
+                // side without the other breaks that reading.
+                Case {
+                    path: case_entry.path(),
+                    fork,
+                    suite: handler.clone(),
+                    name: case_entry.file_name().to_string_lossy().into_owned(),
+                },
+            ));
+        }
+    }
+    out
 }
 
 /// The root of the gossip vector tree.
@@ -201,10 +267,10 @@ impl Case {
 
 /// Collects every case for one runner and handler across all supported forks.
 ///
-/// `config` selects the fixture tree: [`PRESET`] for the preset-dependent
-/// suites, or `"general"` for the configuration-independent ones. Forks this
-/// crate does not implement are skipped, so an upstream release that adds a fork
-/// does not break the build.
+/// `config` selects the fixture tree; every caller here passes [`PRESET`], since
+/// consensus-spec-tests no longer ships a preset-independent `general` tree (see
+/// the module doc). Forks this crate does not implement are skipped, so an
+/// upstream release that adds a fork does not break the build.
 pub fn collect(config: &str, runner: &str, handler: &str) -> Vec<Case> {
     collect_in(&fixture_root(), config, runner, handler)
 }
@@ -298,10 +364,11 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 
 /// Fixture fork directories this crate deliberately does not model.
 ///
-/// `gloas` is the fork after fulu, and this crate stops at fulu. `eip7805` is not
-/// a fork in the sequence at all: the release ships a directory per in-flight EIP
-/// whose cases are generated against a variant of some fork's rules, so there is
-/// no [`ForkName`] for it to parse as.
+/// `gloas` and `heze` are the two forks after fulu (in that order), and this
+/// crate stops at fulu. At `v1.7.0-beta.2` the release ships no other directory
+/// under either preset tree that [`ForkName::parse`] does not know: no
+/// in-flight-EIP directory (`eipNNNN`) remains, unlike at `v1.6.1`, where
+/// `eip7805` was one.
 ///
 /// Naming them is not bookkeeping for its own sake. A directory [`ForkName::parse`]
 /// does not recognize is how [`collect`] skips a fork, and that skip is *silent*
@@ -311,7 +378,7 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// matching fails rather than reporting green, and an unparsed fork slips past
 /// [`HIGHEST_IMPLEMENTED_FORK`] entirely because the gate never sees the case.
 /// So [`fixture_fork_trials`] checks this list against the tree instead.
-pub const UNMODELED_FORKS: &[&str] = &["gloas", "eip7805"];
+pub const UNMODELED_FORKS: &[&str] = &["gloas", "heze"];
 
 /// Panics: a fixture case cannot be a lean case.
 ///
@@ -347,9 +414,11 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
     let mut unknown: Vec<String> = Vec::new();
     let mut unmodeled: BTreeSet<String> = BTreeSet::new();
 
-    // Both trees, since `collect` is called with `general` for the
-    // configuration-independent suites as well as with the preset's own name.
-    for config in [PRESET, "general"] {
+    // Just the preset's own tree: `collect` is never called with any other
+    // config now that the BLS/KZG vectors live in `cryptography-specs`, whose
+    // flat `<kind>/<handler>/<case>` layout has no fork level for this check
+    // to walk in the first place.
+    for config in [PRESET] {
         for entry in read_dir_sorted(&fixture_root().join(config)) {
             if !entry.path().is_dir() {
                 continue;

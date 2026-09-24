@@ -549,8 +549,8 @@ existing once per chain.
   of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.
 - The state transition consuming these containers is **not** in this repo yet;
   it lives on `feat/beacon-chain-stf`, where these types are verified against
-  consensus-specs v1.6.1 (5705 mainnet / 40009 minimal cases). What runs here
-  is the containers' own round-trip and shape tests.
+  consensus-specs v1.7.0-beta.2. What runs here is the containers' own
+  round-trip and shape tests.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s**, persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
   states through `Arc`; they have no slices and no `iter_mut`. A leaf holds a
@@ -615,7 +615,12 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   either wipes and re-downloads rather than leaving the old cases in place and
   silently green, or marking a partial tree complete.
   `CONSENSUS_SPEC_TESTS_CONFIGS` narrows the download: a run reads its own
-  preset's tree plus `general` and nothing else, which is what each CI job sets.
+  preset's tree and nothing else, which is what each CI job sets. The BLS and
+  KZG vectors are a separate, preset-independent download,
+  `make cryptography-specs`, pinned to an `ethereum/cryptography-specs`
+  release: consensus-specs shipped them itself, under a `general` config,
+  through v1.7.0-alpha.12, but v1.7.0-alpha.13 (consensus-specs #5398) moved
+  them out.
 - Preset is a **compile-time** choice (`preset-minimal` feature) because SSZ
   container bounds are const-generic arguments; fork scheduling is runtime
   because the `transition` suite moves fork epochs per case.
@@ -652,8 +657,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `IndexMut` for `ProgressiveList` (#37, an unmerged PR branch head for now).
   This module needs the `SszList` commit (#33) for the same reason.
 - **Status:** all seven forks (phase0 through fulu) have containers, fork
-  upgrades, state transitions, and epoch processing. Every fixture case passes
-  on both presets: mainnet is 5705 cases and minimal 40009. The crate's lib
+  upgrades, state transitions, and epoch processing. As of the v1.6.1 fixture
+  pin, every case passed on both presets: mainnet is 5705 cases and minimal
+  40009. The v1.7.0-beta.2 bump adds failures the fixture release itself
+  brought: the new `networking/gossip_*` format, `ssz_static` cases for
+  `NewPayloadRequest` and the four new `PartialDataColumn*` containers, a
+  fork-choice rule change, and one `transition` case, each fixed by the
+  commits that follow the bump. The crate's lib
   target holds 200 tests with `beacon-spec-tests` on, 185 plus 15 ignored
   without; both figures cover lean's own unit tests as well, since the two
   chains now share one lib target. Fork choice is fixture-verified too: 150 mainnet
@@ -662,7 +672,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   availability, and fulu's column data availability.
 - Nothing is ignored for being unimplemented. Ignored cases are the
   `LightClient*` containers (a different layer, out of scope) and the `gloas`
-  and `eip7805` fixture trees. Those two do not parse as a `ForkName`, so
+  and `heze` fixture trees. Those two do not parse as a `ForkName`, so
   `collect` would skip them silently; `UNMODELED_FORKS` names them and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.

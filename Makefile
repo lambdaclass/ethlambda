@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests consensus-spec-gossip-tests docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests consensus-spec-gossip-tests cryptography-specs docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -43,16 +43,17 @@ test-node: leanSpec/fixtures ## 🧪 Run the node half of the workspace suite
 BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_tests --profile release-fast
 
 # The preset fixes SSZ container bounds at compile time, so each preset needs its
-# own build, and a run walks its own fixture tree plus `general` and nothing else.
-# Hence a target per preset rather than one recipe running both: CI gives each its
-# own job, so the two build and run concurrently and each downloads only the trees
-# its preset reads.
+# own build, and a run walks its own preset's fixture tree and nothing else; the
+# BLS and KZG vectors are a separate, preset-independent download
+# (`cryptography-specs`). Hence a target per preset rather than one recipe
+# running both: CI gives each its own job, so the two build and run
+# concurrently and each downloads only the trees its preset reads.
 test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
 
-test-beacon-mainnet: consensus-spec-tests consensus-spec-gossip-tests ## 🧪 Run the Beacon Chain spec tests, mainnet preset
+test-beacon-mainnet: consensus-spec-tests consensus-spec-gossip-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
 	$(BEACON_TEST) --features beacon-spec-tests
 
-test-beacon-minimal: consensus-spec-tests consensus-spec-gossip-tests ## 🧪 Run the Beacon Chain spec tests, minimal preset
+test-beacon-minimal: consensus-spec-tests consensus-spec-gossip-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal
 
 # Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
@@ -140,15 +141,16 @@ leanSpec/fixtures:
 # definition of correctness for that module, so it should move only when we choose
 # to move it. The release publishes no checksums for these assets, so unlike the
 # leanSpec bundle below there is nothing to verify against.
-CONSENSUS_SPEC_TESTS_VERSION ?= v1.6.1
+CONSENSUS_SPEC_TESTS_VERSION ?= v1.7.0-beta.2
 CONSENSUS_SPEC_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_TESTS_VERSION)
 
-# Which fixture trees to fetch. A run reads its own preset's tree plus `general`,
-# the preset-independent BLS and KZG vectors, and nothing else, so a CI job pinned
-# to one preset narrows this and skips the other preset's tree. That is worth
-# doing: the three together are ~1.25 GiB compressed and several times that on
-# disk, against a runner that has neither the space nor the time to spare.
-CONSENSUS_SPEC_TESTS_CONFIGS ?= general minimal mainnet
+# Which fixture trees to fetch. A run reads its own preset's tree and nothing
+# else, so a CI job pinned to one preset narrows this and skips the other
+# preset's tree. `general` is gone from the list: since v1.7.0-alpha.13
+# (consensus-specs #5398) its KZG vectors live only in
+# ethereum/cryptography-specs, and what is left of it (the BLS suites) ships
+# there too (see `cryptography-specs` below).
+CONSENSUS_SPEC_TESTS_CONFIGS ?= minimal mainnet
 
 # The stamp is named after the version AND the configs, so changing either names
 # a file that does not exist and forces a fresh download. Depending on the
@@ -223,6 +225,26 @@ $(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP):
 		tar -xzf "$$tmpdir/$$config.tar.gz" -C consensus-spec-tests-gossip $$members || exit 1; \
 		rm -rf "$$tmpdir"; \
 	done
+	@touch $@
+
+# BLS and KZG test vectors, split out of consensus-spec-tests' `general` config
+# since v1.7.0-alpha.13 (consensus-specs #5398). Preset-independent, so both
+# beacon test targets share this one download. Flat layout, one zip:
+# `tests/{bls,kzg}/<handler>/<case>/`.
+CRYPTOGRAPHY_SPECS_VERSION ?= v0.1.0
+CRYPTOGRAPHY_SPECS_URL ?= https://github.com/ethereum/cryptography-specs/releases/download/$(CRYPTOGRAPHY_SPECS_VERSION)/tests.zip
+CRYPTOGRAPHY_SPECS_STAMP=cryptography-specs/.version-$(CRYPTOGRAPHY_SPECS_VERSION)
+
+cryptography-specs: $(CRYPTOGRAPHY_SPECS_STAMP) ## ⬇️ Download the BLS and KZG test vectors
+
+$(CRYPTOGRAPHY_SPECS_STAMP):
+	@command -v unzip >/dev/null || { echo "unzip is required to extract the BLS/KZG vectors"; exit 1; }
+	@rm -rf cryptography-specs
+	@mkdir -p cryptography-specs
+	@tmpdir=$$(mktemp -d); trap 'rm -rf "$$tmpdir"' EXIT; \
+	echo "Downloading BLS/KZG test vectors ($(CRYPTOGRAPHY_SPECS_VERSION))"; \
+	curl -L -f -o "$$tmpdir/tests.zip" "$(CRYPTOGRAPHY_SPECS_URL)" || exit 1; \
+	unzip -q "$$tmpdir/tests.zip" -d cryptography-specs || exit 1
 	@touch $@
 
 lean-quickstart:
