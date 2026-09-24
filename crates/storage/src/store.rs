@@ -1778,34 +1778,72 @@ impl Store {
         // live chain index, signatures, and attestation data. These are cheap and
         // affect fork choice correctness (live chain) or attestation processing.
         // Heavy state/block pruning is deferred to prune_old_data().
-        //
-        // Lean only, and deliberately so. The gossip-signature and aggregated
-        // payload buffers hold lean attestations, which a beacon directory
-        // never has, so those two would be no-ops. `prune_live_chain` would
-        // not be: it drops every row below the finalized slot, but the beacon
-        // fork choice walks *past* that boundary. `filter_block_tree` asks
-        // `get_checkpoint_block` for the ancestor at the finalized epoch's
-        // start slot, and `get_ancestor` keeps walking parents while their
-        // slot exceeds the one asked for, so an empty start slot sends it to a
-        // block strictly below the horizon. A missing row there is a hard
-        // `SpecAssert`, not a degraded read, so beacon needs its own horizon
-        // before it can prune at all.
-        if self.chain == Chain::Lean
-            && let Some(finalized) = checkpoints.finalized
+        if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self
-                .prune_live_chain(finalized.slot)
-                .expect("prune live chain");
-            let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+            match self.chain {
+                Chain::Lean => {
+                    // The gossip-signature and aggregated payload buffers hold
+                    // lean attestations, which a beacon directory never has, so
+                    // those two are lean-only. `finalized.slot` is safe to prune
+                    // to directly here: lean checkpoints name a real block's own
+                    // slot, not an epoch boundary that block may not sit on.
+                    let pruned_chain = self
+                        .prune_live_chain(finalized.slot)
+                        .expect("prune live chain");
+                    let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
+                    let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
 
-            let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
-
-            if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
-                info!(
-                    finalized_slot = finalized.slot,
-                    pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
-                );
+                    if pruned_chain > 0 || pruned_sigs > 0 || pruned_payloads > 0 {
+                        info!(
+                            finalized_slot = finalized.slot,
+                            pruned_chain, pruned_sigs, pruned_payloads, "Pruned finalized data"
+                        );
+                    }
+                }
+                Chain::Beacon => {
+                    // `finalized.slot` is the finalized *epoch's* start slot
+                    // (`Store::beacon_checkpoint_as_stored`), which can name a
+                    // slot nobody ever built a block for. Pruning to it
+                    // directly would delete the finalized block's own row
+                    // whenever that start slot was skipped, since the block
+                    // itself then sits strictly below it: `filter_block_tree`
+                    // and `on_block`'s own checkpoint-descendant check both ask
+                    // `get_checkpoint_block` for the ancestor at that start
+                    // slot, and `get_ancestor` keeps walking parents past it
+                    // looking for a row that no longer exists, a hard
+                    // `SpecAssert` rather than a degraded read.
+                    //
+                    // Use the finalized block's own slot instead:
+                    // `prune_live_chain(h)` keeps every row with `slot >= h`,
+                    // so the finalized block's row always survives, and any
+                    // walk from one of its descendants down to a slot at or
+                    // above it stops at or above the finalized block rather
+                    // than falling through a gap. Read from `BlockHeaders`
+                    // rather than `LiveChain`/`block_index()`: the former is
+                    // never pruned, so it still answers after however many
+                    // finalizations have already run, while the latter is
+                    // exactly the table being pruned here.
+                    match self.block_entry(&finalized.root) {
+                        Some((block_slot, _)) => {
+                            let pruned_chain =
+                                self.prune_live_chain(block_slot).expect("prune live chain");
+                            if pruned_chain > 0 {
+                                info!(
+                                    finalized_slot = finalized.slot,
+                                    block_slot, pruned_chain, "Pruned finalized beacon live chain"
+                                );
+                            }
+                        }
+                        None => {
+                            warn!(
+                                finalized_slot = finalized.slot,
+                                finalized_root = %ShortRoot(&finalized.root.0),
+                                "Skipping beacon LiveChain prune: no block entry for the finalized root"
+                            );
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -1993,7 +2031,7 @@ impl Store {
     /// Deletes the named live-chain index rows.
     ///
     /// Unlike [`prune_live_chain`](Self::prune_live_chain), which drops a whole
-    /// slot range below a horizon and is lean-only, this removes exactly the
+    /// slot range below a horizon on either chain, this removes exactly the
     /// `(slot, root)` pairs given. That is what invalidating an execution
     /// payload needs: the roots to drop are a subtree, not a slot window, and
     /// the blocks either side of them at the same slots must survive.
@@ -7171,6 +7209,100 @@ mod tests {
             .expect("record head");
         assert_eq!(store.beacon_head(), Some((9, child_root)));
         assert_eq!(store.head().expect("head"), child_root);
+    }
+
+    #[test]
+    fn beacon_finalization_prunes_live_chain_to_the_finalized_blocks_own_slot() {
+        // Epoch 1 starts at slot 32, but nobody built a block there: the
+        // finalized checkpoint's own block sits at slot 31. Pruning to the
+        // stored checkpoint's slot (32, `Store::beacon_checkpoint_as_stored`)
+        // would delete that block's own row; pruning to its real slot,
+        // looked up from `BlockHeaders`, must not.
+        let anchor = beacon_test_block(0, H256::ZERO);
+        let anchor_root = anchor.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint::default(),
+            0,
+        );
+        store
+            .insert_signed_block(anchor_root, anchor)
+            .expect("insert anchor");
+
+        let block_31 = beacon_test_block(31, anchor_root);
+        let root_31 = block_31.message_hash_tree_root();
+        store
+            .insert_signed_block(root_31, block_31)
+            .expect("insert block 31");
+
+        let head = beacon_test_block(33, root_31);
+        let head_root = head.message_hash_tree_root();
+        store
+            .insert_signed_block(head_root, head)
+            .expect("insert head");
+
+        let finalized = Store::beacon_checkpoint_as_stored(BeaconCheckpoint {
+            epoch: 1,
+            root: root_31,
+        });
+        assert_eq!(
+            finalized.slot, 32,
+            "the epoch's own start slot, not block 31's, must be what gets stored"
+        );
+        store
+            .update_checkpoints(ForkCheckpoints::new(head_root, None, Some(finalized)))
+            .expect("advance finalized");
+
+        let index = store.block_index();
+        assert!(
+            !index.contains_key(&anchor_root),
+            "rows below the finalized block must be pruned"
+        );
+        assert!(
+            index.contains_key(&root_31),
+            "the finalized block's own row must survive"
+        );
+        assert!(
+            index.contains_key(&head_root),
+            "rows above the finalized block must remain"
+        );
+    }
+
+    #[test]
+    fn beacon_finalization_skips_pruning_when_the_finalized_root_has_no_block_entry() {
+        // Defensive path: a finalized root with no `BlockHeaders` row leaves
+        // no horizon to prune to. The fix is to skip pruning outright rather
+        // than guess one, so every row already in `LiveChain` must survive.
+        let anchor = beacon_test_block(0, H256::ZERO);
+        let anchor_root = anchor.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint::default(),
+            0,
+        );
+        store
+            .insert_signed_block(anchor_root, anchor)
+            .expect("insert anchor");
+
+        let unknown_root = H256::repeat_byte(0xee);
+        let finalized = Store::beacon_checkpoint_as_stored(BeaconCheckpoint {
+            epoch: 1,
+            root: unknown_root,
+        });
+        store
+            .update_checkpoints(ForkCheckpoints::new(anchor_root, None, Some(finalized)))
+            .expect("advance finalized despite the missing block entry");
+
+        assert!(
+            store.block_index().contains_key(&anchor_root),
+            "nothing should be pruned when the finalized root cannot be resolved"
+        );
     }
 
     #[test]
