@@ -406,11 +406,14 @@ passed on both presets:
 | minimal | 40009, all green | 3692 | 196 |
 
 The v1.7.0-beta.2 bump (see "Fixture suites" below) adds failures the fixture
-release itself brought rather than any change here: the whole new `networking/gossip_*`
-format, `ssz_static` cases for `NewPayloadRequest` and the four new
-`PartialDataColumn*` containers, a fork-choice rule change, and one
-`transition` case. The commits after the bump fix each in turn; this table is
-stale until they land.
+release itself brought rather than any change here: `ssz_static` cases for
+`NewPayloadRequest` and the four new `PartialDataColumn*` containers, a
+fork-choice rule change, and one `transition` case. (A fourth item, the whole
+new `networking/gossip_*` format, is fixed: the gossip validation vectors this
+crate's `gossip.rs` runner covers now come from this same tree instead of a
+separate v1.7.0-beta.1 download, and every other `gossip_*` handler or fork is
+ignored by name rather than left unmatched.) The remaining commits fix each of
+the rest in turn; this table is stale until they land.
 
 The lib counts were 244 and 245 while the containers, presets, configuration and
 primitives were defined here. Their 48 unit tests moved with them and run in

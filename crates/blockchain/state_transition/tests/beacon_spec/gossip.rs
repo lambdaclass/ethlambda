@@ -2,8 +2,14 @@
 //! vectors (`tests/formats/networking/gossip_validation.md` in
 //! consensus-specs), run against `beacon::gossip`.
 //!
-//! These come from their own fixture tree; see [`super::gossip_fixture_root`].
+//! These used to come from a separate, newer-release fixture tree of their
+//! own; v1.7.0-beta.2's main tree now ships the same vectors under
+//! `networking/gossip_*` alongside every other runner, so they are collected
+//! from there like any other handler (see [`super::collect`]). `networking.rs`
+//! filters these same directories out of its own collection, so the two
+//! runners partition the tree rather than both claiming it.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -22,16 +28,35 @@ use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
 use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
-use libtest_mimic::Trial;
+use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_gossip};
+use super::{Case, PRESET, collect, collect_all_handlers};
 
-/// The handlers this runner covers.
+/// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
     "gossip_beacon_block",
     "gossip_data_column_sidecar",
     "gossip_beacon_aggregate_and_proof",
     "gossip_beacon_attestation",
+];
+
+/// Every other `gossip_*` handler the fixture tree ships, none of which this
+/// node validates yet: the topics it neither subscribes to nor has a
+/// validator for. Reported as ignored, named individually, rather than left
+/// for `HANDLERS` to silently not mention, so the gap is visible in the test
+/// list instead of inferred from an absence. [`trials`]'s accounting test
+/// fails if a fixture release adds a `gossip_*` handler that is in neither
+/// list, the same way [`super::UNMODELED_FORKS`] forces a decision on a new
+/// fork directory.
+const IGNORED_HANDLERS: &[&str] = &[
+    "gossip_attester_slashing",
+    "gossip_blob_sidecar",
+    "gossip_bls_to_execution_change",
+    "gossip_partial_data_column_sidecar",
+    "gossip_proposer_slashing",
+    "gossip_sync_committee_contribution_and_proof",
+    "gossip_sync_committee_message",
+    "gossip_voluntary_exit",
 ];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
@@ -336,15 +361,59 @@ fn run_case(case: &Case) -> Result<(), String> {
 pub fn trials() -> Vec<Trial> {
     let mut trials = Vec::new();
     for handler in HANDLERS {
-        let cases = collect_gossip(PRESET, handler);
+        let cases = collect(PRESET, "networking", handler);
         trials.push(super::discovery_trial(
             &format!("gossip/{handler}"),
             cases.len(),
         ));
         for case in cases {
-            let ignored = !case.in_scope() || SKIPPED.iter().any(|(name, _)| *name == case.name);
+            // The rules `beacon::gossip::block` and `beacon::gossip::column`
+            // implement are fulu's own `validate_beacon_block_gossip` and
+            // `validate_data_column_sidecar_gossip`; a case from any other
+            // fork is ignored rather than run, the same "known gap, not a
+            // silent one" treatment `case.in_scope()` already gives a fork
+            // past `HIGHEST_IMPLEMENTED_FORK`. `case.in_scope()` alone would
+            // pass every fork up to fulu, since the state transition handles
+            // them all; the gossip rules do not.
+            let ignored = !case.in_scope()
+                || case.fork != ForkName::Fulu
+                || SKIPPED.iter().any(|(name, _)| *name == case.name);
             trials.push(super::case_trial("gossip", case, run_case).with_ignored_flag(ignored));
         }
     }
+
+    // Every other `gossip_*` handler and fork this fixture tree ships: named
+    // and ignored rather than left for the loop above to never mention, and
+    // `unknown` is what makes a fixture release adding a handler neither run
+    // nor listed here fail loudly instead of vanishing. Mirrors
+    // `fixture_fork_trials`'s treatment of `UNMODELED_FORKS`.
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    for (handler, case) in collect_all_handlers(PRESET, "networking") {
+        if !handler.starts_with("gossip_") || HANDLERS.contains(&handler.as_str()) {
+            continue;
+        }
+        if !IGNORED_HANDLERS.contains(&handler.as_str()) {
+            unknown.insert(handler);
+            continue;
+        }
+        let name = format!("gossip/{}", case.id());
+        trials.push(Trial::test(name, || Ok(())).with_ignored_flag(true));
+    }
+
+    trials.push(Trial::test(
+        "gossip/every_handler_is_accounted_for",
+        move || {
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(Failed::from(format!(
+                "the fixture release ships gossip_* handlers this runner neither runs nor lists \
+                 in IGNORED_HANDLERS, so every case under them is skipped without appearing \
+                 anywhere in the output: {}",
+                unknown.into_iter().collect::<Vec<_>>().join(", ")
+            )))
+        },
+    ));
+
     trials
 }
