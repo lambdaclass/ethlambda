@@ -272,15 +272,16 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let key_manager = key_manager::KeyManager::new(validator_keys);
+        let mut key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Warm the XMSS signing caches for the current slot before the first tick.
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap the first duty will be at
+        // exactly the gap the first duty will be at. No proposal key: at worst a
+        // proposal right after startup rebuilds one subtree inside `sign`.
         let now_ms = unix_now_ms();
         let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
             / time_config.milliseconds_per_slot) as u32;
-        key_manager.prepare_keys_for(current_slot);
+        key_manager.prepare_keys_for(current_slot, None);
 
         let handle = BlockChainServer {
             store,
@@ -656,8 +657,23 @@ impl BlockChainServer {
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
 
-        // Warm the XMSS signing caches for the next slot so the signing paths don't have to
-        self.key_manager.prepare_keys_for((slot + 1) as u32);
+        // Warm the XMSS signing caches for the next slot so the signing paths
+        // don't have to, but only once this slot's attestations are signed: a
+        // key caches one bottom subtree, so warming before interval 1 evicts the
+        // subtree this slot's attestation signs with whenever the two slots
+        // straddle a subtree boundary. Every later interval asks, in case the
+        // actor overran the first; `prepare_keys_for` does the work once. The
+        // next slot's block is signed at its own interval 0, after this.
+        let attestations_signed = matches!(
+            interval,
+            SlotInterval::Aggregation | SlotInterval::SafeTargetUpdate | SlotInterval::EndOfSlot
+        );
+        if attestations_signed {
+            let next_slot = slot + 1;
+            let proposer = self.get_our_proposer(next_slot);
+            self.key_manager
+                .prepare_keys_for(next_slot as u32, proposer);
+        }
     }
 
     /// Whether an aggregate finishing right now should go straight to gossip

@@ -36,11 +36,31 @@ pub struct ValidatorKeyPair {
 /// and one for block proposal signing.
 pub struct KeyManager {
     keys: HashMap<u64, ValidatorKeyPair>,
+    /// The slot [`Self::prepare_keys_for`] last warmed, so a repeat call for it
+    /// returns without touching the keys.
+    warmed_slot: Option<u32>,
 }
+
+/// Which of a validator's two keys a warm-up entry names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyRole {
+    Attestation,
+    Proposal,
+}
+
+/// Keys each helper thread of [`KeyManager::prepare_keys_for`] warms.
+///
+/// leanVM rebuilds a subtree sequentially, so the only parallelism is across
+/// keys. Batching them keeps the thread count a fraction of the key count,
+/// while each thread still has a few rebuilds to spread its spawn cost over.
+const KEYS_PER_WARM_THREAD: usize = 4;
 
 impl KeyManager {
     pub fn new(keys: HashMap<u64, ValidatorKeyPair>) -> Self {
-        Self { keys }
+        Self {
+            keys,
+            warmed_slot: None,
+        }
     }
 
     /// Returns a list of all registered validator IDs.
@@ -48,21 +68,59 @@ impl KeyManager {
         self.keys.keys().copied().collect()
     }
 
-    /// Warms every validator's signing cache for `slot`.
+    /// Warms the signing caches the duties at `slot` sign with: every
+    /// attestation key, plus `proposer`'s proposal key when one of our
+    /// validators proposes at `slot`.
     ///
     /// Pure latency shifting: the key rebuilds the same bottom Merkle subtree
     /// inside `sign` on a miss, so this only moves that cost off the duty's
-    /// critical path. Called one slot ahead, so a miss here is not yet a
-    /// failure to sign.
-    pub fn prepare_keys_for(&self, slot: u32) {
-        for (validator_id, key_pair) in &self.keys {
-            let _ = prepare_key(&key_pair.attestation_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to warm attestation key signing cache"),
-            );
-            let _ = prepare_key(&key_pair.proposal_key, slot).inspect_err(
-                |err| warn!(validator_id, slot, %err, "Failed to warm proposal key signing cache"),
-            );
+    /// critical path. A key caches a single subtree, though, so warming it
+    /// evicts the subtree an earlier slot signs with whenever the two slots
+    /// straddle a subtree boundary. Call this only once nothing is left to sign
+    /// before `slot`, or that signature rebuilds the evicted subtree on its own
+    /// critical path.
+    ///
+    /// The other proposal keys are left cold: nothing signs with them before
+    /// their own turn to propose, and warming all of them rebuilds one subtree
+    /// per validator at every boundary.
+    ///
+    /// Blocks until every key is warm, with the rebuilds spread over scoped
+    /// threads of [`KEYS_PER_WARM_THREAD`] keys each. A repeat call for the
+    /// slot last warmed returns at once.
+    pub fn prepare_keys_for(&mut self, slot: u32, proposer: Option<u64>) {
+        if self.warmed_slot == Some(slot) {
+            return;
         }
+        self.warmed_slot = Some(slot);
+
+        let keys = self.keys_to_warm(proposer);
+        let start = Instant::now();
+        std::thread::scope(|scope| {
+            for batch in keys.chunks(KEYS_PER_WARM_THREAD) {
+                scope.spawn(move || {
+                    for &(validator_id, role, key) in batch {
+                        let _ = prepare_key(key, slot).inspect_err(|err| {
+                            warn!(validator_id, slot, ?role, %err, "Failed to warm XMSS signing cache")
+                        });
+                    }
+                });
+            }
+        });
+        trace!(slot, keys = keys.len(), elapsed = ?start.elapsed(), "Warmed XMSS signing caches");
+    }
+
+    /// The keys [`Self::prepare_keys_for`] warms: every attestation key, then
+    /// `proposer`'s proposal key if that validator is ours.
+    fn keys_to_warm(&self, proposer: Option<u64>) -> Vec<(u64, KeyRole, &ValidatorSecretKey)> {
+        let attestation_keys = self
+            .keys
+            .iter()
+            .map(|(&id, pair)| (id, KeyRole::Attestation, &pair.attestation_key));
+        let proposal_key = proposer.and_then(|id| {
+            let pair = self.keys.get(&id)?;
+            Some((id, KeyRole::Proposal, &pair.proposal_key))
+        });
+        attestation_keys.chain(proposal_key).collect()
     }
 
     /// Signs an attestation using the validator's attestation key.
@@ -205,5 +263,68 @@ mod tests {
             result,
             Err(KeyManagerError::ValidatorKeyNotFound(123))
         ));
+    }
+
+    /// A key manager for validators `0..count`, each key covering slots 0 and
+    /// 1 only, which keeps generation cheap.
+    fn tiny_key_manager(count: u64) -> KeyManager {
+        let key = |seed: u8| ValidatorSecretKey::generate_from_seed([seed; 32], 0..=1).unwrap();
+        let keys = (0..count)
+            .map(|id| {
+                let pair = ValidatorKeyPair {
+                    attestation_key: key(2 * id as u8),
+                    proposal_key: key(2 * id as u8 + 1),
+                };
+                (id, pair)
+            })
+            .collect();
+        KeyManager::new(keys)
+    }
+
+    fn warmed(key_manager: &KeyManager, proposer: Option<u64>) -> Vec<(u64, KeyRole)> {
+        let mut entries: Vec<_> = key_manager
+            .keys_to_warm(proposer)
+            .into_iter()
+            .map(|(id, role, _)| (id, role))
+            .collect();
+        entries.sort_by_key(|&(id, role)| (role == KeyRole::Proposal, id));
+        entries
+    }
+
+    #[test]
+    fn keys_to_warm_takes_every_attestation_key_and_only_the_proposers_proposal_key() {
+        let key_manager = tiny_key_manager(3);
+        let attestation_keys: Vec<_> = (0..3).map(|id| (id, KeyRole::Attestation)).collect();
+
+        assert_eq!(warmed(&key_manager, None), attestation_keys);
+
+        let mut with_proposer = attestation_keys.clone();
+        with_proposer.push((1, KeyRole::Proposal));
+        assert_eq!(warmed(&key_manager, Some(1)), with_proposer);
+
+        // A proposer that is not one of ours adds nothing.
+        assert_eq!(warmed(&key_manager, Some(99)), attestation_keys);
+    }
+
+    #[test]
+    fn prepare_keys_for_warms_every_batch_once_per_slot() {
+        // More keys than one batch holds, so the warm spans several threads.
+        let count = 2 * KEYS_PER_WARM_THREAD as u64 + 1;
+        let mut key_manager = tiny_key_manager(count);
+
+        key_manager.prepare_keys_for(1, Some(0));
+        assert_eq!(key_manager.warmed_slot, Some(1));
+
+        // A slot outside every key's range only warns, and is still recorded
+        // so the ticks after it do not retry.
+        key_manager.prepare_keys_for(7, None);
+        assert_eq!(key_manager.warmed_slot, Some(7));
+
+        // The warmed keys still sign.
+        let message = H256::default();
+        key_manager
+            .sign_with_attestation_key(count - 1, 1, &message)
+            .unwrap();
+        key_manager.sign_block_root(0, 1, &message).unwrap();
     }
 }
