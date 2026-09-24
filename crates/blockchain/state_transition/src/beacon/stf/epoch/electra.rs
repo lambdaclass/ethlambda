@@ -133,8 +133,7 @@ pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Res
     let finalized_epoch = state.finalized_checkpoint().epoch;
 
     let actions: Vec<Option<RegistryAction>> = state
-        .validators()
-        .iter()
+        .iter_validators()
         .map(|validator| {
             if is_eligible_for_activation_queue(validator) {
                 Some(RegistryAction::QueueForActivation)
@@ -246,7 +245,7 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
     // reading a stable registry, the same reason
     // `super::registry::process_slashings` does.
     let mut penalties = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         if validator.slashed && epoch + withdrawable_offset == validator.withdrawable_epoch {
             let effective_balance_increments = validator.effective_balance / increment;
             let penalty = penalty_per_effective_balance_increment
@@ -315,7 +314,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
     // mutable borrows of `state` begin. Taking `pending_deposits` by value
     // here, rather than iterating it in place, is what frees `state` for
     // those: once the queue is a plain `Vec` of its own, reading
-    // `state.validators()` and crediting balances through `state` cannot
+    // `state.iter_validators()` and crediting balances through `state` cannot
     // conflict with walking the deposits that drive those reads and writes.
     let (deposit_requests_start_index, available_for_processing, deposits) = {
         let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
@@ -362,20 +361,16 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
             break;
         }
 
-        let (is_validator_exited, is_validator_withdrawn) = match state
-            .validators()
-            .iter()
-            .position(|validator| validator.pubkey == deposit.pubkey)
-        {
-            Some(index) => {
-                let validator = &state.validators()[index];
+        let (is_validator_exited, is_validator_withdrawn) = state
+            .iter_validators()
+            .find(|validator| validator.pubkey == deposit.pubkey)
+            .map(|validator| {
                 (
                     validator.exit_epoch < FAR_FUTURE_EPOCH,
                     validator.withdrawable_epoch < next_epoch,
                 )
-            }
-            None => (false, false),
-        };
+            })
+            .unwrap_or((false, false));
 
         if is_validator_withdrawn {
             apply_pending_deposit(state, deposit, config)?;
@@ -444,8 +439,7 @@ fn apply_pending_deposit(
     config: &Config,
 ) -> Result<()> {
     let existing_index = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == deposit.pubkey);
 
     match existing_index {
@@ -543,8 +537,7 @@ fn add_validator_from_pending_deposit(
     validator.effective_balance =
         (amount - amount % preset::EFFECTIVE_BALANCE_INCREMENT).min(max_effective_balance);
 
-    state.validators_mut().push(validator)?;
-    state.balances_mut().push(amount)?;
+    state.push_validator(validator, amount)?;
     pending_queue_fields(state, "add_validator_from_pending_deposit")?
         .push_empty_participation_and_inactivity()
 }
@@ -642,26 +635,31 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
 
     // Two passes for the same reason `super::process_effective_balance_updates`
-    // needs them: `state` is an enum over per-fork structs, so there is no
-    // way to hold `validators` mutably while also reading `balances`, or
-    // (here) while calling `get_max_effective_balance` on the validator
-    // being decided on.
+    // needs them: `validator_mut` clones the element into the update buffer
+    // on every call, whether or not it is then written (see its own doc), so
+    // deciding and writing in one combined pass would buffer and rehash the
+    // whole registry instead of only the validators that actually move; that
+    // also keeps `get_max_effective_balance`, called here on the validator
+    // being decided on, reading rather than fighting a live mutable borrow.
+    debug_assert_eq!(state.iter_validators().len(), state.iter_balances().len());
     let mut updates = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
-        let balance = state.balances()[index];
+    for (index, (validator, balance)) in state
+        .iter_validators()
+        .zip(state.iter_balances())
+        .enumerate()
+    {
         if balance + DOWNWARD_THRESHOLD < validator.effective_balance
             || validator.effective_balance + UPWARD_THRESHOLD < balance
         {
             let max_effective_balance = get_max_effective_balance(validator);
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(max_effective_balance);
-            updates.push((index, effective));
+            updates.push((index as ValidatorIndex, effective));
         }
     }
 
-    let validators = state.validators_mut();
     for (index, effective) in updates {
-        validators[index].effective_balance = effective;
+        state.validator_mut(index)?.effective_balance = effective;
     }
     Ok(())
 }
@@ -969,10 +967,10 @@ mod tests {
             .push(deposit)
             .unwrap();
 
-        let validators_before = state.validators().len();
+        let validators_before = state.validator_count();
         process_pending_deposits(&mut state, &config).unwrap();
 
-        assert_eq!(state.validators().len(), validators_before + 1);
+        assert_eq!(state.validator_count(), validators_before + 1);
         let new_index = validators_before as ValidatorIndex;
         let new_validator = state.validator(new_index).unwrap();
         assert_eq!(new_validator.pubkey, pubkey);
@@ -990,13 +988,13 @@ mod tests {
             BeaconState::Electra(inner) => {
                 assert_eq!(
                     inner.previous_epoch_participation.len(),
-                    state.validators().len()
+                    state.validator_count()
                 );
                 assert_eq!(
                     inner.current_epoch_participation.len(),
-                    state.validators().len()
+                    state.validator_count()
                 );
-                assert_eq!(inner.inactivity_scores.len(), state.validators().len());
+                assert_eq!(inner.inactivity_scores.len(), state.validator_count());
             }
             _ => unreachable!("electra_state_with_validators always builds an Electra state"),
         }
@@ -1020,11 +1018,11 @@ mod tests {
             .push(deposit)
             .unwrap();
 
-        let validators_before = state.validators().len();
+        let validators_before = state.validator_count();
         process_pending_deposits(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.validators().len(),
+            state.validator_count(),
             validators_before,
             "an invalid signature must not create a validator"
         );
@@ -1163,8 +1161,8 @@ mod tests {
         // Push both balances far above either ceiling, so the update fires
         // and both validators are actually capped, not merely nudged.
         let huge = preset::MAX_EFFECTIVE_BALANCE_ELECTRA + preset::EFFECTIVE_BALANCE_INCREMENT;
-        state.balances_mut()[0] = huge;
-        state.balances_mut()[1] = huge;
+        *state.balance_mut(0).unwrap() = huge;
+        *state.balance_mut(1).unwrap() = huge;
 
         process_effective_balance_updates(&mut state).unwrap();
 

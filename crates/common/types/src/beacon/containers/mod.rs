@@ -461,8 +461,6 @@ shared_state_accessors!(
         (historical_roots, historical_roots_mut, HistoricalRoots),
         (eth1_data, eth1_data_mut, Eth1Data),
         (eth1_data_votes, eth1_data_votes_mut, Eth1DataVotes),
-        (validators, validators_mut, Validators),
-        (balances, balances_mut, Balances),
         (randao_mixes, randao_mixes_mut, RandaoMixes),
         (slashings, slashings_mut, Slashings),
         (justification_bits, justification_bits_mut, JustificationBits),
@@ -520,21 +518,119 @@ impl BeaconState {
 }
 
 impl BeaconState {
+    /// The number of validators in the registry.
+    pub fn validator_count(&self) -> usize {
+        dispatch_state!(self, "validator_count", |state| state.validators.len())
+    }
+
+    /// Every validator, in index order, pending writes included.
+    ///
+    /// An iterator rather than a slice: from gloas on the registry is a
+    /// [`ethlambda_ssz_tree::ProgressiveList`] rather than a [`Validators`],
+    /// and the two list types agree on `Item` and `ExactSizeIterator` but not
+    /// on the concrete iterator type, so an iterator is what an accessor here
+    /// can promise across every fork. Prefer this over [`Self::validator`] in
+    /// a loop: each `validator()` call redoes the fork dispatch and a tree
+    /// descent, where this walks the registry once, sequentially.
+    pub fn iter_validators(&self) -> impl ExactSizeIterator<Item = &Validator> {
+        dispatch_state!(self, "iter_validators", |state| state.validators.iter())
+    }
+
+    /// Every balance, in index order, pending writes included. See
+    /// [`Self::iter_validators`] for why this is an iterator.
+    pub fn iter_balances(&self) -> impl ExactSizeIterator<Item = Gwei> {
+        dispatch_state!(self, "iter_balances", |state| state
+            .balances
+            .iter()
+            .copied())
+    }
+
     /// The validator at `index`.
     ///
     /// A named error rather than an `Option`, since the specification indexes the
     /// registry in many places and an out-of-range index is always a fault.
     pub fn validator(&self, index: ValidatorIndex) -> Result<&Validator> {
-        self.validators()
-            .get(index as usize)
-            .ok_or(Error::UnknownValidator(index))
+        dispatch_state!(self, "validator", |state| state
+            .validators
+            .get(index as usize))
+        .ok_or(Error::UnknownValidator(index))
     }
 
-    /// The validator at `index`, mutably.
+    /// The validator at `index`, mutably. Call only when actually writing:
+    /// the underlying list clones the element into its update buffer on this
+    /// call alone, whether or not the caller goes on to change it.
     pub fn validator_mut(&mut self, index: ValidatorIndex) -> Result<&mut Validator> {
-        self.validators_mut()
-            .get_mut(index as usize)
-            .ok_or(Error::UnknownValidator(index))
+        dispatch_state!(self, "validator_mut", |state| state
+            .validators
+            .get_mut(index as usize))
+        .ok_or(Error::UnknownValidator(index))
+    }
+
+    /// The balance of the validator at `index`.
+    pub fn balance(&self, index: ValidatorIndex) -> Result<Gwei> {
+        dispatch_state!(self, "balance", |state| state
+            .balances
+            .get(index as usize)
+            .copied())
+        .ok_or(Error::UnknownValidator(index))
+    }
+
+    /// The balance of the validator at `index`, mutably. Call only when
+    /// actually writing; see [`Self::validator_mut`] for why.
+    pub fn balance_mut(&mut self, index: ValidatorIndex) -> Result<&mut Gwei> {
+        dispatch_state!(self, "balance_mut", |state| state
+            .balances
+            .get_mut(index as usize))
+        .ok_or(Error::UnknownValidator(index))
+    }
+
+    /// Appends a validator and its balance together, keeping the two
+    /// positionally parallel lists in step. From altair on there are three
+    /// more such lists (`previous_epoch_participation`,
+    /// `current_epoch_participation`, `inactivity_scores`); callers on those
+    /// forks still push to them separately, through
+    /// [`Self::altair_validator_lists_mut`], since this function only owns
+    /// the two lists every fork has.
+    pub fn push_validator(&mut self, validator: Validator, balance: Gwei) -> Result<()> {
+        dispatch_state!(self, "push_validator", |state| {
+            state.validators.push(validator)?;
+            state.balances.push(balance)?;
+            Ok(())
+        })
+    }
+
+    /// The registry's own root: the value genesis records as
+    /// `genesis_validators_root`.
+    pub fn validators_root(&self) -> Root {
+        dispatch_state!(self, "validators_root", |state| state
+            .validators
+            .hash_tree_root())
+    }
+
+    /// Whether both validator lists are backed by the same committed tree: a
+    /// cheap check of sharing, not of equality. After `rebase_on` it holds
+    /// exactly when the two registries are equal in content. The storage
+    /// tests use it to prove `get_state` rebased a decoded state onto the
+    /// resident parent. Balances are not compared: a state whose balances
+    /// changed shares only its untouched subtrees, which a root-pointer
+    /// check cannot see.
+    pub fn validators_ptr_eq(&self, other: &BeaconState) -> bool {
+        match (self.registry(), other.registry()) {
+            (Some((v, _)), Some((ov, _))) => v.ptr_eq(ov),
+            _ => false,
+        }
+    }
+
+    /// Both registry lists, or `None` for lean. Private: callers use the
+    /// element accessors above.
+    fn registry(&self) -> Option<(&Validators, &Balances)> {
+        match self {
+            BeaconState::Lean(_) => None,
+            _ => Some(dispatch_state!(self, "registry", |state| (
+                &state.validators,
+                &state.balances
+            ))),
+        }
     }
 
     /// Folds every buffered write into the tree-backed fields (`validators`,
@@ -549,8 +645,10 @@ impl BeaconState {
         if matches!(self, BeaconState::Lean(_)) {
             return;
         }
-        self.validators_mut().apply_updates();
-        self.balances_mut().apply_updates();
+        dispatch_state!(self, "apply_pending_mutations", |state| {
+            state.validators.apply_updates();
+            state.balances.apply_updates();
+        })
     }
 
     /// Whether `validators` or `balances` has a write [`apply_pending_mutations`]
@@ -563,10 +661,8 @@ impl BeaconState {
     ///
     /// [`apply_pending_mutations`]: BeaconState::apply_pending_mutations
     pub fn has_pending_mutations(&self) -> bool {
-        if matches!(self, BeaconState::Lean(_)) {
-            return false;
-        }
-        self.validators().has_pending_updates() || self.balances().has_pending_updates()
+        self.registry()
+            .is_some_and(|(v, b)| v.has_pending_updates() || b.has_pending_updates())
     }
 
     /// Makes this state's tree-backed fields share every unchanged subtree
@@ -577,19 +673,16 @@ impl BeaconState {
     /// Works across forks, since `validators` and `balances` have one type in
     /// every fork. A no-op if either state is lean.
     pub fn rebase_on(&mut self, base: &BeaconState) {
-        if matches!(self, BeaconState::Lean(_)) || matches!(base, BeaconState::Lean(_)) {
+        let Some((base_validators, base_balances)) = base.registry() else {
+            return;
+        };
+        if matches!(self, BeaconState::Lean(_)) {
             return;
         }
-        self.validators_mut().rebase_on(base.validators());
-        self.balances_mut().rebase_on(base.balances());
-    }
-
-    /// The balance of the validator at `index`.
-    pub fn balance(&self, index: ValidatorIndex) -> Result<Gwei> {
-        self.balances()
-            .get(index as usize)
-            .copied()
-            .ok_or(Error::UnknownValidator(index))
+        dispatch_state!(self, "rebase_on", |state| {
+            state.validators.rebase_on(base_validators);
+            state.balances.rebase_on(base_balances);
+        })
     }
 
     /// The randao mix for `epoch`, which the specification indexes modulo the
@@ -1171,8 +1264,157 @@ signed_beacon_block_accessors!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::constants;
     use crate::beacon::preset;
     use crate::beacon::primitives::{ExecutionAddress, Uint256};
+
+    /// A Fulu state with `count` validators, each with a full effective
+    /// balance and otherwise eligible, and every other field at an all-zero
+    /// placeholder sized to the preset. Good enough for the registry accessor
+    /// tests below, which touch `validators`/`balances` only: nothing here
+    /// verifies a signature or aggregates a sync committee.
+    ///
+    /// `ethlambda-types` cannot reuse `ethlambda-state-transition`'s
+    /// `helpers::test_state` builder (dependency runs the other way), so this
+    /// is a small copy of its Fulu literal.
+    fn small_fulu_state(count: usize) -> BeaconState {
+        let validators: Vec<Validator> = (0..count)
+            .map(|_| Validator {
+                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
+                activation_eligibility_epoch: 0,
+                activation_epoch: 0,
+                exit_epoch: constants::FAR_FUTURE_EPOCH,
+                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+                ..Default::default()
+            })
+            .collect();
+        let zero_root_vector = || -> BlockRoots {
+            vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
+                .expect("the vector is built at its exact length")
+        };
+        let empty_sync_committee = || altair::SyncCommittee {
+            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+                .try_into()
+                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
+            aggregate_pubkey: Default::default(),
+        };
+
+        BeaconState::Fulu(fulu::BeaconState {
+            genesis_time: 0,
+            genesis_validators_root: Root::ZERO,
+            slot: preset::SLOTS_PER_EPOCH,
+            fork: Default::default(),
+            latest_block_header: Default::default(),
+            block_roots: zero_root_vector(),
+            state_roots: zero_root_vector(),
+            historical_roots: Default::default(),
+            eth1_data: Default::default(),
+            eth1_data_votes: Default::default(),
+            eth1_deposit_index: 0,
+            validators: validators
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            previous_epoch_participation: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            current_epoch_participation: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            justification_bits: Default::default(),
+            previous_justified_checkpoint: Default::default(),
+            current_justified_checkpoint: Default::default(),
+            finalized_checkpoint: Default::default(),
+            inactivity_scores: vec![0; count]
+                .try_into()
+                .expect("count is far below VALIDATOR_REGISTRY_LIMIT"),
+            current_sync_committee: empty_sync_committee(),
+            next_sync_committee: empty_sync_committee(),
+            latest_execution_payload_header: deneb::ExecutionPayloadHeader {
+                parent_hash: ExecutionBlockHash::ZERO,
+                fee_recipient: ExecutionAddress::ZERO,
+                state_root: Bytes32::ZERO,
+                receipts_root: Bytes32::ZERO,
+                logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                    .try_into()
+                    .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+                prev_randao: Bytes32::ZERO,
+                block_number: 0,
+                gas_limit: 0,
+                gas_used: 0,
+                timestamp: 0,
+                extra_data: Default::default(),
+                base_fee_per_gas: Uint256::ZERO,
+                block_hash: ExecutionBlockHash::ZERO,
+                transactions_root: Root::ZERO,
+                withdrawals_root: Root::ZERO,
+                blob_gas_used: 0,
+                excess_blob_gas: 0,
+            },
+            next_withdrawal_index: 0,
+            next_withdrawal_validator_index: 0,
+            historical_summaries: Default::default(),
+            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
+            deposit_balance_to_consume: 0,
+            exit_balance_to_consume: 0,
+            earliest_exit_epoch: 0,
+            consolidation_balance_to_consume: 0,
+            earliest_consolidation_epoch: 0,
+            pending_deposits: Default::default(),
+            pending_partial_withdrawals: Default::default(),
+            pending_consolidations: Default::default(),
+            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+        })
+    }
+
+    #[test]
+    fn registry_accessors_read_and_write_elements() {
+        let mut state = small_fulu_state(3); // 3 validators, balances 32 ETH
+        assert_eq!(state.validator_count(), 3);
+        assert_eq!(state.iter_validators().len(), 3);
+        assert_eq!(
+            state.iter_balances().sum::<Gwei>(),
+            3 * preset::MAX_EFFECTIVE_BALANCE
+        );
+
+        *state.balance_mut(1).unwrap() += 5;
+        assert_eq!(state.balance(1).unwrap(), preset::MAX_EFFECTIVE_BALANCE + 5);
+
+        let validator = state.validator(0).unwrap().clone();
+        state.push_validator(validator, 7).unwrap();
+        assert_eq!(state.validator_count(), 4);
+        assert_eq!(state.balance(3).unwrap(), 7);
+        assert!(state.balance_mut(4).is_err());
+        assert!(state.validator(4).is_err());
+
+        // Order, the pending balance write, and the pending push all land
+        // where expected.
+        assert_eq!(
+            state.iter_balances().collect::<Vec<_>>(),
+            vec![
+                preset::MAX_EFFECTIVE_BALANCE,
+                preset::MAX_EFFECTIVE_BALANCE + 5,
+                preset::MAX_EFFECTIVE_BALANCE,
+                7,
+            ]
+        );
+
+        // A `validator_mut` write is visible through `iter_validators`, not
+        // just through `validator`.
+        state.validator_mut(2).unwrap().effective_balance = 1;
+        assert_eq!(state.iter_validators().nth(2).unwrap().effective_balance, 1);
+    }
 
     /// Single-validator lean state. The pubkeys are placeholders; nothing here
     /// verifies a signature.

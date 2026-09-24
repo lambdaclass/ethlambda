@@ -17,10 +17,7 @@ use super::misc::compute_activation_exit_epoch;
 
 /// Adds `delta` to a validator's balance.
 pub fn increase_balance(state: &mut BeaconState, index: ValidatorIndex, delta: Gwei) -> Result<()> {
-    let balance = state
-        .balances_mut()
-        .get_mut(index as usize)
-        .ok_or(crate::beacon::Error::UnknownValidator(index))?;
+    let balance = state.balance_mut(index)?;
     *balance = balance.saturating_add(delta);
     Ok(())
 }
@@ -31,10 +28,7 @@ pub fn increase_balance(state: &mut BeaconState, index: ValidatorIndex, delta: G
 /// unsigned and explicitly floors this at zero, since a penalty larger than the
 /// remaining balance is normal rather than an error.
 pub fn decrease_balance(state: &mut BeaconState, index: ValidatorIndex, delta: Gwei) -> Result<()> {
-    let balance = state
-        .balances_mut()
-        .get_mut(index as usize)
-        .ok_or(crate::beacon::Error::UnknownValidator(index))?;
+    let balance = state.balance_mut(index)?;
     *balance = balance.saturating_sub(delta);
     Ok(())
 }
@@ -60,8 +54,7 @@ pub fn initiate_validator_exit(
 
     let earliest = compute_activation_exit_epoch(get_current_epoch(state));
     let mut exit_queue_epoch = state
-        .validators()
-        .iter()
+        .iter_validators()
         .map(|validator| validator.exit_epoch)
         .filter(|epoch| *epoch != FAR_FUTURE_EPOCH)
         .chain(core::iter::once(earliest))
@@ -69,8 +62,7 @@ pub fn initiate_validator_exit(
         .unwrap_or(earliest);
 
     let churn_at_that_epoch = state
-        .validators()
-        .iter()
+        .iter_validators()
         .filter(|validator| validator.exit_epoch == exit_queue_epoch)
         .count() as u64;
     if churn_at_that_epoch >= get_validator_churn_limit(state, config) {

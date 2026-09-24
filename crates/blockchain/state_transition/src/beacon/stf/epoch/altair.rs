@@ -195,7 +195,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
     }
     deltas.push(get_inactivity_penalty_deltas(state, config)?);
 
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
     for (rewards, penalties) in deltas {
         for index in 0..validator_count {
             increase_balance(state, index, rewards[index as usize])?;
@@ -220,7 +220,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
 /// the moment it can be attested for, and `process_attestation` (not
 /// implemented in this file) indexes into it directly rather than appending.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let (previous_epoch_participation, current_epoch_participation, _) =
         state.altair_validator_lists_mut()?;
 
@@ -256,7 +256,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::altair::add_flag;
-    use crate::beacon::primitives::BlsPubkey;
+    use crate::beacon::primitives::{BlsPubkey, Gwei};
 
     /// A deterministic but genuinely valid BLS public key for validator
     /// `index`.
@@ -414,13 +414,13 @@ mod tests {
         let config = Config::mainnet();
         let mut state = altair_state_with_validators(4);
         *state.slot_mut() = 0;
-        let balances_before = state.balances().clone();
+        let balances_before: Vec<Gwei> = state.iter_balances().collect();
 
         process_rewards_and_penalties(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.balances(),
-            &balances_before,
+            state.iter_balances().collect::<Vec<_>>(),
+            balances_before,
             "the genesis epoch has no previous epoch to reward"
         );
     }

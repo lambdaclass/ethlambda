@@ -597,7 +597,7 @@ fn verify_beacon_checkpoint_state(state: &BeaconState) -> Result<(), CheckpointS
         return Err(CheckpointSyncError::SlotIsZero);
     }
 
-    if state.validators().is_empty() {
+    if state.validator_count() == 0 {
         return Err(CheckpointSyncError::NoValidators);
     }
 
@@ -1051,9 +1051,13 @@ mod tests {
     #[test]
     fn a_beacon_anchor_with_no_validators_is_rejected() {
         let mut state = beacon_anchor_state();
-        // `SszList`'s `DerefMut` target is a slice, which cannot shrink, so
-        // emptying the list means replacing it rather than mutating in place.
-        *state.validators_mut() = Default::default();
+        // No element accessor can empty the registry, so this reaches into
+        // the fork this fixture actually decodes as (see
+        // `beacon_anchor_state`) directly.
+        let BeaconState::Phase0(inner) = &mut state else {
+            unreachable!("beacon_anchor_state always builds a Phase0 state");
+        };
+        inner.validators = Default::default();
 
         assert!(matches!(
             verify_beacon_checkpoint_state(&state),

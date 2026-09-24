@@ -322,15 +322,13 @@ mod tests {
     #[test]
     fn process_slot_leaves_no_buffered_registry_writes() {
         let mut state = test_state::with_validators(4);
-        state.balances_mut()[0] += 1;
+        *state.balance_mut(0).unwrap() += 1;
         state.validator_mut(1).unwrap().effective_balance -= 1;
-        assert!(state.balances().has_pending_updates());
-        assert!(state.validators().has_pending_updates());
+        assert!(state.has_pending_mutations());
 
         process_slot(&mut state).unwrap();
 
-        assert!(!state.balances().has_pending_updates());
-        assert!(!state.validators().has_pending_updates());
+        assert!(!state.has_pending_mutations());
     }
 
     /// Epoch processing (`process_rewards_and_penalties` here) writes every
@@ -347,7 +345,6 @@ mod tests {
 
         process_slots(&mut state, target_slot, &config).unwrap();
 
-        assert!(!state.balances().has_pending_updates());
-        assert!(!state.validators().has_pending_updates());
+        assert!(!state.has_pending_mutations());
     }
 }

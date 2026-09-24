@@ -284,7 +284,7 @@ lists lighthouse keeps its state in.
   store flushes a state before caching it, since a shared `Arc` cannot be
   flushed later.
 
-The access pattern matters. `state.validator(i)` and `balances()[i]` are tree
+The access pattern matters. `state.validator(i)` and `state.balance(i)` are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
 `get_total_active_balance` builds the active-index `Vec` and then reads every
@@ -292,8 +292,8 @@ index back, and runs several times per block (once per attestation through
 `get_base_reward_per_increment`, once per execution request through the churn
 limits). In the 2026-09-28 import profile, those per-index reads and the
 repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk `validators().iter()`, zipped with
-`balances().iter()` where it needs both. The total active balance is the obvious
+over the registry should walk `iter_validators()`, zipped with
+`iter_balances()` where it needs both. The total active balance is the obvious
 candidate for computing once per epoch rather than per call, once it is shown
 that no block operation changes it mid-epoch.
 
