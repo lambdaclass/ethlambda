@@ -18,7 +18,7 @@
 //! The specification defines exactly two presets, `mainnet` and `minimal`
 //! (`minimal` exists to keep spec test fixtures and local devnets fast). This
 //! crate mirrors that: [`mainnet`] and [`minimal`] each define every preset
-//! constant the specification uses from phase0 through fulu, and the top-level
+//! constant the specification uses from phase0 through gloas, and the top-level
 //! re-export picks one at compile time, gated on the `preset-minimal` feature.
 //! Downstream code should import from here (`preset::SLOTS_PER_EPOCH`, not
 //! `preset::mainnet::SLOTS_PER_EPOCH`), so that it automatically follows whichever
@@ -27,7 +27,7 @@
 //! # Why some constants are `usize` and others are `u64`
 //!
 //! A constant that bounds an SSZ collection (`List`, `Vector`, `Bitlist`,
-//! `Bitvector`) in some container, in any fork from phase0 through fulu, is typed
+//! `Bitvector`) in some container, in any fork from phase0 through gloas, is typed
 //! `usize` here, because it gets threaded through this crate as a const-generic
 //! parameter on that collection's Rust representation, and const generics require
 //! `usize`. Every other preset constant (reward/penalty divisors, Gwei amounts,
@@ -501,6 +501,56 @@ pub mod mainnet {
     /// precomputed proposer indices fulu adds to the state.
     pub const PROPOSER_LOOKAHEAD_LENGTH: usize =
         (MIN_SEED_LOOKAHEAD as usize + 1) * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // Gloas
+    // ================================================================
+
+    // --- Misc ---
+
+    /// Members of a slot's payload timeliness committee. Bounds
+    /// `PayloadTimelinessCommittee` (`Vector<ValidatorIndex, PTC_SIZE>`),
+    /// `PayloadAttestation.aggregation_bits`/`IndexedPayloadAttestation.attesting_indices`,
+    /// and each row of `BeaconState.ptc_window`.
+    pub const PTC_SIZE: usize = 512;
+
+    // --- Max operations per block ---
+
+    /// Bounds `BeaconBlockBody.payload_attestations`
+    /// (`List<PayloadAttestation, MAX_PAYLOAD_ATTESTATIONS>`).
+    pub const MAX_PAYLOAD_ATTESTATIONS: u64 = 4;
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.builder_deposits`
+    /// (`List<BuilderDepositRequest, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD>`).
+    pub const MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64 = 64;
+
+    /// Bounds `ExecutionRequests.builder_exits`
+    /// (`List<BuilderExitRequest, MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD>`).
+    pub const MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // --- Withdrawals processing ---
+
+    /// Cap on how many builders the withdrawal sweep scans per slot. A loop
+    /// bound, not a container length, so it stays `u64`, the same convention
+    /// as `MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP`.
+    pub const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64 = 16_384;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the specification's
+    /// formula for the length of `BeaconState.ptc_window`
+    /// (`Vector<PayloadTimelinessCommittee, PTC_WINDOW_LENGTH>`): the cached
+    /// committees for the previous, current, and lookahead epochs.
+    pub const PTC_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
+
+    /// `2 * SLOTS_PER_EPOCH`, the specification's formula for the length of
+    /// `BeaconState.builder_pending_payments`
+    /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
+    /// builder payments owed for the previous and current epoch.
+    pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
 }
 
 /// The minimal preset: the same shape as [`mainnet`], scaled down so spec test
@@ -955,6 +1005,54 @@ pub mod minimal {
     /// precomputed proposer indices fulu adds to the state.
     pub const PROPOSER_LOOKAHEAD_LENGTH: usize =
         (MIN_SEED_LOOKAHEAD as usize + 1) * SLOTS_PER_EPOCH as usize;
+
+    // ================================================================
+    // Gloas
+    // ================================================================
+
+    // --- Misc ---
+
+    /// Members of a slot's payload timeliness committee. `[customized]`: a
+    /// small network needs far fewer members to keep the committee
+    /// meaningful at minimal's validator counts.
+    pub const PTC_SIZE: usize = 16;
+
+    // --- Max operations per block ---
+
+    /// Bounds `BeaconBlockBody.payload_attestations`
+    /// (`List<PayloadAttestation, MAX_PAYLOAD_ATTESTATIONS>`).
+    pub const MAX_PAYLOAD_ATTESTATIONS: u64 = 4;
+
+    // --- Execution ---
+
+    /// Bounds `ExecutionRequests.builder_deposits`
+    /// (`List<BuilderDepositRequest, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD>`).
+    pub const MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: u64 = 64;
+
+    /// Bounds `ExecutionRequests.builder_exits`
+    /// (`List<BuilderExitRequest, MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD>`).
+    pub const MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: u64 = 16;
+
+    // --- Withdrawals processing ---
+
+    /// Cap on how many builders the withdrawal sweep scans per slot.
+    /// `[customized]`, the same way `MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP` is.
+    pub const MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: u64 = 16;
+
+    // --- State list lengths ---
+
+    /// `(MIN_SEED_LOOKAHEAD + 2) * SLOTS_PER_EPOCH`, the specification's
+    /// formula for the length of `BeaconState.ptc_window`
+    /// (`Vector<PayloadTimelinessCommittee, PTC_WINDOW_LENGTH>`): the cached
+    /// committees for the previous, current, and lookahead epochs.
+    pub const PTC_WINDOW_LENGTH: usize =
+        (MIN_SEED_LOOKAHEAD as usize + 2) * SLOTS_PER_EPOCH as usize;
+
+    /// `2 * SLOTS_PER_EPOCH`, the specification's formula for the length of
+    /// `BeaconState.builder_pending_payments`
+    /// (`Vector<BuilderPendingPayment, BUILDER_PENDING_PAYMENTS_LENGTH>`):
+    /// builder payments owed for the previous and current epoch.
+    pub const BUILDER_PENDING_PAYMENTS_LENGTH: usize = 2 * SLOTS_PER_EPOCH as usize;
 }
 
 #[cfg(not(feature = "preset-minimal"))]
@@ -1322,6 +1420,12 @@ mod tests {
 
         assert_eq!(mainnet::MAX_VALIDATORS_PER_SLOT, 131_072);
         assert_eq!(minimal::MAX_VALIDATORS_PER_SLOT, 8192);
+
+        assert_eq!(mainnet::PTC_SIZE, 512);
+        assert_eq!(minimal::PTC_SIZE, 16);
+
+        assert_eq!(mainnet::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 16_384);
+        assert_eq!(minimal::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 16);
     }
 
     /// Every derived constant computed from more than one preset value, checked
@@ -1381,6 +1485,24 @@ mod tests {
         assert_eq!(
             minimal::MAX_VALIDATORS_PER_SLOT,
             minimal::MAX_COMMITTEES_PER_SLOT * minimal::MAX_VALIDATORS_PER_COMMITTEE
+        );
+
+        assert_eq!(
+            mainnet::PTC_WINDOW_LENGTH,
+            (mainnet::MIN_SEED_LOOKAHEAD as usize + 2) * mainnet::SLOTS_PER_EPOCH as usize
+        );
+        assert_eq!(
+            minimal::PTC_WINDOW_LENGTH,
+            (minimal::MIN_SEED_LOOKAHEAD as usize + 2) * minimal::SLOTS_PER_EPOCH as usize
+        );
+
+        assert_eq!(
+            mainnet::BUILDER_PENDING_PAYMENTS_LENGTH,
+            2 * mainnet::SLOTS_PER_EPOCH as usize
+        );
+        assert_eq!(
+            minimal::BUILDER_PENDING_PAYMENTS_LENGTH,
+            2 * minimal::SLOTS_PER_EPOCH as usize
         );
     }
 
@@ -1477,6 +1599,12 @@ mod tests {
             KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH, FIELD_ELEMENTS_PER_CELL,
             FIELD_ELEMENTS_PER_EXT_BLOB, CELLS_PER_EXT_BLOB, NUMBER_OF_COLUMNS, BYTES_PER_CELL,
             PROPOSER_LOOKAHEAD_LENGTH,
+        );
+
+        in_both!(usize: PTC_SIZE, PTC_WINDOW_LENGTH, BUILDER_PENDING_PAYMENTS_LENGTH);
+        in_both!(u64:
+            MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
+            MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
         );
     }
 }

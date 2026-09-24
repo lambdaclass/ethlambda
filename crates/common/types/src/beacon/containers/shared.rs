@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_ssz_tree::List;
+use ethlambda_ssz_tree::{List, ProgressiveList};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
@@ -96,6 +96,18 @@ pub type InactivityScores = SszList<u64, { preset::VALIDATOR_REGISTRY_LIMIT }>;
 /// Accumulated [`HistoricalSummary`] entries, which replace [`HistoricalRoots`]
 /// as the commitment to history from capella onward.
 pub type HistoricalSummaries = SszList<HistoricalSummary, { preset::HISTORICAL_ROOTS_LIMIT }>;
+
+/// The gloas validator registry (EIP-7688): unbounded and progressively
+/// merkleized, tree-backed like [`Validators`] for the same reason (a
+/// derived state shares the unchanged part of the registry, and re-hashing
+/// after a block only rehashes the records the block touched). Writes are
+/// buffered sparsely in a `BTreeMap`, the same as [`Validators`].
+pub type ProgressiveValidators = ProgressiveList<Validator, BTreeMap<usize, Validator>>;
+
+/// The gloas balances, positionally parallel to [`ProgressiveValidators`].
+/// Tree-backed like [`Balances`], with writes buffered densely (the default
+/// `VecMap`), since epoch processing writes every balance.
+pub type ProgressiveBalances = ProgressiveList<Gwei>;
 
 // ---------------------------------------------------------------------------
 // Misc
