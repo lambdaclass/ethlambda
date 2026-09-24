@@ -183,7 +183,7 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
         // Warm the XMSS signing caches for the current slot before the first tick.
         // store.time() doesn't work here: after an offline gap it lags wall-clock by
@@ -502,7 +502,7 @@ impl BlockChainServer {
         // key caches one bottom subtree, so warming before interval 1 evicts the
         // subtree this slot's attestation signs with whenever the two slots
         // straddle a subtree boundary. Every later interval asks, in case the
-        // actor overran the first; `prepare_keys_for` does the work once. The
+        // actor overran the first; a key already warm rebuilds nothing. The
         // interval-2 warm lands before interval 4 signs the next slot's block.
         let attestations_signed = matches!(
             interval,

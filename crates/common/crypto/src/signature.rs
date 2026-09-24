@@ -212,8 +212,9 @@ impl ValidatorSecretKey {
     ///
     /// The key holds one cached subtree, so this is worth calling only for the
     /// slot about to be signed, and it is pure latency shifting: a miss inside
-    /// `sign` rebuilds the same subtree. Errors only when `slot` is outside
-    /// [`Self::signable_slots`].
+    /// `sign` rebuilds the same subtree. A slot the cached subtree already
+    /// covers returns without rebuilding, so repeating a call is cheap. Errors
+    /// only when `slot` is outside [`Self::signable_slots`].
     pub fn prepare(&self, slot: u32) -> Result<(), XmssSignError> {
         self.inner.prepare(slot)
     }

@@ -36,9 +36,6 @@ pub struct ValidatorKeyPair {
 /// and one for block proposal signing.
 pub struct KeyManager {
     keys: HashMap<u64, ValidatorKeyPair>,
-    /// The slot [`Self::prepare_keys_for`] last warmed, so a repeat call for it
-    /// returns without touching the keys.
-    warmed_slot: Option<u32>,
 }
 
 /// Which of a validator's two keys a warm-up entry names.
@@ -57,10 +54,7 @@ const KEYS_PER_WARM_THREAD: usize = 4;
 
 impl KeyManager {
     pub fn new(keys: HashMap<u64, ValidatorKeyPair>) -> Self {
-        Self {
-            keys,
-            warmed_slot: None,
-        }
+        Self { keys }
     }
 
     /// Returns a list of all registered validator IDs.
@@ -85,14 +79,10 @@ impl KeyManager {
     /// per validator at every boundary.
     ///
     /// Blocks until every key is warm, with the rebuilds spread over scoped
-    /// threads of [`KEYS_PER_WARM_THREAD`] keys each. A repeat call for the
-    /// slot last warmed returns at once.
-    pub fn prepare_keys_for(&mut self, slot: u32, proposer: Option<u64>) {
-        if self.warmed_slot == Some(slot) {
-            return;
-        }
-        self.warmed_slot = Some(slot);
-
+    /// threads of [`KEYS_PER_WARM_THREAD`] keys each. Each key knows which
+    /// subtree it holds and rebuilds only on a miss, so a repeat call for a
+    /// slot already warmed costs a lock per key and the thread spawns.
+    pub fn prepare_keys_for(&self, slot: u32, proposer: Option<u64>) {
         let keys = self.keys_to_warm(proposer);
         let start = Instant::now();
         std::thread::scope(|scope| {
@@ -307,18 +297,16 @@ mod tests {
     }
 
     #[test]
-    fn prepare_keys_for_warms_every_batch_once_per_slot() {
+    fn prepare_keys_for_warms_every_batch() {
         // More keys than one batch holds, so the warm spans several threads.
         let count = 2 * KEYS_PER_WARM_THREAD as u64 + 1;
         let mut key_manager = tiny_key_manager(count);
 
         key_manager.prepare_keys_for(1, Some(0));
-        assert_eq!(key_manager.warmed_slot, Some(1));
-
-        // A slot outside every key's range only warns, and is still recorded
-        // so the ticks after it do not retry.
+        // A repeat call finds every key warm.
+        key_manager.prepare_keys_for(1, Some(0));
+        // A slot outside every key's range only warns.
         key_manager.prepare_keys_for(7, None);
-        assert_eq!(key_manager.warmed_slot, Some(7));
 
         // The warmed keys still sign.
         let message = H256::default();
