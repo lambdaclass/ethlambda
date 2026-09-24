@@ -245,6 +245,8 @@ The bookkeeping an import triggers (chain-event emission, the finality eviction 
 
 `decode` is a gossip-only section, so `queue` is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: `decode` is a gossip population even though the `source` label allows `sync`, and a fetched block's `total` starts later in its life than a gossiped block's, having never counted the request round trip at all.
 
+On the beacon wire, `decode` for `source="gossip"` spans more than its name says. `BlockArrival::decode_start` is still the wire arrival, but `handed_off` is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check's own `spawn_blocking` task, and the verdict's trip back through the p2p actor's mailbox. There is no wait for a free validation slot to attribute here either: `try_acquire_owned` never blocks, and a message arriving with none free is reported `Ignore(Overloaded)` (and still forwarded to the chain actor) rather than queued. A rising `decode` on the beacon wire alone therefore does not mean decoding got slower; check `lean_beacon_gossip_validation_seconds` before assuming so.
+
 `engine` and `fcu` are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.
 
 The `source` label has two values, `gossip` and `sync` (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its `defer` section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no `decode` and an empty `queue` taken when the import began. Both still appear in the log, which names them `deferred` and `local`.
@@ -260,7 +262,7 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 
 | Phase | What it covers | Chain |
 |-------|----------------|-------|
-| `decode` | Snappy decompression, SSZ decode and the root the p2p handler computes. Gossip only; see above | both |
+| `decode` | Snappy decompression, SSZ decode and the root the p2p handler computes; on the beacon wire this also spans gossip validation. Gossip only; see above | both |
 | `queue` | The wait in the chain actor's mailbox | both |
 | `defer` | Held because the block's own slot had not started yet | beacon |
 | `guards` | Finality and future-slot checks, the already-imported check, the parent-state lookup | both |
@@ -337,6 +339,25 @@ and `lean_state_write_seconds` says whether that time went into the encode or
 the commit. A depth that stays at zero means the writer has nothing
 outstanding.
 
+### Beacon Gossip Validation
+
+Every beacon gossip message gets a verdict before gossipsub forwards it
+(`validate_messages()` is on for the beacon wire only). See
+[beacon_wire.md](./beacon_wire.md#gossip) for the flow. These are
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_gossip_validation_total` | Counter | Verdicts, by topic kind, outcome and reason | On every verdict reported to gossipsub | kind, outcome=accept,queue,ignore,reject, reason | |
+| `lean_beacon_gossip_validation_seconds` | Histogram | Time from a message's arrival to its verdict | On every verdict reported to gossipsub | kind | 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8 |
+| `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
+
+`kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
+label `data_column_sidecar`. `queue` means IGNORE to gossipsub while the chain
+actor still receives the object and parks it. **`verdict_expired_total` should
+stay at zero**: a rising count means validation is too slow for gossipsub's
+message cache.
+
 ### Beacon Committee Cache
 
 `ethlambda beacon` derives an epoch's attester committees with one whole-epoch
@@ -378,12 +399,11 @@ spec.
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
 
 `lean_data_columns_rejected_total`'s reasons are the chain actor's own, one
-layer past gossip's cheaper checks. A malformed, wrong-subnet, stale, future,
-or duplicate sidecar is usually caught one layer down, in gossip, and shows up
-instead as `lean_beacon_gossip_messages_total{topic="data_column_sidecar",
-result=...}`; `reason="malformed"` on this counter therefore fires almost
-exclusively for a *fetched* sidecar, which skips gossip's checks entirely and
-reaches the chain actor first.
+layer past gossip validation. A gossiped sidecar is judged first by the gossip
+rules and counted in `lean_beacon_gossip_validation_total{kind="data_column_sidecar"}`;
+`reason="malformed"` on this counter therefore fires almost exclusively for a
+*fetched* sidecar, which skips gossip validation and reaches the chain actor
+first.
 
 **Watch `lean_blocks_held_for_columns`.** It is the first symptom of a stalled
 availability gate, and a healthy node returns it to zero within a slot or two

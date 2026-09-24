@@ -3158,11 +3158,18 @@ impl BlockChainServer {
     /// [`Self::evict_sidecars_awaiting_parent_at_or_below_finality`] is what
     /// bounds it, which bounds how *long* an entry lives but not how fast
     /// they arrive: `on_gossip_data_column` does not require `parent_root` to
-    /// name a block this node knows, and the p2p layer's `seen_data_columns`
-    /// dedups on the header's own slot, proposer and index, all three of
-    /// which a fabricated header chooses freely. A peer willing to make them
-    /// up can therefore park rows as fast as gossip carries them, until
-    /// finality catches up.
+    /// name a block this node knows. A gossiped sidecar reaching here has had
+    /// its header's signature checked against the head state by the p2p
+    /// layer's gossip validation (`queue_unless_forged`, in
+    /// `ethlambda_state_transition::beacon::gossip::column`), but only when a
+    /// head state is already cached *and* the header's `proposer_index` names
+    /// a validator in it: with no cached head state, or a proposer index that
+    /// names none (`u64::MAX`, say), that check is skipped and a made-up
+    /// header still reaches here and parks a row. A sidecar fetched over
+    /// req/resp skips gossip validation entirely and reaches this method with
+    /// none of that checked, so a peer answering a fetch, or exploiting either
+    /// gap in the gossip path, can still park rows as fast as it can invent a
+    /// slot, proposer and index, until finality catches up.
     fn queue_sidecar_awaiting_parent(
         &mut self,
         block_root: H256,
@@ -3177,11 +3184,13 @@ impl BlockChainServer {
         };
 
         // A re-delivery of something already parked. The by-root and by-range
-        // fetch paths have no `seen_data_columns` between them and the actor,
-        // so this is ordinary, and without the check the same column would take
-        // a second slot in the queue and leave a stale key behind after the
-        // first replay took its row. Asked before the write rather than left to
-        // the set below, because the write is what costs.
+        // fetch paths skip gossip validation entirely, so they never touch the
+        // p2p actor's `SeenColumns` (which in any case only records an Accept,
+        // never a park); a re-delivery reaching here is ordinary, and without
+        // this check the same column would take a second slot in the queue and
+        // leave a stale key behind after the first replay took its row. Asked
+        // before the write rather than left to the set below, because the
+        // write is what costs.
         if self
             .sidecars_awaiting_parent
             .get(&parent_root)
@@ -4678,10 +4687,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_sidecar_parked_twice_takes_one_slot_in_the_queue() {
-        // The by-root and by-range fetch paths have no `seen_data_columns`
-        // between them and this actor, so a re-delivery while the parent is
-        // still stateless is ordinary. A second entry would leave a key with
-        // no row behind it once the first replay took it.
+        // The by-root and by-range fetch paths skip gossip validation
+        // entirely, so nothing between them and this actor dedups a
+        // re-delivery while the parent is still stateless; it is ordinary. A
+        // second entry would leave a key with no row behind it once the
+        // first replay took it.
         let mut store = beacon_store(GENESIS_TIME, 0);
         store
             .set_time_ms(seconds_to_milliseconds(

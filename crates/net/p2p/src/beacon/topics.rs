@@ -40,6 +40,21 @@ pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF,
 ];
 
+/// The metric label every data column subnet shares, so the column subnets
+/// add one label value rather than one per subnet.
+pub const DATA_COLUMN_SIDECAR_KIND: &str = "data_column_sidecar";
+
+/// The metric label for a topic kind this node subscribes to on the beacon
+/// wire: the kind itself for a global topic, [`DATA_COLUMN_SIDECAR_KIND`] for
+/// a column subnet. `None` for anything else, lean kinds included, which is
+/// what tells the gossip handler a message needs no verdict.
+pub fn metric_kind(kind: &str) -> Option<&'static str> {
+    if let Some(&global) = SUBSCRIBED_TOPIC_KINDS.iter().find(|&&known| known == kind) {
+        return Some(global);
+    }
+    data_column_subnet(kind).map(|_| DATA_COLUMN_SIDECAR_KIND)
+}
+
 /// Build one topic name: `/eth2/{fork_digest}/{kind}/ssz_snappy`.
 ///
 /// `fork_digest` is lowercase hex with no `0x` prefix, which is what every
@@ -238,6 +253,19 @@ mod tests {
         let topics = BeaconTopics::new(MAINNET, &[3, 3, 9]);
         assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
         assert_eq!(topics.column_topics.len(), 2);
+    }
+
+    #[test]
+    fn a_beacon_kind_is_its_own_label_and_columns_share_one() {
+        assert_eq!(metric_kind(BEACON_BLOCK), Some(BEACON_BLOCK));
+        assert_eq!(metric_kind(VOLUNTARY_EXIT), Some(VOLUNTARY_EXIT));
+        assert_eq!(
+            metric_kind("data_column_sidecar_7"),
+            Some(DATA_COLUMN_SIDECAR_KIND)
+        );
+        // Lean topic kinds and unsubscribed beacon kinds get no verdict.
+        assert_eq!(metric_kind("block"), None);
+        assert_eq!(metric_kind("beacon_attestation_3"), None);
     }
 
     #[test]

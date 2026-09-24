@@ -376,6 +376,58 @@ pub fn inc_beacon_gossip(topic: &str, result: &str) {
         .inc();
 }
 
+static LEAN_BEACON_GOSSIP_VALIDATION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_validation_total",
+        "Beacon gossip verdicts, by topic kind, outcome and reason",
+        &["kind", "outcome", "reason"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_GOSSIP_VALIDATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_gossip_validation_seconds",
+        "Time from a beacon gossip message's arrival to its verdict",
+        &["kind"],
+        vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
+        ]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_verdict_expired_total",
+        "Beacon gossip verdicts reported after gossipsub had evicted the message",
+        &["kind"]
+    )
+    .unwrap()
+});
+
+/// Count one beacon gossip verdict and how long it took from arrival.
+pub fn observe_beacon_gossip_verdict(
+    kind: &str,
+    outcome: &str,
+    reason: &str,
+    elapsed: std::time::Duration,
+) {
+    LEAN_BEACON_GOSSIP_VALIDATION_TOTAL
+        .with_label_values(&[kind, outcome, reason])
+        .inc();
+    LEAN_BEACON_GOSSIP_VALIDATION_SECONDS
+        .with_label_values(&[kind])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Count one verdict gossipsub could no longer act on.
+pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
+    LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
 pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }

@@ -3404,6 +3404,21 @@ impl Store {
             .expect("get"))
     }
 
+    /// Whether this node already holds a specific column of one block.
+    ///
+    /// A point `get` on the same key [`Self::put_data_column_sidecar`] writes,
+    /// unlike [`Self::data_column_indices_for`]'s prefix scan: a RocksDB
+    /// iterator loads every value it walks past, so scanning a whole block's
+    /// columns just to ask about one of them reads every sibling sidecar this
+    /// node custodies, which is too costly to pay inline for every incoming
+    /// gossip column.
+    pub fn has_data_column(&self, slot: u64, root: &H256, index: u64) -> bool {
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::DataColumns, &data_column_key(slot, root, index))
+            .expect("get")
+            .is_some()
+    }
+
     /// Which columns of one block this node holds, ascending.
     ///
     /// What the availability check asks: it compares this against the columns
@@ -6495,6 +6510,25 @@ mod tests {
             Some(sidecar_bytes(0xab))
         );
         assert_eq!(store.get_data_column_sidecar(7, &root, 4).unwrap(), None);
+    }
+
+    #[test]
+    fn has_data_column_reads_the_same_key_the_verified_table_is_written_under() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let root = H256::repeat_byte(1);
+        store
+            .put_data_column_sidecar(7, &root, 3, sidecar_bytes(0xab))
+            .unwrap();
+
+        assert!(store.has_data_column(7, &root, 3));
+        assert!(
+            !store.has_data_column(7, &root, 4),
+            "a different index at the same slot and root must not be reported present"
+        );
+        assert!(
+            !store.has_data_column(7, &H256::repeat_byte(2), 3),
+            "a different root must not be reported present"
+        );
     }
 
     #[test]

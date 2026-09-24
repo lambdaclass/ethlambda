@@ -797,6 +797,41 @@ impl SignedBeaconBlock {
         }
     }
 
+    /// How many blob KZG commitments this block's body carries: zero before
+    /// deneb, which introduced them.
+    ///
+    /// The one body field `beacon_block` gossip validation bounds before it
+    /// consults any state.
+    pub fn blob_kzg_commitment_count(&self) -> usize {
+        match self {
+            Self::Phase0(_)
+            | Self::Altair(_)
+            | Self::Bellatrix(_)
+            | Self::Capella(_)
+            | Self::Lean(_) => 0,
+            Self::Deneb(block) => block.message.body.blob_kzg_commitments.len(),
+            Self::Electra(block) | Self::Fulu(block) => {
+                block.message.body.blob_kzg_commitments.len()
+            }
+        }
+    }
+
+    /// This block's execution payload timestamp, if it carries a payload.
+    ///
+    /// `None` before bellatrix, for the same reason as
+    /// [`Self::execution_block_hash`].
+    pub fn execution_payload_timestamp(&self) -> Option<u64> {
+        match self {
+            Self::Phase0(_) | Self::Altair(_) | Self::Lean(_) => None,
+            Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
+            Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
+            Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
+            Self::Electra(block) | Self::Fulu(block) => {
+                Some(block.message.body.execution_payload.timestamp)
+            }
+        }
+    }
+
     /// The fork whose rules apply to this block.
     ///
     /// Not the same question as "what shape is this value": `Fulu` and
@@ -1258,5 +1293,59 @@ mod tests {
 
         let block = SignedBeaconBlock::Phase0(signed);
         assert_eq!(block.body_root(), expected);
+    }
+
+    #[test]
+    fn a_fulu_block_reports_its_blob_commitments_and_payload_timestamp() {
+        use crate::beacon::containers::electra;
+        use crate::beacon::primitives::{KzgCommitment, Root};
+
+        let mut body = electra::BeaconBlockBody::empty();
+        body.execution_payload.timestamp = 1_234;
+        body.blob_kzg_commitments = vec![KzgCommitment::default(); 3]
+            .try_into()
+            .expect("within MAX_BLOB_COMMITMENTS_PER_BLOCK");
+        let block = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        });
+
+        assert_eq!(block.blob_kzg_commitment_count(), 3);
+        assert_eq!(block.execution_payload_timestamp(), Some(1_234));
+    }
+
+    #[test]
+    fn a_phase0_block_has_no_blob_commitments_and_no_payload() {
+        use crate::beacon::containers::phase0;
+        use crate::beacon::primitives::Root;
+
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: Root::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        });
+
+        assert_eq!(block.blob_kzg_commitment_count(), 0);
+        assert_eq!(block.execution_payload_timestamp(), None);
     }
 }

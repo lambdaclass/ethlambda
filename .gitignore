@@ -34,6 +34,10 @@ target
 # Beacon Chain spec test fixtures, downloaded by `make consensus-spec-tests`
 /consensus-spec-tests
 
+# The gossip validation vectors, from a newer release, downloaded by
+# `make consensus-spec-gossip-tests`
+/consensus-spec-tests-gossip
+
 # Personal Claude Code overrides (not shared with team)
 CLAUDE.local.md
 

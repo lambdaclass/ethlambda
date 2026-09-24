@@ -45,11 +45,16 @@ use crate::beacon::primitives::{
 /// every later fork's tests in the same way. Deriving a real key from the index
 /// keeps the state reproducible while letting the BLS paths run.
 fn pubkey_for(index: usize) -> BlsPubkey {
+    BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes())
+}
+
+/// The secret key behind [`pubkey_for`]`(index)`, for a test that needs a
+/// validator's signature to verify.
+pub fn secret_key_for(index: usize) -> blst::min_pk::SecretKey {
     let mut ikm = [0u8; 32];
     ikm[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
-    let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[])
-        .expect("32 bytes of input material is enough for key generation");
-    BlsPubkey(secret.sk_to_pk().to_bytes())
+    blst::min_pk::SecretKey::key_gen(&ikm, &[])
+        .expect("32 bytes of input material is enough for key generation")
 }
 
 /// A phase0 state with `count` fully active, full-balance validators, positioned

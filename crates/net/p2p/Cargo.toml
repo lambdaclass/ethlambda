@@ -43,7 +43,7 @@ snap = "1.1"
 # `disconnect_cause` to say why a TCP peer's connection ended.
 either = "1"
 
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
 tracing.workspace = true
 thiserror.workspace = true
 

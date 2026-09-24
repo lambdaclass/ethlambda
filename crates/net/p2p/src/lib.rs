@@ -30,8 +30,9 @@ use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     fmt, io,
     net::{IpAddr, SocketAddr},
-    num::NonZeroU8,
+    num::{NonZeroU8, NonZeroUsize},
     ops::Range,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -42,6 +43,7 @@ use ethlambda_network_api::{
         FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
     },
 };
+use ethlambda_state_transition::beacon::gossip::{SeenBlocks, SeenColumns};
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
@@ -167,18 +169,18 @@ const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 /// alone.
 const DIAL_ADDRESS_CONCURRENCY: NonZeroU8 = NonZeroU8::new(1).expect("1 > 0");
 
-/// How often `seen_data_columns` is pruned down to the finalized boundary.
-///
-/// Its own clock rather than a ride on the discovery tick, which is where it
-/// used to sit. That tick is no longer a steady heartbeat: it is paced by
-/// [`crate::discovery::dial::dial_interval`] and runs as often as
-/// [`crate::discovery::MAX_DIAL_RATE_PER_SECOND`] while the node is short of
-/// peers. Pruning costs a store read plus a scan of the whole set, so
-/// inheriting that cadence would have put both on the p2p actor's single
-/// thread hundreds of times a second, to re-derive a boundary that moves once
-/// an epoch.
-const SEEN_COLUMN_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
+
+/// How many beacon gossip messages may be in stateful validation at once. A
+/// message arriving with none free is ignored rather than queued. Revisit once
+/// `lean_beacon_gossip_validation_seconds` has data from a follower.
+const GOSSIP_VALIDATION_PERMITS: usize = 128;
+
+/// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
+const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
+
+/// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
+const SEEN_COLUMNS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
@@ -562,8 +564,17 @@ pub enum SwarmBuildError {
 /// match the beacon spec, so `seen_ttl` is the only value that differs between
 /// the two networks: lean's is its slot duration times a 3-slot justification
 /// lookback times two, mainnet's epoch is 32 slots of 12s.
-pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config {
-    libp2p::gossipsub::ConfigBuilder::default()
+///
+/// `validate_messages` holds every received message until the application
+/// reports a verdict for it. Beacon only: every beacon topic gets one from
+/// `beacon::verdict`, while lean handlers produce none, so turning it on there
+/// would stop lean gossip from propagating at all.
+pub(crate) fn gossipsub_config(
+    seen_ttl: Duration,
+    validate_messages: bool,
+) -> libp2p::gossipsub::Config {
+    let mut builder = libp2p::gossipsub::ConfigBuilder::default();
+    builder
         // d
         .mesh_n(8)
         // d_low
@@ -583,9 +594,11 @@ pub(crate) fn gossipsub_config(seen_ttl: Duration) -> libp2p::gossipsub::Config 
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .max_messages_per_rpc(Some(500))
         .allow_self_origin(true)
-        .idontwant_message_size_threshold(1000)
-        .build()
-        .expect("invalid gossipsub config")
+        .idontwant_message_size_threshold(1000);
+    if validate_messages {
+        builder.validate_messages();
+    }
+    builder.build().expect("invalid gossipsub config")
 }
 
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
@@ -626,9 +639,10 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         ),
     };
 
+    let validate_messages = matches!(wire, WireConfig::Beacon(_));
     let gossipsub = libp2p::gossipsub::Behaviour::new(
         MessageAuthenticity::Anonymous,
-        gossipsub_config(seen_ttl),
+        gossipsub_config(seen_ttl, validate_messages),
     )
     .expect("failed to initiate behaviour");
 
@@ -872,18 +886,17 @@ impl P2P {
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: DiscoveryState::new(discovery, built.local_peer_id),
-            seen_data_columns: HashSet::new(),
+            seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
+            seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                GOSSIP_VALIDATION_PERMITS,
+            )),
         };
         let handle = server.start();
         send_after(
             DIAL_INTERVAL_AT_ZERO_PEERS,
             handle.context(),
             p2p_protocol::DiscoverPeers,
-        );
-        send_after(
-            SEEN_COLUMN_PRUNE_INTERVAL,
-            handle.context(),
-            p2p_protocol::PruneSeenColumns,
         );
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
@@ -952,16 +965,13 @@ pub struct P2PServer {
 
     pub(crate) discovery: DiscoveryState,
 
-    /// The (slot, proposer, column) tuples already forwarded this session.
-    ///
-    /// Bounded two ways: `handle_beacon_data_column`'s own clock-disparity
-    /// check keeps a tuple naming a fabricated far-future slot from ever
-    /// being inserted (finality will never reach such a slot, so pruning
-    /// alone could never reclaim it), and `prune_seen_data_columns` drops
-    /// every entry at or below the finalized slot once real finality does
-    /// reach it. Not a TTL: the gossip rule is per block, and a block below
-    /// finality can no longer produce a sidecar worth forwarding.
-    pub(crate) seen_data_columns: HashSet<(u64, u64, u64)>,
+    /// The first valid block per `(slot, proposer)` accepted from gossip.
+    pub(crate) seen_blocks: SeenBlocks,
+    /// The first valid sidecar per `(slot, proposer, index)` accepted from
+    /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
+    pub(crate) seen_columns: SeenColumns,
+    /// Permits for stateful gossip checks in flight on blocking threads.
+    pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl P2PServer {
@@ -1029,21 +1039,6 @@ impl P2PServer {
             metrics::set_custody_column_peers(column, columns_custodied_by(self, column).len());
         }
     }
-
-    /// Drop every `seen_data_columns` entry at or below the finalized slot.
-    ///
-    /// Called on [`SEEN_COLUMN_PRUNE_INTERVAL`], regardless of peer churn: a stable, well-connected node might open no
-    /// new connections for a long time, and the set must not depend on how
-    /// often peers happen to churn to actually shrink.
-    pub(crate) fn prune_seen_data_columns(&mut self) {
-        let finalized_slot = self
-            .store
-            .latest_finalized()
-            .expect("finalized checkpoint exists")
-            .slot;
-        self.seen_data_columns
-            .retain(|&(slot, _, _)| slot > finalized_slot);
-    }
 }
 
 // Protocol trait for internal messages only (retry scheduling).
@@ -1058,8 +1053,6 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
-    #[allow(dead_code)] // invoked via send_after, not called directly
-    fn prune_seen_columns(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1153,20 +1146,6 @@ impl P2PServer {
             DIAL_INTERVAL_AT_TARGET
         };
         send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
-    }
-
-    #[send_handler]
-    async fn handle_prune_seen_columns(
-        &mut self,
-        _msg: p2p_protocol::PruneSeenColumns,
-        ctx: &Context<Self>,
-    ) {
-        send_after(
-            SEEN_COLUMN_PRUNE_INTERVAL,
-            ctx.clone(),
-            p2p_protocol::PruneSeenColumns,
-        );
-        self.prune_seen_data_columns();
     }
 }
 
@@ -1545,8 +1524,19 @@ async fn handle_behaviour_event(
         // A deny from this behaviour already denied the connection at the
         // swarm level; nothing here needs to react to it a second time.
         BehaviourEvent::ConnectionLimits(_) => return,
-        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message { message, .. }) => {
-            return gossipsub::handle_gossip_message(server, message).await;
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        }) => {
+            return gossipsub::handle_gossip_message(
+                server,
+                ctx,
+                propagation_source,
+                message_id,
+                message,
+            )
+            .await;
         }
         BehaviourEvent::Gossipsub(_) => return,
         BehaviourEvent::ReqResp(event) => match event {
@@ -2091,6 +2081,162 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     libp2p::gossipsub::MessageId(hash[..20].to_vec())
 }
 
+/// Test scaffolding shared by the beacon gossip handler's `triage_*` tests
+/// (`gossipsub::handler`) and the verdict module's `settle` tests
+/// (`beacon::verdict`): a real, unconnected beacon `P2PServer`, and a sidecar
+/// shaped to clear structural validation. Lives here, rather than duplicated
+/// in each of those two test modules, because both need the identical
+/// beacon-shaped environment; `req_resp::handlers::tests::unconnected_server`
+/// keeps its own lean-flavored copy, since that one builds a different wire.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    use ethlambda_storage::Store;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::{fulu, shared};
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{KzgCommitment, KzgProof, Root};
+    use ethlambda_types::checkpoint::Checkpoint;
+    use ethlambda_types::enr::EnrForkId;
+    use ethlambda_types::primitives::H256;
+    use libssz_types::SszVector;
+
+    use crate::beacon::swarm::BeaconWireConfig;
+    use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
+
+    /// A real, unconnected beacon `P2PServer`, built the same way
+    /// `req_resp::handlers::tests::unconnected_server` builds a lean one:
+    /// port `0` throughout, so this cannot collide with a running node or a
+    /// sibling test, and no bootnodes or peers.
+    ///
+    /// Neither `triage_*` nor `settle` ever reads `swarm_handle` or
+    /// `discovery`, but both are required fields, and building the real thing
+    /// is no more expensive than faking one would be.
+    pub(crate) async fn unconnected_beacon_server(
+        config: Config,
+        finalized_slot: u64,
+    ) -> P2PServer {
+        let built = build_swarm(SwarmConfig {
+            node_key: vec![9u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            wire: WireConfig::Beacon(Box::new(BeaconWireConfig {
+                fork_digest: [0u8; 4],
+                config: config.clone(),
+                genesis_time: config.genesis_time,
+                genesis_validators_root: Root::ZERO,
+                custody_columns: Vec::new(),
+            })),
+        })
+        .expect("swarm builds");
+
+        let (_swarm_stream, swarm_handle) =
+            crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+
+        let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
+            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
+                .secret_bytes()
+                .to_vec(),
+            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 0,
+            p2p_port: 0,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 1,
+            bootnodes: Vec::new(),
+            advertise_ip: None,
+            target_peers: 0,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        })
+        .await
+        .expect("discovery spawns");
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let anchor_checkpoint = Checkpoint {
+            root: H256::ZERO,
+            slot: finalized_slot,
+        };
+        // The caller's own `config`, genesis time included, not a fresh
+        // `Config::mainnet()`: a caller that builds a clock-sensitive `config`
+        // (a recent `genesis_time`, say) needs the store's clock to agree with
+        // it, since `cheap_checks`/`stateful_checks` read the store's own
+        // config rather than the wire's.
+        let store = Store::init_beacon(
+            backend,
+            config.genesis_time,
+            config,
+            H256::ZERO,
+            anchor_checkpoint,
+            finalized_slot,
+        );
+
+        P2PServer {
+            swarm_handle,
+            store,
+            blockchain: None,
+            wire: built.wire,
+            connected_peers: HashMap::new(),
+            peer_custody: HashMap::new(),
+            pending_root_requests: HashMap::new(),
+            pending_column_requests: HashMap::new(),
+            outbound_requests: HashMap::new(),
+            range_sync_state: None,
+            beacon_fetched_through: 0,
+            bootnode_addrs: HashMap::new(),
+            node_names: HashMap::new(),
+            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
+                crate::SEEN_BLOCKS_CAPACITY,
+            ),
+            seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::GOSSIP_VALIDATION_PERMITS,
+            )),
+        }
+    }
+
+    /// A sidecar that clears `verify_data_column_sidecar`'s structural checks
+    /// (one commitment, one proof, one column cell, all the same length) but
+    /// carries no real KZG material: nothing in `triage_data_column`'s reject
+    /// path under test verifies the cryptography, only the shape and the
+    /// header's slot.
+    pub(crate) fn valid_shaped_sidecar(slot: u64, index: u64) -> fulu::DataColumnSidecar {
+        let cell: fulu::Cell =
+            SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL]).expect("exact cell size");
+        fulu::DataColumnSidecar {
+            index,
+            column: vec![cell].try_into().expect("within the per-block limit"),
+            kzg_commitments: vec![KzgCommitment::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            kzg_proofs: vec![KzgProof::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            signed_block_header: shared::SignedBeaconBlockHeader {
+                message: shared::BeaconBlockHeader {
+                    slot,
+                    proposer_index: 7,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2265,6 +2411,13 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    #[test]
+    fn gossip_is_held_for_a_verdict_only_when_asked() {
+        let ttl = Duration::from_secs(1);
+        assert!(gossipsub_config(ttl, true).validate_messages());
+        assert!(!gossipsub_config(ttl, false).validate_messages());
     }
 
     /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]

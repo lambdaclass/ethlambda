@@ -45,6 +45,14 @@ pub enum SwarmCommand {
         channel: request_response::ResponseChannel<Response>,
         response: Response,
     },
+    /// A verdict for a gossip message gossipsub is holding (beacon only).
+    ReportValidation {
+        message_id: libp2p::gossipsub::MessageId,
+        propagation_source: PeerId,
+        acceptance: libp2p::gossipsub::MessageAcceptance,
+        /// Topic kind, for the expired-verdict metric.
+        kind: &'static str,
+    },
 }
 
 /// What the swarm did with a dial, as far as a caller's bookkeeping cares.
@@ -176,6 +184,24 @@ impl SwarmHandle {
             .cmd_tx
             .send(SwarmCommand::SendResponse { channel, response })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot send response"));
+    }
+
+    pub fn report_validation(
+        &self,
+        message_id: libp2p::gossipsub::MessageId,
+        propagation_source: PeerId,
+        acceptance: libp2p::gossipsub::MessageAcceptance,
+        kind: &'static str,
+    ) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::ReportValidation {
+                message_id,
+                propagation_source,
+                acceptance,
+                kind,
+            })
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot report a gossip verdict"));
     }
 }
 
@@ -331,6 +357,23 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .lean_status
                 .send_response(channel, response)
                 .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
+        }
+        SwarmCommand::ReportValidation {
+            message_id,
+            propagation_source,
+            acceptance,
+            kind,
+        } => {
+            // `false`: gossipsub no longer holds the message, because the
+            // verdict came after its message-cache entry was evicted, so an
+            // Accept propagates nothing.
+            let held = swarm
+                .behaviour_mut()
+                .gossipsub
+                .report_message_validation_result(&message_id, &propagation_source, acceptance);
+            if !held {
+                metrics::inc_beacon_gossip_verdict_expired(kind);
+            }
         }
     }
 }

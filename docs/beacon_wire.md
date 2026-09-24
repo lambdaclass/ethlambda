@@ -95,18 +95,24 @@ size, still far short of a full subscription to every attestation,
 sync-committee and data-column subnet, and narrower still than
 `NUMBER_OF_CUSTODY_GROUPS` columns of custody, which is what a supernode
 would carry alone. A sidecar decodes as
-`fulu::DataColumnSidecar`; see [Data column sidecars](#data-column-sidecars)
-for the checks it passes before this node keeps or forwards it.
+`fulu::DataColumnSidecar`; the checks it passes before this node keeps or
+forwards it are described just below. How a kept sidecar is later served back
+out over req/resp is under [Data column sidecars](#data-column-sidecars).
 
-Blocks and aggregate attestations are logged at `info`, one line each; the
-other five global topics are counted and logged at `debug`, since nothing
-distinguishes one voluntary exit from the next at a glance. Data column
-sidecars get their own handler ahead of that shared path, with subnet-match,
-finalized, future-slot and per-`(slot, proposer, index)` dedup checks a
-generic gossip topic has no need of; a sidecar that clears them is counted the
-same way and forwarded to the chain actor for the checks that need a state.
-Nothing is published on any topic, columns included: nothing this node can
-produce today would be signature-valid.
+Every beacon message is held by gossipsub until it has a verdict
+(`validate_messages()` is on for this wire only). Blocks and data column
+sidecars are validated by fulu's gossip rules
+(`ethlambda_state_transition::beacon::gossip`): the checks that need no state
+run inline in the p2p actor, the rest on a bounded `spawn_blocking` task whose
+verdict comes back to the actor (`crate::beacon::verdict`). Accept propagates
+the message; a message whose dependency is not ready yet is IGNOREd. Either
+way it is handed to the chain actor, which parks what it cannot import yet and
+imports the rest immediately, such as a sidecar whose slot merely falls
+outside its parent state's proposer lookahead.
+The other six global topics are decoded, logged (aggregates at `info`, the
+rest at `debug`), and IGNOREd, since nothing consumes them yet; an undecodable
+payload on any topic is REJECTed. Nothing is published on any topic: nothing
+this node can produce today would be signature-valid.
 
 ## Request/response
 
@@ -307,10 +313,13 @@ What this node deliberately does not do with its own slice of the matrix: it
 does not run `compute_matrix` or `recover_matrix` to reconstruct the rest of a
 block's data from it, since reconstruction needs half of
 `NUMBER_OF_CUSTODY_GROUPS` and this node never holds more than its own
-sampling size; and it does not cross-seed, forwarding a
-verified column to a peer that never asked for it — every sidecar this node
-sends leaves in direct answer to a `data_column_sidecars_by_{root,range}`
-request, never as an unsolicited push.
+sampling size; and, over req/resp, it does not cross-seed a verified column to
+a peer that never asked for it: every sidecar this node sends over
+`data_column_sidecars_by_{root,range}` leaves in direct answer to that peer's
+own request. Gossip is the one path where the same column *is* an
+unsolicited push by design: an Accept verdict (see [Gossip](#gossip) above)
+both hands the sidecar to the chain actor and re-propagates it to every mesh
+peer, whether or not any of them asked for it.
 
 ### What is not wired yet
 
@@ -384,6 +393,8 @@ as a query filter, so a `quic`-only record is invisible to it.
 | Metric | Meaning |
 | --- | --- |
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` |
+| `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts; see [metrics.md](./metrics.md#beacon-gossip-validation) |
+| `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 

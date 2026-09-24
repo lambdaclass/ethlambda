@@ -458,12 +458,18 @@ Nothing caps that queue. The finality sweep that evicts held blocks also
 deletes the rows of parked sidecars at or below the finalized slot, and that is
 the only thing reclaiming them, so it bounds how *long* a row lives but not how
 fast rows arrive. `on_gossip_data_column` does not require a sidecar's
-`parent_root` to name a block this node knows, and the p2p layer's
-`seen_data_columns` dedups on the header's own slot, proposer and index, all
-three of which a fabricated header chooses freely, so a peer willing to make
-them up can park rows as fast as gossip carries them. Watch
-`lean_sidecars_awaiting_parent`: it is the only signal that this is happening,
-and unlike `DataColumns` these rows were written on a peer's say-so.
+`parent_root` to name a block this node knows. A gossiped sidecar has had its
+header's signature checked against the head state before it gets this far,
+but only when a head state is already cached *and* the header's
+`proposer_index` names a validator in it: with no cached head state, or a
+proposer index that names none (`u64::MAX`, say), the p2p layer's gossip
+validation skips that check and a made-up header still reaches here. A
+sidecar fetched over req/resp skips gossip validation entirely, so a peer
+answering a fetch, or exploiting either gap in the gossip path, can still
+park rows as fast as it can invent a slot, proposer and index. Watch
+`lean_sidecars_awaiting_parent`: it is the only signal that this is
+happening, and unlike `DataColumns` these rows were written on a peer's
+say-so.
 
 That in-memory map is also the *only* index into this table, and it does not
 survive a restart, so `start_actor` clears the table outright before building

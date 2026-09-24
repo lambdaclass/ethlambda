@@ -20,6 +20,7 @@ pub mod messages;
 pub mod protocols;
 pub mod swarm;
 pub mod topics;
+pub mod verdict;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::primitives::{ForkDigest, Root};

@@ -72,9 +72,11 @@ pub mod bls;
 pub mod das;
 pub mod fork_choice;
 pub mod genesis;
+pub mod gossip;
 pub mod hash;
 pub mod helpers;
 pub mod kzg;
+pub mod precheck;
 pub mod stf;
 pub mod upgrade;
 

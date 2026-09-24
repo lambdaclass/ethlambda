@@ -2392,7 +2392,15 @@ mod tests {
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
             discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
-            seen_data_columns: HashSet::new(),
+            seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
+                crate::SEEN_BLOCKS_CAPACITY,
+            ),
+            seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::GOSSIP_VALIDATION_PERMITS,
+            )),
         }
     }
 

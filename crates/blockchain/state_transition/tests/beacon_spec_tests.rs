@@ -40,6 +40,7 @@ fn main() {
     trials.extend(beacon_spec::epoch_processing::trials());
     trials.extend(beacon_spec::fork::trials());
     trials.extend(beacon_spec::fork_choice::trials());
+    trials.extend(beacon_spec::gossip::trials());
     trials.extend(beacon_spec::operations::trials());
     trials.extend(beacon_spec::rewards::trials());
     trials.extend(beacon_spec::sanity::trials());

@@ -83,7 +83,7 @@ use crate::beacon::primitives::{BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Roo
 /// against each other, which is exactly the point: it is what lets the same
 /// keys be reused for other purposes (or other chains) without cross-protocol
 /// signature reuse.
-const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+pub const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
 /// The minimum number of public keys rayon may put in one sequential chunk
 /// when [`aggregate_verify`] and [`fast_aggregate_verify`] validate an

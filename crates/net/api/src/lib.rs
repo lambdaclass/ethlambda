@@ -107,8 +107,15 @@ pub struct BlockArrival {
     pub decode_start: Option<Instant>,
     /// The block is about to be handed to the chain actor.
     ///
-    /// Where `decode_start` is set, this doubles as the end of the decode: a
-    /// producer hands a block over as soon as it has one.
+    /// Where `decode_start` is set, this doubles as the end of the decode
+    /// section: a producer hands a block over as soon as it has one. On the
+    /// beacon wire that "as soon as" includes gossip validation, since a
+    /// gossiped block is not handed off until it has a verdict
+    /// (`crate::beacon::verdict` in `ethlambda-p2p`), so `decode` there also
+    /// covers the cheap checks, the stateful check itself, and the verdict's
+    /// trip back through the p2p actor's mailbox. Not a wait for a free
+    /// validation slot: `try_acquire_owned` never blocks, and a message
+    /// arriving with none free is reported `Ignore(Overloaded)` immediately.
     pub handed_off: Instant,
     /// Set when this delivery re-delivers a block held for a slot that had
     /// not started.

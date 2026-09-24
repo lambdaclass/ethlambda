@@ -33,6 +33,7 @@ pub mod epoch_processing;
 pub mod fork;
 pub mod fork_choice;
 pub mod genesis;
+pub mod gossip;
 pub mod harness;
 pub mod kzg;
 pub mod merkle_proof;
@@ -85,6 +86,23 @@ pub fn fixture_root() -> PathBuf {
     assert!(
         root.is_dir(),
         "spec test fixtures are missing from {}; run `make consensus-spec-tests`",
+        root.display()
+    );
+    root
+}
+
+/// The root of the gossip vector tree.
+///
+/// The gossip vectors ship in a newer release than [`fixture_root`]'s, so they
+/// live in a tree of their own; see `CONSENSUS_SPEC_GOSSIP_TESTS_VERSION` in
+/// the Makefile. Panics when absent, for the same reason [`fixture_root`] does.
+pub fn gossip_fixture_root() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../consensus-spec-tests-gossip")
+        .join("tests");
+    assert!(
+        root.is_dir(),
+        "gossip test fixtures are missing from {}; run `make consensus-spec-gossip-tests`",
         root.display()
     );
     root
@@ -188,7 +206,17 @@ impl Case {
 /// crate does not implement are skipped, so an upstream release that adds a fork
 /// does not break the build.
 pub fn collect(config: &str, runner: &str, handler: &str) -> Vec<Case> {
-    let root = fixture_root().join(config);
+    collect_in(&fixture_root(), config, runner, handler)
+}
+
+/// Cases for one handler of the `networking` runner, from the gossip tree.
+pub fn collect_gossip(config: &str, handler: &str) -> Vec<Case> {
+    collect_in(&gossip_fixture_root(), config, "networking", handler)
+}
+
+/// [`collect`] over any fixture tree laid out like the release tarballs.
+fn collect_in(root: &Path, config: &str, runner: &str, handler: &str) -> Vec<Case> {
+    let root = root.join(config);
     let mut cases = Vec::new();
 
     for fork_entry in read_dir_sorted(&root) {
