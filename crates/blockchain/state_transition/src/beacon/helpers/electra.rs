@@ -730,10 +730,9 @@ pub fn queue_excess_active_balance(state: &mut BeaconState, index: ValidatorInde
     }
 
     let excess_balance = balance - preset::MIN_ACTIVATION_BALANCE;
-    // `state.balance(index)?` above already proved `index` is in range, and
-    // `balances` is always exactly as long as `validators`, so this indexing
-    // cannot panic.
-    state.balances_mut()[index as usize] = preset::MIN_ACTIVATION_BALANCE;
+    // `state.balance(index)?` above already proved `index` is in range, so
+    // this cannot fail.
+    *state.balance_mut(index)? = preset::MIN_ACTIVATION_BALANCE;
 
     let deposit = placeholder_pending_deposit(state.validator(index)?, excess_balance);
     electra_state(state, "queue_excess_active_balance")?
@@ -760,8 +759,8 @@ pub fn queue_entire_balance_and_reset_validator(
     index: ValidatorIndex,
 ) -> Result<()> {
     let balance = state.balance(index)?;
-    // See `queue_excess_active_balance` for why this indexing cannot panic.
-    state.balances_mut()[index as usize] = 0;
+    // See `queue_excess_active_balance` for why this cannot fail.
+    *state.balance_mut(index)? = 0;
 
     let validator = state.validator_mut(index)?;
     validator.effective_balance = 0;
@@ -1326,7 +1325,7 @@ mod tests {
     #[test]
     fn switch_to_compounding_validator_sets_the_prefix_and_queues_excess() {
         let mut state = electra_state_with_validators(4);
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
 
         switch_to_compounding_validator(&mut state, 0).unwrap();
 
@@ -1340,7 +1339,7 @@ mod tests {
     fn queue_excess_active_balance_caps_the_balance_and_queues_the_rest() {
         let mut state = electra_state_with_validators(4);
         let pubkey = state.validator(0).unwrap().pubkey;
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 5_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 5_000_000_000;
 
         queue_excess_active_balance(&mut state, 0).unwrap();
 
@@ -1356,7 +1355,7 @@ mod tests {
     #[test]
     fn queue_excess_active_balance_does_nothing_at_or_below_the_minimum() {
         let mut state = electra_state_with_validators(4);
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE;
         queue_excess_active_balance(&mut state, 0).unwrap();
         let BeaconState::Electra(inner) = &state else {
             unreachable!("just built as Electra");
@@ -1367,7 +1366,7 @@ mod tests {
     #[test]
     fn queue_entire_balance_and_reset_validator_zeroes_the_validator() {
         let mut state = electra_state_with_validators(4);
-        state.balances_mut()[0] = 12_000_000_000;
+        *state.balance_mut(0).unwrap() = 12_000_000_000;
 
         queue_entire_balance_and_reset_validator(&mut state, 0).unwrap();
 

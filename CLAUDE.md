@@ -560,9 +560,9 @@ existing once per chain.
   buffered until `BeaconState::apply_pending_mutations`, which the state
   transition calls before every state-root computation. A state decoded from
   storage is rebased onto a cached one (`Store::get_state`).
-  - **`state.validator(i)` and `balances()[i]` are tree descents, not array
-    indexing.** A loop over the registry should walk `validators().iter()`
-    (zipped with `balances().iter()` where it needs both), not index per
+  - **`state.validator(i)` and `state.balance(i)` are tree descents, not array
+    indexing.** A loop over the registry should walk `iter_validators()`
+    (zipped with `iter_balances()` where it needs both), not index per
     validator: helpers that build the active-index `Vec` and then read each
     index back were the largest cost left in the import profile
     (`docs/beacon_stf.md`, "Registry and balances").

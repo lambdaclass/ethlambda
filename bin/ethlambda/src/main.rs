@@ -1795,7 +1795,7 @@ async fn fetch_initial_beacon_state(
     info!(
         slot = state.slot(),
         fork = %state.fork_name(),
-        validators = state.validators().len(),
+        validators = state.validator_count(),
         finalized_epoch = state.finalized_checkpoint().epoch,
         anchor_block_slot = block.slot(),
         "Beacon checkpoint sync complete"

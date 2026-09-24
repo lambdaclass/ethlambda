@@ -5238,8 +5238,7 @@ mod tests {
                 effective_balance: i,
                 ..Default::default()
             };
-            parent.validators_mut().push(validator).unwrap();
-            parent.balances_mut().push(i).unwrap();
+            parent.push_validator(validator, i).unwrap();
         }
         parent.apply_pending_mutations();
         store
@@ -5252,7 +5251,7 @@ mod tests {
         let mut child = parent;
         *child.slot_mut() = 11;
         child.latest_block_header_mut().parent_root = parent_root;
-        child.balances_mut()[0] += 1;
+        *child.balance_mut(0).unwrap() += 1;
         child.apply_pending_mutations();
         store
             .insert_signed_block(child_root, beacon_test_block(11, parent_root))
@@ -5269,7 +5268,7 @@ mod tests {
         let resident_parent = cold.get_state(&parent_root).expect("get").expect("present");
         let decoded = cold.get_state(&child_root).expect("get").expect("present");
 
-        assert!(decoded.validators().ptr_eq(resident_parent.validators()));
+        assert!(decoded.validators_ptr_eq(&resident_parent));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 

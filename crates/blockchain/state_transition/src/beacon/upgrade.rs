@@ -696,8 +696,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     // by `(activation_eligibility_epoch, index)`, matching the
     // specification's own tie-break exactly.
     let mut pre_activation: Vec<ValidatorIndex> = post
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| validator.activation_epoch == constants::FAR_FUTURE_EPOCH)
         .map(|(index, _)| index as ValidatorIndex)
@@ -705,7 +704,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     pre_activation.sort_by_key(|&index| {
         let eligibility_epoch = post
             .validator(index)
-            .expect("index was read from post.validators() above")
+            .expect("index was read from post.iter_validators() above")
             .activation_eligibility_epoch;
         (eligibility_epoch, index)
     });
@@ -722,8 +721,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     // it, since compounding eligibility and pre-activation are independent
     // conditions on the same registry.
     let compounding_indices: Vec<ValidatorIndex> = post
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| {
             crate::beacon::helpers::electra::has_compounding_withdrawal_credential(validator)

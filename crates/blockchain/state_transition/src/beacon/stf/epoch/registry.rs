@@ -74,7 +74,7 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
 /// fulu state silently activate validators under deneb's superseded rule.
 pub fn process_registry_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     let current_epoch = get_current_epoch(state);
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
 
     // `initiate_validator_exit` itself scans every validator's exit epoch to
     // find the queue's current tail, which needs `state` uncommitted to any
@@ -191,7 +191,7 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
     // vector, not the validator being read here, but every other mutator in
     // this module needs the same shape, so this one follows suit.
     let mut penalties = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         if validator.slashed && epoch + withdrawable_offset == validator.withdrawable_epoch {
             // Factored out from the penalty numerator to avoid a `uint64`
             // overflow, exactly as the specification does; multiplying before

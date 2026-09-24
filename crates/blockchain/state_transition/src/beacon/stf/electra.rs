@@ -331,12 +331,10 @@ pub fn add_validator_to_registry(
     withdrawal_credentials: Bytes32,
     amount: Gwei,
 ) -> Result<()> {
-    state.validators_mut().push(get_validator_from_deposit(
-        pubkey,
-        withdrawal_credentials,
+    state.push_validator(
+        get_validator_from_deposit(pubkey, withdrawal_credentials, amount),
         amount,
-    ))?;
-    state.balances_mut().push(amount)?;
+    )?;
 
     let mut fields = block_mut(state, "add_validator_to_registry")?;
     fields.epoch_participation_mut(true).push(0)?;
@@ -405,7 +403,7 @@ pub fn apply_deposit(
     signature: &BlsSignature,
     config: &Config,
 ) -> Result<()> {
-    let already_registered = state.validators().iter().any(|v| v.pubkey == pubkey);
+    let already_registered = state.iter_validators().any(|v| v.pubkey == pubkey);
     if !already_registered {
         if is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature, config) {
             // The registry entry starts at a zero balance; see this
@@ -983,7 +981,7 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Wit
     // Sweep for the rest, the same bounded registry walk capella's own
     // `get_expected_withdrawals` runs; see this function's own documentation
     // for what electra changes about it.
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let bound = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
     for _ in 0..bound {
         let validator = state.validator(validator_index)?;
@@ -1087,7 +1085,7 @@ pub fn process_withdrawals(
             .ok_or(Error::ArithmeticOverflow("latest_withdrawal.index + 1"))?;
     }
 
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
     {
         let latest_withdrawal = expected_withdrawals
@@ -1243,8 +1241,7 @@ pub fn process_withdrawal_request(
     }
 
     let Some(index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.validator_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
@@ -1354,8 +1351,7 @@ pub fn is_valid_switch_to_compounding_request(
     }
 
     let Some(source_validator) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .find(|validator| validator.pubkey == request.source_pubkey)
     else {
         return Ok(false);
@@ -1398,8 +1394,7 @@ pub fn process_consolidation_request(
         // Already known to resolve, by the check just above; state has not
         // been mutated since.
         let source_index = state
-            .validators()
-            .iter()
+            .iter_validators()
             .position(|validator| validator.pubkey == request.source_pubkey)
             .map(|index| index as ValidatorIndex)
             .ok_or(Error::SpecAssert(
@@ -1427,16 +1422,14 @@ pub fn process_consolidation_request(
     }
 
     let Some(source_index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.source_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
         return Ok(());
     };
     let Some(target_index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.target_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
@@ -2020,7 +2013,7 @@ mod tests {
             validator.withdrawal_credentials.0[0] = constants::COMPOUNDING_WITHDRAWAL_PREFIX;
             validator.effective_balance = preset::MIN_ACTIVATION_BALANCE;
         }
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
         let pubkey = state.validator(0).unwrap().pubkey;
 
         let request = electra::WithdrawalRequest {
@@ -2047,7 +2040,7 @@ mod tests {
         // nothing even with genuine excess balance.
         let mut state = electra_state_with_validators(2);
         let config = Config::mainnet();
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
         let pubkey = state.validator(0).unwrap().pubkey;
 
         let request = electra::WithdrawalRequest {
@@ -2212,7 +2205,7 @@ mod tests {
     fn a_new_validators_deposit_is_queued_rather_than_credited_directly() {
         let mut state = electra_state_with_validators(1);
         let config = Config::mainnet();
-        let count_before = state.validators().len();
+        let count_before = state.validator_count();
 
         let pubkey = BlsPubkey([9; 48]);
         let signature = BlsSignature::default();
@@ -2235,7 +2228,7 @@ mod tests {
 
         // An invalid signature means the deposit is not credited to a new
         // validator at all: see `apply_deposit`'s own documentation.
-        assert_eq!(state.validators().len(), count_before);
+        assert_eq!(state.validator_count(), count_before);
         assert!(
             crate::beacon::helpers::electra::electra_state_ref(&state, "test assertion")
                 .unwrap()

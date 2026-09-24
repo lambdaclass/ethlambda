@@ -144,7 +144,7 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<Vec<capella::With
     // runtime.
     let (mut withdrawal_index, mut validator_index) = state.withdrawal_cursor()?;
 
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let bound = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
 
     let mut withdrawals = Vec::new();
@@ -245,7 +245,7 @@ pub fn process_withdrawals(
     // this function's own documentation for why the two branches below do not
     // agree on where "next" is once the registry is smaller than
     // MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP.
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
     {
         // A full payload: the next sweep resumes right after the last
@@ -539,7 +539,7 @@ mod tests {
             validator.withdrawal_credentials.0[0] = constants::ETH1_ADDRESS_WITHDRAWAL_PREFIX;
             validator.withdrawable_epoch = 0;
         }
-        state.balances_mut()[index as usize] = balance;
+        *state.balance_mut(index).unwrap() = balance;
     }
 
     fn empty_execution_payload() -> capella::ExecutionPayload {

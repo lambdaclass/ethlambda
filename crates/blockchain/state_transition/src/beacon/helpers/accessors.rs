@@ -83,8 +83,7 @@ pub fn get_randao_mix(state: &BeaconState, epoch: Epoch) -> Bytes32 {
 /// The validators active at `epoch`.
 pub fn get_active_validator_indices(state: &BeaconState, epoch: Epoch) -> Vec<ValidatorIndex> {
     state
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| is_active_validator(validator, epoch))
         .map(|(index, _)| index as ValidatorIndex)
@@ -172,7 +171,7 @@ pub fn get_committee_count_per_slot(state: &BeaconState, epoch: Epoch) -> u64 {
 /// # Why the active set is not memoized on `epoch` or `seed` alone
 ///
 /// [`get_active_validator_indices`] reads `activation_epoch` and `exit_epoch`
-/// off every validator in `state.validators()`, so it is a function of the
+/// off every validator in `state.iter_validators()`, so it is a function of the
 /// state's registry, not of `epoch` or `seed` alone. Two different states can
 /// share an epoch number, or even a seed (it comes from a RANDAO mix fixed
 /// before either state's fork point, so two sibling branches diverging

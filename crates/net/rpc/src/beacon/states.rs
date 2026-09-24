@@ -303,12 +303,11 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
             })
     };
     let entries: Vec<ValidatorEntry> = state
-        .validators()
-        .iter()
-        .zip(state.balances().iter())
+        .iter_validators()
+        .zip(state.iter_balances())
         .enumerate()
         .filter(|(index, (validator, _))| selected(*index as ValidatorIndex, validator))
-        .map(|(index, (validator, &balance))| {
+        .map(|(index, (validator, balance))| {
             let status = ValidatorStatus::of(validator, balance, epoch);
             (index as ValidatorIndex, balance, status, validator)
         })
@@ -463,7 +462,10 @@ mod tests {
         }
 
         fn pubkey_hex(state: &BeaconState, index: usize) -> String {
-            format!("0x{}", hex::encode(state.validators()[index].pubkey.0))
+            format!(
+                "0x{}",
+                hex::encode(state.validator(index as u64).unwrap().pubkey.0)
+            )
         }
 
         /// What `ethlambda validator` sends: its keys, to learn their indices.

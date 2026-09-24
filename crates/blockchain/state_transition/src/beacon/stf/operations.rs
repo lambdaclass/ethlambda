@@ -447,12 +447,10 @@ pub fn add_validator_to_registry(
         ForkName::Lean => lean_state_unreachable("add_validator_to_registry"),
     };
 
-    state.validators_mut().push(get_validator_from_deposit(
-        pubkey,
-        withdrawal_credentials,
+    state.push_validator(
+        get_validator_from_deposit(pubkey, withdrawal_credentials, amount),
         amount,
-    ))?;
-    state.balances_mut().push(amount)?;
+    )?;
 
     if grows_altair_lists {
         let (previous, current, scores) = state.altair_validator_lists_mut()?;
@@ -487,8 +485,7 @@ pub fn apply_deposit(
     config: &Config,
 ) -> Result<()> {
     let existing_index = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == pubkey);
 
     match existing_index {
