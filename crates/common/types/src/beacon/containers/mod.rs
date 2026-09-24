@@ -45,6 +45,7 @@ pub mod capella;
 pub mod deneb;
 pub mod electra;
 pub mod fulu;
+pub mod gloas;
 pub mod phase0;
 pub mod shared;
 
