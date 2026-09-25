@@ -2627,37 +2627,15 @@ validators:
     /// to each new fork's own empty body below, exactly as a genesis
     /// generator targeting that fork directly would have to.
     ///
-    /// Stops at fulu: `upgrade_state` has no `upgrade_to_gloas` yet (it
-    /// returns `Error::UnsupportedForFork` for `ForkName::Gloas` until a
-    /// later task adds one), so this loop cannot chain a gloas state the way
-    /// it does every earlier fork. `genesis_anchor_block`'s own gloas arm
-    /// therefore has no coverage here until that lands.
+    /// Chains all the way through gloas: `upgrade_state` handles every fork
+    /// from altair to gloas, so this loop exercises `genesis_anchor_block`'s
+    /// gloas arm the same way it does every earlier fork's.
     #[test]
     fn a_genesis_anchor_block_hashes_to_the_states_own_header_at_every_fork() {
         let config = Config::mainnet();
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
         for fork in ForkName::ALL {
-            if fork == ForkName::Gloas {
-                // Pinned so this test starts failing, loudly, the moment
-                // `upgrade_to_gloas` lands: that failure is the cue to
-                // delete this early break and extend the loop past it.
-                let err = ethlambda_state_transition::beacon::upgrade::upgrade_state(
-                    &state, fork, &config,
-                )
-                .expect_err("upgrade_to_gloas does not exist yet");
-                assert!(
-                    matches!(
-                        err,
-                        ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                            fork: ForkName::Gloas,
-                            ..
-                        }
-                    ),
-                    "expected UnsupportedForFork, got {err:?}"
-                );
-                break;
-            }
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,

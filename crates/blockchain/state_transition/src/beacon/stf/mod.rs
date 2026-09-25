@@ -68,6 +68,7 @@ use crate::beacon::containers::{BeaconState, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
 use crate::beacon::helpers::misc::compute_signing_root;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{HashTreeRoot as _, Slot};
 use crate::beacon::{bls, config::Config, constants};
@@ -280,6 +281,33 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
     let previous_block_root = state.latest_block_header().hash_tree_root();
     state.block_roots_mut()[position] = previous_block_root;
 
+    // [New in Gloas:EIP7732] Unset `slot + 1`'s payload availability bit:
+    // that next slot has not built (or revealed) a payload yet, so nothing
+    // has attested to one being available for it.
+    // `process_parent_execution_payload` sets the bit back once a payload
+    // for that slot is actually revealed by the following block.
+    match state {
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_)
+        | BeaconState::Electra(_)
+        | BeaconState::Fulu(_) => {}
+        BeaconState::Gloas(inner) => {
+            let next_slot = inner
+                .slot
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow("process_slot: slot + 1"))?;
+            let next_position = (next_slot % preset::SLOTS_PER_HISTORICAL_ROOT as u64) as usize;
+            inner
+                .execution_payload_availability
+                .set(next_position, false)
+                .expect("next_position is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+        }
+        BeaconState::Lean(_) => lean_state_unreachable("process_slot"),
+    }
+
     Ok(())
 }
 
@@ -317,7 +345,74 @@ pub(crate) fn phase0_state_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state;
+
+    #[test]
+    fn process_slot_unsets_next_slots_payload_availability_on_gloas() {
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let next_position = (position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let other_position = (next_position + 1) % preset::SLOTS_PER_HISTORICAL_ROOT;
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("with_validators_at(Gloas) returns a gloas state");
+        };
+        // Every bit starts `false` (`Default::default()`); set both so the
+        // test can tell "process_slot cleared it" from "it was already
+        // clear".
+        inner
+            .execution_payload_availability
+            .set(next_position, true)
+            .unwrap();
+        inner
+            .execution_payload_availability
+            .set(other_position, true)
+            .unwrap();
+
+        // Taken from a clone before `process_slot` runs, so it still carries
+        // `next_position`'s bit `true`. `state_roots[position]` must cache
+        // exactly this root: if the implementation cleared the bit before
+        // caching that root instead of after, the cached root would reflect
+        // the bit already `false`, and the comparison below would catch it.
+        let expected_root = state.clone().hash_tree_root();
+
+        process_slot(&mut state).unwrap();
+
+        assert_eq!(state.state_roots()[position], expected_root);
+
+        let BeaconState::Gloas(inner) = &state else {
+            panic!("process_slot does not change the state's fork");
+        };
+        assert_eq!(
+            inner.execution_payload_availability.get(next_position),
+            Some(false)
+        );
+        // Only `slot + 1`'s bit is touched; every other bit is left alone.
+        assert_eq!(
+            inner.execution_payload_availability.get(other_position),
+            Some(true)
+        );
+    }
+
+    /// `next_position` wraps from `SLOTS_PER_HISTORICAL_ROOT - 1` back to
+    /// `0`, the same ring-buffer indexing `state_roots`/`block_roots` already
+    /// rely on.
+    #[test]
+    fn process_slot_wraps_the_payload_availability_index_at_the_end_of_the_window() {
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot - 1;
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("with_validators_at(Gloas) returns a gloas state");
+        };
+        inner.execution_payload_availability.set(0, true).unwrap();
+
+        process_slot(&mut state).unwrap();
+
+        let BeaconState::Gloas(inner) = &state else {
+            panic!("process_slot does not change the state's fork");
+        };
+        assert_eq!(inner.execution_payload_availability.get(0), Some(false));
+    }
 
     #[test]
     fn process_slot_leaves_no_buffered_registry_writes() {

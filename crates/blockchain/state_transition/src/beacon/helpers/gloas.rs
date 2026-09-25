@@ -95,7 +95,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, Epoch, Gwei, HashTreeRoot as _, Slot, ValidatorIndex,
+    BlsPubkey, Bytes32, Epoch, ExecutionAddress, Gwei, HashTreeRoot as _, Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -833,18 +833,73 @@ pub fn settle_builder_payment(state: &mut gloas::BeaconState, payment_index: u64
 }
 
 // ---------------------------------------------------------------------------
+// Builder registry (EIP-8282)
+// ---------------------------------------------------------------------------
+
+/// `get_index_for_new_builder` (gloas `beacon-chain.md`).
+///
+/// The registry slot a new builder record can reuse: an already-exited,
+/// fully swept builder (`withdrawable_epoch` past, balance zero), or, absent
+/// one, the registry's own length, so [`add_builder_to_registry`]'s
+/// `set_or_append_list` appends a fresh entry instead of overwriting one.
+/// Builder indices are reusable this way, unlike the validator registry,
+/// which never removes an entry.
+pub fn get_index_for_new_builder(state: &gloas::BeaconState) -> gloas::BuilderIndex {
+    let current_epoch = compute_epoch_at_slot(state.slot);
+    for (index, builder) in state.builders.iter().enumerate() {
+        if builder.withdrawable_epoch <= current_epoch && builder.balance == 0 {
+            return index as gloas::BuilderIndex;
+        }
+    }
+    state.builders.len() as gloas::BuilderIndex
+}
+
+/// `add_builder_to_registry` (gloas `beacon-chain.md`).
+///
+/// Registers a new builder record at [`get_index_for_new_builder`]'s slot
+/// (the specification's `set_or_append_list`: an append when that slot is
+/// the registry's own length, an overwrite of a reused, exited slot
+/// otherwise), and returns the index the record now lives at, so a caller
+/// keeping its own index of the registry (`onboard_builders_from_pending_deposits`'s
+/// pubkey-to-index map, `crate::beacon::upgrade`) can update it without a
+/// second lookup. Called from that one-time fork-boundary onboarding pass
+/// and from builder deposit requests (EIP-8282's ongoing onboarding path).
+pub fn add_builder_to_registry(
+    state: &mut gloas::BeaconState,
+    pubkey: BlsPubkey,
+    version: u8,
+    execution_address: ExecutionAddress,
+    amount: Gwei,
+    slot: Slot,
+) -> gloas::BuilderIndex {
+    let index = get_index_for_new_builder(state);
+    let builder = gloas::Builder {
+        pubkey,
+        version,
+        execution_address,
+        balance: amount,
+        deposit_epoch: compute_epoch_at_slot(slot),
+        withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+    };
+    if index == state.builders.len() as gloas::BuilderIndex {
+        state.builders.push(builder);
+    } else {
+        state.builders[index as usize] = builder;
+    }
+    index
+}
+
+// ---------------------------------------------------------------------------
 // Fork projection
 // ---------------------------------------------------------------------------
 
 /// The gloas state, mutably, or an error naming the function that needs one.
 ///
-/// Kept alongside [`gloas_state_ref`] for whichever later task first needs to
-/// mutate a gloas-only field (`builders`, the payload/PTC bookkeeping)
-/// through a generic [`BeaconState`] rather than one already known to be
-/// [`BeaconState::Gloas`] the way [`initiate_builder_exit`] and
-/// [`settle_builder_payment`] are always called with; nothing in this file
-/// calls it yet.
-#[allow(dead_code)]
+/// Kept alongside [`gloas_state_ref`] for a function that mixes a gloas-only
+/// field with others reached through fork-invariant accessors, the way
+/// [`gloas_state_ref`]'s own doc describes; `crate::beacon::upgrade::upgrade_to_gloas`
+/// is the first caller, reaching `ptc_window` and `pending_deposits` through
+/// this projection after building `post` as the full [`BeaconState`] enum.
 pub(crate) fn gloas_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
@@ -1039,5 +1094,129 @@ mod tests {
                 .try_into()
                 .expect("built at exactly PTC_SIZE");
         }
+    }
+
+    /// An arbitrary builder record, active (not exited) at `state`'s current
+    /// epoch: `get_index_for_new_builder`'s never-reusable case.
+    fn active_builder() -> gloas::Builder {
+        gloas::Builder {
+            withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+            balance: 1,
+            ..Default::default()
+        }
+    }
+
+    /// A builder exited and fully swept as of `current_epoch`: the one
+    /// condition `get_index_for_new_builder` reuses a slot for.
+    fn exited_swept_builder(current_epoch: Epoch) -> gloas::Builder {
+        gloas::Builder {
+            withdrawable_epoch: current_epoch,
+            balance: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn get_index_for_new_builder_appends_past_an_empty_registry() {
+        let BeaconState::Gloas(state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        assert_eq!(get_index_for_new_builder(&state), 0);
+    }
+
+    #[test]
+    fn get_index_for_new_builder_appends_when_every_builder_is_still_active() {
+        let BeaconState::Gloas(mut state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        state.builders.push(active_builder());
+        state.builders.push(active_builder());
+        assert_eq!(get_index_for_new_builder(&state), 2);
+    }
+
+    #[test]
+    fn get_index_for_new_builder_reuses_an_exited_swept_slot() {
+        let BeaconState::Gloas(mut state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        let current_epoch = compute_epoch_at_slot(state.slot);
+        state.builders.push(active_builder());
+        // The one reusable slot: exited (`withdrawable_epoch` already past)
+        // and fully swept (balance zero).
+        state.builders.push(exited_swept_builder(current_epoch));
+        state.builders.push(active_builder());
+        assert_eq!(get_index_for_new_builder(&state), 1);
+    }
+
+    #[test]
+    fn get_index_for_new_builder_does_not_reuse_an_exited_but_unswept_slot() {
+        let BeaconState::Gloas(mut state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        let current_epoch = compute_epoch_at_slot(state.slot);
+        // Withdrawable, but balance still nonzero: not yet swept, so not
+        // reusable, even though the epoch condition alone holds.
+        state.builders.push(gloas::Builder {
+            withdrawable_epoch: current_epoch,
+            balance: 1,
+            ..Default::default()
+        });
+        assert_eq!(get_index_for_new_builder(&state), 1);
+    }
+
+    #[test]
+    fn add_builder_to_registry_appends_and_returns_the_new_index() {
+        let BeaconState::Gloas(mut state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        let pubkey = BlsPubkey([9; crate::beacon::primitives::BLS_PUBKEY_SIZE]);
+        let len_before = state.builders.len();
+        let slot = state.slot;
+
+        let index = add_builder_to_registry(
+            &mut state,
+            pubkey,
+            constants::PAYLOAD_BUILDER_VERSION,
+            ExecutionAddress::ZERO,
+            preset::MIN_DEPOSIT_AMOUNT,
+            slot,
+        );
+
+        assert_eq!(index, len_before as gloas::BuilderIndex);
+        assert_eq!(state.builders.len(), len_before + 1);
+        assert_eq!(state.builders[index as usize].pubkey, pubkey);
+    }
+
+    #[test]
+    fn add_builder_to_registry_overwrites_a_reused_slot_without_growing_the_registry() {
+        let BeaconState::Gloas(mut state) = gloas_state_with_validators(4) else {
+            panic!("gloas_state_with_validators returns a gloas state");
+        };
+        let current_epoch = compute_epoch_at_slot(state.slot);
+        state.builders.push(exited_swept_builder(current_epoch));
+        let len_before = state.builders.len();
+        let pubkey = BlsPubkey([3; crate::beacon::primitives::BLS_PUBKEY_SIZE]);
+        let slot = state.slot;
+
+        let index = add_builder_to_registry(
+            &mut state,
+            pubkey,
+            constants::PAYLOAD_BUILDER_VERSION,
+            ExecutionAddress::ZERO,
+            preset::MIN_DEPOSIT_AMOUNT,
+            slot,
+        );
+
+        assert_eq!(index, 0);
+        assert_eq!(
+            state.builders.len(),
+            len_before,
+            "reuse must not grow the registry"
+        );
+        assert_eq!(state.builders[0].pubkey, pubkey);
+        assert_eq!(
+            state.builders[0].withdrawable_epoch,
+            constants::FAR_FUTURE_EPOCH
+        );
     }
 }
