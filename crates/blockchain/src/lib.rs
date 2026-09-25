@@ -2152,16 +2152,18 @@ impl BlockChainServer {
 
     /// Re-run beacon fork choice and republish the head gauge.
     ///
-    /// `fork_choice::on_block` does not compute a head, and `Store::beacon_head`
-    /// only reads back whatever the last [`fork_choice::get_head`] recorded, so
-    /// without this an import moves no head at all: it just adds a block and a
-    /// post-state. Until the block path called this too, [`Self::on_tick`] was
-    /// the only caller, and it is one message per slot in the same mailbox as
-    /// every arriving block. A follower catching up imports back-to-back and
-    /// never drains that mailbox, so the tick did not run, the head stayed
-    /// pinned at the checkpoint-sync anchor, and `lean_head_slot` sat flat for
-    /// the entire catch-up even while imports were landing every few seconds.
-    /// That is what "the head is not advancing" looked like on the dashboard.
+    /// `fork_choice::on_block` may compute a head of its own now (to gate its
+    /// proposer-boost logic), but never records it: `Store::beacon_head` only
+    /// reads back whatever the last [`fork_choice::get_head`] recorded, so
+    /// without this an import moves no *visible* head at all: it just adds a
+    /// block and a post-state. Until the block path called this too,
+    /// [`Self::on_tick`] was the only caller, and it is one message per slot in
+    /// the same mailbox as every arriving block. A follower catching up
+    /// imports back-to-back and never drains that mailbox, so the tick did not
+    /// run, the head stayed pinned at the checkpoint-sync anchor, and
+    /// `lean_head_slot` sat flat for the entire catch-up even while imports
+    /// were landing every few seconds. That is what "the head is not
+    /// advancing" looked like on the dashboard.
     ///
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
@@ -2576,15 +2578,23 @@ impl BlockChainServer {
         }
 
         // Beacon: a block whose post-state is already here needs no work.
-        // `fork_choice::on_block` does not short-circuit on a known root: it
-        // goes straight from cloning the parent state to `state_transition`,
-        // so a re-delivery pays the entire import a second time. On mainnet
-        // 2026-09-08 that was 37 of 116 imports, a third of the actor's import
-        // budget, spent recomputing post-states the store already held.
-        // Children are still collected: this root did import, so anything
-        // pending on it is ready whether or not this delivery is the one that
-        // imported it. Beacon-only, because lean's `store::on_block` has its
-        // own already-imported early return.
+        // `fork_choice::on_block` also returns early on a root that already
+        // has a post-state now (`Store::has_state`, the specification's own
+        // `store.blocks` guard, mapped onto what that membership means here;
+        // see that call site's own doc for why `has_block` alone is the
+        // wrong check), so calling it again costs little more than that one
+        // lookup. This check still
+        // matters because `on_block` answers a bare `Ok(())` either way, with
+        // no signal that nothing happened, while this call site needs to
+        // collect the root's pending children and answer
+        // `ImportOutcome::Imported` regardless of which delivery actually did
+        // the importing. Before `on_block` had its own guard, that
+        // distinction was also a real cost: on mainnet 2026-09-08, a
+        // re-delivery recomputing the whole post-state was 37 of 116 imports,
+        // a third of the actor's import budget. Children are still collected:
+        // this root did import, so anything pending on it is ready whether or
+        // not this delivery is the one that imported it. Beacon-only, because
+        // lean's `store::on_block` has its own already-imported early return.
         if self.store.chain() == Chain::Beacon
             && self
                 .store

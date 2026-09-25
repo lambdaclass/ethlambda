@@ -6,11 +6,9 @@
 //! `steps.yaml` in order. A step is one of `tick`, `block`, `attestation`,
 //! `attester_slashing`, or `on_merge_block` (bellatrix's own `pow_block`
 //! step), driving the correspondingly named handler, or `checks`, which
-//! asserts on the store's own fields and on [`fork_choice::get_head`],
-//! [`fork_choice::get_proposer_head`], and
-//! [`fork_choice::should_override_forkchoice_update`]. See
-//! `tests/formats/fork_choice/README.md` in the pinned specification checkout
-//! for the format in full.
+//! asserts on the store's own fields and on [`fork_choice::get_head`] and
+//! [`fork_choice::get_proposer_head`]. See `tests/formats/fork_choice/README.md`
+//! in the pinned specification checkout for the format in full.
 //!
 //! No released fixture targets phase0 directly: the earliest suite is
 //! altair's, built from altair-shaped states because the generator needs a
@@ -63,8 +61,12 @@
 //! `viable_for_head_roots_and_weights` is part of the format, but no case at
 //! any implemented fork's `checks` step names it, on either preset, so it is
 //! not modeled here rather than guessed at. `should_override_forkchoice_update`
-//! *is* exercised, once per fork from bellatrix on, and [`apply_checks`]
-//! checks it.
+//! is in the format's README too, but no `fork-choice.md` at `v1.7.0-beta.2`
+//! defines it any more (not even `fast-confirmation.md`, which absorbed most
+//! of what bellatrix's `fork-choice.md` dropped): it is gone from the
+//! specification outright, not merely relocated, so this crate drops it with
+//! it rather than keeping an implementation of a function the pinned release
+//! no longer has.
 //!
 //! # `columns: []` means "simulate unavailable", not "vacuously available"
 //!
@@ -173,7 +175,7 @@ fn default_valid() -> bool {
 
 /// A `checks` step's assertions against the store.
 ///
-/// See the module documentation for the one field of the format this leaves
+/// See the module documentation for the two fields of the format this leaves
 /// out, and why.
 #[derive(serde::Deserialize)]
 pub(super) struct Checks {
@@ -184,9 +186,6 @@ pub(super) struct Checks {
     finalized_checkpoint: Option<CheckpointCheck>,
     proposer_boost_root: Option<String>,
     get_proposer_head: Option<String>,
-    /// `[New in Bellatrix]` see
-    /// [`fork_choice::should_override_forkchoice_update`].
-    should_override_forkchoice_update: Option<ShouldOverrideForkchoiceUpdateCheck>,
 }
 
 /// The expected value of [`fork_choice::get_head`], as `checks.head` gives it:
@@ -203,16 +202,6 @@ struct HeadCheck {
 struct CheckpointCheck {
     epoch: u64,
     root: String,
-}
-
-/// The expected value of
-/// [`fork_choice::should_override_forkchoice_update`]: the fixed
-/// `validator_is_connected` answer to call it with, and the result it must
-/// then return.
-#[derive(serde::Deserialize)]
-struct ShouldOverrideForkchoiceUpdateCheck {
-    validator_is_connected: bool,
-    result: bool,
 }
 
 /// Parses a fixture's `0x`-prefixed hex root.
@@ -633,41 +622,13 @@ fn check_get_proposer_head(
     expected_hex: &str,
     store: &mut Store,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
     let slot = fork_choice::get_current_slot(store, config);
-    let actual = fork_choice::get_proposer_head(store, head, slot, config)
+    let actual = fork_choice::get_proposer_head(store, head, slot, config, committees)
         .map_err(|err| format!("get_proposer_head: {err:?}"))?;
     check_root("get_proposer_head", expected_hex, actual)
-}
-
-/// Checks `should_override_forkchoice_update`, the same way
-/// [`check_get_proposer_head`] checks `get_proposer_head`: from the current
-/// head, not a root the fixture supplies separately. `validator_is_connected`
-/// is a fixed answer regardless of which proposer index is asked, matching
-/// what the fixture format itself supplies: one bool for the whole call, not
-/// a per-validator registry.
-fn check_should_override_forkchoice_update(
-    expected: &ShouldOverrideForkchoiceUpdateCheck,
-    store: &mut Store,
-    config: &Config,
-) -> Result<(), String> {
-    let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
-    let actual = fork_choice::should_override_forkchoice_update(
-        store,
-        head,
-        |_| expected.validator_is_connected,
-        config,
-    )
-    .map_err(|err| format!("should_override_forkchoice_update: {err:?}"))?;
-    if actual == expected.result {
-        Ok(())
-    } else {
-        Err(format!(
-            "should_override_forkchoice_update: expected {}, got {actual}",
-            expected.result
-        ))
-    }
 }
 
 /// Applies one `checks` step: every field the fixture sets must match.
@@ -675,6 +636,7 @@ pub(super) fn apply_checks(
     store: &mut Store,
     checks: &Checks,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     if let Some(expected) = checks.time {
         // The fixture's `time` is the specification's seconds; the store keeps
@@ -706,10 +668,7 @@ pub(super) fn apply_checks(
         check_head(expected, store, config)?;
     }
     if let Some(expected) = &checks.get_proposer_head {
-        check_get_proposer_head(expected, store, config)?;
-    }
-    if let Some(expected) = &checks.should_override_forkchoice_update {
-        check_should_override_forkchoice_update(expected, store, config)?;
+        check_get_proposer_head(expected, store, config, committees)?;
     }
     Ok(())
 }
@@ -747,7 +706,7 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
-            Some(checks) => apply_checks(&mut store, checks, config),
+            Some(checks) => apply_checks(&mut store, checks, config, &committees),
             None => apply_execution_step(&mut store, case, step, config, &committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;

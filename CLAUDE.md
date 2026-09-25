@@ -676,7 +676,8 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   without; both figures cover lean's own unit tests as well, since the two
   chains now share one lib target. Fork choice is fixture-verified too: 150 mainnet
   `fork_choice` cases pass, covering bellatrix's `on_merge_block`/terminal-PoW
-  validation, `should_override_forkchoice_update`, deneb's blob data
+  validation, the `v1.7.0` proposer-boost dependent-root gate and
+  `get_proposer_head`'s proposer-equivocation branch, deneb's blob data
   availability, and fulu's column data availability.
 - Nothing is ignored for being unimplemented. Ignored cases are the
   `LightClient*` containers (a different layer, out of scope) and the `gloas`
