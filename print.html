@@ -35,10 +35,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ea462a73.js";
+            window.path_to_searchindex_js = "searchindex-fa33901c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a5d5bf8e.js"></script>
+        <script src="toc-7b7e66e6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -3150,6 +3150,105 @@ is negotiable. Readers tolerate a foreign length by treating bits past the end
 as unset, and a peer’s advertised subnets are clamped to the local committee
 count before they influence anything.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="validator-key-generation"><a class="header" href="#validator-key-generation">Validator Key Generation</a></h1>
+<p><code>ethlambda keygen</code> writes the validator XMSS key set and manifest that
+<code>--hash-sig-keys-dir</code> reads, in the layout <code>hash-sig-cli generate</code> produces.</p>
+<pre><code class="language-bash"># One validator's attester and proposer pair
+ethlambda keygen --output-dir keys
+
+# A genesis for a three-node devnet
+ethlambda keygen --num-validators 3 --output-dir local-devnet/genesis/hash-sig-keys
+</code></pre>
+<p><code>--output-dir</code> is the only required flag.</p>
+<h2 id="why-the-client-generates-its-own-keys"><a class="header" href="#why-the-client-generates-its-own-keys">Why the client generates its own keys</a></h2>
+<p>An XMSS key file is only usable by a client built against the same signature
+scheme, and the scheme lives in leanVM, which ethlambda pins to one revision.</p>
+<p>The trap is that nothing in the file layout changes when the scheme does.
+leanVM’s move from Poseidon over KoalaBear to BLAKE2s over binary fields kept
+the public key at 32 SSZ bytes and the secret key in postcard, so a key set from
+the wrong revision satisfies every check a genesis generator makes: the file
+names match, the sizes match, and the manifest parses. It fails only later, when
+a signature is verified, and then it looks like a consensus bug rather than a
+provisioning one.</p>
+<p>Generating here removes the second pin. These keys come from the same
+<code>ethlambda-crypto</code> types the node loads them with, so the generator and the
+loader cannot disagree about the format.</p>
+<h2 id="flags"><a class="header" href="#flags">Flags</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--num-validators &lt;N&gt;</code></td><td><code>1</code></td><td>Validators to generate a key pair for</td></tr>
+<tr><td><code>--log-num-active-epochs &lt;N&gt;</code></td><td><code>18</code></td><td>Log2 of the slots each key can sign at, from slot 0</td></tr>
+<tr><td><code>--output-dir &lt;DIR&gt;</code></td><td>required</td><td>Where to write; created if absent</td></tr>
+<tr><td><code>--create-manifest &lt;bool&gt;</code></td><td><code>true</code></td><td>Write <code>validator-keys-manifest.yaml</code></td></tr>
+<tr><td><code>--distributed</code></td><td>off</td><td>Name validators by public key rather than by index</td></tr>
+<tr><td><code>--force</code></td><td>off</td><td>Replace key files already in <code>--output-dir</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Each validator gets <strong>two</strong> independent keys, an attester and a proposer, so it
+can sign an attestation and a block in the same slot without spending one slot’s
+one-time leaf twice.</p>
+<p><code>--log-num-active-epochs</code> is the network’s lifetime, not a tuning knob: a key
+cannot sign past its range, and the range is fixed at generation. At the default
+cadence 2^18 slots is about 12 days, after which every validator holding such a
+key stops signing.</p>
+<p><code>--force</code> is off by default because a key is one-time-use material. Replacing a
+set that validators are still signing with makes each of them sign twice at the
+same slot, under a key someone else now holds.</p>
+<h2 id="output"><a class="header" href="#output">Output</a></h2>
+<pre><code>hash-sig-keys/
+├── validator_0_attester_key_pk.ssz   32 bytes, SSZ
+├── validator_0_attester_key_sk.ssz   postcard
+├── validator_0_proposer_key_pk.ssz
+├── validator_0_proposer_key_sk.ssz
+├── validator_1_...
+└── validator-keys-manifest.yaml
+</code></pre>
+<p>The <code>.ssz</code> extension on a secret key is a misnomer kept for the tooling’s sake:
+SSZ has no encoding for one, so it is postcard.</p>
+<p><code>hash-sig-cli</code> had an <code>--export-format both</code> that additionally dumped each key as
+serde JSON. Its own help called that legacy and nothing reads it, so this writes
+only the form above and takes no format flag. A caller carrying
+<code>--export-format ssz</code> from the old invocation has to drop it.</p>
+<h2 id="the-manifest"><a class="header" href="#the-manifest">The manifest</a></h2>
+<pre><code class="language-yaml">key_scheme: XmssTargetSumLifetime32Dim42Base8
+hash_function: BLAKE2s
+encoding: TargetSum
+pubkey_bytes: 32
+lifetime: 4294967296
+leanvm_rev: 48a904208d682848dac0e18ef8b01ebfc40df9ad
+log_num_active_epochs: 18
+num_active_epochs: 262144
+num_validators: 3
+
+validators:
+  - index: 0
+    proposer_key_pubkey_hex: 0x...
+    proposer_key_privkey_file: validator_0_proposer_key_sk.ssz
+    attester_key_pubkey_hex: 0x...
+    attester_key_privkey_file: validator_0_attester_key_sk.ssz
+</code></pre>
+<p><code>leanvm_rev</code> is ethlambda’s addition, and it is the field to trust. Read against
+the scheme parameters alone, two key sets from either side of the BLAKE2s rewrite
+are indistinguishable: <code>key_scheme</code> is built from the lifetime, <code>V</code> and
+<code>CHAIN_LENGTH</code>, and all three came through that change unaltered. <code>hash_function</code>
+does separate them but is a hardcoded label, since leanVM’s facade exports no
+name for its hash. The revision is resolved from <code>Cargo.lock</code> at build time and
+cannot drift from what the binary actually links.</p>
+<p><code>generate-genesis.sh</code> reads <code>key_scheme</code> and cross-checks <code>pubkey_bytes</code> against
+the pubkeys the manifest holds; the rest is informational.</p>
+<h2 id="cost"><a class="header" href="#cost">Cost</a></h2>
+<p>Key generation is <code>O(sqrt(range))</code> in memory and fans out over the bottom Merkle
+subtrees, so a large range is cheaper than it looks: about 3 seconds per
+validator at 2^18 epochs on an M4 Max, generated serially. A 1024-validator
+genesis is therefore tens of minutes, and worth doing once and keeping.</p>
+<p>Building on aarch64 without the crypto extensions makes this, and every other
+leanVM operation, far slower. See the aarch64 entry in <code>.cargo/config.toml</code>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="benchmarking-block-building"><a class="header" href="#benchmarking-block-building">Benchmarking block building</a></h1>
 <p><code>ethlambda benchmark</code> measures block building the way the node performs it when
 it proposes, against a reproducible synthetic workload, with no devnet running.</p>
@@ -3186,7 +3285,7 @@ second, which is why CI can afford to run one on every pull request.</p>
 <tr><td><code>--iterations</code></td><td><code>10</code></td><td>Measured builds, one block each</td></tr>
 <tr><td><code>--proofs-per-data</code></td><td><code>1</code></td><td>Aggregates seeded per <code>AttestationData</code>, mimicking committee aggregators over disjoint validator subsets</td></tr>
 <tr><td><code>--seed</code></td><td><code>42</code></td><td>Seed for the validator set and its XMSS keys; fixes the whole run</td></tr>
-<tr><td><code>--key-cache &lt;dir&gt;</code></td><td>—</td><td>Cache the seed-derived XMSS keys on disk (keyed by leansig revision, seed, validator index and run length). Real crypto only</td></tr>
+<tr><td><code>--key-cache &lt;dir&gt;</code></td><td>—</td><td>Cache the seed-derived XMSS keys on disk (keyed by leanVM revision, seed, validator index and run length). Real crypto only</td></tr>
 <tr><td><code>--mock-crypto</code></td><td>off</td><td>Placeholder proofs instead of real XMSS/leanVM signatures, and no seal. Measures selection, compaction and the state transition only</td></tr>
 <tr><td><code>--enable-proposer-aggregation</code></td><td>off</td><td>Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation</td></tr>
 <tr><td><code>--max-attestations-per-block</code></td><td><code>3</code></td><td>Mirrors the node flag: distinct <code>AttestationData</code> per block</td></tr>
@@ -3249,7 +3348,7 @@ otherwise, because a mis-attributed report is worse than no report.</p>
 <pre><code>Block-building benchmark — synthetic workload (real crypto)
   validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=48a90420 os=macos arch=aarch64 threads=14
 
   iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
   1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33
@@ -3266,7 +3365,7 @@ otherwise, because a mis-attributed report is worse than no report.</p>
   import                 2   19.205ms   19.838ms   20.472ms   20.472ms   20.472ms
 </code></pre>
 <p>Every measured iteration gets its own row, and the summary follows below it.
-Outliers are never discarded: XMSS signing and OTS window advancement produce
+Outliers are never discarded: XMSS signing and its Merkle-subtree cache misses produce
 legitimate heavy tails, and hiding them would misrepresent the thing being
 measured. A coefficient of variation above 10% is flagged so a noisy run is not
 mistaken for a result.</p>
@@ -3283,12 +3382,11 @@ comparison means something different than intended.</p>
 and a candidate can be diffed directly. The header line exists to tell you when
 they <em>cannot</em> be compared:</p>
 <ul>
-<li><code>leansig</code> and <code>leanvm</code> are the resolved revisions the binary was built
-against, read from <code>Cargo.lock</code> at build time. leanSig tracks a moving branch
-and leanVM performs the signature aggregation, so either one moving changes
-the measured crypto. Real-mode roots also depend on the seed-derived keys, so
-the same seed on the same leansig revision reproduces the same signatures and
-the same roots.</li>
+<li><code>leanvm</code> is the resolved revision the binary was built against, read from
+<code>Cargo.lock</code> at build time. leanVM owns the whole signature stack (XMSS and
+aggregation), so a rev bump changes the measured crypto. Real-mode roots also
+depend on the seed-derived keys, so the same seed on the same leanVM revision
+reproduces the same signatures and the same roots.</li>
 <li><code>os</code>, <code>arch</code> and <code>threads</code> change results across machines.</li>
 </ul>
 <p>Two reports that disagree on any of those are not measuring the same thing.</p>

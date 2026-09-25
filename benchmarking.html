@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-ea462a73.js";
+            window.path_to_searchindex_js = "searchindex-fa33901c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a5d5bf8e.js"></script>
+        <script src="toc-7b7e66e6.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -215,7 +215,7 @@ second, which is why CI can afford to run one on every pull request.</p>
 <tr><td><code>--iterations</code></td><td><code>10</code></td><td>Measured builds, one block each</td></tr>
 <tr><td><code>--proofs-per-data</code></td><td><code>1</code></td><td>Aggregates seeded per <code>AttestationData</code>, mimicking committee aggregators over disjoint validator subsets</td></tr>
 <tr><td><code>--seed</code></td><td><code>42</code></td><td>Seed for the validator set and its XMSS keys; fixes the whole run</td></tr>
-<tr><td><code>--key-cache &lt;dir&gt;</code></td><td>—</td><td>Cache the seed-derived XMSS keys on disk (keyed by leansig revision, seed, validator index and run length). Real crypto only</td></tr>
+<tr><td><code>--key-cache &lt;dir&gt;</code></td><td>—</td><td>Cache the seed-derived XMSS keys on disk (keyed by leanVM revision, seed, validator index and run length). Real crypto only</td></tr>
 <tr><td><code>--mock-crypto</code></td><td>off</td><td>Placeholder proofs instead of real XMSS/leanVM signatures, and no seal. Measures selection, compaction and the state transition only</td></tr>
 <tr><td><code>--enable-proposer-aggregation</code></td><td>off</td><td>Mirrors the node flag: collapse same-data proofs via recursive leanVM aggregation</td></tr>
 <tr><td><code>--max-attestations-per-block</code></td><td><code>3</code></td><td>Mirrors the node flag: distinct <code>AttestationData</code> per block</td></tr>
@@ -278,7 +278,7 @@ otherwise, because a mis-attributed report is worse than no report.</p>
 <pre><code>Block-building benchmark — synthetic workload (real crypto)
   validators=2 warmup_slots=1 iterations=2 proofs_per_data=1 seed=42
   enable_proposer_aggregation=false max_attestations_per_block=3
-  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leansig=15cbdd43 leanvm=e2592df4 os=macos arch=aarch64 threads=14
+  ethlambda/v0.1.0/aarch64-apple-darwin/rustc-v1.97.1 leanvm=48a90420 os=macos arch=aarch64 threads=14
 
   iter           compact      merge_type2  select_payloads    sign_proposer     stf_simulate    wrap_proposer   overhead       wall  aggregate     import         root
   1              0.001ms        550.641ms          0.007ms          0.461ms          0.011ms         65.127ms    0.103ms  616.350ms  103.548ms   19.205ms   0x77465b33
@@ -295,7 +295,7 @@ otherwise, because a mis-attributed report is worse than no report.</p>
   import                 2   19.205ms   19.838ms   20.472ms   20.472ms   20.472ms
 </code></pre>
 <p>Every measured iteration gets its own row, and the summary follows below it.
-Outliers are never discarded: XMSS signing and OTS window advancement produce
+Outliers are never discarded: XMSS signing and its Merkle-subtree cache misses produce
 legitimate heavy tails, and hiding them would misrepresent the thing being
 measured. A coefficient of variation above 10% is flagged so a noisy run is not
 mistaken for a result.</p>
@@ -312,12 +312,11 @@ comparison means something different than intended.</p>
 and a candidate can be diffed directly. The header line exists to tell you when
 they <em>cannot</em> be compared:</p>
 <ul>
-<li><code>leansig</code> and <code>leanvm</code> are the resolved revisions the binary was built
-against, read from <code>Cargo.lock</code> at build time. leanSig tracks a moving branch
-and leanVM performs the signature aggregation, so either one moving changes
-the measured crypto. Real-mode roots also depend on the seed-derived keys, so
-the same seed on the same leansig revision reproduces the same signatures and
-the same roots.</li>
+<li><code>leanvm</code> is the resolved revision the binary was built against, read from
+<code>Cargo.lock</code> at build time. leanVM owns the whole signature stack (XMSS and
+aggregation), so a rev bump changes the measured crypto. Real-mode roots also
+depend on the seed-derived keys, so the same seed on the same leanVM revision
+reproduces the same signatures and the same roots.</li>
 <li><code>os</code>, <code>arch</code> and <code>threads</code> change results across machines.</li>
 </ul>
 <p>Two reports that disagree on any of those are not measuring the same thing.</p>
@@ -340,7 +339,7 @@ change to the report contract cannot land unnoticed.</p>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="discovery.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="keygen.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -354,7 +353,7 @@ change to the report contract cannot land unnoticed.</p>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="discovery.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="keygen.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
