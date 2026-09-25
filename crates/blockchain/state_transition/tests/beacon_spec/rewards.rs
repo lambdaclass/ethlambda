@@ -129,13 +129,20 @@ fn components(
         // No `inclusion_delay_deltas` here: see this module's doc for why
         // altair has nothing left for that component to compute. Bellatrix
         // through fulu reuse this same list; see this module's doc for why
-        // none of them changes it.
+        // none of them changes it. Gloas reuses it too:
+        // `BeaconState::altair_validator_lists` now reaches a gloas state's
+        // participation and inactivity lists as plain slices (progressive
+        // rather than `SszList`, EIP-7688, but both `Deref` to `[T]`), which
+        // is all `altair_helpers::get_flag_index_deltas`/
+        // `get_inactivity_penalty_deltas` ever need; see that accessor's own
+        // doc.
         ForkName::Altair
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra
-        | ForkName::Fulu => vec![
+        | ForkName::Fulu
+        | ForkName::Gloas => vec![
             (
                 "source_deltas",
                 altair_helpers::get_flag_index_deltas(state, TIMELY_SOURCE_FLAG_INDEX),
@@ -153,12 +160,6 @@ fn components(
                 altair_helpers::get_inactivity_penalty_deltas(state, config),
             ),
         ],
-        // Gloas's `previous_epoch_participation`/`current_epoch_participation`
-        // are progressive lists (EIP-7688), a different Rust type from the
-        // `SszList` `altair_helpers::get_flag_index_deltas` reads, so this is
-        // not altair's list unchanged even though the reward rule itself is;
-        // a later task writes gloas's own copy over the progressive type.
-        ForkName::Gloas => return Err("gloas not implemented".into()),
         ForkName::Lean => lean_is_not_a_fixture_fork("rewards"),
     };
 

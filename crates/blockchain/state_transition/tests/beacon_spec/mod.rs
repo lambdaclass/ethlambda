@@ -93,10 +93,9 @@ pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Fulu;
 /// runner's Gloas cases stay ignored. Emptied, and removed along with this
 /// check, when [`HIGHEST_IMPLEMENTED_FORK`] becomes `Gloas`.
 ///
-/// `"fork"` (not `"transition"`): `upgrade_to_gloas` is done, so the `fork`
-/// suite's own upgrade-only cases pass, but `transition`'s Gloas cases also
-/// exercise Gloas block processing, which does not exist yet.
-pub const GLOAS_RUNNERS: &[&str] = &["ssz_static", "fork"];
+/// `"transition"` is not listed: its Gloas cases also exercise Gloas block
+/// processing, which does not exist yet.
+pub const GLOAS_RUNNERS: &[&str] = &["ssz_static", "fork", "epoch_processing", "rewards"];
 
 /// The root of the extracted fixture tree.
 ///

@@ -81,18 +81,18 @@ fn apply(
         // its own step.
         "rewards_and_penalties" => match fork {
             ForkName::Phase0 => epoch::rewards::process_rewards_and_penalties(state, config),
+            // `BeaconState::altair_validator_lists` now reaches a gloas
+            // state's participation and inactivity lists too, as plain
+            // slices (progressive rather than `SszList`, EIP-7688, but both
+            // `Deref` to `[T]`), so this one copy serves gloas as well; see
+            // that accessor's own doc.
             ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra
-            | ForkName::Fulu => epoch::altair::process_rewards_and_penalties(state, config),
-            ForkName::Gloas => Err(
-                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                    function: "rewards_and_penalties",
-                    fork: ForkName::Gloas,
-                },
-            ),
+            | ForkName::Fulu
+            | ForkName::Gloas => epoch::altair::process_rewards_and_penalties(state, config),
             ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
@@ -105,7 +105,13 @@ fn apply(
         // deneb's superseded rule, so routing them here would fail loudly, not
         // incorrectly.
         "registry_updates" => match fork {
-            ForkName::Electra | ForkName::Fulu => {
+            // Gloas does not redefine this function either: it stays
+            // electra's balance-denominated version, with no activation-churn
+            // cap, and it only touches `validators`/`balances`, which
+            // `BeaconState` already reaches through element accessors generic
+            // over the bounded/progressive split, so a gloas state runs the
+            // identical function unchanged.
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 epoch::electra::process_registry_updates(state, config)
             }
             ForkName::Phase0
@@ -113,12 +119,6 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_registry_updates(state, config),
-            ForkName::Gloas => Err(
-                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                    function: "registry_updates",
-                    fork: ForkName::Gloas,
-                },
-            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("registry_updates"),
         },
         // Altair's and bellatrix's own changes here are scoped to the
@@ -131,18 +131,17 @@ fn apply(
         // rounding, so electra and fulu need their own function, not just their
         // own constant.
         "slashings" => match fork {
-            ForkName::Electra | ForkName::Fulu => epoch::electra::process_slashings(state, config),
+            // Unmodified in gloas too, and, like `registry_updates` above,
+            // only touches `validators`/`balances` and `state.slashings()`
+            // (a fork-invariant field), so it runs unchanged on a gloas state.
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+                epoch::electra::process_slashings(state, config)
+            }
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_slashings(state, config),
-            ForkName::Gloas => Err(
-                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                    function: "slashings",
-                    fork: ForkName::Gloas,
-                },
-            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("slashings"),
         },
         "eth1_data_reset" => epoch::process_eth1_data_reset(state),
@@ -152,7 +151,9 @@ fn apply(
         // compounding validator's can be far higher, and fulu never reverts
         // that, so both route to electra's.
         "effective_balance_updates" => match fork {
-            ForkName::Electra | ForkName::Fulu => {
+            // Same reasoning as `registry_updates`/`slashings` above: unmodified
+            // in gloas, and reaches only `validators`/`balances`.
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 epoch::electra::process_effective_balance_updates(state)
             }
             ForkName::Phase0
@@ -160,12 +161,6 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::process_effective_balance_updates(state),
-            ForkName::Gloas => Err(
-                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                    function: "effective_balance_updates",
-                    fork: ForkName::Gloas,
-                },
-            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("effective_balance_updates"),
         },
         "slashings_reset" => epoch::process_slashings_reset(state),
@@ -177,46 +172,138 @@ fn apply(
         "historical_roots_update" => epoch::process_historical_roots_update(state),
         // New in capella, replacing `historical_roots_update` above, and
         // carried unchanged through every later fork: `historical_summaries_mut`
-        // itself accepts capella, deneb, electra, and fulu states alike (see
-        // its own doc for why), so one call here serves all four.
+        // itself accepts capella, deneb, electra, fulu, and gloas states alike
+        // (see its own doc for why), so one call here serves all five.
         "historical_summaries_update" => epoch::capella::process_historical_summaries_update(state),
         // Phase0 only: altair replaces the backlog this replays with
         // participation flags, which have no epoch-end "roll the backlog
         // over" step of their own to speak of here (see
         // `participation_flag_updates` below).
         "participation_record_updates" => epoch::process_participation_record_updates(state),
-        // New in altair; no phase0 case ever reaches these, and no later
-        // fork's own `process_epoch` redefines any of the three (each calls
-        // straight through to `epoch::altair`, per its own module doc), so one
-        // call per handler serves every fork that has it.
-        "inactivity_updates" => epoch::altair::process_inactivity_updates(state, config),
-        "participation_flag_updates" => epoch::altair::process_participation_flag_updates(state),
+        // New in altair; no phase0 case ever reaches these. Bellatrix through
+        // fulu each call straight through to `epoch::altair`, per each fork
+        // module's own doc. `inactivity_updates` reads gloas too, below: its
+        // participation and inactivity lists are progressive (EIP-7688), a
+        // different Rust type from the bounded `SszList` altair's own copy
+        // used to need, but `BeaconState::inactivity_scores_mut` and
+        // `altair_validator_lists` both now reach either list kind through a
+        // shared slice type. `participation_flag_updates`, just below, is the
+        // one exception: it *replaces* the whole list rather than writing an
+        // element, which only the fork's own concrete container type can do,
+        // so gloas keeps its own copy of that one step; see
+        // `epoch::gloas`'s own module doc.
+        "inactivity_updates" => match fork {
+            // `BeaconState::inactivity_scores_mut` reaches a gloas state's
+            // scores too (element writes only, which both list kinds allow
+            // through `DerefMut`; see that accessor's own doc), so this one
+            // copy serves gloas as well.
+            ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Gloas => epoch::altair::process_inactivity_updates(state, config),
+            ForkName::Phase0 => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "inactivity_updates",
+                    fork: ForkName::Phase0,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("inactivity_updates"),
+        },
+        "participation_flag_updates" => match fork {
+            ForkName::Gloas => epoch::gloas::process_participation_flag_updates(state),
+            ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => epoch::altair::process_participation_flag_updates(state),
+            ForkName::Phase0 => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "participation_flag_updates",
+                    fork: ForkName::Phase0,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("participation_flag_updates"),
+        },
+        // Unmodified in gloas (both sync committees are fork-invariant
+        // fields, `BeaconState::sync_committees`/`_mut` already list gloas
+        // among the forks they serve), so one call still serves every fork.
         "sync_committee_updates" => epoch::altair::process_sync_committee_updates(state),
         // New in electra (EIP-7251). Fulu's driver keeps calling the very
         // same `process_pending_consolidations` (see `electra::process_epoch`'s
         // own doc for why that one needs no rewrite), but `pending_deposits`
         // has its own fulu-specific function: `epoch::fulu::process_pending_deposits`'s
         // own doc explains why running electra's version under fulu would be
-        // wrong, not merely redundant.
+        // wrong, not merely redundant. Gloas modifies `pending_deposits`
+        // again (EIP-8061: its own activation-only churn budget) and needs
+        // its own copy of `pending_consolidations` too, purely to reach the
+        // progressive queue fields `electra::pending_queue_fields` refuses a
+        // gloas state for; see `epoch::gloas`'s own module doc.
         "pending_deposits" => match fork {
             ForkName::Fulu => epoch::fulu::process_pending_deposits(state, config),
+            ForkName::Gloas => epoch::gloas::process_pending_deposits(state, config),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra => epoch::electra::process_pending_deposits(state, config),
-            ForkName::Gloas => Err(
-                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
-                    function: "pending_deposits",
-                    fork: ForkName::Gloas,
-                },
-            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("pending_deposits"),
         },
-        "pending_consolidations" => epoch::electra::process_pending_consolidations(state, config),
-        // New in fulu (EIP-7917); no earlier fork has this handler at all.
-        "proposer_lookahead" => epoch::fulu::process_proposer_lookahead(state),
+        // Gloas-only: a second handler over the very same `process_pending_deposits`
+        // (its cases are named `activation_churn__*`), split out from
+        // `pending_deposits` above purely to cover EIP-8061's new cap
+        // (`max_per_epoch_activation_churn_limit_gloas`) in isolation. No
+        // `process_pending_deposits_churn` exists in `beacon-chain.md`; this
+        // is not a new sub-transition.
+        "pending_deposits_churn" => epoch::gloas::process_pending_deposits(state, config),
+        // Unmodified in gloas too (`beacon-chain.md` does not touch this
+        // function), and `PendingQueueFields::take_pending_consolidations`/
+        // `set_pending_consolidations` reach a gloas state's queue at the
+        // `Vec` level, so this one copy serves it as well; see
+        // `epoch::electra::process_pending_consolidations`'s own doc.
+        "pending_consolidations" => match fork {
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+                epoch::electra::process_pending_consolidations(state, config)
+            }
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "pending_consolidations",
+                    fork,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("pending_consolidations"),
+        },
+        // New in fulu (EIP-7917). Gloas keeps `proposer_lookahead` itself
+        // unchanged from fulu too, and `epoch::fulu::process_proposer_lookahead`
+        // now picks the proposer-drawing callee by fork internally (EIP-8045
+        // excludes slashed validators for gloas), so this one copy serves
+        // both; see that function's own doc.
+        "proposer_lookahead" => match fork {
+            ForkName::Fulu | ForkName::Gloas => epoch::fulu::process_proposer_lookahead(state),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "proposer_lookahead",
+                    fork,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("proposer_lookahead"),
+        },
+        // New in gloas (EIP-7732); no earlier fork has either handler at all.
+        "builder_pending_payments" => epoch::gloas::process_builder_pending_payments(state),
+        "ptc_window" => epoch::gloas::process_ptc_window(state),
         other => return Err(format!("unhandled epoch step `{other}`")),
     };
 
@@ -277,8 +364,11 @@ fn every_shipped_handler_is_dispatched() -> Trial {
                 "participation_flag_updates",
                 "sync_committee_updates",
                 "pending_deposits",
+                "pending_deposits_churn",
                 "pending_consolidations",
                 "proposer_lookahead",
+                "builder_pending_payments",
+                "ptc_window",
             ];
 
             let mut unknown: Vec<String> = collect_all_handlers(PRESET, "epoch_processing")

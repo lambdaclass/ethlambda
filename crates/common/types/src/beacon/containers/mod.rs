@@ -57,7 +57,7 @@ use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{
     BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _,
-    Root, Slot, ValidatorIndex, WithdrawalIndex,
+    ParticipationFlags, Root, Slot, ValidatorIndex, WithdrawalIndex,
 };
 use crate::beacon::{beacon_value_unreachable, lean_block_unreachable, lean_state_unreachable};
 
@@ -870,24 +870,28 @@ impl BeaconState {
     }
 
     /// The three per-validator lists that exist from altair on, by reference and
-    /// all at once.
+    /// all at once, as plain slices.
     ///
     /// These cannot join `shared_state_accessors`' lists, since phase0 has
     /// none of them, and a per-fork projection to a concrete state struct (the
     /// way the beacon STF's `helpers::altair::altair_state_ref` reaches them)
     /// cannot serve every fork that carries them: bellatrix, capella, deneb, electra,
-    /// and fulu all keep the identical three fields, but each is a distinct
-    /// Rust type, so a projection typed to return `&altair::BeaconState` can
-    /// only ever answer for an altair state.
+    /// fulu, and gloas all keep the identical three fields, but each fork's own
+    /// struct is a distinct Rust type, so a projection typed to return
+    /// `&altair::BeaconState` can only ever answer for an altair state.
     ///
-    /// Gloas is in `absent_from` here, not `carried_by`: EIP-7688 makes all
-    /// three progressive lists, so `gloas::BeaconState`'s own
-    /// `previous_epoch_participation`, `current_epoch_participation` and
-    /// `inactivity_scores` are a different Rust type from every other fork's
-    /// (`ProgressiveList` rather than `SszList`), and this accessor's return
-    /// type is fixed to the pre-gloas one. A gloas caller reaches them through
-    /// a per-fork projection instead, the way `withdrawal_cursor`'s doc above
-    /// explains a projection cannot serve *this* accessor.
+    /// Gloas joins `carried_by` here, unlike [`Self::altair_validator_lists_mut`]:
+    /// EIP-7688 makes all three progressive lists on a gloas state
+    /// (`ProgressiveList` rather than `SszList`), a different concrete Rust
+    /// type from every earlier fork's, but both list kinds `Deref` to a plain
+    /// `[T]`, and a slice is all a *read* ever needs (`.get`, `.len`,
+    /// `.binary_search`, ...). Returning slices rather than the list types
+    /// themselves is what lets one `dispatch_state_from!` body serve both
+    /// kinds: the write side still needs the concrete container type, to grow
+    /// or replace the whole list, which is why [`Self::altair_validator_lists_mut`]
+    /// stays bounded-only. On gloas, element writes go through
+    /// [`Self::inactivity_scores_mut`], and growing or replacing a list goes
+    /// through a per-fork projection.
     ///
     /// Handed back together rather than one accessor per field for the same
     /// reason [`Self::altair_validator_lists_mut`] does: the fork condition
@@ -896,23 +900,25 @@ impl BeaconState {
     /// the rest away with `_`.
     pub fn altair_validator_lists(
         &self,
-    ) -> Result<(&EpochParticipation, &EpochParticipation, &InactivityScores)> {
+    ) -> Result<(&[ParticipationFlags], &[ParticipationFlags], &[u64])> {
         dispatch_state_from!(
             self,
             "BeaconState::altair_validator_lists",
             |state| (
-                &state.previous_epoch_participation,
-                &state.current_epoch_participation,
-                &state.inactivity_scores,
+                &state.previous_epoch_participation[..],
+                &state.current_epoch_participation[..],
+                &state.inactivity_scores[..],
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0, Gloas],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            absent_from: [Phase0],
         )
     }
 
     /// The three per-validator lists that exist from altair on, mutably and all
-    /// at once. See [`Self::altair_validator_lists`] for why this cannot be a
-    /// per-fork projection instead.
+    /// at once, as the fork's own concrete container type. See
+    /// [`Self::altair_validator_lists`] for why this cannot be a per-fork
+    /// projection instead, and for why, unlike that read-only accessor, this
+    /// one does not extend to gloas.
     ///
     /// Handed back together for two reasons that stack:
     /// the beacon STF's `stf::operations::add_validator_to_registry` genuinely
@@ -927,6 +933,18 @@ impl BeaconState {
     /// Borrowing three fields of one struct at once is what the tuple is for.
     /// Rust permits it because the fields are disjoint, whereas three successive
     /// accessor calls would each borrow the whole enum.
+    ///
+    /// Gloas is in `absent_from` here, not `carried_by`: the container type
+    /// this returns (`EpochParticipation`/`InactivityScores`, both `SszList`)
+    /// is fixed to the pre-gloas one, and `gloas::BeaconState`'s own three
+    /// lists are the progressive `ProgressiveList` instead, a different Rust
+    /// type a shared return type cannot name. A gloas caller either grows the
+    /// registry through a per-fork projection
+    /// (`PendingQueueFields::push_empty_participation_and_inactivity`), writes
+    /// one score in place through
+    /// [`Self::inactivity_scores_mut`], or replaces a whole list outright
+    /// through its own state's own field, the way
+    /// `stf::epoch::gloas::process_participation_flag_updates` does.
     pub fn altair_validator_lists_mut(
         &mut self,
     ) -> Result<(
@@ -944,6 +962,30 @@ impl BeaconState {
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
             absent_from: [Phase0, Gloas],
+        )
+    }
+
+    /// `inactivity_scores`, mutably, as a plain slice: element writes only, no
+    /// whole-list replace or length change, which is what lets this include
+    /// gloas where [`Self::altair_validator_lists_mut`] cannot (see that
+    /// accessor's own doc). A `&mut [u64]` cannot grow or shrink, so handing
+    /// one out cannot break either list kind's own length invariant, the same
+    /// reasoning [`libssz_types::ProgressiveList`]'s own `DerefMut` doc gives
+    /// for allowing element mutation but not resizing through a slice.
+    ///
+    /// `stf::epoch::altair::process_inactivity_updates` (shared by every fork
+    /// from altair on, gloas included) is the one caller: it only ever writes
+    /// scores in place, never grows or replaces the list, which
+    /// `add_validator_to_registry` and `process_participation_flag_updates`
+    /// do instead (see [`Self::altair_validator_lists_mut`]'s own doc for
+    /// where each of those goes).
+    pub fn inactivity_scores_mut(&mut self) -> Result<&mut [u64]> {
+        dispatch_state_from!(
+            self,
+            "BeaconState::inactivity_scores_mut",
+            |state| &mut state.inactivity_scores[..],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            absent_from: [Phase0],
         )
     }
 

@@ -149,6 +149,26 @@ fn proposer_lookahead<'a>(
     }
 }
 
+/// The `proposer_lookahead` field, mutably. See [`proposer_lookahead`] for
+/// why this is scoped to fulu and gloas rather than widening
+/// [`fulu_state`]/[`fulu_state_ref`].
+///
+/// `pub(crate)`: `crate::beacon::stf::epoch::fulu::process_proposer_lookahead`,
+/// shared by both forks (see that module's own doc), is the one caller.
+pub(crate) fn proposer_lookahead_mut<'a>(
+    state: &'a mut BeaconState,
+    function: &'static str,
+) -> Result<&'a mut fulu::ProposerLookahead> {
+    match state {
+        BeaconState::Fulu(inner) => Ok(&mut inner.proposer_lookahead),
+        BeaconState::Gloas(inner) => Ok(&mut inner.proposer_lookahead),
+        other => Err(Error::UnsupportedForFork {
+            function,
+            fork: other.fork_name(),
+        }),
+    }
+}
+
 /// The proposer for the state's current slot.
 ///
 /// Fulu's replacement for [`super::accessors::get_beacon_proposer_index`]: a
