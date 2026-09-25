@@ -84,6 +84,16 @@ pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
 /// is one line.
 pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Fulu;
 
+/// Runners whose Gloas cases already run, while the fork is only partly
+/// implemented.
+///
+/// [`case_trial`] checks this alongside [`Case::in_scope`], so a runner named
+/// here has its Gloas cases run (and counted toward pass/fail) even though
+/// [`HIGHEST_IMPLEMENTED_FORK`] has not reached Gloas yet; every other
+/// runner's Gloas cases stay ignored. Emptied, and removed along with this
+/// check, when [`HIGHEST_IMPLEMENTED_FORK`] becomes `Gloas`.
+pub const GLOAS_RUNNERS: &[&str] = &["ssz_static"];
+
 /// The root of the extracted fixture tree.
 ///
 /// Panics rather than skipping when the fixtures are absent. A spec suite that
@@ -461,6 +471,12 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
 /// itself and print the count; the test harness counts ignored tests already,
 /// and names each one, which is strictly more than the tally said.
 ///
+/// A Gloas case is the one exception: while Gloas is only partly implemented,
+/// [`GLOAS_RUNNERS`] names the runners whose Gloas cases already run, ahead of
+/// [`HIGHEST_IMPLEMENTED_FORK`] reaching Gloas, so those cases run (and are
+/// counted toward pass/fail) even though [`Case::in_scope`] alone would mark
+/// them ignored.
+///
 /// A panic inside `run` fails this case alone: the harness catches it per test.
 /// So a fixture that will not decode takes its own case down and no other.
 pub fn case_trial(
@@ -468,7 +484,8 @@ pub fn case_trial(
     case: Case,
     run: impl FnOnce(&Case) -> Result<(), String> + Send + 'static,
 ) -> Trial {
-    let ignored = !case.in_scope();
+    let gloas_enabled = case.fork == ForkName::Gloas && GLOAS_RUNNERS.contains(&runner);
+    let ignored = !(case.in_scope() || gloas_enabled);
     let name = format!("{runner}/{}", case.id());
     Trial::test(name, move || run(&case).map_err(Failed::from)).with_ignored_flag(ignored)
 }
