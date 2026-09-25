@@ -1,87 +1,157 @@
-//! Committee-signature aggregation: off-thread worker orchestration and the
+//! Committee-signature aggregation: the always-on off-thread worker and the
 //! pure functions it runs.
 //!
-//! The blockchain actor fires one aggregation session per slot — at interval 2,
-//! or up to [`EARLY_AGGREGATION_WINDOW`] early when the 2/3 signature
-//! threshold is met — via
-//! [`run_aggregation_worker`]. The actor stays on its message loop; the worker
-//! runs the expensive XMSS proofs on a `spawn_blocking` thread and streams
-//! results back as [`AggregateProduced`] / [`AggregationDone`] messages.
+//! One worker thread is spawned when the blockchain actor starts and lives as
+//! long as it does. It holds its own [`Store`] handle (a clone sharing the same
+//! backend and in-memory buffers), so it both re-reads the pool itself instead
+//! of being handed a per-slot snapshot and writes what it produces straight
+//! back: pick the single best job available right now, run its expensive XMSS
+//! proof, [`store_aggregate`] it, tell the actor with an [`AggregateProduced`]
+//! message, pick again. With nothing eligible it polls every
+//! [`WORKER_IDLE_POLL`].
 //!
-//! [`snapshot_aggregation_inputs`] builds the session's job list with a tiered
-//! greedy selector modeled on `block_builder::select_attestations`: an
-//! up-front store pass resolves every candidate `AttestationData`'s
-//! aggregation material once (raw-first + trim, see [`resolve_job`]), then a
-//! pure in-memory loop scores and orders candidates by consensus value
-//! (current-slot before stale, then Finalize > Justify > Build), emitting at
-//! most `max_jobs` jobs — [`MAX_AGGREGATION_JOBS`] normally, dropping to a
-//! single job in the slot before one of our validators proposes.
+//! It is a plain `std::thread`, not a `spawn_blocking` task. The thread runs
+//! for the process's life and spends it in leanVM proofs, so handing it to the
+//! runtime's blocking pool would park one of those threads permanently while
+//! buying nothing: the loop awaits nothing, and it reaches the actor through an
+//! unbounded channel that needs no reactor.
+//!
+//! Storing on the worker keeps the proof off the actor's mailbox: the message
+//! carries only the attestation data and the participant set naming the proof,
+//! and the actor reads the bytes back out of the pool when it publishes. That
+//! publication is what stays on the interval grid, held to the
+//! vote-aggregation interval unless the aggregate finishes inside the window
+//! (see `SlotInterval::publishes_aggregates_on_arrival`), so proving is free to
+//! run whenever.
+//!
+//! It also means the worker needs no memory of what it has already proved: the
+//! pool its next selection round re-reads already accounts for it. A failed
+//! proof is the exception, since it leaves the pool untouched and gets picked
+//! again; that path sleeps [`WORKER_IDLE_POLL`] so a proof failing cheaply,
+//! before the prover even runs, cannot spin the thread.
+//!
+//! [`select_best_job`] builds the candidate pool with the same tiered scoring
+//! as `block_builder::select_attestations`: a store pass resolves every
+//! candidate `AttestationData`'s aggregation material once (raw-first + trim,
+//! see [`resolve_job`]), then a pure in-memory pass ranks candidates by
+//! consensus value (current-slot before stale, then Finalize > Justify >
+//! Build) and returns the winner.
+//!
+//! What the worker may pick up depends on where the slot is: see
+//! [`JobPolicy`]. In short, a current-slot group needs two thirds of the
+//! signatures this node expects before the vote-aggregation boundary, and
+//! inside the early window ahead of that boundary the worker takes nothing
+//! else — it would rather idle than start a recursive merge that runs into the
+//! slot's committee aggregation.
+//!
+//! The actor parks the worker outright for as long as it needs the prover to
+//! itself, or the node has no business aggregating: around its own block
+//! build, and while the sync gate suppresses duties, so a node that is behind
+//! spends the prover on the block import that closes the gap rather than on a
+//! backlog the network has stopped waiting for. Both are [`PauseReason`]s (see
+//! [`AggregationWorker::pause`] and [`AggregationWorker::set_paused`]).
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::{Duration, Instant};
 
 use ethlambda_crypto::aggregate_mixed;
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_storage::Store;
 use ethlambda_types::{
     ShortRoot,
+    aggregator::AggregatorController,
     attestation::{AggregationBits, AttestationData, HashedAttestationData, validator_indices},
     block::{ByteList512KiB, SingleMessageAggregate},
+    chain_config::ChainConfig,
     constants::{INTERVALS_PER_SLOT, MIN_MILLISECONDS_PER_SLOT},
     primitives::H256,
     state::Validator,
 };
 use spawned_concurrency::message::Message;
-use spawned_concurrency::tasks::{ActorRef, Context, send_after};
+use spawned_concurrency::tasks::ActorRef;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, trace, warn};
 
 use crate::block_builder::{self, EntryScore};
-use crate::metrics;
+use crate::{SlotInterval, metrics};
 
-/// Soft deadline for committee-signature aggregation measured from session
-/// start: one full interval. After this much wall time elapses, the actor
-/// signals the worker to stop via its cancellation token. A session started
-/// exactly at interval 2 therefore runs until interval 3; a session started
-/// early (see `maybe_start_early_aggregation`) ends correspondingly earlier.
-/// The deadline only stops new jobs from starting — a job mid-proof finishes
-/// and publishes right after.
-pub(crate) fn aggregation_deadline(milliseconds_per_interval: u64) -> Duration {
-    Duration::from_millis(milliseconds_per_interval)
+/// How long the worker waits before re-reading the pool when it found nothing
+/// to do — no eligible job, the pause flag raised, or no aggregation duty.
+/// Short enough that a signature arriving mid-interval is picked up promptly,
+/// long enough that an idle node is not re-scanning the pool in a spin loop.
+pub(crate) const WORKER_IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// Upper bound we wait for the worker to exit on shutdown. Reached only when a
+/// proof is mid-flight (`aggregate_mixed` cannot be interrupted); we warn
+/// before giving up on the join.
+pub(crate) const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often shutdown checks whether the worker thread has exited. Joining a
+/// thread blocks, and the actor's `stopped()` hook runs on the runtime, so the
+/// wait polls instead of blocking a runtime thread on a proof that may still
+/// have a second to run.
+const WORKER_SHUTDOWN_POLL: Duration = Duration::from_millis(20);
+
+/// Offset within the slot at which the vote-propagation gate lifts: the start
+/// of the vote-aggregation interval. Before it, a current-slot group needs
+/// [`min_current_slot_group_sigs`] signatures to be worth a proof; from it on,
+/// whatever the group holds is aggregated.
+///
+/// Derived from the configured slot duration, like every other interval
+/// boundary.
+fn vote_aggregation_offset_ms(config: &ChainConfig) -> u64 {
+    // Slot 0 reduces `to_ms_since_genesis` to the offset within a slot.
+    SlotInterval::Aggregation.to_ms_since_genesis(0, config)
 }
 
-/// Upper bound we wait for a prior worker to exit if it is still running when
-/// the next session is about to start. Reached only in pathological cases
-/// (mismatched timers, stuck proofs); we warn before blocking.
-pub(crate) const PRIOR_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Width of the early-aggregation window: a session may start at most this
-/// long before the interval-2 boundary, provided the signature threshold is
-/// met (see the check in `maybe_start_early_aggregation`).
+/// How far into `slot` the wall clock is, in milliseconds.
 ///
-/// Fixed rather than scaled with the slot duration. What the window buys is
-/// wall time for the leanVM proof to land before the block that carries it,
-/// and a proof costs the same however long the network's slot is.
+/// The store clock decides which slot the worker is in, but it counts whole
+/// intervals and [`EARLY_AGGREGATION_WINDOW`] is finer than one, so the
+/// position *inside* the slot still comes from the wall clock. It is measured
+/// from `slot`'s own start and clamped to that slot, so when the two clocks
+/// disagree the answer degrades to an edge of the slot the store says we are
+/// in: short of it the permissive [`JobPolicy::Backlog`] end, past it
+/// [`JobPolicy::Open`]. It never describes a position inside some other slot.
+fn ms_into_slot(now_ms: u64, slot: u64, config: &ChainConfig) -> u64 {
+    let slot_start_ms = config.genesis_time_ms() + slot * config.milliseconds_per_slot;
+    now_ms
+        .saturating_sub(slot_start_ms)
+        .min(config.milliseconds_per_slot)
+}
+
+/// How long before the vote-aggregation boundary the worker stops taking
+/// anything but the slot's committee signatures.
+///
+/// A backlog job is a recursive proof merge that can run well past the
+/// boundary, and the prover is single-threaded: starting one here would delay
+/// the aggregate the whole slot is waiting on. Idling instead costs little,
+/// since the backlog is not going anywhere, and this window is where the
+/// committee's signatures typically cross the two-thirds mark.
+///
+/// Fixed rather than scaled with the slot duration. What the window protects
+/// is wall time for one leanVM proof, and a proof costs the same however long
+/// the network's slot is.
 pub(crate) const EARLY_AGGREGATION_WINDOW: Duration = Duration::from_millis(600);
 
-// The window must fit within one interval: `maybe_start_early_aggregation`
-// subtracts it from the interval-2 offset, and the interval-1 tick schedules
-// the check at `milliseconds_per_interval - EARLY_AGGREGATION_WINDOW`. The
-// slot duration is configurable, so the binding case is the narrowest interval
-// a config file can ask for. Keep this invariant self-enforcing so a future
-// bump to the window, or a lowered floor, can't silently underflow either
-// subtraction.
+// The window must not reach past the start of the slot, so `job_policy`'s
+// subtraction cannot underflow into the previous one. The slot duration is
+// configurable, so the binding case is the narrowest grid a config file can
+// ask for. Keep the invariant self-enforcing so a future bump to the window,
+// or a lowered floor, can't silently underflow that subtraction.
 const _: () = assert!(
     EARLY_AGGREGATION_WINDOW.as_millis()
-        <= (MIN_MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT) as u128,
-    "EARLY_AGGREGATION_WINDOW must not exceed the shortest configurable interval"
+        <= (2 * MIN_MILLISECONDS_PER_SLOT / INTERVALS_PER_SLOT) as u128,
+    "EARLY_AGGREGATION_WINDOW must not reach past the slot boundary at the shortest cadence"
 );
 
 /// A single pre-prepared aggregation group.
 ///
-/// Built on the actor thread from a store snapshot; consumed by an off-thread
-/// worker that only needs to run the expensive `aggregate_mixed` call. Holding
-/// this struct requires no store access.
+/// Built by [`select_best_job`] from the worker's own store reads; everything
+/// [`aggregate_job`] needs for the expensive `aggregate_mixed` call is in here,
+/// so proving it requires no store access.
 pub struct AggregationJob {
     pub(crate) hashed: HashedAttestationData,
     pub(crate) slot: u64,
@@ -111,14 +181,9 @@ impl AggregationJob {
     }
 }
 
-/// All input needed to run a session of committee-signature aggregation off-thread.
-pub struct AggregationSnapshot {
-    pub(crate) jobs: Vec<AggregationJob>,
-    pub(crate) groups_considered: usize,
-}
-
-/// Result of one successful aggregation group. Carried back to the actor thread
-/// as a message payload so the store can be updated and gossip publish fired.
+/// Result of one successful aggregation group. The worker writes it into its
+/// own store handle through [`store_aggregate`], which hands the actor only an
+/// [`AggregateProduced`] naming the proof.
 pub struct AggregatedGroupOutput {
     pub(crate) hashed: HashedAttestationData,
     pub(crate) proof: SingleMessageAggregate,
@@ -126,66 +191,168 @@ pub struct AggregatedGroupOutput {
     pub(crate) keys_to_delete: Vec<(u64, H256)>,
 }
 
-/// Tracks an in-flight off-thread aggregation worker so the actor can cancel,
-/// join, and correlate incoming result messages with the right session.
-pub(crate) struct AggregationSession {
-    /// Slot at which this session was started; used as a fencing id so we can
-    /// drop late-arriving messages from a prior session.
-    pub(crate) session_id: u64,
-    /// Whether the session started before the slot's interval-2 boundary via
-    /// the early-aggregation trigger.
-    pub(crate) early: bool,
-    /// Child of the actor cancellation token; fires either at the deadline or
-    /// when the actor itself is stopping.
-    pub(crate) cancel: CancellationToken,
-    /// Handle to the `spawn_blocking` worker. Held so `stopped()` / new-session
-    /// start can await completion.
-    pub(crate) worker: tokio::task::JoinHandle<()>,
+/// Why the worker is parked. The actor owns every reason and sets them
+/// independently; the worker takes no new job while any is set.
+///
+/// A bitset rather than a single flag or a depth counter: each reason has
+/// exactly one owner, so setting one twice is idempotent, clearing one cannot
+/// clear another's, and nothing is left to leak when an owner is level-driven
+/// rather than scoped. Values are distinct bits of the `AtomicU8` in
+/// [`AggregationWorker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PauseReason {
+    /// The actor is building a block. Both it and the worker run leanVM
+    /// proofs on the same single-threaded prover, and the block is the one
+    /// with a deadline. Scoped to the build, so it is taken as a
+    /// [`PauseGuard`].
+    BlockBuild = 1 << 0,
+    /// The sync gate is suppressing this node's duties. A node that is behind
+    /// would otherwise prove a backlog the network has moved past, against
+    /// the same prover its block import needs to close the gap. Level-driven
+    /// from the actor's tick, so it is set through
+    /// [`AggregationWorker::set_paused`] rather than held as a guard.
+    Syncing = 1 << 1,
 }
 
-/// One successful aggregate streamed back from the worker.
+/// Handle to the always-on aggregation worker, held by the actor for the
+/// actor's whole lifetime.
+pub(crate) struct AggregationWorker {
+    /// Cancelled by the actor's `stopped()` hook; the worker breaks out of its
+    /// loop at the next job boundary.
+    cancel: CancellationToken,
+    /// Set of [`PauseReason`]s currently holding the worker back, as a bitset.
+    /// Non-zero means "take no new job"; see [`Self::pause`].
+    paused: Arc<AtomicU8>,
+    /// Handle to the worker thread, held so shutdown can join it.
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Set or clear one reason's bit. Read-modify-write, so reasons are
+/// independent: an owner only ever touches its own bit.
+fn set_pause_reason(paused: &AtomicU8, reason: PauseReason, on: bool) {
+    if on {
+        paused.fetch_or(reason as u8, Ordering::Release);
+    } else {
+        paused.fetch_and(!(reason as u8), Ordering::Release);
+    }
+}
+
+impl AggregationWorker {
+    /// Stop handing the worker new jobs for `reason` for as long as the
+    /// returned guard lives. A proof already in flight is not interrupted
+    /// (`aggregate_mixed` cannot be), so this bounds contention rather than
+    /// eliminating it.
+    ///
+    /// For a reason whose lifetime is a scope. A reason the actor tracks as
+    /// state instead, recomputing it each tick, belongs in
+    /// [`Self::set_paused`]. Either way one reason has one owner: two live
+    /// guards for the same reason would release it when the first drops.
+    pub(crate) fn pause(&self, reason: PauseReason) -> PauseGuard {
+        set_pause_reason(&self.paused, reason, true);
+        PauseGuard {
+            paused: self.paused.clone(),
+            reason,
+        }
+    }
+
+    /// Level-triggered form of [`Self::pause`]: bring `reason` in line with
+    /// `paused`, whatever it was before. Idempotent, so the actor can drive it
+    /// straight off a predicate it recomputes every tick without tracking
+    /// whether it already set it.
+    pub(crate) fn set_paused(&self, reason: PauseReason, paused: bool) {
+        set_pause_reason(&self.paused, reason, paused);
+    }
+
+    /// Cancel the worker and wait up to [`WORKER_JOIN_TIMEOUT`] for it to exit.
+    ///
+    /// Polls rather than joining straight away: the thread only notices
+    /// cancellation between jobs, so a join here would block a runtime thread
+    /// for as long as the proof in flight takes. Past the timeout the thread is
+    /// left detached — it exits on its own once the current proof returns, and
+    /// the process is on its way out regardless.
+    pub(crate) async fn shutdown(self) {
+        self.cancel.cancel();
+
+        let deadline = Instant::now() + WORKER_JOIN_TIMEOUT;
+        while !self.handle.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(WORKER_SHUTDOWN_POLL).await;
+        }
+
+        if !self.handle.is_finished() {
+            warn!(
+                timeout_secs = WORKER_JOIN_TIMEOUT.as_secs(),
+                "Aggregation worker still proving at shutdown; leaving it detached"
+            );
+            return;
+        }
+        match self.handle.join() {
+            Ok(()) => info!("Aggregation worker joined on shutdown"),
+            Err(_) => warn!("Aggregation worker panicked"),
+        }
+    }
+}
+
+/// Clears its own [`PauseReason`] on drop, so an early return on the paused
+/// code path cannot leave the worker parked forever. Touches no other
+/// reason's bit; see [`AggregationWorker::pause`].
+pub(crate) struct PauseGuard {
+    paused: Arc<AtomicU8>,
+    reason: PauseReason,
+}
+
+impl Drop for PauseGuard {
+    fn drop(&mut self) {
+        set_pause_reason(&self.paused, self.reason, false);
+    }
+}
+
+/// Startup-fixed inputs the worker's vote-propagation gate and subnet window
+/// need. All come from the CLI and never change at runtime, so the worker owns
+/// a copy instead of reaching back into the actor.
+#[derive(Clone)]
+pub(crate) struct WorkerConfig {
+    /// Number of attestation committees (= subnet count).
+    pub(crate) attestation_committee_count: u64,
+    /// Attestation subnets this node subscribes to.
+    pub(crate) subscribed_subnets: HashSet<u64>,
+    /// See [`AggregationWindowConfig::duty_subnet`].
+    pub(crate) aggregation_duty_subnet: u64,
+    /// See [`AggregationWindowConfig::skip_redundant`].
+    pub(crate) skip_redundant_aggregation: bool,
+}
+
+impl WorkerConfig {
+    /// The subnet-window duty [`select_best_job`] scores candidates through.
+    fn window_config(&self) -> AggregationWindowConfig {
+        AggregationWindowConfig {
+            duty_subnet: self.aggregation_duty_subnet,
+            committee_count: self.attestation_committee_count,
+            skip_redundant: self.skip_redundant_aggregation,
+        }
+    }
+}
+
+/// One successful aggregate announced to the actor, after the worker has
+/// already stored it.
+///
+/// Carries no proof: [`store_aggregate`] put it in the pending payload pool,
+/// and `participants` names it there for `Store::proof_for_participants`. A
+/// proof is up to [`ByteList512KiB`], so keeping it out of the mailbox keeps
+/// the actor's queue small however far behind publication falls.
 pub(crate) struct AggregateProduced {
-    pub(crate) session_id: u64,
-    pub(crate) output: AggregatedGroupOutput,
+    pub(crate) hashed: HashedAttestationData,
+    /// Participant set of the stored proof, which is both what names it in the
+    /// pool and what the actor buffers until publication.
+    pub(crate) participants: AggregationBits,
+    /// Wall time the proof itself took, observed on the worker thread.
+    pub(crate) elapsed: Duration,
 }
 impl Message for AggregateProduced {
     type Result = ();
 }
 
-/// Emitted by the worker after its loop exits (completion or cancellation).
-pub(crate) struct AggregationDone {
-    pub(crate) session_id: u64,
-    pub(crate) groups_considered: usize,
-    pub(crate) groups_aggregated: usize,
-    pub(crate) total_raw_sigs: usize,
-    pub(crate) total_children: usize,
-    pub(crate) total_elapsed: Duration,
-    pub(crate) cancelled: bool,
-}
-impl Message for AggregationDone {
-    type Result = ();
-}
-
-/// Self-message scheduled via `send_after` at session start. Cancels the
-/// session's token so the worker stops starting new aggregations.
-pub(crate) struct AggregationDeadline {
-    pub(crate) session_id: u64,
-}
-impl Message for AggregationDeadline {
-    type Result = ();
-}
-
-/// One-shot self-message scheduled at the interval-1 tick; fires when the
-/// early-aggregation window opens (T2 - [`EARLY_AGGREGATION_WINDOW`]) to run
-/// the threshold check for signatures that all arrived before the window.
-/// Arrivals inside the window are checked per insert instead.
-pub(crate) struct EarlyAggregationCheck;
-impl Message for EarlyAggregationCheck {
-    type Result = ();
-}
-
-/// The aggregator's subnet-window duty, as read by
-/// [`snapshot_aggregation_inputs`].
+/// The aggregator's subnet-window duty, as read by [`select_best_job`].
 ///
 /// Grouped rather than passed as three loose arguments, matching
 /// `BlockChainConfig` and `ProposerConfig`.
@@ -201,12 +368,6 @@ pub struct AggregationWindowConfig {
     /// See [`owns_width`].
     pub skip_redundant: bool,
 }
-
-/// Maximum number of aggregation jobs selected per interval-2 session. Caps
-/// leanVM prover work against [`aggregation_deadline`]: the greedy loop in
-/// [`snapshot_aggregation_inputs`] stops after this many rounds even if
-/// scoring candidates remain.
-pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 
 /// The window this aggregator uses for one candidate `AttestationData`, or
 /// `None` when `--skip-redundant-aggregation` is on and another duty subnet
@@ -228,24 +389,24 @@ pub(crate) const MAX_AGGREGATION_JOBS: usize = 2;
 /// wide proof, one validator in each of many subnets, collapsing every
 /// aggregator's window to the full committee set.
 ///
-/// Only one session runs per slot (see [`snapshot_aggregation_inputs`]), and
-/// this candidate's own pool is normally still empty at that point: a produced
-/// aggregate is held until the interval-2 boundary before publication, so
-/// nothing from this slot has landed yet. A current-slot candidate therefore
-/// derives the narrowest width in practice; the pool only has something to
-/// reach into once a data root has stayed live past its own slot.
+/// The worker stores each aggregate it produces straight into the pool (only
+/// publication waits for the vote-aggregation interval), so a current-slot
+/// candidate derives the narrowest width only until this node's first proof
+/// for it lands. That proof normally touches the duty subnet, a subnet this
+/// node subscribes to, so a later round for the same data root, such as a
+/// re-prove folding in a straggler signature, anchors on it and derives a
+/// wider window. The climb the window buys can
+/// therefore play out within one slot, one round per job, as well as across
+/// the slots a data root stays live for.
 ///
-/// That is a timing expectation, not an invariant this code enforces. A peer's
-/// aggregate for the current slot can land before this node takes its
-/// snapshot, under clock skew or when the peer's session started early via
-/// [`EarlyAggregationCheck`], and the current-slot candidate then has an
-/// anchor and a width of 2. Under `--skip-redundant-aggregation` that is not
-/// free: every duty subnet that does not own width 2 this slot sits the
-/// candidate out, so its raw signatures miss the next block. On the intended
-/// topology, distinct duty subnets with distinct subscriptions, a round-one
-/// peer proof never touches this node's subnet, so it finds no anchor there
-/// and the assumption holds anyway. Overlapping subscriptions are where it
-/// fails.
+/// Under `--skip-redundant-aggregation` that climb is not free: a duty subnet
+/// that does not own the derived width this slot sits the candidate out, so a
+/// straggler signature arriving after the first proof waits for a slot whose
+/// rotation hands that width back, or for another aggregator's proof to carry
+/// it. A peer's aggregate touching the duty subnet raises the width the same
+/// way. On the intended topology, distinct duty subnets with distinct
+/// subscriptions, a round-one peer proof never touches this node's subnet;
+/// overlapping subscriptions are where it does.
 fn window_for_candidate(
     new_proofs: &[SingleMessageAggregate],
     known_proofs: &[SingleMessageAggregate],
@@ -281,66 +442,119 @@ fn window_for_candidate(
     ))
 }
 
-/// [`window_for_candidate`] plus the metrics for its outcome. Kept apart from
-/// the derivation so that stays pure and unit-testable without a metrics
-/// registry.
-fn metered_window_for_candidate(
-    new_proofs: &[SingleMessageAggregate],
-    known_proofs: &[SingleMessageAggregate],
-    current_slot: u64,
-    config: AggregationWindowConfig,
-) -> Option<SubnetWindow> {
-    let window = window_for_candidate(new_proofs, known_proofs, current_slot, config);
-    match &window {
-        Some(window) => metrics::observe_aggregation_window_width(window.width()),
-        None => metrics::inc_aggregation_skipped_redundant(),
-    }
-    window
+/// Window metrics gathered over one [`select_best_job`] round, emitted only if
+/// that round picks a job.
+///
+/// The worker re-runs selection every [`WORKER_IDLE_POLL`] while it has
+/// nothing to prove, and every candidate in the pool derives a window each
+/// time. Metering each derivation would scale the window series with the poll
+/// rate: a candidate that is never viable, or one the rotation keeps handing
+/// elsewhere, would count on every poll for as long as it stays in the pool.
+/// Rounds that pick a job are paced by the prover instead, a handful per slot,
+/// which keeps the series comparable to what a per-slot selection recorded.
+#[derive(Debug, Default)]
+struct WindowTally {
+    /// Width derived for each candidate that got a window.
+    widths: Vec<u64>,
+    /// Candidates sat out because another duty subnet owns their width.
+    skipped_redundant: u64,
+    /// Candidates the full-width retry turned viable.
+    fallbacks: u64,
 }
 
-/// Build a snapshot of everything needed to aggregate. Runs on the actor
-/// thread, touches the store, does no heavy cryptography. Returns `None` when
-/// there is nothing to aggregate so callers can avoid spawning an empty worker.
+impl WindowTally {
+    /// Record one candidate's window outcome.
+    fn record_window(&mut self, window: Option<&SubnetWindow>) {
+        match window {
+            Some(window) => self.widths.push(window.width()),
+            None => self.skipped_redundant += 1,
+        }
+    }
+
+    /// Publish the round's tally to the window metrics.
+    fn emit(self) {
+        for width in self.widths {
+            metrics::observe_aggregation_window_width(width);
+        }
+        metrics::inc_aggregation_skipped_redundant(self.skipped_redundant);
+        metrics::inc_aggregation_window_fallback(self.fallbacks);
+    }
+}
+
+/// What the worker is allowed to pick up, given where the slot is.
 ///
-/// A tiered greedy selector modeled on `block_builder::select_attestations`:
+/// The prover is single-threaded and the slot's committee aggregate is the one
+/// piece of work with a deadline, so the policy tightens as that deadline
+/// approaches and opens up once it has passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobPolicy {
+    /// Early in the slot: backlog work is welcome — stale groups, merges of
+    /// proofs already held — and a current-slot group is eligible once it
+    /// holds `min_sigs` signatures.
+    Backlog { min_sigs: usize },
+    /// Inside [`EARLY_AGGREGATION_WINDOW`]: only a current-slot group that
+    /// already holds `min_sigs`. Anything else would occupy the prover across
+    /// the boundary and delay the aggregate the slot is waiting on, so the
+    /// worker idles until either the threshold is met or the boundary arrives.
+    CommitteeOnly { min_sigs: usize },
+    /// From the vote-aggregation boundary on: everything is eligible, however
+    /// few signatures back it.
+    Open,
+}
+
+impl JobPolicy {
+    /// Whether a current-slot gossip group holding `sigs` signatures may be
+    /// proved now.
+    fn admits_current_slot(self, sigs: usize) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Backlog { min_sigs } | Self::CommitteeOnly { min_sigs } => sigs >= min_sigs,
+        }
+    }
+
+    /// Whether work other than the current slot's committee signatures may be
+    /// started now: a stale group, or a merge of proofs already in the pool.
+    fn admits_backlog(self) -> bool {
+        !matches!(self, Self::CommitteeOnly { .. })
+    }
+}
+
+/// Pick the single most valuable aggregation job available right now, or
+/// `None` when nothing is worth proving. Touches the store, does no heavy
+/// cryptography.
 ///
-/// 1. **Up-front store pass**: resolves every candidate `AttestationData`
-///    into a store-free [`AggregationJob`] once via [`resolve_job`]
-///    (raw-first, then trim). Candidates come from gossip groups
+/// A tiered selector modeled on `block_builder::select_attestations`:
+///
+/// 1. **Store pass**: resolves every candidate `AttestationData` into a
+///    store-free [`AggregationJob`] via [`resolve_job`] (raw-first, then
+///    trim). Candidates come from gossip groups
 ///    (`store.iter_gossip_signatures()`) and payload-only groups
 ///    (`store.new_payload_keys()` not already a gossip candidate, requiring
-///    at least two existing proofs to merge).
-///    Each candidate's window is derived from the best reach in its own proof
-///    pool (see [`window_for_candidate`]) and scores child selection.
-/// 2. **Greedy loop**, at most `max_jobs` rounds: each round
-///    scores every unselected candidate against the projected state and
-///    keeps the lowest ordering key (current-slot before stale, then
-///    Finalize > Justify > Build, mirroring the block builder). The winning
-///    [`AggregationJob`] is emitted as-is; the projection is updated with its
-///    realized coverage.
+///    at least two existing proofs to merge), each admitted or held back by
+///    `policy`. Each candidate's window is derived from the best reach in its
+///    own proof pool (see [`window_for_candidate`]) and scores child
+///    selection.
+/// 2. **Ranking**: scores every candidate against the head state and keeps the
+///    lowest ordering key (current-slot before stale, then Finalize > Justify
+///    > Build, mirroring the block builder).
 ///
-/// Stops early when no remaining candidate scores (converged).
-///
-/// `max_jobs` is [`MAX_AGGREGATION_JOBS`] for an ordinary session and `1` when
-/// the caller is about to build a block at interval 4 (see
-/// `BlockChainServer::start_aggregation_session`).
-///
-/// Exactly one session runs per slot, so in practice a data root gets about
-/// one windowed merge rather than a multi-round climb: the current slot's
-/// own candidate always derives the narrowest width and has no children (see
-/// [`window_for_candidate`]), so the window only ever scores a stale
-/// candidate carrying an earlier slot's data, and `max_jobs` caps that to at
-/// most one job per session. The widening the window buys therefore plays
-/// out across the slots a data root stays live for, by aggregators holding
-/// different windows on different slots, not within one slot.
-pub fn snapshot_aggregation_inputs(
+/// The window metrics are recorded only when a job comes back; see
+/// [`WindowTally`].
+fn select_best_job(
     store: &Store,
     current_slot: u64,
-    max_jobs: usize,
+    policy: JobPolicy,
     window_config: AggregationWindowConfig,
-) -> Option<AggregationSnapshot> {
+) -> Option<AggregationJob> {
     let gossip_groups = store.iter_gossip_signatures();
-    let new_payload_keys = store.new_payload_keys();
+    let new_payload_keys = if policy.admits_backlog() {
+        store.new_payload_keys()
+    } else {
+        // A payload-only candidate is a pure proof merge: the most expensive
+        // job there is, and the one with the least claim on the prover right
+        // before the boundary.
+        Vec::new()
+    };
 
     if gossip_groups.is_empty() && new_payload_keys.is_empty() {
         return None;
@@ -350,9 +564,30 @@ pub fn snapshot_aggregation_inputs(
     let validators = &head_state.validators;
 
     let mut candidates: HashMap<H256, AggregationJob> = HashMap::new();
+    let mut tally = WindowTally::default();
 
     for (hashed, validator_sigs) in &gossip_groups {
         let data_root = hashed.root();
+        let admitted = if hashed.data().slot == current_slot {
+            // A current-slot group still collecting signatures is worth more as
+            // one wide proof after the boundary than as several thin ones
+            // before it.
+            policy.admits_current_slot(validator_sigs.len())
+        } else {
+            // Stale groups are backlog: no further signature is coming for
+            // them, so they are only held back to keep the prover free.
+            policy.admits_backlog()
+        };
+        if !admitted {
+            trace!(
+                ?policy,
+                sigs = validator_sigs.len(),
+                group_slot = hashed.data().slot,
+                data_root = %ShortRoot(&data_root.0),
+                "holding aggregation candidate back"
+            );
+            continue;
+        }
         if let Some(job) = build_candidate(
             store,
             hashed.clone(),
@@ -360,6 +595,7 @@ pub fn snapshot_aggregation_inputs(
             validators,
             current_slot,
             window_config,
+            &mut tally,
         ) {
             candidates.insert(data_root, job);
         }
@@ -375,9 +611,15 @@ pub fn snapshot_aggregation_inputs(
             continue;
         }
         let hashed = HashedAttestationData::new(att_data.clone());
-        if let Some(job) =
-            build_candidate(store, hashed, &[], validators, current_slot, window_config)
-        {
+        if let Some(job) = build_candidate(
+            store,
+            hashed,
+            &[],
+            validators,
+            current_slot,
+            window_config,
+            &mut tally,
+        ) {
             candidates.insert(*data_root, job);
         }
     }
@@ -385,7 +627,6 @@ pub fn snapshot_aggregation_inputs(
     if candidates.is_empty() {
         return None;
     }
-    let groups_considered = candidates.len();
     let validator_count = validators.len();
 
     // Chain view covering [0, head_slot]. A state's `historical_block_hashes`
@@ -405,58 +646,105 @@ pub fn snapshot_aggregation_inputs(
         head_state.historical_block_hashes.iter().copied().collect();
     extended_historical_block_hashes.push(store.head().expect("head read works"));
 
-    let mut projected = block_builder::ProjectedState::from_head_state(&head_state);
+    let projected = block_builder::ProjectedState::from_head_state(&head_state);
 
-    let mut jobs: Vec<AggregationJob> = Vec::with_capacity(max_jobs.min(groups_considered));
-    for _round in 0..max_jobs {
-        let Some((data_root, score)) = pick_best_candidate(
-            &candidates,
-            &projected,
-            &known_block_roots,
-            &extended_historical_block_hashes,
-            current_slot,
-            validator_count,
-        ) else {
-            trace!(
-                jobs_selected = jobs.len(),
-                "aggregation selection converged: no scoring candidates"
-            );
-            break;
-        };
+    // One round: the store is re-read before the next job, so a same-target
+    // candidate re-tiers against the aggregate this one produced (once
+    // applied) rather than against an in-memory projection of it.
+    let (data_root, score) = pick_best_candidate(
+        &candidates,
+        &projected,
+        &known_block_roots,
+        &extended_historical_block_hashes,
+        current_slot,
+        validator_count,
+    )
+    .or_else(|| {
+        trace!("aggregation selection converged: no scoring candidates");
+        None
+    })?;
 
-        let job = candidates
-            .remove(&data_root)
-            .expect("picked candidate exists in pool");
-        let coverage = job.coverage();
-        let att_data = job.hashed.data();
-        let target_root = att_data.target.root;
-        let target_slot = att_data.target.slot;
+    let job = candidates
+        .remove(&data_root)
+        .expect("picked candidate exists in pool");
+    let att_data = job.hashed.data();
 
-        trace!(
-            tier = ?score.tier,
-            new_voters = score.new_voters,
-            target_slot,
-            target_root = %ShortRoot(&target_root.0),
-            data_root = %ShortRoot(&data_root.0),
-            "selected aggregation job"
-        );
+    trace!(
+        tier = ?score.tier,
+        new_voters = score.new_voters,
+        target_slot = att_data.target.slot,
+        target_root = %ShortRoot(&att_data.target.root.0),
+        data_root = %ShortRoot(&data_root.0),
+        "selected aggregation job"
+    );
 
-        // Fold the job's realized coverage into the shared projection so
-        // same-target candidates re-tier across rounds exactly as the block
-        // builder's post-state would.
-        projected.advance(score.tier, att_data, coverage.iter().copied());
+    tally.emit();
+    Some(job)
+}
 
-        jobs.push(job);
-    }
-
-    if jobs.is_empty() {
+/// Minimum gossip signatures a current-slot group must hold for the worker to
+/// prove it before the vote-aggregation boundary: two thirds of the votes this
+/// node expects to collect, rounded up.
+///
+/// Groups are keyed by attestation data (not by subnet), so one group gathers
+/// signatures from every subnet we subscribe to; the expected count is
+/// therefore the number of network validators whose committee subnet is one of
+/// ours, not a single committee's worth. With `N` validators across `C`
+/// committees, subnet `s` holds `N / C` validators, plus one more when
+/// `s < N % C`.
+///
+/// Returns `None` when no such validator exists (no subscribed subnet is in
+/// range, or the chain has no committees), which no group can ever clear: the
+/// caller treats that as "wait for the boundary".
+fn min_current_slot_group_sigs(
+    validator_count: u64,
+    committee_count: u64,
+    subscribed_subnets: &HashSet<u64>,
+) -> Option<usize> {
+    if committee_count == 0 {
         return None;
     }
+    let expected_votes: u64 = subscribed_subnets
+        .iter()
+        .filter(|&&subnet| subnet < committee_count)
+        .map(|&subnet| {
+            validator_count / committee_count
+                + u64::from(subnet < validator_count % committee_count)
+        })
+        .sum();
+    let min_sigs = (2 * expected_votes).div_ceil(3) as usize;
+    (min_sigs > 0).then_some(min_sigs)
+}
 
-    Some(AggregationSnapshot {
-        jobs,
-        groups_considered,
-    })
+/// The policy in force `ms_into_slot` into the slot.
+fn job_policy(
+    ms_into_slot: u64,
+    time_config: &ChainConfig,
+    store: &Store,
+    config: &WorkerConfig,
+) -> JobPolicy {
+    let vote_aggregation_offset_ms = vote_aggregation_offset_ms(time_config);
+    if ms_into_slot >= vote_aggregation_offset_ms {
+        return JobPolicy::Open;
+    }
+
+    let validator_count = store.head_state().validators.len() as u64;
+    // With no votes expected there is no quorum to wait for, so nothing
+    // justifies proving a current-slot group early: an unreachable floor holds
+    // every one of them to the boundary.
+    let min_sigs = min_current_slot_group_sigs(
+        validator_count,
+        config.attestation_committee_count,
+        &config.subscribed_subnets,
+    )
+    .unwrap_or(usize::MAX);
+
+    let window_opens_at = vote_aggregation_offset_ms - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
+    if ms_into_slot >= window_opens_at {
+        JobPolicy::CommitteeOnly { min_sigs }
+    } else {
+        JobPolicy::Backlog { min_sigs }
+    }
 }
 
 /// Resolve one candidate `AttestationData` into an [`AggregationJob`]: read
@@ -469,7 +757,8 @@ pub fn snapshot_aggregation_inputs(
 ///
 /// `None` when the window hands this candidate to another duty subnet under
 /// `--skip-redundant-aggregation`, or when the resulting material is not
-/// viable even after the full-window fallback.
+/// viable even after the full-window fallback. Either way the window outcome
+/// goes into `tally`.
 fn build_candidate(
     store: &Store,
     hashed: HashedAttestationData,
@@ -477,19 +766,24 @@ fn build_candidate(
     validators: &[Validator],
     current_slot: u64,
     window_config: AggregationWindowConfig,
+    tally: &mut WindowTally,
 ) -> Option<AggregationJob> {
     let (new_proofs, known_proofs) = store.existing_proofs_for_data(&hashed.root());
-    let window =
-        metered_window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config)?;
-    resolve_job_with_window_fallback(
+    let window = window_for_candidate(&new_proofs, &known_proofs, current_slot, window_config);
+    tally.record_window(window.as_ref());
+    let (job, recovered) = resolve_job_with_window_fallback(
         hashed,
         validator_sigs,
         &new_proofs,
         &known_proofs,
         validators,
-        &window,
+        &window?,
         window_config,
-    )
+    )?;
+    if recovered {
+        tally.fallbacks += 1;
+    }
+    Some(job)
 }
 
 /// Scan the candidate pool and pick the best-scoring, not-yet-selected entry.
@@ -696,9 +990,9 @@ fn fallback_can_recover(
 /// [`SubnetWindow::full`] would score identically, and an empty proof pool has
 /// no child to admit at any width. What is left over, a lone raw signature or
 /// a single-proof group, `resolve_job` also declines for reasons the window
-/// had no part in, so the counter below records recoveries rather than
-/// attempts: `lean_aggregation_window_fallback_total` counts merges the window
-/// would have dropped, not candidates that were never viable.
+/// had no part in, so the flag returned beside the job marks recoveries rather
+/// than attempts: `lean_aggregation_window_fallback_total` counts merges the
+/// window would have dropped, not candidates that were never viable.
 ///
 /// `resolve_job` is store-free, so trying it twice is cheap.
 fn resolve_job_with_window_fallback(
@@ -709,7 +1003,7 @@ fn resolve_job_with_window_fallback(
     validators: &[Validator],
     window: &SubnetWindow,
     config: AggregationWindowConfig,
-) -> Option<AggregationJob> {
+) -> Option<(AggregationJob, bool)> {
     let primary = resolve_job(
         hashed.clone(),
         validator_sigs,
@@ -719,24 +1013,21 @@ fn resolve_job_with_window_fallback(
         window,
     );
     if primary.is_some() || config.skip_redundant {
-        return primary;
+        return primary.map(|job| (job, false));
     }
     if !fallback_can_recover(window, config.committee_count, new_proofs, known_proofs) {
         return None;
     }
     let full = SubnetWindow::full(config.committee_count);
-    let recovered = resolve_job(
+    resolve_job(
         hashed,
         validator_sigs,
         new_proofs,
         known_proofs,
         validators,
         &full,
-    );
-    if recovered.is_some() {
-        metrics::inc_aggregation_window_fallback();
-    }
-    recovered
+    )
+    .map(|job| (job, true))
 }
 
 /// Resolve each child's participant pubkeys. Drops any child whose pubkeys
@@ -775,8 +1066,8 @@ fn resolve_child_pubkeys(
 
 /// Run the expensive `aggregate_mixed` call for a single prepared job.
 ///
-/// Pure function — no store access, safe to call from a `tokio::task::spawn_blocking`
-/// worker. Returns `None` on cryptographic failure.
+/// Pure function — no store access, so the worker thread runs it without
+/// holding any lock. Returns `None` on cryptographic failure.
 pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     if job.raw_ids.is_empty() && job.children.len() < 2 {
         return None;
@@ -815,22 +1106,62 @@ pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     })
 }
 
-/// Apply a worker-produced aggregate to the store. Called per message on the
-/// actor thread; gauge metrics that depend on total counts are batched into
-/// `finalize_aggregation_session` so we pay one lock per session instead of
-/// one per aggregate. Idempotent wrt the gossip delete.
-pub fn apply_aggregated_group(store: &mut Store, output: &AggregatedGroupOutput) {
-    store.insert_new_aggregated_payload(output.hashed.clone(), output.proof.clone());
-    store.delete_gossip_signatures(&output.keys_to_delete);
+/// Store one aggregate the worker just produced and build the announcement
+/// for the actor: the proof into the pending payload pool, and the gossip
+/// signatures it consumed out of the pool.
+///
+/// Runs on the worker thread through its own `Store` handle. `Store`'s `&mut
+/// self` does not mean exclusive access (its buffers are behind `Arc<Mutex<_>>`
+/// and the actor holds a handle of its own), so this interleaves with the
+/// actor, and both writes are safe under that:
+///
+/// - `insert_new_aggregated_payload` records the fork-choice votes before it
+///   pushes the payload, and it records them with a max-merge
+///   (`should_replace_vote`) that gives the same map whatever order concurrent
+///   writers arrive in. A promote landing in the middle moves votes from `new`
+///   to `known` rather than dropping them, so the worst interleaving leaves the
+///   vote or the payload to be promoted one tick later. Neither is lost.
+/// - `delete_gossip_signatures` removes keys this proof consumed. A signature
+///   arriving concurrently for one of them is the same validator's signature
+///   over the same attestation data, i.e. a duplicate of a vote the proof
+///   already binds, so deleting it loses nothing.
+///
+/// Gauge metrics that depend on total counts are batched into
+/// [`refresh_pool_gauges`] instead, so we pay one lock per slot rather than one
+/// per aggregate. Idempotent wrt the gossip delete.
+fn store_aggregate(
+    store: &mut Store,
+    output: AggregatedGroupOutput,
+    elapsed: Duration,
+) -> AggregateProduced {
+    let AggregatedGroupOutput {
+        hashed,
+        proof,
+        participants,
+        keys_to_delete,
+    } = output;
+    // Named before the proof moves into the pool; the bitfield is a few
+    // hundred bytes against the proof's up-to-512 KiB.
+    let bits = proof.participants.clone();
+
+    store.insert_new_aggregated_payload(hashed.clone(), proof);
+    store.delete_gossip_signatures(&keys_to_delete);
 
     metrics::inc_pq_sig_aggregated_signatures();
-    metrics::inc_pq_sig_attestations_in_aggregated_signatures(output.participants.len() as u64);
+    metrics::inc_pq_sig_attestations_in_aggregated_signatures(participants.len() as u64);
+
+    AggregateProduced {
+        hashed,
+        participants: bits,
+        elapsed,
+    }
 }
 
-/// End-of-session gauge refresh. Called once after the worker finishes so the
-/// `lean_latest_new_aggregated_payloads` and `lean_gossip_signatures` gauges
-/// settle on the final counts instead of being churned per aggregate.
-pub fn finalize_aggregation_session(store: &Store) {
+/// Refresh the pool-size gauges. Called from the vote-aggregation tick, once
+/// the slot's buffered aggregates have gone out, so
+/// `lean_latest_new_aggregated_payloads` and `lean_gossip_signatures` settle
+/// on a per-slot reading instead of being churned per aggregate.
+pub fn refresh_pool_gauges(store: &Store) {
     metrics::update_latest_new_aggregated_payloads(store.new_aggregated_payloads_count());
     metrics::update_gossip_signatures(store.gossip_signatures_count());
 }
@@ -1130,59 +1461,94 @@ pub(crate) fn aggregation_bits_from_validator_indices(bits: &[u64]) -> Aggregati
     aggregation_bits
 }
 
-/// Worker loop — runs on a `spawn_blocking` thread, no store access.
+/// Spawn the always-on aggregation worker on its own thread.
 ///
-/// Pulls jobs from the snapshot, runs [`aggregate_job`] for each, and streams
-/// successful aggregates back to the actor as [`AggregateProduced`] messages.
-/// Emits [`AggregationDone`] when the loop exits (completion or cancellation).
-///
-/// Publish alignment: aggregates must not reach the actor (and thus gossip)
-/// before the interval-2 boundary. `publish_at` is that boundary as a wall-clock
-/// instant; a produced aggregate still ahead of it is delivered via
-/// [`send_after`] timed to land at the boundary, otherwise it is sent
-/// immediately. A normal interval-2 session starts at the boundary, so its
-/// aggregates are always past it and sent without delay.
-pub(crate) fn run_aggregation_worker(
-    snapshot: AggregationSnapshot,
+/// The worker owns a [`Store`] clone — same backend, same in-memory buffers —
+/// the shared aggregator-role flag (so a runtime toggle from the RPC thread
+/// reaches it without a restart), and the startup-fixed gate inputs. State the
+/// actor owns rather than shares, such as the sync verdict, reaches it as a
+/// [`PauseReason`] instead. It runs until the returned handle's
+/// [`AggregationWorker::shutdown`] cancels it.
+pub(crate) fn spawn_aggregation_worker(
+    store: Store,
     actor: ActorRef<crate::BlockChainServer>,
-    cancel: CancellationToken,
-    session_id: u64,
-    publish_at: SystemTime,
-) {
-    let start = Instant::now();
-    let groups_considered = snapshot.groups_considered;
-    let mut groups_aggregated = 0usize;
-    let mut total_raw_sigs = 0usize;
-    let mut total_children = 0usize;
-    let jobs_total = snapshot.jobs.len();
-    let mut jobs_attempted = 0usize;
+    aggregator: AggregatorController,
+    config: WorkerConfig,
+) -> AggregationWorker {
+    let cancel = CancellationToken::new();
+    let paused = Arc::new(AtomicU8::new(0));
+    let handle = {
+        let cancel = cancel.clone();
+        let paused = paused.clone();
+        std::thread::Builder::new()
+            .name("aggregation-worker".to_owned())
+            .spawn(move || run_aggregation_worker(store, actor, aggregator, config, cancel, paused))
+            .expect("spawning the aggregation worker thread")
+    };
 
-    for job in snapshot.jobs {
-        if cancel.is_cancelled() {
-            break;
-        }
-        jobs_attempted += 1;
+    AggregationWorker {
+        cancel,
+        paused,
+        handle,
+    }
+}
+
+/// Worker loop — runs on its own thread for the actor's lifetime.
+///
+/// Each round re-reads the pool through the store handle, picks the best job
+/// ([`select_best_job`]), proves it, and hands the result to the actor as an
+/// [`AggregateProduced`] message. With nothing to do — nothing eligible,
+/// parked for some [`PauseReason`], or no aggregation duty — it sleeps
+/// [`WORKER_IDLE_POLL`] and looks again.
+///
+/// `aggregate_mixed` cannot be interrupted, so both cancellation and the pause
+/// reasons are only observed between jobs.
+fn run_aggregation_worker(
+    mut store: Store,
+    actor: ActorRef<crate::BlockChainServer>,
+    aggregator: AggregatorController,
+    config: WorkerConfig,
+    cancel: CancellationToken,
+    paused: Arc<AtomicU8>,
+) {
+    info!("Aggregation worker started");
+
+    // The chain's time grid never changes at runtime, so one read covers the
+    // worker's whole life.
+    let time_config = *store.config();
+
+    while !cancel.is_cancelled() {
+        let Some(job) = next_job(&store, &time_config, &aggregator, &paused, &config) else {
+            std::thread::sleep(WORKER_IDLE_POLL);
+            continue;
+        };
 
         let slot = job.slot;
         let raw_sigs = job.raw_ids.len();
         let children = job.children.len();
 
-        let group_start = Instant::now();
-        let Some(output) = aggregate_job(job) else {
-            let elapsed = group_start.elapsed();
+        let job_start = Instant::now();
+        let output = aggregate_job(job);
+        let elapsed = job_start.elapsed();
+
+        let Some(output) = output else {
             warn!(
-                session_id,
                 slot,
                 raw_sigs,
                 children,
                 ?elapsed,
                 "Committee signature aggregation failed"
             );
+            metrics::inc_aggregator_skipped_other(1);
+            // A failure leaves the store exactly as it found it, so the next
+            // round re-reads the same pool and picks the same job. Sleep before
+            // looping: a proof that fails cheaply, before the prover runs,
+            // would otherwise spin this thread at full speed.
+            std::thread::sleep(WORKER_IDLE_POLL);
             continue;
         };
-        let elapsed = group_start.elapsed();
+
         info!(
-            session_id,
             slot,
             raw_sigs,
             children,
@@ -1191,52 +1557,63 @@ pub(crate) fn run_aggregation_worker(
             "Committee signature aggregated"
         );
 
-        groups_aggregated += 1;
-        total_raw_sigs += raw_sigs;
-        total_children += children;
-
-        // Hold the aggregate until the interval-2 boundary (early session), or
-        // send now if already at/past it. `send_after` is fire-and-forget: it
-        // spawns a timer that delivers the message and is cancelled only if the
-        // actor stops, so the produced aggregate is not lost when the worker's
-        // own loop ends. `duration_since` errs once the boundary has passed,
-        // which collapses to a zero delay here.
-        let delay = publish_at
-            .duration_since(SystemTime::now())
-            .unwrap_or(Duration::ZERO);
-        if delay.is_zero() {
-            if actor
-                .send(AggregateProduced { session_id, output })
-                .is_err()
-            {
-                // Actor is gone; no point producing more.
-                break;
-            }
-        } else {
-            send_after(
-                delay,
-                Context::from_ref(&actor),
-                AggregateProduced { session_id, output },
-            );
+        // Store before announcing, so the pool the actor reads to publish, and
+        // the one the next selection round re-reads, both already account for
+        // this aggregate.
+        let produced = store_aggregate(&mut store, output, elapsed);
+        if actor.send(produced).is_err() {
+            // Actor is gone; nothing would consume further aggregates.
+            break;
         }
     }
 
-    // Jobs the loop never reached (deadline cancellation or actor gone) are
-    // skipped aggregation submissions per leanMetrics.
-    let jobs_dropped = jobs_total - jobs_attempted;
-    if jobs_dropped > 0 {
-        metrics::inc_aggregator_skipped_other(jobs_dropped as u64);
+    info!("Aggregation worker stopped");
+}
+
+/// One round of job selection: honor the role flag and the pause reasons, take
+/// the slot from the store clock and the [`JobPolicy`] from where the wall
+/// clock sits inside it, then ask [`select_best_job`] for the winner. `None`
+/// means "nothing to do right now", which inside the early window is a
+/// deliberate answer rather than an idle one.
+fn next_job(
+    store: &Store,
+    time_config: &ChainConfig,
+    aggregator: &AggregatorController,
+    paused: &AtomicU8,
+    config: &WorkerConfig,
+) -> Option<AggregationJob> {
+    // The role flag is read here because the RPC thread writes it. Everything
+    // the actor itself owns, the sync verdict included, reaches us as a
+    // [`PauseReason`] instead of being re-derived from shared state.
+    if !aggregator.is_enabled() || paused.load(Ordering::Acquire) != 0 {
+        return None;
     }
 
-    let _ = actor.send(AggregationDone {
-        session_id,
-        groups_considered,
-        groups_aggregated,
-        total_raw_sigs,
-        total_children,
-        total_elapsed: start.elapsed(),
-        cancelled: cancel.is_cancelled(),
-    });
+    let now_ms = crate::unix_now_ms();
+    // Before genesis there is no slot to aggregate for. A "has the chain
+    // started" test only; which slot we are in comes from the store clock.
+    if now_ms < time_config.genesis_time_ms() {
+        return None;
+    }
+
+    // The slot comes from the store clock, the one authority the actor drives
+    // the interval grid off (`on_tick`'s idempotency guard keys on it).
+    // Derived independently from the wall clock the two could disagree — the
+    // wall clock drifts behind the monotonic tick cadence inside VMs, and a
+    // long block build leaves the store clock ahead of it — and
+    // `select_best_job` would then bucket the slot's real group as stale,
+    // proving it thin below `min_sigs`, or bucket a stale group as current and
+    // hold it back to a boundary that has already passed.
+    let slot = store.current_slot();
+
+    let policy = job_policy(
+        ms_into_slot(now_ms, slot, time_config),
+        time_config,
+        store,
+        config,
+    );
+
+    select_best_job(store, slot, policy, config.window_config())
 }
 
 #[cfg(test)]
@@ -2114,7 +2491,8 @@ mod tests {
         assert_eq!(picked_root, root_a);
         assert_eq!(score.tier, block_builder::Tier::Build);
 
-        // Apply the selection to the projection, as `snapshot_aggregation_inputs` would.
+        // Fold the winner into the projection, standing in for the store
+        // update the actor applies before the worker's next round.
         let winner = candidates.remove(&picked_root).expect("A is in the pool");
         projected
             .current_votes
@@ -2142,24 +2520,21 @@ mod tests {
         );
     }
 
-    // ---- snapshot_aggregation_inputs (full pipeline) ----
+    // ---- select_best_job (full pipeline) ----
 
     /// An empty store (no gossip signatures, no pending payloads) has nothing
     /// to aggregate.
     #[test]
-    fn snapshot_returns_none_for_empty_store() {
+    fn select_returns_none_for_empty_store() {
         let hashes = vec![H256([1u8; 32])];
         let store = new_test_store(make_head_state(0, 4, &hashes));
-        assert!(
-            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, vacuous_window_config())
-                .is_none()
-        );
+        assert!(select_best_job(&store, 0, JobPolicy::Open, vacuous_window_config()).is_none());
     }
 
     /// A single gossip signature with no other material to merge is dropped
     /// as non-viable up front, leaving zero candidates.
     #[test]
-    fn snapshot_returns_none_for_lone_raw_signature() {
+    fn select_returns_none_for_lone_raw_signature() {
         let hashes = vec![H256([1u8; 32])];
         let mut store = new_test_store(make_head_state(0, 4, &hashes));
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
@@ -2182,10 +2557,7 @@ mod tests {
         let hashed = HashedAttestationData::new(att_data);
         store.insert_gossip_signature(hashed, 0, dummy_sig());
 
-        assert!(
-            snapshot_aggregation_inputs(&store, 0, MAX_AGGREGATION_JOBS, vacuous_window_config())
-                .is_none()
-        );
+        assert!(select_best_job(&store, 0, JobPolicy::Open, vacuous_window_config()).is_none());
     }
 
     /// A group whose target is already justified (here: at or behind the
@@ -2193,7 +2565,7 @@ mod tests {
     /// must never become a job, even with enough raw sigs to otherwise be
     /// viable.
     #[test]
-    fn snapshot_skips_group_whose_target_is_already_justified() {
+    fn select_skips_group_whose_target_is_already_justified() {
         const NUM_VALIDATORS: usize = 10;
         const HEAD_SLOT: u64 = 20;
         const FINALIZED_SLOT: u64 = 10;
@@ -2228,8 +2600,7 @@ mod tests {
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
         assert!(
-            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
-                .is_none(),
+            select_best_job(&store, 999, JobPolicy::Open, vacuous_window_config()).is_none(),
             "a group targeting an already-justified slot must never become a job"
         );
     }
@@ -2249,7 +2620,7 @@ mod tests {
     /// This test FAILS against the unextended (buggy) chain view and PASSES
     /// after the `store.head()` extension.
     #[test]
-    fn snapshot_aggregates_vote_for_current_head_on_non_genesis_chain() {
+    fn select_aggregates_vote_for_current_head_on_non_genesis_chain() {
         const NUM_VALIDATORS: usize = 10;
         const HEAD_SLOT: u64 = 4;
 
@@ -2285,16 +2656,10 @@ mod tests {
         store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
         store.insert_gossip_signature(hashed, 1, dummy_sig());
 
-        let snapshot = snapshot_aggregation_inputs(
-            &store,
-            HEAD_SLOT,
-            MAX_AGGREGATION_JOBS,
-            vacuous_window_config(),
-        )
-        .expect("a vote for the current head must produce a job (chain view covers the tip)");
-        assert_eq!(snapshot.jobs.len(), 1);
+        let job = select_best_job(&store, HEAD_SLOT, JobPolicy::Open, vacuous_window_config())
+            .expect("a vote for the current head must produce a job (chain view covers the tip)");
         assert_eq!(
-            snapshot.jobs[0].hashed.data().target.slot,
+            job.hashed.data().target.slot,
             HEAD_SLOT,
             "the job aggregates the vote targeting the current head"
         );
@@ -2308,10 +2673,16 @@ mod tests {
     /// `v % 4`).
     const WINDOW_TEST_VALIDATORS: usize = 8;
 
+    /// The job the worker would pick at [`WINDOW_TEST_SLOT`] under `config`,
+    /// with the slot's policy fully open so only the window decides.
+    fn windowed_job(store: &Store, config: AggregationWindowConfig) -> Option<AggregationJob> {
+        select_best_job(store, WINDOW_TEST_SLOT, JobPolicy::Open, config)
+    }
+
     /// A store whose `new_payloads` buffer holds one proof per entry in
     /// `participant_sets`, all bound to the same `AttestationData`, so
-    /// `snapshot_aggregation_inputs` sees a single candidate whose pool is
-    /// exactly those proofs.
+    /// [`select_best_job`] sees a single candidate whose pool is exactly those
+    /// proofs.
     ///
     /// Deliberately carries no gossip signatures: a payload-only candidate
     /// isolates child selection from the raw-signature path, which is what the
@@ -2344,7 +2715,7 @@ mod tests {
 
     /// A vote for the canonical block at `slot`, sourced at genesis. Distinct
     /// slots give distinct data roots, so a test can put more than one
-    /// candidate in front of `snapshot_aggregation_inputs`.
+    /// candidate in front of [`select_best_job`].
     fn window_test_att_data(store: &Store, slot: u64, hashes: &[H256]) -> AttestationData {
         let root = if slot == WINDOW_TEST_SLOT {
             store.head().expect("head read works")
@@ -2381,13 +2752,13 @@ mod tests {
 
     /// Two aggregators on different duty subnets, given the same pool of
     /// per-subnet proofs, select different children: the whole point of the
-    /// window. Drives the real `snapshot_aggregation_inputs` path.
+    /// window. Drives the real [`select_best_job`] path.
     ///
     /// A two-subnet smoke case; the full four-subnet climb (and its second
     /// round) is pinned by `four_aggregators_climb_from_per_subnet_proofs_to_full_coverage`,
     /// so keep both.
     #[test]
-    fn snapshot_gives_different_duty_subnets_different_children() {
+    fn selection_gives_different_duty_subnets_different_children() {
         // Four reach-1 proofs (one per subnet), so the derived width is 2 and
         // duty subnet s covers {s, s+1}.
         let store = store_with_payload_only_proofs(
@@ -2406,9 +2777,8 @@ mod tests {
                 committee_count: 4,
                 skip_redundant: false,
             };
-            let snapshot = snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
-                .expect("a payload-only merge is viable");
-            snapshot.jobs[0]
+            windowed_job(&store, config)
+                .expect("a payload-only merge is viable")
                 .accepted_child_ids
                 .iter()
                 .copied()
@@ -2428,10 +2798,10 @@ mod tests {
     /// what round 1 published, all reach 2, so the width is 4 and every
     /// aggregator reaches the full validator set.
     ///
-    /// The two rounds are constructed here as two separate stores, not
-    /// observed from one session: only one session runs per slot, so in
-    /// production these would be two successive slots' sessions for a data
-    /// root that stays live, not two rounds back to back within one session.
+    /// The two rounds are constructed here as two separate stores, standing
+    /// in for the pool each aggregator's worker re-reads once the other
+    /// aggregators' round-one proofs have arrived. In production that can be
+    /// the same slot or a later one, whichever the pool reaches first.
     #[test]
     fn four_aggregators_climb_from_per_subnet_proofs_to_full_coverage() {
         const COMMITTEE_COUNT: u64 = 4;
@@ -2442,9 +2812,8 @@ mod tests {
                 committee_count: COMMITTEE_COUNT,
                 skip_redundant: false,
             };
-            snapshot_aggregation_inputs(store, WINDOW_TEST_SLOT, 1, config)
+            windowed_job(store, config)
                 .expect("a payload-only merge is viable")
-                .jobs[0]
                 .coverage()
         };
 
@@ -2516,9 +2885,8 @@ mod tests {
                 committee_count: COMMITTEE_COUNT,
                 skip_redundant: false,
             };
-            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+            windowed_job(&store, config)
                 .expect("a payload-only merge is viable")
-                .jobs[0]
                 .coverage()
         };
 
@@ -2534,7 +2902,7 @@ mod tests {
         );
     }
 
-    /// A skipped candidate hands its job budget to the next-best
+    /// A skipped candidate hands the worker's next job to the next-best
     /// `AttestationData` rather than being downgraded to a narrower merge of
     /// its own. Two candidates, one job:
     ///
@@ -2578,8 +2946,7 @@ mod tests {
                 committee_count: 4,
                 skip_redundant,
             };
-            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
-                .map(|snapshot| snapshot.jobs[0].hashed.data().slot)
+            windowed_job(&store, config).map(|job| job.hashed.data().slot)
         };
 
         assert_eq!(
@@ -2602,10 +2969,10 @@ mod tests {
     /// With the redundancy-skipping rotation on, a duty subnet that does not
     /// own the derived width sits the candidate out so its job budget can go
     /// to the next-best `AttestationData`. Here that candidate is the only
-    /// one, so the session is simply empty for those aggregators; in
-    /// production the budget lands on the current slot's own candidate, whose
-    /// empty pool gives it no anchor and therefore width 1, which everybody
-    /// owns.
+    /// one, so those aggregators' workers find nothing to prove; in
+    /// production the job goes to the current slot's own candidate until this
+    /// node proves it, since its empty pool gives it no anchor and therefore
+    /// width 1, which everybody owns.
     #[test]
     fn skip_redundant_leaves_unowned_duty_subnets_without_a_job() {
         let pool = [
@@ -2614,30 +2981,24 @@ mod tests {
             make_bits(&[2, 6]),
             make_bits(&[3, 7]),
         ];
-        let snapshot_for = |duty_subnet: u64| {
+        let job_for = |duty_subnet: u64| {
             let store = store_with_payload_only_proofs(WINDOW_TEST_VALIDATORS, &pool);
             let config = AggregationWindowConfig {
                 duty_subnet,
                 committee_count: 4,
                 skip_redundant: true,
             };
-            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+            windowed_job(&store, config)
         };
 
+        assert!(job_for(0).is_some(), "duty 0 owns width 2 at this slot");
+        assert!(job_for(2).is_some(), "duty 2 owns width 2 at this slot");
         assert!(
-            snapshot_for(0).is_some(),
-            "duty 0 owns width 2 at this slot"
-        );
-        assert!(
-            snapshot_for(2).is_some(),
-            "duty 2 owns width 2 at this slot"
-        );
-        assert!(
-            snapshot_for(1).is_none(),
+            job_for(1).is_none(),
             "duty 1 does not own width 2 at this slot"
         );
         assert!(
-            snapshot_for(3).is_none(),
+            job_for(3).is_none(),
             "duty 3 does not own width 2 at this slot"
         );
     }
@@ -2679,12 +3040,12 @@ mod tests {
             skip_redundant: false,
         };
 
-        let snapshot = snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config).expect(
+        let job = windowed_job(&store, config).expect(
             "the full-width fallback recovers a viable job the windowed selection alone drops",
         );
 
         assert_eq!(
-            snapshot.jobs[0].coverage(),
+            job.coverage(),
             HashSet::from([5, 7, 13, 15]),
             "coverage matches the unwindowed selection's last-two-by-pool-order tie-break"
         );
@@ -2777,9 +3138,8 @@ mod tests {
                 committee_count: 1,
                 skip_redundant: false,
             };
-            snapshot_aggregation_inputs(&store, WINDOW_TEST_SLOT, 1, config)
+            windowed_job(&store, config)
                 .expect("a payload-only merge is viable")
-                .jobs[0]
                 .coverage()
         };
 
@@ -2835,48 +3195,240 @@ mod tests {
         store
     }
 
-    /// With more scoring candidates than `MAX_AGGREGATION_JOBS`, exactly that
-    /// many jobs are produced — the best `MAX_AGGREGATION_JOBS` by ordering
-    /// key, i.e. the top two by `target_slot`.
+    /// From a pool of competing candidates the selector emits the single
+    /// best-scoring one — here the highest `target_slot`, which wins the
+    /// Build-tier `new_voters` tie.
     #[test]
-    fn snapshot_caps_jobs_at_max_aggregation_jobs() {
+    fn select_picks_the_best_scoring_candidate() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot =
-            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
-                .expect("should produce jobs");
-        assert_eq!(snapshot.groups_considered, NUM_GROUPS);
-        assert_eq!(snapshot.jobs.len(), MAX_AGGREGATION_JOBS);
+        let job = select_best_job(&store, 999, JobPolicy::Open, vacuous_window_config())
+            .expect("should produce a job");
+        assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
+    }
 
-        let selected_targets: HashSet<u64> = snapshot
-            .jobs
-            .iter()
-            .map(|job| job.hashed.data().target.slot)
-            .collect();
+    /// Early in the slot a current-slot group short of the signature floor is
+    /// held back, but stale groups in the same pool are still fair game: the
+    /// worker keeps busy on the backlog.
+    #[test]
+    fn select_holds_current_slot_group_below_the_floor() {
+        let store = store_with_competing_build_tier_groups();
+
+        // Groups carry two signatures each and are keyed by `target_slot`,
+        // which doubles as their attestation slot in this fixture.
+        let job = select_best_job(
+            &store,
+            NUM_GROUPS as u64,
+            JobPolicy::Backlog { min_sigs: 3 },
+            vacuous_window_config(),
+        )
+        .expect("stale groups stay eligible");
         assert_eq!(
-            selected_targets,
-            HashSet::from([4, 5]),
-            "the two highest target_slot groups win the new_voters tie"
+            job.hashed.data().target.slot,
+            NUM_GROUPS as u64 - 1,
+            "the current-slot group is held; the best stale one is taken instead"
         );
     }
 
-    /// The proposer cap (`max_jobs = 1`) yields exactly one job from the same
-    /// pool, and it is the single best-scoring candidate — the one the uncapped
-    /// selection also picks first (highest `target_slot`). Every other candidate
-    /// is still counted in `groups_considered`, so the cap is visibly a
-    /// selection bound rather than a narrower candidate pool.
+    /// Inside the early window the backlog is held back too: with no
+    /// current-slot group at the floor there is nothing to do, and idling is
+    /// the point — a recursive merge started here would run into the slot's
+    /// committee aggregation.
     #[test]
-    fn snapshot_caps_jobs_at_one_for_proposer() {
+    fn select_holds_the_backlog_inside_the_early_window() {
         let store = store_with_competing_build_tier_groups();
 
-        let snapshot = snapshot_aggregation_inputs(&store, 999, 1, vacuous_window_config())
-            .expect("should produce a job");
-        assert_eq!(snapshot.groups_considered, NUM_GROUPS);
-        assert_eq!(snapshot.jobs.len(), 1);
-        assert_eq!(
-            snapshot.jobs[0].hashed.data().target.slot,
-            NUM_GROUPS as u64,
-            "the single job is the best-scoring candidate, not an arbitrary one"
+        assert!(
+            select_best_job(
+                &store,
+                NUM_GROUPS as u64,
+                JobPolicy::CommitteeOnly { min_sigs: 3 },
+                vacuous_window_config(),
+            )
+            .is_none(),
+            "no current-slot group meets the floor, so the worker waits"
         );
+    }
+
+    /// The current-slot group is taken inside the window as soon as it meets
+    /// the floor: that is the work the window is kept free for.
+    #[test]
+    fn select_takes_the_current_slot_group_at_the_floor() {
+        let store = store_with_competing_build_tier_groups();
+
+        let job = select_best_job(
+            &store,
+            NUM_GROUPS as u64,
+            JobPolicy::CommitteeOnly { min_sigs: 2 },
+            vacuous_window_config(),
+        )
+        .expect("the current-slot group meets the floor");
+        assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
+    }
+
+    /// The same group the floor held back is taken once the boundary opens the
+    /// policy, however few signatures it holds.
+    #[test]
+    fn select_takes_current_slot_group_once_the_policy_opens() {
+        let store = store_with_competing_build_tier_groups();
+
+        let job = select_best_job(
+            &store,
+            NUM_GROUPS as u64,
+            JobPolicy::Open,
+            vacuous_window_config(),
+        )
+        .expect("should produce a job");
+        assert_eq!(job.hashed.data().target.slot, NUM_GROUPS as u64);
+    }
+
+    /// The floor is two thirds of the votes the node's own subnets are
+    /// expected to carry, not two thirds of the validator set: with 10
+    /// validators over 4 committees, subnets 0 and 1 hold 3 each, so a group
+    /// gathering both needs 4 of those 6.
+    #[test]
+    fn min_current_slot_group_sigs_counts_subscribed_subnets_only() {
+        let subscribed = HashSet::from([0, 1]);
+        assert_eq!(
+            min_current_slot_group_sigs(10, 4, &subscribed),
+            Some(4),
+            "ceil(2/3 * (3 + 3))"
+        );
+
+        // A subnet past the committee count carries no validators.
+        assert_eq!(
+            min_current_slot_group_sigs(10, 4, &HashSet::from([9])),
+            None
+        );
+        // No committees at all: nothing to expect.
+        assert_eq!(min_current_slot_group_sigs(10, 0, &subscribed), None);
+    }
+
+    /// The policy is purely a function of where in the slot we are: backlog
+    /// work early, committee signatures only inside the early window, and
+    /// everything from the vote-aggregation boundary to the slot's end. The
+    /// boundaries follow the configured slot duration; the window ahead of
+    /// them does not, since it is sized against one leanVM proof.
+    #[test]
+    fn job_policy_tightens_into_the_window_and_opens_at_the_boundary() {
+        let hashes = vec![H256([1u8; 32])];
+        let store = new_test_store(make_head_state(0, 10, &hashes));
+        let config = WorkerConfig {
+            attestation_committee_count: 4,
+            subscribed_subnets: HashSet::from([0, 1]),
+            aggregation_duty_subnet: 0,
+            skip_redundant_aggregation: false,
+        };
+        // 10 validators over 4 committees: subnets 0 and 1 hold 3 each, so a
+        // group gathering both needs 4 of those 6.
+        let min_sigs = 4;
+
+        for milliseconds_per_slot in [DEFAULT_MILLISECONDS_PER_SLOT, 8_000] {
+            let time_config = ChainConfig::new(1_000, milliseconds_per_slot);
+            let boundary = vote_aggregation_offset_ms(&time_config);
+            assert_eq!(boundary, 2 * milliseconds_per_slot / INTERVALS_PER_SLOT);
+            let window_opens_at = boundary - EARLY_AGGREGATION_WINDOW.as_millis() as u64;
+
+            assert_eq!(
+                job_policy(0, &time_config, &store, &config),
+                JobPolicy::Backlog { min_sigs }
+            );
+            assert_eq!(
+                job_policy(window_opens_at - 1, &time_config, &store, &config),
+                JobPolicy::Backlog { min_sigs }
+            );
+            assert_eq!(
+                job_policy(window_opens_at, &time_config, &store, &config),
+                JobPolicy::CommitteeOnly { min_sigs }
+            );
+            assert_eq!(
+                job_policy(boundary - 1, &time_config, &store, &config),
+                JobPolicy::CommitteeOnly { min_sigs }
+            );
+            assert_eq!(
+                job_policy(boundary, &time_config, &store, &config),
+                JobPolicy::Open
+            );
+            assert_eq!(
+                job_policy(milliseconds_per_slot - 1, &time_config, &store, &config),
+                JobPolicy::Open
+            );
+        }
+    }
+
+    /// The point of a bitset over a single flag: reasons are independent, so
+    /// setting one twice is idempotent (the level-driven owner sets its reason
+    /// on every tick) and releasing one leaves the others holding the worker.
+    #[test]
+    fn pause_reasons_are_independent() {
+        let paused = AtomicU8::new(0);
+
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+        set_pause_reason(&paused, PauseReason::BlockBuild, true);
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        // The build finishing leaves the sync gate still holding the worker.
+        set_pause_reason(&paused, PauseReason::BlockBuild, false);
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+
+        set_pause_reason(&paused, PauseReason::Syncing, false);
+        assert_eq!(paused.load(Ordering::Acquire), 0);
+    }
+
+    /// A guard clears its own reason and nothing else. Under the plain bool
+    /// this replaced, dropping the block-build guard released every reason.
+    #[test]
+    fn pause_guard_drop_releases_only_its_own_reason() {
+        let paused = Arc::new(AtomicU8::new(0));
+        set_pause_reason(&paused, PauseReason::Syncing, true);
+
+        {
+            set_pause_reason(&paused, PauseReason::BlockBuild, true);
+            let _guard = PauseGuard {
+                paused: paused.clone(),
+                reason: PauseReason::BlockBuild,
+            };
+        }
+
+        assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+    }
+
+    /// The store clock owns which slot the worker is in, so the wall-clock
+    /// offset is always measured against *that* slot and clamped to it. A wall
+    /// clock lagging the store reads as the start of the store's slot, one
+    /// running ahead as its end; neither can describe a position inside a
+    /// different slot, which is what would mis-bucket the slot's own group.
+    #[test]
+    fn ms_into_slot_is_measured_against_the_store_slot() {
+        let time_config = ChainConfig::new(1_000, DEFAULT_MILLISECONDS_PER_SLOT);
+        let genesis_ms = time_config.genesis_time_ms();
+        let slot = 7;
+        let slot_start_ms = genesis_ms + slot * DEFAULT_MILLISECONDS_PER_SLOT;
+
+        assert_eq!(ms_into_slot(slot_start_ms, slot, &time_config), 0);
+        assert_eq!(
+            ms_into_slot(slot_start_ms + 1_234, slot, &time_config),
+            1_234
+        );
+
+        // Wall clock a slot and a half behind the store: clamped to the start
+        // of the store's slot, the permissive `Backlog` end.
+        let behind = slot_start_ms - DEFAULT_MILLISECONDS_PER_SLOT / 2;
+        assert_eq!(ms_into_slot(behind, slot, &time_config), 0);
+        assert_eq!(ms_into_slot(genesis_ms, slot, &time_config), 0);
+
+        // Wall clock past the end of the store's slot: clamped to the slot's
+        // width, which is at or past the vote-aggregation boundary, so `Open`.
+        let ahead = slot_start_ms + 3 * DEFAULT_MILLISECONDS_PER_SLOT;
+        assert_eq!(
+            ms_into_slot(ahead, slot, &time_config),
+            DEFAULT_MILLISECONDS_PER_SLOT
+        );
+        assert!(
+            ms_into_slot(ahead, slot, &time_config) >= vote_aggregation_offset_ms(&time_config)
+        );
+
+        // Before genesis at all: still the start of slot 0, no underflow.
+        assert_eq!(ms_into_slot(0, 0, &time_config), 0);
     }
 }
