@@ -469,12 +469,12 @@ pub fn compute_proposer_indices(
 ///
 /// Takes `committees` rather than deriving each committee itself
 /// (`get_beacon_committee`, one active-set scan and one per-member shuffle
-/// apiece): `process_ptc_window` (a later task) calls this once per slot of
-/// an epoch, and at mainnet scale that is `SLOTS_PER_EPOCH` calls against a
-/// multi-million-validator registry, so sharing one epoch-wide shuffle
-/// across all of them (see [`CommitteeCache`]'s own doc) is what keeps that
-/// affordable; [`super::electra::get_attesting_indices`] takes the same
-/// parameter for the same reason.
+/// apiece): [`crate::beacon::stf::epoch::gloas::process_ptc_window`] calls this
+/// once per slot of an epoch, and at mainnet scale that is `SLOTS_PER_EPOCH`
+/// calls against a multi-million-validator registry, so sharing one
+/// epoch-wide shuffle across all of them (see [`CommitteeCache`]'s own doc) is
+/// what keeps that affordable; [`super::electra::get_attesting_indices`] takes
+/// the same parameter for the same reason.
 pub fn compute_ptc(
     state: &BeaconState,
     slot: Slot,
@@ -628,10 +628,10 @@ pub fn get_attestation_participation_flag_indices(
 ///
 /// Unlike [`compute_ptc`] (which always derives one fresh), this reads the
 /// cached window [`gloas::BeaconState::ptc_window`]
-/// `process_ptc_window` (gloas epoch processing)
-/// refreshes each epoch: `slot`'s epoch must be the state's own, the one
-/// before it, or within [`preset::MIN_SEED_LOOKAHEAD`] epochs ahead, which is
-/// exactly the window's own span.
+/// [`crate::beacon::stf::epoch::gloas::process_ptc_window`] refreshes each epoch:
+/// `slot`'s epoch must be the state's own, the one before it, or within
+/// [`preset::MIN_SEED_LOOKAHEAD`] epochs ahead, which is exactly the window's
+/// own span.
 pub fn get_ptc(
     state: &BeaconState,
     slot: Slot,
@@ -717,8 +717,8 @@ pub fn get_indexed_payload_attestation(
 }
 
 /// The attesting weight a builder payment needs before
-/// `process_builder_pending_payments` (a later task) settles it in full
-/// rather than dropping it: [`constants::BUILDER_PAYMENT_THRESHOLD_NUMERATOR`]
+/// [`crate::beacon::stf::epoch::gloas::process_builder_pending_payments`] settles
+/// it in full rather than dropping it: [`constants::BUILDER_PAYMENT_THRESHOLD_NUMERATOR`]
 /// `/` [`constants::BUILDER_PAYMENT_THRESHOLD_DENOMINATOR`] of one slot's
 /// share of the total active balance.
 pub fn get_builder_payment_quorum_threshold(state: &BeaconState) -> Result<Gwei> {
@@ -814,9 +814,14 @@ pub fn initiate_builder_exit(
 /// [`gloas::BeaconState::builder_pending_withdrawals`] if it carries a real
 /// amount, then clears the slot.
 ///
-/// Called by `process_builder_pending_payments` (a later task) once a
-/// payment's accumulated attesting weight has been compared against
-/// [`get_builder_payment_quorum_threshold`].
+/// Called by `apply_parent_execution_payload` (parent-payload block
+/// processing, a later task; SPEC `beacon-chain.md`'s "Settle the builder
+/// payment", ~1767-1780), not by
+/// [`crate::beacon::stf::epoch::gloas::process_builder_pending_payments`]: that
+/// epoch step evicts and settles the *older* half of `builder_pending_payments`
+/// by weight, against [`get_builder_payment_quorum_threshold`]; this settles
+/// one parent block's still-live entry unconditionally, the moment that
+/// block's payload is applied.
 pub fn settle_builder_payment(state: &mut gloas::BeaconState, payment_index: u64) -> Result<()> {
     let len = state.builder_pending_payments.len() as u64;
     crate::beacon::verify(
@@ -895,11 +900,12 @@ pub fn add_builder_to_registry(
 
 /// The gloas state, mutably, or an error naming the function that needs one.
 ///
-/// Kept alongside [`gloas_state_ref`] for a function that mixes a gloas-only
-/// field with others reached through fork-invariant accessors, the way
-/// [`gloas_state_ref`]'s own doc describes; `crate::beacon::upgrade::upgrade_to_gloas`
-/// is the first caller, reaching `ptc_window` and `pending_deposits` through
-/// this projection after building `post` as the full [`BeaconState`] enum.
+/// Kept alongside [`gloas_state_ref`] for mutating a gloas-only field
+/// through a generic [`BeaconState`] rather than one already known to be
+/// [`BeaconState::Gloas`] the way [`initiate_builder_exit`] and
+/// [`settle_builder_payment`] are always called with. The fork upgrade
+/// (`crate::beacon::upgrade::upgrade_to_gloas`) and
+/// [`crate::beacon::stf::epoch::gloas`] are its callers.
 pub(crate) fn gloas_state<'a>(
     state: &'a mut BeaconState,
     function: &'static str,

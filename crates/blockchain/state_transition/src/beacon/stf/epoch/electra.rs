@@ -35,8 +35,9 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{DepositMessage, Validator};
-use crate::beacon::containers::{BeaconState, electra, fulu};
+use crate::beacon::containers::{BeaconState, electra, fulu, gloas};
 use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{get_current_epoch, get_total_active_balance};
 use crate::beacon::helpers::electra::{
     get_activation_exit_churn_limit, get_max_effective_balance, initiate_validator_exit,
@@ -333,7 +334,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
                 "deposit_balance_to_consume + get_activation_exit_churn_limit",
             ))?;
         let deposits: Vec<electra::PendingDeposit> =
-            core::mem::take(fields.pending_deposits_mut()).into_inner();
+            core::mem::take(fields.pending_deposits_mut()?).into_inner();
         (
             deposit_requests_start_index,
             available_for_processing,
@@ -423,7 +424,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
     };
 
     let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
-    *fields.pending_deposits_mut() = electra::PendingDeposits::try_from(remaining)?;
+    *fields.pending_deposits_mut()? = electra::PendingDeposits::try_from(remaining)?;
     *fields.deposit_balance_to_consume_mut() = deposit_balance_to_consume;
 
     Ok(())
@@ -579,12 +580,22 @@ fn add_validator_from_pending_deposit(
 /// behind it, is left in place (not postponed to the back, unlike
 /// [`process_pending_deposits`]'s exited-validator case) to be retried once
 /// it clears.
+///
+/// Also served, unmodified, by gloas: nothing in gloas's own
+/// `beacon-chain.md` touches this function, and the only thing that keeps a
+/// gloas state from calling this exact copy is the queue's own type
+/// (`ProgressiveList` rather than `SszList`, EIP-7688), which
+/// [`PendingQueueFields::take_pending_consolidations`]/[`PendingQueueFields::set_pending_consolidations`]
+/// already abstract over at the `Vec` level. Contrast
+/// [`process_pending_deposits`], which gloas's own `beacon-chain.md` modifies
+/// outright and which therefore keeps its own copy
+/// (`crate::beacon::stf::epoch::gloas::process_pending_deposits`).
 pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
 
     let consolidations: Vec<electra::PendingConsolidation> = {
         let mut fields = pending_queue_fields(state, "process_pending_consolidations")?;
-        core::mem::take(fields.pending_consolidations_mut()).into_inner()
+        fields.take_pending_consolidations()
     };
 
     let mut next_pending_consolidation = 0usize;
@@ -619,7 +630,7 @@ pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config)
         .skip(next_pending_consolidation)
         .collect();
     let mut fields = pending_queue_fields(state, "process_pending_consolidations")?;
-    *fields.pending_consolidations_mut() = electra::PendingConsolidations::try_from(remaining)?;
+    fields.set_pending_consolidations(remaining)?;
 
     Ok(())
 }
@@ -697,9 +708,18 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
 /// the same way this module's own [`process_pending_deposits`] does; it never
 /// reads [`Self::deposit_requests_start_index`], the one field that function
 /// stops consulting.
+///
+/// Gloas joins the enum too (EIP-8061 leaves `deposit_requests_start_index`
+/// and `deposit_balance_to_consume` unchanged, and `beacon-chain.md` does not
+/// modify [`process_pending_consolidations`] at all), even though gloas's own
+/// [`process_pending_deposits`] is a separate function
+/// (`crate::beacon::stf::epoch::gloas::process_pending_deposits`, SPEC marks it
+/// Modified) that reaches its own queue and churn field directly through
+/// `gloas_state` rather than through here.
 pub(crate) enum PendingQueueFields<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
+    Gloas(&'a mut gloas::BeaconState),
 }
 
 impl<'a> PendingQueueFields<'a> {
@@ -713,11 +733,14 @@ impl<'a> PendingQueueFields<'a> {
     /// [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`], the
     /// precondition [`super::fulu::process_pending_deposits`]'s own doc
     /// explains. [`super::fulu::process_pending_deposits`] itself never reads
-    /// this field.
+    /// this field, and no gloas caller reads it through here at all (gloas's
+    /// own `process_pending_deposits` does not read it either; see this
+    /// enum's own doc).
     pub(crate) fn deposit_requests_start_index(&self) -> u64 {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
             PendingQueueFields::Fulu(state) => state.deposit_requests_start_index,
+            PendingQueueFields::Gloas(state) => state.deposit_requests_start_index,
         }
     }
 
@@ -726,6 +749,7 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => state.deposit_balance_to_consume,
         }
     }
 
@@ -733,29 +757,88 @@ impl<'a> PendingQueueFields<'a> {
         match self {
             PendingQueueFields::Electra(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => &mut state.deposit_balance_to_consume,
         }
     }
 
     /// Deposits known but not yet credited to the validator registry.
-    pub(crate) fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
+    ///
+    /// Electra and fulu only, even though this enum now spans gloas too (for
+    /// [`Self::take_pending_consolidations`]'s sake): gloas's own
+    /// `pending_deposits` is `ProgressiveList<PendingDeposit>` (EIP-7688), a
+    /// different Rust type from electra's and fulu's bounded `SszList` this
+    /// returns, and gloas's own `process_pending_deposits` reads its queue
+    /// directly through `gloas_state` instead of through here (see this
+    /// enum's own doc). Fallible, unlike the pre-gloas version of this
+    /// method, purely so a gloas-backed value answers `UnsupportedForFork`
+    /// here instead of failing to compile a shared return type; no caller
+    /// ever actually reaches that arm.
+    pub(crate) fn pending_deposits_mut(&mut self) -> Result<&mut electra::PendingDeposits> {
         match self {
-            PendingQueueFields::Electra(state) => &mut state.pending_deposits,
-            PendingQueueFields::Fulu(state) => &mut state.pending_deposits,
+            PendingQueueFields::Electra(state) => Ok(&mut state.pending_deposits),
+            PendingQueueFields::Fulu(state) => Ok(&mut state.pending_deposits),
+            PendingQueueFields::Gloas(_) => Err(Error::UnsupportedForFork {
+                function: "PendingQueueFields::pending_deposits_mut",
+                fork: ForkName::Gloas,
+            }),
         }
     }
 
-    /// Consolidations known but not yet applied.
-    fn pending_consolidations_mut(&mut self) -> &mut electra::PendingConsolidations {
+    /// Takes the whole pending-consolidations queue out, leaving an empty one
+    /// behind; [`Self::set_pending_consolidations`] puts a (possibly
+    /// shorter) one back. Vec-level rather than the container-typed accessor
+    /// [`Self::pending_deposits_mut`] uses: gloas's own queue is
+    /// `ProgressiveList<PendingConsolidation>` (EIP-7688), a different Rust
+    /// type from electra's and fulu's bounded `SszList`, and unlike
+    /// `process_pending_deposits`, [`process_pending_consolidations`] is
+    /// meant to serve a gloas state directly (gloas's `beacon-chain.md` does
+    /// not modify this function at all), which a shared Vec return type is
+    /// what makes possible.
+    pub(crate) fn take_pending_consolidations(&mut self) -> Vec<electra::PendingConsolidation> {
         match self {
-            PendingQueueFields::Electra(state) => &mut state.pending_consolidations,
-            PendingQueueFields::Fulu(state) => &mut state.pending_consolidations,
+            PendingQueueFields::Electra(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
+            PendingQueueFields::Fulu(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
+            PendingQueueFields::Gloas(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
         }
+    }
+
+    /// See [`Self::take_pending_consolidations`]. Fallible only for electra's
+    /// and fulu's bounded `SszList`; gloas's progressive one never rejects a
+    /// length.
+    pub(crate) fn set_pending_consolidations(
+        &mut self,
+        consolidations: Vec<electra::PendingConsolidation>,
+    ) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.pending_consolidations =
+                    electra::PendingConsolidations::try_from(consolidations)?;
+            }
+            PendingQueueFields::Fulu(state) => {
+                state.pending_consolidations =
+                    electra::PendingConsolidations::try_from(consolidations)?;
+            }
+            PendingQueueFields::Gloas(state) => {
+                state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
+            }
+        }
+        Ok(())
     }
 
     /// Extends `previous_epoch_participation`, `current_epoch_participation`,
     /// and `inactivity_scores` by one all-zero entry each, keeping them
     /// exactly as long as the registry after
     /// [`add_validator_from_pending_deposit`] appends a validator.
+    ///
+    /// Gloas's own three lists are progressive (`libssz_types::ProgressiveList`),
+    /// so their `push` is infallible, unlike electra's and fulu's bounded
+    /// `SszList`.
     fn push_empty_participation_and_inactivity(&mut self) -> Result<()> {
         match self {
             PendingQueueFields::Electra(state) => {
@@ -768,14 +851,20 @@ impl<'a> PendingQueueFields<'a> {
                 state.current_epoch_participation.push(0)?;
                 state.inactivity_scores.push(0)?;
             }
+            PendingQueueFields::Gloas(state) => {
+                state.previous_epoch_participation.push(0);
+                state.current_epoch_participation.push(0);
+                state.inactivity_scores.push(0);
+            }
         }
         Ok(())
     }
 }
 
-/// The electra-or-fulu state, mutably, through [`PendingQueueFields`]. See
-/// its own doc for why this is a second projection rather than a call into
-/// [`crate::beacon::helpers::electra::electra_state`].
+/// The electra, fulu, or gloas state, mutably, through [`PendingQueueFields`].
+/// See its own doc for why this is a second projection rather than a call
+/// into [`crate::beacon::helpers::electra::electra_state`], and for why gloas
+/// joins electra and fulu here.
 pub(crate) fn pending_queue_fields<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
@@ -783,6 +872,7 @@ pub(crate) fn pending_queue_fields<'a>(
     match state {
         BeaconState::Electra(state) => Ok(PendingQueueFields::Electra(state)),
         BeaconState::Fulu(state) => Ok(PendingQueueFields::Fulu(state)),
+        BeaconState::Gloas(state) => Ok(PendingQueueFields::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -841,6 +931,7 @@ mod tests {
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit)
             .unwrap();
 
@@ -850,7 +941,7 @@ mod tests {
         assert_eq!(state.balance(0).unwrap(), balance_before + deposit_amount);
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
         assert_eq!(fields.deposit_balance_to_consume(), 0);
-        assert!(fields.pending_deposits_mut().is_empty());
+        assert!(fields.pending_deposits_mut().unwrap().is_empty());
     }
 
     #[test]
@@ -878,6 +969,7 @@ mod tests {
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit.clone())
             .unwrap();
 
@@ -888,7 +980,7 @@ mod tests {
         assert_eq!(state.balance(0).unwrap(), balance_before);
         // ...and not lost: it comes back out the other end of the queue.
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
-        let remaining = fields.pending_deposits_mut();
+        let remaining = fields.pending_deposits_mut().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], deposit);
     }
@@ -926,8 +1018,12 @@ mod tests {
         };
         {
             let mut fields = pending_queue_fields(&mut state, "test setup").unwrap();
-            fields.pending_deposits_mut().push(first).unwrap();
-            fields.pending_deposits_mut().push(second.clone()).unwrap();
+            fields.pending_deposits_mut().unwrap().push(first).unwrap();
+            fields
+                .pending_deposits_mut()
+                .unwrap()
+                .push(second.clone())
+                .unwrap();
         }
 
         let balance_0_before = state.balance(0).unwrap();
@@ -946,7 +1042,7 @@ mod tests {
             fields.deposit_balance_to_consume(),
             churn_limit - first_amount
         );
-        let remaining = fields.pending_deposits_mut();
+        let remaining = fields.pending_deposits_mut().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], second);
     }
@@ -990,6 +1086,7 @@ mod tests {
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit)
             .unwrap();
 
@@ -1041,6 +1138,7 @@ mod tests {
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit)
             .unwrap();
 
@@ -1054,7 +1152,7 @@ mod tests {
         );
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
         assert!(
-            fields.pending_deposits_mut().is_empty(),
+            fields.pending_deposits_mut().unwrap().is_empty(),
             "the entry is still consumed from the queue, just never credited"
         );
     }
@@ -1075,8 +1173,7 @@ mod tests {
         };
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .pending_consolidations_mut()
-            .push(consolidation)
+            .set_pending_consolidations(vec![consolidation])
             .unwrap();
 
         let source_balance_before = state.balance(0).unwrap();
@@ -1086,7 +1183,7 @@ mod tests {
         assert_eq!(state.balance(0).unwrap(), source_balance_before);
         assert_eq!(state.balance(1).unwrap(), target_balance_before);
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
-        assert!(fields.pending_consolidations_mut().is_empty());
+        assert!(fields.take_pending_consolidations().is_empty());
     }
 
     #[test]
@@ -1102,14 +1199,13 @@ mod tests {
         };
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .pending_consolidations_mut()
-            .push(consolidation.clone())
+            .set_pending_consolidations(vec![consolidation.clone()])
             .unwrap();
 
         process_pending_consolidations(&mut state, &config).unwrap();
 
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
-        let remaining = fields.pending_consolidations_mut();
+        let remaining = fields.take_pending_consolidations();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], consolidation);
     }
@@ -1126,8 +1222,7 @@ mod tests {
         };
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .pending_consolidations_mut()
-            .push(consolidation)
+            .set_pending_consolidations(vec![consolidation])
             .unwrap();
 
         let source_effective_balance = state.validator(0).unwrap().effective_balance;
@@ -1140,7 +1235,7 @@ mod tests {
         assert_eq!(state.balance(0).unwrap(), source_balance_before - moved);
         assert_eq!(state.balance(1).unwrap(), target_balance_before + moved);
         let mut fields = pending_queue_fields(&mut state, "test assertion").unwrap();
-        assert!(fields.pending_consolidations_mut().is_empty());
+        assert!(fields.take_pending_consolidations().is_empty());
     }
 
     // -----------------------------------------------------------------------

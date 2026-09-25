@@ -18,13 +18,14 @@ pub mod altair;
 pub mod capella;
 pub mod electra;
 pub mod fulu;
+pub mod gloas;
 pub mod justification;
 pub mod registry;
 pub mod rewards;
 
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::containers::{BeaconState, HistoricalBatch};
-use crate::beacon::error::{Error, Result, verify};
+use crate::beacon::error::{Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, CommitteeCacheExt, get_block_root, get_block_root_at_slot, get_current_epoch,
@@ -92,12 +93,12 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         ForkName::Electra => electra::process_epoch(state, config),
         ForkName::Fulu => fulu::process_epoch(state, config),
         // EIP-7732's builder registry, payment queues, and payload
-        // availability each need their own epoch-boundary steps; a later
-        // task writes gloas's own driver.
-        ForkName::Gloas => Err(Error::UnsupportedForFork {
-            function: "process_epoch",
-            fork: ForkName::Gloas,
-        }),
+        // availability each need their own epoch-boundary steps
+        // (`process_builder_pending_payments`, `process_ptc_window`), and
+        // EIP-7688's progressive participation, inactivity, and pending-queue
+        // lists need their own copies of several more (see `gloas`'s own
+        // module doc for which), so gloas gets its own driver too.
+        ForkName::Gloas => gloas::process_epoch(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -113,7 +114,13 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 ///
 /// Altair rewrote the step to read participation flags instead of replaying
 /// stored attestations, and no later fork changes it again, so altair's version
-/// serves everything from altair on.
+/// serves everything from altair on, gloas included: nothing in gloas's own
+/// `beacon-chain.md` touches this step either, and
+/// [`crate::beacon::containers::BeaconState::altair_validator_lists`] now reaches
+/// a gloas state's participation lists too (as plain slices, since gloas's are
+/// progressive rather than `SszList`; see that accessor's own doc), which is
+/// what lets this one copy serve every fork from altair on without a
+/// gloas-specific one.
 pub fn process_justification_and_finalization(
     state: &mut BeaconState,
     config: &Config,
@@ -125,14 +132,8 @@ pub fn process_justification_and_finalization(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra
-        | ForkName::Fulu => altair::process_justification_and_finalization(state),
-        // Almost certainly unchanged from altair (nothing in gloas's own
-        // `beacon-chain.md` section touches justification), but left as an
-        // explicit gap rather than assumed until confirmed against the spec.
-        ForkName::Gloas => Err(Error::UnsupportedForFork {
-            function: "process_justification_and_finalization",
-            fork: ForkName::Gloas,
-        }),
+        | ForkName::Fulu
+        | ForkName::Gloas => altair::process_justification_and_finalization(state),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

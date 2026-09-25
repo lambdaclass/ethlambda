@@ -21,6 +21,13 @@
 //! a seed, and therefore a proposer, is only ever knowable that far ahead and
 //! no further.
 //!
+//! Gloas shares this exact function: `proposer_lookahead` keeps the identical
+//! field and type from fulu on (`containers::gloas`'s own module doc), and
+//! gloas's `beacon-chain.md` does not redefine this step either. Only the
+//! callee that draws the newly-visible epoch's proposers differs by fork
+//! (EIP-8045 excludes slashed validators for gloas), so
+//! [`process_proposer_lookahead`] picks it by fork rather than being copied.
+//!
 //! # Why this step runs last
 //!
 //! The newly-visible epoch's proposers come from
@@ -50,10 +57,12 @@ use crate::beacon::constants::FAR_FUTURE_EPOCH;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::electra as electra_containers;
 use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::get_current_epoch;
 use crate::beacon::helpers::electra::get_activation_exit_churn_limit;
-use crate::beacon::helpers::fulu::{fulu_state, get_beacon_proposer_indices};
+use crate::beacon::helpers::fulu::{get_beacon_proposer_indices, proposer_lookahead_mut};
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::Gwei;
 
@@ -133,7 +142,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
                 "deposit_balance_to_consume + get_activation_exit_churn_limit",
             ))?;
         let deposits: Vec<electra_containers::PendingDeposit> =
-            core::mem::take(fields.pending_deposits_mut()).into_inner();
+            core::mem::take(fields.pending_deposits_mut()?).into_inner();
         (available_for_processing, deposits)
     };
 
@@ -210,7 +219,7 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
     };
 
     let mut fields = electra::pending_queue_fields(state, "process_pending_deposits")?;
-    *fields.pending_deposits_mut() = electra_containers::PendingDeposits::try_from(remaining)?;
+    *fields.pending_deposits_mut()? = electra_containers::PendingDeposits::try_from(remaining)?;
     *fields.deposit_balance_to_consume_mut() = deposit_balance_to_consume;
 
     Ok(())
@@ -234,16 +243,37 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
     // The seed for this epoch is only just now fixed, per the module docs, so
     // this is the earliest moment its proposers could have been computed.
     let new_epoch = get_current_epoch(state) + preset::MIN_SEED_LOOKAHEAD + 1;
-    let new_epoch_proposers = get_beacon_proposer_indices(state, new_epoch)?;
+    let new_epoch_proposers = match state.fork_name() {
+        ForkName::Fulu => get_beacon_proposer_indices(state, new_epoch)?,
+        // EIP-8045: gloas's own draw excludes slashed validators before
+        // sampling; see `crate::beacon::helpers::gloas::get_beacon_proposer_indices`'s
+        // own doc. This is the one part of the step gloas cannot share
+        // unchanged; see this module's own module doc.
+        ForkName::Gloas => {
+            crate::beacon::helpers::gloas::get_beacon_proposer_indices(state, new_epoch)?
+        }
+        fork @ (ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra) => {
+            return Err(Error::UnsupportedForFork {
+                function: "process_proposer_lookahead",
+                fork,
+            });
+        }
+        ForkName::Lean => lean_state_unreachable("process_proposer_lookahead"),
+    };
 
-    let fulu_state = fulu_state(state, "process_proposer_lookahead")?;
     let slots_per_epoch = preset::SLOTS_PER_EPOCH as usize;
+    let lookahead = proposer_lookahead_mut(state, "process_proposer_lookahead")?;
 
     let mut window = Vec::with_capacity(preset::PROPOSER_LOOKAHEAD_LENGTH);
-    window.extend_from_slice(&fulu_state.proposer_lookahead[slots_per_epoch..]);
+    window.extend_from_slice(&lookahead[slots_per_epoch..]);
     window.extend(new_epoch_proposers);
 
-    fulu_state.proposer_lookahead = window.try_into().expect(
+    *lookahead = window.try_into().expect(
         "dropping SLOTS_PER_EPOCH entries and appending SLOTS_PER_EPOCH more preserves \
          PROPOSER_LOOKAHEAD_LENGTH",
     );
@@ -383,6 +413,7 @@ mod tests {
         electra::pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit)
             .unwrap();
 
@@ -396,7 +427,7 @@ mod tests {
             balance_before + preset::EFFECTIVE_BALANCE_INCREMENT
         );
         let mut fields = electra::pending_queue_fields(&mut state, "test assertion").unwrap();
-        assert!(fields.pending_deposits_mut().is_empty());
+        assert!(fields.pending_deposits_mut().unwrap().is_empty());
     }
 
     #[test]
@@ -410,6 +441,7 @@ mod tests {
         electra::pending_queue_fields(&mut state, "test setup")
             .unwrap()
             .pending_deposits_mut()
+            .unwrap()
             .push(deposit.clone())
             .unwrap();
 
@@ -426,7 +458,7 @@ mod tests {
         // reaching it.
         assert_eq!(state.balance(0).unwrap(), balance_before);
         let mut fields = electra::pending_queue_fields(&mut state, "test assertion").unwrap();
-        let remaining = fields.pending_deposits_mut();
+        let remaining = fields.pending_deposits_mut().unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0], deposit);
     }
