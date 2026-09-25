@@ -548,23 +548,24 @@ impl ProjectedState {
             .values()
             .filter(|vote| vote.head.root == head_root)
             .count();
-        // Everyone this entry moves lands on `head_root`; those already naming
-        // it are counted in `before`.
-        let moved_on = new_head_voters
-            .iter()
-            .filter(|vid| {
-                head_window
-                    .votes
-                    .get(vid)
-                    .is_none_or(|vote| vote.head.root != head_root)
-            })
-            .count();
-        !meets_threshold(before) && meets_threshold(before + moved_on)
+        // Disjoint from `before` by construction: `new_head_voters` excludes a
+        // validator whose window vote already names `head_root`, so everyone in
+        // it moves onto this head from elsewhere or from nothing.
+        let after = before + new_head_voters.len();
+        !meets_threshold(before) && meets_threshold(after)
     }
 
-    /// The subset of `coverage` whose latest head vote this entry would
-    /// replace, per the LMD-GHOST latest-message rule
-    /// ([`AttestationData::supersedes`]).
+    /// The subset of `coverage` whose head weight this entry would move: a
+    /// validator counts when the window carries no vote for it, or when the
+    /// window's vote names a different head and this entry replaces it per the
+    /// LMD-GHOST latest-message rule ([`AttestationData::supersedes`]).
+    ///
+    /// A newer vote naming the same head is not counted. It becomes the
+    /// validator's latest message, but LMD-GHOST weighs a vote only by the head
+    /// it names, so no weight moves and there is nothing for this axis to
+    /// credit. The head-root check also runs before `supersedes`, which keeps
+    /// the common case (a vote the window already carries) off the data-root
+    /// hashing `supersedes` does on a slot tie.
     ///
     /// Empty unless this entry names a head still inside the window. A head
     /// older than that is not in play: the block it names already sits under a
@@ -588,10 +589,9 @@ impl ProjectedState {
             .iter()
             .copied()
             .filter(|vid| {
-                head_window
-                    .votes
-                    .get(vid)
-                    .is_none_or(|existing| att_data.supersedes(existing))
+                head_window.votes.get(vid).is_none_or(|existing| {
+                    existing.head.root != att_data.head.root && att_data.supersedes(existing)
+                })
             })
             .collect()
     }
@@ -1634,6 +1634,15 @@ mod tests {
     #[test]
     fn score_entry_drops_an_entry_that_adds_neither_voters_nor_head_votes() {
         let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        // Newer votes for a different head, so the entry loses on recency
+        // rather than on naming the head those votes already name.
+        let newer_vote = AttestationData {
+            head: Checkpoint {
+                slot: 8,
+                root: H256([8u8; 32]),
+            },
+            ..make_att_data(9)
+        };
         let projected = ProjectedState {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
@@ -1643,9 +1652,9 @@ mod tests {
             head_window: Some(window(
                 &[DEFAULT_HEAD],
                 &[
-                    (0, make_att_data(9)),
-                    (1, make_att_data(9)),
-                    (2, make_att_data(9)),
+                    (0, newer_vote.clone()),
+                    (1, newer_vote.clone()),
+                    (2, newer_vote),
                 ],
             )),
         };
@@ -1659,17 +1668,25 @@ mod tests {
     }
 
     /// Credited head votes do not count twice across selection rounds, and a
-    /// genuinely newer vote still does.
+    /// genuinely newer vote for a different head still does.
     #[test]
     fn advance_head_votes_prevents_double_counting_across_rounds() {
+        let next_head = H256([6u8; 32]);
         let mut projected = ProjectedState {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
-            head_window: Some(window(&[DEFAULT_HEAD], &[])),
+            head_window: Some(window(&[DEFAULT_HEAD, next_head], &[])),
         };
         let coverage: HashSet<u64> = HashSet::from([0, 1]);
         let first = make_att_data(5);
+        let later = AttestationData {
+            head: Checkpoint {
+                slot: 6,
+                root: next_head,
+            },
+            ..make_att_data(6)
+        };
 
         let credited = projected.new_head_voters(&first, &coverage);
         assert_eq!(
@@ -1684,11 +1701,34 @@ mod tests {
             "the same entry must not be credited a second time"
         );
         assert_eq!(
-            projected
-                .new_head_voters(&make_att_data(6), &coverage)
-                .len(),
+            projected.new_head_voters(&later, &coverage).len(),
             2,
-            "a later slot still supersedes what this block already credited"
+            "a later vote for another head still supersedes what this block \
+             already credited"
+        );
+    }
+
+    /// A newer vote naming the head a validator's window vote already names
+    /// replaces its latest message but moves no LMD-GHOST weight, so it is not
+    /// a new head voter. Only the validator with no window vote counts.
+    #[test]
+    fn a_newer_vote_for_the_same_head_moves_no_head_weight() {
+        let entry = make_att_data(5);
+        let coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_window: Some(window(
+                &[DEFAULT_HEAD],
+                &[(0, make_att_data(4)), (1, make_att_data(4))],
+            )),
+        };
+
+        assert_eq!(
+            projected.new_head_voters(&entry, &coverage),
+            HashSet::from([2]),
+            "validators 0 and 1 already name this head, so re-voting it moves nothing"
         );
     }
 
@@ -1866,12 +1906,20 @@ mod tests {
         let att_data = make_att_data(5);
         // 1 of 10 validators is nowhere near 2/3.
         let coverage: HashSet<u64> = HashSet::from([0]);
+        // Validator 0's window vote names an older head, so this entry moves it.
+        let older_head_vote = AttestationData {
+            head: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+            ..make_att_data(4)
+        };
 
         let projected = ProjectedState {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::from([(att_data.target.root, coverage.clone())]),
-            head_window: Some(window(&[att_data.head.root], &[(0, make_att_data(4))])),
+            head_window: Some(window(&[att_data.head.root], &[(0, older_head_vote)])),
         };
 
         let (score, _, new_head_voters) = projected
