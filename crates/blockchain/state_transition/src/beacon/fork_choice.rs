@@ -160,7 +160,7 @@ use std::sync::Arc;
 
 use ethlambda_storage::{CacheKey, ForkCheckpoints, StorageBackend};
 use ethlambda_types::ShortRoot;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
@@ -1293,6 +1293,21 @@ pub fn compute_weights(
 /// `current_justified_checkpoint` happened to be at the time it was
 /// processed; a block from the current epoch has no unrealized value to pull
 /// up to yet, so its own post-state's checkpoint is used directly.
+///
+/// A missing unrealized justification is the specification's "unhandled
+/// exception" case, and `Store::unrealized_justification`'s own doc comment
+/// says when this build can actually produce one: a narrow crash window
+/// between a block's `insert_signed_block`/`insert_state` committing and
+/// `compute_pulled_up_tip`'s own write landing, which `has_state` then skips
+/// re-importing on resume. Rather than raise here (which would freeze
+/// `get_head` on that one leaf for as long as it stays a leaf), this falls
+/// back to `store.beacon_justified_checkpoint()`, the way Prysm seeds every
+/// block it rebuilds at startup (`buildForkchoiceChain` /
+/// doubly-linked-tree's `insert`). That value is always viable in
+/// `filter_block_tree` (`voting_source.epoch == store.justified.epoch`), so
+/// the fallback can only ever make a block *more* likely to survive
+/// filtering, never change what weight it casts once it does: this function
+/// answers "does this leaf count", not "how much".
 pub fn get_voting_source(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1306,11 +1321,22 @@ pub fn get_voting_source(
     let block_epoch = compute_epoch_at_slot(block_slot);
 
     if current_epoch > block_epoch {
-        store
-            .unrealized_justification(&block_root)
-            .ok_or(Error::SpecAssert(
-                "block_root in store.unrealized_justifications",
-            ))
+        if let Some(checkpoint) = store.unrealized_justification(&block_root) {
+            return Ok(checkpoint);
+        }
+        let justified = store.beacon_justified_checkpoint();
+        // debug, not warn: get_head runs every tick, so a miss that persists
+        // while the block stays a leaf would otherwise repeat every tick
+        // until it is pruned or wins the head.
+        debug!(
+            block_root = %ShortRoot(&block_root.0),
+            block_slot,
+            justified_epoch = justified.epoch,
+            justified_root = %ShortRoot(&justified.root.0),
+            "No unrealized justification for a prior-epoch block; \
+             falling back to the store's justified checkpoint"
+        );
+        Ok(justified)
     } else {
         let head_state = store
             .get_state(&block_root)
@@ -1594,6 +1620,11 @@ pub fn is_shuffling_stable(slot: Slot) -> bool {
 /// Whether `head_root` and `parent_root` would cast the same FFG vote if
 /// either were head, so that reorging one for the other costs nothing on the
 /// justification side.
+///
+/// Unlike [`get_voting_source`], a miss here still raises: only the spec
+/// tests reach this function, through `get_proposer_head`/
+/// `should_override_forkchoice_update`, neither of which any production path
+/// calls yet.
 pub fn is_ffg_competitive(store: &Store, head_root: Root, parent_root: Root) -> Result<bool> {
     let head = store
         .unrealized_justification(&head_root)
@@ -3114,6 +3145,38 @@ mod tests {
         );
     }
 
+    /// The crash-window fallback: no `set_unrealized_justification` call was
+    /// ever made for `block_root`, which is what a `SpecAssert` here used to
+    /// raise on. `get_voting_source` must instead answer exactly
+    /// `store.beacon_justified_checkpoint()`, not some other computed value.
+    #[test]
+    fn get_voting_source_falls_back_to_the_justified_checkpoint_on_a_miss() {
+        let config = Config::active();
+        let mut store = empty_store();
+        // Same clock skew as
+        // `get_voting_source_pulls_up_a_prior_epoch_blocks_vote`, so this
+        // takes the same `current_epoch > block_epoch` branch.
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * preset::SLOTS_PER_EPOCH * 2,
+            ))
+            .unwrap();
+
+        let block_root = Root::repeat_byte(5);
+        store
+            .insert_signed_block(block_root, block(0, Root::ZERO))
+            .unwrap();
+        assert_eq!(
+            store.unrealized_justification(&block_root),
+            None,
+            "the test must exercise a genuine miss"
+        );
+
+        let voting_source =
+            get_voting_source(&store, &store.block_index(), block_root, &config).unwrap();
+        assert_eq!(voting_source, store.beacon_justified_checkpoint());
+    }
+
     #[test]
     fn get_head_persists_the_head_it_computed() {
         let config = Config::active();
@@ -3308,6 +3371,48 @@ mod tests {
         assert!(
             head.as_ref().is_ok_and(|head| *head == c || *head == f),
             "a stale pre-restart fork leaf must not stop get_head: {head:?}"
+        );
+    }
+
+    /// Simulates the one crash window `Store::unrealized_justification`'s
+    /// doc comment describes, rather than a whole-process restart: a block
+    /// imports and commits normally, but its own unrealized-justification
+    /// write is then dropped by hand
+    /// ([`Store::delete_unrealized_justification`]), the way it would be
+    /// missing had the process died between `insert_state` and
+    /// `compute_pulled_up_tip`'s own commit. `get_head` must still resolve to
+    /// it once it becomes the only leaf, falling back rather than failing.
+    #[test]
+    fn get_head_survives_a_dropped_unrealized_justification() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state,
+            &config,
+        );
+        store.delete_unrealized_justification(a);
+        assert_eq!(
+            store.unrealized_justification(&a),
+            None,
+            "the test must exercise a genuine miss, table and cache both"
+        );
+
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        let head = get_head(&mut store, &config).map_err(|err| format!("{err:?}"));
+        assert_eq!(
+            head,
+            Ok(a),
+            "a dropped unrealized justification must fall back rather than fail get_head: {head:?}"
         );
     }
 

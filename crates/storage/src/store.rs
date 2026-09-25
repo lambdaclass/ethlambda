@@ -3307,6 +3307,10 @@ impl Store {
     /// which is what lets this answer correctly right after a restart, before
     /// anything has repopulated the cache: see that table's own doc comment
     /// for the `get_head` freeze a purely in-memory map used to cause.
+    ///
+    /// `None` can still come back genuinely, in the narrow crash window that
+    /// table's doc comment describes; `get_voting_source` is the caller that
+    /// falls back for it rather than treating this as unreachable.
     pub fn unrealized_justification(&self, root: &H256) -> Option<BeaconCheckpoint> {
         if let Some(checkpoint) = self
             .beacon
@@ -3427,6 +3431,30 @@ impl Store {
         }
 
         Ok(count)
+    }
+
+    /// Deletes `root`'s unrealized-justification row and its in-memory cache
+    /// entry, without touching anything else.
+    ///
+    /// Not a production writer: `prune_unrealized_justifications` is the only
+    /// other thing that removes a row, and it always removes a whole slot
+    /// range at once, never one arbitrary root. This exists for tests that
+    /// need to simulate the one crash window
+    /// [`Store::unrealized_justification`]'s own doc comment describes, where
+    /// a block's post-state committed but its unrealized-justification write
+    /// never landed.
+    pub fn delete_unrealized_justification(&mut self, root: H256) {
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::BeaconUnrealizedJustifications, vec![root.to_ssz()])
+            .expect("delete unrealized justification");
+        batch.commit().expect("commit");
+
+        self.beacon
+            .lock()
+            .unwrap()
+            .unrealized_justifications
+            .remove(&root);
     }
 
     // ============ Data Columns ============

@@ -535,11 +535,16 @@ block. Both call `Store::set_unrealized_justification` after the block's own
 `insert_signed_block`/`insert_state` have already run — `compute_pulled_up_tip`
 needs the block's post-state, which does not exist until those have — so the
 write is not in the same atomic batch as the block's import. A crash between
-the two leaves that one block without an unrealized-justification entry,
-which surfaces as the same `SpecAssert` an older, unpatched build would raise
-on every block: a narrower version of the bug this table exists to fix,
-scoped to the single most-recently-imported block rather than the whole
-unfinalized window.
+the two leaves that one block without an unrealized-justification entry;
+`has_state` then skips re-importing it on resume, so nothing ever fills the
+row in afterward either. `get_voting_source` no longer treats that miss as
+fatal: it falls back to `store.beacon_justified_checkpoint()`, the way Prysm
+seeds a rebuilt node's forkchoice store, and logs at `debug` rather than
+raising. That is safe because the fallback only affects whether the block
+counts as viable in `filter_block_tree` (`voting_source.epoch ==
+store.justified.epoch` is always true for it), never how much weight it
+casts once it does. `is_ffg_competitive` still raises on a miss: nothing in
+production calls it.
 
 Pruned on finalization, on the same horizon `LiveChain` is (the finalized
 block's own slot, read from `BlockHeaders` via `block_entry`, not the stored
