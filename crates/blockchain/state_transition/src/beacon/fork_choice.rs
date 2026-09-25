@@ -3026,8 +3026,8 @@ mod tests {
     }
 
     /// The scenario `Store::update_checkpoints`' beacon arm exists for: the
-    /// finalized checkpoint names epoch 1, whose start slot (32) nobody built
-    /// a block for, so the finalized block itself sits at slot 31. Once
+    /// finalized checkpoint names epoch 1, whose start slot nobody built a
+    /// block for, so the finalized block itself sits at the slot before. Once
     /// finalization advances (a real `update_checkpoints` call, which prunes
     /// `LiveChain` as a side effect), `filter_block_tree`'s own
     /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
@@ -3035,10 +3035,15 @@ mod tests {
     /// leaf, and either one erroring here is `get_head` freezing on a live
     /// follower.
     ///
-    /// Reproduces the bug this fixes: pruning to the epoch's start slot (32)
-    /// instead of the finalized block's own slot (31) would delete root_31's
-    /// row along with genesis', and this same call would return
-    /// `Err(SpecAssert("root in store.blocks"))` instead.
+    /// Reproduces the bug this fixes: pruning to the epoch's start slot
+    /// instead of the finalized block's own slot (the one before it) would
+    /// delete that block's row along with genesis', and this same call would
+    /// return `Err(SpecAssert("root in store.blocks"))` instead.
+    ///
+    /// Every slot is derived from the preset's epoch length: under the
+    /// minimal preset, slots hardcoded for mainnet name a finalized block in
+    /// a later epoch than its checkpoint, and the walk to epoch 1 then runs
+    /// into the pruned anchor.
     #[test]
     fn get_checkpoint_block_succeeds_after_pruning_past_an_empty_epoch_boundary() {
         let genesis_root = Root::repeat_byte(1);
@@ -3048,21 +3053,22 @@ mod tests {
             .unwrap();
 
         // The finalized-block-to-be: the last block before epoch 1's start
-        // slot (32), which is never built.
-        let root_31 = Root::repeat_byte(2);
+        // slot, which is never built.
+        let boundary = compute_start_slot_at_epoch(1);
+        let finalized_root = Root::repeat_byte(2);
         store
-            .insert_signed_block(root_31, block(31, genesis_root))
+            .insert_signed_block(finalized_root, block(boundary - 1, genesis_root))
             .unwrap();
 
-        // The current head, two slots past the empty boundary.
+        // The current head, one slot past the empty boundary.
         let head_root = Root::repeat_byte(3);
         store
-            .insert_signed_block(head_root, block(33, root_31))
+            .insert_signed_block(head_root, block(boundary + 1, finalized_root))
             .unwrap();
 
         let finalized = Checkpoint {
             epoch: 1,
-            root: root_31,
+            root: finalized_root,
         };
         update_checkpoints(&mut store, finalized, finalized);
         assert_eq!(
@@ -3078,7 +3084,7 @@ mod tests {
         );
         assert_eq!(
             get_checkpoint_block(&index, head_root, 1).unwrap(),
-            root_31,
+            finalized_root,
             "the walk from head must still reach the finalized block across the empty boundary slot"
         );
     }
