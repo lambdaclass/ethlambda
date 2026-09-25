@@ -472,8 +472,9 @@ forces a decision instead of quietly widening the gap.
 ### Fork choice is fixture-verified
 
 150 mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
-terminal-PoW validation, `should_override_forkchoice_update`, deneb's blob
-data availability, and fulu's column data availability.
+terminal-PoW validation, the `v1.7.0` proposer-boost dependent-root gate and
+`get_proposer_head`'s proposer-equivocation branch, deneb's blob data
+availability, and fulu's column data availability.
 
 The release still ships no phase0 `fork_choice` suite: the earliest is
 altair's, built from altair-shaped states even though altair changes nothing

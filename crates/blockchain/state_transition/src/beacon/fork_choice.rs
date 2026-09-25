@@ -10,10 +10,12 @@
 //! ([`on_tick`], [`on_block`], [`on_attestation`], [`on_attester_slashing`])
 //! are the only ones the specification lists as sole ways to change it,
 //! matching its own framing: "Invalid calls to handlers must not modify
-//! `store`." Every other function in this file takes `&Store`, with one
-//! exception: [`get_head`] takes `&mut Store` too, since it records the head
-//! it just computed; see its own documentation for why that write belongs
-//! there rather than in a caller.
+//! `store`." Most other functions in this file take `&Store`; the exceptions
+//! are [`get_head`] (records the head it just computed; see its own
+//! documentation for why that write belongs there rather than in a caller)
+//! and `record_block_timeliness`/`update_proposer_boost_root`, which write
+//! `store.block_timeliness`/`store.proposer_boost_root` on [`on_block`]'s
+//! behalf: [`on_block`] is their only caller.
 //!
 //! # Units: one seconds-granularity clock, read out in milliseconds at the edges
 //!
@@ -169,7 +171,7 @@ use crate::beacon::containers::{bellatrix, deneb, electra, fulu, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_active_validator_indices, get_beacon_proposer_index, get_current_epoch,
+    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch,
     get_total_active_balance,
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
@@ -683,9 +685,9 @@ pub fn resolve_invalid_block(
 /// specification's own version, and
 /// `tests::a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing` pins
 /// that divergence on purpose. Nothing on this node's paths calls it today
-/// ([`get_proposer_head`] and [`should_override_forkchoice_update`] have no
-/// callers outside this file), but wiring up a beacon proposer duty would make
-/// it reachable, and it should get `compute_weights`' treatment first.
+/// ([`get_proposer_head`] has no callers outside this file), but wiring up a
+/// beacon proposer duty would make it reachable, and it should get
+/// `compute_weights`' treatment first.
 pub fn invalidate_subtree(store: &mut Store, invalid_root: Root) -> usize {
     let index = store.block_index();
 
@@ -1133,14 +1135,48 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
     Ok(committee_weight.saturating_mul(config.proposer_score_boost) / 100)
 }
 
-/// The LMD GHOST weight of `root`: the effective balance of every
-/// non-equivocating, active, unslashed validator whose latest vote descends
-/// through `root`, plus the proposer boost if it applies.
+/// The effective balance of every non-equivocating, active, unslashed
+/// validator in `state` whose latest vote descends through `root`: the
+/// attestation half of [`get_weight`], without the proposer boost.
 ///
 /// Takes `index` rather than building it, the way [`filter_block_tree`] does,
 /// and reuses it for every [`get_ancestor`] call this makes: one per active
-/// validator, plus one for the proposer boost. See [`get_ancestor`]'s
-/// documentation for why that matters.
+/// validator. See [`get_ancestor`]'s documentation for why that matters.
+///
+/// Split out of [`get_weight`] so [`is_head_weak`] and [`is_parent_strong`]
+/// can score a root against the justified state without also asking whether
+/// the proposer boost applies to it; the specification makes the same split,
+/// since neither of those checks the boost.
+pub fn get_attestation_score(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    state: &BeaconState,
+) -> Result<Gwei> {
+    let current_epoch = get_current_epoch(state);
+    let block_slot = index
+        .get(&root)
+        .ok_or(Error::SpecAssert("root in store.blocks"))?
+        .0;
+
+    let mut attestation_score: Gwei = 0;
+    for validator_index in get_active_validator_indices(state, current_epoch) {
+        let validator = state.validator(validator_index)?;
+        if validator.slashed || store.is_equivocating(validator_index) {
+            continue;
+        }
+        let Some(message) = store.latest_message(validator_index) else {
+            continue;
+        };
+        if get_ancestor(index, message.root, block_slot)? == root {
+            attestation_score = attestation_score.saturating_add(validator.effective_balance);
+        }
+    }
+    Ok(attestation_score)
+}
+
+/// The LMD GHOST weight of `root`: [`get_attestation_score`] against the
+/// justified checkpoint's state, plus the proposer boost if it applies.
 ///
 /// The specification's own per-root definition, kept as written. [`get_head`]
 /// calls [`compute_weights`] instead, which produces the same numbers for the
@@ -1153,31 +1189,17 @@ pub fn get_weight(
 ) -> Result<Gwei> {
     let justified_checkpoint = store.beacon_justified_checkpoint();
     let state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let current_epoch = get_current_epoch(&state);
-    let block_slot = index
-        .get(&root)
-        .ok_or(Error::SpecAssert("root in store.blocks"))?
-        .0;
-
-    let mut attestation_score: Gwei = 0;
-    for validator_index in get_active_validator_indices(&state, current_epoch) {
-        let validator = state.validator(validator_index)?;
-        if validator.slashed || store.is_equivocating(validator_index) {
-            continue;
-        }
-        let Some(message) = store.latest_message(validator_index) else {
-            continue;
-        };
-        if get_ancestor(index, message.root, block_slot)? == root {
-            attestation_score = attestation_score.saturating_add(validator.effective_balance);
-        }
-    }
+    let attestation_score = get_attestation_score(store, index, root, &state)?;
 
     let proposer_boost_root = store.proposer_boost_root();
     if proposer_boost_root.is_zero() {
         return Ok(attestation_score);
     }
 
+    let block_slot = index
+        .get(&root)
+        .ok_or(Error::SpecAssert("root in store.blocks"))?
+        .0;
     let mut proposer_score: Gwei = 0;
     if get_ancestor(index, proposer_boost_root, block_slot)? == root {
         proposer_score = get_proposer_score(store, config)?;
@@ -1429,27 +1451,28 @@ pub fn get_filtered_block_tree(
 /// itself: it is the specification's own second whole-`Dict` scan the module
 /// documentation calls out, but it never costs a further backend round trip.
 ///
-/// Takes `&mut Store`, unlike most functions in this file: it records the head
-/// it just found through
-/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints),
-/// the head-and-checkpoint writer both chains share, so a restarted node has
-/// something to answer from immediately rather than replaying this whole walk
-/// on its first tick. That writer also keeps the canonical `BlockRoots` index
-/// in step with the branch fork choice just picked.
+/// Takes `&Store` rather than `&mut Store`: unlike [`get_head`], which records
+/// the head it finds, this is the read-only walk underneath it. [`on_block`]
+/// is the other caller, which needs the head *before* the block it is
+/// importing joins the store (see `update_proposer_boost_root` in the
+/// specification's `on_block`) and must not record that transient answer as
+/// the store's own head.
 ///
-/// Written unconditionally on every call, not only when the head changes: a
-/// value written once and then left alone is a second source of truth a bug
-/// can let drift, and the write is one small metadata row plus an index diff
-/// that is empty whenever the head did not move, set against a whole weighted
-/// tree walk.
-pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
-    // One scan for the whole walk: the filtered tree and the weight table are
-    // both built from it, instead of each rescanning the live chain for itself.
-    let index = store.block_index();
-    let blocks = get_filtered_block_tree(store, &index, config)?;
+/// Takes `index` rather than building it, matching [`get_filtered_block_tree`]
+/// and [`compute_weights`], which this hands the same one to: [`get_head`]
+/// has nothing else to build it from, but [`on_block`] already scanned
+/// `LiveChain` once for its own finalized-descendant check by the time it
+/// gets here, and passes that scan's result on rather than paying for a
+/// second one just to compute the head.
+fn compute_head(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+) -> Result<Root> {
+    let blocks = get_filtered_block_tree(store, index, config)?;
     // Every candidate's weight at once: see `compute_weights` for why the
     // specification's per-root `get_weight` is not what the descent calls.
-    let weights = compute_weights(store, &index, config)?;
+    let weights = compute_weights(store, index, config)?;
     let mut head = store.beacon_justified_checkpoint().root;
     loop {
         let children: Vec<Root> = blocks
@@ -1477,10 +1500,30 @@ pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
             .1;
     }
 
+    Ok(head)
+}
+
+/// [`compute_head`], recorded as the store's own head.
+///
+/// Takes `&mut Store`, unlike most functions in this file: it records the head
+/// it just found through
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints),
+/// the head-and-checkpoint writer both chains share, so a restarted node has
+/// something to answer from immediately rather than replaying this whole walk
+/// on its first tick. That writer also keeps the canonical `BlockRoots` index
+/// in step with the branch fork choice just picked.
+///
+/// Written unconditionally on every call, not only when the head changes: a
+/// value written once and then left alone is a second source of truth a bug
+/// can let drift, and the write is one small metadata row plus an index diff
+/// that is empty whenever the head did not move, set against a whole weighted
+/// tree walk.
+pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
+    let index = store.block_index();
+    let head = compute_head(store, &index, config)?;
     store
         .update_checkpoints(ForkCheckpoints::head_only(head))
         .expect("record beacon head");
-
     Ok(head)
 }
 
@@ -1633,22 +1676,105 @@ pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
 /// Whether `head_root` has few enough votes to be overpowered by the
 /// proposer's own boost, i.e. reorging it out would not be fighting an
 /// already-decisive lead.
-pub fn is_head_weak(store: &Store, head_root: Root, config: &Config) -> Result<bool> {
+///
+/// Counts an equivocating validator's effective balance toward `head_root`'s
+/// weight whenever that validator sits in one of the head slot's committees,
+/// on top of [`get_attestation_score`]'s own vote-based count. Without this,
+/// the weight this reads could only fall as more equivocation evidence
+/// arrived (an attester's vote stops counting once it is known to have
+/// equivocated), so a head could flip from "weak" to "not weak" to "weak"
+/// again as evidence trickled in; adding the equivocators' balance back in
+/// keeps the total monotonic, so once a head is not weak it cannot become weak
+/// again from something that was already true when it was imported.
+///
+/// `committees` derives the head slot's committees off `head_root`'s own
+/// post-state, per bci's committee cache (`helpers/accessors.rs`), rather than
+/// recomputing the shuffling by hand.
+pub fn is_head_weak(
+    store: &Store,
+    head_root: Root,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<bool> {
     let justified_checkpoint = store.beacon_justified_checkpoint();
     let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
     let reorg_threshold =
         calculate_committee_fraction(&justified_state, config.reorg_head_weight_threshold)?;
-    Ok(get_weight(store, &store.block_index(), head_root, config)? < reorg_threshold)
+
+    let index = store.block_index();
+    let mut head_weight = get_attestation_score(store, &index, head_root, &justified_state)?;
+
+    let head_state = store
+        .get_state(&head_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert("head_root in store.block_states"))?;
+    let (head_slot, _) = store
+        .block_entry(&head_root)
+        .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
+    let epoch = compute_epoch_at_slot(head_slot);
+    let epoch_committees = committees.committees(&head_state, epoch);
+    for committee_index in 0..epoch_committees.committees_per_slot() {
+        for &validator_index in epoch_committees.committee(head_slot, committee_index)? {
+            if store.is_equivocating(validator_index) {
+                let validator = justified_state.validator(validator_index)?;
+                head_weight = head_weight.saturating_add(validator.effective_balance);
+            }
+        }
+    }
+
+    Ok(head_weight < reorg_threshold)
 }
 
-/// Whether `parent_root` already has enough votes of its own that the missing
-/// votes are assigned to it rather than being hoarded elsewhere.
-pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Result<bool> {
+/// Whether `root`'s parent already has enough votes of its own that the
+/// missing votes are assigned to it rather than being hoarded elsewhere.
+///
+/// Takes `root`, not the parent directly: the specification derives
+/// `parent_root` from `store.blocks[root].parent_root` inside this function,
+/// so a caller (`get_proposer_head`) that already looked up the parent for
+/// its own purposes and this function's own lookup cannot disagree about
+/// which block that is.
+pub fn is_parent_strong(store: &Store, root: Root, config: &Config) -> Result<bool> {
     let justified_checkpoint = store.beacon_justified_checkpoint();
     let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
     let parent_threshold =
         calculate_committee_fraction(&justified_state, config.reorg_parent_weight_threshold)?;
-    Ok(get_weight(store, &store.block_index(), parent_root, config)? > parent_threshold)
+    let (_, parent_root) = store
+        .block_entry(&root)
+        .ok_or(Error::SpecAssert("root in store.blocks"))?;
+    let index = store.block_index();
+    let parent_weight = get_attestation_score(store, &index, parent_root, &justified_state)?;
+    Ok(parent_weight > parent_threshold)
+}
+
+/// Whether `root`'s proposer has published more than one block for its slot.
+///
+/// The specification scans every known block for one sharing `root`'s slot
+/// and proposer. `index` is not free (it is a `Store::block_index` call, a
+/// full `LiveChain` scan), but every caller here has already paid for one for
+/// its own purposes and passes that same result on, so this answers the slot
+/// half with no *further* scan, and pays for [`Store::get_signed_block`] only
+/// on the handful of blocks that actually compete at that one slot, not the
+/// whole indexed history.
+pub fn is_proposer_equivocation(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+) -> Result<bool> {
+    let block = store
+        .get_signed_block(&root)
+        .expect("get")
+        .ok_or(Error::SpecAssert("root in store.blocks"))?;
+    let proposer_index = block.proposer_index();
+    let slot = block.slot();
+
+    let matching_roots = index
+        .iter()
+        .filter(|&(_, &(candidate_slot, _))| candidate_slot == slot)
+        .filter_map(|(&candidate_root, _)| store.get_signed_block(&candidate_root).expect("get"))
+        .filter(|candidate| candidate.proposer_index() == proposer_index)
+        .count();
+
+    Ok(matching_roots > 1)
 }
 
 /// The block a proposer at `slot` should build on: `head_root`'s parent
@@ -1658,15 +1784,30 @@ pub fn is_parent_strong(store: &Store, parent_root: Root, config: &Config) -> Re
 /// *Note*: the ordering of conditions here is the specification's suggested
 /// order, not a requirement; an implementation may reorder or short-circuit
 /// for performance.
+///
+/// Fulu (EIP-7917) drops the `shuffling_stable` requirement: `shuffling_stable`
+/// is folded into `true` rather than left out of the `&&` chain, which reads
+/// the same as the specification's own two near-identical copies of this
+/// function without keeping two Rust copies to drift apart. Every fork this
+/// module implements shares one copy for the same reason no other condition
+/// here has a per-fork variant.
 pub fn get_proposer_head(
     store: &Store,
     head_root: Root,
     slot: Slot,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<Root> {
-    let (head_slot, parent_root) = store
-        .block_entry(&head_root)
+    // Read once and reused for `head_slot`/`parent_root` below and for the
+    // fulu gate just after: `Store::block_entry` decodes the same signed
+    // block internally on a beacon directory anyway (see its own
+    // documentation), so this pays for one decode rather than two.
+    let head_block = store
+        .get_signed_block(&head_root)
+        .expect("get")
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
+    let head_slot = head_block.slot();
+    let parent_root = head_block.parent_root();
     let (parent_slot, _) = store
         .block_entry(&parent_root)
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
@@ -1675,8 +1816,14 @@ pub fn get_proposer_head(
     // deadline.
     let head_late = is_head_late(store, head_root)?;
     // Do not re-org on an epoch boundary where the proposer shuffling could
-    // change.
-    let shuffling_stable = is_shuffling_stable(slot);
+    // change. [Modified in Fulu:EIP7917] The proposer lookahead fixes
+    // assignments before the epoch boundary, so this is no longer a
+    // requirement once the head being reorged is itself a fulu-or-later
+    // block. Read off `head_block`'s own fork rather than
+    // `Config::fork_at_epoch`: the config's schedule is the chain's real
+    // activation epochs, which a small-slot fixture case never reaches, while
+    // the block in hand already carries the fork that produced it.
+    let shuffling_stable = head_block.fork_name() >= ForkName::Fulu || is_shuffling_stable(slot);
     // Ensure that the FFG information of the new head will be competitive
     // with the current head.
     let ffg_competitive = is_ffg_competitive(store, head_root, parent_root)?;
@@ -1696,11 +1843,16 @@ pub fn get_proposer_head(
         store.proposer_boost_root() != head_root,
         "store.proposer_boost_root != head_root",
     )?;
-    let head_weak = is_head_weak(store, head_root, config)?;
+    let head_weak = is_head_weak(store, head_root, config, committees)?;
 
     // Check that the missing votes are assigned to the parent and not being
     // hoarded.
-    let parent_strong = is_parent_strong(store, parent_root, config)?;
+    let parent_strong = is_parent_strong(store, head_root, config)?;
+
+    // Re-org more aggressively if there is a proposer equivocation in the
+    // previous slot.
+    let index = store.block_index();
+    let proposer_equivocation = is_proposer_equivocation(store, &index, head_root)?;
 
     if head_late
         && shuffling_stable
@@ -1713,102 +1865,11 @@ pub fn get_proposer_head(
     {
         // We can re-org the current head by building upon its parent block.
         Ok(parent_root)
+    } else if head_weak && current_time_ok && proposer_equivocation {
+        Ok(parent_root)
     } else {
         Ok(head_root)
     }
-}
-
-/// Whether a proposer confident it will build the next block should ask its
-/// execution engine to build on `head_root`'s parent instead of `head_root`
-/// itself, suppressing the `notify_forkchoice_updated` call bellatrix's
-/// `ExecutionEngine` protocol would otherwise make right away.
-///
-/// `validator_is_connected` stands in for the specification's own
-/// `validator_is_connected(validator_index: ValidatorIndex) -> bool`, "a
-/// function that indicates whether the validator ... is connected to the
-/// node (e.g. has sent an unexpired proposer preparation message)"
-/// (`specs/bellatrix/fork-choice.md`). Every real answer is
-/// implementation-specific, so a caller supplies its own policy here rather
-/// than this module guessing at one; the fixture suites that exercise this
-/// supply a fixed answer directly, the same way [`stf::ExecutionEngine`]
-/// stands in for a real execution client elsewhere in this module.
-///
-/// Shares [`get_proposer_head`]'s own reorg conditions
-/// (`is_head_late`/`is_shuffling_stable`/`is_ffg_competitive`/`is_finalization_ok`),
-/// but evaluated against `proposal_slot` (`head_root`'s slot plus one)
-/// rather than the caller's own current slot: this asks about the block a
-/// confident proposer is *about* to build, one slot ahead of `head_root`,
-/// not about reorging a block already received.
-pub fn should_override_forkchoice_update(
-    store: &Store,
-    head_root: Root,
-    validator_is_connected: impl Fn(ValidatorIndex) -> bool,
-    config: &Config,
-) -> Result<bool> {
-    let (head_slot, parent_root) = store
-        .block_entry(&head_root)
-        .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
-    let (parent_slot, _) = store
-        .block_entry(&parent_root)
-        .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let current_slot = get_current_slot(store, config);
-    let proposal_slot = head_slot.saturating_add(1);
-
-    // Only re-org the head block if it arrived later than the attestation
-    // deadline.
-    let head_late = is_head_late(store, head_root)?;
-    // Shuffling stable.
-    let shuffling_stable = is_shuffling_stable(proposal_slot);
-    // FFG information of the new head block will be competitive with the
-    // current head.
-    let ffg_competitive = is_ffg_competitive(store, head_root, parent_root)?;
-    // Do not re-org if the chain is not finalizing with acceptable frequency.
-    let finalization_ok = is_finalization_ok(store, proposal_slot, config);
-
-    // Only suppress the fork choice update if we are confident that we will
-    // propose the next block. `get_state` hands back a shared `Arc`, so this
-    // clones out of it before advancing: matching the specification's own
-    // `.copy()`, advancing to `proposal_slot` is only how this samples the
-    // proposer that slot would draw, not a change the store's own cached
-    // entry for `parent_root` should keep.
-    let parent_state = store
-        .get_state(&parent_root)
-        .expect("get")
-        .ok_or(Error::SpecAssert("parent_root in store.block_states"))?;
-    let mut parent_state_advanced = (*parent_state).clone();
-    stf::process_slots(&mut parent_state_advanced, proposal_slot, config)?;
-    let proposer_index = get_beacon_proposer_index(&parent_state_advanced)?;
-    let proposing_reorg_slot = validator_is_connected(proposer_index);
-
-    // Single slot re-org.
-    let parent_slot_ok = parent_slot.checked_add(1) == Some(head_slot);
-    let proposing_on_time = is_proposing_on_time(store, config);
-    // Note that this condition is different from `get_proposer_head`.
-    let current_time_ok =
-        head_slot == current_slot || (proposal_slot == current_slot && proposing_on_time);
-    let single_slot_reorg = parent_slot_ok && current_time_ok;
-
-    // Check the head weight only if the attestations from the head slot have
-    // already been applied; before then, both conditions default to true
-    // rather than judging the head on attestations that have not arrived
-    // yet.
-    let (head_weak, parent_strong) = if current_slot > head_slot {
-        (
-            is_head_weak(store, head_root, config)?,
-            is_parent_strong(store, parent_root, config)?,
-        )
-    } else {
-        (true, true)
-    };
-
-    Ok(head_late
-        && shuffling_stable
-        && ffg_competitive
-        && finalization_ok
-        && proposing_reorg_slot
-        && single_slot_reorg
-        && head_weak
-        && parent_strong)
 }
 
 // ---------------------------------------------------------------------------
@@ -2077,6 +2138,158 @@ pub fn compute_pulled_up_tip(
 }
 
 // ---------------------------------------------------------------------------
+// on_block helpers
+// ---------------------------------------------------------------------------
+
+/// Whether a block at `block_slot` arrived before its slot's attestation
+/// deadline: [`record_block_timeliness`]'s own definition of timely, minus
+/// the write.
+///
+/// Split out so [`on_block`] can gate the (otherwise unconditional)
+/// proposer-boost head computation on the same answer *before* the block
+/// joins the store, without either recomputing the formula by hand or paying
+/// to look the block back up once it has, the way [`record_block_timeliness`]
+/// does.
+fn is_block_timely(store: &Store, block_slot: Slot, config: &Config) -> bool {
+    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
+    let epoch = get_current_store_epoch(store, config);
+    let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
+    let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
+    get_current_slot(store, config) == block_slot && is_before_attesting_interval
+}
+
+/// Records whether `root`'s block, at `block_slot`, arrived before its slot's
+/// attestation deadline: the timeliness [`update_proposer_boost_root`] and
+/// [`is_head_late`] both read back out of
+/// [`Store::block_timeliness`](ethlambda_storage::Store::block_timeliness).
+///
+/// Takes `block_slot` directly rather than reading it back out of the block
+/// [`on_block`] just inserted: `Store::block_entry` decodes the whole signed
+/// block to answer it on a beacon directory (see its own documentation), and
+/// the one caller here always already has the slot, from the block it just
+/// inserted.
+///
+/// `pub(crate)` rather than `pub`, unlike most functions in this file: unlike
+/// [`is_block_timely`], which mirrors a piece of the specification's own
+/// `record_block_timeliness`, this one's own signature (`block_slot` as a
+/// parameter) is this crate's adaptation of it rather than a transcription,
+/// and [`on_block`] is its only caller.
+pub(crate) fn record_block_timeliness(
+    store: &mut Store,
+    root: Root,
+    block_slot: Slot,
+    config: &Config,
+) {
+    let is_timely = is_block_timely(store, block_slot, config);
+    store.set_block_timeliness(root, is_timely);
+}
+
+/// The first slot of the lookahead window `epoch`'s proposer shuffling opens
+/// in: `MIN_SEED_LOOKAHEAD` epochs before `epoch` itself starts.
+pub fn compute_shuffling_lookahead_start_slot(epoch: Epoch) -> Slot {
+    let lookahead_epoch = epoch.saturating_sub(preset::MIN_SEED_LOOKAHEAD);
+    compute_start_slot_at_epoch(lookahead_epoch)
+}
+
+/// The last slot before `epoch`'s proposer shuffling could still change: one
+/// before [`compute_shuffling_lookahead_start_slot`].
+pub fn compute_shuffling_dependent_slot(epoch: Epoch) -> Slot {
+    compute_shuffling_lookahead_start_slot(epoch).saturating_sub(1)
+}
+
+/// Like [`get_ancestor`], but stops at the lowest indexed ancestor on
+/// `root`'s chain instead of failing when the walk would need to step past
+/// it.
+///
+/// The specification's own `get_ancestor` never needs this: a full node's
+/// earliest block is genesis, at slot 0, so a walk toward any real target
+/// slot always terminates there. A checkpoint-synced node's anchor is not
+/// slot 0, and its `parent_root` is a real historical root this store never
+/// held, so [`get_ancestor`] would raise `SpecAssert("root in store.blocks")`
+/// stepping past it. [`get_shuffling_dependent_root`] is the one caller that
+/// can ask for a slot below the anchor (shortly after sync, the dependent
+/// slot for the current epoch can still be that low), so it uses this
+/// instead: the lowest indexed ancestor is the anchor itself for every chain
+/// this store holds, since everything in it descends from that one root, so
+/// two different chains asking this the same question both land on it and
+/// answer the same way `get_ancestor` would once genesis, rather than the
+/// anchor, is the floor.
+fn get_ancestor_or_lowest_indexed(
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    slot: Slot,
+) -> Root {
+    let mut current = root;
+    loop {
+        let Some(&(block_slot, parent_root)) = index.get(&current) else {
+            // `current` is not itself indexed. Every caller starts this walk
+            // from an indexed root, so this only happens after stepping to a
+            // `parent_root` the loop below already checked is indexed, which
+            // makes this branch unreachable; kept as a safe fallback rather
+            // than an `expect`, since returning wherever the walk got to is
+            // still a sound answer even if that invariant ever slipped.
+            return current;
+        };
+        if block_slot <= slot || !index.contains_key(&parent_root) {
+            return current;
+        }
+        current = parent_root;
+    }
+}
+
+/// The block that fixed `epoch`'s proposer shuffling on `root`'s chain: the
+/// ancestor of `root` at [`compute_shuffling_dependent_slot`], or the lowest
+/// indexed ancestor on `root`'s chain if that slot is not covered; see
+/// [`get_ancestor_or_lowest_indexed`] for why the second case is sound.
+pub fn get_shuffling_dependent_root(
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    epoch: Epoch,
+) -> Root {
+    get_ancestor_or_lowest_indexed(index, root, compute_shuffling_dependent_slot(epoch))
+}
+
+/// Boosts `root`'s weight, if it is the first block seen for its slot, arrived
+/// on time, and shares `head`'s proposer shuffling.
+///
+/// The shuffling check is what `v1.7.0` added over the boost's original rule
+/// (timely and first, full stop): a block whose proposer shuffling has already
+/// diverged from the chain fork choice currently follows is not boosted, so
+/// the boost cannot itself be the thing that drags the head onto a branch with
+/// a different, no-longer-relevant view of who was supposed to propose it.
+///
+/// `head` must be the head [`compute_head`] found *before* `root` joined the
+/// store: [`on_block`] is this function's only caller, and it passes exactly
+/// that. `index` should include `root`'s own entry (`on_block` extends its
+/// own pre-insertion index with it rather than re-scanning `LiveChain`), or
+/// the walk below falls back to whatever the closest indexed ancestor
+/// answers, per [`get_ancestor_or_lowest_indexed`].
+///
+/// `pub(crate)`, not `pub`: like [`record_block_timeliness`], this one's
+/// `index` parameter is this crate's own adaptation, not a transcription, and
+/// [`on_block`] is its only caller.
+pub(crate) fn update_proposer_boost_root(
+    store: &mut Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    head: Root,
+    root: Root,
+    config: &Config,
+) {
+    let is_first_block = store.proposer_boost_root().is_zero();
+    let is_timely = store
+        .block_timeliness(&root)
+        .expect("record_block_timeliness always runs first, on the same root");
+    let epoch = get_current_store_epoch(store, config);
+    let head_dependent_root = get_shuffling_dependent_root(index, head, epoch);
+    let block_dependent_root = get_shuffling_dependent_root(index, root, epoch);
+    let is_same_dependent_root = head_dependent_root == block_dependent_root;
+
+    if is_timely && is_first_block && is_same_dependent_root {
+        store.set_proposer_boost_root(root);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // on_tick helpers
 // ---------------------------------------------------------------------------
 
@@ -2319,6 +2532,32 @@ pub fn on_block(
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
 
+    // Return early if the block already has a post-state: a re-delivery must
+    // not re-run `record_block_timeliness`/`update_proposer_boost_root` below
+    // on a block already fully imported. The chain actor's own import cascade
+    // already deduplicates a known root before ever reaching here
+    // (`Store::has_state`, which also skips re-running `state_transition`;
+    // see its own call site's documentation for the cost of not having that
+    // check), so in practice this rarely fires from that path; it is the
+    // specification's own guard, for every caller, mapped onto what
+    // `store.blocks` membership means here.
+    //
+    // `Store::has_state`, not `Store::has_block`: the specification's
+    // `store.blocks` only gains a root at the very end of `on_block`, once a
+    // post-state has been computed for it, so membership there is really "has
+    // been imported". This store's own `blocks` table does not line up with
+    // that: a block the actor is holding for missing data columns is
+    // persisted *before* import (`holding_a_block_persists_it_and_records_its_root`),
+    // so `has_block` answers true for a root that has never actually run
+    // `state_transition`. Guarding on it instead of `has_state` made this
+    // function answer `Ok(())` for a held block without importing it, which
+    // starved every later delivery naming it as an ancestor: none of them
+    // could see a post-state either, so each walked back to this root, found
+    // it "already known", and gave up without importing anything, forever.
+    if store.has_state(&block_root).expect("get") {
+        return Ok(());
+    }
+
     // Parent block must be known. `get_state` hands back a shared `Arc`, which
     // both checks the parent is known and gives the value to clone the copy
     // `state_transition` below mutates from: `state_transition` must not be
@@ -2351,7 +2590,15 @@ pub fn on_block(
     // finalized slot. A single-call index: see `get_ancestor`'s documentation
     // for why a per-hop lookup would be the wrong trade, which does not apply
     // to this one walk.
-    let index = store.block_index();
+    //
+    // `mut`, and kept alive for the rest of this function: the pre-import
+    // head computation and the proposer-boost shuffling check further down
+    // both want this same pre-insertion snapshot of `LiveChain` (`compute_head`
+    // takes it as a parameter, matching `get_filtered_block_tree`/
+    // `compute_weights`), so it is built once here rather than three times
+    // over. Once `block_root` itself joins the store below, one `insert`
+    // keeps this index in step with it instead of re-scanning for that alone.
+    let mut index = store.block_index();
     let finalized_checkpoint_block =
         get_checkpoint_block(&index, parent_root, finalized_checkpoint.epoch)?;
     verify(
@@ -2493,14 +2740,38 @@ pub fn on_block(
     let current_justified = state.current_justified_checkpoint();
     let finalized = state.finalized_checkpoint();
 
-    // Add new block to the store, and the new state for this block to the
-    // store. `block_slot` is copied out first since `signed_block` moves next.
+    // [New in v1.7.0] Whether this block can even be a candidate for the
+    // proposer boost, decided *before* it joins the store and before the one
+    // fallible step below runs, so that a failure here leaves the store
+    // exactly as it was. `update_proposer_boost_root`'s own gate is
+    // `is_timely and is_first_block and <same shuffling as the pre-import
+    // head>`; the first two conditions are cheap and already decide most
+    // blocks, especially every block a follower receives while syncing, which
+    // is never timely. Computing that head (`compute_head`: a `LiveChain`
+    // scan, a filtered-tree walk, and a pass over every latest message; see
+    // `compute_weights` for why the last of those matters at scale) is not
+    // worth paying for on a block the shuffling check could not change the
+    // answer for anyway.
     let block_slot = signed_block.slot();
+    let is_timely = is_block_timely(store, block_slot, config);
+    let is_first_block = store.proposer_boost_root().is_zero();
+    let pre_block_head = if is_timely && is_first_block {
+        Some(compute_head(store, &index, config)?)
+    } else {
+        None
+    };
+
+    // Add new block to the store, and the new state for this block to the
+    // store.
     let signed_block_el_hash = signed_block.execution_block_hash();
     store
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
     store.insert_state(block_root, state).expect("insert");
+    // Keep `index` in step with the one block that changed, rather than
+    // re-scanning `LiveChain` for it: see this function's earlier comment on
+    // `index` for who below still needs it.
+    index.insert(block_root, (block_slot, parent_root));
 
     // Cache this block's own execution hash for `forkchoiceUpdated` and for the
     // `latestValidHash` walk, and record whether the execution layer has
@@ -2529,19 +2800,13 @@ pub fn on_block(
         PayloadValidity::NotRequired | PayloadValidity::Invalidated { .. } => {}
     }
 
-    // Add block timeliness to the store.
-    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
-    let epoch = get_current_store_epoch(store, config);
-    let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
-    let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
-    let is_timely = get_current_slot(store, config) == block_slot && is_before_attesting_interval;
-    store.set_block_timeliness(block_root, is_timely);
-
-    // Add proposer score boost if the block is timely and not conflicting
-    // with an existing block.
-    let is_first_block = store.proposer_boost_root().is_zero();
-    if is_timely && is_first_block {
-        store.set_proposer_boost_root(block_root);
+    // Add block timeliness to the store, and boost its score if it is timely,
+    // first, and shares the pre-import head's proposer shuffling. Both calls
+    // are infallible: nothing from here to the end of this function can turn
+    // into an `Err`, and the store has already been mutated above.
+    record_block_timeliness(store, block_root, block_slot, config);
+    if let Some(pre_block_head) = pre_block_head {
+        update_proposer_boost_root(store, &index, pre_block_head, block_root, config);
     }
 
     // Update checkpoints in store if necessary.
@@ -2719,8 +2984,12 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
 
     use super::*;
+    use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
+    use crate::beacon::helpers::accessors;
+    use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
+    use crate::beacon::primitives::BlsSignature;
 
     /// A store backed by a fresh in-memory backend, with every checkpoint at
     /// its default (genesis) value and no anchor block or state written.
@@ -2775,6 +3044,20 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// [`block`], with an explicit proposer index rather than the default
+    /// `0`, for tests that care about which proposer a block names.
+    fn block_with_proposer(
+        slot: Slot,
+        parent_root: Root,
+        proposer_index: ValidatorIndex,
+    ) -> SignedBeaconBlock {
+        let SignedBeaconBlock::Phase0(mut inner) = block(slot, parent_root) else {
+            unreachable!("`block` builds a phase0 signed block");
+        };
+        inner.message.proposer_index = proposer_index;
+        SignedBeaconBlock::Phase0(inner)
     }
 
     /// An exact anchor pair: `state` is `block`'s own post-state.
@@ -2992,6 +3275,40 @@ mod tests {
         assert!(get_ancestor(&index, Root::repeat_byte(9), 0).is_err());
     }
 
+    /// A checkpoint-synced anchor's own `parent_root` names real history this
+    /// store never held, so it is never indexed. `get_shuffling_dependent_root`
+    /// asking for a dependent slot below such an anchor (which the import
+    /// benchmark's `replay.rs` hits on its very first block: the clock is set
+    /// to that block's own slot, so the current epoch can be as little as one
+    /// past the anchor's) must not walk into that gap the way plain
+    /// `get_ancestor` would.
+    #[test]
+    fn get_shuffling_dependent_root_stops_at_a_non_genesis_anchor() {
+        let anchor_root = Root::repeat_byte(1);
+        let anchor_slot = 100;
+        let unindexed_parent = Root::repeat_byte(0xff);
+
+        let mut index = HashMap::new();
+        index.insert(anchor_root, (anchor_slot, unindexed_parent));
+
+        // One epoch past the anchor's own: still low enough that the
+        // dependent slot (`MIN_SEED_LOOKAHEAD` epochs, minus one, before it)
+        // falls before `anchor_slot`.
+        let epoch = compute_epoch_at_slot(anchor_slot) + 1;
+        assert!(
+            compute_shuffling_dependent_slot(epoch) < anchor_slot,
+            "the scenario this test exists for requires a dependent slot \
+             below the anchor"
+        );
+
+        assert_eq!(
+            get_shuffling_dependent_root(&index, anchor_root, epoch),
+            anchor_root,
+            "the walk must stop at the lowest indexed ancestor rather than \
+             stepping into `unindexed_parent`"
+        );
+    }
+
     #[test]
     fn compute_slots_since_epoch_start_counts_from_the_epoch_boundary() {
         let epoch_start = compute_start_slot_at_epoch(3);
@@ -3045,6 +3362,136 @@ mod tests {
         assert_eq!(
             head, high_root,
             "a weight tie must be broken by the lexicographically higher root"
+        );
+    }
+
+    #[test]
+    fn is_proposer_equivocation_true_for_two_blocks_from_the_same_proposer_and_slot() {
+        let a_root = Root::repeat_byte(2);
+        let b_root = Root::repeat_byte(3);
+        let mut store = empty_store();
+        store
+            .insert_signed_block(a_root, block_with_proposer(1, Root::ZERO, 7))
+            .unwrap();
+        store
+            .insert_signed_block(b_root, block_with_proposer(1, Root::ZERO, 7))
+            .unwrap();
+        let index = index(&[(a_root, 1, Root::ZERO), (b_root, 1, Root::ZERO)]);
+
+        assert!(
+            is_proposer_equivocation(&store, &index, a_root).unwrap(),
+            "two blocks sharing a slot and a proposer must be an equivocation"
+        );
+    }
+
+    #[test]
+    fn is_proposer_equivocation_false_for_two_blocks_same_slot_different_proposers() {
+        let a_root = Root::repeat_byte(2);
+        let b_root = Root::repeat_byte(3);
+        let mut store = empty_store();
+        store
+            .insert_signed_block(a_root, block_with_proposer(1, Root::ZERO, 7))
+            .unwrap();
+        store
+            .insert_signed_block(b_root, block_with_proposer(1, Root::ZERO, 8))
+            .unwrap();
+        let index = index(&[(a_root, 1, Root::ZERO), (b_root, 1, Root::ZERO)]);
+
+        assert!(
+            !is_proposer_equivocation(&store, &index, a_root).unwrap(),
+            "sharing a slot alone, with different proposers, is not an \
+             equivocation"
+        );
+    }
+
+    #[test]
+    fn is_head_weak_counts_an_equivocating_validators_balance_from_the_head_slot_committees() {
+        let config = Config::active();
+        // Exactly `SLOTS_PER_EPOCH` active validators and one committee per
+        // slot puts exactly one validator in the anchor's own slot's
+        // committee 0, so which index the shuffle picks does not matter to
+        // this test: it asks the same cache `is_head_weak` will.
+        let (mut store, anchor_root, anchor_slot) =
+            anchored_store(preset::SLOTS_PER_EPOCH as usize);
+        let committees = CommitteeCache::default();
+
+        assert!(
+            is_head_weak(&store, anchor_root, &config, &committees).unwrap(),
+            "a head with no votes and no equivocators must be weak"
+        );
+
+        let head_state = store
+            .get_state(&anchor_root)
+            .expect("get")
+            .expect("state exists");
+        let epoch = compute_epoch_at_slot(anchor_slot);
+        let equivocator = committees
+            .committees(&head_state, epoch)
+            .committee(anchor_slot, 0)
+            .expect("committee 0 of the anchor's own slot")[0];
+        store.insert_equivocating_index(equivocator);
+
+        assert!(
+            !is_head_weak(&store, anchor_root, &config, &committees).unwrap(),
+            "the equivocator's own effective balance must count toward the \
+             head's weight, clearing the reorg threshold on its own"
+        );
+    }
+
+    #[test]
+    fn get_proposer_head_reorgs_a_weak_timely_head_on_proposer_equivocation() {
+        let config = Config::active();
+        let genesis_root = Root::repeat_byte(1);
+        let parent_root = Root::repeat_byte(2);
+        let head_root = Root::repeat_byte(3);
+        let twin_root = Root::repeat_byte(4);
+        let committees = CommitteeCache::default();
+
+        let mut store = store_anchored_at(genesis_root);
+        store
+            .insert_signed_block(genesis_root, block(0, Root::ZERO))
+            .unwrap();
+        store
+            .insert_signed_block(parent_root, block(1, genesis_root))
+            .unwrap();
+        store
+            .insert_signed_block(head_root, block_with_proposer(2, parent_root, 9))
+            .unwrap();
+        // A second block for `head_root`'s own slot and proposer: the new
+        // `is_proposer_equivocation` condition this test exercises.
+        store
+            .insert_signed_block(twin_root, block_with_proposer(2, parent_root, 9))
+            .unwrap();
+
+        let state = test_state::with_validators(1);
+        store.insert_state(genesis_root, state.clone()).unwrap();
+        store.insert_state(parent_root, state.clone()).unwrap();
+        store.insert_state(head_root, state).unwrap();
+
+        // Timely: `is_head_late` answers `false`, which alone keeps the main
+        // reorg branch (`head_late && ...`) from firing, so a `parent_root`
+        // result below can only come from the new `head_weak &&
+        // current_time_ok && proposer_equivocation` branch.
+        store.set_block_timeliness(head_root, true);
+
+        // `is_ffg_competitive` needs both roots to already have an
+        // unrealized justification on record; its value is irrelevant to the
+        // branch under test as long as both calls succeed.
+        let checkpoint = Checkpoint {
+            epoch: 0,
+            root: genesis_root,
+        };
+        store.set_unrealized_justification(head_root, checkpoint);
+        store.set_unrealized_justification(parent_root, checkpoint);
+
+        // One slot past `head_root`'s own slot (2): `current_time_ok`.
+        let proposer_head = get_proposer_head(&store, head_root, 3, &config, &committees)
+            .expect("every condition this test sets up should let this succeed");
+
+        assert_eq!(
+            proposer_head, parent_root,
+            "a weak, timely head with a second block from its own proposer \
+             must still be reorged out"
         );
     }
 
@@ -3171,6 +3618,154 @@ mod tests {
         );
 
         assert!(store.is_err());
+    }
+
+    /// [`on_block`]'s early-return guard must read `Store::has_state`, not
+    /// `Store::has_block`: a block the actor is holding for missing data
+    /// columns is written with
+    /// [`Store::insert_pending_block`](ethlambda_storage::Store::insert_pending_block)
+    /// before it ever imports, which stores the whole signed block in one
+    /// `BlockHeaders` row (so `has_block` answers true) but writes no
+    /// `LiveChain` entry (so [`Store::block_index`](ethlambda_storage::Store::block_index),
+    /// a `LiveChain` scan, does not name it). Guarding on `has_block` instead
+    /// of `has_state` made `on_block` answer `Ok(())` for a held block
+    /// without importing it, so every later delivery naming it as an
+    /// ancestor found it "already known" and gave up without importing
+    /// anything either -- forever, since nothing ever gave the root a
+    /// post-state.
+    ///
+    /// Delivered timely (the first block for its slot, before the
+    /// attestation deadline), so this also proves `on_block`'s pre-import
+    /// `compute_head` call (walking `Store::block_index`, for the new
+    /// proposer-boost dependent-root gate) tolerates a held block sitting
+    /// unindexed in the store: that walk never sees it, being a `LiveChain`
+    /// scan, so it is untouched by the held block's absent post-state.
+    ///
+    /// Builds a genuinely valid child block (correct proposer, RANDAO reveal,
+    /// and state root, all real BLS signatures over
+    /// [`test_state::secret_key_for`]'s key) rather than the zero-signature
+    /// [`block`] helper, since this exercises the real, signature-checking
+    /// [`on_block`], not a fixture harness that can skip verification.
+    #[test]
+    fn on_block_imports_a_block_already_persisted_with_no_post_state() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair_with(1);
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let target_slot = anchor_state.slot() + 1;
+
+        // The proposer and signing domain for `target_slot` only depend on
+        // advancing the slot clock, not on the block itself, so these are
+        // derived from their own clone ahead of building the block.
+        let mut probe_state = anchor_state.clone();
+        stf::process_slots(&mut probe_state, target_slot, &config).expect("process_slots");
+        let proposer_index =
+            accessors::get_beacon_proposer_index(&probe_state).expect("get_beacon_proposer_index");
+        let proposer_key = test_state::secret_key_for(proposer_index as usize);
+        let proposer_domain =
+            accessors::get_domain(&probe_state, constants::DOMAIN_BEACON_PROPOSER, None);
+        let randao_domain = accessors::get_domain(&probe_state, constants::DOMAIN_RANDAO, None);
+        let randao_epoch = get_current_epoch(&probe_state);
+        let randao_reveal = BlsSignature(
+            proposer_key
+                .sign(
+                    compute_signing_root(randao_epoch.hash_tree_root(), randao_domain).as_slice(),
+                    bls::DST,
+                    &[],
+                )
+                .to_bytes(),
+        );
+
+        let mut draft = block(target_slot, anchor_root);
+        let SignedBeaconBlock::Phase0(inner) = &mut draft else {
+            unreachable!("`block` builds a phase0 signed block");
+        };
+        inner.message.proposer_index = proposer_index;
+        inner.message.body.randao_reveal = randao_reveal;
+
+        // Learn the real post-state (and so the real state root) by running
+        // the transition once, unvalidated, the way a proposer decides
+        // everything but the signature and the state root before signing.
+        let mut trial_state = anchor_state.clone();
+        let trial_committees = CommitteeCache::default();
+        stf::state_transition(
+            &mut trial_state,
+            &draft,
+            false,
+            &config,
+            &stf::ExecutionEngine::valid(),
+            &trial_committees,
+        )
+        .expect("the drafted block must transition cleanly");
+        let state_root = trial_state.hash_tree_root();
+
+        let SignedBeaconBlock::Phase0(inner) = &mut draft else {
+            unreachable!("still phase0");
+        };
+        inner.message.state_root = state_root;
+        let signing_root = compute_signing_root(draft.message_hash_tree_root(), proposer_domain);
+        let SignedBeaconBlock::Phase0(inner) = &mut draft else {
+            unreachable!("still phase0");
+        };
+        inner.signature = BlsSignature(
+            proposer_key
+                .sign(signing_root.as_slice(), bls::DST, &[])
+                .to_bytes(),
+        );
+        let signed_block = draft;
+        let block_root = signed_block.message_hash_tree_root();
+
+        // The store holds the child block already, exactly the shape
+        // `hold_block_for_columns` leaves it in: one `BlockHeaders` row (so
+        // `has_block` is true and the block is readable back by root) but no
+        // `LiveChain` entry (so `block_index` does not name it) and no
+        // post-state (nothing has imported it yet).
+        let mut store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            anchor_state,
+            anchor_block,
+            &config,
+        )
+        .expect("the anchor pair matches");
+        // `on_block` refuses a block from the future (`get_current_slot(store)
+        // >= block.slot`), so the store's clock has to have reached the
+        // child's own slot before this test's `on_block` call below. Set to
+        // the slot's own start, its first block, so `is_block_timely` is
+        // true and `on_block` runs its pre-import `compute_head` call too
+        // (see this test's own doc for why that matters).
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                config.seconds_per_slot * target_slot,
+            ))
+            .expect("set time");
+        store
+            .insert_pending_block(block_root, signed_block.clone())
+            .expect("insert");
+        assert!(store.has_block(&block_root), "persisted above");
+        assert!(
+            !store.has_state(&block_root).expect("get"),
+            "no import has run yet"
+        );
+        assert!(
+            !store.block_index().contains_key(&block_root),
+            "a held block carries no LiveChain entry"
+        );
+
+        let committees = CommitteeCache::default();
+        on_block(
+            &mut store,
+            signed_block,
+            &config,
+            &DataAvailability::NotRequired,
+            &PayloadValidity::NotRequired,
+            &committees,
+        )
+        .expect("a validly signed, correctly rooted block must still import");
+
+        assert!(
+            store.has_state(&block_root).expect("get"),
+            "on_block must not mistake a persisted-but-unimported (held) \
+             block for an already-imported one"
+        );
     }
 
     #[test]
