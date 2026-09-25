@@ -6,10 +6,18 @@
 //! `stateful_checks` read states and verify signatures and proofs, so they run
 //! on a blocking thread. The spec's conformance vectors run both, in order.
 
+pub mod aggregate;
+pub mod attestation;
 pub mod block;
 pub mod column;
 #[cfg(test)]
 pub(crate) mod test_support;
+
+// Re-exported at the module's own top level, alongside `SeenBlocks` and
+// `SeenColumns`: every seen cache lives at the same path regardless of which
+// topic's submodule defines it.
+pub use aggregate::SeenAggregates;
+pub use attestation::SeenAttestations;
 
 use std::num::NonZeroUsize;
 
@@ -17,10 +25,12 @@ use lru::LruCache;
 
 use crate::beacon::config::Config;
 use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::{self, Store};
+use crate::beacon::helpers::accessors::get_block_root_at_slot;
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::precheck::PrecheckError;
-use crate::beacon::primitives::{Root, Slot, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 
 /// A gossip message's verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +100,20 @@ pub enum IgnoreReason {
     Overloaded,
     /// Validation panicked.
     Internal,
+    /// An attestation's slot is in neither the current nor the previous epoch.
+    OutsideEpochWindow,
+    /// An aggregate adds no bit that one already accepted for the same data
+    /// and committee does not have.
+    CoveredBits,
+    /// The block an attestation votes for has never been seen.
+    UnknownBlock,
+    /// The voted block is known but its post-state is not cached.
+    StateUnavailable,
+    /// The finalized checkpoint is not an ancestor of the voted block. IGNORE
+    /// for attestations, where blocks and columns REJECT.
+    FinalizedNotAncestor,
+    /// An ancestor lies outside what the state's `block_roots` can answer.
+    AncestryUnknown,
 }
 
 impl IgnoreReason {
@@ -102,6 +126,12 @@ impl IgnoreReason {
             Self::NoConsumer => "no_consumer",
             Self::Overloaded => "overloaded",
             Self::Internal => "internal",
+            Self::OutsideEpochWindow => "outside_epoch_window",
+            Self::CoveredBits => "covered_bits",
+            Self::UnknownBlock => "unknown_block",
+            Self::StateUnavailable => "state_unavailable",
+            Self::FinalizedNotAncestor => "finalized_not_ancestor",
+            Self::AncestryUnknown => "ancestry_unknown",
         }
     }
 }
@@ -122,6 +152,32 @@ pub enum RejectReason {
     PayloadTimestamp,
     InclusionProof,
     Kzg,
+    /// An attestation's target epoch is not its slot's epoch.
+    EpochMismatch,
+    /// An aggregate with no aggregation bit set.
+    NoParticipants,
+    /// Electra and later require `data.index` to be zero.
+    NonZeroDataIndex,
+    /// An aggregate's `committee_bits` does not name exactly one committee.
+    CommitteeBits,
+    /// The committee index is not below the slot's committee count.
+    CommitteeIndex,
+    /// `aggregation_bits` is not the committee's length.
+    BitsLength,
+    /// The selection proof does not select the aggregator.
+    NotAggregator,
+    /// The aggregator or attester is not a member of the named committee.
+    NotInCommittee,
+    /// A validator index the state has no validator for.
+    UnknownValidator,
+    /// The selection proof's signature is invalid.
+    SelectionProof,
+    /// The aggregator's signature over the `AggregateAndProof` is invalid.
+    AggregatorSignature,
+    /// The aggregate attestation's own signature is invalid.
+    AggregateSignature,
+    /// The target is not the voted block's ancestor at the target epoch.
+    TargetNotAncestor,
 }
 
 impl RejectReason {
@@ -140,6 +196,19 @@ impl RejectReason {
             Self::PayloadTimestamp => "payload_timestamp",
             Self::InclusionProof => "inclusion_proof",
             Self::Kzg => "kzg",
+            Self::EpochMismatch => "epoch_mismatch",
+            Self::NoParticipants => "no_participants",
+            Self::NonZeroDataIndex => "non_zero_data_index",
+            Self::CommitteeBits => "committee_bits",
+            Self::CommitteeIndex => "committee_index",
+            Self::BitsLength => "bits_length",
+            Self::NotAggregator => "not_aggregator",
+            Self::NotInCommittee => "not_in_committee",
+            Self::UnknownValidator => "unknown_validator",
+            Self::SelectionProof => "selection_proof",
+            Self::AggregatorSignature => "aggregator_signature",
+            Self::AggregateSignature => "aggregate_signature",
+            Self::TargetNotAncestor => "target_not_ancestor",
         }
     }
 }
@@ -207,13 +276,74 @@ impl SeenColumns {
     }
 }
 
+/// The specification's `compute_time_at_slot_ms`: the clock reading at the
+/// start of `slot`.
+pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
+    config
+        .genesis_time_ms()
+        .saturating_add(slot.saturating_mul(config.slot_duration_ms))
+}
+
 /// The specification's `is_future_slot`: `slot` starts later than `now_ms`
 /// plus the gossip clock disparity allowance.
 pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
-    let slot_start_ms = config
-        .genesis_time_ms()
-        .saturating_add(slot.saturating_mul(config.slot_duration_ms));
-    slot_start_ms > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+    slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+}
+
+/// The specification's `is_within_epoch`: the clock, with the gossip clock
+/// disparity allowance on both ends, falls somewhere in `epoch`'s own span of
+/// slots.
+///
+/// Built from the same two-sided bound `is_within_slot_range` states
+/// generally (`phase0/p2p-interface.md`), specialised to a whole epoch's
+/// worth of slots: the window's far edge is the *next* epoch's first slot,
+/// since `is_within_slot_range`'s own `slot_range` argument is inclusive of
+/// its start and the epoch has `SLOTS_PER_EPOCH` slots.
+pub(crate) fn is_within_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
+    let start_ms = slot_start_ms(config, compute_start_slot_at_epoch(epoch));
+    if now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY) < start_ms {
+        return false;
+    }
+    let next_epoch_start_ms = slot_start_ms(config, compute_start_slot_at_epoch(epoch + 1));
+    if next_epoch_start_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY) < now_ms {
+        return false;
+    }
+    true
+}
+
+/// The specification's `is_current_or_previous_epoch` (`deneb/p2p-interface.md`):
+/// whether the clock places `epoch` within the disparity-widened current or
+/// previous epoch's window. Aggregates and subnet attestations both reject
+/// (as an `IGNORE`) an epoch outside this pair, on top of
+/// [`is_future_slot`]'s own per-slot check: a slot can be non-future yet still
+/// name an epoch more than one boundary stale, which this catches instead.
+pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
+    is_within_epoch(config, epoch, now_ms) || is_within_epoch(config, epoch + 1, now_ms)
+}
+
+/// Which block `state`'s own history names as the ancestor at `slot`, given
+/// that `state` is `at_block_root`'s post-state.
+///
+/// `get_block_root_at_slot` only answers for a slot strictly before the
+/// state's own (a state cannot look up the `block_roots` entry its own block
+/// is about to write). `at_block_root` is the right answer for its own slot
+/// and, since every caller here only ever asks for a checkpoint at or before
+/// the vote block, for anything at or after it too. `None` means the slot
+/// lies outside `state`'s `SLOTS_PER_HISTORICAL_ROOT` window: this state
+/// simply cannot answer, which is not the same as there being no ancestor,
+/// so callers treat it as unknown (`IGNORE`) rather than a failed check
+/// (`REJECT`).
+///
+/// Shared by [`aggregate`] and [`attestation`] for both of their ancestry
+/// checks (the target checkpoint and the finalized checkpoint), since both
+/// read it off the same vote block's post-state; see that state's choice
+/// documented on [`aggregate::stateful_checks`].
+pub(crate) fn ancestor_at(state: &BeaconState, at_block_root: Root, slot: Slot) -> Option<Root> {
+    if slot >= state.slot() {
+        Some(at_block_root)
+    } else {
+        get_block_root_at_slot(state, slot).ok()
+    }
 }
 
 /// The first slot of the store's finalized epoch.
@@ -447,5 +577,95 @@ mod tests {
         store.insert_live_chain_entry(5, tip, missing);
 
         assert_eq!(finalized_ancestry(&store, tip), FinalizedAncestry::Unknown);
+    }
+
+    #[test]
+    fn an_epoch_window_holds_only_within_the_clock_disparity_at_either_edge() {
+        let config = Config {
+            genesis_time: 0,
+            ..Config::mainnet()
+        };
+        let epoch = 5;
+        let start_ms = slot_start_ms(&config, compute_start_slot_at_epoch(epoch));
+        let next_start_ms = slot_start_ms(&config, compute_start_slot_at_epoch(epoch + 1));
+
+        // The near edge: the disparity allowance lets the clock run early.
+        assert!(is_within_epoch(
+            &config,
+            epoch,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_within_epoch(
+            &config,
+            epoch,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY - 1
+        ));
+        // The far edge: the same allowance lets the clock run late.
+        assert!(is_within_epoch(
+            &config,
+            epoch,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_within_epoch(
+            &config,
+            epoch,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY + 1
+        ));
+    }
+
+    #[test]
+    fn current_or_previous_epoch_covers_exactly_two_epochs() {
+        use crate::beacon::preset;
+
+        let config = Config {
+            genesis_time: 0,
+            ..Config::mainnet()
+        };
+        let epoch = 5;
+        // Comfortably inside the epoch rather than at either boundary: right
+        // at a boundary, the clock disparity allowance deliberately makes
+        // the adjacent epoch's window overlap too (covered by
+        // `an_epoch_window_holds_only_within_the_clock_disparity_at_either_edge`),
+        // which would widen this to three epochs instead of the two this
+        // test means to pin down.
+        let now_ms = slot_start_ms(&config, compute_start_slot_at_epoch(epoch))
+            + preset::SLOTS_PER_EPOCH / 2 * config.slot_duration_ms;
+
+        assert!(is_current_or_previous_epoch(&config, epoch, now_ms));
+        assert!(is_current_or_previous_epoch(&config, epoch - 1, now_ms));
+        assert!(!is_current_or_previous_epoch(&config, epoch - 2, now_ms));
+        assert!(!is_current_or_previous_epoch(&config, epoch + 1, now_ms));
+    }
+
+    #[test]
+    fn ancestor_at_answers_itself_at_or_after_its_own_slot_and_block_roots_before_it() {
+        use crate::beacon::preset;
+
+        let mut state = crate::beacon::helpers::test_state::with_validators(4);
+        let at_block_root = Root::repeat_byte(0xaa);
+        let historical_slot = state.slot() - 1;
+        let historical_root = Root::repeat_byte(0x11);
+        state.block_roots_mut()[historical_slot as usize % preset::SLOTS_PER_HISTORICAL_ROOT] =
+            historical_root;
+
+        // Strictly before the state's own slot: reads `block_roots`.
+        assert_eq!(
+            ancestor_at(&state, at_block_root, historical_slot),
+            Some(historical_root)
+        );
+        // At, or after, the state's own slot: the block itself.
+        assert_eq!(
+            ancestor_at(&state, at_block_root, state.slot()),
+            Some(at_block_root)
+        );
+        assert_eq!(
+            ancestor_at(&state, at_block_root, state.slot() + 5),
+            Some(at_block_root)
+        );
+
+        // Older than the state's `SLOTS_PER_HISTORICAL_ROOT` window: this
+        // state cannot answer, so the ancestor is unknown rather than absent.
+        *state.slot_mut() = preset::SLOTS_PER_HISTORICAL_ROOT as Slot + 10;
+        assert_eq!(ancestor_at(&state, at_block_root, 0), None);
     }
 }

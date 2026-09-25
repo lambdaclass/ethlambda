@@ -109,33 +109,56 @@ impl StatusVersion {
 
 /// The `MetaData` this node advertises, in the version the protocol asked for.
 ///
-/// `attnets` and `syncnets` are all-zero because this node subscribes to no
-/// subnet, which is exactly what it serves. `custody_group_count` is
-/// `CUSTODY_REQUIREMENT`, the floor a peer may demand, not this node's actual
-/// custody: `sampling_size` raises what it actually stores and serves
-/// (`BeaconWire::custody_columns`) to cover at least `SAMPLES_PER_SLOT`
+/// `attnets` names the backbone subnets this node actually subscribed to (see
+/// [`BeaconWire::attestation_subnets`]), so what it claims to serve and what it
+/// listens on are one set. It used to be all-zero, which was honest while this
+/// node held no subscription; claiming subnets it does not serve would earn
+/// peer-score penalties for silence on them, and claiming none while serving
+/// two loses the peers looking for exactly that.
+///
+/// `syncnets` stays all-zero: no sync-committee subnet is subscribed.
+/// `custody_group_count` is `CUSTODY_REQUIREMENT`, the floor a peer may demand,
+/// not this node's actual custody: `sampling_size` raises what it stores and
+/// serves (`BeaconWire::custody_columns`) to cover at least `SAMPLES_PER_SLOT`
 /// groups, so `cgc` can only understate this node's real coverage, never
 /// overstate it.
 pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaData> {
     let seq_number = wire.metadata_seq_number;
+    let attnets = attnets(wire);
     match protocol {
         protocols::METADATA_V1 => Some(BeaconMetaData::V1(MetaDataV1 {
             seq_number,
-            attnets: AttnetsBits::default(),
+            attnets,
         })),
         protocols::METADATA_V2 => Some(BeaconMetaData::V2(MetaDataV2 {
             seq_number,
-            attnets: AttnetsBits::default(),
+            attnets,
             syncnets: SyncnetsBits::default(),
         })),
         protocols::METADATA_V3 => Some(BeaconMetaData::V3(MetaDataV3 {
             seq_number,
-            attnets: AttnetsBits::default(),
+            attnets,
             syncnets: SyncnetsBits::default(),
             custody_group_count: constants::CUSTODY_REQUIREMENT,
         })),
         _ => None,
     }
+}
+
+/// The `attnets` bitfield for this node's backbone subscription.
+///
+/// A subnet id past the bitfield's width is dropped rather than wrapped: the
+/// width is `ATTESTATION_SUBNET_COUNT`, a compile-time constant because
+/// `AttnetsBits` is an SSZ bitvector, while the subnet ids come from
+/// `Config::attestation_subnet_count`. A configuration that widened the count
+/// past the compiled width would otherwise set the wrong bit, which is a worse
+/// answer than setting none.
+fn attnets(wire: &BeaconWire) -> AttnetsBits {
+    let mut attnets = AttnetsBits::default();
+    for &subnet_id in &wire.attestation_subnets {
+        let _ = attnets.set(subnet_id as usize, true);
+    }
+    attnets
 }
 
 /// Open the handshake on a newly established connection.
@@ -200,18 +223,21 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{SignedBeaconBlock, phase0};
+    use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
     use ethlambda_types::checkpoint::Checkpoint;
 
     fn wire() -> BeaconWire {
         BeaconWire {
             fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
-            topics: topics::BeaconTopics::new([0x8c, 0x9f, 0x62, 0xfe], &[]),
+            fork: ForkName::Fulu,
+            topics: topics::BeaconTopics::new([0x8c, 0x9f, 0x62, 0xfe], &[], &[]),
             config: Config::mainnet(),
             genesis_time: 1_606_824_023,
             genesis_validators_root: Root::ZERO,
             metadata_seq_number: 0,
             custody_columns: Vec::new(),
+            attestation_subnets: Vec::new(),
         }
     }
 
@@ -357,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn the_advertised_subnets_are_empty() {
+    fn a_node_with_no_backbone_advertises_no_subnet() {
         // What a node subscribing to no subnet actually serves. Claiming
         // otherwise would earn peer-score penalties for silence on subnets we
         // advertised.
@@ -366,5 +392,40 @@ mod tests {
         };
         assert_eq!(v3.attnets, AttnetsBits::default());
         assert_eq!(v3.syncnets, SyncnetsBits::default());
+    }
+
+    /// The other half of the same rule: a node that does hold a backbone
+    /// subscription has to say so, or the peers looking for that subnet never
+    /// find it.
+    #[test]
+    fn the_advertised_subnets_are_the_subscribed_ones() {
+        let mut wire = wire();
+        wire.attestation_subnets = vec![12, 40];
+        let Some(BeaconMetaData::V3(v3)) = build_metadata(&wire, protocols::METADATA_V3) else {
+            panic!("v3 requested");
+        };
+        for subnet in 0..64usize {
+            let expected = subnet == 12 || subnet == 40;
+            assert_eq!(
+                v3.attnets.get(subnet).unwrap_or(false),
+                expected,
+                "subnet {subnet} advertised wrongly"
+            );
+        }
+        // Still nothing claimed on the sync-committee side.
+        assert_eq!(v3.syncnets, SyncnetsBits::default());
+    }
+
+    /// A subnet id the compiled bitfield has no room for is dropped rather than
+    /// wrapped onto some other subnet's bit, which would advertise a subnet
+    /// this node never subscribed to.
+    #[test]
+    fn a_subnet_past_the_bitfield_width_sets_no_bit() {
+        let mut wire = wire();
+        wire.attestation_subnets = vec![64, 999];
+        let Some(BeaconMetaData::V3(v3)) = build_metadata(&wire, protocols::METADATA_V3) else {
+            panic!("v3 requested");
+        };
+        assert_eq!(v3.attnets, AttnetsBits::default());
     }
 }

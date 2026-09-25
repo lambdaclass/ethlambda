@@ -45,7 +45,7 @@ pub fn process_block(
     signed_block: &containers::SignedBeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     match signed_block {
         containers::SignedBeaconBlock::Phase0(signed) => {
@@ -81,7 +81,7 @@ pub fn process_block_phase0(
     state: &mut BeaconState,
     block: &phase0::BeaconBlock,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -115,7 +115,7 @@ pub fn process_block_altair(
     state: &mut BeaconState,
     block: &altair::BeaconBlock,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     process_block_header(
         state,

@@ -1,8 +1,9 @@
-//! Test scaffolding shared by `block`'s and `column`'s unit tests (and the
-//! parent module's own): a bare store anchored at a chosen finalized slot, a
-//! store finalized past a fork whose `LiveChain` rows the advance pruned, a
-//! keyed fulu parent state whose lookahead names one proposer, and the
-//! seen-cache and clock helpers both modules' tests build on.
+//! Test scaffolding shared by `block`'s, `column`'s, `aggregate`'s and
+//! `attestation`'s unit tests (and the parent module's own): a bare store
+//! anchored at a chosen finalized slot, a store finalized past a fork whose
+//! `LiveChain` rows the advance pruned, a keyed fulu parent state whose
+//! lookahead names one proposer, and the seen-cache and clock helpers every
+//! module's tests build on.
 //!
 //! `precheck.rs` keeps its own `fulu_parent`: it is built through that
 //! module's own multi-fork `keyed_state` helper, which this module has no use
@@ -14,6 +15,8 @@ use std::sync::Arc;
 use ethlambda_storage::backend::InMemoryBackend;
 use ethlambda_types::checkpoint::Checkpoint;
 
+use super::aggregate::SeenAggregates;
+use super::attestation::SeenAttestations;
 use super::{SeenBlocks, SeenColumns};
 use crate::beacon::config::Config;
 use crate::beacon::containers::{
@@ -144,6 +147,19 @@ pub(crate) fn seen_blocks() -> SeenBlocks {
 /// The [`seen_blocks`] counterpart for columns.
 pub(crate) fn seen_columns() -> SeenColumns {
     SeenColumns::new(NonZeroUsize::new(8).expect("non-zero"))
+}
+
+/// The [`seen_blocks`] counterpart for aggregates: both capacities sized the
+/// same generous way, since a test's handful of messages never approaches
+/// either bound.
+pub(crate) fn seen_aggregates() -> SeenAggregates {
+    let capacity = NonZeroUsize::new(8).expect("non-zero");
+    SeenAggregates::new(capacity, capacity)
+}
+
+/// The [`seen_blocks`] counterpart for subnet attestations.
+pub(crate) fn seen_attestations() -> SeenAttestations {
+    SeenAttestations::new(NonZeroUsize::new(8).expect("non-zero"))
 }
 
 /// A fulu state of eight keyed validators whose lookahead names `proposer`

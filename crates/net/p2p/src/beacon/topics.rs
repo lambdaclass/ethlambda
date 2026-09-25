@@ -1,13 +1,26 @@
 //! The gossipsub topics `ethlambda beacon` subscribes to.
 //!
-//! Seven global topics, plus the data column subnets this node's own node id
-//! selects for custody. The rule for the rest is still that this node
-//! subscribes only to what it consumes, so `beacon_attestation_{0..63}`,
-//! `sync_committee_{0..3}` and `blob_sidecar_{subnet_id}` stay absent; each
-//! arrives with the sub-project that reads it. `data_column_sidecar_{0..127}`
-//! is the one family now legitimately subscribed, and only narrowly: this
-//! node's own sampling size worth of columns, not the whole matrix, which is
-//! what widening it to every column would turn this node into.
+//! Seven global topics, plus two families this node's own node id selects a
+//! narrow slice of: the data column subnets it custodies, and the
+//! `SUBNETS_PER_NODE` attestation subnets it backbones.
+//!
+//! "Only what it consumes" is no longer the whole rule, and
+//! `beacon_attestation_{subnet_id}` is where it stops applying.
+//! `p2p-interface.md` asks every beacon node to hold a long-lived subscription
+//! to `SUBNETS_PER_NODE` of these, chosen from its node id, precisely so that
+//! the subnets have a stable membership for validators to publish into; phase 0
+//! has no shard committees to give them one. That subscription is owed to the
+//! network rather than to this node's own head, so what arrives on it is
+//! relayed but never applied to fork choice, which is what a lighthouse node
+//! with no validators does too.
+//!
+//! `sync_committee_{0..3}` and `blob_sidecar_{subnet_id}` stay absent; the
+//! first arrives with the work that reads it and the second is deneb's format
+//! for blobs, deprecated at fulu in favour of the column matrix. Both subnet
+//! families that *are* subscribed are subscribed narrowly: this node's sampling
+//! size worth of columns rather than the whole matrix, and two attestation
+//! subnets rather than all sixty-four, since widening either is what turns this
+//! node into a supernode.
 
 use std::collections::BTreeMap;
 
@@ -44,15 +57,24 @@ pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
 /// add one label value rather than one per subnet.
 pub const DATA_COLUMN_SIDECAR_KIND: &str = "data_column_sidecar";
 
+/// The metric label every attestation subnet shares, so the backbone subnets
+/// add one label value rather than one per subnet. See
+/// [`DATA_COLUMN_SIDECAR_KIND`].
+pub const BEACON_ATTESTATION_KIND: &str = "beacon_attestation";
+
 /// The metric label for a topic kind this node subscribes to on the beacon
 /// wire: the kind itself for a global topic, [`DATA_COLUMN_SIDECAR_KIND`] for
-/// a column subnet. `None` for anything else, lean kinds included, which is
-/// what tells the gossip handler a message needs no verdict.
+/// a column subnet, [`BEACON_ATTESTATION_KIND`] for an attestation subnet.
+/// `None` for anything else, lean kinds included, which is what tells the
+/// gossip handler a message needs no verdict.
 pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if let Some(&global) = SUBSCRIBED_TOPIC_KINDS.iter().find(|&&known| known == kind) {
         return Some(global);
     }
-    data_column_subnet(kind).map(|_| DATA_COLUMN_SIDECAR_KIND)
+    if data_column_subnet(kind).is_some() {
+        return Some(DATA_COLUMN_SIDECAR_KIND);
+    }
+    attestation_subnet(kind).map(|_| BEACON_ATTESTATION_KIND)
 }
 
 /// Build one topic name: `/eth2/{fork_digest}/{kind}/ssz_snappy`.
@@ -71,6 +93,30 @@ pub fn topic_name(fork_digest: ForkDigest, kind: &str) -> String {
 /// the same index lean's `/leanconsensus/…` names put it at.
 pub fn topic_kind(topic: &str) -> Option<&str> {
     crate::gossipsub::topic_kind(topic)
+}
+
+/// Topic family for unaggregated attestations, one topic per subnet.
+pub const BEACON_ATTESTATION_PREFIX: &str = "beacon_attestation_";
+
+/// The topic carrying one attestation subnet.
+pub fn attestation_topic_name(fork_digest: ForkDigest, subnet_id: u64) -> String {
+    topic_name(
+        fork_digest,
+        &format!("{BEACON_ATTESTATION_PREFIX}{subnet_id}"),
+    )
+}
+
+/// The subnet an attestation topic kind names, or `None` if the kind is not one.
+///
+/// The digit check keeps a hypothetical global `beacon_attestation_something`
+/// from being read as a subnet, the same guard [`data_column_subnet`] has and
+/// for the same reason.
+pub fn attestation_subnet(kind: &str) -> Option<u64> {
+    let suffix = kind.strip_prefix(BEACON_ATTESTATION_PREFIX)?;
+    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
 }
 
 /// Topic family for data column sidecars, one subnet per column index.
@@ -119,10 +165,26 @@ pub struct BeaconTopics {
     /// stable ascending order, matching `custody_columns`'s own
     /// sorted-ascending convention.
     pub column_topics: BTreeMap<u64, IdentTopic>,
+    /// The attestation subnets this node holds a long-lived subscription to,
+    /// by subnet id.
+    ///
+    /// `p2p-interface.md` asks every beacon node to hold `SUBNETS_PER_NODE` of
+    /// these whether or not it runs validators, so the subnets have a stable
+    /// backbone for validators to publish into; phase 0 has no shard committees
+    /// to give them one otherwise. This node subscribes and relays on them
+    /// without applying what arrives to its own fork choice, which is what a
+    /// lighthouse node with no validators does too.
+    ///
+    /// A `BTreeMap` for the reason `column_topics` is one.
+    pub attestation_topics: BTreeMap<u64, IdentTopic>,
 }
 
 impl BeaconTopics {
-    pub fn new(fork_digest: ForkDigest, column_subnets: &[u64]) -> Self {
+    pub fn new(
+        fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
         // Built first so the map's own key semantics do the deduplication;
         // `topics` below only ever sees what survived that.
         let mut column_topics = BTreeMap::new();
@@ -132,16 +194,25 @@ impl BeaconTopics {
                 .or_insert_with(|| IdentTopic::new(data_column_topic_name(fork_digest, subnet_id)));
         }
 
+        let mut attestation_topics = BTreeMap::new();
+        for &subnet_id in attestation_subnets {
+            attestation_topics
+                .entry(subnet_id)
+                .or_insert_with(|| IdentTopic::new(attestation_topic_name(fork_digest, subnet_id)));
+        }
+
         let mut topics: Vec<IdentTopic> = SUBSCRIBED_TOPIC_KINDS
             .iter()
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
             .collect();
         topics.extend(column_topics.values().cloned());
+        topics.extend(attestation_topics.values().cloned());
 
         Self {
             fork_digest,
             topics,
             column_topics,
+            attestation_topics,
         }
     }
 }
@@ -180,7 +251,7 @@ mod tests {
 
     #[test]
     fn subscriptions_are_exactly_the_seven_global_topics() {
-        let topics = BeaconTopics::new(MAINNET, &[]);
+        let topics = BeaconTopics::new(MAINNET, &[], &[]);
         assert_eq!(topics.topics.len(), 7);
     }
 
@@ -191,8 +262,12 @@ mod tests {
         // ~30k BLS verifications per epoch and the whole column bandwidth.
         // `data_column_sidecar_` is no longer in this list: that family is now
         // legitimately subscribed, narrowly, by `only_the_custodied_subnets_are_subscribed`.
+        // `beacon_attestation_` has left it for the same reason, and is covered
+        // by `only_the_backbone_attestation_subnets_are_subscribed`; what this
+        // still pins is that neither family appears unless a caller asked for
+        // it, which is what the empty lists here say.
         let excluded = ["beacon_attestation_", "sync_committee_", "blob_sidecar_"];
-        for topic in BeaconTopics::new(MAINNET, &[]).topics {
+        for topic in BeaconTopics::new(MAINNET, &[], &[]).topics {
             let name = topic.to_string();
             let kind = topic_kind(&name).expect("a well-formed topic name");
             for prefix in excluded {
@@ -235,7 +310,7 @@ mod tests {
     fn only_the_custodied_subnets_are_subscribed() {
         // The narrow set is the point: subscribing to all of them is what
         // makes a supernode, at the whole matrix's bandwidth.
-        let topics = BeaconTopics::new(MAINNET, &[3, 9]);
+        let topics = BeaconTopics::new(MAINNET, &[3, 9], &[]);
         assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
         assert_eq!(topics.column_topics.len(), 2);
         assert!(topics.column_topics.contains_key(&3));
@@ -250,7 +325,7 @@ mod tests {
         // constructor the same id twice. `topics` must not gain a duplicate
         // entry for it: that would mean two `subscribe()` calls, two log
         // lines, and a `topics` count `column_topics.len()` disagrees with.
-        let topics = BeaconTopics::new(MAINNET, &[3, 3, 9]);
+        let topics = BeaconTopics::new(MAINNET, &[3, 3, 9], &[]);
         assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
         assert_eq!(topics.column_topics.len(), 2);
     }
@@ -263,9 +338,26 @@ mod tests {
             metric_kind("data_column_sidecar_7"),
             Some(DATA_COLUMN_SIDECAR_KIND)
         );
-        // Lean topic kinds and unsubscribed beacon kinds get no verdict.
+        // Lean topic kinds get no verdict.
         assert_eq!(metric_kind("block"), None);
-        assert_eq!(metric_kind("beacon_attestation_3"), None);
+    }
+
+    #[test]
+    fn attestation_subnets_share_one_label() {
+        // Every subnet in the family maps to the same label, the same way
+        // every data column subnet maps to `DATA_COLUMN_SIDECAR_KIND`: one
+        // metric label value per family, not one per subnet, and every
+        // subnet message gets a verdict rather than being invisible to
+        // `handle_beacon_gossip`.
+        assert_eq!(
+            metric_kind("beacon_attestation_3"),
+            Some(BEACON_ATTESTATION_KIND)
+        );
+        assert_eq!(
+            metric_kind("beacon_attestation_40"),
+            Some(BEACON_ATTESTATION_KIND)
+        );
+        assert_eq!(metric_kind("beacon_attestation_"), None);
     }
 
     #[test]
@@ -274,7 +366,7 @@ mod tests {
         // what lets a reader of `topics` predict the tail's order from the
         // subnet ids alone, the same way `custody_columns` is sorted
         // ascending rather than left in whatever order the walk found them.
-        let topics = BeaconTopics::new(MAINNET, &[9, 3]);
+        let topics = BeaconTopics::new(MAINNET, &[9, 3], &[]);
         let tail: Vec<String> = topics.topics[SUBSCRIBED_TOPIC_KINDS.len()..]
             .iter()
             .map(|topic| topic.to_string())
@@ -286,5 +378,66 @@ mod tests {
                 data_column_topic_name(MAINNET, 9),
             ]
         );
+    }
+
+    #[test]
+    fn an_attestation_topic_is_the_family_name_and_its_subnet() {
+        assert_eq!(
+            attestation_topic_name(MAINNET, 12),
+            "/eth2/8c9f62fe/beacon_attestation_12/ssz_snappy"
+        );
+    }
+
+    #[test]
+    fn an_attestation_topic_reads_its_subnet_back() {
+        assert_eq!(attestation_subnet("beacon_attestation_7"), Some(7));
+        assert_eq!(attestation_subnet("beacon_attestation_"), None);
+        assert_eq!(attestation_subnet("beacon_attestation_x"), None);
+        // The global aggregate topic shares no prefix with the family, but the
+        // block topic is the one a careless `starts_with` would catch.
+        assert_eq!(attestation_subnet("beacon_block"), None);
+        assert_eq!(attestation_subnet(BEACON_AGGREGATE_AND_PROOF), None);
+    }
+
+    /// The backbone is a narrow slice, not the whole family: subscribing to all
+    /// sixty-four is what makes a supernode, at every attester's bandwidth.
+    #[test]
+    fn only_the_backbone_attestation_subnets_are_subscribed() {
+        let topics = BeaconTopics::new(MAINNET, &[], &[12, 40]);
+        assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
+        assert_eq!(topics.attestation_topics.len(), 2);
+        assert!(topics.attestation_topics.contains_key(&12));
+        assert!(topics.attestation_topics.contains_key(&40));
+    }
+
+    /// Both families can be subscribed at once, and each keeps its own count:
+    /// the two tails are appended in order, columns then attestations.
+    #[test]
+    fn both_subnet_families_are_subscribed_together() {
+        let topics = BeaconTopics::new(MAINNET, &[3, 9], &[40, 12]);
+        assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 4);
+        let tail: Vec<String> = topics.topics[SUBSCRIBED_TOPIC_KINDS.len()..]
+            .iter()
+            .map(|topic| topic.to_string())
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                data_column_topic_name(MAINNET, 3),
+                data_column_topic_name(MAINNET, 9),
+                attestation_topic_name(MAINNET, 12),
+                attestation_topic_name(MAINNET, 40),
+            ]
+        );
+    }
+
+    /// A repeated subnet id is subscribed once, for the reason its column
+    /// counterpart is: two `subscribe()` calls and a `topics` count that
+    /// disagrees with the map beside it.
+    #[test]
+    fn a_repeated_attestation_subnet_is_subscribed_once() {
+        let topics = BeaconTopics::new(MAINNET, &[], &[12, 12, 40]);
+        assert_eq!(topics.topics.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
+        assert_eq!(topics.attestation_topics.len(), 2);
     }
 }

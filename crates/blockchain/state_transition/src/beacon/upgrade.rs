@@ -62,7 +62,7 @@ fn translate_participation(
     // targets the epoch before the fork and they share that one shuffling
     // between them, and a fork transition runs once per network rather than
     // once per block. Nothing outside this loop needs it afterwards.
-    let mut committees = CommitteeCache::default();
+    let committees = CommitteeCache::default();
 
     for attestation in pending_attestations {
         let participation_flag_indices =
@@ -82,8 +82,7 @@ fn translate_participation(
             data: attestation.data,
             signature: BlsSignature::default(),
         };
-        let attesting_indices =
-            get_attesting_indices(post, &attestation_for_indices, &mut committees)?;
+        let attesting_indices = get_attesting_indices(post, &attestation_for_indices, &committees)?;
 
         let altair_state = match post {
             BeaconState::Altair(state) => state,

@@ -187,17 +187,21 @@ $(CONSENSUS_SPEC_TESTS_STAMP):
 
 # The gossip validation vectors (`networking/gossip_*`) first ship in a
 # pre-release, so they come from a tree of their own rather than moving the pin
-# above. Only fulu's block and column handlers are extracted, since those are
-# the topics this node validates; the rest of each tarball is never unpacked.
-# Fold this back into the main tree once that release is final.
+# above. Only fulu's block, column, aggregate and attestation handlers are
+# extracted, since those are the topics this node validates; the rest of each
+# tarball is never unpacked. Fold this back into the main tree once that
+# release is final.
 CONSENSUS_SPEC_GOSSIP_TESTS_VERSION ?= v1.7.0-beta.1
 CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)
 # Follows CONSENSUS_SPEC_TESTS_CONFIGS, so narrowing that one narrows this too.
 # `general` is dropped because it has no `networking` runner: naming its
 # members would fail the extraction.
 CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS = $(filter-out general,$(CONSENSUS_SPEC_TESTS_CONFIGS))
-CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar
-CONSENSUS_SPEC_GOSSIP_TESTS_STAMP=consensus-spec-tests-gossip/.version-$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS)))
+CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar gossip_beacon_aggregate_and_proof gossip_beacon_attestation
+# Includes the handler list, not just the version and configs: growing the
+# list must re-extract an existing tree, which a stamp keyed on version and
+# configs alone would not notice, since neither of those changed.
+CONSENSUS_SPEC_GOSSIP_TESTS_STAMP=consensus-spec-tests-gossip/.version-$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS)))-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS)))
 
 consensus-spec-gossip-tests: $(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP) ## ⬇️ Download the gossip validation spec test fixtures
 

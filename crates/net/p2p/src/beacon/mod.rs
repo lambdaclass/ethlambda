@@ -19,11 +19,13 @@ pub mod encoding;
 pub mod handler;
 pub mod messages;
 pub mod protocols;
+pub mod subnets;
 pub mod swarm;
 pub mod topics;
 pub mod verdict;
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 
 /// Everything the beacon wire needs after startup has computed it.
@@ -33,6 +35,13 @@ use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 /// derivation must use the same schedule the fork digest was computed from.
 pub struct BeaconWire {
     pub fork_digest: ForkDigest,
+    /// The fork `fork_digest` was computed at, so the fork of everything
+    /// that arrives on a subscribed topic.
+    ///
+    /// Only `beacon_attestation_{subnet_id}` reads it. Every other
+    /// fork-dependent topic finds its fork from the slot inside the payload,
+    /// which this one cannot do; see [`decode::decode_attestation`].
+    pub fork: ForkName,
     pub topics: topics::BeaconTopics,
     pub config: Config,
     pub genesis_time: u64,
@@ -50,6 +59,11 @@ pub struct BeaconWire {
     /// gossip handler and the request handlers can check what this node
     /// promises to serve without recomputing it from the node id.
     pub custody_columns: Vec<u64>,
+    /// The attestation subnets this node backbones, from the same node id.
+    ///
+    /// Read by `build_metadata` for the `attnets` bitfield it advertises, so
+    /// what this node claims to serve is what it actually subscribed to.
+    pub attestation_subnets: Vec<u64>,
 }
 
 impl BeaconWire {

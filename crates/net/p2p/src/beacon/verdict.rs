@@ -3,18 +3,25 @@
 //! The rules live in `ethlambda_state_transition::beacon::gossip`; this module
 //! decides where each half runs and what happens to the result. Cheap checks
 //! run inline in the p2p actor. Stateful checks run on a `spawn_blocking`
-//! thread, bounded by [`P2PServer::gossip_validation_permits`], which sends a
-//! [`GossipVerdict`] back to the actor. Every beacon gossip message ends in
-//! exactly one [`report`]: gossipsub holds each one until then.
+//! thread, bounded by one of two pools depending on the kind: a block or a
+//! column draws from [`P2PServer::gossip_validation_permits`], an aggregate or
+//! a subnet attestation from [`P2PServer::attestation_validation_permits`] (see
+//! that field's own documentation for why they must not share one). Either way
+//! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
+//! gossip message ends in exactly one [`report`]: gossipsub holds each one
+//! until then.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
-use ethlambda_network_api::{BlockArrival, BlockSource};
+use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::containers::{SignedBeaconBlock, fulu::DataColumnSidecar};
-use ethlambda_types::beacon::primitives::Root;
+use ethlambda_types::beacon::containers::electra::SingleAttestation;
+use ethlambda_types::beacon::containers::{
+    SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
+};
+use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
@@ -47,15 +54,52 @@ pub(crate) enum Validated {
     // commitment and proof list plus a full cell, wide enough on its own to
     // set the enum's size.
     Column(Box<DataColumnSidecar>),
+    /// A `beacon_aggregate_and_proof`.
+    Aggregate {
+        aggregate: Box<SignedAggregateAndProof>,
+        /// The attesting indices its aggregate signature verified. Empty
+        /// until [`Validated::stateful_checks`] fills it in on `Accept`;
+        /// [`Validated::forward`] is what reads it, and only ever on that
+        /// outcome, so an empty value here is never mistaken for a verified
+        /// one.
+        attesting_indices: Vec<ValidatorIndex>,
+    },
+    /// A `beacon_attestation_{subnet_id}`. Never forwarded to the chain actor
+    /// (see [`Validated::forward`]'s doc comment), so nothing beyond the
+    /// verdict and the seen cache is kept once its checks have run.
+    Attestation {
+        attestation: Box<SingleAttestation>,
+        subnet_id: u64,
+    },
 }
 
 impl Validated {
-    fn stateful_checks(&self, store: &Store) -> Outcome {
+    /// Run this object's stateful checks. `&mut self` rather than `&self`:
+    /// [`Self::Aggregate`]'s `attesting_indices` starts empty and is filled in
+    /// here on `Accept`, the one place its aggregate signature is checked and
+    /// its attesting indices resolved, so [`Validated::forward`] finds them
+    /// already in hand rather than having to re-verify the aggregate to learn
+    /// them.
+    fn stateful_checks(&mut self, store: &Store) -> Outcome {
         match self {
             Self::Block { block, block_root } => {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
             Self::Column(sidecar) => gossip::column::stateful_checks(store, sidecar),
+            Self::Aggregate {
+                aggregate,
+                attesting_indices,
+            } => match gossip::aggregate::stateful_checks(store, aggregate) {
+                Ok(indices) => {
+                    *attesting_indices = indices;
+                    Outcome::Accept
+                }
+                Err(outcome) => outcome,
+            },
+            Self::Attestation {
+                attestation,
+                subnet_id,
+            } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
         }
     }
 
@@ -74,6 +118,8 @@ impl Validated {
                     .seen_columns
                     .record(header.slot, header.proposer_index, sidecar.index)
             }
+            Self::Aggregate { aggregate, .. } => server.seen_aggregates.record(aggregate),
+            Self::Attestation { attestation, .. } => server.seen_attestations.record(attestation),
         }
     }
 
@@ -84,7 +130,15 @@ impl Validated {
     /// its import runs the state transition, which judges it again. A column
     /// goes straight there only on `Accept`: the chain actor keeps a column
     /// without checking it, so one gossip did not finish judging goes through
-    /// [`column_checks`] first.
+    /// [`column_checks`] first. An aggregate goes on only on `Accept`, and
+    /// carries the attesting indices [`Self::stateful_checks`] resolved: the
+    /// chain actor no longer verifies anything on this topic (see reviewer
+    /// finding #1 on PR #19), so an aggregate that never got a real `Accept`
+    /// (`Overloaded`, `Ignore`, `Reject`) must never reach it. A subnet
+    /// attestation is never forwarded at all, on any outcome: nothing on the
+    /// chain actor consumes one, matching a lighthouse follower with no
+    /// validators, which verifies and relays its own backbone subnets but
+    /// never calls `apply_attestation_to_fork_choice` for them either.
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
         let Some(blockchain) = &server.blockchain else {
             return;
@@ -108,6 +162,19 @@ impl Validated {
                     .inspect_err(|err| warn!(%err, "Failed to forward a data column sidecar"));
             }
             Self::Column(sidecar) => column_checks::check_and_forward(server, vec![*sidecar]),
+            Self::Aggregate {
+                aggregate,
+                attesting_indices,
+            } if outcome == Outcome::Accept => {
+                let arrival = AggregateArrival {
+                    decode_start: received_at,
+                    handed_off: Instant::now(),
+                };
+                let _ = blockchain
+                    .new_beacon_aggregate(aggregate, attesting_indices, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a gossip aggregate"));
+            }
+            Self::Aggregate { .. } | Self::Attestation { .. } => {}
         }
     }
 }
@@ -211,21 +278,35 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 /// Run `object`'s stateful checks on a blocking thread. The verdict comes back
 /// to the actor as a [`GossipVerdict`].
 ///
+/// A block or a column draws its permit from
+/// [`P2PServer::gossip_validation_permits`]; an aggregate or a subnet
+/// attestation from [`P2PServer::attestation_validation_permits`], a pool of
+/// its own so neither topic's per-slot burst can starve the other (see that
+/// field's documentation).
+///
 /// With every permit taken, the object is reported `Ignore(Overloaded)`
 /// instead of queued: queueing it would only make its verdict later than
-/// gossipsub's cache can wait for, so it never propagates unvalidated. It
-/// still goes on towards the chain actor, though: a block to an import that
-/// runs the state transition regardless of what gossip decided, a column to
-/// [`column_checks`] (see [`Validated::forward`]). Dropping it here instead
-/// would leave the actor to learn of it only through a child's by-root fetch
-/// or range sync, both far slower than gossip.
+/// gossipsub's cache can wait for, so it never propagates unvalidated. A block
+/// still goes on towards the chain actor regardless: its import runs the
+/// state transition, which judges it again. A column goes through
+/// [`column_checks`] instead (see [`Validated::forward`]); dropping either
+/// here would leave the actor to learn of it only through a child's by-root
+/// fetch or range sync, both far slower than gossip. An aggregate or a subnet
+/// attestation is not forwarded on this outcome at all: see
+/// [`Validated::forward`]'s own documentation for why.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
     id: GossipId,
     object: Validated,
 ) {
-    let Ok(permit) = server.gossip_validation_permits.clone().try_acquire_owned() else {
+    let permits = match &object {
+        Validated::Block { .. } | Validated::Column(_) => &server.gossip_validation_permits,
+        Validated::Aggregate { .. } | Validated::Attestation { .. } => {
+            &server.attestation_validation_permits
+        }
+    };
+    let Ok(permit) = permits.clone().try_acquire_owned() else {
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -236,6 +317,7 @@ pub(crate) fn spawn_stateful_checks(
     let actor = ctx.actor_ref();
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let mut object = object;
         let outcome = guarded(|| object.stateful_checks(&store));
         let _ = actor
             .send(GossipVerdict {
@@ -270,9 +352,15 @@ pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use ethlambda_network_api::P2PToBlockChain;
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
+    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::electra;
+    use ethlambda_types::beacon::containers::{AttestationData, Checkpoint, electra, phase0};
+    use spawned_concurrency::error::ActorError;
 
     use super::*;
     use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
@@ -291,6 +379,100 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// A minimal phase0 aggregate at `(slot, aggregator)`: only what
+    /// `settle`/`record_seen` and `forward` read is meaningful, nothing here
+    /// is signature-valid. Mirrors `beacon_aggregates`'s own test helper in
+    /// `ethlambda-blockchain`.
+    fn phase0_aggregate(slot: u64, aggregator: u64) -> SignedAggregateAndProof {
+        SignedAggregateAndProof::Phase0(phase0::SignedAggregateAndProof {
+            message: phase0::AggregateAndProof {
+                aggregator_index: aggregator,
+                aggregate: phase0::Attestation {
+                    aggregation_bits: phase0::AggregationBits::with_length(1).unwrap(),
+                    data: AttestationData {
+                        slot,
+                        index: 0,
+                        beacon_block_root: Root::ZERO,
+                        source: Checkpoint::default(),
+                        target: Checkpoint {
+                            epoch: slot / 32,
+                            root: Root::ZERO,
+                        },
+                    },
+                    signature: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// A minimal electra `SingleAttestation` at `(slot, attester)`. Same
+    /// reasoning as [`phase0_aggregate`].
+    fn electra_attestation(slot: u64, attester: u64) -> SingleAttestation {
+        SingleAttestation {
+            committee_index: 0,
+            attester_index: attester,
+            data: AttestationData {
+                slot,
+                index: 0,
+                beacon_block_root: Root::ZERO,
+                source: Checkpoint::default(),
+                target: Checkpoint {
+                    epoch: slot / 32,
+                    root: Root::ZERO,
+                },
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A [`P2PToBlockChain`] stand-in that only records whether
+    /// `new_beacon_aggregate` was called, for the tests that check `forward`
+    /// keeps an aggregate off the chain actor on every outcome but `Accept`.
+    struct RecordingChain(AtomicBool);
+
+    impl P2PToBlockChain for RecordingChain {
+        fn new_block(
+            &self,
+            _block: SignedBeaconBlock,
+            _source: BlockSource,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_aggregated_attestation(
+            &self,
+            _attestation: SignedAggregatedAttestation,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_data_column_sidecars(
+            &self,
+            _sidecars: Vec<DataColumnSidecar>,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn data_column_sidecars_awaiting_parent(
+            &self,
+            _sidecars: Vec<DataColumnSidecar>,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_beacon_aggregate(
+            &self,
+            _aggregate: Box<SignedAggregateAndProof>,
+            _attesting_indices: Vec<ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            self.0.store(true, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -356,6 +538,105 @@ mod tests {
             settle(&mut server, Outcome::Accept, &object),
             Outcome::Ignore(IgnoreReason::AlreadySeen)
         );
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_an_aggregate_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::Aggregate {
+            aggregate: Box::new(phase0_aggregate(5, 1)),
+            attesting_indices: Vec::new(),
+        };
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_an_attestation_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::Attestation {
+            attestation: Box::new(electra_attestation(5, 1)),
+            subnet_id: 0,
+        };
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+    }
+
+    /// The condition reviewer finding #1 on PR #19 was about: an aggregate
+    /// that never got a real `Accept` (here, `Overloaded`, standing in for
+    /// `Ignore`/`Reject` too, since `forward`'s guard is the same `if let ...
+    /// if outcome == Outcome::Accept` for all three) must never reach the
+    /// chain actor.
+    #[tokio::test]
+    async fn an_overloaded_aggregate_is_not_forwarded() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        server.blockchain = Some(chain.clone());
+        let object = Validated::Aggregate {
+            aggregate: Box::new(phase0_aggregate(5, 1)),
+            attesting_indices: Vec::new(),
+        };
+
+        object.forward(
+            &server,
+            Instant::now(),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+        );
+
+        assert!(!chain.0.load(Ordering::SeqCst));
+    }
+
+    /// A subnet attestation is never forwarded, on any outcome, `Accept`
+    /// included: see `Validated::forward`'s own documentation for why.
+    #[tokio::test]
+    async fn a_subnet_attestation_is_never_forwarded_even_on_accept() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        server.blockchain = Some(chain.clone());
+        let object = Validated::Attestation {
+            attestation: Box::new(electra_attestation(5, 1)),
+            subnet_id: 0,
+        };
+
+        object.forward(&server, Instant::now(), Outcome::Accept);
+
+        assert!(!chain.0.load(Ordering::SeqCst));
+    }
+
+    /// The pool an aggregate or a subnet attestation draws its stateful-check
+    /// permit from is not the pool a block or a column draws from: exhausting
+    /// one must leave the other untouched, or a burst on this topic could
+    /// make a block or a column answer `Ignore(Overloaded)` too.
+    #[tokio::test]
+    async fn the_block_column_and_attestation_permit_pools_are_independent() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let attestation_permits_before = server.attestation_validation_permits.available_permits();
+
+        let mut held = Vec::new();
+        while let Ok(permit) = server.gossip_validation_permits.clone().try_acquire_owned() {
+            held.push(permit);
+        }
+        assert_eq!(server.gossip_validation_permits.available_permits(), 0);
+
+        assert_eq!(
+            server.attestation_validation_permits.available_permits(),
+            attestation_permits_before
+        );
+        assert!(server.attestation_validation_permits.try_acquire().is_ok());
     }
 
     #[test]

@@ -68,6 +68,7 @@
 //!
 //! [specs]: https://github.com/ethereum/consensus-specs
 
+pub mod aggregate;
 pub mod bls;
 pub mod das;
 pub mod fork_choice;
@@ -87,7 +88,9 @@ mod lean_boundary;
 // `crate::beacon::containers::phase0::BeaconState` and
 // `ethlambda_types::beacon::containers::phase0::BeaconState` are one type by one
 // name, so a caller holding either spelling can hand it straight to this module.
-pub use ethlambda_types::beacon::{config, constants, containers, error, fork, preset, primitives};
+pub use ethlambda_types::beacon::{
+    committees, config, constants, containers, error, fork, preset, primitives,
+};
 
 pub use error::{Error, Result, verify};
 pub use fork::ForkName;

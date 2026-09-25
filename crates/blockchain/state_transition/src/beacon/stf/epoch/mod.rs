@@ -27,8 +27,8 @@ use crate::beacon::containers::{BeaconState, HistoricalBatch};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_block_root, get_block_root_at_slot, get_current_epoch, get_previous_epoch,
-    get_randao_mix, get_total_balance,
+    CommitteeCache, CommitteeCacheExt, get_block_root, get_block_root_at_slot, get_current_epoch,
+    get_previous_epoch, get_randao_mix, get_total_balance,
 };
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::lean_state_unreachable;
@@ -198,7 +198,7 @@ pub fn get_unslashed_attesting_indices(
     state: &BeaconState,
     attestations: &[PendingAttestation],
 ) -> Result<Vec<ValidatorIndex>> {
-    unslashed_attesting_indices(state, attestations, &mut CommitteeCache::default())
+    unslashed_attesting_indices(state, attestations, &CommitteeCache::default())
 }
 
 /// [`get_unslashed_attesting_indices`], drawing committees from a cache the
@@ -206,7 +206,7 @@ pub fn get_unslashed_attesting_indices(
 pub(crate) fn unslashed_attesting_indices(
     state: &BeaconState,
     attestations: &[PendingAttestation],
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
     let mut indices = Vec::new();
     for attestation in attestations {

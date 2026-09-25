@@ -34,9 +34,11 @@ jobs:
   # `ld terminated with signal 7 [Bus error]` rather than as ENOSPC.
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -80,9 +82,11 @@ jobs:
   # every runner except the sole coverage `beacon::genesis` has.
   presets:
     name: Test minimal preset
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -115,7 +119,7 @@ jobs:
   # missing entry never fails the build.
   tooling:
     name: Tooling
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -145,7 +149,7 @@ jobs:
   # cache entry for them, so only the first leg to arrive downloads anything.
   test:
     name: Test (${{ matrix.half }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     strategy:
       # Which half broke is most of the triage, so report both.
       fail-fast: false
@@ -153,6 +157,8 @@ jobs:
         half: [consensus, node]
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
@@ -171,9 +177,11 @@ jobs:
   # generates its chain and reads no files.
   benchmark-smoke:
     name: Benchmark smoke
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master
@@ -228,7 +236,7 @@ jobs:
           exit $status
   beacon-spec-tests:
     name: Beacon spec tests (${{ matrix.preset }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     # Far and away the longest job here: two full fixture trees to fetch and a
     # release-grade build before the first case runs. Bounded well above what a
     # healthy run takes, purely so a hang is reaped in tens of minutes rather
@@ -249,6 +257,8 @@ jobs:
       CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
     steps:
       - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@master

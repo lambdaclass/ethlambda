@@ -2,7 +2,8 @@ use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
 };
@@ -217,6 +218,60 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         sidecars: Vec<DataColumnSidecar>,
     ) -> Result<(), ActorError>;
+    /// An aggregate gossip validation accepted: `ethlambda-p2p`'s beacon
+    /// gossip verdict machinery already ran every `beacon_aggregate_and_proof`
+    /// condition, `attesting_indices` included, so the chain actor only has to
+    /// apply it to fork choice.
+    ///
+    /// Separate from [`Self::new_aggregated_attestation`], which carries
+    /// lean's unrelated [`SignedAggregatedAttestation`]: the two chains'
+    /// aggregate containers share no type, so unlike [`Self::new_block`] there
+    /// is nothing for one message to be generic over.
+    ///
+    /// Boxed for the reason `ethlambda-p2p`'s own gossip enum boxes it: two
+    /// signed block headers' worth of payload would otherwise set the size of
+    /// every message in this protocol.
+    ///
+    /// `attesting_indices` are the validators whose votes the aggregate
+    /// signature verified, resolved once against the committee p2p's gossip
+    /// validation already looked up. The chain actor never rebuilds a
+    /// committee or checks a signature for this topic: its only consumer is
+    /// `ethlambda_state_transition`'s apply-only
+    /// `fork_choice::apply_verified_aggregate`.
+    ///
+    /// One aggregate per message rather than a batch, unlike
+    /// [`Self::new_data_column_sidecars`]: gossip is the only producer, and it
+    /// has exactly one to hand.
+    fn new_beacon_aggregate(
+        &self,
+        aggregate: Box<SignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
+        arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+}
+
+/// When an aggregate reached this node, for the one metric that cannot be
+/// derived on the far side of the mailbox.
+///
+/// The mailbox hop is the failure mode applying gossip aggregates introduces:
+/// this topic carries up to `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE`
+/// messages a slot, and if they start queueing behind block imports the votes
+/// arrive too late to move the head while every per-aggregate timing still
+/// looks healthy. Measuring it means capturing an instant before the queue and
+/// reading it after, which is what this carries.
+///
+/// [`BlockArrival`]'s shape without its `deferred_from`: an aggregate held for
+/// a slot that has not started is held *inside* the chain actor, so that wait
+/// is measured where it happens rather than travelling on the message. And
+/// `decode_start` is not optional here, because gossip is the only producer
+/// and it always decodes the payload itself.
+#[derive(Clone, Copy, Debug)]
+pub struct AggregateArrival {
+    /// The payload came off the wire, before decompression.
+    pub decode_start: Instant,
+    /// The aggregate is about to be handed to the chain actor, which is also
+    /// the end of the decode.
+    pub handed_off: Instant,
 }
 
 // --- Init messages ---

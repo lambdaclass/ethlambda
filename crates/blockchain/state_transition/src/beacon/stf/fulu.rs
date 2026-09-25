@@ -60,7 +60,7 @@ pub fn process_block(
     block: &electra::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
