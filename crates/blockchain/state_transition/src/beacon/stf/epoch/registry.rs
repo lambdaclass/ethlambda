@@ -37,6 +37,15 @@ use crate::beacon::primitives::{Epoch, Gwei, ValidatorIndex};
 /// where the specification no longer has one at all, so both are refused
 /// outright rather than guessed at; see [`process_registry_updates`]'s own
 /// documentation for exactly which forks that leaves this serving.
+///
+/// Gloas is refused for the same reason, not routed to
+/// [`crate::beacon::helpers::gloas::get_activation_churn_limit`]: gloas
+/// inherits electra's balance-denominated `process_registry_updates`
+/// wholesale too (it has no validator-count activation cap of its own for
+/// this function to pick between), so this gate has nothing to serve gloas
+/// either. `get_activation_churn_limit` belongs to gloas's own
+/// `process_pending_deposits` (EIP-8061, a later task), which caps *deposit*
+/// processing, not registry activation.
 fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
     let churn_limit = get_validator_churn_limit(state, config);
     match state.fork_name() {

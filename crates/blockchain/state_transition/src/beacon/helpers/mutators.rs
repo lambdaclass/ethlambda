@@ -132,7 +132,14 @@ fn initiate_validator_exit_for_fork(
     config: &Config,
 ) -> Result<()> {
     match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => {
+        // Gloas is not a redefinition of `initiate_validator_exit` (EIP-8061
+        // touches only `compute_exit_epoch_and_update_churn`'s own churn
+        // limit, by fork dispatch there), so it reaches electra's copy
+        // unchanged, the same way pyspec's own unmodified
+        // `initiate_validator_exit` does on a gloas state: the churn it
+        // draws through `compute_exit_epoch_and_update_churn` is already
+        // gloas's own by the time it gets here.
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
             crate::beacon::helpers::electra::initiate_validator_exit(state, index, config)
         }
         ForkName::Phase0
@@ -140,15 +147,6 @@ fn initiate_validator_exit_for_fork(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => initiate_validator_exit(state, index, config),
-        // Gloas (EIP-8061) redefines the validator exit churn itself
-        // (`churn_limit_quotient_gloas`/`max_per_epoch_activation_churn_limit_gloas`
-        // in `Config`, read by `get_activation_churn_limit`/
-        // `get_exit_churn_limit`), which is more than a retuned constant;
-        // left as an explicit gap for the STF port rather than assumed.
-        ForkName::Gloas => Err(Error::UnsupportedForFork {
-            function: "initiate_validator_exit_for_fork",
-            fork: ForkName::Gloas,
-        }),
         ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
     }
 }
@@ -273,5 +271,43 @@ mod tests {
         // the validator keeps most of its balance for now.
         assert!(state.balance(3).unwrap() < balance_before);
         assert!(state.balance(3).unwrap() > balance_before / 2);
+    }
+
+    /// `initiate_validator_exit_for_fork` routes a gloas state to electra's
+    /// `initiate_validator_exit` unchanged, which in turn calls
+    /// `compute_exit_epoch_and_update_churn`, which is where the gloas and
+    /// electra churn split lives (a per-epoch limit chosen by fork, not a
+    /// separate gloas copy of the whole cursor update). This proves the
+    /// split reaches all the way through: with `Config::minimal()` and 64
+    /// validators, gloas's exit churn limit differs from electra's combined
+    /// activation/exit limit (the test asserts they differ before relying
+    /// on it), so the two leave a different `exit_balance_to_consume`
+    /// behind for the same single exit.
+    #[test]
+    fn initiate_validator_exit_for_fork_uses_gloas_own_exit_churn_on_a_gloas_state() {
+        let config = Config::minimal();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 64);
+
+        let gloas_limit =
+            crate::beacon::helpers::gloas::get_exit_churn_limit(&state, &config).unwrap();
+        let electra_limit =
+            crate::beacon::helpers::electra::get_activation_exit_churn_limit(&state, &config)
+                .unwrap();
+        assert_ne!(
+            gloas_limit, electra_limit,
+            "the fixture must actually discriminate between the two churn formulas"
+        );
+
+        let effective_balance = state.validator(0).unwrap().effective_balance;
+        initiate_validator_exit_for_fork(&mut state, 0, &config).unwrap();
+
+        let BeaconState::Gloas(inner) = &state else {
+            unreachable!("built as Gloas");
+        };
+        assert_eq!(
+            inner.exit_balance_to_consume,
+            gloas_limit - effective_balance,
+            "the exit must have consumed gloas's own churn budget, not electra's"
+        );
     }
 }

@@ -30,7 +30,7 @@ use crate::beacon::containers::shared::{
 };
 use crate::beacon::containers::{
     BeaconState, BlockRoots, RandaoMixes, Slashings, altair, bellatrix, capella, deneb, electra,
-    fulu, phase0,
+    fulu, gloas, phase0,
 };
 use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
@@ -140,13 +140,7 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Deneb => BeaconState::Deneb(deneb_state(count)),
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
-        // No gloas literal builder exists yet: its registry is progressive
-        // rather than bounded (see `containers::gloas`'s module doc), so this
-        // cannot reuse `fulu_state`'s placeholder fields unchanged. A later
-        // task adds `gloas_state` alongside the others above.
-        ForkName::Gloas => {
-            unimplemented!("with_validators_at: gloas has no test-state builder yet")
-        }
+        ForkName::Gloas => BeaconState::Gloas(gloas_state(count)),
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.
@@ -542,6 +536,92 @@ fn fulu_state(count: usize) -> fulu::BeaconState {
         // and override (see `crate::beacon::helpers::fulu::tests::fulu_state_with_validators`),
         // and this builder has no fulu-specific import to spare for it.
         proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+            .try_into()
+            .expect("the vector is built at its exact length"),
+    }
+}
+
+/// The [`with_validators_at`] counterpart for gloas.
+///
+/// A separate literal rather than a small patch over [`fulu_state`]: gloas's
+/// registry ([`crate::beacon::containers::shared::ProgressiveValidators`]/
+/// [`crate::beacon::containers::shared::ProgressiveBalances`]) is tree-backed
+/// rather than bounded (EIP-7688, see `containers::gloas`'s module doc), so
+/// [`full_validators`]/[`full_balances`]'s `SszList`-typed output does not
+/// fit gloas's fields; both convert from a plain `Vec` through `.into()`
+/// instead of `full_validators`/`full_balances`'s `.try_into()`. Every field
+/// from `builders` onward is new in gloas and has no meaningful default
+/// beyond an empty registry and an all-zero window, the same placeholder
+/// `crate::beacon::containers::gloas`'s own `zero_state` test helper uses.
+fn gloas_state(count: usize) -> gloas::BeaconState {
+    let validators: Vec<Validator> = (0..count)
+        .map(|_| Validator {
+            effective_balance: preset::MAX_EFFECTIVE_BALANCE,
+            activation_eligibility_epoch: 0,
+            activation_epoch: 0,
+            exit_epoch: constants::FAR_FUTURE_EPOCH,
+            withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+            ..Default::default()
+        })
+        .collect();
+    let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::PTC_SIZE]
+        .try_into()
+        .expect("built at exactly PTC_SIZE");
+
+    gloas::BeaconState {
+        genesis_time: 0,
+        genesis_validators_root: Root::ZERO,
+        slot: preset::SLOTS_PER_EPOCH,
+        fork: Default::default(),
+        latest_block_header: Default::default(),
+        block_roots: zero_root_vector(),
+        state_roots: zero_root_vector(),
+        historical_roots: Default::default(),
+        eth1_data: Default::default(),
+        eth1_data_votes: Default::default(),
+        eth1_deposit_index: 0,
+        validators: validators.into(),
+        balances: vec![preset::MAX_EFFECTIVE_BALANCE; count].into(),
+        randao_mixes: zero_randao_mixes(),
+        slashings: zero_slashings(),
+        previous_epoch_participation: vec![0; count].into(),
+        current_epoch_participation: vec![0; count].into(),
+        justification_bits: Default::default(),
+        previous_justified_checkpoint: Default::default(),
+        current_justified_checkpoint: Default::default(),
+        finalized_checkpoint: Default::default(),
+        inactivity_scores: vec![0; count].into(),
+        current_sync_committee: empty_sync_committee(),
+        next_sync_committee: empty_sync_committee(),
+        latest_block_hash: ExecutionBlockHash::ZERO,
+        next_withdrawal_index: 0,
+        next_withdrawal_validator_index: 0,
+        historical_summaries: Default::default(),
+        deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
+        deposit_balance_to_consume: 0,
+        exit_balance_to_consume: 0,
+        earliest_exit_epoch: 0,
+        consolidation_balance_to_consume: 0,
+        earliest_consolidation_epoch: 0,
+        pending_deposits: Default::default(),
+        pending_partial_withdrawals: Default::default(),
+        pending_consolidations: Default::default(),
+        proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+            .try_into()
+            .expect("the vector is built at its exact length"),
+        builders: Default::default(),
+        next_withdrawal_builder_index: 0,
+        execution_payload_availability: Default::default(),
+        builder_pending_payments: vec![
+            gloas::BuilderPendingPayment::default();
+            preset::BUILDER_PENDING_PAYMENTS_LENGTH
+        ]
+        .try_into()
+        .expect("the vector is built at its exact length"),
+        builder_pending_withdrawals: Default::default(),
+        latest_execution_payload_bid: Default::default(),
+        payload_expected_withdrawals: Default::default(),
+        ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
             .try_into()
             .expect("the vector is built at its exact length"),
     }

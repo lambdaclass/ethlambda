@@ -125,9 +125,11 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::Validator;
-use crate::beacon::containers::{BeaconState, electra, fulu};
+use crate::beacon::containers::{BeaconState, electra, fulu, gloas};
 use crate::beacon::error::{Error, Result};
+use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Epoch, Gwei, HashTreeRoot as _,
@@ -562,26 +564,53 @@ pub fn initiate_validator_exit(
     Ok(())
 }
 
-/// Advances electra's exit-queue cursor for an exit of `exit_balance`,
-/// returning the epoch it may take effect at.
+/// Advances the exit-queue cursor for an exit of `exit_balance`, returning
+/// the epoch it may take effect at.
 ///
 /// This is where the "balance to consume" cursor this module's doc describes
 /// actually lives: `earliest_exit_epoch` is the earliest epoch that still has
 /// unspent churn, and `exit_balance_to_consume` is how much of that epoch's
 /// budget remains. A new epoch's budget is only opened (refilled to a full
-/// [`get_activation_exit_churn_limit`]) once the cursor actually needs to move
-/// past the epoch it currently sits on; until then, a later, smaller exit in
-/// the same epoch spends whatever an earlier one left over instead of always
-/// waiting for a fresh epoch.
+/// per-epoch churn limit) once the cursor actually needs to move past the
+/// epoch it currently sits on; until then, a later, smaller exit in the same
+/// epoch spends whatever an earlier one left over instead of always waiting
+/// for a fresh epoch.
+///
+/// Gloas modifies this function by exactly the one line the specification's
+/// own diff shows (EIP-8061, beacon-chain.md): the per-epoch churn limit is
+/// [`crate::beacon::helpers::gloas::get_exit_churn_limit`]'s own uncapped
+/// budget rather than [`get_activation_exit_churn_limit`]'s combined one.
+/// Nothing past that line differs, so gloas does not get a copy of its own:
+/// this picks the limit by fork and otherwise runs the one shared cursor
+/// update, through [`ChurnCursorsMut`] rather than [`ElectraOrFuluMut`] (see
+/// that enum's own doc for why). Gloas modifies neither
+/// `initiate_validator_exit` (so neither voluntary exits nor registry
+/// ejections) nor `process_withdrawal_request`, so calling this from any
+/// of them already picks up gloas's churn automatically, the same way
+/// pyspec's unmodified callers do.
 pub fn compute_exit_epoch_and_update_churn(
     state: &mut BeaconState,
     exit_balance: Gwei,
     config: &Config,
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
-    let per_epoch_churn = get_activation_exit_churn_limit(state, config)?;
+    let per_epoch_churn = match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => get_activation_exit_churn_limit(state, config)?,
+        ForkName::Gloas => crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?,
+        fork @ (ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb) => {
+            return Err(Error::UnsupportedForFork {
+                function: "compute_exit_epoch_and_update_churn",
+                fork,
+            });
+        }
+        ForkName::Lean => lean_state_unreachable("compute_exit_epoch_and_update_churn"),
+    };
 
-    let mut fields = electra_state(state, "compute_exit_epoch_and_update_churn")?;
+    let mut fields = churn_cursors_mut(state, "compute_exit_epoch_and_update_churn")?;
 
     let mut earliest_exit_epoch = fields
         .earliest_exit_epoch()
@@ -636,24 +665,64 @@ pub fn compute_exit_epoch_and_update_churn(
     Ok(earliest_exit_epoch)
 }
 
-/// Advances electra's consolidation-queue cursor for a consolidation moving
+/// The per-epoch consolidation churn limit for `state`'s own fork,
+/// dispatching between electra's [`get_consolidation_churn_limit`] (also
+/// fulu's, unmodified) and gloas's own
+/// [`crate::beacon::helpers::gloas::get_consolidation_churn_limit`]
+/// (EIP-8061, independently derived from total active balance rather than
+/// left over from the activation/exit split).
+///
+/// The one call site every consolidation-churn reader reaches, so a gloas
+/// state is never charged electra's formula by accident:
+/// [`compute_consolidation_epoch_and_update_churn`] and
+/// [`crate::beacon::stf::electra::process_consolidation_request`] both go
+/// through this rather than either raw formula directly.
+pub fn get_consolidation_churn_limit_for_fork(
+    state: &BeaconState,
+    config: &Config,
+) -> Result<Gwei> {
+    match state.fork_name() {
+        ForkName::Electra | ForkName::Fulu => get_consolidation_churn_limit(state, config),
+        ForkName::Gloas => {
+            crate::beacon::helpers::gloas::get_consolidation_churn_limit(state, config)
+        }
+        fork @ (ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb) => Err(Error::UnsupportedForFork {
+            function: "get_consolidation_churn_limit_for_fork",
+            fork,
+        }),
+        ForkName::Lean => lean_state_unreachable("get_consolidation_churn_limit_for_fork"),
+    }
+}
+
+/// Advances the consolidation-queue cursor for a consolidation moving
 /// `consolidation_balance`, returning the epoch it may take effect at.
 ///
 /// The consolidation-side counterpart of
 /// [`compute_exit_epoch_and_update_churn`], carrying the exact same
 /// `(earliest_epoch, balance_to_consume)` cursor shape but drawing from
-/// [`get_consolidation_churn_limit`]'s separate budget instead of the
-/// activation/exit one, so a burst of consolidations cannot also drain the
-/// budget an unrelated exit needs.
+/// [`get_consolidation_churn_limit_for_fork`]'s separate budget instead of
+/// the activation/exit one, so a burst of consolidations cannot also drain
+/// the budget an unrelated exit needs.
+///
+/// Unlike [`compute_exit_epoch_and_update_churn`], gloas does not redefine
+/// this function itself: only its callee (electra's
+/// [`get_consolidation_churn_limit`]) is gloas-modified. So the cursor
+/// read/write below stays the one copy every fork through gloas shares,
+/// fed by [`get_consolidation_churn_limit_for_fork`] rather than either raw
+/// formula.
 pub fn compute_consolidation_epoch_and_update_churn(
     state: &mut BeaconState,
     consolidation_balance: Gwei,
     config: &Config,
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
-    let per_epoch_churn = get_consolidation_churn_limit(state, config)?;
+    let per_epoch_churn = get_consolidation_churn_limit_for_fork(state, config)?;
 
-    let mut fields = electra_state(state, "compute_consolidation_epoch_and_update_churn")?;
+    let mut fields = churn_cursors_mut(state, "compute_consolidation_epoch_and_update_churn")?;
 
     let mut earliest_consolidation_epoch = fields
         .earliest_consolidation_epoch()
@@ -838,62 +907,6 @@ pub(crate) enum ElectraOrFuluMut<'a> {
 }
 
 impl<'a> ElectraOrFuluMut<'a> {
-    pub(crate) fn earliest_exit_epoch(&self) -> Epoch {
-        match self {
-            ElectraOrFuluMut::Electra(state) => state.earliest_exit_epoch,
-            ElectraOrFuluMut::Fulu(state) => state.earliest_exit_epoch,
-        }
-    }
-
-    pub(crate) fn earliest_exit_epoch_mut(&mut self) -> &mut Epoch {
-        match self {
-            ElectraOrFuluMut::Electra(state) => &mut state.earliest_exit_epoch,
-            ElectraOrFuluMut::Fulu(state) => &mut state.earliest_exit_epoch,
-        }
-    }
-
-    pub(crate) fn exit_balance_to_consume(&self) -> Gwei {
-        match self {
-            ElectraOrFuluMut::Electra(state) => state.exit_balance_to_consume,
-            ElectraOrFuluMut::Fulu(state) => state.exit_balance_to_consume,
-        }
-    }
-
-    pub(crate) fn exit_balance_to_consume_mut(&mut self) -> &mut Gwei {
-        match self {
-            ElectraOrFuluMut::Electra(state) => &mut state.exit_balance_to_consume,
-            ElectraOrFuluMut::Fulu(state) => &mut state.exit_balance_to_consume,
-        }
-    }
-
-    pub(crate) fn earliest_consolidation_epoch(&self) -> Epoch {
-        match self {
-            ElectraOrFuluMut::Electra(state) => state.earliest_consolidation_epoch,
-            ElectraOrFuluMut::Fulu(state) => state.earliest_consolidation_epoch,
-        }
-    }
-
-    pub(crate) fn earliest_consolidation_epoch_mut(&mut self) -> &mut Epoch {
-        match self {
-            ElectraOrFuluMut::Electra(state) => &mut state.earliest_consolidation_epoch,
-            ElectraOrFuluMut::Fulu(state) => &mut state.earliest_consolidation_epoch,
-        }
-    }
-
-    pub(crate) fn consolidation_balance_to_consume(&self) -> Gwei {
-        match self {
-            ElectraOrFuluMut::Electra(state) => state.consolidation_balance_to_consume,
-            ElectraOrFuluMut::Fulu(state) => state.consolidation_balance_to_consume,
-        }
-    }
-
-    pub(crate) fn consolidation_balance_to_consume_mut(&mut self) -> &mut Gwei {
-        match self {
-            ElectraOrFuluMut::Electra(state) => &mut state.consolidation_balance_to_consume,
-            ElectraOrFuluMut::Fulu(state) => &mut state.consolidation_balance_to_consume,
-        }
-    }
-
     /// Deposits queued but not yet credited to the validator registry, pushed
     /// to by [`queue_excess_active_balance`] and
     /// [`queue_entire_balance_and_reset_validator`].
@@ -930,6 +943,112 @@ pub(crate) fn electra_state_ref<'a>(
     match state {
         BeaconState::Electra(state) => Ok(ElectraOrFulu::Electra(state)),
         BeaconState::Fulu(state) => Ok(ElectraOrFulu::Fulu(state)),
+        other => Err(Error::UnsupportedForFork {
+            function,
+            fork: other.fork_name(),
+        }),
+    }
+}
+
+/// Either fork whose state carries the four balance-churn cursor fields
+/// (`earliest_exit_epoch`, `exit_balance_to_consume`,
+/// `earliest_consolidation_epoch`, `consolidation_balance_to_consume`,
+/// EIP-7251) unchanged: electra, fulu, or gloas, which keeps every one of
+/// them at the same type (see `containers::gloas`'s module doc) even though
+/// gloas redefines which churn limit feeds them
+/// (`compute_exit_epoch_and_update_churn`,
+/// [`get_consolidation_churn_limit_for_fork`]).
+///
+/// Deliberately narrower than [`ElectraOrFuluMut`]: that enum also exposes
+/// `pending_deposits_mut`, whose gloas type
+/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
+/// [`libssz_types::ProgressiveList`], EIP-7688) is not electra's and fulu's
+/// bounded [`electra::PendingDeposits`], so widening `ElectraOrFuluMut`
+/// itself to gloas would leave that one method with no honest gloas arm to
+/// give it. This projection carries only the four fields every one of the
+/// three forks actually shares.
+pub(crate) enum ChurnCursorsMut<'a> {
+    Electra(&'a mut electra::BeaconState),
+    Fulu(&'a mut fulu::BeaconState),
+    Gloas(&'a mut gloas::BeaconState),
+}
+
+impl<'a> ChurnCursorsMut<'a> {
+    pub(crate) fn earliest_exit_epoch(&self) -> Epoch {
+        match self {
+            ChurnCursorsMut::Electra(state) => state.earliest_exit_epoch,
+            ChurnCursorsMut::Fulu(state) => state.earliest_exit_epoch,
+            ChurnCursorsMut::Gloas(state) => state.earliest_exit_epoch,
+        }
+    }
+
+    pub(crate) fn earliest_exit_epoch_mut(&mut self) -> &mut Epoch {
+        match self {
+            ChurnCursorsMut::Electra(state) => &mut state.earliest_exit_epoch,
+            ChurnCursorsMut::Fulu(state) => &mut state.earliest_exit_epoch,
+            ChurnCursorsMut::Gloas(state) => &mut state.earliest_exit_epoch,
+        }
+    }
+
+    pub(crate) fn exit_balance_to_consume(&self) -> Gwei {
+        match self {
+            ChurnCursorsMut::Electra(state) => state.exit_balance_to_consume,
+            ChurnCursorsMut::Fulu(state) => state.exit_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => state.exit_balance_to_consume,
+        }
+    }
+
+    pub(crate) fn exit_balance_to_consume_mut(&mut self) -> &mut Gwei {
+        match self {
+            ChurnCursorsMut::Electra(state) => &mut state.exit_balance_to_consume,
+            ChurnCursorsMut::Fulu(state) => &mut state.exit_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => &mut state.exit_balance_to_consume,
+        }
+    }
+
+    pub(crate) fn earliest_consolidation_epoch(&self) -> Epoch {
+        match self {
+            ChurnCursorsMut::Electra(state) => state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Fulu(state) => state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Gloas(state) => state.earliest_consolidation_epoch,
+        }
+    }
+
+    pub(crate) fn earliest_consolidation_epoch_mut(&mut self) -> &mut Epoch {
+        match self {
+            ChurnCursorsMut::Electra(state) => &mut state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Fulu(state) => &mut state.earliest_consolidation_epoch,
+            ChurnCursorsMut::Gloas(state) => &mut state.earliest_consolidation_epoch,
+        }
+    }
+
+    pub(crate) fn consolidation_balance_to_consume(&self) -> Gwei {
+        match self {
+            ChurnCursorsMut::Electra(state) => state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Fulu(state) => state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => state.consolidation_balance_to_consume,
+        }
+    }
+
+    pub(crate) fn consolidation_balance_to_consume_mut(&mut self) -> &mut Gwei {
+        match self {
+            ChurnCursorsMut::Electra(state) => &mut state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Fulu(state) => &mut state.consolidation_balance_to_consume,
+            ChurnCursorsMut::Gloas(state) => &mut state.consolidation_balance_to_consume,
+        }
+    }
+}
+
+/// The electra-or-fulu-or-gloas state, mutably, through [`ChurnCursorsMut`].
+/// See that enum's own doc for why it exists apart from [`electra_state`].
+pub(crate) fn churn_cursors_mut<'a>(
+    state: &'a mut BeaconState,
+    function: &'static str,
+) -> Result<ChurnCursorsMut<'a>> {
+    match state {
+        BeaconState::Electra(state) => Ok(ChurnCursorsMut::Electra(state)),
+        BeaconState::Fulu(state) => Ok(ChurnCursorsMut::Fulu(state)),
+        BeaconState::Gloas(state) => Ok(ChurnCursorsMut::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -1416,5 +1535,60 @@ mod tests {
 
         let exit_epoch = compute_exit_epoch_and_update_churn(&mut state, 1, &config).unwrap();
         assert_eq!(exit_epoch, baseline);
+    }
+
+    /// Gloas does not redefine `compute_consolidation_epoch_and_update_churn`
+    /// itself: only its churn limit is gloas-modified
+    /// ([`get_consolidation_churn_limit_for_fork`]). A gloas state must still
+    /// go through this shared cursor update, fed gloas's own churn limit
+    /// rather than electra's.
+    ///
+    /// 2048 validators: with mainnet's `CONSOLIDATION_CHURN_LIMIT_QUOTIENT`
+    /// (the wider of the two configs this runs under, `Config::mainnet()`
+    /// and `Config::minimal()`), that is exactly the active balance needed
+    /// for gloas's independent, from-total-active-balance formula to clear
+    /// one whole `EFFECTIVE_BALANCE_INCREMENT` rather than round down to
+    /// zero.
+    #[test]
+    fn compute_consolidation_epoch_and_update_churn_uses_gloas_own_limit_on_a_gloas_state() {
+        let config = Config::mainnet();
+        let mut state =
+            crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 2_048);
+        let gloas_limit =
+            crate::beacon::helpers::gloas::get_consolidation_churn_limit(&state, &config).unwrap();
+        assert!(gloas_limit > 0, "the fixture must exercise a real budget");
+
+        compute_consolidation_epoch_and_update_churn(&mut state, 1, &config).unwrap();
+
+        let fields = churn_cursors_mut(&mut state, "test").unwrap();
+        assert_eq!(fields.consolidation_balance_to_consume(), gloas_limit - 1);
+    }
+
+    /// Proves [`get_consolidation_churn_limit_for_fork`] actually
+    /// discriminates: `process_consolidation_request`
+    /// (`crate::beacon::stf::electra`) reads it too, so if it ever collapsed
+    /// to always answering with electra's formula, a gloas state would
+    /// silently mis-gate consolidation requests against the wrong budget.
+    #[test]
+    fn get_consolidation_churn_limit_for_fork_differs_between_electra_and_gloas() {
+        let config = Config::minimal();
+        let electra_state = electra_state_with_validators(64);
+        let gloas_state =
+            crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 64);
+
+        let electra_limit =
+            get_consolidation_churn_limit_for_fork(&electra_state, &config).unwrap();
+        let gloas_limit = get_consolidation_churn_limit_for_fork(&gloas_state, &config).unwrap();
+
+        assert_eq!(
+            electra_limit,
+            get_consolidation_churn_limit(&electra_state, &config).unwrap()
+        );
+        assert_eq!(
+            gloas_limit,
+            crate::beacon::helpers::gloas::get_consolidation_churn_limit(&gloas_state, &config)
+                .unwrap()
+        );
+        assert_ne!(electra_limit, gloas_limit);
     }
 }
