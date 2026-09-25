@@ -164,9 +164,7 @@ use tracing::{error, warn};
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::{
-    AttestationData, BeaconState, Checkpoint, SignedAggregateAndProof, SignedBeaconBlock,
-};
+use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
 use crate::beacon::containers::{bellatrix, deneb, electra, fulu, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
@@ -239,7 +237,7 @@ impl Attestation {
     pub fn verified_attesting_indices(
         &self,
         state: &BeaconState,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         self.indices(state, true, committees)
     }
@@ -256,7 +254,7 @@ impl Attestation {
     pub fn attesting_indices(
         &self,
         state: &BeaconState,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         self.indices(state, false, committees)
     }
@@ -271,7 +269,7 @@ impl Attestation {
         &self,
         state: &BeaconState,
         verify_signature: bool,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         match self {
             Attestation::Phase0(attestation) => {
@@ -295,32 +293,6 @@ impl Attestation {
                     )?;
                 }
                 Ok(indexed.attesting_indices.into_inner())
-            }
-        }
-    }
-}
-
-/// The aggregate inside a [`SignedAggregateAndProof`], in the shape every
-/// fork-choice function here takes.
-///
-/// A `From` rather than a method on the container, because the container lives
-/// in `ethlambda-types` and [`Attestation`] lives here: this is the one
-/// conversion that crosses that boundary, and putting it on this side is what
-/// lets `ethlambda-network-api` carry the container without depending on this
-/// crate.
-///
-/// Clones the inner attestation, which is what lets
-/// [`on_gossip_aggregate`] hand one to
-/// [`Attestation::verified_attesting_indices`] rather than reimplementing that
-/// fork dispatch for the aggregate's own two variants.
-impl From<&SignedAggregateAndProof> for Attestation {
-    fn from(signed: &SignedAggregateAndProof) -> Self {
-        match signed {
-            SignedAggregateAndProof::Phase0(signed) => {
-                Attestation::Phase0(signed.message.aggregate.clone())
-            }
-            SignedAggregateAndProof::Electra(signed) => {
-                Attestation::Electra(signed.message.aggregate.clone())
             }
         }
     }
@@ -2310,7 +2282,7 @@ pub fn on_block(
     config: &Config,
     blob_evidence: &DataAvailability,
     payload_validity: &PayloadValidity,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
@@ -2543,7 +2515,7 @@ pub fn on_attestation(
     attestation: &Attestation,
     is_from_block: bool,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation(store, data, is_from_block, config)?;
@@ -2602,7 +2574,7 @@ pub fn on_block_attestation(
     block_state: &BeaconState,
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation_indexed(store, data, true, config, index)?;
@@ -2613,69 +2585,43 @@ pub fn on_block_attestation(
     Ok(())
 }
 
-/// [`on_attestation`] for an aggregate that arrived on
-/// `beacon_aggregate_and_proof`, with that topic's own gossip conditions
-/// checked first.
+/// Apply an aggregate that reached the chain actor after
+/// `ethlambda-p2p`'s beacon gossip validation already accepted it.
 ///
-/// The two halves are deliberately one function rather than a validator the
-/// caller runs before `on_attestation`. Both need the target checkpoint state
-/// and both need [`Store::block_index`], and each of those is expensive enough
-/// that materializing it twice is the whole cost: the state can be a replay of
-/// every block since the last pinned boundary, and the index is a full
-/// `Table::LiveChain` scan.
+/// Every condition `beacon_aggregate_and_proof`'s own gossip rules add over a
+/// plain attestation, the committee lookups, `is_aggregator`, committee
+/// membership, and all three BLS checks, ran once in
+/// `ethlambda_state_transition::beacon::gossip::aggregate` before this was
+/// called, on the state that attestation's own target checkpoint names. This
+/// function must not repeat any of it: doing so would be the reviewed defect
+/// this replaced, committees rebuilt and signatures re-verified once per
+/// aggregate on the chain actor's single thread.
 ///
-/// `is_from_block` is fixed at `false`, unlike [`on_attestation`]'s parameter:
-/// an aggregate on this topic is by definition not carried in a block, so the
-/// current-or-previous-epoch target check applies and there is no caller who
-/// would want it skipped.
+/// What is left is exactly [`on_attestation`]'s own validity check and its
+/// bookkeeping, since neither is gossip's to answer: [`validate_on_attestation_indexed`]
+/// catches a target this node has since finalized past or a vote whose own
+/// slot has not passed yet, both of which can change between p2p's verdict
+/// and the chain actor picking the aggregate up, and [`update_latest_messages`]
+/// records it against `attesting_indices`, resolved by the caller's gossip
+/// validation rather than recomputed here.
 ///
-/// # Order
+/// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
+/// this topic: an aggregate here is by definition not carried in a block, so
+/// the current-or-previous-epoch target check applies.
 ///
-/// The cheap structural conditions run before any pairing, which is the
-/// ordering the specification's own validator has and the reason a node can
-/// afford this topic at all: [`validate_on_attestation_indexed`] and the
-/// committee-shaped conditions in
-/// [`crate::beacon::aggregate::validate_aggregate_and_proof_gossip`] reject on
-/// arithmetic and index lookups, and only what survives reaches the three BLS
-/// verifications (the selection proof, the aggregator's signature, and the
-/// aggregate signature inside
-/// [`Attestation::verified_attesting_indices`]).
-///
-/// The caller is still expected to have run the seen-set gates first; see
-/// [`crate::beacon::aggregate`]'s module documentation for why those cannot
-/// live here.
-pub fn on_gossip_aggregate(
+/// `index` is [`Store::block_index`], taken as a parameter rather than built
+/// here so a caller applying several aggregates at once (the chain actor's
+/// deferral queue, drained once per tick) pays for the full `Table::LiveChain`
+/// scan once for the whole drain rather than once per aggregate.
+pub fn apply_verified_aggregate(
     store: &mut Store,
-    signed_aggregate: &SignedAggregateAndProof,
+    data: AttestationData,
+    attesting_indices: &[ValidatorIndex],
     config: &Config,
-    committees: &mut CommitteeCache,
+    index: &HashMap<Root, (Slot, Root)>,
 ) -> Result<()> {
-    let data = signed_aggregate.data();
-
-    // Built once and handed to both validators below, which would otherwise
-    // scan `Table::LiveChain` once each.
-    let index = store.block_index();
-    validate_on_attestation_indexed(store, data, false, config, &index)?;
-
-    // `checkpoint_state` hands back an owned value, so no borrow of `store`
-    // outlives it into `update_latest_messages`' mutable use below.
-    let target_state = checkpoint_state(store, &data.target, config)?;
-    crate::beacon::aggregate::validate_aggregate_and_proof_gossip(
-        store,
-        signed_aggregate,
-        &target_state,
-        config,
-        &index,
-        committees,
-    )?;
-
-    // The aggregate signature itself, which is the condition that makes these
-    // votes worth recording at all.
-    let attesting_indices = Attestation::from(signed_aggregate)
-        .verified_attesting_indices(&target_state, committees)?;
-
-    update_latest_messages(store, &attesting_indices, data);
-
+    validate_on_attestation_indexed(store, data, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data);
     Ok(())
 }
 

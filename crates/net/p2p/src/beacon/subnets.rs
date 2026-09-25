@@ -123,8 +123,12 @@ pub fn compute_subscribed_subnet(
     config: &Config,
 ) -> Result<u64> {
     let prefix_bits = attestation_subnet_prefix_bits(config);
+    // Strictly less than `u64::BITS`: `1u64 << prefix_bits` below requires a
+    // shift strictly less than the type's width, and `prefix_bits ==
+    // u64::BITS` would overflow it (a panic in debug, `1` itself in release,
+    // either way not the value the shift asks for).
     verify(
-        prefix_bits > 0 && prefix_bits <= u64::BITS,
+        prefix_bits > 0 && prefix_bits < u64::BITS,
         "the attestation subnet prefix fits in a u64",
     )?;
     let period = config.epochs_per_subnet_subscription.max(1);
@@ -221,6 +225,23 @@ mod tests {
                 "the derived prefix must match the configured one"
             );
         }
+    }
+
+    /// A prefix of exactly 64 bits must be refused rather than reaching the
+    /// `1u64 << prefix_bits` shift below, which is exactly as wide as `u64`
+    /// and would overflow it.
+    #[test]
+    fn a_prefix_of_exactly_64_bits_is_refused() {
+        let config = Config {
+            attestation_subnet_count: 64,
+            // `attestation_subnet_prefix_bits` is `ceillog2(64) + extra_bits`
+            // = `6 + extra_bits`, so 58 extra bits makes the derived prefix
+            // exactly `u64::BITS`.
+            attestation_subnet_extra_bits: 58,
+            ..Config::mainnet()
+        };
+        assert_eq!(attestation_subnet_prefix_bits(&config), u64::BITS);
+        assert!(compute_subscribed_subnet([0u8; 32], 0, 0, &config).is_err());
     }
 
     #[test]

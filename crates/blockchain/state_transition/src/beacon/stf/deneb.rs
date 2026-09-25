@@ -36,8 +36,8 @@ use crate::beacon::containers::{BeaconState, deneb, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_block_root, get_block_root_at_slot,
-    get_current_epoch, get_previous_epoch, get_randao_mix,
+    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root,
+    get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
@@ -76,7 +76,7 @@ pub fn process_block(
     block: &deneb::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -146,7 +146,7 @@ fn process_operations(
     voluntary_exits: &[SignedVoluntaryExit],
     bls_to_execution_changes: &[SignedBLSToExecutionChange],
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -280,7 +280,7 @@ pub fn process_withdrawals(
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);

@@ -7,13 +7,12 @@
 
 use std::time::Instant;
 
-use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
+use ethlambda_network_api::{BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
-use ethlambda_state_transition::beacon::helpers::misc::compute_epoch_at_slot;
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::{constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY, containers::SignedBeaconBlock},
+    beacon::containers::SignedBeaconBlock,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -238,7 +237,7 @@ fn handle_beacon_gossip(
     } else if kind == beacon_topics::BEACON_AGGREGATE_AND_PROOF {
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
-        triage_attestation(wire, payload, subnet_id)
+        triage_attestation(server, wire, payload, subnet_id)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -314,24 +313,9 @@ fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dis
     Dispatch::Validate(Validated::Column(Box::new(sidecar)))
 }
 
-/// Decode a beacon aggregate, run the clock-only checks
-/// `validate_beacon_aggregate_and_proof_gossip` allows to run this early, and
-/// forward whatever passes them straight to the chain actor.
-///
-/// Transitional: a real `Dispatch::Validate` path (committees, the three BLS
-/// checks, the seen-set gates) belongs in
-/// `ethlambda_state_transition::beacon::gossip`, next to `block`/`column`, but
-/// does not exist yet. Until it does, this keeps PR #19's shape verbatim
-/// rather than leaving aggregates unhandled: the object never becomes a
-/// `Validated` variant, so it is forwarded here, directly, rather than
-/// through [`Validated::forward`]. The verdict this function answers with is
-/// therefore not "was this aggregate valid", only "did it clear a clock and a
-/// shape check"; `beacon_aggregate_and_proof` is a global topic carrying
-/// roughly a thousand aggregates per slot on mainnet at about 30ms each in
-/// `on_attestation`, more work per slot than a slot lasts on a
-/// single-threaded actor, so this always answers `Dispatch::Report(Ignore(NoConsumer))`
-/// on a decoded aggregate and never propagates one: fork choice still learns
-/// its votes from block bodies inside `on_block`, not from this topic.
+/// Decode a beacon aggregate and run its cheap gossip checks: a verdict
+/// already, or the object for [`verdict::spawn_stateful_checks`] to take
+/// further. Same shape as [`triage_block`]/[`triage_data_column`].
 fn triage_aggregate(
     server: &P2PServer,
     wire: &BeaconWire,
@@ -352,55 +336,6 @@ fn triage_aggregate(
 
     let data = aggregate.data();
     let (target_epoch, target_root) = aggregate.target();
-
-    // Only the conditions that need nothing but this message and a clock. The
-    // rest of `validate_beacon_aggregate_and_proof_gossip` needs a state and a
-    // committee, which belong in the not-yet-written stateful half of this
-    // topic's own gossip module, not here.
-
-    // [REJECT] The aggregate attestation's epoch matches its target. No
-    // `RejectReason` names this yet, so `Malformed` stands in: both describe
-    // content that fails a structural spec check rather than a decode error.
-    if target_epoch != compute_epoch_at_slot(data.slot) {
-        metrics::inc_beacon_gossip(KIND, "epoch_mismatch");
-        return Dispatch::Report(Outcome::Reject(RejectReason::Malformed));
-    }
-
-    // [REJECT] The aggregate attestation has participants. One with no bits
-    // set names no votes, so it cannot move fork choice whatever else holds.
-    if aggregate.attester_count() == 0 {
-        metrics::inc_beacon_gossip(KIND, "no_participants");
-        return Dispatch::Report(Outcome::Reject(RejectReason::Malformed));
-    }
-
-    // [IGNORE] The aggregate attestation's slot is within the propagation
-    // range. Both ends matter, for different reasons: too old is a vote the
-    // network has moved past, while too new is the unbounded direction, since
-    // nothing else stops a fabricated far-future slot. `FutureSlot` names the
-    // first exactly; `Finalized` is reused for the second, since both name
-    // "too old to still matter" everywhere else this module uses them.
-    let now_ms = unix_now_ms();
-    let slot_start_ms = wire
-        .config
-        .genesis_time_ms()
-        .saturating_add(data.slot.saturating_mul(wire.config.slot_duration_ms));
-    if slot_start_ms > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY) {
-        metrics::inc_beacon_gossip(KIND, "future_slot");
-        return Dispatch::Report(Outcome::Ignore(IgnoreReason::FutureSlot));
-    }
-    let current_slot = now_ms
-        .saturating_sub(wire.config.genesis_time_ms())
-        .checked_div(wire.config.slot_duration_ms)
-        .unwrap_or(0);
-    if data
-        .slot
-        .saturating_add(wire.config.attestation_propagation_slot_range)
-        < current_slot
-    {
-        metrics::inc_beacon_gossip(KIND, "stale_slot");
-        return Dispatch::Report(Outcome::Ignore(IgnoreReason::Finalized));
-    }
-
     // `debug` rather than `info`: a mainnet slot carries up to
     // `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE` of these,
     // and a line each at `info` buries every other line the node emits. What
@@ -416,65 +351,85 @@ fn triage_aggregate(
         "Beacon aggregate attestation decoded"
     );
 
-    if let Some(ref blockchain) = server.blockchain {
-        let arrival = AggregateArrival {
-            decode_start: received_at,
-            handed_off: Instant::now(),
-        };
-        let _ = blockchain
-            .new_beacon_aggregate(Box::new(aggregate), arrival)
-            .inspect_err(|err| error!(%err, "Failed to forward an aggregate to blockchain"));
+    if let Err(outcome) = gossip::aggregate::cheap_checks(
+        &server.seen_aggregates,
+        &server.store,
+        &aggregate,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
     }
-
-    Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+    Dispatch::Validate(Validated::Aggregate {
+        aggregate: Box::new(aggregate),
+        attesting_indices: Vec::new(),
+    })
 }
 
 /// Decode an unaggregated attestation off one of this node's backbone
-/// subnets, and record that it arrived. Ignored rather than validated: none
-/// of them has a consumer yet, so this always answers `Dispatch::Report`.
+/// subnets and run its cheap gossip checks. Same shape as [`triage_block`].
 ///
-/// Forwards nothing, deliberately. `p2p-interface.md` asks every beacon node to
-/// hold `SUBNETS_PER_NODE` of these subscriptions so the subnets have a stable
-/// mesh for validators to publish into, and being in that mesh is the whole of
-/// what this node owes: gossipsub relays what a verdict here propagates to the
-/// rest of the mesh on its own. A lighthouse node with no validators does
-/// exactly this too, verifying and re-propagating a subnet attestation but
-/// skipping `apply_attestation_to_fork_choice` unless a local aggregator duty
-/// or `--import-all-attestations` says otherwise. Two subnets out of
-/// sixty-four would in any case be a small slice of the votes the aggregate
-/// topic already carries in full.
+/// A phase0-shaped payload (see [`beacon_decode::Attestation`]) answers
+/// `Ignore(NoConsumer)` without reaching [`gossip::attestation`] at all: that
+/// module's rules are electra's `SingleAttestation` only, matching what every
+/// subnet actually carries from electra onward, and a pre-electra shape has
+/// never had a consumer on this node either way (see the module's earlier
+/// transitional history).
 ///
-/// No signature is verified, which is where this stops short of what
-/// lighthouse does, and deliberately: a signature check is worth paying for
-/// when it gates something, and here it would gate nothing with no consumer
-/// on the far side. That is different from why the other five global topics
-/// go unverified too: this node's gossipsub now holds every beacon message
-/// for a verdict (`validate_messages()` is on), so the cost of a wasted check
-/// here is the blocking thread it would occupy, not a check nobody's pipeline
-/// could even have used.
-fn triage_attestation(wire: &BeaconWire, payload: &[u8], subnet_id: u64) -> Dispatch {
+/// Forwarding stays absent even once this topic gets a real verdict. See
+/// [`crate::beacon::verdict::Validated::forward`] for why: `p2p-interface.md`
+/// asks every beacon node to hold `SUBNETS_PER_NODE` of these subscriptions so
+/// the subnets have a stable mesh for validators to publish into, and being in
+/// that mesh, verifying and relaying what arrives, is the whole of what this
+/// node owes it. A lighthouse node with no validators does exactly this too:
+/// it verifies and re-propagates a subnet attestation but skips
+/// `apply_attestation_to_fork_choice` unless a local aggregator duty or
+/// `--import-all-attestations` says otherwise. Two subnets out of sixty-four
+/// would in any case be a small slice of the votes the aggregate topic
+/// already carries in full.
+fn triage_attestation(
+    server: &P2PServer,
+    wire: &BeaconWire,
+    payload: &[u8],
+    subnet_id: u64,
+) -> Dispatch {
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
-    let outcome = match beacon_decode::decode_attestation(wire.fork, payload) {
-        Ok(attestation) => {
-            metrics::inc_beacon_gossip(KIND, "decoded");
-            let data = attestation.data();
-            trace!(
-                slot = data.slot,
-                subnet_id,
-                target_epoch = data.target.epoch,
-                target_root = %ShortRoot(&data.target.root.0),
-                bytes = payload.len(),
-                "Beacon attestation decoded"
-            );
-            Outcome::Ignore(IgnoreReason::NoConsumer)
-        }
+    let attestation = match beacon_decode::decode_attestation(wire.fork, payload) {
+        Ok(attestation) => attestation,
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
-            Outcome::Reject(RejectReason::Decode)
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
         }
     };
-    Dispatch::Report(outcome)
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    let single = match attestation {
+        beacon_decode::Attestation::Electra(single) => single,
+        beacon_decode::Attestation::Phase0(_) => {
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
+        }
+    };
+    let data = single.data;
+    trace!(
+        slot = data.slot,
+        subnet_id,
+        target_epoch = data.target.epoch,
+        target_root = %ShortRoot(&data.target.root.0),
+        bytes = payload.len(),
+        "Beacon attestation decoded"
+    );
+
+    if let Err(outcome) = gossip::attestation::cheap_checks(
+        &server.seen_attestations,
+        &server.store,
+        &single,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::Attestation {
+        attestation: Box::new(single),
+        subnet_id,
+    })
 }
 
 /// Decode one of the five beacon topics with nothing particular to report,
@@ -605,10 +560,76 @@ pub async fn publish_aggregated_attestation(
 #[cfg(test)]
 mod tests {
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::shared;
+    use ethlambda_types::beacon::containers::{AttestationData, electra, phase0, shared};
+    use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
     use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
+
+    /// An electra-shaped aggregate at `slot` with `data.index` set to
+    /// `data_index`. Only what [`gossip::aggregate::cheap_checks`]'s very
+    /// first condition reads is meaningful; nothing here is signature-valid
+    /// or has a real committee.
+    fn electra_aggregate(slot: Slot, data_index: u64) -> electra::SignedAggregateAndProof {
+        electra::SignedAggregateAndProof {
+            message: electra::AggregateAndProof {
+                aggregator_index: 0,
+                aggregate: electra::Attestation {
+                    aggregation_bits: Default::default(),
+                    data: AttestationData {
+                        slot,
+                        index: data_index,
+                        ..Default::default()
+                    },
+                    signature: Default::default(),
+                    committee_bits: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// An electra-shaped `SingleAttestation` at `slot` with `data.index` set
+    /// to `data_index`. Same reasoning as [`electra_aggregate`].
+    fn electra_single_attestation(slot: Slot, data_index: u64) -> electra::SingleAttestation {
+        electra::SingleAttestation {
+            committee_index: 0,
+            attester_index: 0,
+            data: AttestationData {
+                slot,
+                index: data_index,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A phase0-shaped attestation at `slot`: a whole `Attestation` with one
+    /// bit set, the pre-electra subnet shape.
+    fn phase0_attestation(slot: Slot) -> phase0::Attestation {
+        let mut aggregation_bits = phase0::AggregationBits::with_length(1).unwrap();
+        aggregation_bits.set(0, true).unwrap();
+        phase0::Attestation {
+            aggregation_bits,
+            data: AttestationData {
+                slot,
+                ..Default::default()
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A config whose schedule already has electra active at epoch 0, so a
+    /// server built from it reports `wire.fork >= ForkName::Electra`
+    /// (`unconnected_beacon_server` fixes `wire.fork` at
+    /// `config.fork_at_epoch(0)`) and an electra-shaped aggregate at any slot
+    /// decodes as such too (its own fork comes from its slot, under this same
+    /// config).
+    fn electra_at_epoch_zero() -> Config {
+        Config::mainnet().with_fork_epoch(ForkName::Electra, 0)
+    }
 
     #[tokio::test]
     async fn garbage_bytes_on_the_block_topic_are_rejected_as_undecodable() {
@@ -702,6 +723,24 @@ mod tests {
         ));
     }
 
+    /// A cheap-check rejection that needs no clock and no state: electra
+    /// requires `data.index == 0`, and `gossip::aggregate::cheap_checks`
+    /// checks that before it even looks at the seen cache.
+    #[tokio::test]
+    async fn an_electra_aggregate_with_a_nonzero_data_index_is_rejected() {
+        let server = unconnected_beacon_server(electra_at_epoch_zero(), 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
+        ));
+    }
+
     #[tokio::test]
     async fn garbage_bytes_on_an_attestation_subnet_are_rejected_as_undecodable() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -711,8 +750,46 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         assert!(matches!(
-            triage_attestation(wire, &[0xff; 3], 0),
+            triage_attestation(&server, wire, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    /// The other pre-electra shape a subnet can carry: unlike the aggregate
+    /// topic, whose two shapes both have a validator
+    /// (`gossip::aggregate` handles both `SignedAggregateAndProof` variants),
+    /// `gossip::attestation`'s rules only understand electra's
+    /// `SingleAttestation`. A phase0-shaped payload therefore never reaches
+    /// them at all.
+    #[tokio::test]
+    async fn a_phase0_shaped_attestation_has_no_consumer() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = phase0_attestation(4).to_ssz();
+
+        assert!(matches!(
+            triage_attestation(&server, wire, &payload, 0),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+        ));
+    }
+
+    /// The same cheap, stateless rejection as the aggregate topic's, on its
+    /// `SingleAttestation` sibling.
+    #[tokio::test]
+    async fn an_electra_attestation_with_a_nonzero_data_index_is_rejected() {
+        let server = unconnected_beacon_server(electra_at_epoch_zero(), 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_single_attestation(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_attestation(&server, wire, &payload, 0),
+            Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
         ));
     }
 

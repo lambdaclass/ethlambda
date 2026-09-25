@@ -1,15 +1,17 @@
 //! The chain actor's state for `beacon_aggregate_and_proof`.
 //!
-//! Three things that have to live beside the store rather than in the p2p
+//! Two things that have to live beside the store rather than in the p2p
 //! layer, and one reason each.
 //!
-//! **The two seen-sets**, because the specification records an aggregate as
-//! seen only *after* its signatures verify, and only this actor holds that
-//! verdict. Recording on arrival instead is a one-message censorship attack:
-//! a garbage aggregate claiming some `(epoch, aggregator)` pair would drop the
-//! genuine aggregate from that aggregator for the rest of the epoch. Lighthouse
-//! splits it the same way, reading its observed-sets in `verify_early_checks`
-//! and writing them in `verify_late_checks`.
+//! **The applied-bits gate**, a running union of the aggregation bits this
+//! actor has already applied to fork choice per `(target_epoch,
+//! hash_tree_root(data), committee_index)`. `ethlambda-p2p`'s gossip
+//! validation owns the specification's own `Seen` sets now (a garbage
+//! aggregate can no longer censor a genuine one, since gossip only records a
+//! key once its signatures verify), so this gate is not about spec conformance
+//! at all: it is what keeps a committee's other aggregators, each carrying the
+//! same votes and each individually accepted by gossip, from paying
+//! [`fork_choice::apply_verified_aggregate`]'s own work more than once.
 //!
 //! **The deferral queue**, because `validate_on_attestation` requires
 //! `get_current_slot(store) >= attestation.data.slot + 1` and aggregates are
@@ -25,11 +27,11 @@
 //!
 //! A slot carries at most
 //! [`aggregate::MAX_AGGREGATES_PER_SLOT`](ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT)
-//! aggregates, so the queue is capped at a small multiple of that and the
-//! seen-sets are pruned on finality. All three are the one structure on this
-//! actor whose size a peer would otherwise get to choose.
+//! aggregates, so the queue is capped at a small multiple of that. The
+//! applied-bits gate is pruned by the store's own clock, not by finality: see
+//! [`AggregateGossip::prune`].
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use ethlambda_state_transition::beacon::aggregate::{
     MAX_AGGREGATES_PER_SLOT, is_non_strict_superset,
@@ -50,18 +52,13 @@ const DEFERRED_SLOTS: u64 = 2;
 /// The deferral queue's hard cap.
 const MAX_DEFERRED: usize = (MAX_AGGREGATES_PER_SLOT * DEFERRED_SLOTS) as usize;
 
-/// How many epochs of seen-sets to keep behind finality.
-///
-/// The gossip conditions only ever ask about the current or the previous
-/// epoch, so one epoch behind the current one is all that is ever read.
-/// Pruning is driven by finality rather than by the clock, which trails
-/// further, so this is deliberately generous: it costs a bounded number of
-/// small sets and never drops an entry a live check could still want.
-const SEEN_EPOCHS: u64 = 4;
-
 /// One aggregate held for a slot that has not passed yet.
 pub(crate) struct Deferred {
     pub aggregate: Box<SignedAggregateAndProof>,
+    /// The attesting indices gossip validation resolved for this aggregate;
+    /// carried alongside it so a drain has no state left to rebuild before
+    /// calling [`fork_choice::apply_verified_aggregate`].
+    pub attesting_indices: Vec<ValidatorIndex>,
     /// The slot this becomes applicable at: the aggregate's own slot plus one,
     /// cached so a drain compares numbers rather than reaching back into the
     /// container.
@@ -74,8 +71,6 @@ pub(crate) enum Dropped {
     /// A valid aggregate whose bits are already covered for this
     /// `(AttestationData, committee)`.
     KnownSubset,
-    /// This aggregator has already had an aggregate applied this epoch.
-    KnownAggregator,
     /// The queue was full when this arrived.
     QueueFull,
 }
@@ -85,7 +80,6 @@ impl Dropped {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::KnownSubset => "known_subset",
-            Self::KnownAggregator => "known_aggregator",
             Self::QueueFull => "queue_full",
         }
     }
@@ -95,8 +89,6 @@ impl Dropped {
 /// subscribes to no such topic.
 #[derive(Default)]
 pub(crate) struct AggregateGossip {
-    /// Aggregators whose aggregate has been applied, by target epoch.
-    seen_aggregators: HashMap<Epoch, HashSet<ValidatorIndex>>,
     /// The union of aggregation bits applied for each
     /// `(hash_tree_root(data), committee_index)`, by target epoch.
     ///
@@ -111,21 +103,17 @@ pub(crate) struct AggregateGossip {
 }
 
 impl AggregateGossip {
-    /// Whether this aggregate can add nothing that has not already been
-    /// applied.
+    /// Whether this aggregate adds nothing that has not already been applied.
     ///
-    /// Read before verification and written only after it; see the module
-    /// documentation. Both gates are the specification's `[IGNORE]`s, so a
-    /// caller treats a `Some` as "drop it quietly", not as misbehaviour.
+    /// Read before [`fork_choice::apply_verified_aggregate`] and written only
+    /// after it succeeds; see the module documentation. The specification's
+    /// own `[IGNORE]` for this condition is gossip's to answer now (p2p's
+    /// `SeenAggregates` records it before this aggregate is even forwarded),
+    /// so a caller here treats a `Some` purely as "this would cost work with
+    /// no effect", not as misbehaviour.
     pub(crate) fn already_covered(&self, aggregate: &SignedAggregateAndProof) -> Option<Dropped> {
         let data = aggregate.data();
         let epoch = data.target.epoch;
-
-        if let Some(seen) = self.seen_aggregators.get(&epoch)
-            && seen.contains(&aggregate.aggregator_index())
-        {
-            return Some(Dropped::KnownAggregator);
-        }
 
         // An aggregate naming no single committee is rejected downstream by
         // the gossip conditions; there is no key to look it up under here, so
@@ -136,16 +124,11 @@ impl AggregateGossip {
         is_non_strict_superset(seen, &aggregate.aggregation_bits()).then_some(Dropped::KnownSubset)
     }
 
-    /// Record an aggregate that verified, so a later one covering no more is
-    /// dropped before it costs three signature verifications.
+    /// Record an aggregate that was applied, so a later one covering no more
+    /// is dropped before it reaches fork choice at all.
     pub(crate) fn record(&mut self, aggregate: &SignedAggregateAndProof) {
         let data = aggregate.data();
         let epoch = data.target.epoch;
-
-        self.seen_aggregators
-            .entry(epoch)
-            .or_default()
-            .insert(aggregate.aggregator_index());
 
         let Some(committee_index) = aggregate.committee_index() else {
             return;
@@ -176,13 +159,18 @@ impl AggregateGossip {
     /// queue is closer to being applicable than one just arriving, so
     /// dropping it to make room would trade a nearly-ready vote for a newer
     /// one that still has to wait.
-    pub(crate) fn defer(&mut self, aggregate: Box<SignedAggregateAndProof>) -> Option<Dropped> {
+    pub(crate) fn defer(
+        &mut self,
+        aggregate: Box<SignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
+    ) -> Option<Dropped> {
         if self.deferred.len() >= MAX_DEFERRED {
             return Some(Dropped::QueueFull);
         }
         let applicable_at = aggregate.slot().saturating_add(1);
         self.deferred.push_back(Deferred {
             aggregate,
+            attesting_indices,
             applicable_at,
         });
         None
@@ -213,11 +201,18 @@ impl AggregateGossip {
         self.deferred.len()
     }
 
-    /// Drop seen-sets for epochs far enough behind finality that no live check
-    /// can name them, and any held aggregate for a finalized slot.
-    pub(crate) fn prune(&mut self, finalized_epoch: Epoch, finalized_slot: Slot) {
-        let floor = finalized_epoch.saturating_sub(SEEN_EPOCHS);
-        self.seen_aggregators.retain(|epoch, _| *epoch >= floor);
+    /// Drop the applied-bits gate's entries for any epoch but the current and
+    /// the previous one, and any held aggregate for a finalized slot.
+    ///
+    /// Driven by the store's own clock (`current_epoch`), not by finality
+    /// (`finalized_slot` still prunes the deferral queue, which is a
+    /// different bound): the gossip conditions this gate backs only ever ask
+    /// about the current or the previous epoch
+    /// (`is_current_or_previous_epoch`), and finality can stall for far longer
+    /// than that window while gossip keeps arriving, which is exactly the
+    /// unbounded growth a peer must not get to cause.
+    pub(crate) fn prune(&mut self, current_epoch: Epoch, finalized_slot: Slot) {
+        let floor = current_epoch.saturating_sub(1);
         self.seen_bits.retain(|epoch, _| *epoch >= floor);
         // A held aggregate for a finalized slot can no longer change the head,
         // and nothing else would ever remove it: its slot has passed, so a
@@ -279,20 +274,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_second_aggregate_from_one_aggregator_is_dropped() {
-        let mut gossip = AggregateGossip::default();
-        let first = aggregate(0, 7, [true, false, false, false]);
-        gossip.record(&first);
-        // A different aggregate entirely, but from the same aggregator in the
-        // same epoch.
-        let second = aggregate(1, 7, [false, true, true, true]);
-        assert_eq!(
-            gossip.already_covered(&second),
-            Some(Dropped::KnownAggregator)
-        );
-    }
-
     /// The gate that actually pays for itself: a committee's other aggregators
     /// publish the same votes, and once the union covers them their aggregates
     /// cost no signature verification at all.
@@ -334,11 +315,16 @@ mod tests {
     #[test]
     fn a_held_aggregate_is_taken_once_its_slot_has_passed() {
         let mut gossip = AggregateGossip::default();
-        assert_eq!(gossip.defer(Box::new(aggregate(5, 1, [true; 4]))), None);
+        assert_eq!(
+            gossip.defer(Box::new(aggregate(5, 1, [true; 4])), vec![1]),
+            None
+        );
         // Still slot 5: the aggregate votes at 5 and needs 6.
         assert!(gossip.take_ready(5).is_empty());
         assert_eq!(gossip.deferred_len(), 1);
-        assert_eq!(gossip.take_ready(6).len(), 1);
+        let ready = gossip.take_ready(6);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].attesting_indices, vec![1]);
         assert_eq!(gossip.deferred_len(), 0);
     }
 
@@ -347,9 +333,9 @@ mod tests {
     #[test]
     fn a_drain_takes_ready_entries_from_anywhere_in_the_queue() {
         let mut gossip = AggregateGossip::default();
-        gossip.defer(Box::new(aggregate(9, 1, [true; 4])));
-        gossip.defer(Box::new(aggregate(2, 2, [true; 4])));
-        gossip.defer(Box::new(aggregate(9, 3, [true; 4])));
+        gossip.defer(Box::new(aggregate(9, 1, [true; 4])), vec![]);
+        gossip.defer(Box::new(aggregate(2, 2, [true; 4])), vec![]);
+        gossip.defer(Box::new(aggregate(9, 3, [true; 4])), vec![]);
 
         let ready = gossip.take_ready(5);
         assert_eq!(ready.len(), 1, "only the slot-2 aggregate is applicable");
@@ -362,12 +348,12 @@ mod tests {
         let mut gossip = AggregateGossip::default();
         for index in 0..MAX_DEFERRED {
             assert_eq!(
-                gossip.defer(Box::new(aggregate(9, index as u64, [true; 4]))),
+                gossip.defer(Box::new(aggregate(9, index as u64, [true; 4])), vec![]),
                 None
             );
         }
         assert_eq!(
-            gossip.defer(Box::new(aggregate(9, 0, [true; 4]))),
+            gossip.defer(Box::new(aggregate(9, 0, [true; 4])), vec![]),
             Some(Dropped::QueueFull)
         );
         assert_eq!(gossip.deferred_len(), MAX_DEFERRED);
@@ -380,22 +366,41 @@ mod tests {
         gossip.record(&aggregate(0, 1, [true; 4]));
         // Epoch 10, via slot 320.
         gossip.record(&aggregate(320, 2, [true; 4]));
-        gossip.defer(Box::new(aggregate(100, 3, [true; 4])));
+        gossip.defer(Box::new(aggregate(100, 3, [true; 4])), vec![]);
 
+        // Current epoch 10: the window keeps only epochs 9 and 10.
         gossip.prune(10, 200);
 
-        // Epoch 0 is more than SEEN_EPOCHS behind epoch 10.
+        // Epoch 0 is outside the current-or-previous-epoch window.
         assert_eq!(
             gossip.already_covered(&aggregate(0, 1, [true; 4])),
             None,
-            "the old epoch's aggregator should have been forgotten"
+            "the old epoch's coverage should have been forgotten"
         );
         // Epoch 10 is still within the window.
         assert_eq!(
             gossip.already_covered(&aggregate(320, 2, [true; 4])),
-            Some(Dropped::KnownAggregator)
+            Some(Dropped::KnownSubset)
         );
         // The held aggregate votes at slot 100, below the finalized slot.
         assert_eq!(gossip.deferred_len(), 0);
+    }
+
+    /// The applied-bits window follows the store's clock, not finality: a
+    /// finality stall must not let coverage from an old epoch keep costing an
+    /// LRU-free `HashMap` entry forever.
+    #[test]
+    fn pruning_follows_the_current_epoch_even_when_finality_has_not_moved() {
+        let mut gossip = AggregateGossip::default();
+        gossip.record(&aggregate(0, 1, [true; 4]));
+
+        // Finality is still at slot 0, but the clock has moved to epoch 50.
+        gossip.prune(50, 0);
+
+        assert_eq!(
+            gossip.already_covered(&aggregate(0, 1, [true; 4])),
+            None,
+            "coverage far behind the current epoch must not survive finality stalling"
+        );
     }
 }

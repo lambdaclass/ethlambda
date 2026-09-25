@@ -1447,11 +1447,14 @@ fn beacon_aggregate_duration_buckets() -> Vec<f64> {
 /// How long the chain actor spent on one aggregate, from the moment it was
 /// taken off the mailbox to the moment fork choice had it.
 ///
-/// Covers `on_gossip_aggregate` end to end, so it folds in the target
-/// checkpoint state lookup, the `block_index()` scan, the committee build and
-/// all three signature verifications. Observed for aggregates that were
-/// actually processed, applied or not; one dropped by a seen-set never reaches
-/// this.
+/// Covers `apply_verified_aggregate` end to end. `ethlambda-p2p`'s gossip
+/// validation already resolved the committees and all three signatures before
+/// handing the aggregate over, so what this measures now is just
+/// `validate_on_attestation_indexed` and recording the vote against an
+/// already-built `block_index()`; a slow observation here points at the store
+/// itself, not at cryptography. Observed for aggregates that were actually
+/// processed, applied or not; one dropped by the applied-bits gate never
+/// reaches this.
 pub fn observe_beacon_aggregate_processing(duration: Duration) {
     static LEAN_BEACON_AGGREGATE_PROCESSING_SECONDS: std::sync::LazyLock<Histogram> =
         std::sync::LazyLock::new(|| {
@@ -1488,8 +1491,10 @@ pub fn observe_beacon_aggregate_mailbox_wait(duration: Duration) {
 /// Count one aggregate's outcome.
 ///
 /// `applied` is the one that moved a vote. Everything else names why it did
-/// not: the two seen-set gates, the deferral queue's cap, and `invalid` for a
-/// gossip condition or signature that did not hold.
+/// not: `known_subset` is the applied-bits gate, `queue_full` is the deferral
+/// queue's cap, and `invalid` is `apply_verified_aggregate` refusing a
+/// gossip-accepted aggregate, most often because its target has since been
+/// superseded by finality or its own slot has not passed yet.
 pub fn inc_beacon_aggregate_outcome(outcome: &str) {
     static LEAN_BEACON_AGGREGATE_TOTAL: std::sync::LazyLock<IntCounterVec> =
         std::sync::LazyLock::new(|| {

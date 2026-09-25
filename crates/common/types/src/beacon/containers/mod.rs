@@ -784,9 +784,9 @@ impl SignedAggregateAndProof {
     /// gossip validation then requires that bitfield to select *exactly* one
     /// committee, so answering `None` for both zero and several is not a lost
     /// distinction: both are the same rejection, and collapsing them here is
-    /// what keeps
-    /// [`crate::beacon::aggregate::validate_aggregate_and_proof_gossip`] from
-    /// having to know this enum's two shapes.
+    /// what keeps `ethlambda-state-transition`'s `beacon::gossip::aggregate`
+    /// cheap checks (this crate cannot intra-link into that one) from having
+    /// to know this enum's two shapes.
     ///
     /// The `len(aggregation_bits) == len(committee)` check downstream is only
     /// meaningful because of that "exactly one": electra's `aggregation_bits`

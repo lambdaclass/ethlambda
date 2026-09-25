@@ -12,7 +12,7 @@
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::phase0::{Attestation, AttestingIndices, IndexedAttestation};
 use crate::beacon::error::Result;
-use crate::beacon::helpers::accessors::{CommitteeCache, get_domain};
+use crate::beacon::helpers::accessors::{CommitteeCache, CommitteeCacheExt, get_domain};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::helpers::predicates::are_indices_sorted_and_unique;
 use crate::beacon::primitives::{HashTreeRoot as _, ValidatorIndex};
@@ -39,7 +39,7 @@ use crate::beacon::{bls, constants};
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
     let epoch = compute_epoch_at_slot(attestation.data.slot);
     let epoch_committees = committees.committees(state, epoch);
@@ -58,7 +58,7 @@ pub fn get_attesting_indices(
 pub fn get_indexed_attestation(
     state: &BeaconState,
     attestation: &Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<IndexedAttestation> {
     let indices = get_attesting_indices(state, attestation, committees)?;
     Ok(IndexedAttestation {

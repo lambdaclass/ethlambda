@@ -342,9 +342,12 @@ outstanding.
 ### Beacon Gossip Validation
 
 Every beacon gossip message gets a verdict before gossipsub forwards it
-(`validate_messages()` is on for the beacon wire only). See
-[beacon_wire.md](./beacon_wire.md#gossip) for the flow. These are
-ethlambda-specific, not part of the leanMetrics spec.
+(`validate_messages()` is on for the beacon wire only), `beacon_aggregate_and_proof`
+and `beacon_attestation_{subnet_id}` included: both are validated the same way
+blocks and columns are, in `ethlambda_state_transition::beacon::gossip::{aggregate,attestation}`.
+See [beacon_wire.md](./beacon_wire.md#gossip) for the flow and
+[beacon_wire.md](./beacon_wire.md#aggregate-attestations) for the two topics'
+own section. These are ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
@@ -353,22 +356,56 @@ ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
-label `data_column_sidecar`. `queue` means IGNORE to gossipsub while the chain
-actor still receives the object and parks it. **`verdict_expired_total` should
-stay at zero**: a rising count means validation is too slow for gossipsub's
-message cache.
+label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
+`beacon_attestation`. `queue` means IGNORE to gossipsub while the chain actor
+still receives the object and parks it; neither the aggregate nor the
+attestation topic ever answers `queue`, since the vote block's post-state is
+either cached or it is not (`IgnoreReason::UnknownBlock`/`StateUnavailable`),
+with nothing to hold the message for. **`verdict_expired_total` should stay at
+zero**: a rising count means validation is too slow for gossipsub's message
+cache.
+
+The two topics add reasons the others do not, all `reason` label values on
+`lean_beacon_gossip_validation_total`: `outside_epoch_window`, `covered_bits`
+(aggregate only), `unknown_block`, `state_unavailable`,
+`finalized_not_ancestor`, `ancestry_unknown` on the ignore side;
+`epoch_mismatch`, `no_participants` (aggregate only), `non_zero_data_index`,
+`committee_bits` (aggregate only), `committee_index`, `bits_length` (aggregate
+only), `not_aggregator` (aggregate only), `not_in_committee`,
+`unknown_validator`, `selection_proof` (aggregate only),
+`aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
+only), `target_not_ancestor`, `wrong_subnet` (attestation only) on the reject
+side. `already_seen` and `overloaded` are shared with every other topic.
+
+Two permit pools bound the blocking-thread half of validation:
+`gossip_validation_permits` for blocks and columns,
+`attestation_validation_permits` for aggregates and subnet attestations. They
+are deliberately separate: a mainnet slot's worth of aggregates and backbone
+attestations arrives every slot, not only during a range sync, and sharing one
+pool would let that burst answer `Ignore(Overloaded)` for a block or a column
+instead. Neither pool has a metric of its own yet; a permit exhausted on
+either shows up as `outcome="ignore",reason="overloaded"` on
+`lean_beacon_gossip_validation_total`, for the topics that draw from it.
 
 ### Beacon Committee Cache
 
 `ethlambda beacon` derives an epoch's attester committees with one whole-epoch
-shuffle and keeps the result in the chain actor's `CommitteeCache`, keyed by
-epoch and the block that decided the shuffling. See `CommitteeCache` in
-`crates/blockchain/state_transition/src/beacon/helpers/accessors.rs`. This is
-ethlambda-specific, not part of the leanMetrics spec.
+shuffle and keeps the result in `CommitteeCache`, keyed by epoch and the block
+that decided the shuffling. The cache itself lives in the `Store`
+(`crates/storage/src/committee_cache.rs`), shared by both actors: the chain
+actor's own attestation processing and p2p's gossip validation for
+`beacon_aggregate_and_proof`/`beacon_attestation_{subnet_id}` read the same
+entries rather than each keeping a copy, which is what lets a validation task
+and the actor race a shuffle at an epoch boundary and have only the first one
+pay for it. `CommitteeCacheExt` in
+`crates/blockchain/state_transition/src/beacon/helpers/accessors.rs` is the
+consensus-logic wrapper (`ShufflingKey` derivation, the shuffle itself) around
+the storage-side container. This is ethlambda-specific, not part of the
+leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCache::committees` call: the state transition's and fork choice's attestation processing | result=hit,miss,unkeyable |
+| `lean_beacon_committee_cache_lookups_total` | Counter | Committee lookups, by whether the cache served them | On every `CommitteeCacheExt::committees` call: the state transition's, fork choice's and p2p's gossip validation's attestation processing | result=hit,miss,unkeyable |
 
 **Read the miss rate against the epoch rate, not the hit rate.** A follower on
 one chain misses about once per epoch, when the first block of a new epoch asks
@@ -440,20 +477,23 @@ them.
 | Name | Type | Usage | Sample collection event | Labels | Buckets |
 |------|------|-------|-------------------------|--------|---------|
 | `lean_beacon_aggregate_decode_seconds` | Histogram | Time the p2p actor spent decoding one aggregate off the wire | On each successful decode in the gossip handler | | 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05 |
-| `lean_beacon_aggregate_mailbox_wait_seconds` | Histogram | Time an aggregate spent in the chain actor's mailbox | On the chain actor taking one off the mailbox | | 0.0005 … 2.5 |
-| `lean_beacon_aggregate_processing_seconds` | Histogram | Time the chain actor spent in `on_gossip_aggregate` | On each aggregate the actor processed, applied or not | | 0.0005 … 2.5 |
+| `lean_beacon_aggregate_mailbox_wait_seconds` | Histogram | Time an already-verified aggregate spent in the chain actor's mailbox | On the chain actor taking one off the mailbox | | 0.0005 … 2.5 |
+| `lean_beacon_aggregate_processing_seconds` | Histogram | Time the chain actor spent applying one already-verified aggregate (`apply_verified_aggregate` plus the applied-bits gate) | On each aggregate the actor processed, applied or not | | 0.0005 … 2.5 |
 | `lean_beacon_aggregate_end_to_end_seconds` | Histogram | Wire to fork choice, for aggregates applied on arrival | On applying an aggregate that was not deferred | | 0.0005 … 2.5 |
-| `lean_beacon_aggregate_total` | Counter | Aggregates by outcome | On each aggregate reaching a verdict | outcome=applied,invalid,known_subset,known_aggregator,queue_full | |
+| `lean_beacon_aggregate_total` | Counter | Aggregates by outcome | On each aggregate reaching a verdict | outcome=applied,invalid,known_subset,queue_full | |
 | `lean_beacon_aggregates_deferred` | Gauge | Aggregates held until their own slot has passed | On every defer and every per-slot drain | | |
 
-The four histograms exist because the per-aggregate amortizations were
-deliberately left unbuilt: each aggregate pays its own `Table::LiveChain` scan
-and its own `EpochCommittees` build, which is affordable only while the
-seen-set gates keep the surviving volume low. Deferring that work is safe only
-while its cost is visible, and without these the symptom would be an
-unexplained head lag. They are split across the two actors on purpose:
-`decode` is the p2p actor's and the other three are the chain actor's, so a
-slow aggregate is attributable to a layer rather than guessed at.
+`decode` is the only one of the four histograms still timing what it always
+did. The other three no longer include gossip validation: committees, all
+three signature checks and the specification's own seen sets moved to p2p
+(`lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
+covers that half now), so `processing` and `end_to_end` read a great deal
+lower than before this change, and a comparison against an older deployment's
+values is comparing two different things. What is left for these three to
+measure is real, though: `validate_on_attestation_indexed` and the applied-bits
+gate still cost a `Table::LiveChain` scan and a hash-map lookup per aggregate,
+so a slow chain-actor number still points at the store rather than at
+cryptography.
 
 **Watch `lean_beacon_aggregate_mailbox_wait_seconds`.** It is the failure mode
 this path introduces and the one no other timing can show: a mainnet slot
@@ -462,13 +502,18 @@ aggregates, and if they queue behind block imports their votes arrive too late
 to move the head while every per-aggregate timing still looks healthy.
 
 **Read `lean_beacon_aggregate_total{outcome}` as a ratio, not a rate.**
-`known_subset` dominating is the design working: a committee's aggregators
-mostly converge on the same votes, and each one the running union already covers
-is dropped before three signature verifications rather than after. `applied`
-falling toward zero while `known_subset` stays high means the node is seeing
-only aggregates it has already covered, which is normal; `invalid` climbing
-means the aggregates reaching fork choice are failing their conditions, most
-often because this node has not imported the block being voted for.
+`known_subset` is the actor's own applied-bits gate now, not the specification's
+seen set (that one is p2p's, and a duplicate or already-covered aggregate is
+refused there, under `lean_beacon_gossip_validation_total`, before it ever
+reaches this counter). `known_subset` dominating is still the design working:
+a committee's aggregators mostly converge on the same votes, and each one the
+running union already covers is dropped before another
+`apply_verified_aggregate` call. `applied` falling toward zero while
+`known_subset` stays high means the node is seeing only aggregates it has
+already covered, which is normal; `invalid` climbing means aggregates gossip
+already accepted are failing `apply_verified_aggregate` regardless, most often
+because this node has not imported the block being voted for, or has since
+finalized past its target.
 
 **`queue_full` should be zero.** The deferral queue holds two slots' worth, and
 reaching its cap means aggregates are arriving faster than the once-per-slot

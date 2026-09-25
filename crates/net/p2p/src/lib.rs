@@ -44,8 +44,12 @@ use ethlambda_network_api::{
         PublishBlock,
     },
 };
-use ethlambda_state_transition::beacon::gossip::{SeenBlocks, SeenColumns};
+use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::gossip::{
+    SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
+};
 use ethlambda_storage::{Chain, Store};
+use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
@@ -189,11 +193,77 @@ const GOSSIP_VALIDATION_PERMITS: usize = 128;
 /// arriving with none free waits for one. Revisit with data, as for gossip.
 const COLUMN_CHECK_PERMITS: usize = 16;
 
+/// How many `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}`
+/// stateful checks may run at once.
+///
+/// A pool of its own, not [`GOSSIP_VALIDATION_PERMITS`]'s: a mainnet slot
+/// carries up to `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE`
+/// aggregates plus whatever this node's backbone subnets add, a burst that
+/// arrives every slot rather than only during a range sync. Sharing the block
+/// and column pool with that burst would let it take every permit and answer
+/// `Ignore(Overloaded)` for a block or a column instead, which must never
+/// happen: neither topic gates anything the way this one gates fork choice's
+/// votes for the current head. Sized the same as [`GOSSIP_VALIDATION_PERMITS`]
+/// for now, since both do comparable per-item work (one state read, one to
+/// three BLS verifications); revisit once
+/// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
+/// has data from a follower.
+const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
 const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
 
 /// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
 const SEEN_COLUMNS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
+/// cache remembers, and how many `(hash_tree_root(data), committee_index)`
+/// bitfields alongside it (`SeenAggregates::new`'s two capacities, both sized
+/// the same here).
+///
+/// [`MAX_AGGREGATES_PER_SLOT`] bounds how many aggregators one slot can select
+/// at all, mainnet's largest number this topic ever has to hold coordinates
+/// for. `is_current_or_previous_epoch` is the only gossip condition either
+/// half of this cache backs, so a key from further back than two epochs is
+/// never asked about again; sizing for two epochs of that per-slot bound is
+/// generous headroom rather than a tight derivation, in the same spirit
+/// [`SEEN_BLOCKS_CAPACITY`] and [`SEEN_COLUMNS_CAPACITY`] are sized in.
+const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new((MAX_AGGREGATES_PER_SLOT * SLOTS_PER_EPOCH * 2) as usize).expect("non-zero");
+
+/// Capacity of the accepted-attestation cache, keyed by `(target_epoch,
+/// attester_index)`, for a node relaying `backbone_subnets` attestation
+/// subnets.
+///
+/// Unlike [`SEEN_AGGREGATES_CAPACITY`], there is no per-slot cap on how many
+/// distinct attesters this topic can name: every validator attests once per
+/// epoch, and on mainnet a single backbone subnet can carry on the order of a
+/// thousand of them per slot. The real bound instead comes from
+/// `compute_subnet_for_attestation` (see
+/// `beacon::gossip::attestation::compute_subnet_for_attestation`), which is
+/// `(committees_per_slot * slot_in_epoch + committee_index) %
+/// attestation_subnet_count`. `committees_per_slot` never exceeds
+/// `MAX_COMMITTEES_PER_SLOT`, which itself never exceeds
+/// `attestation_subnet_count` (64 of 64 on both mainnet and minimal), so the
+/// `committees_per_slot` committee indices of one slot are consecutive
+/// integers spanning no more residues than there are subnets: they land on
+/// distinct subnets without wrapping into a collision. One subnet therefore
+/// carries at most one committee per slot, i.e. at most
+/// [`MAX_VALIDATORS_PER_COMMITTEE`] attesters.
+///
+/// The capacity is two epochs (the only window `is_current_or_previous_epoch`
+/// accepts) of `SLOTS_PER_EPOCH` slots, each contributing at most that many
+/// attesters per subnet this node backbones. `backbone_subnets` is runtime
+/// (`BeaconWire::attestation_subnets`), so this is computed at `P2PServer`
+/// construction rather than as a const, and floored to one subnet so a lean
+/// node, which backbones none, still gets a valid non-zero capacity. As with
+/// [`SEEN_AGGREGATES_CAPACITY`], the LRU only grows to what actually arrives,
+/// so this bound costs memory only under that load.
+fn seen_attestations_capacity(backbone_subnets: usize) -> NonZeroUsize {
+    let subnets = backbone_subnets.max(1);
+    let capacity = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
+    NonZeroUsize::new(capacity).expect("positive factors give a positive capacity")
+}
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
@@ -890,6 +960,12 @@ impl P2P {
             Chain::Beacon => store.beacon_head().map_or(0, |(slot, _)| slot),
             Chain::Lean => 0,
         };
+        // Read before `built.wire` moves into the server below; absent on a
+        // lean wire, which `seen_attestations_capacity` floors for.
+        let backbone_attestation_subnets = built
+            .wire
+            .beacon()
+            .map_or(0, |beacon| beacon.attestation_subnets.len());
 
         let server = P2PServer {
             swarm_handle,
@@ -908,10 +984,20 @@ impl P2P {
             discovery: DiscoveryState::new(discovery, built.local_peer_id),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_aggregates: SeenAggregates::new(
+                SEEN_AGGREGATES_CAPACITY,
+                SEEN_AGGREGATES_CAPACITY,
+            ),
+            seen_attestations: SeenAttestations::new(seen_attestations_capacity(
+                backbone_attestation_subnets,
+            )),
             gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 GOSSIP_VALIDATION_PERMITS,
             )),
             column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
+            attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                ATTESTATION_VALIDATION_PERMITS,
+            )),
         };
         let handle = server.start();
         send_after(
@@ -991,10 +1077,22 @@ pub struct P2PServer {
     /// The first valid sidecar per `(slot, proposer, index)` accepted from
     /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
     pub(crate) seen_columns: SeenColumns,
-    /// Permits for stateful gossip checks in flight on blocking threads.
+    /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
+    /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
+    pub(crate) seen_aggregates: SeenAggregates,
+    /// Accepted `beacon_attestation_{subnet_id}`s, by `(target_epoch,
+    /// attester_index)`.
+    pub(crate) seen_attestations: SeenAttestations,
+    /// Permits for block and column stateful gossip checks in flight on
+    /// blocking threads.
     pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
     /// Permits for data column chain checks in flight on blocking threads.
     pub(crate) column_check_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for aggregate and subnet-attestation stateful gossip checks in
+    /// flight on blocking threads. Separate from
+    /// [`Self::gossip_validation_permits`]; see
+    /// [`ATTESTATION_VALIDATION_PERMITS`].
+    pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl P2PServer {
@@ -2214,6 +2312,12 @@ pub(crate) mod test_support {
             anchor_checkpoint,
             finalized_slot,
         );
+        // Read before `built.wire` moves into the server below, mirroring
+        // `P2P::spawn`.
+        let backbone_attestation_subnets = built
+            .wire
+            .beacon()
+            .map_or(0, |beacon| beacon.attestation_subnets.len());
 
         P2PServer {
             swarm_handle,
@@ -2236,11 +2340,23 @@ pub(crate) mod test_support {
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_aggregates:
+                ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                ),
+            seen_attestations:
+                ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
+                    crate::seen_attestations_capacity(backbone_attestation_subnets),
+                ),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
             column_check_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::COLUMN_CHECK_PERMITS,
+            )),
+            attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::ATTESTATION_VALIDATION_PERMITS,
             )),
         }
     }
@@ -2289,6 +2405,17 @@ mod tests {
 
     fn random_peer() -> PeerId {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
+    }
+
+    /// Zero backbone subnets (a lean node, or a beacon node that backbones
+    /// none) must not shrink the cache to a useless zero capacity, and every
+    /// additional subnet scales it by the same per-subnet, per-epoch bound.
+    #[test]
+    fn seen_attestations_capacity_floors_at_one_subnet_and_scales_with_more() {
+        let per_subnet = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE;
+        assert_eq!(seen_attestations_capacity(0).get(), per_subnet);
+        assert_eq!(seen_attestations_capacity(1).get(), per_subnet);
+        assert_eq!(seen_attestations_capacity(3).get(), per_subnet * 3);
     }
 
     /// The split the specified `reason` label cannot make. Each of these is a

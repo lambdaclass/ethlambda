@@ -91,27 +91,16 @@ peer can compute the set without asking. `p2p-interface.md` asks every beacon
 node to hold them whether or not it runs validators: phase 0 has no shard
 committees, so nothing else gives these subnets a stable membership for
 validators to publish into. The subscription is therefore owed to the network
-rather than to this node's head, and what arrives on it is relayed by gossipsub
-but never applied to fork choice. A lighthouse node with no validators behaves
-the same way, subscribing to its own node-id backbone while
-`should_process_attestation` keeps those attestations out of its fork choice
-unless a local aggregator duty or `--import-all-attestations` says otherwise.
+rather than to this node's head: this node verifies and relays what arrives on
+it (see [Gossip validation](#gossip) below) but never applies it to fork
+choice. A lighthouse node with no validators behaves the same way, subscribing
+to its own node-id backbone and verifying what arrives on it while
+`should_process_attestation` keeps it out of fork choice unless a local
+aggregator duty or `--import-all-attestations` says otherwise.
 
-Two deliberate shortfalls there. The set is computed once at startup and kept
-for the process's lifetime rather than rotating every
-`EPOCHS_PER_SUBNET_SUBSCRIPTION` epochs; lighthouse does the same, and reads
-that constant nowhere. And no signature is verified on these subnets, which is
-where this stops short of lighthouse: this node builds its gossipsub without
-`validate_messages()`, so libp2p forwards a message on receipt, the relay has
-already happened by the time a handler sees the payload, and nothing downstream
-reads the verdict either.
-
-Setting `validate_messages()` is what would turn that handler into a real
-verifier, not peer scoring: it holds propagation until the verdict is reported
-back, which is what gives a verdict somewhere to go. Lighthouse sets it
-(`lighthouse_network/src/config.rs`) and pairs it with the same
-`ValidationMode::Anonymous` this node uses, so the mode is not what separates
-the two — that one flag is.
+One deliberate shortfall: the set is computed once at startup and kept for the
+process's lifetime rather than rotating every `EPOCHS_PER_SUBNET_SUBSCRIPTION`
+epochs. Lighthouse does the same, and reads that constant nowhere.
 
 `sync_committee_{0..3}` stays unsubscribed and arrives with the work that reads
 it. `blob_sidecar_{subnet_id}` stays absent permanently: it is deneb's format
@@ -134,80 +123,118 @@ forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under [Data column sidecars](#data-column-sidecars).
 
 Every beacon message is held by gossipsub until it has a verdict
-(`validate_messages()` is on for this wire only). Blocks and data column
-sidecars are validated by fulu's gossip rules
-(`ethlambda_state_transition::beacon::gossip`): the checks that need no state
-run inline in the p2p actor, the rest on a bounded `spawn_blocking` task whose
-verdict comes back to the actor (`crate::beacon::verdict`). Accept propagates
-the message; a message whose dependency is not ready yet is IGNOREd. Either
-way it is handed to the chain actor, which parks what it cannot import yet and
-imports the rest immediately, such as a sidecar whose slot merely falls
-outside its parent state's proposer lookahead.
+(`validate_messages()` is on for this wire only). Blocks, data column
+sidecars, aggregates and subnet attestations are all validated by fulu's
+gossip rules (`ethlambda_state_transition::beacon::gossip`, one module per
+topic family): the checks that need no state run inline in the p2p actor, the
+rest on a bounded `spawn_blocking` task whose verdict comes back to the actor
+(`crate::beacon::verdict`). Two permit pools bound how many of these run at
+once, so a burst on one family cannot starve another:
+`gossip_validation_permits` for blocks and columns,
+`attestation_validation_permits` for aggregates and subnet attestations. A
+mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
+TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
+than only during a range sync, which is why that traffic needs a pool of its
+own rather than sharing the block and column one. Accept propagates the
+message; a message whose dependency is not ready yet is IGNOREd. See
+[Aggregate attestations](#aggregate-attestations) for the two topics with
+their own section.
 
-Aggregates are transitional: the checks needing only a clock (epoch matches
-target, has participants, propagation window) run inline in the p2p actor, the
-same as blocks and columns, but the checks needing a state and a committee
-have no gossip module of their own yet, so a clock-clean aggregate is forwarded
-straight to the chain actor rather than through a real `Accept`, and this
-topic's own verdict is always IGNOREd, same as before this wire held messages
-for one at all. A mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
-TARGET_AGGREGATORS_PER_COMMITTEE` of them, so these are logged at `debug`
-rather than `info`; what an operator wants from this topic is the counters and
-histograms under [Metrics](#metrics). See [Aggregate
-attestations](#aggregate-attestations).
+Blocks and data column sidecars are, either way, handed to the chain actor,
+which parks what it cannot import yet and imports the rest immediately, such
+as a sidecar whose slot merely falls outside its parent state's proposer
+lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the
+attesting indices gossip validation resolved. A subnet attestation never
+reaches it at all, on any outcome: verifying and relaying it is the whole of
+what this node owes the topic (see above), so there is nothing further for the
+chain actor to do with one.
 
-The attestation subnet backbone (`beacon_attestation_{subnet_id}`) is decoded,
-logged at `trace`, and IGNOREd for the same reason: no consumer reads an
-unaggregated vote yet. The remaining five global topics are decoded, logged at
-`debug`, and IGNOREd too, since nothing consumes them either; an undecodable
-payload on any topic is REJECTed. Nothing is published on any topic, columns
-included: nothing this node can produce today would be signature-valid.
+The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
+since nothing consumes them; an undecodable payload on any topic is REJECTed.
+Nothing is published on any topic, columns included: nothing this node can
+produce today would be signature-valid.
 
 ## Aggregate attestations
 
 `beacon_aggregate_and_proof` reaches fork choice. It is how a follower learns
 votes for the *current* head rather than only the votes a block body carries,
-which are always at least one block old.
+which are always at least one block old. `beacon_attestation_{subnet_id}`,
+covered in the same section below, never does: this node relays its backbone
+subnets without ever applying what arrives on them.
 
-`validate_beacon_aggregate_and_proof_gossip` is split across three places, each
-holding the conditions it can actually answer:
+Both topics are validated the same way blocks and columns are, in
+`ethlambda_state_transition::beacon::gossip::{aggregate,attestation}`: cheap
+conditions (seen cache, propagation window, `data.index == 0`, exactly one
+committee named) run inline in the p2p actor; the rest run on a blocking
+thread, in this order:
 
-| Condition | Where | Why there |
-| --- | --- | --- |
-| epoch matches target, has participants, propagation range | `gossipsub::handler` | needs nothing but the message and a clock, so a stale or malformed aggregate never costs a mailbox slot |
-| first for this `(epoch, aggregator)`, superset of bits already seen | the chain actor | the specification marks an aggregate seen only *after* its signatures verify, and only the actor holds that verdict |
-| target known, LMD/FFG consistency, slot in the past | `validate_on_attestation` | already run for every attestation, block-borne or not |
-| committee range and size, `is_aggregator`, committee membership, all three signatures, finality ancestry | `beacon::aggregate` | needs a state and a committee |
+1. The vote's block is known (`Store::has_block`); if not, IGNORE.
+2. **Committees, signatures and ancestry all resolve against the vote block's
+   own cached post-state**
+   (`store.cached_state(CacheKey::BlockState(beacon_block_root))`), not the
+   specification's head state and not the target checkpoint's state either.
+   Three reasons converge: it is the attested chain's own state, so its
+   shuffling is the one the attesters were actually assigned, where the head
+   (or a checkpoint reached by replaying a different branch) can name the
+   wrong one; it is an `O(1)` cache read rather than a lookup or a replay; and
+   its own `block_roots` answers both ancestry questions without a
+   `Store::block_index` / `LiveChain` scan.
+3. The signatures that need only a pubkey, before any committee derivation: an
+   aggregate's selection proof and aggregator signature, an attestation's own
+   signature. An unknown validator index REJECTs here rather than paying for a
+   committee lookup first, since a forged message must not be able to reach a
+   shuffling derivation.
+4. The committees, through the `Store`-held cache both actors share; then
+   `is_aggregator` (rewritten to take a committee length rather than a
+   pre-fetched cache), committee membership, and, for a subnet attestation, the
+   subnet match (`compute_subnet_for_attestation`).
+5. An aggregate's own signature, over the indexed attestation built from that
+   committee. The indices it verifies travel to the chain actor; it never
+   rebuilds them.
+6. Ancestry against the vote state's `block_roots`: the target is the vote
+   block's ancestor at the target epoch (REJECT), and the finalized checkpoint
+   is an ancestor of the vote block (IGNORE).
 
-The seen-set placement is not a detail. Recording an aggregate on arrival, before
-its signatures verify, is a one-message censorship attack: a garbage aggregate
-claiming some `(epoch, aggregator)` pair would drop that aggregator's genuine
-one for the rest of the epoch. Lighthouse splits it the same way, reading its
-observed-sets in `verify_early_checks` and writing them in `verify_late_checks`.
+The seen caches (`SeenAggregates`, keyed both by `(target_epoch,
+aggregator_index)` and by `(hash_tree_root(data), committee_index)`;
+`SeenAttestations`, by `(target_epoch, attester_index)`) live in p2p now,
+recorded only on `Accept` by `verdict::settle`, and are bounded by capacity
+(an LRU, like the block and column seen caches) rather than pruned on
+finality: a peer must not get to grow either one just by outlasting
+finalization. Recording only after the signatures verify is still what keeps a
+garbage aggregate from being able to censor a genuine one for the rest of the
+epoch by claiming its `(epoch, aggregator)` pair first; lighthouse splits the
+same way, reading its observed-sets in `verify_early_checks` and writing them
+in `verify_late_checks`.
 
-Two further departures from the pseudocode, both deliberate:
+Only an aggregate that gossip `Accept`s reaches the chain actor, carrying the
+attesting indices already resolved; the actor never re-derives a committee or
+checks a signature for this topic. What is left for it:
 
-- **Committees resolve against the aggregate's target checkpoint state**, not
-  `store.block_states[get_head(store).root]`. Stricter, not looser: the head may
-  sit on a branch the aggregate does not vote for, while the target is an
-  ancestor of the attested block by `validate_on_attestation`'s own consistency
-  check. It also means one state serves both the gossip conditions and the
-  `on_attestation` that follows.
-- **Aggregates are held for a slot.** `validate_on_attestation` requires
+- **A lighter, actor-local applied-bits gate**, a running union of aggregation
+  bits already applied per `(target_epoch, hash_tree_root(data),
+  committee_index)`. Not a spec seen-set (p2p owns that one now); it exists so
+  a committee's other aggregators, each individually accepted by gossip
+  because each is a first-seen, valid message, do not all pay for
+  `apply_verified_aggregate` when the first one already covered their bits.
+  Pruned by the store's own clock to the current and previous epoch, not by
+  finality, so a stalled chain cannot make this grow without bound either.
+- **The deferral queue.** `validate_on_attestation` requires
   `get_current_slot(store) >= data.slot + 1`, and aggregates are published two
   thirds of the way through the slot they vote for, so every one arrives too
   early. Without the queue this topic would apply approximately nothing. It
   drains once per beacon tick, between the clock advancing and the head being
   recomputed, so released votes are in fork choice before that tick's head is
   chosen. The specification licenses this directly ("consider scheduling it for
-  later processing in such case") and lighthouse has the same queue.
+  later processing in such case") and lighthouse has the same queue. Held
+  entries now carry their gossip-resolved attesting indices alongside them, so
+  a drain applies them without recomputing anything.
 
-What makes the volume affordable is the superset-of-bits gate rather than any
-amortization: a committee's aggregators mostly converge on the same votes, so
-once the running union covers a later aggregate it is dropped for a hash and two
-lookups instead of three signature verifications. The per-aggregate costs the
-gates do not remove, one `Table::LiveChain` scan and one `EpochCommittees` build
-each, are left in place until the histograms below say they matter.
+A subnet attestation is fully verified by this same pipeline and then simply
+dropped: nothing forwards it to the chain actor, on any outcome, matching a
+lighthouse follower with no validators, which verifies and relays its own
+backbone subnets while `should_process_attestation` keeps them out of its fork
+choice.
 
 ## Request/response
 
@@ -495,26 +522,27 @@ as a query filter, so a `quic`-only record is invisible to it.
 
 | Metric | Meaning |
 | --- | --- |
-| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed`; the aggregate topic adds `epoch_mismatch`, `no_participants`, `future_slot` and `stale_slot` for the clock-only gates it still runs here |
-| `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts; see [metrics.md](./metrics.md#beacon-gossip-validation) |
+| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` |
+| `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
 | `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |
 | `lean_beacon_aggregate_mailbox_wait_seconds` | How long an aggregate sat in the chain actor's mailbox |
-| `lean_beacon_aggregate_processing_seconds` | Time the chain actor spent applying one aggregate |
+| `lean_beacon_aggregate_processing_seconds` | Time the chain actor spent applying one already-verified aggregate |
 | `lean_beacon_aggregate_end_to_end_seconds` | Wire to fork choice, for aggregates applied on arrival |
-| `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset`, `known_aggregator` or `queue_full` |
+| `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
 
-The four aggregate histograms exist because the per-aggregate amortizations were
-deliberately *not* built (see [Aggregate
-attestations](#aggregate-attestations)), and deferring them is only safe while
-their cost is visible. Split across the two actors on purpose: `decode` is p2p's
-and the other three are the chain actor's, so a slow aggregate can be attributed
-to a layer rather than guessed at. `mailbox_wait` is the one that cannot be
-derived any other way, and it is the failure mode this path introduces:
-roughly a thousand aggregates a slot queueing behind block imports arrive too
+The four aggregate histograms no longer cover what they used to: gossip
+validation (committees, all three signatures, the seen caches) runs in p2p now
+and is folded into `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
+instead. `decode` is p2p's own decode step; the other three, all in
+`ethlambda-blockchain`, now measure only `apply_verified_aggregate` and the
+actor's applied-bits gate, which is why `processing` reads far lower than it
+used to. `mailbox_wait` is still the one that cannot be derived any other way,
+and it is still the failure mode this path introduces: roughly a thousand
+aggregates a slot (verified ones only, now) queueing behind block imports arrive too
 late to move the head while every other timing still looks healthy.
 
 The `lean_` prefix is the repo-wide convention and applies here too. Data

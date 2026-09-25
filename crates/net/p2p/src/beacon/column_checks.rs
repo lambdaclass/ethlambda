@@ -112,6 +112,7 @@ mod tests {
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock};
+    use ethlambda_types::beacon::primitives::ValidatorIndex;
     use spawned_concurrency::error::ActorError;
     use tokio::sync::mpsc;
 
@@ -163,6 +164,7 @@ mod tests {
         fn new_beacon_aggregate(
             &self,
             _aggregate: Box<SignedAggregateAndProof>,
+            _attesting_indices: Vec<ValidatorIndex>,
             _arrival: AggregateArrival,
         ) -> Result<(), ActorError> {
             Ok(())

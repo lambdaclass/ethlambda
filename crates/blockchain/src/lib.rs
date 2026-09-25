@@ -5,7 +5,7 @@ use ethlambda_network_api::{
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
-use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, CacheKey, Chain, Store};
 use ethlambda_types::{
@@ -17,6 +17,7 @@ use ethlambda_types::{
         constants,
         containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
         preset,
+        primitives::ValidatorIndex,
     },
     block::SignedBlock,
     chain_config::ChainConfig,
@@ -389,7 +390,6 @@ impl BlockChain {
             sync_status_controller,
             events,
             duties,
-            committees: CommitteeCache::default(),
         }
         // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
         .start_with_backend(Backend::Thread);
@@ -522,22 +522,6 @@ pub struct BlockChainServer {
     /// [`crate::beacon_aggregates`] for why all three live on the actor rather
     /// than in the p2p layer that first sees an aggregate.
     beacon_aggregates: crate::beacon_aggregates::AggregateGossip,
-
-    /// Committee shufflings shared across everything that asks a beacon state
-    /// which validators attest at a slot: the state transition as it processes
-    /// a block's attestations, and fork choice as it replays those same
-    /// attestations into the latest-message store.
-    ///
-    /// Lives here, on the actor, because the actor is what owns the sequence of
-    /// imports that share it. Deriving a shuffling costs one scan of the
-    /// validator registry and one shuffle of the active set, and at mainnet's
-    /// ~2.4M validators an import that derives one per attestation per pass
-    /// spends most of its time doing nothing else. Keyed so that only states
-    /// that really do agree on an epoch's committees share an entry; see
-    /// `CommitteeCache`. The actor also tells it which shufflings the head
-    /// needs, so eviction spares them; see [`Self::pin_head_shufflings`].
-    /// Always empty on lean, which has no beacon committees.
-    committees: CommitteeCache,
 
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
@@ -1629,6 +1613,13 @@ impl BlockChainServer {
             _ if !is_new => ImportOutcome::Imported,
             beacon_block => {
                 let config = self.store.config();
+                // Cloned out before `fork_choice::on_block` below takes
+                // `&mut self.store`: an owned `Arc` handle, rather than a
+                // borrow through `self.store.committee_cache()`, is what lets
+                // this call also pass `&mut self.store` in the same
+                // expression, since the two would otherwise both borrow
+                // `self.store` at once.
+                let committees = self.store.committee_cache();
                 // Extracted before `beacon_block` moves into `fork_choice::on_block`
                 // below, which takes ownership of it.
                 let (attestations, slashings) = fork_choice::block_operations(&beacon_block);
@@ -1732,7 +1723,7 @@ impl BlockChainServer {
                     &config,
                     &evidence,
                     &validity,
-                    &mut self.committees,
+                    &committees,
                 );
                 timings.stf_end = Some(Instant::now());
                 if let Err(err) = imported {
@@ -1775,7 +1766,7 @@ impl BlockChainServer {
                                 &block_state,
                                 &config,
                                 &index,
-                                &mut self.committees,
+                                &committees,
                             )
                             .inspect_err(|err| {
                                 trace!(%slot, ?err, "Ignoring an unusable attestation from a block")
@@ -1885,7 +1876,6 @@ impl BlockChainServer {
             sync_status_controller: SyncStatusController::default(),
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
-            committees: CommitteeCache::default(),
             beacon_aggregates: Default::default(),
         }
     }
@@ -2165,13 +2155,14 @@ impl BlockChainServer {
         timings
     }
 
-    /// Apply a gossip aggregate, or hold it until its own slot has passed.
+    /// Apply an aggregate `ethlambda-p2p`'s gossip validation already
+    /// accepted, or hold it until its own slot has passed.
     ///
-    /// The seen-set gates run first, before anything expensive: a valid
+    /// The applied-bits gate runs first, before anything else: a valid
     /// aggregate whose votes are already covered is the common case on this
     /// topic, since a committee's sixteen aggregators mostly converge on the
     /// same bits, and dropping one here costs a hash and two lookups instead
-    /// of three signature verifications.
+    /// of another `apply_verified_aggregate` call.
     ///
     /// The hold is not an optimization. `validate_on_attestation` requires
     /// `get_current_slot(store) >= data.slot + 1`, and aggregates are
@@ -2181,6 +2172,7 @@ impl BlockChainServer {
     fn on_gossip_beacon_aggregate(
         &mut self,
         aggregate: Box<SignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
     ) {
         if let Some(dropped) = self.beacon_aggregates.already_covered(&aggregate) {
@@ -2191,22 +2183,30 @@ impl BlockChainServer {
         let config = self.store.config();
         let current_slot = fork_choice::get_current_slot(&self.store, &config);
         if current_slot < aggregate.slot().saturating_add(1) {
-            if let Some(dropped) = self.beacon_aggregates.defer(aggregate) {
+            if let Some(dropped) = self.beacon_aggregates.defer(aggregate, attesting_indices) {
                 metrics::inc_beacon_aggregate_outcome(dropped.label());
             }
             metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
             return;
         }
 
-        self.apply_beacon_aggregate(&aggregate, Some(arrival));
+        let index = self.store.block_index();
+        self.apply_beacon_aggregate(&aggregate, &attesting_indices, &index, Some(arrival));
     }
 
-    /// Run one aggregate through fork choice and record what became of it.
+    /// Apply one already-verified aggregate to fork choice and record what
+    /// became of it.
     ///
-    /// The seen-sets are written here, on success only, which is the ordering
-    /// the specification and lighthouse both have: an aggregate that failed
-    /// its signatures must not be able to mark its claimed aggregator as seen,
-    /// or one forged message censors that aggregator's real one for the epoch.
+    /// The applied-bits gate is written here, on success only: an aggregate
+    /// [`fork_choice::apply_verified_aggregate`] refused (a target this node
+    /// has since finalized past, say) must not be able to mark its bits
+    /// covered, or a forged claim of coverage would suppress a later,
+    /// applicable aggregate for the same committee.
+    ///
+    /// `index` is [`ethlambda_storage::Store::block_index`], taken as a
+    /// parameter so [`Self::drain_deferred_aggregates`] builds it once for the
+    /// whole drain rather than once per aggregate; see that function's own
+    /// documentation.
     ///
     /// `arrival` is `Some` only on the path that applies an aggregate as it
     /// arrives. A drained one waits a deliberate slot for its own slot to
@@ -2215,15 +2215,18 @@ impl BlockChainServer {
     fn apply_beacon_aggregate(
         &mut self,
         aggregate: &SignedAggregateAndProof,
+        attesting_indices: &[ValidatorIndex],
+        index: &HashMap<H256, (u64, H256)>,
         arrival: Option<AggregateArrival>,
     ) {
         let started = Instant::now();
         let config = self.store.config();
-        let outcome = fork_choice::on_gossip_aggregate(
+        let outcome = fork_choice::apply_verified_aggregate(
             &mut self.store,
-            aggregate,
+            aggregate.data(),
+            attesting_indices,
             &config,
-            &mut self.committees,
+            index,
         );
         metrics::observe_beacon_aggregate_processing(started.elapsed());
         if let Some(arrival) = arrival {
@@ -2252,33 +2255,47 @@ impl BlockChainServer {
     }
 
     /// Apply every held aggregate whose slot has now passed, and prune what
-    /// finality has put out of reach.
+    /// the clock and finality have put out of reach.
     ///
     /// Called once per beacon tick, between the store clock advancing and the
     /// head being recomputed, so the votes released here are in fork choice
     /// before the head this tick reports is chosen.
+    ///
+    /// Builds [`ethlambda_storage::Store::block_index`] once for the whole
+    /// drain: it is a full `Table::LiveChain` scan, and paying for it once per
+    /// aggregate here would undo the reason `on_block`'s own attestations
+    /// already share one. Skipped entirely when nothing is ready, since most
+    /// beacon ticks find no deferred aggregate and a scan has nothing to serve.
     fn drain_deferred_aggregates(&mut self) {
         let config = self.store.config();
         let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        let current_epoch = fork_choice::get_current_store_epoch(&self.store, &config);
 
-        let finalized_epoch = self.store.beacon_finalized_checkpoint().epoch;
         let finalized_slot = self
             .store
             .latest_finalized()
             .expect("finalized checkpoint exists")
             .slot;
-        self.beacon_aggregates
-            .prune(finalized_epoch, finalized_slot);
+        self.beacon_aggregates.prune(current_epoch, finalized_slot);
 
-        for entry in self.beacon_aggregates.take_ready(current_slot) {
-            // Re-checked rather than trusted from when it was held: an
-            // aggregate applied in the meantime may already cover this one, and
-            // that is the whole point of the gate.
-            if let Some(dropped) = self.beacon_aggregates.already_covered(&entry.aggregate) {
-                metrics::inc_beacon_aggregate_outcome(dropped.label());
-                continue;
+        let ready = self.beacon_aggregates.take_ready(current_slot);
+        if !ready.is_empty() {
+            let index = self.store.block_index();
+            for entry in ready {
+                // Re-checked rather than trusted from when it was held: an
+                // aggregate applied in the meantime may already cover this one, and
+                // that is the whole point of the gate.
+                if let Some(dropped) = self.beacon_aggregates.already_covered(&entry.aggregate) {
+                    metrics::inc_beacon_aggregate_outcome(dropped.label());
+                    continue;
+                }
+                self.apply_beacon_aggregate(
+                    &entry.aggregate,
+                    &entry.attesting_indices,
+                    &index,
+                    None,
+                );
             }
-            self.apply_beacon_aggregate(&entry.aggregate, None);
         }
 
         metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
@@ -2337,11 +2354,12 @@ impl BlockChainServer {
         let Some((_, head_root)) = self.store.beacon_head() else {
             return;
         };
-        if self.committees.head_root() == Some(head_root) {
+        let committees = self.store.committee_cache();
+        if committees.head_root() == Some(head_root) {
             return;
         }
         if let Some(head_state) = self.store.cached_state(CacheKey::BlockState(head_root)) {
-            self.committees.update_head(head_root, &head_state);
+            committees.update_head(head_root, &head_state);
         }
     }
 
@@ -3804,7 +3822,7 @@ impl Handler<NewBeaconAggregate> for BlockChainServer {
         // Read before anything else: this is the wait no timing on the far
         // side of the mailbox can see, and it is where a backlog would show.
         metrics::observe_beacon_aggregate_mailbox_wait(msg.arrival.handed_off.elapsed());
-        self.on_gossip_beacon_aggregate(msg.aggregate, msg.arrival);
+        self.on_gossip_beacon_aggregate(msg.aggregate, msg.attesting_indices, msg.arrival);
     }
 }
 
@@ -4238,7 +4256,6 @@ mod tests {
             sync_status_controller: SyncStatusController::default(),
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
-            committees: CommitteeCache::default(),
         }
     }
 

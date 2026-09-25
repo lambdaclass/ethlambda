@@ -78,7 +78,7 @@ pub fn process_block(
     block: &capella::BeaconBlock,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -373,7 +373,7 @@ pub fn process_operations(
     voluntary_exits: &[SignedVoluntaryExit],
     bls_to_execution_changes: &[capella::SignedBLSToExecutionChange],
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     super::operations::process_operations(
         state,

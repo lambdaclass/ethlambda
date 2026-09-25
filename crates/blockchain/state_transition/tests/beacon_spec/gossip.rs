@@ -10,12 +10,14 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, Checkpoint, SignedBeaconBlock, fulu,
+    BeaconState, Checkpoint, SignedAggregateAndProof, SignedBeaconBlock, electra, fulu, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, PayloadValidity, Store,
 };
-use ethlambda_state_transition::beacon::gossip::{self as rules, Outcome, SeenBlocks, SeenColumns};
+use ethlambda_state_transition::beacon::gossip::{
+    self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlocks, SeenColumns,
+};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
 use ethlambda_storage::ForkCheckpoints;
@@ -25,7 +27,12 @@ use libtest_mimic::Trial;
 use super::{Case, PRESET, collect_gossip};
 
 /// The handlers this runner covers.
-const HANDLERS: &[&str] = &["gossip_beacon_block", "gossip_data_column_sidecar"];
+const HANDLERS: &[&str] = &[
+    "gossip_beacon_block",
+    "gossip_data_column_sidecar",
+    "gossip_beacon_aggregate_and_proof",
+    "gossip_beacon_attestation",
+];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
 const SKIPPED: &[(&str, &str)] = &[
@@ -36,6 +43,14 @@ const SKIPPED: &[(&str, &str)] = &[
     (
         "gossip_data_column_sidecar__reject_parent_failed_validation",
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_beacon_aggregate_and_proof__reject_block_failed_validation",
+        "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_beacon_attestation__reject_block_failed_validation",
+        "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
     ),
 ];
 
@@ -87,6 +102,31 @@ fn parse_root(hex_root: &str) -> Root {
 fn decode_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
     SignedBeaconBlock::from_ssz(case.fork, &case.ssz_bytes(name))
         .map_err(|err| format!("decoding {name}: {err:?}"))
+}
+
+/// `SignedAggregateAndProof` has no `from_ssz(fork, bytes)` of its own (it
+/// carries no state, unlike a block or a state, so nothing else in this crate
+/// needed one yet): every fork through deneb shares phase0's shape, and
+/// electra and fulu share electra's, exactly the split
+/// [`SignedAggregateAndProof`]'s own doc describes for
+/// [`SignedBeaconBlock::Fulu`].
+fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAndProof, String> {
+    let bytes = case.ssz_bytes(name);
+    match case.fork {
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(SignedAggregateAndProof::Phase0(
+            phase0::SignedAggregateAndProof::from_ssz_bytes(&bytes)
+                .map_err(|err| format!("decoding {name}: {err:?}"))?,
+        )),
+        ForkName::Electra | ForkName::Fulu => Ok(SignedAggregateAndProof::Electra(
+            electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
+                .map_err(|err| format!("decoding {name}: {err:?}"))?,
+        )),
+        other => Err(format!("no aggregate shape for fork {other:?}")),
+    }
 }
 
 /// The case's own `config.yaml`, when it carries one: the vectors that pin a
@@ -166,7 +206,7 @@ fn build_store(
             config,
             &DataAvailability::NotRequired,
             &validity,
-            &mut CommitteeCache::default(),
+            &CommitteeCache::default(),
         )
         .map_err(|err| format!("importing {}: {err:?}", entry.block))?;
     }
@@ -221,6 +261,8 @@ fn run_case(case: &Case) -> Result<(), String> {
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
     let mut seen_columns = SeenColumns::new(capacity);
+    let mut seen_aggregates = SeenAggregates::new(capacity, capacity);
+    let mut seen_attestations = SeenAttestations::new(capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
         let now_ms = config.genesis_time_ms() + meta.current_time_ms + message.offset_ms;
@@ -246,6 +288,41 @@ fn run_case(case: &Case) -> Result<(), String> {
                 if outcome == Outcome::Accept {
                     let header = &sidecar.signed_block_header.message;
                     seen_columns.record(header.slot, header.proposer_index, sidecar.index);
+                }
+                outcome
+            }
+            "beacon_aggregate_and_proof" => {
+                let aggregate = decode_signed_aggregate(case, &message.message)?;
+                let outcome = match rules::aggregate::validate(
+                    &seen_aggregates,
+                    &store,
+                    &aggregate,
+                    now_ms,
+                ) {
+                    Ok(_) => Outcome::Accept,
+                    Err(outcome) => outcome,
+                };
+                if outcome == Outcome::Accept {
+                    seen_aggregates.record(&aggregate);
+                }
+                outcome
+            }
+            "beacon_attestation" => {
+                let attestation =
+                    electra::SingleAttestation::from_ssz_bytes(&case.ssz_bytes(&message.message))
+                        .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let subnet_id = message
+                    .subnet_id
+                    .ok_or("a beacon_attestation message names its subnet")?;
+                let outcome = rules::attestation::validate(
+                    &seen_attestations,
+                    &store,
+                    &attestation,
+                    subnet_id,
+                    now_ms,
+                );
+                if outcome == Outcome::Accept {
+                    seen_attestations.record(&attestation);
                 }
                 outcome
             }

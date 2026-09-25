@@ -3,6 +3,7 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
 };
@@ -217,7 +218,10 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         sidecars: Vec<DataColumnSidecar>,
     ) -> Result<(), ActorError>;
-    /// A beacon aggregate that passed the checks needing nothing but a clock.
+    /// An aggregate gossip validation accepted: `ethlambda-p2p`'s beacon
+    /// gossip verdict machinery already ran every `beacon_aggregate_and_proof`
+    /// condition, `attesting_indices` included, so the chain actor only has to
+    /// apply it to fork choice.
     ///
     /// Separate from [`Self::new_aggregated_attestation`], which carries
     /// lean's unrelated [`SignedAggregatedAttestation`]: the two chains'
@@ -228,12 +232,20 @@ pub trait P2PToBlockChain: Send + Sync {
     /// signed block headers' worth of payload would otherwise set the size of
     /// every message in this protocol.
     ///
+    /// `attesting_indices` are the validators whose votes the aggregate
+    /// signature verified, resolved once against the committee p2p's gossip
+    /// validation already looked up. The chain actor never rebuilds a
+    /// committee or checks a signature for this topic: its only consumer is
+    /// `ethlambda_state_transition`'s apply-only
+    /// `fork_choice::apply_verified_aggregate`.
+    ///
     /// One aggregate per message rather than a batch, unlike
     /// [`Self::new_data_column_sidecars`]: gossip is the only producer, and it
     /// has exactly one to hand.
     fn new_beacon_aggregate(
         &self,
         aggregate: Box<SignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
     ) -> Result<(), ActorError>;
 }
