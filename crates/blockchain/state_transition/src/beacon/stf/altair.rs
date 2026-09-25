@@ -31,8 +31,8 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch,
-    get_domain, get_previous_epoch, get_total_active_balance,
+    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root_at_slot,
+    get_current_epoch, get_domain, get_previous_epoch, get_total_active_balance,
 };
 use crate::beacon::helpers::altair::{
     add_flag, get_attestation_participation_flag_indices, get_base_reward_per_increment, has_flag,
@@ -81,7 +81,7 @@ use std::collections::HashMap;
 pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -577,7 +577,7 @@ mod tests {
         let proposer_index = get_beacon_proposer_index(&state).unwrap();
         let balance_before = state.balance(proposer_index).unwrap();
 
-        process_attestation(&mut state, &attestation, &mut CommitteeCache::default()).unwrap();
+        process_attestation(&mut state, &attestation, &CommitteeCache::default()).unwrap();
 
         let (previous_epoch_participation, _, _) = state.altair_validator_lists().unwrap();
         for &index in &committee {
@@ -607,7 +607,7 @@ mod tests {
         // so reprocessing the identical attestation must grant nothing new, and
         // the proposer's balance must not move.
         let balance_before_replay = state.balance(proposer_index).unwrap();
-        process_attestation(&mut state, &attestation, &mut CommitteeCache::default()).unwrap();
+        process_attestation(&mut state, &attestation, &CommitteeCache::default()).unwrap();
         let balance_after_replay = state.balance(proposer_index).unwrap();
         assert_eq!(
             balance_before_replay, balance_after_replay,

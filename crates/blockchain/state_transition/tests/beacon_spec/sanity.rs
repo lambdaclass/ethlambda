@@ -49,7 +49,7 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
 
     // One cache across the case's blocks, as the node holds one across its
     // imports, so consecutive blocks of an epoch share its shuffling.
-    let mut committees = CommitteeCache::default();
+    let committees = CommitteeCache::default();
 
     for index in 0..meta.blocks_count {
         let bytes = case.ssz_bytes_indexed("blocks", index);
@@ -60,7 +60,7 @@ fn apply_blocks(case: &Case, state: &mut BeaconState, config: &Config) -> Result
             state.latest_block_header_mut().state_root = root;
         }
 
-        stf::state_transition(state, &block, true, config, &engine, &mut committees)
+        stf::state_transition(state, &block, true, config, &engine, &committees)
             .map_err(|err| format!("block {index} rejected: {err:?}"))?;
 
         previous_state_root = Some(block.state_root());

@@ -131,7 +131,7 @@ pub fn state_transition(
     validate_result: bool,
     config: &Config,
     engine: &ExecutionEngine,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
 

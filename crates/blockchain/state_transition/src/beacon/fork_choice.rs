@@ -237,7 +237,7 @@ impl Attestation {
     pub fn verified_attesting_indices(
         &self,
         state: &BeaconState,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         self.indices(state, true, committees)
     }
@@ -254,7 +254,7 @@ impl Attestation {
     pub fn attesting_indices(
         &self,
         state: &BeaconState,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         self.indices(state, false, committees)
     }
@@ -269,7 +269,7 @@ impl Attestation {
         &self,
         state: &BeaconState,
         verify_signature: bool,
-        committees: &mut CommitteeCache,
+        committees: &CommitteeCache,
     ) -> Result<Vec<ValidatorIndex>> {
         match self {
             Attestation::Phase0(attestation) => {
@@ -2344,7 +2344,7 @@ pub fn on_block(
     config: &Config,
     blob_evidence: &DataAvailability,
     payload_validity: &PayloadValidity,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let block_root = signed_block.message_hash_tree_root();
     let parent_root = signed_block.parent_root();
@@ -2577,7 +2577,7 @@ pub fn on_attestation(
     attestation: &Attestation,
     is_from_block: bool,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation(store, data, is_from_block, config)?;
@@ -2636,7 +2636,7 @@ pub fn on_block_attestation(
     block_state: &BeaconState,
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
     validate_on_attestation_indexed(store, data, true, config, index)?;
@@ -2644,6 +2644,46 @@ pub fn on_block_attestation(
     let attesting_indices = attestation.attesting_indices(block_state, committees)?;
     update_latest_messages(store, &attesting_indices, data);
 
+    Ok(())
+}
+
+/// Apply an aggregate that reached the chain actor after
+/// `ethlambda-p2p`'s beacon gossip validation already accepted it.
+///
+/// Every condition `beacon_aggregate_and_proof`'s own gossip rules add over a
+/// plain attestation, the committee lookups, `is_aggregator`, committee
+/// membership, and all three BLS checks, ran once in
+/// `ethlambda_state_transition::beacon::gossip::aggregate` before this was
+/// called, on the state that attestation's own target checkpoint names. This
+/// function must not repeat any of it: doing so would be the reviewed defect
+/// this replaced, committees rebuilt and signatures re-verified once per
+/// aggregate on the chain actor's single thread.
+///
+/// What is left is exactly [`on_attestation`]'s own validity check and its
+/// bookkeeping, since neither is gossip's to answer: [`validate_on_attestation_indexed`]
+/// catches a target this node has since finalized past or a vote whose own
+/// slot has not passed yet, both of which can change between p2p's verdict
+/// and the chain actor picking the aggregate up, and [`update_latest_messages`]
+/// records it against `attesting_indices`, resolved by the caller's gossip
+/// validation rather than recomputed here.
+///
+/// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
+/// this topic: an aggregate here is by definition not carried in a block, so
+/// the current-or-previous-epoch target check applies.
+///
+/// `index` is [`Store::block_index`], taken as a parameter rather than built
+/// here so a caller applying several aggregates at once (the chain actor's
+/// deferral queue, drained once per tick) pays for the full `Table::LiveChain`
+/// scan once for the whole drain rather than once per aggregate.
+pub fn apply_verified_aggregate(
+    store: &mut Store,
+    data: AttestationData,
+    attesting_indices: &[ValidatorIndex],
+    config: &Config,
+    index: &HashMap<Root, (Slot, Root)>,
+) -> Result<()> {
+    validate_on_attestation_indexed(store, data, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data);
     Ok(())
 }
 

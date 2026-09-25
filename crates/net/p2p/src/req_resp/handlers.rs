@@ -2362,6 +2362,12 @@ mod tests {
             State::from_genesis(0, vec![]),
             DEFAULT_MILLISECONDS_PER_SLOT,
         );
+        // Read before `built.wire` moves into the server below; this is a
+        // lean wire, so `seen_attestations_capacity` floors it to one subnet.
+        let backbone_attestation_subnets = built
+            .wire
+            .beacon()
+            .map_or(0, |beacon| beacon.attestation_subnets.len());
 
         P2PServer {
             swarm_handle,
@@ -2384,11 +2390,23 @@ mod tests {
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_aggregates:
+                ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                ),
+            seen_attestations:
+                ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
+                    crate::seen_attestations_capacity(backbone_attestation_subnets),
+                ),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
             column_check_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::COLUMN_CHECK_PERMITS,
+            )),
+            attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::ATTESTATION_VALIDATION_PERMITS,
             )),
         }
     }

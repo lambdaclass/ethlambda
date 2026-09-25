@@ -132,7 +132,7 @@ fn apply_step(
     case: &Case,
     step: &Step,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     if let Some(time) = step.tick {
         fork_choice::on_tick(store, time, config);
@@ -177,7 +177,7 @@ fn apply_block(
     name: &str,
     expect_valid: bool,
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     let signed_block = super::fork_choice::decode_signed_block(case, name)?;
     let validity = seeded_validity(store, &signed_block);
@@ -237,12 +237,12 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let mut store = fork_choice::get_forkchoice_store(backend, anchor_state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
-    let mut committees = CommitteeCache::default();
+    let committees = CommitteeCache::default();
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
             Some(checks) => super::fork_choice::apply_checks(&mut store, checks, config),
-            None => apply_step(&mut store, case, step, config, &mut committees),
+            None => apply_step(&mut store, case, step, config, &committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
     }

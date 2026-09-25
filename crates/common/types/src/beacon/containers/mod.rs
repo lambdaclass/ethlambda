@@ -55,8 +55,8 @@ use libssz::{SszDecode as _, SszEncode as _};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{
-    BlsSignature, Bytes32, Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _, Root, Slot,
-    ValidatorIndex, WithdrawalIndex,
+    BlsSignature, Bytes32, CommitteeIndex, Epoch, ExecutionBlockHash, Gwei, HashTreeRoot as _,
+    Root, Slot, ValidatorIndex, WithdrawalIndex,
 };
 use crate::beacon::{beacon_value_unreachable, lean_block_unreachable, lean_state_unreachable};
 
@@ -701,6 +701,147 @@ impl BeaconState {
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
             absent_from: [Phase0],
         )
+    }
+}
+
+/// An aggregate attestation with the proof its aggregator was selected, in
+/// whichever fork's shape it currently has.
+///
+/// Two variants, not one per fork, for the reason
+/// [`SignedBeaconBlock::Fulu`] wraps electra's block: every fork through deneb
+/// shares [`phase0::SignedAggregateAndProof`] outright, and fulu shares
+/// electra's the same way.
+///
+/// Here rather than beside the gossip decode in `ethlambda-p2p`, where it was
+/// first declared, because the gossip path no longer ends at that decode: an
+/// aggregate now travels over `ethlambda-network-api` to the chain actor and
+/// into fork choice. That protocol crate depends on this one and on nothing
+/// else, deliberately, so a fork-generic container every layer names has to
+/// live here, next to [`SignedBeaconBlock`].
+///
+/// The accessors are the pure ones. Turning this into the fork-choice crate's
+/// own `Attestation` needs that crate's enum, so it lives there as a
+/// `From` implementation rather than as a method here.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SignedAggregateAndProof {
+    Phase0(phase0::SignedAggregateAndProof),
+    Electra(electra::SignedAggregateAndProof),
+}
+
+impl SignedAggregateAndProof {
+    /// The validator that was selected to aggregate this committee's votes.
+    pub fn aggregator_index(&self) -> ValidatorIndex {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregator_index,
+            Self::Electra(signed) => signed.message.aggregator_index,
+        }
+    }
+
+    /// The slot the aggregated attestation votes at.
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregate.data.slot,
+            Self::Electra(signed) => signed.message.aggregate.data.slot,
+        }
+    }
+
+    /// The fork-invariant half of the aggregate this carries.
+    pub fn data(&self) -> AttestationData {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregate.data,
+            Self::Electra(signed) => signed.message.aggregate.data,
+        }
+    }
+
+    /// The epoch and root the aggregate's `target` checkpoint names.
+    pub fn target(&self) -> (Epoch, Root) {
+        let target = self.data().target;
+        (target.epoch, target.root)
+    }
+
+    /// The aggregator's signature over the aggregate's slot, which is what
+    /// makes its selection verifiable rather than self-declared.
+    pub fn selection_proof(&self) -> BlsSignature {
+        match self {
+            Self::Phase0(signed) => signed.message.selection_proof,
+            Self::Electra(signed) => signed.message.selection_proof,
+        }
+    }
+
+    /// The aggregator's signature over the whole `AggregateAndProof`.
+    pub fn signature(&self) -> BlsSignature {
+        match self {
+            Self::Phase0(signed) => signed.signature,
+            Self::Electra(signed) => signed.signature,
+        }
+    }
+
+    /// The one committee index the aggregate names, or `None` if it does not
+    /// name exactly one.
+    ///
+    /// EIP-7549 moved the committee out of `data.index`, which electra
+    /// requires to be zero, and into a `committee_bits` bitfield. Electra's
+    /// gossip validation then requires that bitfield to select *exactly* one
+    /// committee, so answering `None` for both zero and several is not a lost
+    /// distinction: both are the same rejection, and collapsing them here is
+    /// what keeps `ethlambda-state-transition`'s `beacon::gossip::aggregate`
+    /// cheap checks (this crate cannot intra-link into that one) from having
+    /// to know this enum's two shapes.
+    ///
+    /// The `len(aggregation_bits) == len(committee)` check downstream is only
+    /// meaningful because of that "exactly one": electra's `aggregation_bits`
+    /// spans every committee `committee_bits` names, so it equals one
+    /// committee's width precisely when one committee is named.
+    pub fn committee_index(&self) -> Option<CommitteeIndex> {
+        match self {
+            Self::Phase0(signed) => Some(signed.message.aggregate.data.index),
+            Self::Electra(signed) => {
+                let bits = &signed.message.aggregate.committee_bits;
+                let mut named = (0..bits.len()).filter(|&index| bits.get(index).unwrap_or(false));
+                let first = named.next()?;
+                // A second named committee disqualifies the aggregate outright.
+                match named.next() {
+                    None => Some(first as CommitteeIndex),
+                    Some(_) => None,
+                }
+            }
+        }
+    }
+
+    /// How many attesters the aggregate covers.
+    ///
+    /// Counts set bits rather than reporting the bitfield's length: from
+    /// electra on, `aggregation_bits` spans every committee named in
+    /// `committee_bits`, so its length says how wide the aggregate could be,
+    /// not how many validators actually signed.
+    pub fn attester_count(&self) -> usize {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
+            Self::Electra(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
+        }
+    }
+
+    /// The aggregation bits, as a plain vector of booleans.
+    ///
+    /// The shape the seen-set's superset test needs: it compares one
+    /// aggregate's coverage against the union of what has already been seen
+    /// for the same `AttestationData`, and neither bitfield type it could
+    /// receive supports that directly.
+    pub fn aggregation_bits(&self) -> Vec<bool> {
+        match self {
+            Self::Phase0(signed) => {
+                let bits = &signed.message.aggregate.aggregation_bits;
+                (0..bits.len())
+                    .map(|i| bits.get(i).unwrap_or(false))
+                    .collect()
+            }
+            Self::Electra(signed) => {
+                let bits = &signed.message.aggregate.aggregation_bits;
+                (0..bits.len())
+                    .map(|i| bits.get(i).unwrap_or(false))
+                    .collect()
+            }
+        }
     }
 }
 

@@ -518,6 +518,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // advertisements and req/resp serving.
             let custody_columns = params.wire.custody_columns.clone();
 
+            // Cloned ahead of the same move, for the ENR entry below: the
+            // record has to advertise exactly the subnets the swarm subscribes
+            // to, and both readings come from this one computation.
+            let attestation_subnets: HashSet<u64> =
+                params.wire.attestation_subnets.iter().copied().collect();
+
             // The anchored beacon store. `P2PServer` holds it for the lean
             // handlers, and the two beacon block handlers read it too: it is
             // what `beacon_blocks_by_{range,root}/2` are answered from.
@@ -577,9 +583,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             ChainSetup {
                 wire: WireConfig::Beacon(Box::new(params.wire)),
                 discovery: DiscoveryWireEntries {
-                    // No attestation subnet is subscribed, so the bitfield is
-                    // 64 bits all unset: exactly what this node serves.
-                    subscription_subnets: Default::default(),
+                    // The backbone subnets this node's id selects, so the ENR's
+                    // `attnets` names what the gossip subscription actually
+                    // holds. Both come from `wire_params`' one computation
+                    // rather than from two, which is what keeps a peer's
+                    // reading of this record true of the node behind it.
+                    subscription_subnets: attestation_subnets,
                     attestation_committee_count:
                         ethlambda_p2p::beacon::constants::ATTESTATION_SUBNET_COUNT,
                     fork_id: params.fork_id,

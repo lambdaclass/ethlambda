@@ -1422,3 +1422,127 @@ pub fn inc_engine_not_optimistic_candidate() {
         });
     LEAN_ENGINE_NOT_OPTIMISTIC_CANDIDATE_TOTAL.inc();
 }
+
+// ---------------------------------------------------------------------------
+// Beacon aggregate gossip
+// ---------------------------------------------------------------------------
+//
+// Deferring the per-aggregate amortizations (one `block_index()` scan and one
+// `EpochCommittees` build per aggregate, rather than one per batch) is only
+// safe while their cost is visible. These are what make it visible: without
+// them the symptom is an unexplained head lag, which is exactly the situation
+// the block-import timing report was added to answer for blocks.
+
+/// Buckets for one aggregate's journey, in seconds.
+///
+/// Reaching the top of this range means a single aggregate costs more than a
+/// mainnet slot's worth of the actor's time at this arrival rate, which is the
+/// threshold the deferred amortization exists for.
+fn beacon_aggregate_duration_buckets() -> Vec<f64> {
+    vec![
+        0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    ]
+}
+
+/// How long the chain actor spent on one aggregate, from the moment it was
+/// taken off the mailbox to the moment fork choice had it.
+///
+/// Covers `apply_verified_aggregate` end to end. `ethlambda-p2p`'s gossip
+/// validation already resolved the committees and all three signatures before
+/// handing the aggregate over, so what this measures now is just
+/// `validate_on_attestation_indexed` and recording the vote against an
+/// already-built `block_index()`; a slow observation here points at the store
+/// itself, not at cryptography. Observed for aggregates that were actually
+/// processed, applied or not; one dropped by the applied-bits gate never
+/// reaches this.
+pub fn observe_beacon_aggregate_processing(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_PROCESSING_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_processing_seconds",
+                "Time the chain actor spent applying one gossip aggregate to fork choice",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_PROCESSING_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// How long an aggregate waited between the p2p actor handing it over and the
+/// chain actor picking it up.
+///
+/// The mailbox hop, and the failure mode this whole path introduces: roughly a
+/// thousand aggregates a slot queueing behind block imports arrive too late to
+/// move the head while every per-aggregate timing still looks healthy. Invisible
+/// from inside the chain actor, which is why the instant rides on the message.
+pub fn observe_beacon_aggregate_mailbox_wait(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_MAILBOX_WAIT_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_mailbox_wait_seconds",
+                "Time a gossip aggregate spent in the chain actor's mailbox",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_MAILBOX_WAIT_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// Count one aggregate's outcome.
+///
+/// `applied` is the one that moved a vote. Everything else names why it did
+/// not: `known_subset` is the applied-bits gate, `queue_full` is the deferral
+/// queue's cap, and `invalid` is `apply_verified_aggregate` refusing a
+/// gossip-accepted aggregate, most often because its target has since been
+/// superseded by finality or its own slot has not passed yet.
+pub fn inc_beacon_aggregate_outcome(outcome: &str) {
+    static LEAN_BEACON_AGGREGATE_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_beacon_aggregate_total",
+                "Gossip aggregates by outcome",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How many aggregates are held waiting for their own slot to pass.
+///
+/// A steady value near the queue's cap means aggregates are arriving faster
+/// than the once-per-slot drain clears them, which is the backlog the cap
+/// turns into a drop rather than into unbounded memory.
+pub fn update_beacon_aggregates_deferred(count: usize) {
+    static LEAN_BEACON_AGGREGATES_DEFERRED: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_beacon_aggregates_deferred",
+                "Gossip aggregates held until their own slot has passed"
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATES_DEFERRED.set(count as i64);
+}
+
+/// How long one aggregate took from coming off the wire to being applied to
+/// fork choice.
+///
+/// Observed only for aggregates applied on arrival, never for ones released
+/// from the deferral queue: those wait a deliberate slot for their own slot to
+/// pass, and folding that hold in would report the design as latency. The
+/// held path's own health is [`update_beacon_aggregates_deferred`].
+pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_end_to_end_seconds",
+                "Time from a gossip aggregate arriving on the wire to it reaching fork choice",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
+}

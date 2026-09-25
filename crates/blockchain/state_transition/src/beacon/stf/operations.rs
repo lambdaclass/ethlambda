@@ -23,7 +23,8 @@ use crate::beacon::containers::shared::{
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain, get_previous_epoch,
+    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_current_epoch, get_domain,
+    get_previous_epoch,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{
@@ -70,7 +71,7 @@ pub fn process_operations(
     deposits: &[Deposit],
     voluntary_exits: &[SignedVoluntaryExit],
     config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     // `eth1_deposit_index` only ever advances by one per processed deposit,
     // and `deposit_count` only ever grows, so in a correctly-derived state the
@@ -264,7 +265,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
     _config: &Config,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);

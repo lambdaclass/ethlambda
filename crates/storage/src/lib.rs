@@ -1,6 +1,7 @@
 mod api;
 pub mod backend;
 mod beacon_state_delta;
+mod committee_cache;
 mod error;
 mod metrics;
 mod state_codec;
@@ -9,6 +10,7 @@ mod state_writer;
 mod store;
 
 pub use api::{ALL_TABLES, StorageBackend, StorageReadView, StorageWriteBatch, Table};
+pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 /// Error type returned by the fallible [`Store`] operations, exported so
 /// callers can match on it (e.g. to distinguish [`Error::DbVersionMismatch`]).
 pub use error::Error;

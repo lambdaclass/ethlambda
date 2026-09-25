@@ -188,16 +188,15 @@ pub fn get_inclusion_delay_deltas(
     // the answer does not depend on `index`, and every attestation here
     // belongs to the previous epoch, so one cache serves all of them one
     // shuffling.
-    let mut committees = CommitteeCache::default();
+    let committees = CommitteeCache::default();
     let attesters_per_attestation = matching_source_attestations
         .iter()
         .map(|attestation| {
-            unslashed_attesting_indices(state, std::slice::from_ref(attestation), &mut committees)
+            unslashed_attesting_indices(state, std::slice::from_ref(attestation), &committees)
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for index in unslashed_attesting_indices(state, &matching_source_attestations, &mut committees)?
-    {
+    for index in unslashed_attesting_indices(state, &matching_source_attestations, &committees)? {
         let attestation = matching_source_attestations
             .iter()
             .zip(&attesters_per_attestation)

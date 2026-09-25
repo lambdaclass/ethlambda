@@ -135,8 +135,8 @@ use crate::beacon::primitives::{
 };
 
 use super::accessors::{
-    CommitteeCache, get_active_validator_indices, get_current_epoch, get_domain, get_seed,
-    get_total_active_balance,
+    CommitteeCache, CommitteeCacheExt, get_active_validator_indices, get_current_epoch, get_domain,
+    get_seed, get_total_active_balance,
 };
 use super::math::bytes_to_uint64;
 use super::misc::{compute_activation_exit_epoch, compute_epoch_at_slot, compute_signing_root};
@@ -438,7 +438,7 @@ pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorInde
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &electra::Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
     let committee_indices = get_committee_indices(&attestation.committee_bits);
     let epoch_committees =
@@ -465,7 +465,7 @@ pub fn get_attesting_indices(
 pub fn get_indexed_attestation(
     state: &BeaconState,
     attestation: &electra::Attestation,
-    committees: &mut CommitteeCache,
+    committees: &CommitteeCache,
 ) -> Result<electra::IndexedAttestation> {
     let indices = get_attesting_indices(state, attestation, committees)?;
     Ok(electra::IndexedAttestation {
@@ -1217,7 +1217,7 @@ mod tests {
         };
 
         let indices =
-            get_attesting_indices(&state, &attestation, &mut CommitteeCache::default()).unwrap();
+            get_attesting_indices(&state, &attestation, &CommitteeCache::default()).unwrap();
 
         let mut expected = vec![
             committee_0[0],
@@ -1260,7 +1260,7 @@ mod tests {
         };
 
         let indexed =
-            get_indexed_attestation(&state, &attestation, &mut CommitteeCache::default()).unwrap();
+            get_indexed_attestation(&state, &attestation, &CommitteeCache::default()).unwrap();
         assert_eq!(&*indexed.attesting_indices, &[committee[0]]);
         assert_eq!(indexed.signature, attestation.signature);
         assert_eq!(indexed.data, attestation.data);

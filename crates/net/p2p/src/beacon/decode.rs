@@ -9,12 +9,16 @@
 //! topics rather than a fixed name, decodes with no lookup either, for a
 //! different reason: fulu is the only fork that defines the container, so
 //! there is no ladder to begin with (see [`decode_data_column_sidecar`]).
+//! `beacon_attestation_{subnet_id}` is the exception to reading the fork off
+//! the payload: electra moved its slot, so its fork comes from the topic's
+//! digest instead (see [`decode_attestation`]).
 //!
 //! | Topic | Fork-dependent |
 //! |---|---|
 //! | `beacon_block` | Yes, every fork |
 //! | `beacon_aggregate_and_proof` | Yes, at electra |
 //! | `attester_slashing` | Yes, at electra |
+//! | `beacon_attestation_{subnet_id}` | Yes, at electra, by topic digest |
 //! | `voluntary_exit`, `proposer_slashing` | No |
 //! | `bls_to_execution_change` | No, capella onward |
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
@@ -32,52 +36,14 @@ use libssz::SszDecode as _;
 use super::topics;
 
 /// An aggregate attestation with its selection proof, in whichever shape the
-/// slot's fork gives it. Electra widened `Attestation` with `committee_bits`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SignedAggregateAndProof {
-    Phase0(phase0::SignedAggregateAndProof),
-    Electra(electra::SignedAggregateAndProof),
-}
-
-impl SignedAggregateAndProof {
-    /// The validator that was selected to aggregate this committee's votes.
-    pub fn aggregator_index(&self) -> u64 {
-        match self {
-            Self::Phase0(signed) => signed.message.aggregator_index,
-            Self::Electra(signed) => signed.message.aggregator_index,
-        }
-    }
-
-    /// The slot the aggregated attestation votes at.
-    pub fn slot(&self) -> Slot {
-        match self {
-            Self::Phase0(signed) => signed.message.aggregate.data.slot,
-            Self::Electra(signed) => signed.message.aggregate.data.slot,
-        }
-    }
-
-    /// The epoch and root the aggregate's `target` checkpoint names.
-    pub fn target(&self) -> (u64, ethlambda_types::beacon::primitives::Root) {
-        let target = match self {
-            Self::Phase0(signed) => &signed.message.aggregate.data.target,
-            Self::Electra(signed) => &signed.message.aggregate.data.target,
-        };
-        (target.epoch, target.root)
-    }
-
-    /// How many attesters the aggregate covers.
-    ///
-    /// Counts set bits rather than reporting the bitfield's length: from
-    /// electra on, `aggregation_bits` spans every committee named in
-    /// `committee_bits`, so its length says how wide the aggregate could be,
-    /// not how many validators actually signed.
-    pub fn attester_count(&self) -> usize {
-        match self {
-            Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
-            Self::Electra(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
-        }
-    }
-}
+/// slot's fork gives it.
+///
+/// Re-exported rather than declared here, where it used to live. The gossip
+/// path no longer ends at this decode: an aggregate now travels over
+/// `ethlambda-network-api` to the chain actor and into fork choice, so the type
+/// has to sit where every one of those layers can name it. The accessors this
+/// module's own logging uses came with it.
+pub use ethlambda_types::beacon::containers::SignedAggregateAndProof;
 
 /// Slashing evidence, in whichever shape the slot's fork gives it. Electra
 /// widened `IndexedAttestation`'s committee bound.
@@ -239,6 +205,49 @@ pub fn decode_aggregate_and_proof(
             .map(SignedAggregateAndProof::Electra)
     } else {
         phase0::SignedAggregateAndProof::from_ssz_bytes(bytes).map(SignedAggregateAndProof::Phase0)
+    }
+    .map_err(|_| DecodeError::Ssz)
+}
+
+/// An unaggregated attestation, in whichever shape the topic's fork gives it.
+///
+/// Electra split this topic differently from [`SignedAggregateAndProof`]'s. An
+/// aggregate kept its container and widened it, but a subnet vote changed
+/// container altogether: once EIP-7549 made `aggregation_bits` span every
+/// committee in the slot, a lone attester's bit no longer said which committee
+/// it sat in, so [`electra::SingleAttestation`] names `committee_index` and
+/// `attester_index` outright.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Attestation {
+    Phase0(phase0::Attestation),
+    Electra(electra::SingleAttestation),
+}
+
+impl Attestation {
+    /// The fork-invariant half of the attestation.
+    pub fn data(&self) -> ethlambda_types::beacon::containers::AttestationData {
+        match self {
+            Self::Phase0(attestation) => attestation.data,
+            Self::Electra(attestation) => attestation.data,
+        }
+    }
+}
+
+/// Decode a `beacon_attestation_{subnet_id}` payload, in the shape `fork`
+/// gives it.
+///
+/// The one fork-dependent topic whose fork cannot come from its own slot: the
+/// two shapes put `slot` at different offsets, four bytes in for phase0's
+/// `Attestation` and sixteen for `SingleAttestation`, so choosing the offset is
+/// the question the slot was supposed to answer. The topic answers it instead.
+/// `p2p-interface.md` types each topic by the fork its digest names, and
+/// lighthouse decodes this one on that digest too. `fork` is the fork the
+/// subscribed digest was computed at.
+pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, DecodeError> {
+    if fork >= ForkName::Electra {
+        electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
+    } else {
+        phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0)
     }
     .map_err(|_| DecodeError::Ssz)
 }
@@ -427,6 +436,76 @@ mod tests {
         let bytes = sidecar.to_ssz();
         assert_eq!(decode_data_column_sidecar(&bytes).unwrap().index, 3);
         assert!(decode_data_column_sidecar(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// One attester's vote at `slot`, in the shape electra puts on a subnet.
+    fn single_attestation(slot: Slot) -> electra::SingleAttestation {
+        electra::SingleAttestation {
+            committee_index: 5,
+            attester_index: 123_456,
+            data: shared::AttestationData {
+                slot,
+                beacon_block_root: Root::repeat_byte(1),
+                ..Default::default()
+            },
+            signature: BlsSignature::default(),
+        }
+    }
+
+    /// One attester's vote at `slot`, in the shape phase0 puts on a subnet: a
+    /// whole `Attestation` with a single bit set.
+    fn phase0_attestation(slot: Slot) -> phase0::Attestation {
+        let mut aggregation_bits = phase0::AggregationBits::with_length(8).unwrap();
+        aggregation_bits.set(3, true).unwrap();
+        phase0::Attestation {
+            aggregation_bits,
+            data: shared::AttestationData {
+                slot,
+                beacon_block_root: Root::repeat_byte(1),
+                ..Default::default()
+            },
+            signature: BlsSignature::default(),
+        }
+    }
+
+    #[test]
+    fn a_subnet_attestation_from_electra_on_is_a_single_attestation() {
+        let config = Config::mainnet();
+        let single = single_attestation(slot_of(config.fulu_fork_epoch));
+        let decoded = decode_attestation(ForkName::Fulu, &single.to_ssz()).expect("decodes");
+        assert_eq!(decoded, Attestation::Electra(single));
+    }
+
+    #[test]
+    fn a_subnet_attestation_before_electra_is_a_whole_attestation() {
+        let attestation = phase0_attestation(slot_of(10));
+        let decoded = decode_attestation(ForkName::Deneb, &attestation.to_ssz()).expect("decodes");
+        assert_eq!(decoded, Attestation::Phase0(attestation));
+    }
+
+    #[test]
+    fn the_topic_fork_rather_than_the_payload_picks_the_attestation_shape() {
+        // Each shape offered under the other's fork is refused rather than
+        // misread. Without this, `decode_attestation` could ignore `fork` and
+        // the two tests above would still pass.
+        let single = single_attestation(slot_of(10)).to_ssz();
+        assert_eq!(
+            decode_attestation(ForkName::Deneb, &single),
+            Err(DecodeError::Ssz)
+        );
+        let phase0 = phase0_attestation(slot_of(10)).to_ssz();
+        assert_eq!(
+            decode_attestation(ForkName::Electra, &phase0),
+            Err(DecodeError::Ssz)
+        );
+    }
+
+    #[test]
+    fn a_truncated_subnet_attestation_is_refused() {
+        let bytes = single_attestation(slot_of(10)).to_ssz();
+        for length in 0..bytes.len() {
+            assert!(decode_attestation(ForkName::Fulu, &bytes[..length]).is_err());
+        }
     }
 
     #[test]

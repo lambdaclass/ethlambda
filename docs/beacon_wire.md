@@ -7,10 +7,13 @@ startup order.
 
 It follows, from its checkpoint anchor to the tip: a chain actor imports what
 gossip announces and what range sync fetches, and the two block protocols serve
-other peers from the same store. It publishes nothing, and it does not read the
-aggregate topic, so fork choice learns its votes from block bodies. It also
-custodies and serves a slice of the fulu data column matrix, sized and
-selected by its own node id; see [Data column sidecars](#data-column-sidecars).
+other peers from the same store. Fork choice learns its votes from block bodies
+and from the aggregate topic, which is how it sees votes for the *current* head
+rather than only ones at least a block old; see [Aggregate
+attestations](#aggregate-attestations). It publishes nothing. It also custodies
+and serves a slice of the fulu data column matrix, and backbones a slice of the
+attestation subnets, both sized and selected by its own node id; see [Data
+column sidecars](#data-column-sidecars).
 
 ## Running it
 
@@ -64,8 +67,10 @@ to; restart it to pick up the new digest.
 
 ## Gossip
 
-Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus the data column
-subnets described below:
+Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus two subnet
+families this node's own node id selects a narrow slice of: the data column
+subnets it custodies and the attestation subnets it backbones, both described
+below.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -76,12 +81,30 @@ subnets described below:
 | `proposer_slashing` | `ProposerSlashing` |
 | `bls_to_execution_change` | `SignedBLSToExecutionChange` |
 | `sync_committee_contribution_and_proof` | `SignedContributionAndProof` |
+| `beacon_attestation_{subnet_id}` | `Attestation`, phase0 or electra |
 
-Two subnet families stay unsubscribed: `beacon_attestation_{0..63}` and
-`sync_committee_{0..3}`. That still drops roughly 30k BLS verifications per
-epoch; each arrives with the work that reads it. `blob_sidecar_{subnet_id}`
-stays absent too, permanently: it is deneb's format for blobs, deprecated at
-fulu in favor of the column matrix below.
+`beacon_attestation_{0..63}` is no longer wholly unsubscribed. This node holds
+`SUBNETS_PER_NODE` (2 on mainnet) long-lived subscriptions from that family,
+chosen by `compute_subscribed_subnets(node_id, epoch)`, a public function of
+this node's own discv5 node id in the same way `custody_columns` is, so any
+peer can compute the set without asking. `p2p-interface.md` asks every beacon
+node to hold them whether or not it runs validators: phase 0 has no shard
+committees, so nothing else gives these subnets a stable membership for
+validators to publish into. The subscription is therefore owed to the network
+rather than to this node's head: this node verifies and relays what arrives on
+it (see [Gossip validation](#gossip) below) but never applies it to fork
+choice. A lighthouse node with no validators behaves the same way, subscribing
+to its own node-id backbone and verifying what arrives on it while
+`should_process_attestation` keeps it out of fork choice unless a local
+aggregator duty or `--import-all-attestations` says otherwise.
+
+One deliberate shortfall: the set is computed once at startup and kept for the
+process's lifetime rather than rotating every `EPOCHS_PER_SUBNET_SUBSCRIPTION`
+epochs. Lighthouse does the same, and reads that constant nowhere.
+
+`sync_committee_{0..3}` stays unsubscribed and arrives with the work that reads
+it. `blob_sidecar_{subnet_id}` stays absent permanently: it is deneb's format
+for blobs, deprecated at fulu in favor of the column matrix below.
 
 `data_column_sidecar_{0..127}` is no longer in that absent list. This node
 subscribes to `sampling_size(CUSTODY_REQUIREMENT)` of them — the sampling size
@@ -90,9 +113,9 @@ floored by `SAMPLES_PER_SLOT` above `CUSTODY_REQUIREMENT` itself — chosen by
 node id (`das-core.md`), so any peer can compute the same set without asking.
 `NUMBER_OF_CUSTODY_GROUPS` and `DATA_COLUMN_SIDECAR_SUBNET_COUNT` are equal
 today, so a column is its own subnet with no reduction. That makes this
-node's total subscription count the seven global topics plus its sampling
-size, still far short of a full subscription to every attestation,
-sync-committee and data-column subnet, and narrower still than
+node's total subscription count the seven global topics plus its sampling size
+plus `SUBNETS_PER_NODE`, still far short of a full subscription to every
+attestation, sync-committee and data-column subnet, and narrower still than
 `NUMBER_OF_CUSTODY_GROUPS` columns of custody, which is what a supernode
 would carry alone. A sidecar decodes as
 `fulu::DataColumnSidecar`; the checks it passes before this node keeps or
@@ -100,19 +123,118 @@ forwards it are described just below. How a kept sidecar is later served back
 out over req/resp is under [Data column sidecars](#data-column-sidecars).
 
 Every beacon message is held by gossipsub until it has a verdict
-(`validate_messages()` is on for this wire only). Blocks and data column
-sidecars are validated by fulu's gossip rules
-(`ethlambda_state_transition::beacon::gossip`): the checks that need no state
-run inline in the p2p actor, the rest on a bounded `spawn_blocking` task whose
-verdict comes back to the actor (`crate::beacon::verdict`). Accept propagates
-the message; a message whose dependency is not ready yet is IGNOREd. Either
-way it is handed to the chain actor, which parks what it cannot import yet and
-imports the rest immediately, such as a sidecar whose slot merely falls
-outside its parent state's proposer lookahead.
-The other six global topics are decoded, logged (aggregates at `info`, the
-rest at `debug`), and IGNOREd, since nothing consumes them yet; an undecodable
-payload on any topic is REJECTed. Nothing is published on any topic: nothing
-this node can produce today would be signature-valid.
+(`validate_messages()` is on for this wire only). Blocks, data column
+sidecars, aggregates and subnet attestations are all validated by fulu's
+gossip rules (`ethlambda_state_transition::beacon::gossip`, one module per
+topic family): the checks that need no state run inline in the p2p actor, the
+rest on a bounded `spawn_blocking` task whose verdict comes back to the actor
+(`crate::beacon::verdict`). Two permit pools bound how many of these run at
+once, so a burst on one family cannot starve another:
+`gossip_validation_permits` for blocks and columns,
+`attestation_validation_permits` for aggregates and subnet attestations. A
+mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
+TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
+than only during a range sync, which is why that traffic needs a pool of its
+own rather than sharing the block and column one. Accept propagates the
+message; a message whose dependency is not ready yet is IGNOREd. See
+[Aggregate attestations](#aggregate-attestations) for the two topics with
+their own section.
+
+Blocks and data column sidecars are, either way, handed to the chain actor,
+which parks what it cannot import yet and imports the rest immediately, such
+as a sidecar whose slot merely falls outside its parent state's proposer
+lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the
+attesting indices gossip validation resolved. A subnet attestation never
+reaches it at all, on any outcome: verifying and relaying it is the whole of
+what this node owes the topic (see above), so there is nothing further for the
+chain actor to do with one.
+
+The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
+since nothing consumes them; an undecodable payload on any topic is REJECTed.
+Nothing is published on any topic, columns included: nothing this node can
+produce today would be signature-valid.
+
+## Aggregate attestations
+
+`beacon_aggregate_and_proof` reaches fork choice. It is how a follower learns
+votes for the *current* head rather than only the votes a block body carries,
+which are always at least one block old. `beacon_attestation_{subnet_id}`,
+covered in the same section below, never does: this node relays its backbone
+subnets without ever applying what arrives on them.
+
+Both topics are validated the same way blocks and columns are, in
+`ethlambda_state_transition::beacon::gossip::{aggregate,attestation}`: cheap
+conditions (seen cache, propagation window, `data.index == 0`, exactly one
+committee named) run inline in the p2p actor; the rest run on a blocking
+thread, in this order:
+
+1. The vote's block is known (`Store::has_block`); if not, IGNORE.
+2. **Committees, signatures and ancestry all resolve against the vote block's
+   own cached post-state**
+   (`store.cached_state(CacheKey::BlockState(beacon_block_root))`), not the
+   specification's head state and not the target checkpoint's state either.
+   Three reasons converge: it is the attested chain's own state, so its
+   shuffling is the one the attesters were actually assigned, where the head
+   (or a checkpoint reached by replaying a different branch) can name the
+   wrong one; it is an `O(1)` cache read rather than a lookup or a replay; and
+   its own `block_roots` answers both ancestry questions without a
+   `Store::block_index` / `LiveChain` scan.
+3. The signatures that need only a pubkey, before any committee derivation: an
+   aggregate's selection proof and aggregator signature, an attestation's own
+   signature. An unknown validator index REJECTs here rather than paying for a
+   committee lookup first, since a forged message must not be able to reach a
+   shuffling derivation.
+4. The committees, through the `Store`-held cache both actors share; then
+   `is_aggregator` (rewritten to take a committee length rather than a
+   pre-fetched cache), committee membership, and, for a subnet attestation, the
+   subnet match (`compute_subnet_for_attestation`).
+5. An aggregate's own signature, over the indexed attestation built from that
+   committee. The indices it verifies travel to the chain actor; it never
+   rebuilds them.
+6. Ancestry against the vote state's `block_roots`: the target is the vote
+   block's ancestor at the target epoch (REJECT), and the finalized checkpoint
+   is an ancestor of the vote block (IGNORE).
+
+The seen caches (`SeenAggregates`, keyed both by `(target_epoch,
+aggregator_index)` and by `(hash_tree_root(data), committee_index)`;
+`SeenAttestations`, by `(target_epoch, attester_index)`) live in p2p now,
+recorded only on `Accept` by `verdict::settle`, and are bounded by capacity
+(an LRU, like the block and column seen caches) rather than pruned on
+finality: a peer must not get to grow either one just by outlasting
+finalization. Recording only after the signatures verify is still what keeps a
+garbage aggregate from being able to censor a genuine one for the rest of the
+epoch by claiming its `(epoch, aggregator)` pair first; lighthouse splits the
+same way, reading its observed-sets in `verify_early_checks` and writing them
+in `verify_late_checks`.
+
+Only an aggregate that gossip `Accept`s reaches the chain actor, carrying the
+attesting indices already resolved; the actor never re-derives a committee or
+checks a signature for this topic. What is left for it:
+
+- **A lighter, actor-local applied-bits gate**, a running union of aggregation
+  bits already applied per `(target_epoch, hash_tree_root(data),
+  committee_index)`. Not a spec seen-set (p2p owns that one now); it exists so
+  a committee's other aggregators, each individually accepted by gossip
+  because each is a first-seen, valid message, do not all pay for
+  `apply_verified_aggregate` when the first one already covered their bits.
+  Pruned by the store's own clock to the current and previous epoch, not by
+  finality, so a stalled chain cannot make this grow without bound either.
+- **The deferral queue.** `validate_on_attestation` requires
+  `get_current_slot(store) >= data.slot + 1`, and aggregates are published two
+  thirds of the way through the slot they vote for, so every one arrives too
+  early. Without the queue this topic would apply approximately nothing. It
+  drains once per beacon tick, between the clock advancing and the head being
+  recomputed, so released votes are in fork choice before that tick's head is
+  chosen. The specification licenses this directly ("consider scheduling it for
+  later processing in such case") and lighthouse has the same queue. Held
+  entries now carry their gossip-resolved attesting indices alongside them, so
+  a drain applies them without recomputing anything.
+
+A subnet attestation is fully verified by this same pipeline and then simply
+dropped: nothing forwards it to the chain actor, on any outcome, matching a
+lighthouse follower with no validators, which verifies and relays its own
+backbone subnets while `should_process_attestation` keeps them out of its fork
+choice.
 
 ## Request/response
 
@@ -280,16 +402,21 @@ the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.
 
-The per-block one is `hold_block_for_columns`, called when a
+The per-block one starts at `hold_block_for_columns`, called when a
 fulu block carrying commitments arrives short of the columns this node
 custodies for it. Import holds the block — it stays out of fork choice, but
 its header, body and proof are already written, the same way a block missing
-its parent is held — and sends `data_column_sidecars_by_root/1` for exactly
-the missing columns, with
+its parent is held — and asks for nothing yet. A block's columns are
+published alongside it, so the rest are normally already in flight on gossip,
+and a peer asked at that moment usually does not have them either; on mainnet
+followers at the tip, gossip completed a held block within 0.3 s at p99. The
+asking is left to `redrive_held_blocks`, which runs on every slot tick: for
+each held block it sends `data_column_sidecars_by_root/1` for exactly the
+columns still missing, with
 `MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`, a
 peer that has already failed this lookup excluded until the whole pool is
 exhausted. A lookup that runs out of peers or
-retries stops asking rather than retrying forever; see
+retries stops asking until the next tick asks again; see
 `lean_data_column_fetch_failures_total` in [metrics.md](./metrics.md). The
 block is released the moment its last missing column arrives, and dropped
 along with any pending descendants once finality passes its slot, whichever
@@ -366,7 +493,7 @@ syncing" rather than as a conflicting chain.
 | Entry | Value |
 | --- | --- |
 | `eth2` | the computed `ENRForkID` |
-| `attnets` | 64 bits, all unset |
+| `attnets` | 64 bits, with this node's `SUBNETS_PER_NODE` backbone subnets set |
 | `cgc` | `CUSTODY_REQUIREMENT` |
 | `quic` | `--gossipsub-port` |
 | `tcp` | `--gossipsub-port`, the same number: TCP and UDP are separate namespaces |
@@ -374,8 +501,11 @@ syncing" rather than as a conflicting chain.
 
 Two of these advertise less, or more, than they look like:
 
-- `attnets` all-unset is exactly what a node subscribing to no attestation
-  subnet serves. It costs only that subnet-gap-filling peers rank us lower.
+- `attnets` names exactly the subnets this node subscribed to, which is the
+  only honest value: claiming one it does not serve earns peer-score penalties
+  for silence there, and claiming none while serving two loses the peers
+  looking for precisely that. It used to be all-unset, which was honest while
+  this node held no subscription at all.
 - `cgc` advertises `CUSTODY_REQUIREMENT`, the floor below which peers may
   reject a record outright, not `sampling_size(CUSTODY_REQUIREMENT)`, the
   larger number of columns this node actually custodies, stores and serves
@@ -393,10 +523,27 @@ as a query filter, so a `quic`-only record is invisible to it.
 | Metric | Meaning |
 | --- | --- |
 | `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` |
-| `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts; see [metrics.md](./metrics.md#beacon-gossip-validation) |
+| `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |
 | `lean_beacon_fork_digest{digest}` | The digest computed at startup, as a label |
+| `lean_beacon_aggregate_decode_seconds` | Time spent decoding one aggregate off the wire |
+| `lean_beacon_aggregate_mailbox_wait_seconds` | How long an aggregate sat in the chain actor's mailbox |
+| `lean_beacon_aggregate_processing_seconds` | Time the chain actor spent applying one already-verified aggregate |
+| `lean_beacon_aggregate_end_to_end_seconds` | Wire to fork choice, for aggregates applied on arrival |
+| `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
+| `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
+
+The four aggregate histograms no longer cover what they used to: gossip
+validation (committees, all three signatures, the seen caches) runs in p2p now
+and is folded into `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
+instead. `decode` is p2p's own decode step; the other three, all in
+`ethlambda-blockchain`, now measure only `apply_verified_aggregate` and the
+actor's applied-bits gate, which is why `processing` reads far lower than it
+used to. `mailbox_wait` is still the one that cannot be derived any other way,
+and it is still the failure mode this path introduces: roughly a thousand
+aggregates a slot (verified ones only, now) queueing behind block imports arrive too
+late to move the head while every other timing still looks healthy.
 
 The `lean_` prefix is the repo-wide convention and applies here too. Data
 column sidecar metrics (`lean_data_columns_stored_total`,
@@ -433,22 +580,25 @@ Within 5 seconds:
 Derived the mainnet wire parameters  genesis_time=1606824023 genesis_validators_root=0x4b363db9… epoch=… fork=fulu fork_digest=8c9f62fe
 No fork or blob-schedule boundary is scheduled
 Custodying data columns  columns=[…]
-Advertising cgc=4 while subscribing to no attestation or sync committee subnet, and publishing nothing
-Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=15 columns=8
+Backboning attestation subnets  subnets_per_node=2 subnets=[…]
+Advertising cgc=4 while subscribing to no sync committee subnet, and publishing nothing
+Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=17 columns=8 attestation_subnets=[…]
 HTTP server listening  addr=127.0.0.1:5054
 Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
 Local ENR  enr=enr:-…
 ```
 
 The `Advertising cgc=…` line names what is still true: this node subscribes to
-no attestation or sync-committee subnet and publishes nothing of its own.
-Storing and serving the columns it custodies (see [Data column
-sidecars](#data-column-sidecars)) is no longer part of that gap.
+no sync-committee subnet and publishes nothing of its own. Storing and serving
+the columns it custodies (see [Data column
+sidecars](#data-column-sidecars)) is no longer part of that gap, and neither is
+the attestation subnet backbone.
 
 `seeds=17` proves the built-in list parsed; a lower number means a bootnode
-ENR was skipped with a warning. `topics=15` proves the subscription set: the 7
-global topics plus the 8 column subnets this run's (randomly generated) node
-id selected; `columns=8` is the same sampling size confirmed directly.
+ENR was skipped with a warning. `topics=17` proves the subscription set: the 7
+global topics, the 8 column subnets this run's (randomly generated) node id
+selected, and the 2 attestation subnets the same id selected; `columns=8` and
+`attestation_subnets=[…]` confirm the two families directly.
 
 Within 30 seconds:
 

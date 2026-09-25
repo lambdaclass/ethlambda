@@ -1,10 +1,11 @@
 use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as EnginePayloadStatus};
 use ethlambda_network_api::{
-    BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest, InitP2P,
+    AggregateArrival, BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest,
+    InitP2P,
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
-use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, CacheKey, Chain, Store};
 use ethlambda_types::{
@@ -14,8 +15,9 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{SignedBeaconBlock, fulu},
+        containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
         preset,
+        primitives::ValidatorIndex,
     },
     block::SignedBlock,
     chain_config::ChainConfig,
@@ -50,6 +52,7 @@ use crate::store::StoreError;
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
+mod beacon_aggregates;
 pub mod beacon_engine;
 pub mod block_builder;
 pub(crate) mod coverage;
@@ -378,6 +381,7 @@ impl BlockChain {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            beacon_aggregates: Default::default(),
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
@@ -386,7 +390,6 @@ impl BlockChain {
             sync_status_controller,
             events,
             duties,
-            committees: CommitteeCache::default(),
         }
         // Own thread: these handlers are long synchronous CPU that starves a shared runtime.
         .start_with_backend(Backend::Thread);
@@ -514,21 +517,11 @@ pub struct BlockChainServer {
     /// only subscribe, preserving the one-directional write flow.
     events: EventBus,
 
-    /// Committee shufflings shared across everything that asks a beacon state
-    /// which validators attest at a slot: the state transition as it processes
-    /// a block's attestations, and fork choice as it replays those same
-    /// attestations into the latest-message store.
-    ///
-    /// Lives here, on the actor, because the actor is what owns the sequence of
-    /// imports that share it. Deriving a shuffling costs one scan of the
-    /// validator registry and one shuffle of the active set, and at mainnet's
-    /// ~2.4M validators an import that derives one per attestation per pass
-    /// spends most of its time doing nothing else. Keyed so that only states
-    /// that really do agree on an epoch's committees share an entry; see
-    /// `CommitteeCache`. The actor also tells it which shufflings the head
-    /// needs, so eviction spares them; see [`Self::pin_head_shufflings`].
-    /// Always empty on lean, which has no beacon committees.
-    committees: CommitteeCache,
+    /// The `beacon_aggregate_and_proof` seen-sets and deferral queue. Always
+    /// empty on lean, which subscribes to no such topic. See
+    /// [`crate::beacon_aggregates`] for why all three live on the actor rather
+    /// than in the p2p layer that first sees an aggregate.
+    beacon_aggregates: crate::beacon_aggregates::AggregateGossip,
 
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
@@ -948,6 +941,11 @@ impl BlockChainServer {
                 // proposer boost and pulls up unrealized checkpoints for each
                 // slot it skipped, not just the latest one.
                 fork_choice::on_tick(&mut self.store, timestamp_ms / 1000, &config);
+                // Between the clock and the head: an aggregate for the slot
+                // that just ended becomes applicable exactly now, and its
+                // votes have to be in fork choice before the head this tick
+                // reports is chosen.
+                self.drain_deferred_aggregates();
                 self.recompute_beacon_head().await;
             }
         }
@@ -1615,6 +1613,13 @@ impl BlockChainServer {
             _ if !is_new => ImportOutcome::Imported,
             beacon_block => {
                 let config = self.store.config();
+                // Cloned out before `fork_choice::on_block` below takes
+                // `&mut self.store`: an owned `Arc` handle, rather than a
+                // borrow through `self.store.committee_cache()`, is what lets
+                // this call also pass `&mut self.store` in the same
+                // expression, since the two would otherwise both borrow
+                // `self.store` at once.
+                let committees = self.store.committee_cache();
                 // Extracted before `beacon_block` moves into `fork_choice::on_block`
                 // below, which takes ownership of it.
                 let (attestations, slashings) = fork_choice::block_operations(&beacon_block);
@@ -1718,7 +1723,7 @@ impl BlockChainServer {
                     &config,
                     &evidence,
                     &validity,
-                    &mut self.committees,
+                    &committees,
                 );
                 timings.stf_end = Some(Instant::now());
                 if let Err(err) = imported {
@@ -1761,7 +1766,7 @@ impl BlockChainServer {
                                 &block_state,
                                 &config,
                                 &index,
-                                &mut self.committees,
+                                &committees,
                             )
                             .inspect_err(|err| {
                                 trace!(%slot, ?err, "Ignoring an unusable attestation from a block")
@@ -1871,7 +1876,7 @@ impl BlockChainServer {
             sync_status_controller: SyncStatusController::default(),
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
-            committees: CommitteeCache::default(),
+            beacon_aggregates: Default::default(),
         }
     }
 
@@ -2150,6 +2155,152 @@ impl BlockChainServer {
         timings
     }
 
+    /// Apply an aggregate `ethlambda-p2p`'s gossip validation already
+    /// accepted, or hold it until its own slot has passed.
+    ///
+    /// The applied-bits gate runs first, before anything else: a valid
+    /// aggregate whose votes are already covered is the common case on this
+    /// topic, since a committee's sixteen aggregators mostly converge on the
+    /// same bits, and dropping one here costs a hash and two lookups instead
+    /// of another `apply_verified_aggregate` call.
+    ///
+    /// The hold is not an optimization. `validate_on_attestation` requires
+    /// `get_current_slot(store) >= data.slot + 1`, and aggregates are
+    /// published two thirds of the way through the slot they vote for, so
+    /// every one of them arrives too early. Applying only what is already late
+    /// would be applying almost nothing.
+    fn on_gossip_beacon_aggregate(
+        &mut self,
+        aggregate: Box<SignedAggregateAndProof>,
+        attesting_indices: Vec<ValidatorIndex>,
+        arrival: AggregateArrival,
+    ) {
+        if let Some(dropped) = self.beacon_aggregates.already_covered(&aggregate) {
+            metrics::inc_beacon_aggregate_outcome(dropped.label());
+            return;
+        }
+
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        if current_slot < aggregate.slot().saturating_add(1) {
+            if let Some(dropped) = self.beacon_aggregates.defer(aggregate, attesting_indices) {
+                metrics::inc_beacon_aggregate_outcome(dropped.label());
+            }
+            metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
+            return;
+        }
+
+        let index = self.store.block_index();
+        self.apply_beacon_aggregate(&aggregate, &attesting_indices, &index, Some(arrival));
+    }
+
+    /// Apply one already-verified aggregate to fork choice and record what
+    /// became of it.
+    ///
+    /// The applied-bits gate is written here, on success only: an aggregate
+    /// [`fork_choice::apply_verified_aggregate`] refused (a target this node
+    /// has since finalized past, say) must not be able to mark its bits
+    /// covered, or a forged claim of coverage would suppress a later,
+    /// applicable aggregate for the same committee.
+    ///
+    /// `index` is [`ethlambda_storage::Store::block_index`], taken as a
+    /// parameter so [`Self::drain_deferred_aggregates`] builds it once for the
+    /// whole drain rather than once per aggregate; see that function's own
+    /// documentation.
+    ///
+    /// `arrival` is `Some` only on the path that applies an aggregate as it
+    /// arrives. A drained one waits a deliberate slot for its own slot to
+    /// pass, so reporting its end-to-end time would report that design as
+    /// latency.
+    fn apply_beacon_aggregate(
+        &mut self,
+        aggregate: &SignedAggregateAndProof,
+        attesting_indices: &[ValidatorIndex],
+        index: &HashMap<H256, (u64, H256)>,
+        arrival: Option<AggregateArrival>,
+    ) {
+        let started = Instant::now();
+        let config = self.store.config();
+        let outcome = fork_choice::apply_verified_aggregate(
+            &mut self.store,
+            aggregate.data(),
+            attesting_indices,
+            &config,
+            index,
+        );
+        metrics::observe_beacon_aggregate_processing(started.elapsed());
+        if let Some(arrival) = arrival {
+            metrics::observe_beacon_aggregate_end_to_end(arrival.decode_start.elapsed());
+        }
+
+        match outcome {
+            Ok(()) => {
+                self.beacon_aggregates.record(aggregate);
+                metrics::inc_beacon_aggregate_outcome("applied");
+            }
+            // Expected in normal operation rather than a defect: a
+            // checkpoint-synced follower sees aggregates naming targets below
+            // its anchor, and any peer may send one for a block this node has
+            // not imported yet.
+            Err(err) => {
+                trace!(
+                    slot = aggregate.slot(),
+                    aggregator = aggregate.aggregator_index(),
+                    ?err,
+                    "Ignoring an unusable gossip aggregate"
+                );
+                metrics::inc_beacon_aggregate_outcome("invalid");
+            }
+        }
+    }
+
+    /// Apply every held aggregate whose slot has now passed, and prune what
+    /// the clock and finality have put out of reach.
+    ///
+    /// Called once per beacon tick, between the store clock advancing and the
+    /// head being recomputed, so the votes released here are in fork choice
+    /// before the head this tick reports is chosen.
+    ///
+    /// Builds [`ethlambda_storage::Store::block_index`] once for the whole
+    /// drain: it is a full `Table::LiveChain` scan, and paying for it once per
+    /// aggregate here would undo the reason `on_block`'s own attestations
+    /// already share one. Skipped entirely when nothing is ready, since most
+    /// beacon ticks find no deferred aggregate and a scan has nothing to serve.
+    fn drain_deferred_aggregates(&mut self) {
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        let current_epoch = fork_choice::get_current_store_epoch(&self.store, &config);
+
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+        self.beacon_aggregates.prune(current_epoch, finalized_slot);
+
+        let ready = self.beacon_aggregates.take_ready(current_slot);
+        if !ready.is_empty() {
+            let index = self.store.block_index();
+            for entry in ready {
+                // Re-checked rather than trusted from when it was held: an
+                // aggregate applied in the meantime may already cover this one, and
+                // that is the whole point of the gate.
+                if let Some(dropped) = self.beacon_aggregates.already_covered(&entry.aggregate) {
+                    metrics::inc_beacon_aggregate_outcome(dropped.label());
+                    continue;
+                }
+                self.apply_beacon_aggregate(
+                    &entry.aggregate,
+                    &entry.attesting_indices,
+                    &index,
+                    None,
+                );
+            }
+        }
+
+        metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
+    }
+
     /// Re-run beacon fork choice, write the head it finds, and republish the
     /// gauge, without telling the execution client about it.
     ///
@@ -2203,11 +2354,12 @@ impl BlockChainServer {
         let Some((_, head_root)) = self.store.beacon_head() else {
             return;
         };
-        if self.committees.head_root() == Some(head_root) {
+        let committees = self.store.committee_cache();
+        if committees.head_root() == Some(head_root) {
             return;
         }
         if let Some(head_state) = self.store.cached_state(CacheKey::BlockState(head_root)) {
-            self.committees.update_head(head_root, &head_state);
+            committees.update_head(head_root, &head_state);
         }
     }
 
@@ -2711,8 +2863,7 @@ impl BlockChainServer {
         }
     }
 
-    /// Keep `block` until every column this node custodies for it has arrived,
-    /// and ask peers for the ones that have not.
+    /// Keep `block` until every column this node custodies for it has arrived.
     ///
     /// The same shape as a block held for a missing parent: the block itself is
     /// already in the DB, so only its root is remembered here, and the map is
@@ -2721,6 +2872,17 @@ impl BlockChainServer {
     /// there: das-core leaves the timing question open, and lighthouse prunes
     /// its pending components at `max(finalized_epoch + 1, the availability
     /// boundary)` instead.
+    ///
+    /// Nothing is asked for here. A block's columns are published alongside
+    /// it, so a block that reaches the gate short of them almost always has
+    /// the rest in flight on gossip, and asking peers at this moment races
+    /// that delivery: the peers asked usually do not have the columns yet
+    /// either, so they answer empty and burn the lookup's attempts. Measured
+    /// on mainnet followers at the tip, gossip completed a held block within
+    /// 0.3 s at p99, and every stored column came from gossip. Each arriving
+    /// column releases the block through
+    /// [`Self::release_block_if_columns_complete`]; whatever is still missing
+    /// at the next slot's [`Self::redrive_held_blocks`] is asked for there.
     fn hold_block_for_columns(&mut self, block: SignedBeaconBlock, timings: ImportTimings) {
         let slot = block.slot();
         let block_root = block.message_hash_tree_root();
@@ -2754,9 +2916,6 @@ impl BlockChainServer {
         self.blocks_awaiting_columns.insert(block_root, slot);
         self.held_timings.insert(block_root, timings);
         metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
-
-        // The block itself is in the DB by now: this very method just wrote it.
-        self.request_missing_columns(block_root, missing);
     }
 
     /// Recursively discard a block and all its pending descendants.
@@ -3213,17 +3372,19 @@ impl BlockChainServer {
     }
 
     /// Once a slot, revisit every held block: release the ones whose columns
-    /// have quietly completed, and re-ask for whatever the rest are still
+    /// have quietly completed, and ask for whatever the rest are still
     /// missing.
     ///
-    /// [`Self::hold_block_for_columns`] asks once, when the block is first
-    /// held, and the only other thing that revisits a hold is a sidecar for
-    /// that exact block arriving on gossip. A block whose missing columns no
-    /// connected peer custodies gets neither: every peer answers
-    /// `DataColumnsByRoot` with an empty list, the lookup spends its retry
-    /// ladder against the peer set in a few seconds, and the hold is then left
-    /// with nothing that will ever disturb it again while the chain stops
-    /// behind it.
+    /// The only asker. [`Self::hold_block_for_columns`] leaves a new hold to
+    /// gossip, so a block's first ask is the first tick after it was held,
+    /// by which time a column still missing is unlikely to be on its way. Every
+    /// later tick asks again, which is what a lookup that fails needs: the
+    /// only other thing that revisits a hold is a sidecar for that exact block
+    /// arriving. A block whose missing columns no connected peer custodies
+    /// gets neither: every peer answers `DataColumnsByRoot` with an empty
+    /// list, the lookup spends its retry ladder against the peer set in a few
+    /// seconds, and without this the hold would be left with nothing that
+    /// will ever disturb it again while the chain stops behind it.
     ///
     /// Seen following mainnet with the gate on: every connected peer
     /// advertised the minimum `custody_group_count`, so a dozen peers between
@@ -3481,8 +3642,8 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBlock,
-    NewDataColumnSidecars,
+    DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
+    NewBlock, NewDataColumnSidecars,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3646,6 +3807,22 @@ impl Handler<NewDataColumnSidecars> for BlockChainServer {
 impl Handler<DataColumnSidecarsAwaitingParent> for BlockChainServer {
     async fn handle(&mut self, msg: DataColumnSidecarsAwaitingParent, _ctx: &Context<Self>) {
         self.park_data_columns(msg.sidecars);
+    }
+}
+
+impl Handler<NewBeaconAggregate> for BlockChainServer {
+    async fn handle(&mut self, msg: NewBeaconAggregate, _ctx: &Context<Self>) {
+        // Beacon-only: nothing subscribes a lean node to this topic, so a
+        // message here would be a dispatch bug rather than a chain that has
+        // nothing to do with it. Dropped rather than panicked on, the way
+        // every other handler treats a message for the other chain.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        // Read before anything else: this is the wait no timing on the far
+        // side of the mailbox can see, and it is where a backlog would show.
+        metrics::observe_beacon_aggregate_mailbox_wait(msg.arrival.handed_off.elapsed());
+        self.on_gossip_beacon_aggregate(msg.aggregate, msg.attesting_indices, msg.arrival);
     }
 }
 
@@ -4070,6 +4247,7 @@ mod tests {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            beacon_aggregates: Default::default(),
             custody_columns: Vec::new(),
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
@@ -4078,7 +4256,6 @@ mod tests {
             sync_status_controller: SyncStatusController::default(),
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
-            committees: CommitteeCache::default(),
         }
     }
 
@@ -4246,11 +4423,12 @@ mod tests {
     }
 
     /// Every `BlockChainToP2P` message the chain actor sends, kept for a test
-    /// to read back. Only `check_data_column_sidecars` is recorded: nothing
-    /// under test here sends the others.
+    /// to read back. Only `check_data_column_sidecars` and `fetch_block` are
+    /// recorded: nothing under test here sends the others.
     #[derive(Default)]
     struct RecordingP2P {
         checks: std::sync::Mutex<Vec<Vec<fulu::DataColumnSidecar>>>,
+        fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
     impl ethlambda_network_api::BlockChainToP2P for RecordingP2P {
@@ -4274,8 +4452,9 @@ mod tests {
         }
         fn fetch_block(
             &self,
-            _request: FetchRequest,
+            request: FetchRequest,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.fetches.lock().unwrap().push(request);
             Ok(())
         }
         fn check_data_column_sidecars(
@@ -5121,6 +5300,53 @@ mod tests {
         assert!(
             server.blocks_awaiting_columns.contains_key(&block_root),
             "one missing column is still a missing column"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_hold_is_left_to_gossip_and_the_tick_asks_for_what_is_still_missing() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let (mut server, p2p) = beacon_server_recording(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let block_root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block, ImportTimings::default());
+
+        assert!(
+            p2p.fetches.lock().unwrap().is_empty(),
+            "a new hold must not ask peers for columns gossip is still delivering"
+        );
+
+        // Gossip delivers all but the last column before the tick.
+        let (last, delivered) = CUSTODY.split_last().expect("CUSTODY is not empty");
+        for index in delivered {
+            let sidecar = sidecar_for(
+                &server.store.get_signed_block(&block_root).unwrap().unwrap(),
+                *index,
+            );
+            server
+                .store
+                .put_data_column_sidecar(slot, &block_root, *index, sidecar.to_ssz())
+                .unwrap();
+        }
+
+        server.redrive_held_blocks().await;
+
+        let fetches = p2p.fetches.lock().unwrap();
+        let [request] = fetches.as_slice() else {
+            panic!(
+                "the tick must ask exactly once, got {} requests",
+                fetches.len()
+            );
+        };
+        assert_eq!(request.block_root, block_root);
+        assert!(!request.needs_block, "the held block is already in the DB");
+        assert_eq!(
+            request.columns,
+            vec![*last],
+            "only the column gossip did not deliver"
         );
     }
 }

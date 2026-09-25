@@ -5,6 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use lru::LruCache;
 
 use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
+use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 
 use ethlambda_crypto::signature::ValidatorSignature;
@@ -870,6 +871,26 @@ pub struct Store {
     /// States handed to the writer but not yet committed; see
     /// [`PendingStates`].
     pending_states: Arc<PendingStates>,
+    /// Committee shufflings shared across everything that asks a beacon state
+    /// which validators attest at a slot: the state transition as it
+    /// processes a block's attestations, fork choice as it replays those same
+    /// attestations into the latest-message store, and p2p's gossip
+    /// validation tasks, on their own blocking threads, doing the same for a
+    /// gossiped aggregate or subnet attestation.
+    ///
+    /// Held here, by the `Store` both actors already share (rather than by
+    /// the chain actor alone, as it used to be), because it is exactly what
+    /// makes the sharing above possible: a `Store` clone is cheap and every
+    /// caller already has one, where a second field threaded down from the
+    /// chain actor alone would not reach p2p's tasks at all. Internally
+    /// synchronized like [`Self::state_cache`], so every method takes
+    /// `&self`; see [`CommitteeCache`]'s own documentation for the cache
+    /// itself, and `ethlambda-state-transition`'s
+    /// `beacon::helpers::accessors::CommitteeCacheExt` for the state-aware
+    /// half built on top of it.
+    ///
+    /// Always empty on lean, which has no beacon committees.
+    committee_cache: Arc<CommitteeCache>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
@@ -1499,6 +1520,7 @@ impl Store {
             ))),
             state_cache,
             pending_states,
+            committee_cache: Arc::new(CommitteeCache::default()),
             beacon: Default::default(),
             state_writer,
         }
@@ -2677,6 +2699,19 @@ impl Store {
         self.state_cache.lock().unwrap().put(key, state);
     }
 
+    /// The committee-shuffling cache shared by every clone of this `Store`.
+    ///
+    /// Returns a cloned `Arc` (an atomic increment, like [`Self::config`])
+    /// rather than a borrow of `&self`: a caller that also needs `&mut self`
+    /// in the same call, such as `fork_choice::on_block`'s `store` and
+    /// `committees` parameters, cannot borrow `self` both ways at once, and
+    /// an owned handle sidesteps that rather than forcing every such caller
+    /// to split its call in two. The clone is cheap, and every method on the
+    /// returned cache takes `&self` regardless of which handle reaches it.
+    pub fn committee_cache(&self) -> Arc<CommitteeCache> {
+        Arc::clone(&self.committee_cache)
+    }
+
     /// Returns whether a state is available for the given block root.
     ///
     /// True if `pending_states` holds the state, a snapshot exists, or the
@@ -3805,6 +3840,8 @@ fn write_signed_block(
 mod tests {
     use super::*;
     use crate::backend::InMemoryBackend;
+    use crate::committee_cache::{Lookup, ShufflingKey};
+    use ethlambda_types::beacon::committees::EpochCommittees;
     use ethlambda_types::beacon::containers::Checkpoint as BeaconCheckpoint;
     // Only the tests name a status variant: the store itself stores and hands
     // back whole `PayloadStatusV1` values without ever reading the tag.
@@ -5309,6 +5346,27 @@ mod tests {
 
         clone.cache_state(key, Arc::new(beacon_test_state(7)));
         assert!(store.cached_state(key).is_some());
+    }
+
+    #[test]
+    fn the_committee_cache_is_shared_across_store_clones() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let clone = store.clone();
+        let key = ShufflingKey {
+            epoch: 1,
+            decision_root: H256::from([1u8; 32]),
+        };
+
+        let (first, first_lookup) = clone
+            .committee_cache()
+            .get_or_init(key, || EpochCommittees::new(1, Vec::new(), 1));
+        let (second, second_lookup) = store
+            .committee_cache()
+            .get_or_init(key, || panic!("should not rebuild"));
+
+        assert_eq!(first_lookup, Lookup::Miss);
+        assert_eq!(second_lookup, Lookup::Hit);
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]
