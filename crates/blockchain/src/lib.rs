@@ -2711,8 +2711,7 @@ impl BlockChainServer {
         }
     }
 
-    /// Keep `block` until every column this node custodies for it has arrived,
-    /// and ask peers for the ones that have not.
+    /// Keep `block` until every column this node custodies for it has arrived.
     ///
     /// The same shape as a block held for a missing parent: the block itself is
     /// already in the DB, so only its root is remembered here, and the map is
@@ -2721,6 +2720,17 @@ impl BlockChainServer {
     /// there: das-core leaves the timing question open, and lighthouse prunes
     /// its pending components at `max(finalized_epoch + 1, the availability
     /// boundary)` instead.
+    ///
+    /// Nothing is asked for here. A block's columns are published alongside
+    /// it, so a block that reaches the gate short of them almost always has
+    /// the rest in flight on gossip, and asking peers at this moment races
+    /// that delivery: the peers asked usually do not have the columns yet
+    /// either, so they answer empty and burn the lookup's attempts. Measured
+    /// on mainnet followers at the tip, gossip completed a held block within
+    /// 0.3 s at p99, and every stored column came from gossip. Each arriving
+    /// column releases the block through
+    /// [`Self::release_block_if_columns_complete`]; whatever is still missing
+    /// at the next slot's [`Self::redrive_held_blocks`] is asked for there.
     fn hold_block_for_columns(&mut self, block: SignedBeaconBlock, timings: ImportTimings) {
         let slot = block.slot();
         let block_root = block.message_hash_tree_root();
@@ -2754,9 +2764,6 @@ impl BlockChainServer {
         self.blocks_awaiting_columns.insert(block_root, slot);
         self.held_timings.insert(block_root, timings);
         metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
-
-        // The block itself is in the DB by now: this very method just wrote it.
-        self.request_missing_columns(block_root, missing);
     }
 
     /// Recursively discard a block and all its pending descendants.
@@ -3213,17 +3220,19 @@ impl BlockChainServer {
     }
 
     /// Once a slot, revisit every held block: release the ones whose columns
-    /// have quietly completed, and re-ask for whatever the rest are still
+    /// have quietly completed, and ask for whatever the rest are still
     /// missing.
     ///
-    /// [`Self::hold_block_for_columns`] asks once, when the block is first
-    /// held, and the only other thing that revisits a hold is a sidecar for
-    /// that exact block arriving on gossip. A block whose missing columns no
-    /// connected peer custodies gets neither: every peer answers
-    /// `DataColumnsByRoot` with an empty list, the lookup spends its retry
-    /// ladder against the peer set in a few seconds, and the hold is then left
-    /// with nothing that will ever disturb it again while the chain stops
-    /// behind it.
+    /// The only asker. [`Self::hold_block_for_columns`] leaves a new hold to
+    /// gossip, so a block's first ask is the first tick after it was held,
+    /// by which time a column still missing is unlikely to be on its way. Every
+    /// later tick asks again, which is what a lookup that fails needs: the
+    /// only other thing that revisits a hold is a sidecar for that exact block
+    /// arriving. A block whose missing columns no connected peer custodies
+    /// gets neither: every peer answers `DataColumnsByRoot` with an empty
+    /// list, the lookup spends its retry ladder against the peer set in a few
+    /// seconds, and without this the hold would be left with nothing that
+    /// will ever disturb it again while the chain stops behind it.
     ///
     /// Seen following mainnet with the gate on: every connected peer
     /// advertised the minimum `custody_group_count`, so a dozen peers between
@@ -4246,11 +4255,12 @@ mod tests {
     }
 
     /// Every `BlockChainToP2P` message the chain actor sends, kept for a test
-    /// to read back. Only `check_data_column_sidecars` is recorded: nothing
-    /// under test here sends the others.
+    /// to read back. Only `check_data_column_sidecars` and `fetch_block` are
+    /// recorded: nothing under test here sends the others.
     #[derive(Default)]
     struct RecordingP2P {
         checks: std::sync::Mutex<Vec<Vec<fulu::DataColumnSidecar>>>,
+        fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
     impl ethlambda_network_api::BlockChainToP2P for RecordingP2P {
@@ -4274,8 +4284,9 @@ mod tests {
         }
         fn fetch_block(
             &self,
-            _request: FetchRequest,
+            request: FetchRequest,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.fetches.lock().unwrap().push(request);
             Ok(())
         }
         fn check_data_column_sidecars(
@@ -5121,6 +5132,53 @@ mod tests {
         assert!(
             server.blocks_awaiting_columns.contains_key(&block_root),
             "one missing column is still a missing column"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_hold_is_left_to_gossip_and_the_tick_asks_for_what_is_still_missing() {
+        let store = beacon_store(GENESIS_TIME, 0);
+        let (mut server, p2p) = beacon_server_recording(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let block_root = block.message_hash_tree_root();
+        let slot = block.slot();
+        server.hold_block_for_columns(block, ImportTimings::default());
+
+        assert!(
+            p2p.fetches.lock().unwrap().is_empty(),
+            "a new hold must not ask peers for columns gossip is still delivering"
+        );
+
+        // Gossip delivers all but the last column before the tick.
+        let (last, delivered) = CUSTODY.split_last().expect("CUSTODY is not empty");
+        for index in delivered {
+            let sidecar = sidecar_for(
+                &server.store.get_signed_block(&block_root).unwrap().unwrap(),
+                *index,
+            );
+            server
+                .store
+                .put_data_column_sidecar(slot, &block_root, *index, sidecar.to_ssz())
+                .unwrap();
+        }
+
+        server.redrive_held_blocks().await;
+
+        let fetches = p2p.fetches.lock().unwrap();
+        let [request] = fetches.as_slice() else {
+            panic!(
+                "the tick must ask exactly once, got {} requests",
+                fetches.len()
+            );
+        };
+        assert_eq!(request.block_root, block_root);
+        assert!(!request.needs_block, "the held block is already in the DB");
+        assert_eq!(
+            request.columns,
+            vec![*last],
+            "only the column gossip did not deliver"
         );
     }
 }

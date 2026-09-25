@@ -280,16 +280,21 @@ the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.
 
-The per-block one is `hold_block_for_columns`, called when a
+The per-block one starts at `hold_block_for_columns`, called when a
 fulu block carrying commitments arrives short of the columns this node
 custodies for it. Import holds the block — it stays out of fork choice, but
 its header, body and proof are already written, the same way a block missing
-its parent is held — and sends `data_column_sidecars_by_root/1` for exactly
-the missing columns, with
+its parent is held — and asks for nothing yet. A block's columns are
+published alongside it, so the rest are normally already in flight on gossip,
+and a peer asked at that moment usually does not have them either; on mainnet
+followers at the tip, gossip completed a held block within 0.3 s at p99. The
+asking is left to `redrive_held_blocks`, which runs on every slot tick: for
+each held block it sends `data_column_sidecars_by_root/1` for exactly the
+columns still missing, with
 `MAX_FETCH_RETRIES` attempts and backoff doubling from `INITIAL_BACKOFF_MS`, a
 peer that has already failed this lookup excluded until the whole pool is
 exhausted. A lookup that runs out of peers or
-retries stops asking rather than retrying forever; see
+retries stops asking until the next tick asks again; see
 `lean_data_column_fetch_failures_total` in [metrics.md](./metrics.md). The
 block is released the moment its last missing column arrives, and dropped
 along with any pending descendants once finality passes its slot, whichever
