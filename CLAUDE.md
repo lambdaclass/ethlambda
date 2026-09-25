@@ -686,7 +686,7 @@ snapshot (`States`) + diff (`StateDiffs`) pairs; `BlockRoots` and `LiveChain`
 index by slot for range serving and fork choice. Attestations and gossip
 signatures are not persisted; they live in in-memory `Store` buffers consumed
 during the tick pipeline. See [`docs/data_storage.md`](docs/data_storage.md)
-for the full reference: what each of the ten tables holds and how it's
+for the full reference: what each of the eleven tables holds and how it's
 keyed, the snapshot/diff reconstruction algorithm, the block-import write
 sequence, pruning rules, what never changes at runtime, and startup/restore
 behavior.
@@ -702,10 +702,19 @@ behavior.
   which is what keeps a parked column from satisfying the availability gate.
   Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
   `start_actor` clears the whole table at startup.
-- `DB_VERSION` is 3: `Config` gained the runtime keys a `config.yaml` supplies,
-  and it is SSZ-encoded under `KEY_CONFIG`, so a data directory written by the
-  previous version decodes into the wrong fields. `Store::from_db_state`
-  refuses any other version outright; there is no migration.
+- `BeaconUnrealizedJustifications` (root -> `(slot, Checkpoint)`) persists the
+  beacon store's per-block unrealized justified checkpoint
+  (consensus-specs' `store.unrealized_justifications`), which used to live
+  only in an in-memory `BeaconScratch` map. A restart emptied that map with
+  nothing to refill it, so `get_voting_source` hit a hard `SpecAssert` on the
+  first pre-restart leaf from an older epoch and `get_head` froze. The
+  in-memory map stays as a write-through cache in front of the table. Pruned
+  on finalization to the same horizon as `LiveChain` (the finalized block's
+  own slot, keeping that block's own entry).
+- `DB_VERSION` is 4: version 4 added `BeaconUnrealizedJustifications`, so a
+  directory written by the previous version has no row there for any block it
+  already imported. `Store::from_db_state` refuses any other version outright;
+  there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

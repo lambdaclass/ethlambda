@@ -168,7 +168,13 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// is SSZ-encoded under [`KEY_CONFIG`], so a directory written by the previous
 /// version decodes into the wrong fields. There is no migration, by the same
 /// policy every previous change followed.
-pub const DB_VERSION: u64 = 3;
+///
+/// 4 added `Table::BeaconUnrealizedJustifications`: a directory written by the
+/// previous version has no row there for any block it already imported, which
+/// would otherwise look identical to "no unrealized justification computed
+/// yet" rather than "this directory predates the table", the same silent
+/// wrong answer every prior bump exists to rule out.
+pub const DB_VERSION: u64 = 4;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -605,20 +611,27 @@ impl GossipSignatureBuffer {
 }
 
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
-/// chain history: nothing here survives a restart, and nothing here is worth
-/// the write amplification of persisting.
+/// chain history: most of it does not survive a restart, and is not worth the
+/// write amplification of persisting.
 ///
 /// `proposer_boost_root` resets every slot, `block_timeliness` is read only by
 /// the same-slot reorg helpers, `equivocating_indices` is rebuilt by replaying
 /// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
-/// of attestations, `pow_blocks` stands in for a call to an execution client
-/// that a restarted node would simply make again, and
-/// `unrealized_justifications` is recomputed by replaying epoch processing on a
-/// copy of a block's post-state, which a node resuming from an anchor does
-/// anyway as it re-imports the unfinalized window. `optimistic_roots` and
-/// `payload_statuses` are likewise answers an execution client can be asked
-/// for again, and `el_block_hashes` is a cache over data already decodable
-/// from the block itself.
+/// of attestations, and `pow_blocks` stands in for a call to an execution
+/// client that a restarted node would simply make again. `optimistic_roots`
+/// and `payload_statuses` are likewise answers an execution client can be
+/// asked for again, and `el_block_hashes` is a cache over data already
+/// decodable from the block itself.
+///
+/// `unrealized_justifications` is the one exception: it is a write-through
+/// cache over `Table::BeaconUnrealizedJustifications`, not scratch that a
+/// restart may safely lose. A resumed node does *not* re-import the
+/// unfinalized window from its anchor the way a fresh sync would, so a value
+/// computed only in memory would be gone for good the moment a pre-restart
+/// leaf from an older epoch needed it again, and `get_voting_source` would
+/// fail outright rather than recompute it. See
+/// [`Store::unrealized_justification`] and
+/// [`Store::set_unrealized_justification`].
 ///
 /// Most of this is uncapped: the per-validator maps are bounded by the
 /// validator set, and the per-block ones (`block_timeliness`,
@@ -636,6 +649,9 @@ pub(crate) struct BeaconScratch {
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
+    /// In-memory half of `Table::BeaconUnrealizedJustifications`; see this
+    /// struct's own documentation for why this map, unlike its neighbours,
+    /// has a persisted backing table.
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
     /// against the slot the unfinalized-window bound prunes them by.
@@ -681,6 +697,27 @@ fn decode_slot_root_key(bytes: &[u8]) -> (u64, H256) {
     let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
     let root = H256::from_slice(&bytes[8..]);
     (slot, root)
+}
+
+/// Encode a `Table::BeaconUnrealizedJustifications` value: the block's own
+/// slot (8 bytes big-endian, matching [`encode_slot_root_key`]'s convention,
+/// though nothing here depends on byte order since this is a value rather
+/// than a key), then the checkpoint's SSZ.
+///
+/// The slot rides in the value rather than the key; see the table's own doc
+/// comment (`crates/storage/src/api/tables.rs`) for why keying by root alone
+/// is what keeps [`Store::unrealized_justification`] a single point read.
+fn encode_unrealized_justification_value(slot: u64, checkpoint: BeaconCheckpoint) -> Vec<u8> {
+    let mut bytes = slot.to_be_bytes().to_vec();
+    bytes.extend_from_slice(&checkpoint.to_ssz());
+    bytes
+}
+
+/// The inverse of [`encode_unrealized_justification_value`].
+fn decode_unrealized_justification_value(bytes: &[u8]) -> (u64, BeaconCheckpoint) {
+    let slot = u64::from_be_bytes(bytes[..8].try_into().expect("valid slot bytes"));
+    let checkpoint = BeaconCheckpoint::from_ssz_bytes(&bytes[8..]).expect("valid checkpoint");
+    (slot, checkpoint)
 }
 
 fn encode_block_root_key(slot: u64) -> Vec<u8> {
@@ -1772,10 +1809,21 @@ impl Store {
                         Some((block_slot, _)) => {
                             let pruned_chain =
                                 self.prune_live_chain(block_slot).expect("prune live chain");
-                            if pruned_chain > 0 {
+                            // Same horizon as `LiveChain` above, and for the
+                            // same reason: the finalized block's own row must
+                            // survive, since a resumed node with nothing
+                            // imported past the anchor needs the anchor's own
+                            // entry to be a leaf `get_head` can still walk to.
+                            let pruned_justifications = self
+                                .prune_unrealized_justifications(block_slot)
+                                .expect("prune unrealized justifications");
+                            if pruned_chain > 0 || pruned_justifications > 0 {
                                 info!(
                                     finalized_slot = finalized.slot,
-                                    block_slot, pruned_chain, "Pruned finalized beacon live chain"
+                                    block_slot,
+                                    pruned_chain,
+                                    pruned_justifications,
+                                    "Pruned finalized beacon live chain"
                                 );
                             }
                         }
@@ -3251,26 +3299,131 @@ impl Store {
     /// one.
     ///
     /// `get_voting_source` reads this for every block from a prior epoch, so
-    /// it is the hottest map in the scratch; recomputing a missing entry means
-    /// replaying epoch processing on a copy of that block's post-state. That
-    /// still does not make it chain history: a restarted node re-imports the
-    /// unfinalized window from its anchor and refills the map as it goes.
+    /// the in-memory cache is checked first and a hit costs no backend round
+    /// trip. A miss falls through to `Table::BeaconUnrealizedJustifications`,
+    /// which is what lets this answer correctly right after a restart, before
+    /// anything has repopulated the cache: see that table's own doc comment
+    /// for the `get_head` freeze a purely in-memory map used to cause.
     pub fn unrealized_justification(&self, root: &H256) -> Option<BeaconCheckpoint> {
-        self.beacon
+        if let Some(checkpoint) = self
+            .beacon
             .lock()
             .unwrap()
             .unrealized_justifications
             .get(root)
             .copied()
+        {
+            return Some(checkpoint);
+        }
+
+        let view = self.backend.begin_read().expect("read view");
+        view.get(Table::BeaconUnrealizedJustifications, &root.to_ssz())
+            .expect("get")
+            .map(|bytes| decode_unrealized_justification_value(&bytes).1)
     }
 
-    /// Records `root`'s unrealized justification.
-    pub fn set_unrealized_justification(&mut self, root: H256, checkpoint: BeaconCheckpoint) {
+    /// Records `root`'s unrealized justification, persisting it to
+    /// `Table::BeaconUnrealizedJustifications` and updating the in-memory
+    /// cache the same call.
+    ///
+    /// `slot` is `root`'s own block slot, not the checkpoint's epoch: the
+    /// table keys by root alone (see its own doc comment for why), so the
+    /// slot travels in the value instead, for
+    /// [`Store::prune_unrealized_justifications`] to read back without
+    /// decoding a whole block.
+    ///
+    /// Called from `compute_pulled_up_tip` right after `insert_signed_block`
+    /// has already committed the block's own row, not inside that commit's
+    /// batch: `compute_pulled_up_tip` needs the block's *post-state*, which
+    /// only exists once `insert_signed_block`/`insert_state` have run, and
+    /// `insert_state` itself hands off to the background state writer (see
+    /// `state_writer.rs`) rather than committing synchronously. A crash
+    /// between the block's commit and this one leaves an imported block with
+    /// no unrealized-justification row, exactly the state a version-3
+    /// directory is in for every block it already holds; `get_voting_source`
+    /// then fails on that one root the same way it used to fail on all of
+    /// them, rather than losing the whole restart.
+    pub fn set_unrealized_justification(
+        &mut self,
+        root: H256,
+        slot: u64,
+        checkpoint: BeaconCheckpoint,
+    ) {
         self.beacon
             .lock()
             .unwrap()
             .unrealized_justifications
             .insert(root, checkpoint);
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        let entries = vec![(
+            root.to_ssz(),
+            encode_unrealized_justification_value(slot, checkpoint),
+        )];
+        batch
+            .put_batch(Table::BeaconUnrealizedJustifications, entries)
+            .expect("put unrealized justification");
+        batch.commit().expect("commit");
+    }
+
+    /// Prune `Table::BeaconUnrealizedJustifications` entries whose own block
+    /// sits strictly below `finalized_block_slot`, always keeping any entry
+    /// at or above it.
+    ///
+    /// `finalized_block_slot` is the finalized block's *own* slot, the same
+    /// horizon `prune_live_chain` is called with from `update_checkpoints`'s
+    /// `Chain::Beacon` arm (`block_entry(&finalized.root)`, not the stored
+    /// checkpoint's epoch-start slot) — see that arm's own comment for why the
+    /// two differ, and why using it here means the finalized block's own
+    /// entry, needed the moment nothing has imported past it yet, always
+    /// survives.
+    ///
+    /// Unlike [`prune_live_chain`](Self::prune_live_chain), this table is
+    /// keyed by root, not `slot ‖ root`, so there is no slot-ordered prefix to
+    /// stop early on: every row's value has to be decoded to read its slot
+    /// back out. That is cheap here, since the table only ever holds the
+    /// unfinalized window's worth of leaves between two finalizations.
+    ///
+    /// Also evicts the same roots from the in-memory cache, so a stale answer
+    /// there cannot outlive the row backing it.
+    pub fn prune_unrealized_justifications(
+        &mut self,
+        finalized_block_slot: u64,
+    ) -> Result<usize, Error> {
+        let view = self.backend.begin_read().expect("read view");
+        let keys_to_delete: Vec<Vec<u8>> = view
+            .prefix_iterator(Table::BeaconUnrealizedJustifications, &[])
+            .expect("iterator")
+            .filter_map(|res| res.ok())
+            .filter(|(_, value)| {
+                decode_unrealized_justification_value(value).0 < finalized_block_slot
+            })
+            .map(|(key, _)| key.to_vec())
+            .collect();
+        drop(view);
+
+        let count = keys_to_delete.len();
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(
+                Table::BeaconUnrealizedJustifications,
+                keys_to_delete.clone(),
+            )
+            .expect("delete pruned unrealized justifications");
+        batch.commit().expect("commit");
+
+        let mut scratch = self.beacon.lock().unwrap();
+        for key in &keys_to_delete {
+            scratch
+                .unrealized_justifications
+                .remove(&H256::from_slice(key));
+        }
+
+        Ok(count)
     }
 
     // ============ Data Columns ============
@@ -6603,26 +6756,96 @@ mod tests {
     }
 
     #[test]
-    fn an_unrealized_justification_is_scratch_not_chain_history() {
-        // Shared across clones of one `Store`, since the scratch sits behind
-        // an `Arc`, but gone once the process reopens the directory: a
-        // restarted node refills the map as it re-imports the unfinalized
-        // window.
+    fn an_unrealized_justification_persists_across_a_reopened_store() {
+        // Shared across clones of one `Store`, since the write-through cache
+        // sits behind an `Arc`, and still answers on a reopened store, whose
+        // cache starts empty but shares the same backend: that fall-through
+        // to `Table::BeaconUnrealizedJustifications` is what a restart no
+        // longer loses.
         let backend = Arc::new(InMemoryBackend::new());
         let mut store = beacon_test_store(backend.clone());
         let root = H256::from([1u8; 32]);
+        let slot = 40;
         let cp = BeaconCheckpoint {
             epoch: 5,
             root: H256::from([2u8; 32]),
         };
 
-        store.set_unrealized_justification(root, cp);
+        store.set_unrealized_justification(root, slot, cp);
         assert_eq!(store.unrealized_justification(&root), Some(cp));
         assert_eq!(store.unrealized_justification(&H256::from([3u8; 32])), None);
         assert_eq!(store.clone().unrealized_justification(&root), Some(cp));
 
         let reopened = beacon_test_store(backend);
-        assert_eq!(reopened.unrealized_justification(&root), None);
+        assert_eq!(
+            reopened.unrealized_justification(&root),
+            Some(cp),
+            "a fresh store's empty cache must fall through to the persisted row"
+        );
+    }
+
+    #[test]
+    fn beacon_finalization_prunes_unrealized_justifications_to_the_finalized_blocks_own_slot() {
+        // Same empty-epoch-start-slot shape as
+        // `beacon_finalization_prunes_live_chain_to_the_finalized_blocks_own_slot`:
+        // epoch 1 starts at slot 32, but nobody built a block there, so the
+        // finalized checkpoint's own block sits at slot 31. Pruning to the
+        // stored (epoch-start) slot would delete that block's own entry;
+        // pruning to its real slot must not.
+        let anchor = beacon_test_block(0, H256::ZERO);
+        let anchor_root = anchor.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint::default(),
+            0,
+        );
+        store
+            .insert_signed_block(anchor_root, anchor)
+            .expect("insert anchor");
+        store.set_unrealized_justification(anchor_root, 0, BeaconCheckpoint::default());
+
+        let block_31 = beacon_test_block(31, anchor_root);
+        let root_31 = block_31.message_hash_tree_root();
+        store
+            .insert_signed_block(root_31, block_31)
+            .expect("insert block 31");
+        store.set_unrealized_justification(root_31, 31, BeaconCheckpoint::default());
+
+        let head = beacon_test_block(33, root_31);
+        let head_root = head.message_hash_tree_root();
+        store
+            .insert_signed_block(head_root, head)
+            .expect("insert head");
+        store.set_unrealized_justification(head_root, 33, BeaconCheckpoint::default());
+
+        let finalized = Store::beacon_checkpoint_as_stored(BeaconCheckpoint {
+            epoch: 1,
+            root: root_31,
+        });
+        assert_eq!(
+            finalized.slot, 32,
+            "the epoch's own start slot, not block 31's, must be what gets stored"
+        );
+        store
+            .update_checkpoints(ForkCheckpoints::new(head_root, None, Some(finalized)))
+            .expect("advance finalized");
+
+        assert_eq!(
+            store.unrealized_justification(&anchor_root),
+            None,
+            "entries below the finalized block must be pruned"
+        );
+        assert!(
+            store.unrealized_justification(&root_31).is_some(),
+            "the finalized block's own entry must survive"
+        );
+        assert!(
+            store.unrealized_justification(&head_root).is_some(),
+            "entries above the finalized block must remain"
+        );
     }
 
     // ============ Data Column Tests ============

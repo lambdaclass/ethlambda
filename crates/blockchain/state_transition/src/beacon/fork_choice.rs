@@ -985,13 +985,18 @@ pub fn get_forkchoice_store(
     // this file's only outright whole-`BeaconState` clone. `checkpoint_state`
     // now derives that second copy on demand instead of caching it, so the
     // anchor is written once.
+    // Captured before `anchor_state` moves into `insert_state` below:
+    // `set_unrealized_justification` needs the anchor's own slot to persist
+    // alongside its checkpoint (see `Table::BeaconUnrealizedJustifications`),
+    // and `insert_state` takes the state by value.
+    let anchor_slot = anchor_state.slot();
     store
         .insert_signed_block(anchor_root, anchor_block)
         .expect("insert");
     store
         .insert_state(anchor_root, anchor_state)
         .expect("insert");
-    store.set_unrealized_justification(anchor_root, justified_checkpoint);
+    store.set_unrealized_justification(anchor_root, anchor_slot, justified_checkpoint);
 
     Ok(store)
 }
@@ -2033,7 +2038,7 @@ pub fn compute_pulled_up_tip(
     let current_justified = state.current_justified_checkpoint();
     let finalized = state.finalized_checkpoint();
 
-    store.set_unrealized_justification(block_root, current_justified);
+    store.set_unrealized_justification(block_root, block_slot, current_justified);
     update_unrealized_checkpoints(store, current_justified, finalized);
 
     // If the block is from a prior epoch, apply the realized values. `block_slot`
@@ -3052,7 +3057,7 @@ mod tests {
             "the test must exercise two different values"
         );
 
-        store.set_unrealized_justification(block_root, unrealized);
+        store.set_unrealized_justification(block_root, 0, unrealized);
 
         let mut state = crate::beacon::helpers::test_state::with_validators(1);
         *state.current_justified_checkpoint_mut() = realized;
@@ -3089,6 +3094,178 @@ mod tests {
         let (slot, root) = store.beacon_head().expect("head recorded");
         assert_eq!(root, head);
         assert_eq!(slot, store.block_entry(&head).expect("head block").0);
+    }
+
+    /// Imports `block` with `post_state` as its post-state through the part
+    /// of [`on_block`] fork choice later reads back: the block and state rows,
+    /// then [`compute_pulled_up_tip`], the only production writer of a
+    /// non-anchor block's unrealized justification. `state_transition` is
+    /// skipped, since it would need properly signed blocks and nothing here
+    /// depends on it.
+    fn import_unchecked(
+        store: &mut Store,
+        block: SignedBeaconBlock,
+        mut post_state: BeaconState,
+        config: &Config,
+    ) -> Root {
+        let root = block.message_hash_tree_root();
+        let slot = block.slot();
+        *post_state.slot_mut() = slot;
+        store.insert_signed_block(root, block).unwrap();
+        store.insert_state(root, post_state).unwrap();
+        compute_pulled_up_tip(store, root, slot, config).expect("pulled-up tip");
+        root
+    }
+
+    /// A post-state for a block building on `anchor_root` in the anchor's
+    /// own epoch, whose justified checkpoint is that anchor: the shape every
+    /// block in the anchor epoch has, and one that keeps every leaf below
+    /// viable (`voting_source.epoch == justified.epoch`) whatever the clock
+    /// reads, so a failure can only come from the lookup, not the filter.
+    fn post_state_over(anchor_state: &BeaconState, anchor_root: Root) -> BeaconState {
+        let mut state = anchor_state.clone();
+        *state.current_justified_checkpoint_mut() = Checkpoint {
+            epoch: compute_epoch_at_slot(anchor_state.slot()),
+            root: anchor_root,
+        };
+        state
+    }
+
+    /// The resume path `fetch_initial_beacon_state` takes: reopen the
+    /// directory, check the anchor states, repair the head. Nothing else
+    /// happens to the store before the chain actor starts ticking it.
+    fn resume(backend: Arc<dyn StorageBackend>) -> Store {
+        let mut store = Store::from_db_state(backend)
+            .expect("same version")
+            .expect("a beacon directory");
+        store
+            .verify_anchor_states()
+            .expect("anchor states persisted");
+        store.repair_head().expect("head has a state");
+        store
+    }
+
+    /// The store clock two epochs past the anchor's, the first tick a node
+    /// restarted into a later epoch runs.
+    fn two_epochs_past(anchor_slot: Slot, config: &Config) -> u64 {
+        (anchor_slot + 2 * preset::SLOTS_PER_EPOCH) * config.seconds_per_slot
+    }
+
+    /// Reproduces the unrealized-justification loss on resume: the
+    /// pre-restart head is a leaf from an epoch older than the store's clock,
+    /// so `get_voting_source` needs its entry, and a reopened store used to
+    /// have none.
+    ///
+    /// Failed before `Table::BeaconUnrealizedJustifications` existed, with
+    /// `SpecAssert("block_root in store.unrealized_justifications")`; passes
+    /// now that the entry is persisted rather than living only in
+    /// `BeaconScratch`.
+    #[test]
+    fn get_head_survives_a_restart_over_a_pre_restart_leaf() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        // anchor -> a -> b, all in the anchor's epoch.
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state.clone(),
+            &config,
+        );
+        let b = import_unchecked(&mut store, block(anchor_slot + 2, a), post_state, &config);
+
+        // Before the restart, with the clock already past b's epoch, the map
+        // answers b's lookup and b is the head.
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        assert_eq!(get_head(&mut store, &config).expect("pre-restart"), b);
+
+        // Restart: the writer flushes on drop, then the directory reopens.
+        drop(store);
+        let mut resumed = resume(backend);
+        assert_eq!(resumed.beacon_head().map(|(_, root)| root), Some(b));
+        assert!(
+            resumed.unrealized_justification(&b).is_some(),
+            "the persisted entry must survive the restart, before the in-memory \
+             cache has been refilled by anything"
+        );
+
+        // The first tick after the restart: same time, same tree, same head
+        // expected.
+        on_tick(&mut resumed, two_epochs_past(anchor_slot, &config), &config);
+        let head = get_head(&mut resumed, &config).map_err(|err| format!("{err:?}"));
+        assert_eq!(
+            head,
+            Ok(b),
+            "a restart must not change what get_head can compute"
+        );
+    }
+
+    /// The same loss, but for a stale fork leaf rather than the head: a
+    /// block imported after the restart extends the head (so the head is no
+    /// longer a leaf and has a fresh entry), yet a pre-restart sibling branch
+    /// is still a leaf above the justified root, and its persisted entry must
+    /// still answer, from before the restart, with nothing having recomputed
+    /// it since.
+    ///
+    /// Failed before like [`get_head_survives_a_restart_over_a_pre_restart_leaf`].
+    #[test]
+    fn get_head_survives_a_restart_past_a_pre_restart_fork_leaf() {
+        let config = Config::active();
+        let (anchor_state, anchor_block) = anchor_pair();
+        let anchor_slot = anchor_state.slot();
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store =
+            get_forkchoice_store(backend.clone(), anchor_state.clone(), anchor_block, &config)
+                .expect("the pair matches");
+
+        // anchor -> a -> {b, f}: f is the branch the network did not build on.
+        let post_state = post_state_over(&anchor_state, anchor_root);
+        let a = import_unchecked(
+            &mut store,
+            block(anchor_slot + 1, anchor_root),
+            post_state.clone(),
+            &config,
+        );
+        let b = import_unchecked(
+            &mut store,
+            block(anchor_slot + 2, a),
+            post_state.clone(),
+            &config,
+        );
+        let f = import_unchecked(
+            &mut store,
+            block(anchor_slot + 3, a),
+            post_state.clone(),
+            &config,
+        );
+        on_tick(&mut store, two_epochs_past(anchor_slot, &config), &config);
+        get_head(&mut store, &config).expect("pre-restart");
+
+        drop(store);
+        let mut resumed = resume(backend);
+        on_tick(&mut resumed, two_epochs_past(anchor_slot, &config), &config);
+
+        // The chain moves on from b after the restart; c gets a fresh entry.
+        let c = import_unchecked(&mut resumed, block(anchor_slot + 4, b), post_state, &config);
+        assert!(resumed.unrealized_justification(&c).is_some());
+        assert!(
+            resumed.unrealized_justification(&f).is_some(),
+            "f's entry was persisted before the restart and nothing has pruned it"
+        );
+
+        let head = get_head(&mut resumed, &config).map_err(|err| format!("{err:?}"));
+        assert!(
+            head.as_ref().is_ok_and(|head| *head == c || *head == f),
+            "a stale pre-restart fork leaf must not stop get_head: {head:?}"
+        );
     }
 
     /// The specification's assertion cannot hold for a checkpoint-synced
