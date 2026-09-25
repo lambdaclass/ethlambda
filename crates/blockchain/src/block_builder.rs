@@ -190,8 +190,9 @@ pub(crate) fn build_block(
 /// Tiered greedy attestation selection for block proposal.
 ///
 /// Each round scores remaining candidates against a projected post-state and
-/// picks the best per `EntryScore`: tier 1 (finalizes source) beats tier 2
-/// (justifies target) beats tier 3 (adds new voters). Justification and
+/// picks the best per `EntryScore`: `Finalize` (finalizes source) beats
+/// `Justify` (justifies target) beats `TargetAdvance` (brings the head to 2/3)
+/// beats `Build` (adds new voters or head votes). Justification and
 /// finalization are projected incrementally so dependent attestations become
 /// eligible on the next round without re-running the STF.
 ///
@@ -316,7 +317,7 @@ fn pick_best_candidate(
         let Some((score, new_voters, new_head_voters)) =
             projected.score_entry(att_data, &coverage, chain.validator_count)
         else {
-            trace_skipped_attestation("zero_new_voters", att_data, data_root);
+            trace_skipped_attestation("no_new_voters_or_head_votes", att_data, data_root);
             continue;
         };
 
@@ -508,22 +509,25 @@ impl ProjectedState {
             .unwrap_or(false)
     }
 
-    /// Whether applying this entry puts 2/3 of the validator set's latest head
-    /// votes on `att_data.head.root`.
+    /// Whether applying this entry takes `att_data.head.root` from below 2/3 of
+    /// the validator set's latest head votes to at least 2/3.
     ///
-    /// The head-side analogue of `crosses_2_3` for justification, and counted
-    /// the same way: over the projected POST-state, not the delta. A validator
-    /// counts when the entry moves it onto this head, or when it already names
-    /// this head and the entry does not move it elsewhere.
+    /// Both ends are measured, unlike `crosses_2_3` for justification, which
+    /// only checks the post-state. That axis gets the "below before" half for
+    /// free: once a target crosses, `advance` marks it justified and every
+    /// later entry for it reads as settled, adding no voters. The head axis has
+    /// no such settling, so without the pre-state check every entry adding a
+    /// single vote to a head already at 2/3 would claim [`Tier::TargetAdvance`]
+    /// and outrank every `Build` entry, including ones bringing real
+    /// justification voters. In steady state that head is common: the block
+    /// before the head carries nearly everyone's vote for the block two back,
+    /// and a few late validators still naming it make exactly that entry.
     ///
-    /// Both halves of that count come from the same branch-relative window, so
-    /// the post-state this measures is the one the block being built would
-    /// actually produce. A per-validator map fed by every block import would
-    /// break the second half in the direction that matters: it would retain
-    /// validators whose vote only a sibling branch carried, letting an entry
-    /// that moves one head claim a threshold this branch is nowhere near and
-    /// outrank, at [`Tier::TargetAdvance`], entries bringing real justification
-    /// voters.
+    /// Both counts come from the same branch-relative window, so they describe
+    /// the branch the block being built extends. A per-validator map fed by
+    /// every block import would retain validators whose vote only a sibling
+    /// branch carried, letting an entry claim a threshold this branch is
+    /// nowhere near.
     ///
     /// `None` head votes means the axis is switched off, so no supermajority
     /// can be claimed.
@@ -537,14 +541,25 @@ impl ProjectedState {
             return false;
         };
         let head_root = att_data.head.root;
-        // Everyone this entry moves lands on `head_root` by construction.
-        let retained = head_window
+        let meets_threshold = |count: usize| 3 * count >= 2 * validator_count;
+
+        let before = head_window
             .votes
-            .iter()
-            .filter(|(vid, vote)| vote.head.root == head_root && !new_head_voters.contains(vid))
+            .values()
+            .filter(|vote| vote.head.root == head_root)
             .count();
-        let total = retained + new_head_voters.len();
-        3 * total >= 2 * validator_count
+        // Everyone this entry moves lands on `head_root`; those already naming
+        // it are counted in `before`.
+        let moved_on = new_head_voters
+            .iter()
+            .filter(|vid| {
+                head_window
+                    .votes
+                    .get(vid)
+                    .is_none_or(|vote| vote.head.root != head_root)
+            })
+            .count();
+        !meets_threshold(before) && meets_threshold(before + moved_on)
     }
 
     /// The subset of `coverage` whose latest head vote this entry would
@@ -587,7 +602,7 @@ impl ProjectedState {
     /// Returns `None` only if the entry is worthless on *both* axes: it adds no
     /// justification voter for `att_data.target.root` and no validator's head
     /// vote either. An entry that adds head votes alone is kept, at
-    /// [`Tier::TargetAdvance`] if those votes carry the head past 2/3 and
+    /// [`Tier::TargetAdvance`] if those votes carry the head across 2/3 and
     /// [`Tier::Build`] otherwise, because its fork-choice weight is real even
     /// when its target is already carried: dropping it is how a slot whose
     /// votes all name a settled target ends up proposing nothing at all.
@@ -657,12 +672,9 @@ impl ProjectedState {
         // justify regardless of `crosses_2_3` — it is here for its head votes.
         let justifies = !is_genesis_self_vote(att_data) && crosses_2_3 && !new_voters.is_empty();
 
-        // Same rule on the head axis, for the same reason: an entry that moves
-        // nobody's head vote did not bring the head anywhere, however much
-        // weight already sits there. Requiring a non-empty contribution is what
-        // keeps a settled entry from claiming a threshold it did not cross.
-        let advances_head = !new_head_voters.is_empty()
-            && self.head_crosses_2_3(att_data, &new_head_voters, validator_count);
+        // Same rule on the head axis: the threshold has to be crossed BY this
+        // entry, however much weight already sits on its head.
+        let advances_head = self.head_crosses_2_3(att_data, &new_head_voters, validator_count);
 
         let tier = if justifies && finalizes {
             Tier::Finalize
@@ -777,8 +789,9 @@ pub(crate) enum Tier {
     Finalize = 1,
     /// Applying the entry crosses 2/3 on target but does not finalize.
     Justify = 2,
-    /// Applying the entry brings 2/3 of validators' latest head votes onto the
-    /// entry's head root, without justifying anything.
+    /// Applying the entry takes the entry's head root from below 2/3 of
+    /// validators' latest head votes to at least 2/3, without justifying
+    /// anything. A head already at 2/3 before the entry does not qualify.
     ///
     /// The LMD-GHOST analogue of `Justify`: it does not move the justification
     /// checkpoint, but it settles the head, which is what a later target is
@@ -800,18 +813,22 @@ pub(crate) enum Tier {
 ///
 /// - **Finalize / Justify**: the entry already crosses 2/3 on its target, so
 ///   newer chain progress leads: larger `target_slot`, then larger `att_slot`,
-///   then more `new_voters`. Pushing the justified slot as far forward as
-///   possible shortens recovery from a justification or finalization stall.
-/// - **Build**: the entry only adds marginal voters toward the threshold, so
-///   coverage leads: more `new_voters`, then larger `target_slot`, then larger
-///   `att_slot`.
+///   then more `new_head_voters`, then more `new_voters`. Pushing the justified
+///   slot as far forward as possible shortens recovery from a justification or
+///   finalization stall. Head votes come before justification voters here
+///   because the target is crossing either way, so the marginal justification
+///   voter is worth less than the head weight riding along with it.
+/// - **TargetAdvance**: the entry settles a head, not a target, so larger
+///   `att_slot` leads, then more `new_head_voters`. Neither `target_slot` nor
+///   `new_voters` is ranked.
+/// - **Build**: the entry only adds marginal weight below every threshold, so
+///   coverage leads: more `new_voters`, then more `new_head_voters`, then
+///   larger `target_slot`, then larger `att_slot`. Head votes break a tie on
+///   justification value and never outrank it: two entries bringing the same
+///   justification voters are not equivalent, since the one also moving more
+///   validators' latest head is worth more to fork choice.
 ///
-/// `new_head_voters` sits immediately after `new_voters` in both tiers, so it
-/// breaks a tie on justification value and never outranks it. Two entries that
-/// bring the same justification voters are not equivalent: the one whose votes
-/// also move more validators' latest head is worth more to fork choice.
-///
-/// In both tiers `data_root` (ascending) is the final deterministic tiebreak.
+/// In every tier `data_root` (ascending) is the final deterministic tiebreak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EntryScore {
     pub(crate) tier: Tier,
@@ -1919,6 +1936,97 @@ mod tests {
         );
     }
 
+    /// `TargetAdvance` needs the entry to cross 2/3, not merely to land on a
+    /// head already above it. Otherwise one late vote for a head that already
+    /// carries a supermajority would outrank a `Build` entry bringing real
+    /// justification voters.
+    #[test]
+    fn target_advance_requires_crossing_not_already_above() {
+        const VALIDATOR_COUNT: usize = 10;
+        // Validators 0..=6 (7 of 10, already >= 2/3) name DEFAULT_HEAD.
+        let carried: Vec<(u64, AttestationData)> = (0..=6).map(|v| (v, make_att_data(4))).collect();
+
+        // A: one more validator onto the already-supermajority head.
+        let a = make_att_data(5);
+        let a_coverage: HashSet<u64> = HashSet::from([7]);
+
+        // B: 3 justification voters on an open target, head outside the window.
+        let b = AttestationData {
+            slot: 5,
+            head: Checkpoint {
+                slot: 4,
+                root: H256([9u8; 32]),
+            },
+            target: Checkpoint {
+                slot: 3,
+                root: H256([3u8; 32]),
+            },
+            source: Checkpoint {
+                slot: 0,
+                root: H256::ZERO,
+            },
+        };
+        let b_coverage: HashSet<u64> = HashSet::from([0, 1, 2]);
+
+        let projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_window: Some(window(&[DEFAULT_HEAD], &carried)),
+        };
+
+        let (score_a, _, new_head_voters_a) = projected
+            .score_entry(&a, &a_coverage, VALIDATOR_COUNT)
+            .expect("A moves a head vote");
+        let (score_b, _, _) = projected
+            .score_entry(&b, &b_coverage, VALIDATOR_COUNT)
+            .expect("B adds justification voters");
+
+        assert_eq!(new_head_voters_a.len(), 1);
+        assert_eq!(
+            score_a.tier,
+            Tier::Build,
+            "A did not cross 2/3, the head was already there"
+        );
+        assert!(
+            score_b.ordering_key(H256([2u8; 32])) < score_a.ordering_key(H256([1u8; 32])),
+            "B's justification voters must outrank A's single head vote"
+        );
+    }
+
+    /// The pre-state check also applies across rounds: once a selected entry
+    /// carries the head across 2/3, a later entry for the same head is no
+    /// longer `TargetAdvance`, just as a crossed target stops justifying.
+    #[test]
+    fn target_advance_is_claimed_once_per_head() {
+        const VALIDATOR_COUNT: usize = 10;
+        // Validators 0..=5 (6 of 10, just below 2/3) name DEFAULT_HEAD.
+        let carried: Vec<(u64, AttestationData)> = (0..=5).map(|v| (v, make_att_data(4))).collect();
+        let mut projected = ProjectedState {
+            justified_slots: JustifiedSlots::new(),
+            finalized_slot: 0,
+            current_votes: HashMap::new(),
+            head_window: Some(window(&[DEFAULT_HEAD], &carried)),
+        };
+
+        let first = make_att_data(5);
+        let (score, _, new_head_voters) = projected
+            .score_entry(&first, &HashSet::from([6]), VALIDATOR_COUNT)
+            .expect("it moves a head vote");
+        assert_eq!(score.tier, Tier::TargetAdvance, "6 -> 7 of 10 crosses 2/3");
+        projected.advance_head_votes(&first, new_head_voters);
+
+        let second = make_att_data(6);
+        let (score, _, _) = projected
+            .score_entry(&second, &HashSet::from([7]), VALIDATOR_COUNT)
+            .expect("it still moves a head vote");
+        assert_eq!(
+            score.tier,
+            Tier::Build,
+            "the head crossed in the previous round, so 7 -> 8 crosses nothing"
+        );
+    }
+
     /// `TargetAdvance` ranks on recency first, then head weight. The target is
     /// not moving at this tier, so `newer_target` is deliberately not consulted.
     #[test]
@@ -2030,7 +2138,8 @@ mod tests {
         assert!(target_advance.ordering_key(root) < build.ordering_key(root));
     }
 
-    /// Head votes break a tie on justification voters, and never outrank them.
+    /// At `Build` tier, head votes break a tie on justification voters and
+    /// never outrank them.
     #[test]
     fn head_votes_break_a_tie_on_justification_voters() {
         let root = H256::ZERO;

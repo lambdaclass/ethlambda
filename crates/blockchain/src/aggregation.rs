@@ -553,7 +553,7 @@ fn pick_best_candidate(
         let Some((score, _new_voters, new_head_voters)) =
             projected.score_entry(att_data, &candidate.coverage(), validator_count)
         else {
-            trace_skipped_candidate("zero_new_voters", att_data, data_root);
+            trace_skipped_candidate("no_new_voters_or_head_votes", att_data, data_root);
             continue;
         };
 

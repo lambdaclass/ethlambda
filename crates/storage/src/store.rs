@@ -9,6 +9,7 @@ use crate::error::Error;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
+    ShortRoot,
     attestation::{
         AggregatedAttestation, AggregationBits, AttestationData, HashedAttestationData,
         bits_is_subset, validator_indices,
@@ -27,7 +28,7 @@ use libssz::{SszDecode, SszEncode};
 
 use crate::state_diff::StateDiff;
 use thiserror::Error;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Errors returned by [`Store::get_forkchoice_store`].
 #[derive(Debug, Error)]
@@ -1558,7 +1559,7 @@ impl Store {
     /// Feeds `known_votes`, which is what fork choice weighs: every vote this
     /// node knows, however it arrived. Block production does NOT score against
     /// this map; it reads the branch it is building on through
-    /// [`Self::extract_head_window_votes`].
+    /// [`Self::extract_head_vote_window`].
     fn record_known_attestation_votes(&self, attestations: &[AggregatedAttestation]) {
         let mut fork_choice = self.fork_choice.lock().unwrap();
         for attestation in attestations {
@@ -1606,19 +1607,42 @@ impl Store {
     /// is the checkpoint-sync anchor, and it resolves on the first import. The
     /// walk stops at a root with no header at all, which is the normal
     /// terminator: the anchor's parent names no block.
+    ///
+    /// A read error is treated like a missing record, so it shortens the window
+    /// rather than failing the proposal, but it is logged: unlike a missing
+    /// record it is never expected.
     pub fn extract_head_vote_window(&self, head_root: H256, blocks: usize) -> HeadVoteWindow {
         let mut window = HeadVoteWindow::default();
         let mut root = head_root;
         for _ in 0..blocks {
-            let Ok(Some(header)) = self.get_block_header(&root) else {
-                break;
+            let header = match self.get_block_header(&root) {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(
+                        %err,
+                        block_root = %ShortRoot(&root.0),
+                        "Head-vote window cut short: failed to read block header"
+                    );
+                    break;
+                }
             };
             window.roots.insert(root);
-            if let Ok(Some(block)) = self.get_block(&root) {
-                for attestation in block.body.attestations.iter() {
-                    for validator_id in validator_indices(&attestation.aggregation_bits) {
-                        Self::record_vote(&mut window.votes, validator_id, &attestation.data);
+            match self.get_block(&root) {
+                Ok(Some(block)) => {
+                    for attestation in block.body.attestations.iter() {
+                        for validator_id in validator_indices(&attestation.aggregation_bits) {
+                            Self::record_vote(&mut window.votes, validator_id, &attestation.data);
+                        }
                     }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        %err,
+                        block_root = %ShortRoot(&root.0),
+                        "Head-vote window missing a block's votes: failed to read block"
+                    );
                 }
             }
             root = header.parent_root;
