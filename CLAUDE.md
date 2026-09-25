@@ -408,8 +408,20 @@ build cannot process, so a Sepolia follower stops tracking the chain at
 `GLOAS_FORK_EPOCH`; the ignored-keys warning at startup names it.
 
 A loaded network decodes its own `genesis.ssz` instead, at whatever fork its
-own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, is
-checked for a matching `PRESET_BASE` before anything else runs.
+own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, goes
+through two checks as soon as it parses, and a failure is a hard startup
+error. For a directory they run before its `genesis.ssz` is decoded, since
+the compiled preset sets that state's container bounds and a mismatch would
+otherwise surface as an SSZ error:
+
+- `check_preset`: `PRESET_BASE` must name the compiled preset.
+- `check_constants`: every key the node runs on a compile-time constant for
+  instead of reading `Config` (the custody counts, subnet counts,
+  `MAX_REQUEST_*`, `MAX_PAYLOAD_SIZE`, the snappy message domains,
+  `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal that constant.
+  `/eth/v1/config/spec` reports these keys off the stored `Config`, so this is
+  what keeps it from reporting a value the node does not use. A new such
+  constant needs a line in `check_constants`.
 
 Two consequences, on the built-in arm. `beacon` takes **no genesis**
 configuration of its own the way `node` does: `genesis_time` and
@@ -696,7 +708,11 @@ behavior.
 - A `StateDiff` omits `config` and `validators`, trusting they never mutate;
   breaking that invariant would silently corrupt every reconstructed state.
 - `Metadata["config"]` is written once at bootstrap and never rewritten; it
-  doubles as the DB's genesis-time fingerprint on resume.
+  doubles as the DB's genesis-time fingerprint on resume. A beacon resume also
+  refuses a config file that changes a chain value in it
+  (`first_config_difference`: fork schedule, slot time, `PRESET_BASE`, ...),
+  but only warns about a changed `CONFIG_NAME`, a label with no consensus
+  effect. The stored name is the one the node keeps reporting.
 - `PendingDataColumns` holds *unverified* sidecars parked until their block's
   parent has a post-state. `data_column_indices_for` reads `DataColumns` only,
   which is what keeps a parked column from satisfying the availability gate.
@@ -711,10 +727,13 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 4: version 4 added `BeaconUnrealizedJustifications`, so a
-  directory written by the previous version has no row there for any block it
-  already imported. `Store::from_db_state` refuses any other version outright;
-  there is no migration.
+- `DB_VERSION` is 5: the new unrealized-justifications table means a
+  directory written by an earlier version has no row there for any block it
+  already imported, which would otherwise look identical to "no unrealized
+  justification computed yet" rather than "this directory predates the
+  table". (4 was `PRESET_BASE`/`CONFIG_NAME` at the front of `Config`; 3 was
+  the runtime keys a `config.yaml` supplies.) `Store::from_db_state` refuses
+  any other version outright; there is no migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

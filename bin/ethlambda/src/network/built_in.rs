@@ -60,7 +60,8 @@ impl BuiltInNetwork {
         let chain = self.chain();
         let parsed = ConfigFile::parse(chain.config_yaml)
             .wrap_err_with(|| format!("the built-in {} config.yaml did not parse", self.name()))?;
-        super::check_preset(&parsed.preset_base)?;
+        super::check_preset(parsed.config.preset_base.as_str())?;
+        super::check_constants(&parsed.config)?;
         // A built-in config can carry a fork this build cannot process (Sepolia
         // schedules gloas), and saying so at every start is the point: the
         // node follows the chain only up to that fork's epoch.
@@ -71,7 +72,6 @@ impl BuiltInNetwork {
         super::derive_genesis_fields(&mut config, genesis.genesis_time);
 
         Ok(BuiltIn {
-            network: self,
             config,
             genesis,
             bootnodes: crate::parse_bootnode_strings(chain.bootnodes_yaml),
@@ -82,7 +82,6 @@ impl BuiltInNetwork {
 /// A resolved built-in network: what [`super::NetworkSource`] answers from.
 #[derive(Debug)]
 pub(crate) struct BuiltIn {
-    pub(crate) network: BuiltInNetwork,
     pub(crate) config: Config,
     pub(crate) genesis: Genesis,
     pub(crate) bootnodes: Vec<String>,
@@ -167,7 +166,9 @@ mod tests {
             let resolved = network
                 .resolve()
                 .unwrap_or_else(|err| panic!("{} did not resolve: {err:#}", network.name()));
-            assert_eq!(resolved.network, network);
+            // `--network <name>` and the `CONFIG_NAME` the node logs and
+            // reports must be the same name.
+            assert_eq!(resolved.config.config_name.as_str(), network.name());
             assert_eq!(
                 resolved.config.genesis_time,
                 resolved.genesis.genesis_time,

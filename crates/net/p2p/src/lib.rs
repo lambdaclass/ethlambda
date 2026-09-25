@@ -107,6 +107,11 @@ pub use libp2p::PeerId;
 /// to drive its own fetches from outside rather than through the range session.
 pub use req_resp::{request_beacon_block_by_root, request_beacon_blocks_by_range};
 
+/// `MAX_PAYLOAD_SIZE`, the ceiling on an uncompressed gossip or req/resp
+/// payload. Public because a beacon `config.yaml` carries it too, and startup
+/// refuses a network whose value differs from this one.
+pub use req_resp::MAX_PAYLOAD_SIZE;
+
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
 //
 // This ladder, not a separate wall-clock budget, is what actually bounds how
@@ -2077,10 +2082,19 @@ fn tcp_muxer_disconnect_cause(err: &Either<libp2p::yamux::Error, io::Error>) -> 
     }
 }
 
-fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
-    const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-    const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+/// `MESSAGE_DOMAIN_INVALID_SNAPPY`: what [`compute_message_id`] prefixes a
+/// message that does not decompress with.
+///
+/// Public, like [`MESSAGE_DOMAIN_VALID_SNAPPY`], because a beacon
+/// `config.yaml` carries both: startup refuses a network that sets either to
+/// something else, since this node would compute message ids its peers do not.
+pub const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 
+/// `MESSAGE_DOMAIN_VALID_SNAPPY`: what [`compute_message_id`] prefixes a
+/// message that decompresses with.
+pub const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
+fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
     let mut hasher = sha2::Sha256::new();
     let decompressed = gossipsub::decompress_message(&message.data).ok();
 

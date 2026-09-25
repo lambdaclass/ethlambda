@@ -39,8 +39,8 @@ use super::shared::{
 use super::shared::{
     BeaconBlockHeader, Checkpoint, Deposit, Eth1Data, Fork, ProposerSlashing, SignedVoluntaryExit,
 };
-use crate::beacon::preset;
 use crate::beacon::primitives::{BlsPubkey, BlsSignature, Bytes32, Root, Slot, ValidatorIndex};
+use crate::beacon::{constants, preset};
 
 /// One bit per sync committee member, recording who contributed to a
 /// [`SyncAggregate`].
@@ -53,24 +53,11 @@ pub type SyncCommitteeBits = SszBitvector<{ preset::SYNC_COMMITTEE_SIZE }>;
 /// than one seat in the same committee.
 pub type SyncCommitteePubkeys = SszVector<BlsPubkey, { preset::SYNC_COMMITTEE_SIZE }>;
 
-/// How many gossipsub subnets the sync committee aggregation protocol splits a
-/// sync committee into, so that a [`SyncCommitteeContribution`] only has to
-/// cover one subcommittee rather than the whole committee.
-///
-/// This is a fixed specification constant (`validator.md`'s "Constants",
-/// mirrored the same in the mainnet and minimal presets), not a preset value,
-/// so by this crate's own convention it belongs in `crate::beacon::constants` alongside
-/// `JUSTIFICATION_BITS_LENGTH`. It is defined here instead, as a judgment call,
-/// because it does not exist anywhere in the crate yet and this file is not
-/// permitted to add it to `constants.rs`; whoever owns that module should move
-/// it there.
-const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
-
 /// One bit per member of a single sync subcommittee (one
 /// `SYNC_COMMITTEE_SUBNET_COUNT`th of a full sync committee), recording who
 /// contributed to one [`SyncCommitteeContribution`].
 pub type SyncSubcommitteeBits =
-    SszBitvector<{ preset::SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT }>;
+    SszBitvector<{ preset::SYNC_COMMITTEE_SIZE / constants::SYNC_COMMITTEE_SUBNET_COUNT }>;
 
 // ---------------------------------------------------------------------------
 // Sync committees

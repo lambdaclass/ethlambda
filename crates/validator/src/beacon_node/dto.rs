@@ -372,8 +372,10 @@ pub fn parse_pubkey(text: &str) -> Result<BlsPubkey> {
     Ok(BlsPubkey(array))
 }
 
+/// `0x`-prefixed hex, through the same adapter the beacon node writes its own
+/// responses with.
 pub fn encode_hex(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
+    ethlambda_types::beacon::serde_helpers::HexPrefixed(bytes).to_string()
 }
 
 /// Reads one `0x`-prefixed, 4-byte fork version out of a `GET

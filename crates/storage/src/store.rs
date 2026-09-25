@@ -169,12 +169,15 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// version decodes into the wrong fields. There is no migration, by the same
 /// policy every previous change followed.
 ///
-/// 4 added `Table::BeaconUnrealizedJustifications`: a directory written by the
+/// 4 added `PRESET_BASE` and `CONFIG_NAME` to `Config`, at the front of its
+/// encoding, for the same reason and with the same consequence as 3.
+///
+/// 5 added `Table::BeaconUnrealizedJustifications`: a directory written by the
 /// previous version has no row there for any block it already imported, which
 /// would otherwise look identical to "no unrealized justification computed
 /// yet" rather than "this directory predates the table", the same silent
 /// wrong answer every prior bump exists to rule out.
-pub const DB_VERSION: u64 = 4;
+pub const DB_VERSION: u64 = 5;
 
 /// The consensus protocol a data directory holds.
 ///

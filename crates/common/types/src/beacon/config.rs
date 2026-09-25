@@ -16,11 +16,12 @@
 //!   gloas-era and is a list rather than a scalar. A fork version stored here
 //!   would give [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`]
 //!   has no variant for, so these are reported as unknown keys instead.
-//! - **`PRESET_BASE` and `CONFIG_NAME`.** Both are strings, and this struct is
-//!   SSZ-encoded into the database, so storing them would mean a bounded byte
-//!   list and a storage bound each. Neither needs persisting: the first is
-//!   read once at startup to check the compiled preset, the second is for
-//!   logging and the spec endpoint.
+//!
+//! `PRESET_BASE` and `CONFIG_NAME` used to be left out as well, because they
+//! are strings and this struct is SSZ-encoded into the database. They are here
+//! now, as bounded [`ConfigName`]s, so that `/eth/v1/config/spec` reads every
+//! value it reports from the one `Config` the store holds, rather than having
+//! the name threaded to it separately from startup.
 //!
 //! Networking values and the deposit contract identity used to be left out too,
 //! on the grounds that the state transition never reads them. They are here now
@@ -74,6 +75,133 @@ pub struct BlobScheduleEntry {
 /// version.
 pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 
+/// How many bytes a [`ConfigName`] can hold.
+///
+/// A storage bound, not a consensus one, for the same reason as
+/// [`MAX_BLOB_SCHEDULE_ENTRIES`]: the specification leaves both names
+/// unbounded, and the ones in use (`mainnet`, `minimal`, `sepolia`, `hoodi`,
+/// kurtosis's `testnet`) are a few bytes each.
+pub const MAX_CONFIG_NAME_LENGTH: usize = 256;
+
+/// A name a `config.yaml` carries: its `CONFIG_NAME` or `PRESET_BASE`.
+///
+/// Text of at most [`MAX_CONFIG_NAME_LENGTH`] bytes, which every constructor
+/// checks. SSZ-encoded as a `List[uint8, MAX_CONFIG_NAME_LENGTH]`, since
+/// [`Config`] is persisted to the database; (de)serialized as a plain string,
+/// which is how both the file and `/eth/v1/config/spec` write it.
+///
+/// Held as a `String` rather than as the byte list it encodes to, so that
+/// [`Self::as_str`] borrows instead of re-checking UTF-8 on every call. The SSZ
+/// impls are written out for that reason: a derive would need the field to be
+/// the list.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ConfigName(String);
+
+/// The quoted text: a resume that refuses a changed `PRESET_BASE`, or warns
+/// about a changed `CONFIG_NAME`, prints both through `{:?}`.
+impl std::fmt::Debug for ConfigName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+/// A name longer than [`MAX_CONFIG_NAME_LENGTH`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{length} bytes is longer than the {MAX_CONFIG_NAME_LENGTH} a config name may hold")]
+pub struct ConfigNameTooLong {
+    pub length: usize,
+}
+
+impl ConfigName {
+    /// A name known to fit, such as a built-in network's.
+    ///
+    /// # Panics
+    ///
+    /// If `name` is longer than [`MAX_CONFIG_NAME_LENGTH`].
+    fn fixed(name: &str) -> Self {
+        Self::try_from(name).expect("a built-in name fits the bound")
+    }
+
+    /// The name as text.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for ConfigName {
+    type Error = ConfigNameTooLong;
+
+    fn try_from(name: &str) -> Result<Self, Self::Error> {
+        if name.len() > MAX_CONFIG_NAME_LENGTH {
+            return Err(ConfigNameTooLong { length: name.len() });
+        }
+        Ok(Self(name.to_owned()))
+    }
+}
+
+impl std::fmt::Display for ConfigName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The name's bytes, which is how `SszList<u8, MAX_CONFIG_NAME_LENGTH>`
+/// encodes them too: a list of a fixed-size basic type is its elements
+/// concatenated, with no length prefix of its own.
+impl libssz::SszEncode for ConfigName {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.0.as_bytes());
+    }
+}
+
+impl libssz::SszDecode for ConfigName {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        0
+    }
+
+    /// Decoded through the list type, so an over-long name is refused with
+    /// the list's own error.
+    ///
+    /// Lossy rather than fallible on bytes that are not UTF-8. Every
+    /// constructor takes a `&str`, so only a corrupt database can hold such
+    /// bytes, and `DecodeError` has no variant that describes them. A repaired
+    /// `PRESET_BASE` still fails the resume comparison against the file's,
+    /// and a repaired `CONFIG_NAME` shows up in the warning about it.
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        let list = SszList::<u8, MAX_CONFIG_NAME_LENGTH>::from_ssz_bytes(bytes)?;
+        Ok(Self(String::from_utf8_lossy(&list).into_owned()))
+    }
+}
+
+impl serde::Serialize for ConfigName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ConfigName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::try_from(name.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The runtime configuration for one network: fork scheduling plus every
 /// other value the state transition and fork choice read at runtime rather
 /// than at compile time.
@@ -86,6 +214,21 @@ pub const MAX_BLOB_SCHEDULE_ENTRIES: usize = 32;
 )]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE", default)]
 pub struct Config {
+    // -- Identity ---------------------------------------------------------
+    /// `PRESET_BASE`: which preset the file was written for.
+    ///
+    /// Startup refuses a file whose value differs from the compiled preset, so
+    /// on a running node this always names [`crate::beacon::preset::Preset::ACTIVE`].
+    ///
+    /// Defaults to empty rather than to mainnet's value when the file omits
+    /// it: the startup check has to fail on an absent key rather than guess.
+    #[serde(default)]
+    pub preset_base: ConfigName,
+    /// `CONFIG_NAME`: the network's name, for logging and
+    /// `/eth/v1/config/spec`. Empty when the file omits it.
+    #[serde(default)]
+    pub config_name: ConfigName,
+
     // -- Genesis construction ---------------------------------------------
     /// How many active validators the chain needs before it may start.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -336,7 +479,10 @@ pub struct Config {
     // this crate reads them. They are here because a `config.yaml` carries
     // them, `/eth/v1/config/spec` has to echo them, and a field with no typed
     // home would otherwise be reported as an unknown key on every startup of
-    // every valid configuration.
+    // every valid configuration. Where the node runs on a compile-time
+    // constant instead (here and in the PeerDAS custody group below), the
+    // binary's `network::check_constants` refuses a network that sets another
+    // value, so the endpoint never reports one the node does not use.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_propagation_slot_range: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -494,6 +640,8 @@ impl Config {
     /// specification version's `configs/mainnet.yaml`.
     pub fn mainnet() -> Self {
         Config {
+            preset_base: ConfigName::fixed("mainnet"),
+            config_name: ConfigName::fixed("mainnet"),
             min_genesis_active_validator_count: 16_384,
             min_genesis_time: 1_606_824_000,
             genesis_delay: 604_800,
@@ -612,6 +760,8 @@ impl Config {
     /// [`Config::with_fork_epoch`] rather than inheriting a fixed schedule.
     pub fn minimal() -> Self {
         Config {
+            preset_base: ConfigName::fixed("minimal"),
+            config_name: ConfigName::fixed("minimal"),
             min_genesis_active_validator_count: 64,
             min_genesis_time: 1_578_009_600,
             genesis_delay: 300,
@@ -723,6 +873,11 @@ impl Config {
     /// genesis" for all seven of them.
     pub fn lean(genesis_time: u64, slot_duration_ms: u64) -> Self {
         Self {
+            // A lean `config.yaml` has no `PRESET_BASE` or `CONFIG_NAME` key,
+            // and a lean chain has no beacon preset, so there is neither name
+            // to carry.
+            preset_base: ConfigName::default(),
+            config_name: ConfigName::default(),
             genesis_time,
             slot_duration_ms,
             // Truncated on a cadence that is not a whole number of seconds.
@@ -1239,6 +1394,63 @@ mod tests {
             Config::mainnet().max_request_payloads,
             "MAX_REQUEST_PAYLOADS is still absent; it must keep defaulting"
         );
+    }
+
+    #[test]
+    fn the_names_come_from_the_file_and_default_to_empty() {
+        let text = include_str!("../../../../../bin/ethlambda/assets/mainnet/config.yaml");
+        let parsed: Config = serde_yaml_ng::from_str(text).unwrap();
+        assert_eq!(parsed.preset_base.as_str(), "mainnet");
+        assert_eq!(parsed.config_name.as_str(), "mainnet");
+
+        // Not mainnet's values, which every other absent key falls back to:
+        // an absent PRESET_BASE has to fail the startup preset check rather
+        // than pass it by default.
+        let bare: Config = serde_yaml_ng::from_str("SECONDS_PER_SLOT: 12").unwrap();
+        assert_eq!(bare.preset_base, ConfigName::default());
+        assert_eq!(bare.config_name, ConfigName::default());
+    }
+
+    #[test]
+    fn a_config_name_is_bounded_and_round_trips() {
+        let longest = "n".repeat(MAX_CONFIG_NAME_LENGTH);
+        let name = ConfigName::try_from(longest.as_str()).unwrap();
+        assert_eq!(name.as_str(), longest);
+        assert_eq!(ConfigName::from_ssz_bytes(&name.to_ssz()).unwrap(), name);
+        assert_eq!(
+            serde_json::to_value(&name).unwrap(),
+            serde_json::Value::String(longest.clone())
+        );
+
+        let too_long = format!("{longest}n");
+        assert_eq!(
+            ConfigName::try_from(too_long.as_str()),
+            Err(ConfigNameTooLong {
+                length: MAX_CONFIG_NAME_LENGTH + 1
+            })
+        );
+        let yaml = format!("CONFIG_NAME: {too_long}");
+        let err = serde_yaml_ng::from_str::<Config>(&yaml).unwrap_err();
+        assert!(err.to_string().contains("config name"), "got {err}");
+    }
+
+    /// The hand-written SSZ impls must encode exactly what the byte list they
+    /// replaced did, or every `DB_VERSION` 4 directory written before them
+    /// would decode into the wrong fields.
+    #[test]
+    fn a_config_name_encodes_as_the_byte_list_it_replaced() {
+        let name = ConfigName::fixed("ethlambda-devnet");
+        let list: SszList<u8, MAX_CONFIG_NAME_LENGTH> =
+            b"ethlambda-devnet".to_vec().try_into().unwrap();
+        assert_eq!(name.to_ssz(), list.to_ssz());
+        assert_eq!(ConfigName::from_ssz_bytes(&list.to_ssz()).unwrap(), name);
+
+        let over_long = vec![b'n'; MAX_CONFIG_NAME_LENGTH + 1];
+        assert!(ConfigName::from_ssz_bytes(&over_long).is_err());
+
+        // Only a corrupt database holds these, and the name survives as text.
+        let not_utf8 = ConfigName::from_ssz_bytes(&[b'a', 0xff]).unwrap();
+        assert_eq!(not_utf8.as_str(), "a\u{fffd}");
     }
 
     #[test]
