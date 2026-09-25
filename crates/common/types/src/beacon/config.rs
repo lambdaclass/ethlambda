@@ -917,11 +917,14 @@ impl Config {
             min_epochs_for_data_column_sidecars_requests: 4_096,
             subnets_per_node: 2,
 
-            deposit_chain_id: 1,
-            deposit_network_id: 1,
+            // configs/minimal.yaml: Ethereum Goerli testnet's chain and
+            // network id, not mainnet's; the contract address is not
+            // Goerli's real one, just the file's own repeating placeholder.
+            deposit_chain_id: 5,
+            deposit_network_id: 5,
             deposit_contract_address: [
-                0x00, 0x00, 0x00, 0x00, 0x21, 0x9a, 0xb5, 0x40, 0x35, 0x6c, 0xbb, 0x83, 0x9c, 0xbe,
-                0x05, 0x30, 0x3d, 0x77, 0x05, 0xfa,
+                0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78, 0x90, 0x12, 0x34, 0x56, 0x78,
+                0x90, 0x12, 0x34, 0x56, 0x78, 0x90,
             ],
 
             balance_per_additional_custody_group: 32_000_000_000,
@@ -930,7 +933,7 @@ impl Config {
             samples_per_slot: 8,
             validator_custody_requirement: 8,
 
-            consolidation_churn_limit_quotient: 65_536,
+            consolidation_churn_limit_quotient: 32,
 
             attestation_subnet_prefix_bits: 6,
             max_request_blob_sidecars: 768,
