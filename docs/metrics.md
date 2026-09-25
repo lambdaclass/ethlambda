@@ -428,6 +428,54 @@ uncapped, so that gauge is also the only warning that a peer is parking
 sidecars under parents it never means to supply: each one holds a
 `Table::PendingDataColumns` row until finality passes its slot.
 
+### Beacon Aggregate Attestations
+
+`ethlambda beacon` applies `beacon_aggregate_and_proof` to fork choice, which is
+how it sees votes for the current head rather than only the votes a block body
+carries (see
+[beacon_wire.md](./beacon_wire.md#aggregate-attestations)). These are
+ethlambda-specific, not part of the leanMetrics spec, and lean nodes never emit
+them.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_aggregate_decode_seconds` | Histogram | Time the p2p actor spent decoding one aggregate off the wire | On each successful decode in the gossip handler | | 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05 |
+| `lean_beacon_aggregate_mailbox_wait_seconds` | Histogram | Time an aggregate spent in the chain actor's mailbox | On the chain actor taking one off the mailbox | | 0.0005 … 2.5 |
+| `lean_beacon_aggregate_processing_seconds` | Histogram | Time the chain actor spent in `on_gossip_aggregate` | On each aggregate the actor processed, applied or not | | 0.0005 … 2.5 |
+| `lean_beacon_aggregate_end_to_end_seconds` | Histogram | Wire to fork choice, for aggregates applied on arrival | On applying an aggregate that was not deferred | | 0.0005 … 2.5 |
+| `lean_beacon_aggregate_total` | Counter | Aggregates by outcome | On each aggregate reaching a verdict | outcome=applied,invalid,known_subset,known_aggregator,queue_full | |
+| `lean_beacon_aggregates_deferred` | Gauge | Aggregates held until their own slot has passed | On every defer and every per-slot drain | | |
+
+The four histograms exist because the per-aggregate amortizations were
+deliberately left unbuilt: each aggregate pays its own `Table::LiveChain` scan
+and its own `EpochCommittees` build, which is affordable only while the
+seen-set gates keep the surviving volume low. Deferring that work is safe only
+while its cost is visible, and without these the symptom would be an
+unexplained head lag. They are split across the two actors on purpose:
+`decode` is the p2p actor's and the other three are the chain actor's, so a
+slow aggregate is attributable to a layer rather than guessed at.
+
+**Watch `lean_beacon_aggregate_mailbox_wait_seconds`.** It is the failure mode
+this path introduces and the one no other timing can show: a mainnet slot
+carries up to `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE`
+aggregates, and if they queue behind block imports their votes arrive too late
+to move the head while every per-aggregate timing still looks healthy.
+
+**Read `lean_beacon_aggregate_total{outcome}` as a ratio, not a rate.**
+`known_subset` dominating is the design working: a committee's aggregators
+mostly converge on the same votes, and each one the running union already covers
+is dropped before three signature verifications rather than after. `applied`
+falling toward zero while `known_subset` stays high means the node is seeing
+only aggregates it has already covered, which is normal; `invalid` climbing
+means the aggregates reaching fork choice are failing their conditions, most
+often because this node has not imported the block being voted for.
+
+**`queue_full` should be zero.** The deferral queue holds two slots' worth, and
+reaching its cap means aggregates are arriving faster than the once-per-slot
+drain clears them. Read it beside `lean_beacon_aggregates_deferred`, which sits
+near one slot's worth in the steady state and near the cap when the drain is
+falling behind.
+
 ### Attestation Aggregate Coverage
 
 Observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section (the `section` label). The slot is the X-axis. These are sampled roughly once per slot, but emission is gated by the section's source data, so a gauge can retain its previous value:

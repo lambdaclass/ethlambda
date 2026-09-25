@@ -230,6 +230,10 @@ pub const SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY: u64 = 128;
 /// How many aggregators the protocol aims for per attestation committee.
 /// `is_aggregator` selects a validator when its selection proof hashes to zero
 /// modulo `committee_length / TARGET_AGGREGATORS_PER_COMMITTEE`.
+///
+/// It also fixes the volume this node receives on
+/// `beacon_aggregate_and_proof`: `MAX_COMMITTEES_PER_SLOT` committees each
+/// selecting this many aggregators is the per-slot upper bound.
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
 /// The sync committee counterpart of [`TARGET_AGGREGATORS_PER_COMMITTEE`]:

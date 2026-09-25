@@ -9,6 +9,7 @@
 use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 
@@ -150,6 +151,9 @@ pub fn connection_limits(target_peers: usize) -> libp2p::connection_limits::Beha
 /// that derivation must use the schedule the fork digest was computed from.
 pub struct BeaconWireConfig {
     pub fork_digest: ForkDigest,
+    /// The fork `fork_digest` was computed at. See
+    /// [`BeaconWire::fork`](crate::beacon::BeaconWire).
+    pub fork: ForkName,
     pub config: Config,
     pub genesis_time: u64,
     /// The chain the digests are bound to. See
@@ -159,6 +163,14 @@ pub struct BeaconWireConfig {
     /// node id. Both the subnet subscription and the availability check read
     /// this, so the node cannot subscribe to one set and require another.
     pub custody_columns: Vec<u64>,
+    /// The attestation subnets this node backbones, computed once at startup
+    /// from the same node id.
+    ///
+    /// Carried rather than derived here for the reason `custody_columns` is:
+    /// the ENR's `attnets` bits and the gossip subscription have to name one
+    /// set, and a peer computes the same set from this node's id, so deriving
+    /// it twice is how the two would come to disagree.
+    pub attestation_subnets: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -264,10 +276,12 @@ mod tests {
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
             wire: crate::WireConfig::Beacon(Box::new(BeaconWireConfig {
                 fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+                fork: ForkName::Fulu,
                 config: Config::mainnet(),
                 genesis_time: 1_606_824_023,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: custody_columns.clone(),
+                attestation_subnets: Vec::new(),
             })),
         })
         .expect("swarm builds");

@@ -108,10 +108,10 @@ fn count_drop(outcome: Outcome) {
 mod tests {
     use std::sync::Arc;
 
-    use ethlambda_network_api::{BlockArrival, BlockSource, P2PToBlockChain};
+    use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource, P2PToBlockChain};
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::SignedBeaconBlock;
+    use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock};
     use spawned_concurrency::error::ActorError;
     use tokio::sync::mpsc;
 
@@ -158,6 +158,13 @@ mod tests {
             sidecars: Vec<DataColumnSidecar>,
         ) -> Result<(), ActorError> {
             let _ = self.0.send(Forwarded::AwaitingParent(sidecars));
+            Ok(())
+        }
+        fn new_beacon_aggregate(
+            &self,
+            _aggregate: Box<SignedAggregateAndProof>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
             Ok(())
         }
     }

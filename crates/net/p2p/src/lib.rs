@@ -813,7 +813,11 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                     column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
                 })
                 .collect();
-            let topics = beacon::topics::BeaconTopics::new(beacon.fork_digest, &column_subnets);
+            let topics = beacon::topics::BeaconTopics::new(
+                beacon.fork_digest,
+                &column_subnets,
+                &beacon.attestation_subnets,
+            );
             for topic in &topics.topics {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
                 info!(topic = %topic, "Subscribed to beacon topic");
@@ -824,17 +828,20 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 fork_digest = %hex::encode(beacon.fork_digest),
                 topics = topics.topics.len(),
                 columns = beacon.custody_columns.len(),
+                attestation_subnets = ?beacon.attestation_subnets,
                 "Beacon P2P node started"
             );
 
             Wire::Beacon(Box::new(beacon::BeaconWire {
                 fork_digest: beacon.fork_digest,
+                fork: beacon.fork,
                 topics,
                 config: beacon.config,
                 genesis_time: beacon.genesis_time,
                 genesis_validators_root: beacon.genesis_validators_root,
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
+                attestation_subnets: beacon.attestation_subnets,
             }))
         }
     };
@@ -2158,10 +2165,12 @@ pub(crate) mod test_support {
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
             wire: WireConfig::Beacon(Box::new(BeaconWireConfig {
                 fork_digest: [0u8; 4],
+                fork: config.fork_at_epoch(0),
                 config: config.clone(),
                 genesis_time: config.genesis_time,
                 genesis_validators_root: Root::ZERO,
                 custody_columns: Vec::new(),
+                attestation_subnets: Vec::new(),
             })),
         })
         .expect("swarm builds");
@@ -2501,6 +2510,7 @@ mod tests {
         use crate::beacon::protocols;
         use crate::req_resp::{Response, ResponsePayload};
         use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::fork::ForkName;
         use ethlambda_types::beacon::primitives::Root;
         use libp2p::request_response::{self, ResponseChannel};
 
@@ -2512,10 +2522,12 @@ mod tests {
                 target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
                 wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
                     fork_digest: [0x11, 0x22, 0x33, 0x44],
+                    fork: ForkName::Fulu,
                     config: Config::mainnet(),
                     genesis_time: 0,
                     genesis_validators_root: Root::ZERO,
                     custody_columns: Vec::new(),
+                    attestation_subnets: Vec::new(),
                 })),
             })
             .expect("swarm builds")

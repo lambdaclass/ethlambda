@@ -593,3 +593,25 @@ pub fn set_custody_column_peers(column: u64, peers: usize) {
         .with_label_values(&[&column.to_string()])
         .set(peers as i64);
 }
+
+/// How long this actor spent turning one aggregate's bytes into a container.
+///
+/// The first section of the aggregate path, and the only one that happens
+/// before the chain actor's mailbox. Its two siblings
+/// (`lean_beacon_aggregate_mailbox_wait_seconds` and
+/// `lean_beacon_aggregate_processing_seconds`) live in `ethlambda-blockchain`,
+/// where the rest of the path runs; together the three say which layer a slow
+/// aggregate was slow in.
+pub fn observe_beacon_aggregate_decode(duration: std::time::Duration) {
+    static LEAN_BEACON_AGGREGATE_DECODE_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_aggregate_decode_seconds",
+            "Time spent decoding one gossip aggregate off the wire",
+            vec![
+                0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05
+            ]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_AGGREGATE_DECODE_SECONDS.observe(duration.as_secs_f64());
+}

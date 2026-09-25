@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar},
     block::SignedBlock,
     primitives::H256,
 };
@@ -217,6 +217,49 @@ pub trait P2PToBlockChain: Send + Sync {
         &self,
         sidecars: Vec<DataColumnSidecar>,
     ) -> Result<(), ActorError>;
+    /// A beacon aggregate that passed the checks needing nothing but a clock.
+    ///
+    /// Separate from [`Self::new_aggregated_attestation`], which carries
+    /// lean's unrelated [`SignedAggregatedAttestation`]: the two chains'
+    /// aggregate containers share no type, so unlike [`Self::new_block`] there
+    /// is nothing for one message to be generic over.
+    ///
+    /// Boxed for the reason `ethlambda-p2p`'s own gossip enum boxes it: two
+    /// signed block headers' worth of payload would otherwise set the size of
+    /// every message in this protocol.
+    ///
+    /// One aggregate per message rather than a batch, unlike
+    /// [`Self::new_data_column_sidecars`]: gossip is the only producer, and it
+    /// has exactly one to hand.
+    fn new_beacon_aggregate(
+        &self,
+        aggregate: Box<SignedAggregateAndProof>,
+        arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+}
+
+/// When an aggregate reached this node, for the one metric that cannot be
+/// derived on the far side of the mailbox.
+///
+/// The mailbox hop is the failure mode applying gossip aggregates introduces:
+/// this topic carries up to `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE`
+/// messages a slot, and if they start queueing behind block imports the votes
+/// arrive too late to move the head while every per-aggregate timing still
+/// looks healthy. Measuring it means capturing an instant before the queue and
+/// reading it after, which is what this carries.
+///
+/// [`BlockArrival`]'s shape without its `deferred_from`: an aggregate held for
+/// a slot that has not started is held *inside* the chain actor, so that wait
+/// is measured where it happens rather than travelling on the message. And
+/// `decode_start` is not optional here, because gossip is the only producer
+/// and it always decodes the payload itself.
+#[derive(Clone, Copy, Debug)]
+pub struct AggregateArrival {
+    /// The payload came off the wire, before decompression.
+    pub decode_start: Instant,
+    /// The aggregate is about to be handed to the chain actor, which is also
+    /// the end of the decode.
+    pub handed_off: Instant,
 }
 
 // --- Init messages ---

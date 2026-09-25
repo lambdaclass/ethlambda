@@ -297,6 +297,16 @@ actual_slot = finalized_slot + 1 + relative_index
   - Mesh size: 8 (6-12 bounds), heartbeat: 700ms
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
   - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there
+  - Beacon subscribes seven global topics plus two node-id-derived subnet families: the
+    columns it custodies, and `SUBNETS_PER_NODE` attestation subnets it backbones.
+    `beacon_aggregate_and_proof` **reaches fork choice**: p2p runs the conditions needing
+    only a clock, the chain actor runs the rest plus the two seen-set gates (those need the
+    verification verdict, since the spec marks an aggregate seen only *after* its signatures
+    verify). Aggregates are held one slot, because `validate_on_attestation` requires
+    `current_slot >= data.slot + 1` and they are published mid-slot; without that queue the
+    topic would apply nothing. The subnet backbone is subscribed and relayed but **not**
+    applied to fork choice and **not** signature-verified, matching a lighthouse follower.
+    See [`docs/beacon_wire.md`](docs/beacon_wire.md)
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
@@ -555,6 +565,17 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `ethlambda-blockchain`, `ethlambda-rpc` and `ethlambda-test-fixtures` all
   depend on this crate. That is the cost of one crate holding both chains'
   rules; the module is not feature-gated.
+- Two modules hold `p2p-interface.md` rather than `fork-choice.md` rules, and
+  each is here for a reason of its own. `aggregate.rs` (`is_aggregator` plus the
+  `beacon_aggregate_and_proof` conditions) takes a `BeaconState`, so it could
+  not live in the p2p crate; the handler that calls it,
+  `fork_choice::on_gossip_aggregate`, stays with its spec siblings in
+  `fork_choice.rs`. `das.rs` needs no state, but the `networking` fixture suite
+  has handlers for `get_custody_groups` and
+  `compute_columns_for_custody_group`, and that runner lives in this crate's
+  `tests/beacon_spec/`. The attestation-subnet counterpart is neither, so it
+  lives with the wire code it serves, in `ethlambda-p2p`'s
+  `beacon::subnets`.
 - Tests: `make test-beacon` (builds once per preset), or `test-beacon-mainnet` /
   `test-beacon-minimal` for one. CI runs the two as a job each, so they build and
   run concurrently. `make test` covers the whole

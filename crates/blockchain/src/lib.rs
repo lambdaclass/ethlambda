@@ -1,6 +1,7 @@
 use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as EnginePayloadStatus};
 use ethlambda_network_api::{
-    BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest, InitP2P,
+    AggregateArrival, BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest,
+    InitP2P,
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
@@ -14,7 +15,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{SignedBeaconBlock, fulu},
+        containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
         preset,
     },
     block::SignedBlock,
@@ -50,6 +51,7 @@ use crate::store::StoreError;
 pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
+mod beacon_aggregates;
 pub mod beacon_engine;
 pub mod block_builder;
 pub(crate) mod coverage;
@@ -378,6 +380,7 @@ impl BlockChain {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            beacon_aggregates: Default::default(),
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
@@ -513,6 +516,12 @@ pub struct BlockChainServer {
     /// Chain-event publication bus. The actor is the sole publisher; consumers
     /// only subscribe, preserving the one-directional write flow.
     events: EventBus,
+
+    /// The `beacon_aggregate_and_proof` seen-sets and deferral queue. Always
+    /// empty on lean, which subscribes to no such topic. See
+    /// [`crate::beacon_aggregates`] for why all three live on the actor rather
+    /// than in the p2p layer that first sees an aggregate.
+    beacon_aggregates: crate::beacon_aggregates::AggregateGossip,
 
     /// Committee shufflings shared across everything that asks a beacon state
     /// which validators attest at a slot: the state transition as it processes
@@ -948,6 +957,11 @@ impl BlockChainServer {
                 // proposer boost and pulls up unrealized checkpoints for each
                 // slot it skipped, not just the latest one.
                 fork_choice::on_tick(&mut self.store, timestamp_ms / 1000, &config);
+                // Between the clock and the head: an aggregate for the slot
+                // that just ended becomes applicable exactly now, and its
+                // votes have to be in fork choice before the head this tick
+                // reports is chosen.
+                self.drain_deferred_aggregates();
                 self.recompute_beacon_head().await;
             }
         }
@@ -1872,6 +1886,7 @@ impl BlockChainServer {
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
             committees: CommitteeCache::default(),
+            beacon_aggregates: Default::default(),
         }
     }
 
@@ -2148,6 +2163,125 @@ impl BlockChainServer {
             timings.fcu_end = Some(end);
         }
         timings
+    }
+
+    /// Apply a gossip aggregate, or hold it until its own slot has passed.
+    ///
+    /// The seen-set gates run first, before anything expensive: a valid
+    /// aggregate whose votes are already covered is the common case on this
+    /// topic, since a committee's sixteen aggregators mostly converge on the
+    /// same bits, and dropping one here costs a hash and two lookups instead
+    /// of three signature verifications.
+    ///
+    /// The hold is not an optimization. `validate_on_attestation` requires
+    /// `get_current_slot(store) >= data.slot + 1`, and aggregates are
+    /// published two thirds of the way through the slot they vote for, so
+    /// every one of them arrives too early. Applying only what is already late
+    /// would be applying almost nothing.
+    fn on_gossip_beacon_aggregate(
+        &mut self,
+        aggregate: Box<SignedAggregateAndProof>,
+        arrival: AggregateArrival,
+    ) {
+        if let Some(dropped) = self.beacon_aggregates.already_covered(&aggregate) {
+            metrics::inc_beacon_aggregate_outcome(dropped.label());
+            return;
+        }
+
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        if current_slot < aggregate.slot().saturating_add(1) {
+            if let Some(dropped) = self.beacon_aggregates.defer(aggregate) {
+                metrics::inc_beacon_aggregate_outcome(dropped.label());
+            }
+            metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
+            return;
+        }
+
+        self.apply_beacon_aggregate(&aggregate, Some(arrival));
+    }
+
+    /// Run one aggregate through fork choice and record what became of it.
+    ///
+    /// The seen-sets are written here, on success only, which is the ordering
+    /// the specification and lighthouse both have: an aggregate that failed
+    /// its signatures must not be able to mark its claimed aggregator as seen,
+    /// or one forged message censors that aggregator's real one for the epoch.
+    ///
+    /// `arrival` is `Some` only on the path that applies an aggregate as it
+    /// arrives. A drained one waits a deliberate slot for its own slot to
+    /// pass, so reporting its end-to-end time would report that design as
+    /// latency.
+    fn apply_beacon_aggregate(
+        &mut self,
+        aggregate: &SignedAggregateAndProof,
+        arrival: Option<AggregateArrival>,
+    ) {
+        let started = Instant::now();
+        let config = self.store.config();
+        let outcome = fork_choice::on_gossip_aggregate(
+            &mut self.store,
+            aggregate,
+            &config,
+            &mut self.committees,
+        );
+        metrics::observe_beacon_aggregate_processing(started.elapsed());
+        if let Some(arrival) = arrival {
+            metrics::observe_beacon_aggregate_end_to_end(arrival.decode_start.elapsed());
+        }
+
+        match outcome {
+            Ok(()) => {
+                self.beacon_aggregates.record(aggregate);
+                metrics::inc_beacon_aggregate_outcome("applied");
+            }
+            // Expected in normal operation rather than a defect: a
+            // checkpoint-synced follower sees aggregates naming targets below
+            // its anchor, and any peer may send one for a block this node has
+            // not imported yet.
+            Err(err) => {
+                trace!(
+                    slot = aggregate.slot(),
+                    aggregator = aggregate.aggregator_index(),
+                    ?err,
+                    "Ignoring an unusable gossip aggregate"
+                );
+                metrics::inc_beacon_aggregate_outcome("invalid");
+            }
+        }
+    }
+
+    /// Apply every held aggregate whose slot has now passed, and prune what
+    /// finality has put out of reach.
+    ///
+    /// Called once per beacon tick, between the store clock advancing and the
+    /// head being recomputed, so the votes released here are in fork choice
+    /// before the head this tick reports is chosen.
+    fn drain_deferred_aggregates(&mut self) {
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+
+        let finalized_epoch = self.store.beacon_finalized_checkpoint().epoch;
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists")
+            .slot;
+        self.beacon_aggregates
+            .prune(finalized_epoch, finalized_slot);
+
+        for entry in self.beacon_aggregates.take_ready(current_slot) {
+            // Re-checked rather than trusted from when it was held: an
+            // aggregate applied in the meantime may already cover this one, and
+            // that is the whole point of the gate.
+            if let Some(dropped) = self.beacon_aggregates.already_covered(&entry.aggregate) {
+                metrics::inc_beacon_aggregate_outcome(dropped.label());
+                continue;
+            }
+            self.apply_beacon_aggregate(&entry.aggregate, None);
+        }
+
+        metrics::update_beacon_aggregates_deferred(self.beacon_aggregates.deferred_len());
     }
 
     /// Re-run beacon fork choice, write the head it finds, and republish the
@@ -3490,8 +3624,8 @@ impl BlockChainServer {
 // --- Manual Handler impls for network-api messages ---
 
 use ethlambda_network_api::p2p_to_block_chain::{
-    DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBlock,
-    NewDataColumnSidecars,
+    DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
+    NewBlock, NewDataColumnSidecars,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3655,6 +3789,22 @@ impl Handler<NewDataColumnSidecars> for BlockChainServer {
 impl Handler<DataColumnSidecarsAwaitingParent> for BlockChainServer {
     async fn handle(&mut self, msg: DataColumnSidecarsAwaitingParent, _ctx: &Context<Self>) {
         self.park_data_columns(msg.sidecars);
+    }
+}
+
+impl Handler<NewBeaconAggregate> for BlockChainServer {
+    async fn handle(&mut self, msg: NewBeaconAggregate, _ctx: &Context<Self>) {
+        // Beacon-only: nothing subscribes a lean node to this topic, so a
+        // message here would be a dispatch bug rather than a chain that has
+        // nothing to do with it. Dropped rather than panicked on, the way
+        // every other handler treats a message for the other chain.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        // Read before anything else: this is the wait no timing on the far
+        // side of the mailbox can see, and it is where a backlog would show.
+        metrics::observe_beacon_aggregate_mailbox_wait(msg.arrival.handed_off.elapsed());
+        self.on_gossip_beacon_aggregate(msg.aggregate, msg.arrival);
     }
 }
 
@@ -4079,6 +4229,7 @@ mod tests {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            beacon_aggregates: Default::default(),
             custody_columns: Vec::new(),
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,

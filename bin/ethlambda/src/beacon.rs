@@ -236,22 +236,40 @@ pub fn wire_params(
         );
     }
 
+    // The same node id again, and the same consequence of an ephemeral one:
+    // `p2p-interface.md` makes this a public function of the node id so that a
+    // peer can compute what this node should be listening to from its ENR
+    // alone. Computed at the current epoch and then kept for the process's
+    // lifetime; see `subnets`'s module documentation for why this does not
+    // rotate.
+    let attestation_subnets =
+        ethlambda_p2p::beacon::subnets::compute_subscribed_subnets(node_id, epoch, &chain)
+            .map_err(|err| eyre::eyre!("computing the attestation subnet backbone: {err:?}"))?;
+    info!(
+        subnets_per_node = chain.subnets_per_node,
+        subnets = ?attestation_subnets,
+        "Backboning attestation subnets"
+    );
+
     // Say plainly what is still advertised without being backed by behavior,
     // so a running node never implies more than it does. Storing and serving
-    // the custodied columns logged above is no longer in that gap; attestation
-    // and sync committee subnet subscription, and publishing, still are.
+    // the custodied columns logged above is no longer in that gap, and neither
+    // is the attestation subnet backbone; sync committee subnet subscription,
+    // and publishing, still are.
     warn!(
-        "Advertising cgc={custody_group_count} while subscribing to no attestation or \
-         sync committee subnet, and publishing nothing"
+        "Advertising cgc={custody_group_count} while subscribing to no sync committee \
+         subnet, and publishing nothing"
     );
 
     Ok(BeaconWireParams {
         wire: BeaconWireConfig {
             fork_digest: fork_id.fork_digest,
+            fork,
             config: chain,
             genesis_time: genesis.genesis_time,
             genesis_validators_root: genesis.genesis_validators_root,
             custody_columns,
+            attestation_subnets,
         },
         fork_id,
     })
@@ -335,6 +353,9 @@ mod tests {
         // The digest is whatever fork the wall clock lands in, so it is not
         // pinned here; that it agrees with the ENR entry is the invariant.
         assert_eq!(params.wire.fork_digest, params.fork_id.fork_digest);
+        // Mainnet's wall clock is past fulu and no later fork is defined, so
+        // fulu is the only fork the wire can name.
+        assert_eq!(params.wire.fork, ForkName::Fulu);
     }
 
     /// Two node ids sampling the same size select different columns: this is
