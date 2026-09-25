@@ -128,6 +128,13 @@ Fork choice head update
   already accounts for it. A FAILED proof does leave the pool untouched and will be picked
   again, which is accepted; the failure branch sleeps `WORKER_IDLE_POLL` so a proof that
   fails cheaply cannot spin the thread
+- `select_best_job` scores child selection through the subnet window
+  (`AggregationWindowConfig`: duty subnet, committee count, `--skip-redundant-aggregation`),
+  handed over inside `WorkerConfig`. Because the worker stores its own proof at once, the
+  window can widen within a slot, not only across slots
+- Window metrics go through `WindowTally` and are emitted ONLY for a selection round that
+  picks a job. Do NOT meter inside `build_candidate`: idle rounds repeat every
+  `WORKER_IDLE_POLL`, so per-derivation metering scales the series with the poll rate
 
 ### State Transition Phases
 1. **process_slots()**: Advance through empty slots, update historical roots

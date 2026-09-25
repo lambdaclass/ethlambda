@@ -149,9 +149,9 @@ const _: () = assert!(
 
 /// A single pre-prepared aggregation group.
 ///
-/// Built on the actor thread from a store snapshot; consumed by an off-thread
-/// worker that only needs to run the expensive `aggregate_mixed` call. Holding
-/// this struct requires no store access.
+/// Built by [`select_best_job`] from the worker's own store reads; everything
+/// [`aggregate_job`] needs for the expensive `aggregate_mixed` call is in here,
+/// so proving it requires no store access.
 pub struct AggregationJob {
     pub(crate) hashed: HashedAttestationData,
     pub(crate) slot: u64,
@@ -181,8 +181,9 @@ impl AggregationJob {
     }
 }
 
-/// Result of one successful aggregation group. Carried back to the actor thread
-/// as a message payload so the store can be updated and gossip publish fired.
+/// Result of one successful aggregation group. The worker writes it into its
+/// own store handle through [`store_aggregate`], which hands the actor only an
+/// [`AggregateProduced`] naming the proof.
 pub struct AggregatedGroupOutput {
     pub(crate) hashed: HashedAttestationData,
     pub(crate) proof: SingleMessageAggregate,
@@ -1065,8 +1066,8 @@ fn resolve_child_pubkeys(
 
 /// Run the expensive `aggregate_mixed` call for a single prepared job.
 ///
-/// Pure function — no store access, safe to call from a `tokio::task::spawn_blocking`
-/// worker. Returns `None` on cryptographic failure.
+/// Pure function — no store access, so the worker thread runs it without
+/// holding any lock. Returns `None` on cryptographic failure.
 pub fn aggregate_job(job: AggregationJob) -> Option<AggregatedGroupOutput> {
     if job.raw_ids.is_empty() && job.children.len() < 2 {
         return None;

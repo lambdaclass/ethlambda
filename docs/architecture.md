@@ -103,10 +103,11 @@ buffers — and loops: rank the pool's candidates by consensus value, prove the 
 it to the actor as an `AggregateProduced` message, rank again. Idle rounds sleep
 `WORKER_IDLE_POLL` before re-reading the pool.
 
-The actor applies each aggregate to the store the moment it arrives, so the pool the worker
-re-reads already accounts for it, but buffers the gossip publication until interval 2. That
-splits the two concerns the old per-slot session conflated: proving runs whenever there is
-work, publication stays on the interval grid.
+The worker stores each aggregate itself before announcing it, so the pool its next round
+re-reads already accounts for it, and the message carries only the participant set naming
+the proof, never the proof. The actor buffers those names and gossips the proofs at interval
+2, reading them back out of the pool. That splits the two concerns the old per-slot session
+conflated: proving runs whenever there is work, publication stays on the interval grid.
 
 What the worker may take up is a function of where the slot is (`JobPolicy`). Early on it
 works the backlog — stale groups, merges of proofs already in the pool — and takes a
@@ -147,6 +148,13 @@ narrowest window then leaves it aggregating those instead of merging other aggre
 proofs. The price is that two aggregators reading one lopsided pool can derive different
 widths, so their windows nest rather than tile; that costs a round of climbing, not
 correctness.
+
+Because the worker stores each proof in the pool as soon as it finishes, a data root can
+climb within a single slot: once this node's first proof for the slot lands, a later round
+for the same data (a re-prove folding in a late signature, or a merge with a peer's proof)
+anchors on it and works through a wider window. Under `--skip-redundant-aggregation`
+(below) that means a late signature can wait for a slot in which this node owns the wider
+width, rather than being folded in straight away.
 
 A window can still decline a merge the unwindowed pool would have allowed, when the proof pool
 is sparse relative to the window's contiguous span (a strided aggregator placement is the
