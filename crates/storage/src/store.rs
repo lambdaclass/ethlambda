@@ -171,7 +171,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 ///
 /// 4 added `PRESET_BASE` and `CONFIG_NAME` to `Config`, at the front of its
 /// encoding, for the same reason and with the same consequence as 3.
-pub const DB_VERSION: u64 = 4;
+///
+/// 5 widened `Config` with the gloas schedule, timing and churn keys
+/// (`max_request_payloads` was already claimed before this version bump), so a
+/// directory written by version 4 decodes into the wrong fields.
+pub const DB_VERSION: u64 = 5;
 
 /// The consensus protocol a data directory holds.
 ///

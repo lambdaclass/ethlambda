@@ -163,6 +163,15 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => get_next_sync_committee_indices(state)?,
+        // Almost certainly reuses electra's indices function, the way fulu
+        // does, since gloas keeps electra's effective-balance ceiling. Left
+        // as an explicit gap rather than assumed; a later task ports it.
+        ForkName::Gloas => {
+            return Err(Error::UnsupportedForFork {
+                function: "get_next_sync_committee",
+                fork: ForkName::Gloas,
+            });
+        }
         ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),
     };
     let mut pubkeys = Vec::with_capacity(indices.len());

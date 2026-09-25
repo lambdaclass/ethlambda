@@ -598,11 +598,15 @@ impl BeaconNodeApi for HttpBeaconNode {
         // so a fork added after fulu is not silently waved through as
         // electra-shaped.
         match fork {
+            // Gloas's own attestation shape is not this client's electra one
+            // (EIP-7549 continues to change under EIP-7688), so it is
+            // refused by name too rather than mis-decoded.
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
+            | ForkName::Gloas
             | ForkName::Lean => {
                 return Err(Error::InconsistentResponse(format!(
                     "node produced a {} aggregate, which this client does not publish; electra \

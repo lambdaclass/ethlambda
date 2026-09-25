@@ -16,7 +16,7 @@ pub use ethlambda_storage::{CommitteeCache, Lookup, ShufflingKey};
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
-use crate::beacon::error::Result;
+use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
 use crate::beacon::lean_state_unreachable;
@@ -366,6 +366,18 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra => {}
+        // Gloas's own `proposer_lookahead` is unchanged from fulu (see
+        // `containers::gloas`'s module doc), so this almost certainly
+        // reduces to `super::fulu::get_beacon_proposer_index` unmodified.
+        // Left as an explicit gap rather than assumed, since ePBS separates
+        // the block proposer from the payload's builder and this repository
+        // has not yet ported that distinction.
+        ForkName::Gloas => {
+            return Err(Error::UnsupportedForFork {
+                function: "get_beacon_proposer_index",
+                fork: ForkName::Gloas,
+            });
+        }
         ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 
@@ -393,6 +405,7 @@ pub fn get_beacon_proposer_index(state: &BeaconState) -> Result<ValidatorIndex> 
             |index| Ok(state.validator(index)?.effective_balance),
         ),
         ForkName::Fulu => unreachable!("Fulu returns via the dispatch match above"),
+        ForkName::Gloas => unreachable!("Gloas returns via the dispatch match above"),
         ForkName::Lean => lean_state_unreachable("get_beacon_proposer_index"),
     }
 }

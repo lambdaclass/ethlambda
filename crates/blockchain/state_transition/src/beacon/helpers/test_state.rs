@@ -140,6 +140,13 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Deneb => BeaconState::Deneb(deneb_state(count)),
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
+        // No gloas literal builder exists yet: its registry is progressive
+        // rather than bounded (see `containers::gloas`'s module doc), so this
+        // cannot reuse `fulu_state`'s placeholder fields unchanged. A later
+        // task adds `gloas_state` alongside the others above.
+        ForkName::Gloas => {
+            unimplemented!("with_validators_at: gloas has no test-state builder yet")
+        }
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
         // whole input.

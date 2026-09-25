@@ -287,6 +287,7 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        ForkName::Gloas => Err("gloas not implemented".into()),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -314,6 +315,7 @@ fn decode_attestation(case: &Case, name: &str) -> Result<fork_choice::Attestatio
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
+        ForkName::Gloas => Err("gloas not implemented".into()),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -333,6 +335,7 @@ fn decode_attester_slashing(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
+        ForkName::Gloas => Err("gloas not implemented".into()),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }

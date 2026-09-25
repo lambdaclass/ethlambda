@@ -841,6 +841,15 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Deneb => upgrade_to_deneb(state, config),
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
+        // `upgrade_to_gloas` does not exist yet: EIP-7688 replaces the
+        // registry's list kind and EIP-7732 removes
+        // `latest_execution_payload_header` outright, so this is not a
+        // field-by-field carry-over the way `upgrade_to_fulu` is. A later
+        // task writes it.
+        ForkName::Gloas => Err(Error::UnsupportedForFork {
+            function: "upgrade_state",
+            fork: to,
+        }),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),

@@ -160,12 +160,16 @@ of its own the way `node` does: those are read off the resolved network instead
 of being separate operator input. A `config.yaml` (a directory's, or a built-in
 network's embedded one) is read permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
-config, the gloas and heze schedule this build cannot process) are dropped
+config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it. The keys this build runs on compile-time constants for (the
-custody and subnet counts, the `MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the
-snappy message domains and `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
+that would fix it. Sepolia's config schedules gloas, whose keys this build
+does claim but whose state transition it does not implement yet: a separate,
+explicit warning at startup names that boundary, since the chain follower
+stops tracking the chain there regardless of what parsed cleanly. The keys this
+build runs on compile-time constants for (the custody and subnet counts, the
+`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains and
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
 constants, or startup fails naming each key that differs: the node cannot
 follow a network that sets them otherwise, and `/eth/v1/config/spec` would
 report values it does not use. For a directory, both checks run before its

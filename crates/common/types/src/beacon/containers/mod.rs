@@ -77,6 +77,7 @@ macro_rules! dispatch_state {
             BeaconState::Deneb($state) => $body,
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
+            BeaconState::Gloas($state) => $body,
             BeaconState::Lean(_) => lean_state_unreachable($function),
         }
     };
@@ -106,6 +107,7 @@ macro_rules! dispatch_state_including_lean {
             BeaconState::Deneb($state) => $body,
             BeaconState::Electra($state) => $body,
             BeaconState::Fulu($state) => $body,
+            BeaconState::Gloas($state) => $body,
             BeaconState::Lean($state) => $body,
         }
     };
@@ -150,6 +152,7 @@ macro_rules! dispatch_block {
             SignedBeaconBlock::Deneb($block) => $body,
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Lean(_) => lean_block_unreachable($function),
         }
     };
@@ -174,6 +177,7 @@ macro_rules! dispatch_block_including_lean {
             SignedBeaconBlock::Deneb($block) => $body,
             SignedBeaconBlock::Electra($block) => $body,
             SignedBeaconBlock::Fulu($block) => $body,
+            SignedBeaconBlock::Gloas($block) => $body,
             SignedBeaconBlock::Lean($block) => $body,
         }
     };
@@ -199,6 +203,7 @@ pub enum BeaconState {
     Deneb(deneb::BeaconState),
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
+    Gloas(gloas::BeaconState),
     Lean(crate::state::State),
 }
 
@@ -242,6 +247,7 @@ impl serde::Serialize for BeaconState {
             BeaconState::Deneb(state) => state.serialize(serializer),
             BeaconState::Electra(state) => state.serialize(serializer),
             BeaconState::Fulu(state) => state.serialize(serializer),
+            BeaconState::Gloas(state) => state.serialize(serializer),
             BeaconState::Lean(_) => Err(serde::ser::Error::custom(
                 "a lean state has no JSON encoding: /lean/v0/states/finalized serves SSZ only",
             )),
@@ -282,6 +288,7 @@ impl BeaconState {
             BeaconState::Deneb(_) => ForkName::Deneb,
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
+            BeaconState::Gloas(_) => ForkName::Gloas,
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -344,6 +351,9 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
+            ForkName::Gloas => Ok(BeaconState::Gloas(gloas::BeaconState::from_ssz_bytes(
+                bytes,
+            )?)),
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
             )?)),
@@ -518,6 +528,69 @@ impl BeaconState {
     }
 }
 
+/// The registry of whichever list kind this state's fork uses.
+///
+/// Every fork through fulu backs `validators`/`balances` with the bounded,
+/// tree-backed [`List`](ethlambda_ssz_tree::List); gloas (EIP-7688) backs them
+/// with the unbounded, progressively merkleized
+/// [`ProgressiveList`](ethlambda_ssz_tree::ProgressiveList) instead. The two
+/// types share every method this crate calls on them (`len`, `get`, `get_mut`,
+/// `push`, `apply_updates`, `hash_tree_root`, `has_pending_updates`,
+/// `rebase_on`, `ptr_eq`), which is what lets [`dispatch_state!`] keep one body
+/// for most of the accessors below. This enum exists only for the handful that
+/// return the list itself rather than an element: `dispatch_state!`'s
+/// `$body` still has to typecheck as one Rust type across every arm, and
+/// `&Validators` and `&ProgressiveValidators` are not that.
+enum Registry<'a> {
+    Bounded(&'a Validators, &'a Balances),
+    Progressive(&'a ProgressiveValidators, &'a ProgressiveBalances),
+}
+
+/// [`Registry`], mutably. A separate type rather than a lifetime trick on the
+/// same one: an enum cannot hold either `&'a T` or `&'a mut T` depending on
+/// the caller, so [`BeaconState::rebase_on`] needs its own mutable version to
+/// match against.
+enum RegistryMut<'a> {
+    Bounded(&'a mut Validators, &'a mut Balances),
+    Progressive(&'a mut ProgressiveValidators, &'a mut ProgressiveBalances),
+}
+
+/// An iterator over either registry list kind, so [`BeaconState::iter_validators`]
+/// and [`BeaconState::iter_balances`] can promise one return type across every
+/// fork despite [`Registry`]'s two underlying list types having different
+/// concrete iterators. Private like `Registry`/`RegistryMut`: both accessors
+/// hand it back only as the opaque `impl ExactSizeIterator` those two already
+/// promised, so nothing outside this module ever names the concrete type.
+enum RegistryIter<'a, T, U> {
+    Bounded(ethlambda_ssz_tree::Iter<'a, T, U>),
+    Progressive(ethlambda_ssz_tree::ProgressiveIter<'a, T, U>),
+}
+
+impl<'a, T: ethlambda_ssz_tree::Value, U: ethlambda_ssz_tree::UpdateMap<T>> Iterator
+    for RegistryIter<'a, T, U>
+{
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<&'a T> {
+        match self {
+            Self::Bounded(it) => it.next(),
+            Self::Progressive(it) => it.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Bounded(it) => it.size_hint(),
+            Self::Progressive(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<T: ethlambda_ssz_tree::Value, U: ethlambda_ssz_tree::UpdateMap<T>> ExactSizeIterator
+    for RegistryIter<'_, T, U>
+{
+}
+
 impl BeaconState {
     /// The number of validators in the registry.
     pub fn validator_count(&self) -> usize {
@@ -534,16 +607,22 @@ impl BeaconState {
     /// a loop: each `validator()` call redoes the fork dispatch and a tree
     /// descent, where this walks the registry once, sequentially.
     pub fn iter_validators(&self) -> impl ExactSizeIterator<Item = &Validator> {
-        dispatch_state!(self, "iter_validators", |state| state.validators.iter())
+        match self.registry() {
+            Some(Registry::Bounded(v, _)) => RegistryIter::Bounded(v.iter()),
+            Some(Registry::Progressive(v, _)) => RegistryIter::Progressive(v.iter()),
+            None => lean_state_unreachable("iter_validators"),
+        }
     }
 
     /// Every balance, in index order, pending writes included. See
     /// [`Self::iter_validators`] for why this is an iterator.
     pub fn iter_balances(&self) -> impl ExactSizeIterator<Item = Gwei> {
-        dispatch_state!(self, "iter_balances", |state| state
-            .balances
-            .iter()
-            .copied())
+        match self.registry() {
+            Some(Registry::Bounded(_, b)) => RegistryIter::Bounded(b.iter()),
+            Some(Registry::Progressive(_, b)) => RegistryIter::Progressive(b.iter()),
+            None => lean_state_unreachable("iter_balances"),
+        }
+        .copied()
     }
 
     /// The validator at `index`.
@@ -617,20 +696,60 @@ impl BeaconState {
     /// check cannot see.
     pub fn validators_ptr_eq(&self, other: &BeaconState) -> bool {
         match (self.registry(), other.registry()) {
-            (Some((v, _)), Some((ov, _))) => v.ptr_eq(ov),
+            (Some(Registry::Bounded(v, _)), Some(Registry::Bounded(ov, _))) => v.ptr_eq(ov),
+            (Some(Registry::Progressive(v, _)), Some(Registry::Progressive(ov, _))) => v.ptr_eq(ov),
             _ => false,
         }
     }
 
-    /// Both registry lists, or `None` for lean. Private: callers use the
-    /// element accessors above.
-    fn registry(&self) -> Option<(&Validators, &Balances)> {
+    /// Both registry lists, whichever kind this fork uses, or `None` for
+    /// lean. Private: callers use the element accessors above.
+    ///
+    /// Written out as its own match rather than through `dispatch_state!`:
+    /// that macro inserts one `$body` verbatim into every arm, so it needs
+    /// every arm's result to be the same Rust type. `Registry` exists
+    /// precisely because [`Validators`] and [`ProgressiveValidators`] are not
+    /// that type from gloas on.
+    fn registry(&self) -> Option<Registry<'_>> {
         match self {
+            BeaconState::Phase0(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Altair(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Bellatrix(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Capella(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Deneb(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Electra(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Fulu(s) => Some(Registry::Bounded(&s.validators, &s.balances)),
+            BeaconState::Gloas(s) => Some(Registry::Progressive(&s.validators, &s.balances)),
             BeaconState::Lean(_) => None,
-            _ => Some(dispatch_state!(self, "registry", |state| (
-                &state.validators,
-                &state.balances
-            ))),
+        }
+    }
+
+    /// [`Self::registry`], mutably. Kept separate rather than folded into one
+    /// generic helper: the borrow checker needs the `&mut self` match here to
+    /// be visibly distinct from the `&self` one above.
+    fn registry_mut(&mut self) -> Option<RegistryMut<'_>> {
+        match self {
+            BeaconState::Phase0(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Altair(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Bellatrix(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Capella(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Deneb(s) => Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances)),
+            BeaconState::Electra(s) => {
+                Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Fulu(s) => Some(RegistryMut::Bounded(&mut s.validators, &mut s.balances)),
+            BeaconState::Gloas(s) => {
+                Some(RegistryMut::Progressive(&mut s.validators, &mut s.balances))
+            }
+            BeaconState::Lean(_) => None,
         }
     }
 
@@ -662,8 +781,11 @@ impl BeaconState {
     ///
     /// [`apply_pending_mutations`]: BeaconState::apply_pending_mutations
     pub fn has_pending_mutations(&self) -> bool {
-        self.registry()
-            .is_some_and(|(v, b)| v.has_pending_updates() || b.has_pending_updates())
+        match self.registry() {
+            Some(Registry::Bounded(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
+            Some(Registry::Progressive(v, b)) => v.has_pending_updates() || b.has_pending_updates(),
+            None => false,
+        }
     }
 
     /// Makes this state's tree-backed fields share every unchanged subtree
@@ -671,19 +793,32 @@ impl BeaconState {
     /// of the registry. The state's contents do not change, only which
     /// allocations back them.
     ///
-    /// Works across forks, since `validators` and `balances` have one type in
-    /// every fork. A no-op if either state is lean.
+    /// Works across every fork that shares a registry list kind with `base`,
+    /// since `List::rebase_on` and `ProgressiveList::rebase_on` each take a
+    /// `&Self`, not some common trait object. A no-op if either state is
+    /// lean, or if the two disagree on list kind (a gloas state rebased onto
+    /// a pre-gloas one, or vice versa): that pairing only happens across the
+    /// fork boundary itself, where there is no shared tree to reuse anyway.
     pub fn rebase_on(&mut self, base: &BeaconState) {
-        let Some((base_validators, base_balances)) = base.registry() else {
+        let Some(base_registry) = base.registry() else {
             return;
         };
-        if matches!(self, BeaconState::Lean(_)) {
-            return;
+        match (self.registry_mut(), base_registry) {
+            (Some(RegistryMut::Bounded(v, b)), Registry::Bounded(bv, bb)) => {
+                v.rebase_on(bv);
+                b.rebase_on(bb);
+            }
+            (Some(RegistryMut::Progressive(v, b)), Registry::Progressive(bv, bb)) => {
+                v.rebase_on(bv);
+                b.rebase_on(bb);
+            }
+            // Self is lean (no registry at all), or the two states disagree
+            // on list kind: exactly the fork-boundary case this function's
+            // own doc names as a no-op.
+            (None, _)
+            | (Some(RegistryMut::Bounded(..)), Registry::Progressive(..))
+            | (Some(RegistryMut::Progressive(..)), Registry::Bounded(..)) => {}
         }
-        dispatch_state!(self, "rebase_on", |state| {
-            state.validators.rebase_on(base_validators);
-            state.balances.rebase_on(base_balances);
-        })
     }
 
     /// The randao mix for `epoch`, which the specification indexes modulo the
@@ -696,14 +831,17 @@ impl BeaconState {
     /// The withdrawal sweep's cursor: how many withdrawals the chain has ever
     /// made, and which validator the next sweep resumes from.
     ///
-    /// Both exist from capella on, so they cannot join
+    /// Both exist from capella on, gloas included, so they cannot join
     /// `shared_state_accessors`' fork-invariant lists, and they are read
     /// through here rather than through a per-fork projection to a concrete
     /// state struct because the sweep that reads them is genuinely shared: deneb
     /// reuses capella's `get_expected_withdrawals` unchanged, and a projection
     /// returning `&capella::BeaconState` cannot serve a deneb state at all. That
     /// mistake was made once here and cost a runtime `UnsupportedForFork` on
-    /// every deneb block carrying a withdrawal.
+    /// every deneb block carrying a withdrawal. Both fields keep their exact
+    /// pre-gloas types (`WithdrawalIndex`, `ValidatorIndex`), unlike the three
+    /// lists [`Self::altair_validator_lists`] reads, which is why gloas joins
+    /// this accessor's `carried_by` rather than its `absent_from`.
     pub fn withdrawal_cursor(&self) -> Result<(WithdrawalIndex, ValidatorIndex)> {
         dispatch_state_from!(
             self,
@@ -712,7 +850,7 @@ impl BeaconState {
                 state.next_withdrawal_index,
                 state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -726,7 +864,7 @@ impl BeaconState {
                 &mut state.next_withdrawal_index,
                 &mut state.next_withdrawal_validator_index,
             ),
-            carried_by: [Capella, Deneb, Electra, Fulu],
+            carried_by: [Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0, Altair, Bellatrix],
         )
     }
@@ -741,6 +879,15 @@ impl BeaconState {
     /// and fulu all keep the identical three fields, but each is a distinct
     /// Rust type, so a projection typed to return `&altair::BeaconState` can
     /// only ever answer for an altair state.
+    ///
+    /// Gloas is in `absent_from` here, not `carried_by`: EIP-7688 makes all
+    /// three progressive lists, so `gloas::BeaconState`'s own
+    /// `previous_epoch_participation`, `current_epoch_participation` and
+    /// `inactivity_scores` are a different Rust type from every other fork's
+    /// (`ProgressiveList` rather than `SszList`), and this accessor's return
+    /// type is fixed to the pre-gloas one. A gloas caller reaches them through
+    /// a per-fork projection instead, the way `withdrawal_cursor`'s doc above
+    /// explains a projection cannot serve *this* accessor.
     ///
     /// Handed back together rather than one accessor per field for the same
     /// reason [`Self::altair_validator_lists_mut`] does: the fork condition
@@ -759,7 +906,7 @@ impl BeaconState {
                 &state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0],
+            absent_from: [Phase0, Gloas],
         )
     }
 
@@ -796,27 +943,27 @@ impl BeaconState {
                 &mut state.inactivity_scores,
             ),
             carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
-            absent_from: [Phase0],
+            absent_from: [Phase0, Gloas],
         )
     }
 
     /// The current and next sync committee, by reference.
     ///
     /// Both exist from altair on, byte-for-byte the same field in every later
-    /// fork (see, for instance, bellatrix's own state doc), so they cannot
-    /// join `shared_state_accessors`' lists, since phase0 predates sync
-    /// committees entirely. A per-fork projection cannot serve here either:
+    /// fork including gloas (see, for instance, bellatrix's own state doc), so
+    /// they cannot join `shared_state_accessors`' lists, since phase0 predates
+    /// sync committees entirely. A per-fork projection cannot serve here either:
     /// the beacon STF's `stf::altair::process_sync_aggregate` is called for every
-    /// fork from altair through fulu (see that function's own documentation),
+    /// fork from altair on (see that function's own documentation),
     /// and a projection typed to return `&altair::BeaconState` can only ever answer
-    /// for an altair state, not for the bellatrix, capella, deneb, electra, or
-    /// fulu ones the same call site also has to serve.
+    /// for an altair state, not for the bellatrix, capella, deneb, electra,
+    /// fulu, or gloas ones the same call site also has to serve.
     pub fn sync_committees(&self) -> Result<(&altair::SyncCommittee, &altair::SyncCommittee)> {
         dispatch_state_from!(
             self,
             "BeaconState::sync_committees",
             |state| (&state.current_sync_committee, &state.next_sync_committee),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -839,7 +986,7 @@ impl BeaconState {
                 &mut state.current_sync_committee,
                 &mut state.next_sync_committee,
             ),
-            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu],
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
             absent_from: [Phase0],
         )
     }
@@ -1027,6 +1174,7 @@ pub enum SignedBeaconBlock {
     /// Fulu's block. See the enum doc for why this wraps
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
+    Gloas(gloas::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
     ///
@@ -1067,9 +1215,18 @@ impl SignedBeaconBlock {
     ///
     /// Named arms rather than a catch-all `_`, so a fork added to the enum
     /// breaks this match instead of silently defaulting to "no payload".
+    ///
+    /// `None` for [`Self::Gloas`] too, for a different reason than the
+    /// pre-merge forks: ePBS (EIP-7732) removes the payload from the block
+    /// entirely, so a gloas block carries only a builder's *bid* on a payload
+    /// (`signed_execution_payload_bid`), not the payload itself. The block's
+    /// own EL hash depends on whether that payload is later revealed and
+    /// attested available, which this accessor, reading only the block,
+    /// cannot answer. Part B replaces this once the payload envelope and
+    /// availability tracking exist.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Lean(_) => None,
+            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Capella(block) => Some(block.message.body.execution_payload.block_hash),
             Self::Deneb(block) => Some(block.message.body.execution_payload.block_hash),
@@ -1084,6 +1241,14 @@ impl SignedBeaconBlock {
     ///
     /// The one body field `beacon_block` gossip validation bounds before it
     /// consults any state.
+    ///
+    /// ePBS (EIP-7732) moves the list out of the body directly: a gloas
+    /// block's commitments live on the builder's bid
+    /// (`signed_execution_payload_bid.message.blob_kzg_commitments`), not on
+    /// a `blob_kzg_commitments` field of the body itself. Unlike
+    /// [`Self::execution_block_hash`], the block still carries this count on
+    /// its own, so it is read from the bid rather than answered with a
+    /// placeholder.
     pub fn blob_kzg_commitment_count(&self) -> usize {
         match self {
             Self::Phase0(_)
@@ -1095,16 +1260,27 @@ impl SignedBeaconBlock {
             Self::Electra(block) | Self::Fulu(block) => {
                 block.message.body.blob_kzg_commitments.len()
             }
+            Self::Gloas(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+                .len(),
         }
     }
 
     /// This block's execution payload timestamp, if it carries a payload.
     ///
     /// `None` before bellatrix, for the same reason as
-    /// [`Self::execution_block_hash`].
+    /// [`Self::execution_block_hash`], and `None` for [`Self::Gloas`] for the
+    /// reason given there too: the builder's bid
+    /// (`signed_execution_payload_bid.message`) carries no `timestamp` field,
+    /// since ePBS's payload envelope, not the block, is what a timestamp
+    /// would describe.
     pub fn execution_payload_timestamp(&self) -> Option<u64> {
         match self {
-            Self::Phase0(_) | Self::Altair(_) | Self::Lean(_) => None,
+            Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
             Self::Bellatrix(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Capella(block) => Some(block.message.body.execution_payload.timestamp),
             Self::Deneb(block) => Some(block.message.body.execution_payload.timestamp),
@@ -1129,6 +1305,7 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Deneb(_) => ForkName::Deneb,
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
+            SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -1161,6 +1338,9 @@ impl SignedBeaconBlock {
             )),
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
+            )),
+            ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(
+                gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
@@ -1379,6 +1559,101 @@ mod tests {
         })
     }
 
+    /// A Gloas state with `count` validators, mirroring [`small_fulu_state`]
+    /// but for gloas's progressive registry
+    /// ([`ProgressiveValidators`]/[`ProgressiveBalances`]) and its own
+    /// builder/payload fields, each at an all-zero or empty placeholder.
+    /// Good enough for the registry accessor tests below, which touch
+    /// `validators`/`balances` only.
+    fn small_gloas_state(count: usize) -> BeaconState {
+        let validators: Vec<Validator> = (0..count)
+            .map(|_| Validator {
+                effective_balance: preset::MAX_EFFECTIVE_BALANCE,
+                activation_eligibility_epoch: 0,
+                activation_epoch: 0,
+                exit_epoch: constants::FAR_FUTURE_EPOCH,
+                withdrawable_epoch: constants::FAR_FUTURE_EPOCH,
+                ..Default::default()
+            })
+            .collect();
+        let zero_root_vector = || -> BlockRoots {
+            vec![Root::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
+                .try_into()
+                .expect("the vector is built at its exact length")
+        };
+        let empty_sync_committee = || altair::SyncCommittee {
+            pubkeys: vec![Default::default(); preset::SYNC_COMMITTEE_SIZE]
+                .try_into()
+                .expect("built at exactly SYNC_COMMITTEE_SIZE"),
+            aggregate_pubkey: Default::default(),
+        };
+        let empty_ptc: gloas::PayloadTimelinessCommittee = vec![0u64; preset::PTC_SIZE]
+            .try_into()
+            .expect("built at exactly PTC_SIZE");
+
+        BeaconState::Gloas(gloas::BeaconState {
+            genesis_time: 0,
+            genesis_validators_root: Root::ZERO,
+            slot: preset::SLOTS_PER_EPOCH,
+            fork: Default::default(),
+            latest_block_header: Default::default(),
+            block_roots: zero_root_vector(),
+            state_roots: zero_root_vector(),
+            historical_roots: Default::default(),
+            eth1_data: Default::default(),
+            eth1_data_votes: Default::default(),
+            eth1_deposit_index: 0,
+            validators: validators.into(),
+            balances: vec![preset::MAX_EFFECTIVE_BALANCE; count].into(),
+            randao_mixes: vec![Bytes32::ZERO; preset::EPOCHS_PER_HISTORICAL_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            slashings: vec![0; preset::EPOCHS_PER_SLASHINGS_VECTOR]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            previous_epoch_participation: vec![0; count].into(),
+            current_epoch_participation: vec![0; count].into(),
+            justification_bits: Default::default(),
+            previous_justified_checkpoint: Default::default(),
+            current_justified_checkpoint: Default::default(),
+            finalized_checkpoint: Default::default(),
+            inactivity_scores: vec![0; count].into(),
+            current_sync_committee: empty_sync_committee(),
+            next_sync_committee: empty_sync_committee(),
+            latest_block_hash: ExecutionBlockHash::ZERO,
+            next_withdrawal_index: 0,
+            next_withdrawal_validator_index: 0,
+            historical_summaries: Default::default(),
+            deposit_requests_start_index: constants::UNSET_DEPOSIT_REQUESTS_START_INDEX,
+            deposit_balance_to_consume: 0,
+            exit_balance_to_consume: 0,
+            earliest_exit_epoch: 0,
+            consolidation_balance_to_consume: 0,
+            earliest_consolidation_epoch: 0,
+            pending_deposits: Default::default(),
+            pending_partial_withdrawals: Default::default(),
+            pending_consolidations: Default::default(),
+            proposer_lookahead: vec![0; preset::PROPOSER_LOOKAHEAD_LENGTH]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+            builders: Default::default(),
+            next_withdrawal_builder_index: 0,
+            execution_payload_availability: Default::default(),
+            builder_pending_payments: vec![
+                gloas::BuilderPendingPayment::default();
+                preset::BUILDER_PENDING_PAYMENTS_LENGTH
+            ]
+            .try_into()
+            .expect("the vector is built at its exact length"),
+            builder_pending_withdrawals: Default::default(),
+            latest_execution_payload_bid: Default::default(),
+            payload_expected_withdrawals: Default::default(),
+            ptc_window: vec![empty_ptc; preset::PTC_WINDOW_LENGTH]
+                .try_into()
+                .expect("the vector is built at its exact length"),
+        })
+    }
+
     #[test]
     fn registry_accessors_read_and_write_elements() {
         let mut state = small_fulu_state(3); // 3 validators, balances 32 ETH
@@ -1415,6 +1690,83 @@ mod tests {
         // just through `validator`.
         state.validator_mut(2).unwrap().effective_balance = 1;
         assert_eq!(state.iter_validators().nth(2).unwrap().effective_balance, 1);
+    }
+
+    /// Same coverage as `registry_accessors_read_and_write_elements`, on a
+    /// gloas state instead of a fulu one: the registry there is a
+    /// [`ethlambda_ssz_tree::ProgressiveList`] (`Registry::Progressive`), not
+    /// a bounded [`List`], and this is what proves the element accessors
+    /// take that arm too rather than only ever exercising
+    /// `Registry::Bounded`.
+    #[test]
+    fn gloas_registry_accessors_read_and_write_elements() {
+        let mut state = small_gloas_state(3); // 3 validators, balances 32 ETH
+        assert_eq!(state.validator_count(), 3);
+        assert_eq!(state.iter_validators().len(), 3);
+        assert_eq!(
+            state.iter_balances().sum::<Gwei>(),
+            3 * preset::MAX_EFFECTIVE_BALANCE
+        );
+
+        *state.balance_mut(1).unwrap() += 5;
+        assert_eq!(state.balance(1).unwrap(), preset::MAX_EFFECTIVE_BALANCE + 5);
+
+        let validator = state.validator(0).unwrap().clone();
+        state.push_validator(validator, 7).unwrap();
+        assert_eq!(state.validator_count(), 4);
+        assert_eq!(state.balance(3).unwrap(), 7);
+        assert!(state.balance_mut(4).is_err());
+        assert!(state.validator(4).is_err());
+
+        assert_eq!(
+            state.iter_balances().collect::<Vec<_>>(),
+            vec![
+                preset::MAX_EFFECTIVE_BALANCE,
+                preset::MAX_EFFECTIVE_BALANCE + 5,
+                preset::MAX_EFFECTIVE_BALANCE,
+                7,
+            ]
+        );
+
+        state.validator_mut(2).unwrap().effective_balance = 1;
+        assert_eq!(state.iter_validators().nth(2).unwrap().effective_balance, 1);
+    }
+
+    /// [`BeaconState::rebase_on`] and [`BeaconState::validators_ptr_eq`]
+    /// across two gloas states: the `Registry::Progressive` arm of both,
+    /// which nothing above exercises. Two independently built states with
+    /// equal content start out backed by different allocations
+    /// (`validators_ptr_eq` false); `rebase_on` shares every subtree the
+    /// content agrees on, so `validators_ptr_eq` becomes true afterward, the
+    /// same invariant the storage crate's tests rely on for a decoded state
+    /// rebased onto its resident parent.
+    #[test]
+    fn gloas_registry_rebases_onto_an_equal_gloas_parent() {
+        let base = small_gloas_state(3);
+        let mut derived = small_gloas_state(3);
+        assert!(!derived.validators_ptr_eq(&base));
+
+        derived.rebase_on(&base);
+        assert!(derived.validators_ptr_eq(&base));
+    }
+
+    /// A fulu state and a gloas state disagree on registry list kind
+    /// (`Registry::Bounded` vs `Registry::Progressive`), which is exactly
+    /// the fork boundary [`BeaconState::rebase_on`]'s own documentation
+    /// describes as a no-op: there is no shared tree to reuse between a
+    /// bounded and a progressive registry. Pins that the mismatch is
+    /// silently inert rather than a panic, and changes nothing about either
+    /// state.
+    #[test]
+    fn a_fulu_and_a_gloas_registry_do_not_rebase_across_the_fork_boundary() {
+        let fulu = small_fulu_state(3);
+        let mut gloas = small_gloas_state(3);
+        let before = gloas.clone();
+
+        gloas.rebase_on(&fulu);
+
+        assert_eq!(gloas, before, "a mixed-kind rebase must be a no-op");
+        assert!(!gloas.validators_ptr_eq(&fulu));
     }
 
     /// Single-validator lean state. The pubkeys are placeholders; nothing here

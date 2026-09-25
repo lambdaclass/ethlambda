@@ -83,6 +83,12 @@ fn apply(
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => epoch::altair::process_rewards_and_penalties(state, config),
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "rewards_and_penalties",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("rewards_and_penalties"),
         },
         // Deneb's own change (EIP-7514's activation-churn cap) is selected
@@ -103,6 +109,12 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_registry_updates(state, config),
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "registry_updates",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("registry_updates"),
         },
         // Altair's and bellatrix's own changes here are scoped to the
@@ -121,6 +133,12 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::registry::process_slashings(state, config),
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "slashings",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("slashings"),
         },
         "eth1_data_reset" => epoch::process_eth1_data_reset(state),
@@ -138,6 +156,12 @@ fn apply(
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => epoch::process_effective_balance_updates(state),
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "effective_balance_updates",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("effective_balance_updates"),
         },
         "slashings_reset" => epoch::process_slashings_reset(state),

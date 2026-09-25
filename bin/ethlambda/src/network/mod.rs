@@ -232,6 +232,34 @@ fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
     config.slot_duration_ms = config.seconds_per_slot * 1_000;
 }
 
+/// Warn at startup when `config` schedules gloas, whichever way this network
+/// was resolved.
+///
+/// Shared by a loaded directory and the built-in networks for the same
+/// reason [`derive_genesis_fields`] is. The ignored-keys warning
+/// (`ConfigFile::warn_about_ignored_keys`) no longer implies this the way it
+/// used to, now that `GLOAS_*` keys are claimed rather than reported as
+/// unknown, so this says it explicitly instead of leaving it to be
+/// discovered as a stall: this build's state transition and fork choice
+/// refuse every gloas block and epoch boundary, so a follower stops making
+/// progress there regardless of how cleanly its config parsed. A loaded
+/// network reaches this the same as a built-in one, and can even schedule
+/// gloas at epoch 0, in which case its own genesis state already decodes as
+/// gloas and `fork_choice::get_forkchoice_store` refuses it outright at
+/// startup; this warning fires first either way.
+fn warn_if_gloas_scheduled(network: &str, config: &Config) {
+    if config.gloas_fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+        tracing::warn!(
+            network,
+            gloas_fork_epoch = config.gloas_fork_epoch,
+            "This build stops following this chain at its gloas fork epoch; \
+             crossing it is not a stall a restart clears, since state_transition \
+             refuses every gloas block and epoch boundary until a later release \
+             implements it"
+        );
+    }
+}
+
 /// A resolved network: everything startup needs before it can build a swarm.
 ///
 /// The built-in arm holds what the binary carries; the loaded arm holds what

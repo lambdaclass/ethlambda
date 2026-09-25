@@ -411,9 +411,15 @@ Hoodi's against fork digests published in their own bootnode ENRs), and at
 runtime by checkpoint sync and resume, which both check the anchor state
 against them. `beacon::tests::the_built_in_network_derives_what_it_always_did`
 pins the parsed mainnet config to `Config::mainnet()`, so the file and the
-Rust constant cannot drift apart. Sepolia's config schedules gloas, which this
-build cannot process, so a Sepolia follower stops tracking the chain at
-`GLOAS_FORK_EPOCH`; the ignored-keys warning at startup names it.
+Rust constant cannot drift apart. Sepolia's config schedules gloas: its
+`GLOAS_*` keys are claimed (`ForkName::Gloas` exists, and `Config` carries the
+fork's schedule, timing and churn fields), but its state transition and fork
+choice do not exist yet, so a Sepolia follower stops tracking the chain at
+`GLOAS_FORK_EPOCH` regardless. `network::warn_if_gloas_scheduled` (shared by
+`BuiltInNetwork::resolve` and a loaded `NetworkDir`) warns about this
+explicitly at startup (checked against `config.gloas_fork_epoch`), separately
+from the ignored-keys warning, which now only ever names heze's keys and
+`GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
 
 A loaded network decodes its own `genesis.ssz` instead, at whatever fork its
 own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, goes
@@ -772,12 +778,13 @@ behavior.
   which is what keeps a parked column from satisfying the availability gate.
   Its only index is the chain actor's in-memory `sidecars_awaiting_parent`, so
   `start_actor` clears the whole table at startup.
-- `DB_VERSION` is 4: `Config` gained `PRESET_BASE` and `CONFIG_NAME` (as
-  `ConfigName`, a bounded string) at the front of its encoding, and it is
-  SSZ-encoded under `KEY_CONFIG`, so a data directory written by an earlier
-  version decodes into the wrong fields. (3 was the runtime keys a
-  `config.yaml` supplies.) `Store::from_db_state` refuses any other version
-  outright; there is no migration.
+- `DB_VERSION` is 5: `Config` gained the gloas schedule, timing and churn
+  keys, and it is SSZ-encoded under `KEY_CONFIG`, so a data directory written
+  by an earlier version decodes into the wrong fields. (4 was `PRESET_BASE` and
+  `CONFIG_NAME`, as `ConfigName`, a bounded string, at the front of the
+  encoding; 3 was the runtime keys a `config.yaml` supplies.)
+  `Store::from_db_state` refuses any other version outright; there is no
+  migration.
 
 ### State Root Computation
 - Always computed via `hash_tree_root()` after full state transition

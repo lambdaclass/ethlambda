@@ -41,6 +41,13 @@ pub struct NewPayloadRequest<'a> {
 /// and `engine_newPayloadV4` would reject their payloads as an unsupported fork
 /// anyway. Supporting them would mean the V1 through V3 methods too, for chains
 /// this follower cannot reach.
+///
+/// Gloas is `None` too, genuinely rather than temporarily: ePBS (EIP-7732)
+/// moves the payload out of the block into a separately gossiped envelope
+/// (see `containers::gloas::SignedExecutionPayloadEnvelope`), so a gloas
+/// block carries nothing this function could ask about at all. A later task
+/// answers the engine question gloas actually asks, from that envelope
+/// rather than from the block.
 pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadRequest<'_>> {
     let inner = match block {
         SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner) => inner,
@@ -49,6 +56,7 @@ pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadReques
         | SignedBeaconBlock::Bellatrix(_)
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Gloas(_)
         | SignedBeaconBlock::Lean(_) => return None,
     };
 

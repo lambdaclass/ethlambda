@@ -24,7 +24,7 @@ pub mod rewards;
 
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::containers::{BeaconState, HistoricalBatch};
-use crate::beacon::error::{Result, verify};
+use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, CommitteeCacheExt, get_block_root, get_block_root_at_slot, get_current_epoch,
@@ -88,6 +88,13 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         ForkName::Deneb => capella::process_epoch(state, config),
         ForkName::Electra => electra::process_epoch(state, config),
         ForkName::Fulu => fulu::process_epoch(state, config),
+        // EIP-7732's builder registry, payment queues, and payload
+        // availability each need their own epoch-boundary steps; a later
+        // task writes gloas's own driver.
+        ForkName::Gloas => Err(Error::UnsupportedForFork {
+            function: "process_epoch",
+            fork: ForkName::Gloas,
+        }),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -116,6 +123,13 @@ pub fn process_justification_and_finalization(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu => altair::process_justification_and_finalization(state),
+        // Almost certainly unchanged from altair (nothing in gloas's own
+        // `beacon-chain.md` section touches justification), but left as an
+        // explicit gap rather than assumed until confirmed against the spec.
+        ForkName::Gloas => Err(Error::UnsupportedForFork {
+            function: "process_justification_and_finalization",
+            fork: ForkName::Gloas,
+        }),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

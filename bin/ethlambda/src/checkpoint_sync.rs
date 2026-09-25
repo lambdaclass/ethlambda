@@ -180,6 +180,17 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
+    /// `get_forkchoice_store` refused the anchor outright because this build
+    /// cannot process its fork yet (currently only gloas): a real anchor, not
+    /// a peer serving a mismatched pair, so it is named separately from
+    /// [`Self::AnchorPairingMismatch`] rather than folded into it.
+    #[error(
+        "this build cannot follow {fork} yet; the anchor is at {fork} and nothing past this \
+         point will import until that support lands"
+    )]
+    UnsupportedFork {
+        fork: ethlambda_types::beacon::fork::ForkName,
+    },
     #[error("no checkpoint urls configured")]
     NoCheckpointUrls,
     #[error("failed to insert anchor signed block into store")]

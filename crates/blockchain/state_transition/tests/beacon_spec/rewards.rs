@@ -153,6 +153,12 @@ fn components(
                 altair_helpers::get_inactivity_penalty_deltas(state, config),
             ),
         ],
+        // Gloas's `previous_epoch_participation`/`current_epoch_participation`
+        // are progressive lists (EIP-7688), a different Rust type from the
+        // `SszList` `altair_helpers::get_flag_index_deltas` reads, so this is
+        // not altair's list unchanged even though the reward rule itself is;
+        // a later task writes gloas's own copy over the progressive type.
+        ForkName::Gloas => return Err("gloas not implemented".into()),
         ForkName::Lean => lean_is_not_a_fixture_fork("rewards"),
     };
 

@@ -82,12 +82,15 @@ pub fn process_operations(
     // Deneb never reaches here: it has its own `process_operations`
     // (`deneb.rs`), which calls its own `process_attestation` for this loop
     // instead of this shared one. Electra and fulu have their own
-    // `process_operations` too (`electra.rs`, which fulu reuses), so all
-    // three are refused rather than guessed at.
+    // `process_operations` too (`electra.rs`, which fulu reuses), and gloas
+    // will need a third (its bodies carry progressive attestations and
+    // slashings, plus the payload-attestation and builder-registry
+    // operations this signature has no parameters for), so all four are
+    // refused rather than guessed at.
     let altair_attestations = match state.fork_name() {
         ForkName::Phase0 => false,
         ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => true,
-        fork @ (ForkName::Deneb | ForkName::Electra | ForkName::Fulu) => {
+        fork @ (ForkName::Deneb | ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_operations",
                 fork,
@@ -438,7 +441,12 @@ pub fn add_validator_to_registry(
     let grows_altair_lists = match state.fork_name() {
         ForkName::Phase0 => false,
         ForkName::Altair | ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => true,
-        fork @ (ForkName::Electra | ForkName::Fulu) => {
+        // Gloas queues deposits the way electra does (see the pending-deposit
+        // queue in `containers::gloas`), and its three altair-onward lists
+        // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
+        // own documentation), so it is refused for both reasons rather than
+        // folded into either branch above.
+        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
             return Err(Error::UnsupportedForFork {
                 function: "add_validator_to_registry",
                 fork,

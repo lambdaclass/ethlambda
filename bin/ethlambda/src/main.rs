@@ -57,7 +57,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
     genesis::{GenesisConfig, verify_state_genesis},
@@ -1471,6 +1471,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch: _,
         fulu_fork_version: _,
         fulu_fork_epoch: _,
+        gloas_fork_version: _,
+        gloas_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1490,6 +1492,15 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         proposer_reorg_cutoff_bps: _,
         sync_message_due_bps: _,
         contribution_due_bps: _,
+        attestation_due_bps_gloas: _,
+        aggregate_due_bps_gloas: _,
+        sync_message_due_bps_gloas: _,
+        contribution_due_bps_gloas: _,
+        payload_due_bps: _,
+        payload_attestation_due_bps: _,
+        // Compared below, alongside `min_validator_withdrawability_delay`:
+        // the builder-registry counterpart, also a state-transition rule.
+        min_builder_withdrawability_delay: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -1502,6 +1513,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         max_per_epoch_activation_churn_limit: _,
         min_per_epoch_churn_limit_electra: _,
         max_per_epoch_activation_exit_churn_limit: _,
+        churn_limit_quotient_gloas: _,
+        max_per_epoch_activation_churn_limit_gloas: _,
 
         // Fork choice: weighting/timing knobs a node applies to its own view
         // of the chain. They change which head a node *prefers*, not which
@@ -1591,9 +1604,12 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch,
         fulu_fork_version,
         fulu_fork_epoch,
+        gloas_fork_version,
+        gloas_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
+        min_builder_withdrawability_delay,
         shard_committee_period,
         inactivity_score_bias,
         inactivity_score_recovery_rate,
@@ -1603,6 +1619,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         max_per_epoch_activation_churn_limit,
         min_per_epoch_churn_limit_electra,
         max_per_epoch_activation_exit_churn_limit,
+        churn_limit_quotient_gloas,
+        max_per_epoch_activation_churn_limit_gloas,
         consolidation_churn_limit_quotient,
         max_blobs_per_block_deneb,
         max_blobs_per_block_electra,
@@ -1612,6 +1630,24 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         deposit_contract_address,
     );
     None
+}
+
+/// Turns a beacon `get_forkchoice_store` failure into the right
+/// [`checkpoint_sync::CheckpointSyncError`]. Keeps
+/// `Error::UnsupportedForFork` (this build genuinely cannot follow the
+/// anchor's own fork, currently only gloas) distinguishable from every other
+/// failure there (a peer serving a mismatched anchor pair): collapsing both
+/// into `AnchorPairingMismatch` would tell an operator to look for a bad peer
+/// when the real answer is "wait for this build to support the fork".
+fn anchor_store_error(
+    err: ethlambda_state_transition::beacon::Error,
+) -> checkpoint_sync::CheckpointSyncError {
+    match err {
+        ethlambda_state_transition::beacon::Error::UnsupportedForFork { fork, .. } => {
+            checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork }
+        }
+        _ => checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch,
+    }
 }
 
 /// Fetch the initial state for a beacon node.
@@ -1779,7 +1815,7 @@ async fn fetch_initial_beacon_state(
         );
         return fork_choice::get_forkchoice_store(backend, state, block, &config)
             .inspect_err(|err| error!(%err, "Failed to initialize store from the genesis state"))
-            .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch);
+            .map_err(anchor_store_error);
     }
 
     info!(?checkpoint_urls, "Starting beacon checkpoint sync");
@@ -1803,7 +1839,7 @@ async fn fetch_initial_beacon_state(
 
     fork_choice::get_forkchoice_store(backend, state, block, &config)
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
-        .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
+        .map_err(anchor_store_error)
 }
 
 /// The block the specification pairs with a genesis anchor state.
@@ -1901,6 +1937,16 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Gloas => SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: gloas::BeaconBlockBody::empty(),
             },
             signature: Default::default(),
         }),
@@ -2580,12 +2626,38 @@ validators:
     /// from genesis still names phase0's empty-body root; it is re-stamped
     /// to each new fork's own empty body below, exactly as a genesis
     /// generator targeting that fork directly would have to.
+    ///
+    /// Stops at fulu: `upgrade_state` has no `upgrade_to_gloas` yet (it
+    /// returns `Error::UnsupportedForFork` for `ForkName::Gloas` until a
+    /// later task adds one), so this loop cannot chain a gloas state the way
+    /// it does every earlier fork. `genesis_anchor_block`'s own gloas arm
+    /// therefore has no coverage here until that lands.
     #[test]
     fn a_genesis_anchor_block_hashes_to_the_states_own_header_at_every_fork() {
         let config = Config::mainnet();
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
         for fork in ForkName::ALL {
+            if fork == ForkName::Gloas {
+                // Pinned so this test starts failing, loudly, the moment
+                // `upgrade_to_gloas` lands: that failure is the cue to
+                // delete this early break and extend the loop past it.
+                let err = ethlambda_state_transition::beacon::upgrade::upgrade_state(
+                    &state, fork, &config,
+                )
+                .expect_err("upgrade_to_gloas does not exist yet");
+                assert!(
+                    matches!(
+                        err,
+                        ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                            fork: ForkName::Gloas,
+                            ..
+                        }
+                    ),
+                    "expected UnsupportedForFork, got {err:?}"
+                );
+                break;
+            }
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -2602,6 +2674,7 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
+                ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;

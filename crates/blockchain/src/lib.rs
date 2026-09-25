@@ -787,6 +787,19 @@ fn data_availability_for(
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)
         | SignedBeaconBlock::Capella(_) => Some(fork_choice::DataAvailability::NotRequired),
+        // ePBS (EIP-7732) moves the availability question onto the payload
+        // envelope's data columns, not this block's own (nonexistent)
+        // `blob_kzg_commitments`, so this gate has nothing gloas-shaped to
+        // check yet. Unreachable from network input today:
+        // `process_or_pend_block` refuses every gloas block before this
+        // function is ever called, precisely so a gloas block never reaches
+        // this gate, `fork_choice::block_operations`, or `on_block`'s own
+        // `Error::UnsupportedForFork`, none of which it can pay for
+        // productively. `None` here regardless, defensively: were that gate
+        // ever bypassed, holding the block rather than answering
+        // `NotRequired` keeps it from being treated as available and handed
+        // to `on_block` under a false pretense.
+        SignedBeaconBlock::Gloas(_) => None,
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
         // one; named on its own rather than folded into the group above so
@@ -2508,6 +2521,31 @@ impl BlockChainServer {
         let parent_root = signed_block.parent_root();
         let proposer = signed_block.proposer_index();
         timings.guards_start = Some(Instant::now());
+
+        // Refused before anything else, including the columns/finalized-slot
+        // checks below: `state_transition` refuses every gloas block anyway
+        // (`Error::UnsupportedForFork`), so persisting one as pending and
+        // discovering that on the other end of a clone-parent-state-then-fail
+        // round trip is pure waste. Worse than waste were this not here
+        // first: a gloas block whose parent is missing would otherwise be
+        // `insert_pending_block`-ed and tracked in `pending_block_parents`,
+        // and every later block naming it as an ancestor would walk back to
+        // it, fetch it out of storage, and requeue it, paying that same
+        // round trip again on every single delivery, forever, since nothing
+        // ever marks it imported. `discard_pending_subtree` clears any
+        // children already queued under it before this landed; logged once,
+        // here, rather than once per retry, since after this there is no
+        // retry.
+        if matches!(signed_block, SignedBeaconBlock::Gloas(_)) {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&block_root.0),
+                "Refusing a gloas block: this build does not implement the gloas state \
+                 transition yet"
+            );
+            self.discard_pending_subtree(block_root);
+            return None;
+        }
 
         // Asked before the parent check, so that an absent `columns_wait` row
         // can be read two ways rather than one: the columns were never
