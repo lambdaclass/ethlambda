@@ -74,6 +74,14 @@ pub enum Table {
     /// write-through cache over it, since `get_voting_source` reads this for
     /// every block from a prior epoch.
     ///
+    /// A miss is now possible only in one narrow crash window: the store
+    /// writer flushes a block's post-state, the process dies before that
+    /// block's own row here lands, and resume's `has_state` check then skips
+    /// re-importing it. `get_voting_source` no longer raises on that miss; it
+    /// falls back to the store's justified checkpoint (see its own doc
+    /// comment). `is_ffg_competitive` still raises, since nothing in
+    /// production calls it.
+    ///
     /// Keyed by root alone rather than `slot ‖ root` (`encode_slot_root_key`,
     /// as `LiveChain`/`BlockProof` are): both readers of this table
     /// (`get_voting_source`, `is_ffg_competitive`) look up a root with no slot
