@@ -685,7 +685,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
         crate::beacon::helpers::electra::get_consolidation_churn_limit(&post, config)?;
     {
         let mut fields =
-            crate::beacon::helpers::electra::electra_state(&mut post, "upgrade_to_electra")?;
+            crate::beacon::helpers::electra::churn_cursors_mut(&mut post, "upgrade_to_electra")?;
         *fields.exit_balance_to_consume_mut() = exit_balance_to_consume;
         *fields.consolidation_balance_to_consume_mut() = consolidation_balance_to_consume;
     }

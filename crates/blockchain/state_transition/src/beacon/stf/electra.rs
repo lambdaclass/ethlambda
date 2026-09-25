@@ -62,7 +62,7 @@ use crate::beacon::helpers::accessors::{
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
 use crate::beacon::helpers::electra::{
     compute_exit_epoch_and_update_churn, electra_state, get_committee_indices,
-    get_consolidation_churn_limit, get_indexed_attestation, get_max_effective_balance,
+    get_consolidation_churn_limit_for_fork, get_indexed_attestation, get_max_effective_balance,
     get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
     has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
     initiate_validator_exit as electra_initiate_validator_exit, is_fully_withdrawable_validator,
@@ -1438,7 +1438,7 @@ pub fn process_consolidation_request(
     if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
         return Ok(());
     }
-    if get_consolidation_churn_limit(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
+    if get_consolidation_churn_limit_for_fork(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
         return Ok(());
     }
 
