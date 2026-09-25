@@ -79,18 +79,25 @@ pub struct BeaconContext {
 
 /// Beacon-chain networking constants.
 ///
-/// `ethlambda_types::beacon::config` deliberately carries no networking values
-/// (see its module doc), so the two subnet counts below live with the code
-/// that reads them. `CUSTODY_REQUIREMENT` is the exception: das-core defines
-/// it because non-networking code (the future availability check) needs it
-/// too, so it lives in the types crate and is only re-exported here.
+/// `ethlambda_types::beacon::config::Config` carries the networking values a
+/// `config.yaml` sets, but this crate runs on compile-time constants instead,
+/// because some of them size a type (the `attnets` bitfield). Startup refuses a
+/// network whose `Config` disagrees with any of them, so the two never differ
+/// on a running node and `/eth/v1/config/spec` can report the `Config`'s.
+///
+/// `ATTESTATION_SUBNET_COUNT` lives here, with the code that reads it. The
+/// other two are re-exported from the types crate because something outside
+/// networking reads them too: `CUSTODY_REQUIREMENT` the availability check,
+/// `SYNC_COMMITTEE_SUBNET_COUNT` the sync subcommittee container and
+/// `/eth/v1/config/spec`.
 pub mod constants {
     /// `ATTESTATION_SUBNET_COUNT`. The `attnets` bitfield is this wide even
     /// though this node subscribes to none of them.
     pub const ATTESTATION_SUBNET_COUNT: u64 = 64;
 
-    /// `SYNC_COMMITTEE_SUBNET_COUNT`. The width of `MetaData`'s `syncnets`.
-    pub const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
+    /// The width of `MetaData`'s `syncnets`. Re-exported so the bitfield and
+    /// the sync subcommittee size divide by one value.
+    pub use ethlambda_types::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT;
 
     /// Re-exported rather than redefined: the subnet subscription, the `cgc`
     /// ENR entry, the `MetaDataV3` field and the availability check must all

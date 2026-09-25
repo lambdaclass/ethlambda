@@ -1403,6 +1403,15 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
     // `persisted`/`supplied` directly); it exists purely to force that
     // choice.
     let Config {
+        // Identity. `preset_base` is compared below: `check_preset` and the
+        // directory's preset byte already pin the compiled preset, and this
+        // also pins the stored string, which `/eth/v1/config/spec` reports, to
+        // the file's. `config_name` is only a label with no consensus effect,
+        // so the caller warns about a changed one rather than refusing it:
+        // renaming a devnet must not cost its nodes their data directories.
+        preset_base: _,
+        config_name: _,
+
         // Genesis construction: read only while building a genesis state
         // from Eth1 deposit history, never again once one exists. Not chain
         // identity for a directory that already has a state.
@@ -1535,6 +1544,7 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
     } = persisted;
 
     compare!(
+        preset_base,
         genesis_fork_version,
         altair_fork_version,
         altair_fork_epoch,
@@ -1647,9 +1657,21 @@ async fn fetch_initial_beacon_state(
                 )
             })?;
 
-            if let Some(difference) = first_config_difference(&store.config(), &config) {
+            let persisted = store.config();
+            if let Some(difference) = first_config_difference(&persisted, &config) {
                 error!(%difference, "Persisted config disagrees with the network config");
                 return Err(checkpoint_sync::CheckpointSyncError::ConfigChanged { difference });
+            }
+            // Not a chain value, so not refused (see `first_config_difference`).
+            // `Metadata["config"]` is never rewritten, so the stored name is
+            // the one `/eth/v1/config/spec` goes on reporting.
+            if persisted.config_name != config.config_name {
+                warn!(
+                    stored = %persisted.config_name,
+                    supplied = %config.config_name,
+                    "CONFIG_NAME differs from the one this data directory was initialized with; \
+                     resuming, and reporting the stored name"
+                );
             }
 
             // The only mutation on this path, and only reached once both
@@ -2440,6 +2462,35 @@ validators:
         assert!(
             difference.contains("churn_limit_quotient"),
             "the error should name the field that changed: {difference}"
+        );
+    }
+
+    /// A changed `PRESET_BASE` is refused, and the error shows both names as
+    /// text. A changed `CONFIG_NAME` is a label with no consensus effect, so it
+    /// resumes (the caller only warns), unless a chain value changed with it.
+    #[test]
+    fn a_changed_preset_name_is_caught_but_a_changed_config_name_is_not() {
+        let persisted = Config::mainnet();
+
+        let mut other_preset = Config::mainnet();
+        other_preset.preset_base = "minimal".try_into().unwrap();
+        let difference = first_config_difference(&persisted, &other_preset)
+            .expect("a changed PRESET_BASE must be caught");
+        assert_eq!(
+            difference,
+            r#"preset_base: directory has "mainnet", config file says "minimal""#
+        );
+
+        let mut renamed = Config::mainnet();
+        renamed.config_name = "devnet-2".try_into().unwrap();
+        assert_eq!(first_config_difference(&persisted, &renamed), None);
+
+        renamed.altair_fork_epoch += 1;
+        let difference = first_config_difference(&persisted, &renamed)
+            .expect("a rename must not hide a changed chain value");
+        assert!(
+            difference.starts_with("altair_fork_epoch:"),
+            "got {difference}"
         );
     }
 

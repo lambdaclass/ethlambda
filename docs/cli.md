@@ -163,7 +163,19 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the gloas and heze schedule this build cannot process) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it.
+that would fix it. The keys this build runs on compile-time constants for (the
+custody and subnet counts, the `MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the
+snappy message domains and `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
+constants, or startup fails naming each key that differs: the node cannot
+follow a network that sets them otherwise, and `/eth/v1/config/spec` would
+report values it does not use. For a directory, both checks run before its
+`genesis.ssz` is decoded, so a directory built for the other preset fails with
+the preset error rather than an SSZ one.
+
+Resuming a data directory under a `config.yaml` whose `CONFIG_NAME` differs
+from the stored one only logs a warning; the stored name is kept. Any changed
+chain value (a fork epoch or version, the slot time, `PRESET_BASE`) is still a
+hard error.
 
 `--checkpoint-sync-url` now supplies the beacon anchor: a finalized
 `BeaconState` and its anchor block, fetched from a standard Beacon API server
@@ -212,7 +224,7 @@ not chain-specific, branches once, and shares the shutdown:
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
 | resolve `--node-key` | shared | shared |
-| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); for a directory, read `config.yaml` and `genesis.ssz`; for either kind, check `PRESET_BASE` against the compiled preset |
+| resolve `--network` into a `NetworkSource` | n/a: lean has no `--network` | classify the value (built-in name vs. directory); parse the `config.yaml` (embedded, or the directory's) and check `PRESET_BASE` against the compiled preset and the constant-backed keys against their constants; for a directory, then decode `genesis.ssz` |
 | read `--bootnodes` (falls back to the chain's default list; see the table above) | shared | shared |
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |

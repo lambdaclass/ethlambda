@@ -23,8 +23,6 @@ pub(crate) const BOOTNODES_TXT: &str = "bootstrap_nodes.txt";
 #[derive(Debug)]
 pub(crate) struct NetworkDir {
     pub(crate) config: Config,
-    pub(crate) preset_base: String,
-    pub(crate) config_name: String,
     pub(crate) genesis_state: Box<BeaconState>,
     pub(crate) bootnodes: Vec<String>,
 }
@@ -44,6 +42,18 @@ pub(crate) enum NetworkDirError {
         path: PathBuf,
         #[source]
         source: ConfigFileError,
+    },
+    #[error("{}: {source}", path.display())]
+    Preset {
+        path: PathBuf,
+        #[source]
+        source: super::PresetCheckError,
+    },
+    #[error("{}: {source}", path.display())]
+    Constants {
+        path: PathBuf,
+        #[source]
+        source: super::ConstantsMismatch,
     },
     // `{fork:?}` rather than `{fork}`: `ForkName` exposes `as_str` and does not
     // implement `Display`.
@@ -72,6 +82,21 @@ impl NetworkDir {
             source,
         })?;
         parsed.warn_about_ignored_keys();
+
+        // Before `genesis.ssz` is decoded: its container bounds are the
+        // compiled preset's, so a directory built for the other preset would
+        // otherwise fail as an SSZ error rather than naming the cargo feature
+        // that fixes it.
+        super::check_preset(parsed.config.preset_base.as_str()).map_err(|source| {
+            NetworkDirError::Preset {
+                path: config_path.clone(),
+                source,
+            }
+        })?;
+        super::check_constants(&parsed.config).map_err(|source| NetworkDirError::Constants {
+            path: config_path.clone(),
+            source,
+        })?;
 
         let genesis_path = base.join(GENESIS_STATE_FILE);
         let genesis_bytes = read_required_bytes(&genesis_path)?;
@@ -107,8 +132,6 @@ impl NetworkDir {
 
         Ok(Self {
             config,
-            preset_base: parsed.preset_base,
-            config_name: parsed.config_name,
             genesis_state: Box::new(genesis_state),
             bootnodes,
         })
@@ -202,7 +225,7 @@ mod tests {
     fn a_complete_directory_loads() {
         let dir = complete_dir();
         let loaded = NetworkDir::load(dir.path()).unwrap();
-        assert_eq!(loaded.config_name, "ethlambda-devnet");
+        assert_eq!(loaded.config.config_name.as_str(), "ethlambda-devnet");
         assert_eq!(loaded.config.deposit_chain_id, 3_151_908);
         assert_eq!(loaded.bootnodes.len(), 2);
     }
@@ -257,6 +280,58 @@ mod tests {
 
         let err = NetworkDir::load(dir.path()).unwrap_err().to_string();
         assert!(err.contains("SECONDS_PER_SLOT"), "got {err}");
+    }
+
+    /// Write `dir`'s `config.yaml` as the devnet fixture's with one line
+    /// replaced.
+    fn replace_config_line(dir: &tempfile::TempDir, from: &str, to: &str) {
+        let devnet_text = std::fs::read_to_string(fixture("devnet").join("config.yaml")).unwrap();
+        let text = devnet_text.replacen(from, to, 1);
+        assert_ne!(text, devnet_text, "fixture no longer carries {from:?}");
+        std::fs::write(dir.path().join("config.yaml"), text).unwrap();
+    }
+
+    /// A directory built for the other preset must fail naming the preset,
+    /// not as an SSZ error from decoding its genesis state against this
+    /// build's container bounds.
+    #[test]
+    fn a_preset_mismatch_is_reported_before_the_genesis_state_is_decoded() {
+        let dir = complete_dir();
+        let other = if super::super::compiled_preset() == "mainnet" {
+            "minimal"
+        } else {
+            "mainnet"
+        };
+        replace_config_line(
+            &dir,
+            "PRESET_BASE: 'mainnet'",
+            &format!("PRESET_BASE: '{other}'"),
+        );
+        // No preset decodes these bytes, so reaching the decode would fail as
+        // `Genesis` rather than `Preset`.
+        std::fs::write(dir.path().join("genesis.ssz"), b"not a state").unwrap();
+
+        let err = NetworkDir::load(dir.path()).unwrap_err();
+        assert!(matches!(err, NetworkDirError::Preset { .. }), "got {err}");
+        assert!(
+            err.to_string().contains("Rebuild with --features"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_changed_compiled_constant_is_refused_naming_the_key() {
+        let dir = complete_dir();
+        replace_config_line(&dir, "CUSTODY_REQUIREMENT: 4", "CUSTODY_REQUIREMENT: 8");
+
+        let err = NetworkDir::load(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, NetworkDirError::Constants { .. }),
+            "got {err}"
+        );
+        let err = err.to_string();
+        assert!(err.contains("config.yaml"), "got {err}");
+        assert!(err.contains("CUSTODY_REQUIREMENT is 8"), "got {err}");
     }
 
     #[test]

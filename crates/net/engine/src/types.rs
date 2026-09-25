@@ -11,6 +11,7 @@
 
 use ethlambda_types::beacon::containers::deneb;
 use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Uint256};
+use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 use serde::{Deserialize, Serialize, Serializer};
 
 /// `PayloadStatusV1.status`.
@@ -139,7 +140,7 @@ impl Serialize for ExecutionPayloadV3<'_> {
 
 /// Encodes a `DATA`: `0x`-prefixed, every byte rendered, no stripping.
 pub fn data(bytes: &[u8]) -> String {
-    format!("0x{}", hex::encode(bytes))
+    HexPrefixed(bytes).to_string()
 }
 
 /// Encodes a `QUANTITY`: `0x`-prefixed, leading zeros stripped, `0x0` for zero.

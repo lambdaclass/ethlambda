@@ -116,12 +116,12 @@ pub mod hex_array {
 ///
 /// Module-scoped rather than private to [`hex_array`] so [`ssz_hex`] can
 /// format its owned SSZ encoding through the same path without a second
-/// allocation. `pub(crate)` (rather than private) so
-/// `beacon::primitives`'s own hand-written `Serialize` impls for the fixed-width
-/// byte newtypes (`H160`, `BlsPubkey`, `BlsSignature`, `KzgCommitment`,
-/// `KzgProof`) can reuse it too, instead of duplicating this `Display` adapter
-/// or allocating a `String` just to hex-encode a byte slice.
-pub(crate) struct HexPrefixed<'a>(pub(crate) &'a [u8]);
+/// allocation. Public so everything else that writes Beacon API hex reuses it
+/// too rather than repeating `format!("0x{}", hex::encode(..))`:
+/// `beacon::primitives`'s hand-written `Serialize` impls for the fixed-width
+/// byte newtypes, the RPC crate's hand-built JSON, and the validator client's
+/// request bodies. Call `.to_string()` on it where a `String` is needed.
+pub struct HexPrefixed<'a>(pub &'a [u8]);
 
 impl std::fmt::Display for HexPrefixed<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

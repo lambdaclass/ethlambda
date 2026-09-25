@@ -168,7 +168,10 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// is SSZ-encoded under [`KEY_CONFIG`], so a directory written by the previous
 /// version decodes into the wrong fields. There is no migration, by the same
 /// policy every previous change followed.
-pub const DB_VERSION: u64 = 3;
+///
+/// 4 added `PRESET_BASE` and `CONFIG_NAME` to `Config`, at the front of its
+/// encoding, for the same reason and with the same consequence as 3.
+pub const DB_VERSION: u64 = 4;
 
 /// The consensus protocol a data directory holds.
 ///

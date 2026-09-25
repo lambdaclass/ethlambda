@@ -80,8 +80,8 @@ pub(crate) struct PresetMismatch {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PresetCheckError {
-    /// `config_file::unknown_preset` fills `preset_base` with an empty string
-    /// when `PRESET_BASE` is absent, precisely so this can fail closed rather
+    /// `Config::preset_base` defaults to an empty name when `PRESET_BASE` is
+    /// absent, precisely so this can fail closed rather
     /// than assume "mainnet". Reported on its own, distinctly from
     /// [`PresetMismatch`]: with no declared preset, `{declared}` in that
     /// error's message would render as an empty string, reading as "declares
@@ -113,6 +113,101 @@ pub(crate) fn check_preset(declared: &str) -> Result<(), PresetCheckError> {
         declared: declared.to_string(),
     }
     .into())
+}
+
+/// One `config.yaml` key that the node runs on a compile-time constant for,
+/// set to another value.
+#[derive(Debug)]
+pub(crate) struct ConstantMismatch {
+    /// The key as the file spells it.
+    key: String,
+    declared: String,
+    compiled: String,
+}
+
+/// Every [`ConstantMismatch`] one configuration has, reported together so an
+/// operator fixes them in one pass rather than one restart per key.
+#[derive(Debug)]
+pub(crate) struct ConstantsMismatch(Vec<ConstantMismatch>);
+
+impl std::fmt::Display for ConstantsMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the network config sets values this build cannot run with, since it uses \
+             compile-time constants for them:"
+        )?;
+        for ConstantMismatch {
+            key,
+            declared,
+            compiled,
+        } in &self.0
+        {
+            write!(f, " {key} is {declared}, this build uses {compiled};")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ConstantsMismatch {}
+
+/// Refuse a configuration that sets a value this build runs on a compile-time
+/// constant for to anything else.
+///
+/// `Config` carries these keys so that `/eth/v1/config/spec` can report them,
+/// but the networking and custody code reads the constants, some of which size
+/// a type (the `attnets` bitfield is an `SszBitvector` of
+/// `ATTESTATION_SUBNET_COUNT` bits). Refusing the mismatch at startup is what
+/// keeps the endpoint truthful: every `Config` that reaches the store equals
+/// the constants on these keys. It is a hard error rather than a warning for
+/// the reason [`check_preset`] is one. A node that disagrees with its peers
+/// about custody or subnet counts would still look healthy while failing to
+/// serve or verify what they expect.
+///
+/// The list is every `Config` field whose key names a value this build also
+/// defines as a constant; a field the node does not act on at all (such as
+/// `SUBNETS_PER_NODE`, since it subscribes to no attestation subnet) has no
+/// constant to disagree with and is reported as the file sets it.
+pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> {
+    use ethlambda_p2p::beacon::{constants as p2p, protocols};
+    use ethlambda_types::beacon::constants;
+
+    let mut mismatches = Vec::new();
+    macro_rules! check {
+        ($($field:ident == $compiled:expr),+ $(,)?) => {
+            $(
+                if config.$field != $compiled {
+                    mismatches.push(ConstantMismatch {
+                        key: stringify!($field).to_ascii_uppercase(),
+                        declared: format!("{:?}", config.$field),
+                        compiled: format!("{:?}", $compiled),
+                    });
+                }
+            )+
+        };
+    }
+    check!(
+        attestation_subnet_count == p2p::ATTESTATION_SUBNET_COUNT,
+        data_column_sidecar_subnet_count == constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+        number_of_custody_groups == constants::NUMBER_OF_CUSTODY_GROUPS,
+        custody_requirement == constants::CUSTODY_REQUIREMENT,
+        samples_per_slot == constants::SAMPLES_PER_SLOT,
+        min_epochs_for_data_column_sidecars_requests
+            == constants::MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS,
+        maximum_gossip_clock_disparity == constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY,
+        max_request_blocks == protocols::MAX_REQUEST_BLOCKS,
+        max_request_blocks_deneb == protocols::MAX_REQUEST_BLOCKS_DENEB,
+        max_request_data_column_sidecars == protocols::max_request_data_column_sidecars(),
+        max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
+        message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
+        message_domain_valid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_VALID_SNAPPY,
+    );
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(ConstantsMismatch(mismatches))
+    }
 }
 
 /// Fill in the two [`Config`] fields a `config.yaml` cannot be trusted for.
@@ -161,10 +256,11 @@ impl NetworkSource {
                 Ok(Self::BuiltIn(Box::new(network.resolve()?)))
             }
             NetworkSpec::Directory(path) => {
+                // `load` checks the preset and the constants itself, before it
+                // decodes `genesis.ssz`, whose container bounds the preset sets.
                 let loaded = dir::NetworkDir::load(path)?;
-                check_preset(&loaded.preset_base)?;
                 tracing::info!(
-                    network = %loaded.config_name,
+                    network = %loaded.config.config_name,
                     path = %path.display(),
                     "Loaded network from directory"
                 );
@@ -187,13 +283,11 @@ impl NetworkSource {
         }
     }
 
-    /// The resolved network's name, for logging: a built-in network's name,
-    /// or a loaded directory's own `CONFIG_NAME`.
+    /// The resolved network's `CONFIG_NAME`, for logging. A built-in
+    /// network's is its own name, which `every_built_in_network_resolves`
+    /// checks.
     pub(crate) fn name(&self) -> &str {
-        match self {
-            Self::BuiltIn(built_in) => built_in.network.name(),
-            Self::Loaded(loaded) => &loaded.config_name,
-        }
+        self.config().config_name.as_str()
     }
 
     /// The two genesis values the fork digest is derived from.
@@ -304,9 +398,34 @@ mod tests {
         );
     }
 
+    /// The specification's own configs must pass, or every built-in network
+    /// and every devnet derived from one would be refused.
+    #[test]
+    fn the_shipped_configs_match_the_compiled_constants() {
+        check_constants(&Config::mainnet()).unwrap();
+        check_constants(&Config::minimal()).unwrap();
+    }
+
+    #[test]
+    fn a_config_that_changes_a_compiled_constant_is_refused_naming_each_key() {
+        let mut config = Config::mainnet();
+        config.custody_requirement = 8;
+        config.message_domain_valid_snappy = [0x02, 0x00, 0x00, 0x00];
+
+        let err = check_constants(&config).unwrap_err().to_string();
+        assert!(
+            err.contains("CUSTODY_REQUIREMENT is 8, this build uses 4"),
+            "got {err}"
+        );
+        assert!(
+            err.contains("MESSAGE_DOMAIN_VALID_SNAPPY is [2, 0, 0, 0]"),
+            "got {err}"
+        );
+    }
+
     #[test]
     fn an_absent_preset_base_is_a_distinct_error_from_a_mismatch() {
-        // `config_file::unknown_preset` fills an absent PRESET_BASE with "".
+        // `Config::preset_base` defaults an absent PRESET_BASE to "".
         let err = check_preset("").unwrap_err().to_string();
         assert!(err.contains("PRESET_BASE"), "got {err}");
         assert!(
