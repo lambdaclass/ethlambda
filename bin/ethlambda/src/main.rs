@@ -3,6 +3,7 @@ mod checkpoint_sync;
 mod cli;
 mod command;
 mod fd_limit;
+mod keygen;
 mod version;
 
 // Jemalloc causes programs to deadlock during process startup under Shadow.
@@ -25,7 +26,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -36,7 +37,7 @@ use tokio_util::sync::CancellationToken;
 use cli::NodeOptions;
 use command::Command;
 use ethlambda_blockchain::block_builder::ProposerConfig;
-use ethlambda_blockchain::key_manager::ValidatorKeyPair;
+use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
 use ethlambda_p2p::{
@@ -81,6 +82,12 @@ fn main() -> eyre::Result<()> {
             init_benchmark_logging()?;
             benchmark::run(options)
         }
+        // Key generation is synchronous, CPU-bound work whose product is files,
+        // so it runs on this thread too and leaves stdout alone.
+        Command::Keygen(options) => {
+            init_keygen_logging()?;
+            keygen::run(options)
+        }
     }
 }
 
@@ -109,6 +116,22 @@ fn init_benchmark_logging() -> eyre::Result<()> {
         .wrap_err("failed to set global tracing subscriber")
 }
 
+/// Keygen logging: INFO and above, on stderr. Key generation takes minutes for a
+/// large validator set, so progress has to be visible; stderr keeps stdout free
+/// for a machine-readable summary to claim later.
+fn init_keygen_logging() -> eyre::Result<()> {
+    let filter = EnvFilter::builder()
+        .with_default_directive(tracing::Level::INFO.into())
+        .from_env_lossy();
+    let subscriber = Registry::default().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_filter(filter),
+    );
+    tracing::subscriber::set_global_default(subscriber)
+        .wrap_err("failed to set global tracing subscriber")
+}
+
 // Shadow single-steps execution in a discrete-event simulation, so the default
 // multi-threaded runtime's worker threads add only scheduling noise, never
 // parallelism. Use a single-threaded runtime under Shadow. This is an
@@ -120,6 +143,14 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
 
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
+
+    // Compiles the aggregation bytecode and fixes the prover's allocator. Ahead of the
+    // test-driver branch below, which verifies signatures, and of every consensus path.
+    info!(
+        arena = options.prover_arena,
+        "Initializing leanVM prover and verifier"
+    );
+    ethlambda_crypto::init_leanvm(options.prover_arena);
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
@@ -216,6 +247,12 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         attestation_committee_count,
         "Loaded attestation committee count"
     );
+    // Checked here rather than in clap: the committee count is only known once
+    // the CLI flag and the validator config have both been consulted.
+    validate_aggregate_subnet_ids(
+        options.aggregate_subnet_ids.as_deref(),
+        attestation_committee_count,
+    )?;
     ethlambda_blockchain::metrics::set_attestation_committee_count(attestation_committee_count);
 
     let bootnodes = read_bootnodes(&bootnodes_path)?;
@@ -278,12 +315,34 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     // receiver-count guard in `emit` makes every emission a no-op.
     let events = EventBus::default();
 
+    let aggregation_duty_subnet = resolve_aggregation_duty_subnet(
+        options.aggregate_subnet_ids.as_deref(),
+        &subscribed_subnets,
+    );
+    info!(
+        aggregation_duty_subnet,
+        assigned = options.aggregate_subnet_ids.is_some(),
+        "Resolved aggregation duty subnet"
+    );
+    if options.skip_redundant_aggregation && options.aggregate_subnet_ids.is_none() {
+        warn!(
+            aggregation_duty_subnet,
+            "--skip-redundant-aggregation is set but the duty subnet was derived, not assigned: \
+             every co-located aggregator whose validators span all subnets derives the same duty \
+             subnet, so they will sit out in lockstep in the same slot instead of taking turns, \
+             and the widest level gets no producer at all in most slots. Give each aggregator a \
+             distinct first --aggregate-subnet-ids value to fix this."
+        );
+    }
+
     let blockchain_config = BlockChainConfig {
         aggregator: aggregator.clone(),
         sync_status_controller: sync_status.clone(),
         attestation_committee_count,
         gate_duties: !options.disable_duty_sync_gate,
         subscribed_subnets: subscribed_subnets.clone(),
+        aggregation_duty_subnet,
+        skip_redundant_aggregation: options.skip_redundant_aggregation,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,
@@ -533,8 +592,8 @@ fn read_bootnodes(bootnodes_path: impl AsRef<Path>) -> eyre::Result<Vec<Bootnode
 #[derive(Debug, Deserialize, Clone)]
 struct AnnotatedValidator {
     index: u64,
-    /// Parsed for hex-format validation only; not cross-checked against the
-    /// loaded secret key since leansig doesn't expose any pk getters.
+    /// Parsed for hex-format validation only; not currently cross-checked
+    /// against the loaded secret key's derived public key.
     #[serde(rename = "pubkey_hex", deserialize_with = "deser_pubkey_hex")]
     _pubkey_hex: ValidatorPubkeyBytes,
     privkey_file: PathBuf,
@@ -550,14 +609,13 @@ where
     let pubkey: ValidatorPubkeyBytes = hex::decode(&value)
         .map_err(|_| D::Error::custom("ValidatorPubkey value is not valid hex"))?
         .try_into()
-        .map_err(|_| D::Error::custom("ValidatorPubkey length != 52"))?;
+        .map_err(|_| {
+            D::Error::custom(format!(
+                "ValidatorPubkey length != {}",
+                ethlambda_types::state::PUBLIC_KEY_SIZE
+            ))
+        })?;
     Ok(pubkey)
-}
-
-#[derive(Debug)]
-enum ValidatorKeyRole {
-    Attestation,
-    Proposal,
 }
 
 /// Classify a privkey file as attestation or proposal based on the filename.
@@ -565,7 +623,7 @@ enum ValidatorKeyRole {
 /// Matches zeam's (`pkgs/cli/src/node.zig:540`) and lantern's
 /// (`client_keys.c:606`) routing, which lets all three clients share the
 /// `lean-quickstart` generator output unchanged.
-fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
+fn classify_role(file: &Path) -> Result<KeyRole, String> {
     let name = file
         .file_name()
         .and_then(|n| n.to_str())
@@ -573,8 +631,8 @@ fn classify_role(file: &Path) -> Result<ValidatorKeyRole, String> {
     let is_attester = name.contains("attester");
     let is_proposer = name.contains("proposer");
     match (is_attester, is_proposer) {
-        (true, false) => Ok(ValidatorKeyRole::Attestation),
-        (false, true) => Ok(ValidatorKeyRole::Proposal),
+        (true, false) => Ok(KeyRole::Attestation),
+        (false, true) => Ok(KeyRole::Proposal),
         (false, false) => Err(format!(
             "filename '{name}' must contain 'attester' or 'proposer'"
         )),
@@ -630,8 +688,8 @@ fn read_validator_keys(
         let path = resolve_path(&entry.privkey_file);
         let slots = grouped.entry(entry.index).or_default();
         let target = match role {
-            ValidatorKeyRole::Attestation => &mut slots.attestation,
-            ValidatorKeyRole::Proposal => &mut slots.proposal,
+            KeyRole::Attestation => &mut slots.attestation,
+            KeyRole::Proposal => &mut slots.proposal,
         };
         if target.is_some() {
             eyre::bail!("validator {}: duplicate {role:?} entry", entry.index);
@@ -817,12 +875,132 @@ async fn fetch_initial_state(
     Ok(store)
 }
 
+/// Reject an `--aggregate-subnet-ids` value that names no subnet.
+///
+/// The flag feeds two consumers that read an out-of-range value differently:
+/// the P2P swarm subscribes to the raw id (`attestation_subscription_subnets`
+/// passes it through), while the aggregation window reduces it modulo the
+/// committee count. `--attestation-committee-count 4 --aggregate-subnet-ids 5`
+/// therefore subscribes to a topic no validator publishes on and aggregates as
+/// duty subnet 1, which the node does not listen to, with the startup log
+/// showing 5 either way. Refusing to start is the only reading of that
+/// configuration that cannot silently mean something else.
+fn validate_aggregate_subnet_ids(
+    assigned_subnet_ids: Option<&[u64]>,
+    attestation_committee_count: u64,
+) -> eyre::Result<()> {
+    let out_of_range = assigned_subnet_ids
+        .unwrap_or_default()
+        .iter()
+        .find(|&&id| id >= attestation_committee_count);
+    match out_of_range {
+        None => Ok(()),
+        Some(id) => Err(eyre::eyre!(
+            "--aggregate-subnet-ids value {id} is not a subnet: ids must be below \
+             attestation_committee_count ({attestation_committee_count})"
+        )),
+    }
+}
+
+/// The subnet this node is responsible for when scoring recursive aggregation.
+///
+/// Operators assign it explicitly via --aggregate-subnet-ids so co-located
+/// aggregators land on different subnets and merge different proofs. Without
+/// an assignment, fall back to the lowest subnet this node already listens
+/// on: `min` rather than an arbitrary pick because `HashSet` iteration order
+/// is not stable and the duty subnet must be.
+fn resolve_aggregation_duty_subnet(
+    assigned_subnet_ids: Option<&[u64]>,
+    subscribed_subnets: &HashSet<u64>,
+) -> u64 {
+    assigned_subnet_ids
+        .and_then(|ids| ids.first().copied())
+        .or_else(|| subscribed_subnets.iter().copied().min())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
+    use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    /// The duty subnet is the first explicitly assigned subnet, so an operator
+    /// can place co-located aggregators on different subnets deliberately.
+    #[test]
+    fn duty_subnet_prefers_the_first_assigned_id() {
+        let subscribed = HashSet::from([0u64, 1, 2, 3]);
+        assert_eq!(
+            resolve_aggregation_duty_subnet(Some(&[3, 1]), &subscribed),
+            3,
+            "the first assigned id wins, not the lowest"
+        );
+    }
+
+    /// With no assignment, the lowest subscribed subnet is used, which is
+    /// stable across restarts unlike an arbitrary pick from the set.
+    #[test]
+    fn duty_subnet_falls_back_to_the_lowest_subscribed() {
+        let subscribed = HashSet::from([5u64, 2]);
+        assert_eq!(resolve_aggregation_duty_subnet(None, &subscribed), 2);
+    }
+
+    /// A node with nothing assigned and nothing subscribed still needs an
+    /// answer; subnet 0 always exists.
+    #[test]
+    fn duty_subnet_defaults_to_zero_with_nothing_to_go_on() {
+        assert_eq!(resolve_aggregation_duty_subnet(None, &HashSet::new()), 0);
+    }
+
+    /// An empty list is no assignment at all, so the subscription fallback
+    /// still applies rather than the last-resort zero.
+    #[test]
+    fn duty_subnet_treats_an_empty_assignment_as_no_assignment() {
+        assert_eq!(
+            resolve_aggregation_duty_subnet(Some(&[]), &HashSet::from([4u64])),
+            4
+        );
+    }
+
+    /// An id at or above the committee count names a topic no validator
+    /// publishes on, and would be reduced to a different subnet by the
+    /// aggregation window, so the node refuses it rather than running with
+    /// its subscriptions and its duty subnet disagreeing.
+    #[test]
+    fn an_out_of_range_aggregate_subnet_id_is_rejected() {
+        let err = validate_aggregate_subnet_ids(Some(&[5]), 4)
+            .expect_err("subnet 5 does not exist at committee count 4");
+        let message = err.to_string();
+        assert!(message.contains('5'), "names the offending id: {message}");
+        assert!(message.contains('4'), "names the bound: {message}");
+    }
+
+    /// The check covers every id, not just the first: only the first becomes
+    /// the duty subnet, but all of them become gossip subscriptions.
+    #[test]
+    fn an_out_of_range_aggregate_subnet_id_is_rejected_past_the_first() {
+        assert!(validate_aggregate_subnet_ids(Some(&[0, 9]), 4).is_err());
+    }
+
+    /// The bound is exclusive: subnets run 0..committee_count.
+    #[test]
+    fn in_range_aggregate_subnet_ids_are_accepted() {
+        assert!(validate_aggregate_subnet_ids(Some(&[0, 3]), 4).is_ok());
+        assert!(
+            validate_aggregate_subnet_ids(Some(&[0]), 1).is_ok(),
+            "subnet 0 is the only subnet at a committee count of 1"
+        );
+    }
+
+    /// Nothing assigned is nothing to validate; the duty subnet is then
+    /// derived from subscriptions, which are already in range by construction.
+    #[test]
+    fn an_unset_or_empty_assignment_passes_validation() {
+        assert!(validate_aggregate_subnet_ids(None, 4).is_ok());
+        assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
+    }
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
@@ -949,8 +1127,8 @@ validators:
             genesis_time,
             milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
             genesis_validators: vec![GenesisValidatorEntry {
-                attestation_pubkey: [1u8; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [1u8; PUBLIC_KEY_SIZE],
+                proposal_pubkey: [2u8; PUBLIC_KEY_SIZE],
             }],
         }
     }
@@ -1079,7 +1257,7 @@ validators:
         seed_db(backend.clone(), &seeded_genesis);
 
         let mut other_genesis = test_genesis(genesis_time);
-        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; 52];
+        other_genesis.genesis_validators[0].attestation_pubkey = [9u8; PUBLIC_KEY_SIZE];
         let Err(err) = fetch_initial_state(&[], &other_genesis, backend).await else {
             panic!("a foreign validator set must not be silently re-anchored");
         };
