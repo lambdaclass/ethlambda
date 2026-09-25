@@ -401,15 +401,34 @@ pub fn snapshot_aggregation_inputs(
     // existing blocks (head.slot / target.slot <= head_slot), so no
     // empty-slot padding beyond the tip is needed.
     let known_block_roots = store.get_block_roots().expect("block roots read works");
+    let head_root = store.head().expect("head read works");
     let mut extended_historical_block_hashes: Vec<H256> =
         head_state.historical_block_hashes.iter().copied().collect();
-    extended_historical_block_hashes.push(store.head().expect("head read works"));
+    extended_historical_block_hashes.push(head_root);
 
-    let mut projected = block_builder::ProjectedState::from_head_state(&head_state);
+    // Seed the head votes too, not just the justification projection. Since a
+    // vote for an already-justified target is no longer filtered out, its only
+    // remaining value is the fork-choice weight it carries; without this the
+    // worker would score every such group at zero on both axes and prove none
+    // of them, leaving the pool empty exactly on the slots where every pooled
+    // vote names a settled target, which is the case this is meant to cover.
+    //
+    // The baseline is what the head's own branch carries, not what this node
+    // has seen. Every aggregate this worker produces is applied back into the
+    // pool and the fork-choice vote map together (`apply_aggregated_group` on
+    // the actor thread, then the next promote moves both new->known), so
+    // scoring against the seen-votes map would report zero for the very groups
+    // just proved. Reading from `head_root` rather than from a running
+    // import-fed map is what keeps a branch this node abandoned from
+    // suppressing work on the one it kept.
+    let mut projected = block_builder::ProjectedState::from_head_state(&head_state)
+        .with_head_window(
+            store.extract_head_vote_window(head_root, block_builder::HEAD_VOTE_WINDOW_BLOCKS),
+        );
 
     let mut jobs: Vec<AggregationJob> = Vec::with_capacity(max_jobs.min(groups_considered));
     for _round in 0..max_jobs {
-        let Some((data_root, score)) = pick_best_candidate(
+        let Some((data_root, score, new_head_voters)) = pick_best_candidate(
             &candidates,
             &projected,
             &known_block_roots,
@@ -445,6 +464,10 @@ pub fn snapshot_aggregation_inputs(
         // same-target candidates re-tier across rounds exactly as the block
         // builder's post-state would.
         projected.advance(score.tier, att_data, coverage.iter().copied());
+        // Credit its head voters too. Without this a validator counts as newly
+        // covered again on every round, so later candidates over-score on an
+        // axis that now decides ordering, and the worker picks the wrong group.
+        projected.advance_head_votes(att_data, new_head_voters);
 
         jobs.push(job);
     }
@@ -508,8 +531,8 @@ fn pick_best_candidate(
     extended_historical_block_hashes: &[H256],
     current_slot: u64,
     validator_count: usize,
-) -> Option<(H256, EntryScore)> {
-    let mut best: Option<(H256, EntryScore)> = None;
+) -> Option<(H256, EntryScore, HashSet<u64>)> {
+    let mut best: Option<(H256, EntryScore, HashSet<u64>)> = None;
     let mut best_key: Option<(u8, block_builder::OrderingKey)> = None;
 
     for (data_root, candidate) in candidates {
@@ -523,10 +546,14 @@ fn pick_best_candidate(
             continue;
         }
 
-        let Some((score, _new_voters)) =
+        // Head votes ARE scored here: the projection above is seeded from
+        // `extract_head_vote_window`. So this skip now means "adds nothing on
+        // EITHER axis" rather than "adds no justification voters", and a group
+        // whose target is already settled survives on its head votes alone.
+        let Some((score, _new_voters, new_head_voters)) =
             projected.score_entry(att_data, &candidate.coverage(), validator_count)
         else {
-            trace_skipped_candidate("zero_new_voters", att_data, data_root);
+            trace_skipped_candidate("no_new_voters_or_head_votes", att_data, data_root);
             continue;
         };
 
@@ -536,7 +563,7 @@ fn pick_best_candidate(
         let slot_bucket: u8 = if att_data.slot == current_slot { 0 } else { 1 };
         let candidate_key = candidate_ordering_key(slot_bucket, &score, *data_root);
         if best_key.as_ref().is_none_or(|k| candidate_key < *k) {
-            best = Some((*data_root, score));
+            best = Some((*data_root, score, new_head_voters));
             best_key = Some(candidate_key);
         }
     }
@@ -1790,6 +1817,15 @@ mod tests {
         }
     }
 
+    /// The branch baseline `snapshot_aggregation_inputs` scores against, read
+    /// the same way the call site reads it.
+    fn head_window(store: &Store) -> ethlambda_storage::HeadVoteWindow {
+        store.extract_head_vote_window(
+            store.head().expect("head root"),
+            block_builder::HEAD_VOTE_WINDOW_BLOCKS,
+        )
+    }
+
     fn new_test_store(head_state: State) -> Store {
         let backend: Arc<dyn ethlambda_storage::StorageBackend> = Arc::new(InMemoryBackend::new());
         Store::from_anchor_state(backend, head_state, DEFAULT_MILLISECONDS_PER_SLOT)
@@ -2007,9 +2043,10 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_window: None,
         };
 
-        let (picked_root, score) = pick_best_candidate(
+        let (picked_root, score, _head_voters) = pick_best_candidate(
             &candidates,
             &projected,
             &known_block_roots,
@@ -2099,10 +2136,11 @@ mod tests {
             justified_slots: JustifiedSlots::new(),
             finalized_slot: 0,
             current_votes: HashMap::new(),
+            head_window: None,
         };
 
         // Round 1: A (6 new voters) outranks B (2 new voters); both Build tier.
-        let (picked_root, score) = pick_best_candidate(
+        let (picked_root, score, _head_voters) = pick_best_candidate(
             &candidates,
             &projected,
             &known_block_roots,
@@ -2125,7 +2163,7 @@ mod tests {
         // Round 2: only B remains. Combined with A's now-recorded 6 voters,
         // B's 2 new voters cross 2/3 of 10 — B is re-tiered from what would
         // have been Build in isolation to Justify.
-        let (picked_root, score) = pick_best_candidate(
+        let (picked_root, score, _head_voters) = pick_best_candidate(
             &candidates,
             &projected,
             &known_block_roots,
@@ -2188,12 +2226,20 @@ mod tests {
         );
     }
 
-    /// A group whose target is already justified (here: at or behind the
-    /// finalized boundary) can never justify or finalize anything further and
-    /// must never become a job, even with enough raw sigs to otherwise be
-    /// viable.
+    /// A group whose target sits at or behind the finalized boundary must
+    /// never become a job, even with enough raw sigs to otherwise be viable:
+    /// it can neither justify nor finalize anything, and a finalized target is
+    /// settled for good, so its votes carry no fork-choice signal worth proving
+    /// either.
+    ///
+    /// The rejection comes from `target_not_justifiable`
+    /// (`slot_is_justifiable_after` is false below the finalized slot), not
+    /// from the target being justified: a justified target *above* the
+    /// finalized boundary is deliberately still eligible, scored on its head
+    /// votes alone. See
+    /// `snapshot_aggregates_a_justified_target_for_its_head_votes`.
     #[test]
-    fn snapshot_skips_group_whose_target_is_already_justified() {
+    fn snapshot_skips_group_whose_target_is_at_or_behind_finalized() {
         const NUM_VALIDATORS: usize = 10;
         const HEAD_SLOT: u64 = 20;
         const FINALIZED_SLOT: u64 = 10;
@@ -2230,7 +2276,274 @@ mod tests {
         assert!(
             snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
                 .is_none(),
-            "a group targeting an already-justified slot must never become a job"
+            "a group targeting a finalized slot must never become a job"
+        );
+    }
+
+    /// Regression guard for the CALL SITE, not the accessor.
+    ///
+    /// `snapshot_aggregation_inputs` must score head votes against the votes
+    /// the head's own branch carries (`extract_head_vote_window`), never
+    /// against the votes this node has merely seen
+    /// (`extract_latest_known_attestations`). The two look interchangeable and
+    /// both compile, but the seen-votes map advances in lockstep with the very
+    /// pool these jobs are selected from (`insert_new_aggregated_payload`
+    /// writes `new_votes` + `new_payloads`, then
+    /// `promote_new_aggregated_payloads` drains both into their `known`
+    /// counterparts), so scoring against it reports zero for every group and
+    /// silently kills the whole head-vote axis. That shipped twice.
+    ///
+    /// So: promote a payload for this exact attestation, which populates
+    /// `known_votes` while leaving the branch baseline empty. A job must still
+    /// be selected. Swapping the call site back to the seen-votes map makes
+    /// this assertion fail, which is the entire point of the test.
+    #[test]
+    fn snapshot_scores_head_votes_against_the_chain_not_against_seen_votes() {
+        const NUM_VALIDATORS: usize = 10;
+        const HEAD_SLOT: u64 = 20;
+        const FINALIZED_SLOT: u64 = 10;
+        const TARGET_SLOT: u64 = 12;
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        // The votes below name `hashes[0]` as their head, so that block has to
+        // sit inside the head-vote window: an entry whose head has aged out of
+        // it scores zero on this axis by design.
+        head_state.latest_block_header.parent_root = hashes[0];
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
+
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let hashed = HashedAttestationData::new(att_data.clone());
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed.clone(), 1, dummy_sig());
+
+        // Put this very vote into the SEEN map, the way the worker's own output
+        // lands there, while leaving the branch baseline untouched.
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        bits.set(0, true).unwrap();
+        bits.set(1, true).unwrap();
+        store.insert_new_aggregated_payload(hashed, SingleMessageAggregate::empty(bits));
+        store.promote_new_aggregated_payloads();
+        assert!(
+            !store.extract_latest_known_attestations().is_empty(),
+            "fixture must actually populate the seen-votes map"
+        );
+        assert!(
+            head_window(&store).votes.is_empty(),
+            "fixture must leave the branch baseline empty: no block on this \
+             branch carried the vote"
+        );
+
+        assert!(
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_some(),
+            "a vote the chain does not carry is still worth proving, however \
+             many times this node has already seen it"
+        );
+    }
+
+    /// The suppression direction, which the other tests never exercise: once a
+    /// block ON THIS BRANCH has carried the vote, the group is worth nothing on
+    /// either axis and must not become a job.
+    ///
+    /// Without this, "always selects" and "correctly selects" look identical:
+    /// an empty baseline makes every group score its full coverage, so a test
+    /// that only ever asserts `is_some()` passes even if the baseline is
+    /// ignored outright.
+    ///
+    /// The carrier is the head block's parent rather than a loose sibling,
+    /// which is the whole point of a branch-relative baseline: a block the head
+    /// does not descend from must NOT suppress anything (covered at the
+    /// accessor by `head_window_votes_ignore_a_block_on_an_abandoned_branch`).
+    #[test]
+    fn select_skips_a_group_whose_vote_the_chain_already_carries() {
+        const NUM_VALIDATORS: usize = 10;
+        const HEAD_SLOT: u64 = 20;
+        const FINALIZED_SLOT: u64 = 10;
+        const TARGET_SLOT: u64 = 12;
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+
+        // The block that puts this exact vote on chain, for both participants.
+        let mut bits = AggregationBits::with_length(NUM_VALIDATORS).unwrap();
+        bits.set(0, true).unwrap();
+        bits.set(1, true).unwrap();
+        let carrier = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: hashes[0],
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: vec![ethlambda_types::attestation::AggregatedAttestation {
+                        aggregation_bits: bits,
+                        data: att_data.clone(),
+                    }]
+                    .try_into()
+                    .unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+        let carrier_root = {
+            use ethlambda_types::primitives::HashTreeRoot as _;
+            carrier.message.hash_tree_root()
+        };
+
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        // The head descends from the carrier, and reads back as an empty-bodied
+        // block so the window walk can step through it to reach the carrier.
+        head_state.latest_block_header.parent_root = carrier_root;
+        head_state.latest_block_header.body_root = {
+            use ethlambda_types::primitives::HashTreeRoot as _;
+            BlockBody::default().hash_tree_root()
+        };
+
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
+        store
+            .insert_signed_block(carrier_root, carrier)
+            .expect("insert block carrying the vote");
+
+        let hashed = HashedAttestationData::new(att_data);
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed, 1, dummy_sig());
+
+        assert_eq!(
+            head_window(&store).votes.len(),
+            2,
+            "fixture must actually put the vote on the head's branch"
+        );
+
+        assert!(
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_none(),
+            "this branch already carries the vote, so it adds nothing on either \
+             axis"
+        );
+    }
+
+    /// The counterpart: a target that is justified but still above the
+    /// finalized boundary DOES become a job, on the strength of its head votes
+    /// alone.
+    ///
+    /// This is the case that used to be filtered out wholesale. On a chain
+    /// whose justifiable rungs sit several slots apart, every pooled vote names
+    /// a settled target for slots at a time; dropping them all left the
+    /// aggregators with nothing to prove and the next proposer with no
+    /// candidate body to adopt.
+    #[test]
+    fn snapshot_aggregates_a_justified_target_for_its_head_votes() {
+        const NUM_VALIDATORS: usize = 10;
+        const HEAD_SLOT: u64 = 20;
+        const FINALIZED_SLOT: u64 = 10;
+        const TARGET_SLOT: u64 = 12; // above finalized, and marked justified
+
+        let hashes: Vec<H256> = (0..HEAD_SLOT).map(|i| H256([(i + 1) as u8; 32])).collect();
+        let mut head_state = make_head_state(HEAD_SLOT, NUM_VALIDATORS, &hashes);
+        head_state.latest_finalized = Checkpoint {
+            root: hashes[FINALIZED_SLOT as usize],
+            slot: FINALIZED_SLOT,
+        };
+        ethlambda_state_transition::justified_slots_ops::extend_to_slot(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        ethlambda_state_transition::justified_slots_ops::set_justified(
+            &mut head_state.justified_slots,
+            FINALIZED_SLOT,
+            TARGET_SLOT,
+        );
+        // The votes below name `hashes[0]` as their head, so that block has to
+        // sit inside the head-vote window: an entry whose head has aged out of
+        // it scores zero on this axis by design.
+        head_state.latest_block_header.parent_root = hashes[0];
+        let mut store = new_test_store(head_state);
+        insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
+
+        let att_data = AttestationData {
+            slot: TARGET_SLOT,
+            head: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+            target: Checkpoint {
+                root: hashes[TARGET_SLOT as usize],
+                slot: TARGET_SLOT,
+            },
+            source: Checkpoint {
+                root: hashes[0],
+                slot: 0,
+            },
+        };
+        let hashed = HashedAttestationData::new(att_data);
+        store.insert_gossip_signature(hashed.clone(), 0, dummy_sig());
+        store.insert_gossip_signature(hashed, 1, dummy_sig());
+
+        assert!(
+            snapshot_aggregation_inputs(&store, 999, MAX_AGGREGATION_JOBS, vacuous_window_config())
+                .is_some(),
+            "a justified target above the finalized boundary must still be proved for its head votes"
         );
     }
 
