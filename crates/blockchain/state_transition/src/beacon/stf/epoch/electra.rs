@@ -303,6 +303,13 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
 ///   nor withdrawn) consumes churn and is credited, unless doing so would
 ///   exceed the budget, in which case processing stops for this epoch as
 ///   described above.
+///
+/// Electra's own version, in effect only through this fork. Fulu retires the
+/// eth1-bridge-ahead-of-requests gate outright (`beacon-chain.md`'s "Modified
+/// `process_pending_deposits`"), so [`super::fulu::process_pending_deposits`]
+/// keeps its own copy of this loop rather than sharing this one; see that
+/// function's own doc for why running this version under fulu would be
+/// wrong, not merely redundant.
 pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
     let next_epoch = get_current_epoch(state) + 1;
     let churn_limit = get_activation_exit_churn_limit(state, config)?;
@@ -433,7 +440,12 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
 /// this, still builds a new validator phase0's way; see
 /// [`add_validator_from_pending_deposit`]'s doc for exactly how reusing it
 /// would go wrong here.
-fn apply_pending_deposit(
+///
+/// `pub(crate)`, not private: fulu's own `process_pending_deposits`
+/// ([`super::fulu::process_pending_deposits`]) shares this step unchanged,
+/// only dropping the eth1-bridge ordering gate ahead of it; see that
+/// function's own doc.
+pub(crate) fn apply_pending_deposit(
     state: &mut BeaconState,
     deposit: &electra::PendingDeposit,
     config: &Config,
@@ -678,7 +690,14 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
 /// though its shape, an electra-or-fulu match, is identical: fulu keeps every
 /// field this covers unchanged (see `crate::beacon::helpers::electra`'s own module
 /// doc for why that module's projection accepts fulu too).
-enum PendingQueueFields<'a> {
+///
+/// `pub(crate)`: fulu's own [`super::fulu::process_pending_deposits`] reads
+/// [`Self::deposit_balance_to_consume`] and writes through
+/// [`Self::pending_deposits_mut`] and [`Self::deposit_balance_to_consume_mut`]
+/// the same way this module's own [`process_pending_deposits`] does; it never
+/// reads [`Self::deposit_requests_start_index`], the one field that function
+/// stops consulting.
+pub(crate) enum PendingQueueFields<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
 }
@@ -688,7 +707,14 @@ impl<'a> PendingQueueFields<'a> {
     /// from crediting deposits off `Eth1Data` votes to crediting them off
     /// `DepositRequest`s directly, read by [`process_pending_deposits`] to
     /// know whether any eth1-bridge deposit is still outstanding.
-    fn deposit_requests_start_index(&self) -> u64 {
+    ///
+    /// `pub(crate)`: fulu's own tests (`super::fulu`) read this to assert a
+    /// test state starts with it at
+    /// [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`], the
+    /// precondition [`super::fulu::process_pending_deposits`]'s own doc
+    /// explains. [`super::fulu::process_pending_deposits`] itself never reads
+    /// this field.
+    pub(crate) fn deposit_requests_start_index(&self) -> u64 {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
             PendingQueueFields::Fulu(state) => state.deposit_requests_start_index,
@@ -696,14 +722,14 @@ impl<'a> PendingQueueFields<'a> {
     }
 
     /// How much of this epoch's deposit balance churn limit remains unused.
-    fn deposit_balance_to_consume(&self) -> Gwei {
+    pub(crate) fn deposit_balance_to_consume(&self) -> Gwei {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
         }
     }
 
-    fn deposit_balance_to_consume_mut(&mut self) -> &mut Gwei {
+    pub(crate) fn deposit_balance_to_consume_mut(&mut self) -> &mut Gwei {
         match self {
             PendingQueueFields::Electra(state) => &mut state.deposit_balance_to_consume,
             PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
@@ -711,7 +737,7 @@ impl<'a> PendingQueueFields<'a> {
     }
 
     /// Deposits known but not yet credited to the validator registry.
-    fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
+    pub(crate) fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
         match self {
             PendingQueueFields::Electra(state) => &mut state.pending_deposits,
             PendingQueueFields::Fulu(state) => &mut state.pending_deposits,
@@ -750,7 +776,7 @@ impl<'a> PendingQueueFields<'a> {
 /// The electra-or-fulu state, mutably, through [`PendingQueueFields`]. See
 /// its own doc for why this is a second projection rather than a call into
 /// [`crate::beacon::helpers::electra::electra_state`].
-fn pending_queue_fields<'a>(
+pub(crate) fn pending_queue_fields<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
 ) -> Result<PendingQueueFields<'a>> {

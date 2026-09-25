@@ -1126,6 +1126,11 @@ pub fn process_withdrawals(
 /// [`electra::BeaconBlockBody::execution_requests`] rather than carrying them
 /// as three separate body fields the way every other operation list is
 /// carried.
+///
+/// Electra's own version. Fulu redefines the deposit-request leg
+/// ([`super::fulu::process_deposit_request`]) to drop the former deposit
+/// mechanism's bookkeeping, so it keeps a copy of this whole loop
+/// ([`super::fulu::process_execution_requests`]) rather than sharing this one.
 pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
@@ -1161,6 +1166,22 @@ pub fn process_execution_requests(
 /// [`process_withdrawal_request`] and [`process_consolidation_request`]
 /// trust the execution layer's own request rather than re-deriving a
 /// signature for it.
+///
+/// Electra's own version, in effect only through this fork. This is the
+/// function that *releases* electra's own gate in
+/// [`super::epoch::electra::process_pending_deposits`]: setting
+/// `deposit_requests_start_index` the first time a request is seen is what
+/// eventually turns that gate's `eth1_deposit_index < deposit_requests_start_index`
+/// false. By fulu the former deposit mechanism that field tracks is fully
+/// retired (`beacon-chain.md`'s "Modified `process_deposit_request`" for that
+/// fork), so [`super::fulu::process_deposit_request`] queues the same
+/// [`electra::PendingDeposit`] without touching that field at all, and
+/// [`super::epoch::fulu::process_pending_deposits`] drops the gate to match.
+/// The two changes are a package: pairing fulu's deposit handler (which never
+/// sets the field) with electra's still-gated pending-deposits step, rather
+/// than fulu's own, would leave the field permanently unset and the gate
+/// permanently true, wedging the queue for good; see that function's own
+/// doc.
 pub fn process_deposit_request(
     state: &mut BeaconState,
     request: &electra::DepositRequest,
@@ -1687,6 +1708,12 @@ pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec
 /// `eth1_deposit_index_limit - state.eth1_deposit_index` cannot underflow:
 /// the surrounding `if` already established `state.eth1_deposit_index <
 /// eth1_deposit_index_limit`.
+///
+/// Electra's own version. Fulu removes the old deposit-contract path outright
+/// (`beacon-chain.md`'s "Modified `process_operations`": `assert
+/// len(body.deposits) == 0`, unconditionally, with no `process_deposit` call
+/// at all), so it keeps its own copy, [`super::fulu::process_operations`],
+/// rather than calling this one.
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
