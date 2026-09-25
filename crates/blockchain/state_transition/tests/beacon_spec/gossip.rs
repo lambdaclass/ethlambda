@@ -48,11 +48,24 @@ const HANDLERS: &[&str] = &[
 /// fails if a fixture release adds a `gossip_*` handler that is in neither
 /// list, the same way [`super::UNMODELED_FORKS`] forces a decision on a new
 /// fork directory.
+///
+/// `gossip_execution_payload_bid`, `gossip_execution_payload_envelope`,
+/// `gossip_payload_attestation_message`, and `gossip_proposer_preferences`
+/// are gloas's own topics (EIP-7732 ePBS): the builder's bid, the revealed
+/// payload envelope, the payload timeliness committee's vote, and a
+/// builder's advertised preferences, respectively. None of them existed
+/// until gloas's fixture directory started parsing (`ForkName::Gloas`), so
+/// they land here rather than silently in `unknown` the first time this
+/// runner sees them. Alphabetized with the rest rather than kept together.
 const IGNORED_HANDLERS: &[&str] = &[
     "gossip_attester_slashing",
     "gossip_blob_sidecar",
     "gossip_bls_to_execution_change",
+    "gossip_execution_payload_bid",
+    "gossip_execution_payload_envelope",
     "gossip_partial_data_column_sidecar",
+    "gossip_payload_attestation_message",
+    "gossip_proposer_preferences",
     "gossip_proposer_slashing",
     "gossip_sync_committee_contribution_and_proof",
     "gossip_sync_committee_message",
@@ -134,7 +147,9 @@ fn decode_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
 /// needed one yet): every fork through deneb shares phase0's shape, and
 /// electra and fulu share electra's, exactly the split
 /// [`SignedAggregateAndProof`]'s own doc describes for
-/// [`SignedBeaconBlock::Fulu`].
+/// [`SignedBeaconBlock::Fulu`]. Gloas's own aggregate has no modeled variant,
+/// and this runner does not run its cases (see [`trials`]), so it is refused
+/// by name.
 fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAndProof, String> {
     let bytes = case.ssz_bytes(name);
     match case.fork {
@@ -150,7 +165,9 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        other => Err(format!("no aggregate shape for fork {other:?}")),
+        ForkName::Gloas | ForkName::Lean => {
+            Err(format!("no aggregate shape for fork {:?}", case.fork))
+        }
     }
 }
 

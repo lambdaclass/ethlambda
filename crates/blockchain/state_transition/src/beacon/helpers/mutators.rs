@@ -140,6 +140,15 @@ fn initiate_validator_exit_for_fork(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => initiate_validator_exit(state, index, config),
+        // Gloas (EIP-8061) redefines the validator exit churn itself
+        // (`churn_limit_quotient_gloas`/`max_per_epoch_activation_churn_limit_gloas`
+        // in `Config`, read by `get_activation_churn_limit`/
+        // `get_exit_churn_limit`), which is more than a retuned constant;
+        // left as an explicit gap for the STF port rather than assumed.
+        ForkName::Gloas => Err(Error::UnsupportedForFork {
+            function: "initiate_validator_exit_for_fork",
+            fork: ForkName::Gloas,
+        }),
         ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
     }
 }

@@ -199,6 +199,12 @@ fn apply(
                     block.body.hash_tree_root(),
                 )
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "block_header",
+                    fork: ForkName::Gloas,
+                },
+            ),
             // No `other` arm: the patterns above already cover every `ForkName`
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
@@ -231,6 +237,12 @@ fn apply(
                 let attestation: electra::Attestation = case.ssz("attestation");
                 electra_stf::process_attestation(state, &attestation, &committees)
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "attestation",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
         },
         "attester_slashing" => match case.fork {
@@ -251,6 +263,12 @@ fn apply(
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
                 electra_stf::process_attester_slashing(state, &slashing, config)
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "attester_slashing",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
         // `ProposerSlashing` never changes shape, and no fork's specification
@@ -279,6 +297,12 @@ fn apply(
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "deposit",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("deposit"),
         },
         "voluntary_exit" => match case.fork {
@@ -301,6 +325,12 @@ fn apply(
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "voluntary_exit",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
         // New in altair, and never listed as modified again, so this needs no
@@ -376,6 +406,12 @@ fn apply(
                         "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
+                ForkName::Gloas => Err(
+                    ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                        function: "execution_payload",
+                        fork: ForkName::Gloas,
+                    },
+                ),
                 ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
             }
         }
@@ -416,6 +452,12 @@ fn apply(
             fork @ (ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix) => {
                 return Err(format!("withdrawals has no handler for fork `{fork}`"));
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "withdrawals",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // All three are new in electra, alongside `withdrawals`; fulu's

@@ -8,6 +8,7 @@ use super::{
     finalized_start_slot, is_future_slot,
 };
 use crate::beacon::containers::SignedBeaconBlock;
+use crate::beacon::fork::ForkName;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::precheck::{self, PrecheckError, Reference, precheck_block};
@@ -25,6 +26,19 @@ pub fn cheap_checks(
 ) -> Result<(), Outcome> {
     let config = store.config();
     let slot = block.slot();
+    // [IGNORE] This build does not validate a gloas-shaped block against
+    // these (fulu) rules: EIP-7732 changes what a block commits to enough
+    // that accepting one here would propagate something this node cannot
+    // itself import (`fork_choice::on_block` refuses every gloas block with
+    // `Error::UnsupportedForFork`). Checked first, so a gloas block never
+    // reaches a rule below whose fields it happens to still answer (its
+    // `blob_kzg_commitment_count` reads the builder's bid) but whose verdict
+    // would misdescribe it. `Ignore`, not `Reject`: the sender did nothing
+    // wrong, and every honest peer sends exactly this once this node's own
+    // clock reaches gloas.
+    if block.fork_name() == ForkName::Gloas {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
     // [IGNORE] The block is not from a future slot.
     if is_future_slot(&config, slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));

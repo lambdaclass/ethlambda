@@ -69,6 +69,14 @@ pub fn process_block(
         containers::SignedBeaconBlock::Fulu(signed) => {
             fulu::process_block(state, &signed.message, config, engine, committees)
         }
+        // ePBS (EIP-7732) restructures block processing around a builder's
+        // bid rather than an embedded payload; a later task ports it.
+        containers::SignedBeaconBlock::Gloas(_) => {
+            Err(crate::beacon::error::Error::UnsupportedForFork {
+                function: "process_block",
+                fork: crate::beacon::fork::ForkName::Gloas,
+            })
+        }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }

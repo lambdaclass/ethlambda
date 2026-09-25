@@ -40,7 +40,7 @@ const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
 /// a target of the beacon STF's `upgrade`-style traversal. See
 /// [`ForkName::ALL`].
 ///
-/// Forks after fulu exist upstream but are out of scope for this crate.
+/// Forks after gloas exist upstream but are out of scope for this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,
@@ -50,6 +50,7 @@ pub enum ForkName {
     Deneb,
     Electra,
     Fulu,
+    Gloas,
     /// The Lean consensus protocol, which this repository implements alongside
     /// the Beacon Chain. Not a Beacon Chain fork, and not in [`ForkName::ALL`].
     Lean,
@@ -61,9 +62,9 @@ impl ForkName {
     /// [`ForkName::Lean`] is not here: it is not a Beacon Chain fork. Because
     /// `parse`, `previous`, `next`, and the spec-fixture harness all search this
     /// array, its absence is what makes `parse("lean")` return `None`, keeps
-    /// `Fulu.next()` at `None`, and stops any fixture directory from resolving
+    /// `Gloas.next()` at `None`, and stops any fixture directory from resolving
     /// to a lean case.
-    pub const ALL: [ForkName; 7] = [
+    pub const ALL: [ForkName; 8] = [
         ForkName::Phase0,
         ForkName::Altair,
         ForkName::Bellatrix,
@@ -71,6 +72,7 @@ impl ForkName {
         ForkName::Deneb,
         ForkName::Electra,
         ForkName::Fulu,
+        ForkName::Gloas,
     ];
 
     /// The lowercase name the specification and its fixture paths use.
@@ -83,6 +85,7 @@ impl ForkName {
             ForkName::Deneb => "deneb",
             ForkName::Electra => "electra",
             ForkName::Fulu => "fulu",
+            ForkName::Gloas => "gloas",
             ForkName::Lean => "lean",
         }
     }
@@ -114,8 +117,8 @@ impl ForkName {
     /// deriving the on-disk tag from it too would mean a reorder made for the
     /// ordering's sake silently reinterpreted every state already written.
     ///
-    /// [`ForkName::Lean`] takes 255 rather than 7 so that the beacon forks after
-    /// fulu can keep taking the next free value as they land.
+    /// [`ForkName::Lean`] takes 255 rather than 8 so that the beacon forks after
+    /// gloas can keep taking the next free value as they land.
     pub const fn selector(self) -> u8 {
         match self {
             ForkName::Phase0 => 0,
@@ -125,6 +128,7 @@ impl ForkName {
             ForkName::Deneb => 4,
             ForkName::Electra => 5,
             ForkName::Fulu => 6,
+            ForkName::Gloas => 7,
             ForkName::Lean => 255,
         }
     }
@@ -148,7 +152,8 @@ impl ForkName {
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra
-            | ForkName::Fulu => BEACON_SNAPSHOT_INTERVAL,
+            | ForkName::Fulu
+            | ForkName::Gloas => BEACON_SNAPSHOT_INTERVAL,
         }
     }
 
@@ -165,6 +170,7 @@ impl ForkName {
             4 => Some(ForkName::Deneb),
             5 => Some(ForkName::Electra),
             6 => Some(ForkName::Fulu),
+            7 => Some(ForkName::Gloas),
             255 => Some(ForkName::Lean),
             _ => None,
         }
@@ -193,13 +199,23 @@ mod tests {
         for fork in ForkName::ALL {
             assert_eq!(ForkName::parse(fork.as_str()), Some(fork));
         }
-        assert_eq!(ForkName::parse("gloas"), None);
+        assert_eq!(ForkName::parse("gloas"), Some(ForkName::Gloas));
+        assert_eq!(ForkName::parse("heze"), None);
+    }
+
+    #[test]
+    fn gloas_is_the_last_beacon_fork() {
+        assert_eq!(ForkName::Fulu.next(), Some(ForkName::Gloas));
+        // Also guards the reason Lean is kept out of ALL: adding it there
+        // would make this None into Some(Lean) and let `upgrade` walk off
+        // the end.
+        assert_eq!(ForkName::Gloas.next(), None);
     }
 
     #[test]
     fn neighbours_terminate_at_the_ends() {
         assert_eq!(ForkName::Phase0.previous(), None);
-        assert_eq!(ForkName::Fulu.next(), None);
+        assert_eq!(ForkName::Gloas.next(), None);
         assert_eq!(ForkName::Altair.previous(), Some(ForkName::Phase0));
         assert_eq!(ForkName::Altair.next(), Some(ForkName::Bellatrix));
     }
@@ -221,13 +237,6 @@ mod tests {
         assert_eq!(ForkName::parse("lean"), None);
         assert_eq!(ForkName::Lean.next(), None);
         assert_eq!(ForkName::Lean.previous(), None);
-    }
-
-    #[test]
-    fn fulu_is_still_the_last_beacon_fork() {
-        // Guards the reason Lean is kept out of ALL: adding it there would make
-        // this None into Some(Lean) and let `upgrade` walk off the end.
-        assert_eq!(ForkName::Fulu.next(), None);
     }
 
     #[test]
@@ -270,9 +279,10 @@ mod tests {
         // derived from the variant order, which the derived Ord already owns.
         assert_eq!(ForkName::Phase0.selector(), 0);
         assert_eq!(ForkName::Fulu.selector(), 6);
-        // Lean sits at the top of the byte range so gloas and heze can keep
-        // taking the next free value after fulu.
+        assert_eq!(ForkName::Gloas.selector(), 7);
+        // Lean sits at the top of the byte range so heze can keep taking the
+        // next free value after gloas.
         assert_eq!(ForkName::Lean.selector(), 255);
-        assert_eq!(ForkName::from_selector(7), None);
+        assert_eq!(ForkName::from_selector(8), None);
     }
 }

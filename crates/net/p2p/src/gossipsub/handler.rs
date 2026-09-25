@@ -13,6 +13,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
+    beacon::fork::ForkName,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -290,11 +291,36 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 
 /// Decode a data column sidecar and run its cheap gossip checks. Same shape as
 /// [`triage_block`].
+///
+/// Decodes first, unlike the clock-based gate this used to be: gossipsub
+/// topic subscriptions are frozen at startup (`build_swarm` does not
+/// resubscribe as a fork boundary is crossed), so a node running across the
+/// gloas boundary stays on its fulu-digest topic the whole time, where a
+/// late but perfectly legitimate fulu sidecar can still legally arrive. A
+/// clock check ahead of the decode would drop that one too, mistaking it for
+/// gloas-shaped just because the clock has moved on. Only on a decode
+/// failure does the clock matter, and only as an approximation: this node's
+/// *topic* fork (whichever one gossip actually subscribed under at startup)
+/// is not threaded down to this handler today, so [`beacon_decode::current_fork`]
+/// (the wall clock) stands in for it. That is exactly backwards for a node
+/// stuck on stale fulu topics past the boundary, the same case this doc
+/// opens with: a genuinely malformed fulu sidecar arriving there reads as
+/// `Ignore` instead of `Reject`, since the clock alone cannot tell "stale
+/// topic, bad bytes" apart from "current topic, gloas-shaped bytes". Safe
+/// either way, since `Ignore` never down-scores a peer; a future change that
+/// carries the topic's own fork into `BeaconWire` (or wherever else carries
+/// the fork digest to this handler) can make this exact instead of merely
+/// safe.
 fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
     let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
+            let config = server.store.config();
+            if beacon_decode::current_fork(&config) == ForkName::Gloas {
+                metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+                return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+            }
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(?err, "Dropping an undecodable data column sidecar");
             return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
@@ -326,6 +352,13 @@ fn triage_aggregate(
     const KIND: &str = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
     let aggregate = match beacon_decode::decode_aggregate_and_proof(&wire.config, payload) {
         Ok(aggregate) => aggregate,
+        // `UnsupportedFork` is not the sender's fault (an honest gloas peer
+        // sends exactly this once this node's own clock reaches gloas), so it
+        // must not score like every other decode failure does.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -446,6 +479,12 @@ fn triage_other(wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
                 "Beacon gossip decoded"
             );
             Outcome::Ignore(IgnoreReason::NoConsumer)
+        }
+        // See `triage_aggregate`'s matching arm for why this scores as
+        // `Ignore` rather than `Reject`.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(kind, "unsupported_fork");
+            Outcome::Ignore(IgnoreReason::UnsupportedFork)
         }
         Err(err) => {
             metrics::inc_beacon_gossip(kind, "decode_failed");

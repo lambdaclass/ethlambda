@@ -425,14 +425,18 @@ runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
 The release ships no mainnet `genesis` fixtures, so that whole runner is gated
 behind the `preset-minimal` feature (`tests/spec/genesis.rs`).
 
-Nothing is ignored for being unimplemented. Every ignored case is one of two
+Nothing is ignored for being unimplemented, with one exception now that
+`ForkName::Gloas` exists: every gloas case is individually ignored, by the
+same `HIGHEST_IMPLEMENTED_FORK`/`Case::in_scope` gate that would ignore any
+other fork past the last one this crate implements (`HIGHEST_IMPLEMENTED_FORK`
+stays `Fulu` through Part A). Every other ignored case is one of two
 deliberate exclusions:
 
 - `LightClient*` containers under `ssz_static`, 5 container types across altair
   through fulu. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
-- The `gloas` and `heze` fixture trees, one ignored entry each. See
-  "Accounting for every fork directory" below.
+- The `heze` fixture tree, one ignored entry. See "Accounting for every fork
+  directory" below.
 
 ## Accounting for every fork directory
 
@@ -441,12 +445,14 @@ a name that does not parse is skipped. That skip is silent in a way the
 `HIGHEST_IMPLEMENTED_FORK` gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.
 
-The release does ship two such trees. `gloas` and `heze` are the two forks
-after fulu, in that order. Between them they hold 3068 mainnet and 21137
-minimal cases, all of which were previously dropped without a trace, which is
-the opposite of what this harness promises.
+`gloas` no longer takes this silent path: `ForkName::parse("gloas")` succeeds,
+so its cases become ordinary tests, individually named and ignored through ordinary
+`Case::in_scope` gating, the same as fulu's cases would be if
+`HIGHEST_IMPLEMENTED_FORK` were dropped back a fork. `heze`, the one fork after
+gloas, is still unparseable and still silently skipped without this section's
+own accounting.
 
-So `UNMODELED_FORKS` names them, each reports as one ignored test, and
+So `UNMODELED_FORKS` names `heze` alone, it reports as one ignored test, and
 `fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
 directory that is neither parseable nor listed. A release that adds a fork now
 forces a decision instead of quietly widening the gap.

@@ -167,6 +167,7 @@ use crate::beacon::constants;
 use crate::beacon::containers::{AttestationData, BeaconState, Checkpoint, SignedBeaconBlock};
 use crate::beacon::containers::{bellatrix, deneb, electra, fulu, phase0};
 use crate::beacon::error::{Error, Result, verify};
+use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, get_active_validator_indices, get_beacon_proposer_index, get_current_epoch,
     get_total_active_balance,
@@ -459,6 +460,18 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
         ),
+        // EIP-7688 makes a gloas block's own `attestations`/`attester_slashings`
+        // a `ProgressiveList`, which `on_block_attestation` and
+        // `on_attester_slashing` are not yet shaped to take, so this cannot
+        // decode them the way every other arm does. Unreachable from network
+        // input today: `crates/blockchain`'s `process_or_pend_block` refuses
+        // every gloas block before this is ever called, precisely so this
+        // arm, `data_availability_for`, and `on_block`'s own
+        // `Error::UnsupportedForFork` are never paid for on a block that
+        // cannot be imported regardless. Empty rather than a panic
+        // regardless, defensively: were that gate ever bypassed, this must
+        // not crash the actor on the way to `on_block`'s own refusal.
+        SignedBeaconBlock::Gloas(_) => (Vec::new(), Vec::new()),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
 }
@@ -892,6 +905,22 @@ pub fn get_forkchoice_store(
     anchor_block: SignedBeaconBlock,
     config: &Config,
 ) -> Result<Store> {
+    // Refused before any other check: a gloas anchor (checkpoint sync
+    // decodes one structurally today, and a loaded network scheduling
+    // `GLOAS_FORK_EPOCH: 0` reaches this from `genesis_anchor_block` too)
+    // would otherwise boot a store this build can never advance past:
+    // `state_transition` already refuses every gloas block and epoch
+    // boundary, so a node anchored here would sit at genesis forever,
+    // looking alive while importing nothing. Checked ahead of the
+    // fork-matching `verify` below so a gloas anchor reports its real reason
+    // rather than a spurious "fork mismatch".
+    if anchor_state.fork_name() == ForkName::Gloas {
+        return Err(Error::UnsupportedForFork {
+            function: "get_forkchoice_store",
+            fork: ForkName::Gloas,
+        });
+    }
+
     // The specification's `BeaconState` and `BeaconBlock` are already one
     // fork's own types, so a mismatch between them cannot even be expressed
     // there; here both are enums, so this module has to enforce the invariant
@@ -2357,6 +2386,20 @@ pub fn on_block(
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)
         | SignedBeaconBlock::Capella(_) => {}
+        // ePBS (EIP-7732) moves the availability question from the block's
+        // blob/column commitments to the separately gossiped execution
+        // payload envelope; the check above the match on `signed_block` does
+        // not apply to a gloas block at all. `state_transition` below is the
+        // gloas gap this repository has not closed yet (Part B), so this
+        // returns the same `Error::UnsupportedForFork` any other
+        // fork-mismatched call in this crate does, rather than skipping the
+        // availability question with a silent `{}` arm.
+        SignedBeaconBlock::Gloas(_) => {
+            return Err(Error::UnsupportedForFork {
+                function: "fork_choice::on_block",
+                fork: ForkName::Gloas,
+            });
+        }
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
     }
 

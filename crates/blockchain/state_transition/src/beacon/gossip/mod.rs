@@ -98,6 +98,13 @@ pub enum IgnoreReason {
     Overloaded,
     /// Validation panicked.
     Internal,
+    /// The message's own fork is one this build does not validate or decode
+    /// (currently gloas): not the sender's fault, and not malformed, so this
+    /// is `Ignore` rather than `Reject`. A `Reject` down-scores the peer in
+    /// gossipsub, and every honest peer on the network sends these once this
+    /// node's own clock crosses that fork's activation, which would punish
+    /// the whole mesh for a gap in this build rather than in the message.
+    UnsupportedFork,
     /// An attestation's slot is in neither the current nor the previous epoch.
     OutsideEpochWindow,
     /// An aggregate adds no bit that one already accepted for the same data
@@ -124,6 +131,7 @@ impl IgnoreReason {
             Self::NoConsumer => "no_consumer",
             Self::Overloaded => "overloaded",
             Self::Internal => "internal",
+            Self::UnsupportedFork => "unsupported_fork",
             Self::OutsideEpochWindow => "outside_epoch_window",
             Self::CoveredBits => "covered_bits",
             Self::UnknownBlock => "unknown_block",

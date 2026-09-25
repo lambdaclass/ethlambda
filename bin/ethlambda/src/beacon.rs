@@ -189,7 +189,21 @@ pub fn wire_params(
 
     // The digest is computed once. Crossing a boundary while running strands
     // this node on topic names nobody publishes to, so say when that is.
+    //
+    // The gloas boundary gets its own message rather than the generic one: a
+    // restart there recomputes the digest and resubscribes to the right
+    // topics, the same as any other boundary, but it does not make this
+    // build any more able to import a gloas block or cross a gloas epoch
+    // boundary (`state_transition` refuses both). Suggesting a restart
+    // "crosses" it would read as a stall a restart clears, which this is
+    // not.
     match next_fork_boundary(&chain, epoch) {
+        Some(boundary) if boundary == chain.gloas_fork_epoch => warn!(
+            boundary_epoch = boundary,
+            boundary_unix_time = time_at_epoch(&chain, genesis.genesis_time, boundary),
+            "The fork digest changes at this boundary, but this build cannot follow past it: \
+             a restart resubscribes to the right topics, not past the gloas gap itself"
+        ),
         Some(boundary) => info!(
             boundary_epoch = boundary,
             boundary_unix_time = time_at_epoch(&chain, genesis.genesis_time, boundary),
