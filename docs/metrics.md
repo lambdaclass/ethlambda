@@ -416,6 +416,26 @@ is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
 
+### Beacon Pubkey Cache
+
+Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
+gossip validation) resolves its signers' compressed public keys to validated
+curve points through one process-wide cache, keyed by the compressed bytes. See
+`PubkeyCache` in `crates/blockchain/state_transition/src/beacon/bls.rs`. This is
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_pubkey_cache_lookups_total` | Counter | Public keys resolved for a signature check, by whether the cache already held them | Once per signature check, counting every signer | result=hit,miss |
+| `lean_beacon_pubkey_cache_entries` | Gauge | Validated public keys the cache holds | On each key added; the cache never removes one | |
+
+**Misses should fall to near zero within an epoch of a start**, once every
+active validator has signed something the node checked. A steady miss rate
+after that means keys the cache is refusing to hold: either the entry bound is
+reached (the gauge stops rising), or the keys are invalid, which are never
+cached and pay the full check every time. `entries` is also the cache's memory
+footprint, roughly a decompressed point plus its compressed key per entry.
+
 ### Data Column Sidecars (Fulu DAS)
 
 `ethlambda beacon` is a fulu data-availability-sampling custodian: it derives
