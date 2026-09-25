@@ -77,8 +77,11 @@ pub fn process_epoch_phase0(state: &mut BeaconState, config: &Config) -> Result<
 ///   across forks, and never redefines `process_epoch` itself, so this reuses
 ///   capella's driver.
 /// - Electra's and fulu's sections each give a full, modified `process_epoch`
-///   (electra adds the pending-deposit and pending-consolidation steps;
-///   fulu appends the proposer-lookahead step), so each gets its own stub.
+///   (electra adds the pending-deposit and pending-consolidation steps; fulu
+///   appends the proposer-lookahead step and, less visibly in this listing,
+///   swaps in its own `process_pending_deposits`, which drops the
+///   eth1-bridge gate electra's version still has), so each gets its own
+///   stub.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
     match state.fork_name() {
         ForkName::Phase0 => process_epoch_phase0(state, config),

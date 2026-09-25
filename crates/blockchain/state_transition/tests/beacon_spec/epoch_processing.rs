@@ -36,8 +36,12 @@
 //!   different handler name rather than a different fork's version of this
 //!   one, starting at capella.
 //! - Electra adds `pending_deposits` and `pending_consolidations`, with no
-//!   earlier-fork counterpart at all; fulu carries both forward unchanged and
-//!   adds `proposer_lookahead` of its own, likewise with no earlier-fork
+//!   earlier-fork counterpart at all. Fulu carries `pending_consolidations`
+//!   forward unchanged, but its own `beacon-chain.md` lists a modified
+//!   `pending_deposits` (it drops the eth1-bridge-ahead-of-requests gate,
+//!   which stalls if `deposit_requests_start_index` is still unset or not
+//!   yet drained when a deposit request reaches it), and adds
+//!   `proposer_lookahead` of its own, likewise with no earlier-fork
 //!   counterpart.
 
 use std::sync::Arc;
@@ -188,11 +192,28 @@ fn apply(
         "inactivity_updates" => epoch::altair::process_inactivity_updates(state, config),
         "participation_flag_updates" => epoch::altair::process_participation_flag_updates(state),
         "sync_committee_updates" => epoch::altair::process_sync_committee_updates(state),
-        // New in electra (EIP-7251); fulu carries both pending queues forward
-        // unchanged, calling the very same functions (see
-        // `electra::process_epoch`'s own doc for why fulu's driver needs no
-        // rewrite of either).
-        "pending_deposits" => epoch::electra::process_pending_deposits(state, config),
+        // New in electra (EIP-7251). Fulu's driver keeps calling the very
+        // same `process_pending_consolidations` (see `electra::process_epoch`'s
+        // own doc for why that one needs no rewrite), but `pending_deposits`
+        // has its own fulu-specific function: `epoch::fulu::process_pending_deposits`'s
+        // own doc explains why running electra's version under fulu would be
+        // wrong, not merely redundant.
+        "pending_deposits" => match fork {
+            ForkName::Fulu => epoch::fulu::process_pending_deposits(state, config),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra => epoch::electra::process_pending_deposits(state, config),
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "pending_deposits",
+                    fork: ForkName::Gloas,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("pending_deposits"),
+        },
         "pending_consolidations" => epoch::electra::process_pending_consolidations(state, config),
         // New in fulu (EIP-7917); no earlier fork has this handler at all.
         "proposer_lookahead" => epoch::fulu::process_proposer_lookahead(state),

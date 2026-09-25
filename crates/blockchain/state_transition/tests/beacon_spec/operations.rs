@@ -81,9 +81,17 @@
 //!   to hold a differently-typed `payload` parameter, not different logic.
 //! - `consolidation_request`, `deposit_request`, and `withdrawal_request` are
 //!   all new in electra, alongside `withdrawals`, `process_attestation`,
-//!   `process_deposit`, and `process_voluntary_exit`; fulu's specification
-//!   lists none of the seven as modified again, so electra's functions serve
-//!   fulu's cases too.
+//!   `process_deposit`, and `process_voluntary_exit`. Fulu's specification
+//!   lists `consolidation_request`, `withdrawal_request`, `withdrawals`,
+//!   `process_attestation`, and `process_voluntary_exit` as unmodified, so
+//!   electra's functions serve fulu's cases for those five too, and it lists
+//!   `process_deposit` as removed outright rather than modified (beta.2 ships
+//!   no fulu `operations/deposit` fixtures, so that arm is untested either
+//!   way). `deposit_request` is the one exception with a genuine fulu-only
+//!   function: it drops the statement that sets
+//!   `deposit_requests_start_index`, since fulu retires the eth1-bridge
+//!   deposit mechanism outright (`fulu_stf::process_deposit_request`'s own
+//!   doc).
 use std::sync::Arc;
 
 use ethlambda_state_transition::beacon::ForkName;
@@ -291,8 +299,15 @@ fn apply(
             }
             // Electra queues a deposit's amount instead of crediting it
             // directly (EIP-7251), so the epoch boundary can rate-limit
-            // activation by balance rather than by validator count; fulu's
-            // specification makes no further change.
+            // activation by balance rather than by validator count. Fulu's
+            // specification removes `process_deposit` outright rather than
+            // modifying it (`beacon-chain.md`'s "Modified `process_operations`":
+            // `assert len(body.deposits) == 0`, no call at all), so this
+            // fulu arm is dead in practice: beta.2 ships no fulu
+            // `operations/deposit` fixtures. Kept rather than dropped so a
+            // future fixture release that does ship one fails loudly through
+            // whatever electra's function rejects it for, not silently
+            // through `unhandled operation`.
             ForkName::Electra | ForkName::Fulu => {
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
@@ -460,17 +475,45 @@ fn apply(
             ),
             ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
-        // All three are new in electra, alongside `withdrawals`; fulu's
-        // specification lists none of them as modified, so electra's own
-        // functions serve fulu's cases too.
+        // `consolidation_request` and `withdrawal_request` are new in
+        // electra, alongside `withdrawals`; fulu's specification lists
+        // neither as modified, so electra's own functions serve fulu's cases
+        // too.
         "consolidation_request" => {
             let request: electra::ConsolidationRequest = case.ssz("consolidation_request");
             electra_stf::process_consolidation_request(state, &request, config)
         }
-        "deposit_request" => {
-            let request: electra::DepositRequest = case.ssz("deposit_request");
-            electra_stf::process_deposit_request(state, &request)
-        }
+        // `deposit_request` is new in electra too, but fulu's specification
+        // does list a modified version (`beacon-chain.md`'s "Modified
+        // `process_deposit_request`"): it drops the statement that sets
+        // `deposit_requests_start_index` the first time a request is seen,
+        // since fulu retires the eth1-bridge deposit mechanism outright (see
+        // `fulu_stf::process_deposit_request`'s own doc). Routing a fulu
+        // case to electra's version regardless would still pass every fixture
+        // shipped so far, since pyspec's own fulu genesis already sets that
+        // field, but it is not the function fulu's specification names.
+        "deposit_request" => match case.fork {
+            ForkName::Fulu => {
+                let request: electra::DepositRequest = case.ssz("deposit_request");
+                fulu_stf::process_deposit_request(state, &request)
+            }
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra => {
+                let request: electra::DepositRequest = case.ssz("deposit_request");
+                electra_stf::process_deposit_request(state, &request)
+            }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "deposit_request",
+                    fork: ForkName::Gloas,
+                },
+            ),
+            ForkName::Lean => lean_is_not_a_fixture_fork("deposit_request"),
+        },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");
             electra_stf::process_withdrawal_request(state, &request, config)

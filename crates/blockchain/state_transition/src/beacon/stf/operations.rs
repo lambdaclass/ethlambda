@@ -81,12 +81,12 @@ pub fn process_operations(
     //
     // Deneb never reaches here: it has its own `process_operations`
     // (`deneb.rs`), which calls its own `process_attestation` for this loop
-    // instead of this shared one. Electra and fulu have their own
-    // `process_operations` too (`electra.rs`, which fulu reuses), and gloas
-    // will need a third (its bodies carry progressive attestations and
-    // slashings, plus the payload-attestation and builder-registry
-    // operations this signature has no parameters for), so all four are
-    // refused rather than guessed at.
+    // instead of this shared one. Electra and fulu each have their own
+    // `process_operations` too (`electra.rs` and `fulu.rs` respectively), and
+    // gloas will need one of its own as well (its bodies carry progressive
+    // attestations and slashings, plus the payload-attestation and
+    // builder-registry operations this signature has no parameters for), so
+    // all four are refused rather than guessed at.
     let altair_attestations = match state.fork_name() {
         ForkName::Phase0 => false,
         ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => true,
