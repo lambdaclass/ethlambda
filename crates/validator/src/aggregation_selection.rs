@@ -42,10 +42,10 @@ use crate::signing::SigningContext;
 
 /// How many aggregators the protocol aims for per committee.
 ///
-/// A validator-guide constant rather than a preset one, which is why it lives
-/// here and not in `ethlambda-types`: it governs how this client behaves, not
-/// what the chain agrees about, and no container's shape depends on it.
-pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
+/// Re-exported rather than defined here: it governs how this client behaves,
+/// not what the chain agrees about, but the beacon node's
+/// `/eth/v1/config/spec` reports it too, and the two must name one value.
+pub use ethlambda_types::beacon::constants::TARGET_AGGREGATORS_PER_COMMITTEE;
 
 /// Whether `selection_proof` selects its signer as an aggregator for a
 /// committee of `committee_length` members.

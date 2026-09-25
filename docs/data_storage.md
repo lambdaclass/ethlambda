@@ -318,7 +318,12 @@ network. `from_db_state` no longer judges the network or the chain (see
 back and hands both to the caller, which compares `config`'s `genesis_time`
 and slot duration (and `genesis_validators_root`, computed off the anchored
 state itself rather than stored in `Metadata`) against the network it was
-configured for, and `chain` against the sub-command it is running.
+configured for, and `chain` against the sub-command it is running. A beacon
+resume goes further, comparing every chain value in `config` (the fork
+schedule, the slot time, `PRESET_BASE`, ...) against the `config.yaml` it was
+started with, in `first_config_difference`. `CONFIG_NAME` is the exception: a
+label with no consensus effect, so a changed one is only warned about, and the
+stored name stays, since `config` is never rewritten.
 
 A beacon directory **shares** `head`, `latest_justified` and `latest_finalized`
 rather than keeping parallel ones. `init_beacon` seeds all three from one

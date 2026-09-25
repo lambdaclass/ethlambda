@@ -231,7 +231,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
-| `GET` | `/eth/v1/config/spec` | JSON | The `Config` the store was bootstrapped with |
+| `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
@@ -253,6 +253,30 @@ surface's: every integer is a quoted decimal string, byte strings are
 Serving `/eth/v2/debug/beacon/states/finalized` as SSZ is what makes this client
 checkpoint-syncable from itself: it is the exact path
 [`checkpoint_sync.rs`](./checkpoint_sync.md) fetches from other clients.
+
+### `GET /eth/v1/config/spec`
+
+One flat object holding the network's configuration, the compiled preset, and
+the specification's constants, as the Beacon API asks. Validator clients depend
+on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
+its own, and treats an absent key as a mismatch.
+
+The key set is lighthouse's, less gloas-only keys (this build cannot process
+gloas) and three keys the specification does not define
+(`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`, `TTFB_TIMEOUT`). Domain types
+and withdrawal prefixes are `0x`-prefixed hex; `VERSIONED_HASH_VERSION_KZG` is
+a decimal, as lighthouse reports it. `GENESIS_TIME` is absent:
+`/eth/v1/beacon/genesis` reports it.
+
+The configuration keys come from the `Config` the data directory was
+initialized with. Some of them (the custody and subnet counts, the
+`MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains,
+`MAXIMUM_GOSSIP_CLOCK_DISPARITY`) the node runs on compile-time constants for,
+rather than reading them from `Config`. Startup refuses a network whose
+`config.yaml` sets any of them to a different value (see
+[`cli.md`](./cli.md)), so what this endpoint reports is what the node uses.
+`CONFIG_NAME` is the stored name: a resume under a renamed `config.yaml` warns
+and keeps it.
 
 ### Accepted ids, and three that are refused
 

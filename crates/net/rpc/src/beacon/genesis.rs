@@ -7,6 +7,7 @@ use axum::{
     routing::get,
 };
 use ethlambda_storage::Store;
+use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 
 use crate::beacon::ApiError;
 
@@ -35,7 +36,7 @@ async fn get_genesis(State(store): State<Store>) -> Response {
         "data": {
             "genesis_time": config.genesis_time.to_string(),
             "genesis_validators_root": genesis_validators_root,
-            "genesis_fork_version": format!("0x{}", hex::encode(config.genesis_fork_version)),
+            "genesis_fork_version": HexPrefixed(&config.genesis_fork_version).to_string(),
         }
     }))
 }

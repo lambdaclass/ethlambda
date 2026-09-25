@@ -1,10 +1,9 @@
 //! Parsing one network's `config.yaml`.
 //!
-//! Three passes over the same text: [`Config`], then the two string values
-//! that deliberately have no home in it, then the document's keys alone, to
-//! report the ones no field claimed.
+//! Two passes over the same text: [`Config`], then the document's keys alone,
+//! to report the ones no field claimed.
 //!
-//! Three passes rather than one untyped map the other two read out of,
+//! Two passes rather than one untyped map the typed pass reads out of,
 //! because this document has no untyped representation. Both
 //! `TERMINAL_TOTAL_DIFFICULTY` and an unquoted `DEPOSIT_CONTRACT_ADDRESS`
 //! parse as integers wider than `u64`, and `serde_yaml_ng::Value` has no
@@ -23,31 +22,11 @@ use serde::de::{IgnoredAny, Visitor};
 /// What one `config.yaml` yields.
 #[derive(Debug)]
 pub(crate) struct ConfigFile {
-    /// The typed runtime configuration.
+    /// The typed runtime configuration, `PRESET_BASE` and `CONFIG_NAME`
+    /// included.
     pub(crate) config: Config,
-    /// `PRESET_BASE`, checked against the compiled preset at startup.
-    pub(crate) preset_base: String,
-    /// `CONFIG_NAME`, for logging.
-    pub(crate) config_name: String,
     /// Keys no field claimed: a typo, or a fork this build cannot process.
     pub(crate) ignored: Vec<String>,
-}
-
-/// The two string values `Config` deliberately does not carry.
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-struct Identity {
-    #[serde(default = "unknown_preset")]
-    preset_base: String,
-    #[serde(default)]
-    config_name: String,
-}
-
-fn unknown_preset() -> String {
-    // An absent PRESET_BASE cannot be assumed to be mainnet: the check at
-    // startup has to fail rather than guess, so give it a value no build
-    // claims to serve.
-    String::new()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,24 +39,15 @@ impl ConfigFile {
     /// Parse one `config.yaml`'s text.
     pub(crate) fn parse(text: &str) -> Result<Self, ConfigFileError> {
         let config: Config = serde_yaml_ng::from_str(text)?;
-        let identity: Identity = serde_yaml_ng::from_str(text)?;
         let document: BTreeMap<String, IgnoredAny> = serde_yaml_ng::from_str(text)?;
 
         let claimed = config_field_names();
         let ignored = document
             .into_keys()
             .filter(|key| !claimed.contains(&key.as_str()))
-            // The identity keys are consumed by `Identity` rather than by
-            // `Config`, so `Config` does not claim them. They are not typos.
-            .filter(|key| key != "PRESET_BASE" && key != "CONFIG_NAME")
             .collect();
 
-        Ok(Self {
-            config,
-            preset_base: identity.preset_base,
-            config_name: identity.config_name,
-            ignored,
-        })
+        Ok(Self { config, ignored })
     }
 
     /// Log what was ignored, as one line naming each key.
@@ -162,8 +132,8 @@ mod tests {
     #[test]
     fn the_devnets_values_are_read() {
         let parsed = ConfigFile::parse(DEVNET).unwrap();
-        assert_eq!(parsed.config_name, "ethlambda-devnet");
-        assert_eq!(parsed.preset_base, "mainnet");
+        assert_eq!(parsed.config.config_name.as_str(), "ethlambda-devnet");
+        assert_eq!(parsed.config.preset_base.as_str(), "mainnet");
         assert_eq!(parsed.config.deposit_chain_id, 3_151_908);
         assert_eq!(parsed.config.seconds_per_slot, 6);
     }
@@ -189,8 +159,7 @@ mod tests {
 
     #[test]
     fn preset_base_and_config_name_are_not_reported_as_ignored() {
-        // Both are consumed deliberately rather than stored in Config, so they
-        // must not show up in the warning.
+        // Both are `Config` fields now, so the derive claims them.
         let parsed = ConfigFile::parse(DEVNET).unwrap();
         assert!(!parsed.ignored.iter().any(|key| key == "PRESET_BASE"));
         assert!(!parsed.ignored.iter().any(|key| key == "CONFIG_NAME"));

@@ -220,6 +220,30 @@ pub const BASIS_POINTS: u64 = 10_000;
 pub const SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY: u64 = 128;
 
 // ---------------------------------------------------------------------------
+// Validator guide (phase0 and altair validator.md)
+// ---------------------------------------------------------------------------
+//
+// These govern how a validator behaves rather than what the chain agrees
+// about, and only the last sizes a container. They live here, not with the
+// code that acts on them, because `/eth/v1/config/spec` reports all three.
+
+/// How many aggregators the protocol aims for per attestation committee.
+/// `is_aggregator` selects a validator when its selection proof hashes to zero
+/// modulo `committee_length / TARGET_AGGREGATORS_PER_COMMITTEE`.
+pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
+
+/// The sync committee counterpart of [`TARGET_AGGREGATORS_PER_COMMITTEE`]:
+/// how many aggregators the protocol aims for per sync subcommittee. Nothing
+/// in this build aggregates sync committee messages, so the spec endpoint is
+/// its only reader.
+pub const TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE: u64 = 16;
+
+/// How many gossip subnets sync committee messages are split across, one
+/// subcommittee of `SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT` members
+/// each. Sizes `SyncSubcommitteeBits` and `MetaData.syncnets`, hence `usize`.
+pub const SYNC_COMMITTEE_SUBNET_COUNT: usize = 4;
+
+// ---------------------------------------------------------------------------
 // Blob (deneb)
 // ---------------------------------------------------------------------------
 
@@ -281,9 +305,11 @@ pub const CONSOLIDATION_REQUEST_TYPE: u8 = 0x02;
 /// divides the two, and stays correct if a future network separates them.
 ///
 /// A `configs/*.yaml` value in the specification, but identical across both
-/// shipped configs, so it is a constant here. Making it a `Config` field would
-/// change the SSZ encoding persisted under `Metadata[KEY_CONFIG]`, which forces
-/// `DB_VERSION` up and refuses every existing data directory on the next start.
+/// shipped configs, so the node runs on this constant. `Config` carries the
+/// file's value too, for `/eth/v1/config/spec` to report, and startup refuses a
+/// network whose value differs from this one, so the two cannot disagree on a
+/// running node. The other custody and networking values below follow the
+/// same rule.
 pub const NUMBER_OF_CUSTODY_GROUPS: u64 = 128;
 
 /// How many gossip subnets carry data column sidecars: the modulus in
@@ -315,9 +341,8 @@ pub const MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: u64 = 4096;
 /// still be accepted rather than rejected outright, in milliseconds.
 ///
 /// A `configs/*.yaml` value in the specification, identical across both
-/// shipped configs, so it is a constant here for the same reason
-/// [`NUMBER_OF_CUSTODY_GROUPS`] is: a `Config` field would perturb the
-/// persisted encoding under `Metadata[KEY_CONFIG]`.
+/// shipped configs, so it is a constant here and startup refuses a network
+/// that sets another, as with [`NUMBER_OF_CUSTODY_GROUPS`].
 ///
 /// Milliseconds rather than [`core::time::Duration`], matching every other
 /// value in this module: a caller that wants a `Duration` wraps this one
