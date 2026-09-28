@@ -18,14 +18,16 @@ use libp2p::{PeerId, request_response};
 use rand::seq::SliceRandom;
 use spawned_concurrency::tasks::{Context, send_after};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use ethlambda_state_transition::beacon::das;
+use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::containers::fulu::{
     ColumnIndices, DataColumnSidecar, DataColumnsByRootIdentifier,
 };
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
@@ -36,7 +38,7 @@ use super::{
 };
 use crate::beacon::BeaconWire;
 use crate::beacon::column_checks;
-use crate::beacon::decode::decode_data_column_sidecar;
+use crate::beacon::decode::{decode_data_column_sidecar, fork_at_slot};
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
@@ -49,9 +51,10 @@ use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::MAX_REQUEST_BLOCKS;
 use crate::req_resp::messages::BlocksByRangeRequest;
 use crate::{
-    BACKOFF_MULTIPLIER, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE, P2PServer,
-    PendingColumnRequest, PendingRequest, PendingRequestKind, RangeSyncState, ReqRespProtocol,
-    ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics, p2p_protocol,
+    BACKOFF_MULTIPLIER, CustodyWait, INITIAL_BACKOFF_MS, MAX_FETCH_RETRIES, MAX_SYNC_RANGE,
+    P2PServer, PendingColumnRequest, PendingRequest, PendingRequestKind, RANGE_BATCH_CUSTODY_WAIT,
+    RangeSyncState, ReqRespProtocol, ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics,
+    p2p_protocol,
 };
 use libp2p::request_response::ResponseChannel;
 
@@ -190,7 +193,7 @@ pub async fn handle_req_resp_message(
                                 kind = "beacon_status_response",
                                 peer_count, "P2P message received"
                             );
-                            handle_status_response(server, peer, status).await;
+                            handle_status_response(server, peer, status, ctx).await;
                         }
                         ResponsePayload::Pong(ping) => {
                             trace!(kind = "beacon_pong", peer_count, "P2P message received");
@@ -202,6 +205,9 @@ pub async fn handle_req_resp_message(
                                 peer_count, "P2P message received"
                             );
                             handle_metadata_response(server, peer, metadata);
+                            // A peer's custody usually becomes known here, so
+                            // a range batch held back for it may go now.
+                            resume_range_batch_held_for_custody(server, ctx).await;
                         }
                         ResponsePayload::DataColumnSidecars(sidecars) => {
                             trace!(
@@ -280,7 +286,7 @@ pub async fn handle_req_resp_message(
                                 }) => {
                                     if server.wire.is_beacon() {
                                         handle_beacon_blocks_by_range_response(
-                                            server, peer, blocks, start_slot, end_slot,
+                                            server, peer, blocks, start_slot, end_slot, ctx,
                                         )
                                         .await;
                                     } else {
@@ -1177,7 +1183,17 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
 /// [`RangeSyncState::complete_batch`] still advances by the true request span
 /// on the next response even when this batch was clamped smaller than
 /// `next_batch` planned.
-async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
+///
+/// A batch that needs columns is held back, blocks included, until every one
+/// of this node's custody columns has a known custodian among the connected
+/// peers, or until [`RANGE_BATCH_CUSTODY_WAIT`] runs out. Lighthouse's range
+/// sync holds its batches back the same way, and for the same reason: blocks
+/// and columns go out together, and a column request sent before custody is
+/// known asks peers that do not keep the columns. Holding returns `true`, since
+/// nothing failed. The batch is re-checked when a peer's metadata arrives (see
+/// [`resume_range_batch_held_for_custody`]), on every call that would have sent
+/// it anyway, and at the deadline.
+async fn request_next_beacon_range_batch(server: &mut P2PServer, ctx: &Context<P2PServer>) -> bool {
     let Some((peer, batch)) = server
         .range_sync_state
         .as_ref()
@@ -1185,6 +1201,46 @@ async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
     else {
         return true;
     };
+
+    let uncovered = if range_batch_needs_columns(server, &batch) {
+        custody_columns_without_known_custodian(server)
+    } else {
+        Vec::new()
+    };
+    let Some(state) = &mut server.range_sync_state else {
+        return true;
+    };
+    let now = Instant::now();
+    if !uncovered.is_empty() {
+        match state.wait_for_custody(now) {
+            CustodyWait::Started => {
+                debug!(
+                    start_slot = batch.start,
+                    uncovered = uncovered.len(),
+                    "Holding a range batch until its custody columns have known custodians"
+                );
+                send_after(
+                    RANGE_BATCH_CUSTODY_WAIT,
+                    ctx.clone(),
+                    p2p_protocol::RetryBeaconRangeBatch,
+                );
+                return true;
+            }
+            CustodyWait::Waiting => return true,
+            CustodyWait::Expired => {}
+        }
+    }
+    if let Some(waited) = state.end_custody_wait(now) {
+        // `info!` rather than `debug!`: this is the whole of a follower's
+        // catch-up start being delayed, it happens about once per restart, and
+        // production runs at `INFO`.
+        info!(
+            start_slot = batch.start,
+            waited_ms = waited.as_millis() as u64,
+            uncovered = uncovered.len(),
+            "Sending a range batch held back for custody"
+        );
+    }
 
     let planned = batch.end - batch.start;
     // `planned`, not `count`: `next_batch` plans against `MAX_REQUEST_BLOCKS`
@@ -1214,8 +1270,8 @@ async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
     // Pull the columns for the same span alongside the blocks, so they are
     // already stored when each block reaches the availability gate rather than
     // chased one root at a time after it has been held. Not gated on success:
-    // a batch with no column peers still syncs its blocks, and the by-root
-    // path remains behind every one that turns out to be missing.
+    // a batch whose custody wait expired still syncs its blocks, and the
+    // by-root path remains behind every one that turns out to be missing.
     request_beacon_data_columns_by_range(server, batch.start, planned).await;
 
     if let Some(state) = &mut server.range_sync_state {
@@ -1223,6 +1279,74 @@ async fn request_next_beacon_range_batch(server: &mut P2PServer) -> bool {
     }
 
     true
+}
+
+/// Re-check a range batch held back for custody, and send it if it may go now.
+/// Nothing happens unless a batch is held.
+///
+/// Called at the batch's deadline and after every peer metadata answer, which
+/// is where a peer's custody usually becomes known. The other place it is
+/// learned, a peer's ENR `cgc`, is read on connection, and the `Status`
+/// exchange that follows a connection re-checks the batch through
+/// [`handle_status_response`] already.
+///
+/// Only a *held* batch: a range session also sits idle after a failed batch,
+/// until the next `Status` answer restarts it, and restarting it from here
+/// would change that behavior on every metadata answer.
+pub(crate) async fn resume_range_batch_held_for_custody(
+    server: &mut P2PServer,
+    ctx: &Context<P2PServer>,
+) {
+    let held = server
+        .range_sync_state
+        .as_ref()
+        .is_some_and(RangeSyncState::is_waiting_for_custody);
+    if held {
+        request_next_beacon_range_batch(server, ctx).await;
+    }
+}
+
+/// Whether a range batch over `batch` asks for data columns at all.
+fn range_batch_needs_columns(server: &P2PServer, batch: &std::ops::Range<u64>) -> bool {
+    server
+        .wire
+        .beacon()
+        .is_some_and(|wire| range_needs_columns(&wire.config, &wire.custody_columns, batch))
+}
+
+/// Whether blocks over `batch` can carry columns this node custodies: its last
+/// slot is at or after fulu, and the custody set is not empty. Lighthouse's
+/// range sync skips its custody-peer check before PeerDAS for the same reason:
+/// a batch with no columns to fetch has no custodian to wait for.
+fn range_needs_columns(
+    config: &Config,
+    custody_columns: &[u64],
+    batch: &std::ops::Range<u64>,
+) -> bool {
+    let last_slot = batch.end.saturating_sub(1);
+    !custody_columns.is_empty() && fork_at_slot(config, last_slot) >= ForkName::Fulu
+}
+
+/// This node's custody columns that no connected peer is known to custody.
+fn custody_columns_without_known_custodian(server: &P2PServer) -> Vec<u64> {
+    let Some(wire) = server.wire.beacon() else {
+        return Vec::new();
+    };
+    columns_without_known_custodian(server, &wire.custody_columns)
+}
+
+/// The columns among `columns` that no connected peer is known to custody.
+///
+/// Counted through [`columns_custodied_by`], the same answer
+/// [`request_beacon_data_columns_by_range`] aims its requests with, so a batch
+/// is released exactly when that request would find a custodian for every
+/// column.
+fn columns_without_known_custodian(server: &P2PServer, columns: &[u64]) -> Vec<u64> {
+    columns
+        .iter()
+        .copied()
+        .filter(|&column| columns_custodied_by(server, column).is_empty())
+        .collect()
 }
 
 fn fail_range_request(server: &mut P2PServer, peer: &PeerId) {
@@ -1535,7 +1659,12 @@ fn beacon_sync_target(fetched_through: u64, peer_head_slot: u64) -> Option<std::
 /// [`beacon_sync_target`]) and in which function sends the batch
 /// ([`request_next_beacon_range_batch`], so the beacon protocol id and
 /// `MAX_REQUEST_BLOCKS_DENEB` apply).
-async fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: BeaconStatus) {
+async fn handle_status_response(
+    server: &mut P2PServer,
+    peer: PeerId,
+    status: BeaconStatus,
+    ctx: &Context<P2PServer>,
+) {
     let Some(wire) = server.wire.beacon() else {
         return;
     };
@@ -1579,7 +1708,7 @@ async fn handle_status_response(server: &mut P2PServer, peer: PeerId, status: Be
         }
     }
 
-    request_next_beacon_range_batch(server).await;
+    request_next_beacon_range_batch(server, ctx).await;
     trace!(%peer, "Beacon long-range sync: using BeaconBlocksByRange");
 }
 
@@ -2230,6 +2359,7 @@ async fn handle_beacon_blocks_by_range_response(
     blocks: Vec<SignedBeaconBlock>,
     start_slot: u64,
     end_slot: u64,
+    ctx: &Context<P2PServer>,
 ) {
     trace!(%peer, count = blocks.len(), "Received beacon blocks response");
 
@@ -2291,7 +2421,7 @@ async fn handle_beacon_blocks_by_range_response(
             return;
         }
     }
-    request_next_beacon_range_batch(server).await;
+    request_next_beacon_range_batch(server, ctx).await;
 }
 
 #[cfg(test)]
@@ -2521,6 +2651,59 @@ mod tests {
         // A range answer is megabytes when it lands, so the speculative ask is
         // a couple of peers, not every peer that has said nothing.
         assert_eq!(peers_of_unknown_custody(&server, 2).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_column_is_covered_only_by_a_connected_peer_known_to_keep_it() {
+        // A fresh follower's first range batch went out with two peers and
+        // almost no custody known, and came back with no columns. The batch is
+        // now held until this says every custody column has somewhere to go,
+        // so it must not count a peer that has said nothing, nor one that has
+        // left.
+        let mut server = unconnected_server().await;
+        let keeps_4 = PeerId::random();
+        let silent = PeerId::random();
+        let departed = PeerId::random();
+        server
+            .connected_peers
+            .insert(keeps_4, ConnectionDirection::Inbound);
+        server
+            .connected_peers
+            .insert(silent, ConnectionDirection::Inbound);
+        server.peer_custody.insert(keeps_4, vec![4]);
+        server.peer_custody.insert(departed, vec![5]);
+
+        assert_eq!(
+            columns_without_known_custodian(&server, &[4, 5, 6]),
+            vec![5, 6]
+        );
+    }
+
+    #[test]
+    fn only_a_range_reaching_fulu_waits_for_column_custodians() {
+        let config = Config::mainnet();
+        let first_fulu_slot =
+            config.fulu_fork_epoch * ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+        let custody = [4, 5];
+
+        // Every slot before fulu: no columns exist, so nothing to wait for.
+        assert!(!range_needs_columns(
+            &config,
+            &custody,
+            &(first_fulu_slot - 64..first_fulu_slot)
+        ));
+        // A batch whose last slot is fulu's first does fetch columns.
+        assert!(range_needs_columns(
+            &config,
+            &custody,
+            &(first_fulu_slot - 63..first_fulu_slot + 1)
+        ));
+        // A node custodying nothing never asks for columns.
+        assert!(!range_needs_columns(
+            &config,
+            &[],
+            &(first_fulu_slot..first_fulu_slot + 64)
+        ));
     }
 
     #[tokio::test]

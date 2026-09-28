@@ -402,6 +402,19 @@ the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.
 
+Since the column request is aimed by custody, a batch reaching fulu is held
+back, blocks included, until every custody column has a known custodian among
+the connected peers. Lighthouse's range sync holds its batches the same way.
+Right after startup, custody is known for almost no peer, since a peer's
+custody arrives with its `metadata/3` answer after it connects. A mainnet
+follower's first batch after a fresh checkpoint sync went out 5 s after
+startup with two peers and at most one known custodian per column, and 121 of
+the 122 holds it caused were missing every custody column. The
+batch is re-checked after every metadata answer and every `Status` answer, and
+it goes regardless once `RANGE_BATCH_CUSTODY_WAIT` has passed, because nothing
+here searches for a custodian of a specific column; past that deadline the
+uncovered columns go to a couple of peers whose custody is unknown, as before.
+
 The per-block one starts at `hold_block_for_columns`, called when a
 fulu block carrying commitments arrives short of the columns this node
 custodies for it. Import holds the block — it stays out of fork choice, but
