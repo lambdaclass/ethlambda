@@ -164,9 +164,10 @@ config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
 that would fix it. Sepolia's config schedules gloas, whose keys this build
-does claim but whose state transition it does not implement yet: a separate,
-explicit warning at startup names that boundary, since the chain follower
-stops tracking the chain there regardless of what parsed cleanly. The keys this
+does claim but whose blocks the chain actor refuses, since nothing delivers
+payload envelopes or payload attestations to it yet: a separate, explicit
+warning at startup names that boundary, since the chain follower stops
+tracking the chain there regardless of what parsed cleanly. The keys this
 build runs on compile-time constants for (the custody and subnet counts, the
 `MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains and
 `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those

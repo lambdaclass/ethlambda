@@ -180,9 +180,9 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
-    /// `get_forkchoice_store` refused the anchor outright because this build
-    /// cannot process its fork yet (currently only gloas): a real anchor, not
-    /// a peer serving a mismatched pair, so it is named separately from
+    /// Startup refused the anchor outright because this build cannot follow
+    /// its fork yet (currently only gloas): a real anchor, not a peer serving
+    /// a mismatched pair, so it is named separately from
     /// [`Self::AnchorPairingMismatch`] rather than folded into it.
     #[error(
         "this build cannot follow {fork} yet; the anchor is at {fork} and nothing past this \

@@ -792,13 +792,12 @@ fn data_availability_for(
         // `blob_kzg_commitments`, so this gate has nothing gloas-shaped to
         // check yet. Unreachable from network input today:
         // `process_or_pend_block` refuses every gloas block before this
-        // function is ever called, precisely so a gloas block never reaches
-        // this gate, `fork_choice::block_operations`, or `on_block`'s own
-        // `Error::UnsupportedForFork`, none of which it can pay for
-        // productively. `None` here regardless, defensively: were that gate
-        // ever bypassed, holding the block rather than answering
-        // `NotRequired` keeps it from being treated as available and handed
-        // to `on_block` under a false pretense.
+        // function is ever called, because this node cannot yet deliver the
+        // payload envelopes and payload attestations a gloas chain needs.
+        // `on_block` itself accepts a gloas block and reads no availability
+        // evidence for it. `None` here regardless, defensively: were that
+        // gate ever bypassed, `None` keeps a block this node cannot follow
+        // out of `on_block` entirely.
         SignedBeaconBlock::Gloas(_) => None,
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
@@ -2525,10 +2524,11 @@ impl BlockChainServer {
         timings.guards_start = Some(Instant::now());
 
         // Refused before anything else, including the columns/finalized-slot
-        // checks below: `state_transition` refuses every gloas block anyway
-        // (`Error::UnsupportedForFork`), so persisting one as pending and
-        // discovering that on the other end of a clone-parent-state-then-fail
-        // round trip is pure waste. Worse than waste were this not here
+        // checks below: this node cannot follow a gloas chain yet, since
+        // nothing delivers the payload envelopes a block's full branch needs
+        // (`fork_choice::on_execution_payload_envelope`) or the payload
+        // attestations that vote on them, so persisting a gloas block as
+        // pending is pure waste. Worse than waste were this not here
         // first: a gloas block whose parent is missing would otherwise be
         // `insert_pending_block`-ed and tracked in `pending_block_parents`,
         // and every later block naming it as an ancestor would walk back to
@@ -2542,8 +2542,7 @@ impl BlockChainServer {
             warn!(
                 %slot,
                 block_root = %ShortRoot(&block_root.0),
-                "Refusing a gloas block: this build does not implement the gloas state \
-                 transition yet"
+                "Refusing a gloas block: this build cannot follow a gloas chain yet"
             );
             self.discard_pending_subtree(block_root);
             return None;

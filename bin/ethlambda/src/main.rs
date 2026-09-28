@@ -1632,21 +1632,35 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
     None
 }
 
-/// Turns a beacon `get_forkchoice_store` failure into the right
-/// [`checkpoint_sync::CheckpointSyncError`]. Keeps
-/// `Error::UnsupportedForFork` (this build genuinely cannot follow the
-/// anchor's own fork, currently only gloas) distinguishable from every other
-/// failure there (a peer serving a mismatched anchor pair): collapsing both
-/// into `AnchorPairingMismatch` would tell an operator to look for a bad peer
-/// when the real answer is "wait for this build to support the fork".
-fn anchor_store_error(
-    err: ethlambda_state_transition::beacon::Error,
-) -> checkpoint_sync::CheckpointSyncError {
-    match err {
-        ethlambda_state_transition::beacon::Error::UnsupportedForFork { fork, .. } => {
-            checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork }
-        }
-        _ => checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch,
+/// Refuses an anchor state in `fork` if this node cannot follow that fork yet,
+/// currently gloas.
+///
+/// `fork_choice::get_forkchoice_store` accepts a gloas anchor, since fork choice
+/// itself handles the fork. This node's wiring does not: nothing delivers
+/// payload envelopes or payload attestations to the chain actor, and
+/// `process_or_pend_block` refuses every gloas block, so a follower anchored
+/// here would sit at its anchor forever, looking alive while importing
+/// nothing. Refusing at startup reports the real reason instead. Checked ahead
+/// of any store construction, on both anchor sources (a loaded network's
+/// genesis state can schedule `GLOAS_FORK_EPOCH: 0`, and a checkpoint provider
+/// can serve a gloas finalized state), so a rejected anchor writes nothing to
+/// the data directory.
+///
+/// Keeps the refusal distinguishable from a peer serving a mismatched anchor
+/// pair: reporting both as `AnchorPairingMismatch` would tell an operator to
+/// look for a bad peer when the real answer is "wait for this build to support
+/// the fork".
+fn refuse_unfollowable_fork(fork: ForkName) -> Result<(), checkpoint_sync::CheckpointSyncError> {
+    match fork {
+        ForkName::Gloas => Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork }),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu => Ok(()),
+        ForkName::Lean => unreachable!("a beacon anchor is never ForkName::Lean"),
     }
 }
 
@@ -1807,6 +1821,8 @@ async fn fetch_initial_beacon_state(
         };
 
         let state = loaded.genesis_state.as_ref().clone();
+        refuse_unfollowable_fork(state.fork_name())
+            .inspect_err(|err| error!(%err, "Cannot anchor at this network's genesis state"))?;
         let block = genesis_anchor_block(&state);
         info!(
             genesis_time = genesis.genesis_time,
@@ -1815,7 +1831,7 @@ async fn fetch_initial_beacon_state(
         );
         return fork_choice::get_forkchoice_store(backend, state, block, &config)
             .inspect_err(|err| error!(%err, "Failed to initialize store from the genesis state"))
-            .map_err(anchor_store_error);
+            .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch);
     }
 
     info!(?checkpoint_urls, "Starting beacon checkpoint sync");
@@ -1837,9 +1853,11 @@ async fn fetch_initial_beacon_state(
         "Beacon checkpoint sync complete"
     );
 
+    refuse_unfollowable_fork(state.fork_name())
+        .inspect_err(|err| error!(%err, "Cannot anchor at the checkpoint provider's state"))?;
     fork_choice::get_forkchoice_store(backend, state, block, &config)
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
-        .map_err(anchor_store_error)
+        .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
 }
 
 /// The block the specification pairs with a genesis anchor state.
@@ -1970,6 +1988,27 @@ mod tests {
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
+
+    /// Fork choice accepts a gloas anchor, so the node has to be the one to
+    /// refuse it: nothing here delivers the payload envelopes a gloas chain
+    /// needs. Every fork this node does follow must still be let through.
+    #[test]
+    fn startup_refuses_a_gloas_anchor_and_only_a_gloas_anchor() {
+        assert!(matches!(
+            refuse_unfollowable_fork(ForkName::Gloas),
+            Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork {
+                fork: ForkName::Gloas
+            })
+        ));
+        for fork in ForkName::ALL {
+            if fork != ForkName::Gloas {
+                assert!(
+                    refuse_unfollowable_fork(fork).is_ok(),
+                    "{fork} must stay followable"
+                );
+            }
+        }
+    }
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
     /// where networks share a non-default committee count.
@@ -2480,6 +2519,79 @@ validators:
             .beacon_head()
             .expect("an anchored directory has a head");
         assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
+    }
+
+    /// A loaded network can schedule gloas at epoch 0, which makes its own
+    /// genesis state a gloas one. Fork choice accepts that anchor, so startup
+    /// has to be what refuses it, with the reason that names the fork, and
+    /// before anything is written to the data directory.
+    #[tokio::test]
+    async fn a_gloas_genesis_is_refused_before_the_store_is_built() {
+        use ethlambda_state_transition::beacon::config::Config;
+        use ethlambda_state_transition::beacon::upgrade::upgrade_state;
+
+        // Every fork from altair on scheduled at epoch 0, in the file and in
+        // the config the genesis state is upgraded with.
+        let scheduled = [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+            ForkName::Gloas,
+        ];
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+        )
+        .unwrap();
+        let config_text: String = fixture
+            .lines()
+            .map(|line| {
+                match scheduled.iter().find(|fork| {
+                    let key = format!("{}_FORK_EPOCH:", fork.as_str().to_uppercase());
+                    line.starts_with(&key)
+                }) {
+                    Some(fork) => format!("{}_FORK_EPOCH: 0", fork.as_str().to_uppercase()),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in scheduled {
+            config = config.with_fork_epoch(fork, 0);
+            state = upgrade_state(&state, fork, &config).unwrap();
+        }
+        assert_eq!(state.fork_name(), ForkName::Gloas);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), config_text).unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        let loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = network::NetworkSource::Loaded(Box::new(loaded));
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        // `Store` is not `Debug`, so take the error by pattern.
+        let Err(err) = fetch_initial_beacon_state(&[], backend.clone(), &source).await else {
+            panic!("a gloas genesis must not become an anchor");
+        };
+        assert!(
+            matches!(
+                err,
+                checkpoint_sync::CheckpointSyncError::UnsupportedFork {
+                    fork: ForkName::Gloas
+                }
+            ),
+            "the refusal must name the fork: {err}"
+        );
+        assert!(
+            Store::from_db_state(backend).unwrap().is_none(),
+            "a refused anchor leaves the directory empty"
+        );
     }
 
     /// A changed fork epoch leaves genesis time and the validators root

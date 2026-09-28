@@ -6,16 +6,19 @@
 //! `Store` therefore accepts a block from any fork this module implements,
 //! even though the algorithm applied to it is unconditionally phase0's.
 //! `Store` tracks the block tree, attester votes, and the checkpoints fork
-//! choice reasons about; the four handlers at the bottom of this file
-//! ([`on_tick`], [`on_block`], [`on_attestation`], [`on_attester_slashing`])
-//! are the only ones the specification lists as sole ways to change it,
-//! matching its own framing: "Invalid calls to handlers must not modify
-//! `store`." Most other functions in this file take `&Store`; the exceptions
-//! are [`get_head`] (records the head it just computed; see its own
-//! documentation for why that write belongs there rather than in a caller)
-//! and `record_block_timeliness`/`update_proposer_boost_root`, which write
-//! `store.block_timeliness`/`store.proposer_boost_root` on [`on_block`]'s
-//! behalf: [`on_block`] is their only caller.
+//! choice reasons about; the handlers at the bottom of this file
+//! ([`on_tick`], [`on_block`], [`on_attestation`], [`on_attester_slashing`],
+//! and, from gloas on, [`on_execution_payload_envelope`] and
+//! [`on_payload_attestation_message`]) are the ones the specification lists as
+//! sole ways to change it, matching its own framing: "Invalid calls to
+//! handlers must not modify `store`." Most other functions in this file take
+//! `&Store`; the exceptions are [`get_head`] (records the head it just
+//! computed; see its own documentation for why that write belongs there
+//! rather than in a caller), [`notify_ptc_messages`] (a helper of
+//! [`on_block`] that applies payload attestations through
+//! [`on_payload_attestation_message`]), and `update_proposer_boost_root`,
+//! which writes `store.proposer_boost_root` on [`on_block`]'s behalf:
+//! [`on_block`] is its only caller.
 //!
 //! # Units: one seconds-granularity clock, read out in milliseconds at the edges
 //!
@@ -111,22 +114,26 @@
 //! different concrete type, not just a wider bound on the same one.
 //!
 //! [`Attestation`] and [`AttesterSlashing`] mirror [`SignedBeaconBlock`]'s own
-//! answer to that problem: an enum over the two shapes, with two variants
-//! rather than one per fork for the same reason `SignedBeaconBlock` has only
-//! seven, not one per fork through fulu. But fork choice reads far less out
-//! of an attestation than a block: `data.slot`, `data.target`,
-//! `data.beacon_block_root`, and the attesting indices, per the module
-//! documentation above. `AttestationData` (`crate::beacon::containers::shared`) is
-//! already fork-invariant, so every function below except the two enums'
-//! own methods reads it directly rather than matching on a fork tag it does
-//! not need: [`validate_on_attestation`] and [`update_latest_messages`] take
-//! `AttestationData` and a resolved `&[ValidatorIndex]`, not an
-//! [`Attestation`]. The one place a fork's own shape actually matters is
-//! resolving an [`Attestation`] into the attesters it names and checking
-//! their aggregate signature, which needs the fork-specific
-//! `get_indexed_attestation`/`is_valid_indexed_attestation` pair
-//! ([`crate::beacon::helpers::attestation`] for phase0, [`crate::beacon::helpers::electra`]
-//! for electra); [`Attestation::verified_attesting_indices`] and
+//! answer to that problem: an enum over the shapes, with one variant per
+//! shape rather than one per fork: a fork that leaves a container unchanged
+//! reuses the earlier one, as [`SignedBeaconBlock::Fulu`] wraps electra's.
+//! But fork choice reads far less out of an attestation than a block:
+//! `data.slot`, `data.target`, `data.beacon_block_root`, and the attesting
+//! indices, per the module documentation above. `AttestationData`
+//! (`crate::beacon::containers::shared`) is already fork-invariant, so every
+//! function below except the two enums' own methods reads it directly rather
+//! than matching on a fork tag it does not need: [`validate_on_attestation`]
+//! and [`update_latest_messages`] take `AttestationData` and a resolved
+//! `&[ValidatorIndex]`, not an [`Attestation`]. Gloas gives `data.index` a
+//! meaning and orders votes by slot, so those two also take a [`ForkRules`]
+//! value, which [`Attestation::rules`] derives from the variant. The one place
+//! a fork's own shape otherwise matters is resolving an [`Attestation`] into
+//! the attesters it names and checking their aggregate signature, which needs
+//! the fork-specific `get_indexed_attestation`/`is_valid_indexed_attestation`
+//! pair ([`crate::beacon::helpers::attestation`] for phase0,
+//! [`crate::beacon::helpers::electra`] for electra,
+//! [`crate::beacon::helpers::gloas`] for gloas);
+//! [`Attestation::verified_attesting_indices`] and
 //! [`AttesterSlashing::verified_attesting_indices`] are where that dispatch
 //! happens, once, so [`on_attestation`] and [`on_attester_slashing`]
 //! themselves never match on a fork at all.
@@ -176,6 +183,7 @@ use crate::beacon::helpers::accessors::{
 };
 use crate::beacon::helpers::attestation as phase0_attestation;
 use crate::beacon::helpers::electra as electra_helpers;
+use crate::beacon::helpers::gloas as gloas_helpers;
 use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_start_slot_at_epoch, is_valid_merkle_branch,
 };
@@ -213,14 +221,60 @@ pub use ethlambda_types::beacon::fork_choice::{
 /// documentation for why this exists and what it lets the rest of this file
 /// stay generic over.
 ///
-/// Two variants, not one per fork: every fork through deneb shares
+/// Three variants, not one per fork: every fork through deneb shares
 /// [`phase0::Attestation`] outright, and fulu shares [`electra::Attestation`]
 /// the same way [`SignedBeaconBlock::Fulu`] shares
-/// [`electra::SignedBeaconBlock`].
+/// [`electra::SignedBeaconBlock`]. Gloas has its own, since EIP-7688 makes its
+/// `aggregation_bits` unbounded, which is a different Rust type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Attestation {
     Phase0(phase0::Attestation),
     Electra(electra::Attestation),
+    Gloas(gloas::Attestation),
+}
+
+/// Which fork's handler rules apply: to an attestation's `data.index` and to
+/// the order of an attester's votes, and to a block or anchor's gloas-only
+/// state.
+///
+/// Before gloas, `data.index` is a committee index (zero from electra on) and
+/// votes are compared by target epoch. Gloas repurposes `index` as the payload
+/// flag (`0` for the empty branch or a same-slot vote, `1` for the full
+/// branch), and its `LatestMessage` is compared by slot. For attesters who do
+/// not equivocate, the slot order and the epoch order agree.
+///
+/// Every value comes from an exhaustive match on a fork or a container
+/// ([`ForkRules::of`], [`Attestation::rules`]), so a fork added after gloas has
+/// to be given its rules there rather than falling into the pre-gloas ones. An
+/// attestation's rules follow its own container, not the store's clock: an
+/// attestation carried by a gloas block is a [`gloas::Attestation`] even when
+/// its slot is in the last pre-gloas epoch. Such a vote has `index == 0`, which
+/// both rule sets accept, and is then ordered the way gloas's own
+/// `update_latest_messages` orders it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkRules {
+    /// Phase0 through fulu.
+    PreGloas,
+    /// Gloas (EIP-7732).
+    Gloas,
+}
+
+impl ForkRules {
+    /// The rules a value of `fork` (a block, a state, or an anchor) is handled
+    /// under. Names every fork, so the next one has to be placed here.
+    pub fn of(fork: ForkName) -> Self {
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => ForkRules::PreGloas,
+            ForkName::Gloas => ForkRules::Gloas,
+            ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
+        }
+    }
 }
 
 impl Attestation {
@@ -231,13 +285,23 @@ impl Attestation {
         match self {
             Attestation::Phase0(attestation) => attestation.data,
             Attestation::Electra(attestation) => attestation.data,
+            Attestation::Gloas(attestation) => attestation.data,
+        }
+    }
+
+    /// The rules [`validate_on_attestation`] and [`update_latest_messages`]
+    /// apply to this attestation; see [`ForkRules`].
+    pub fn rules(&self) -> ForkRules {
+        match self {
+            Attestation::Phase0(_) | Attestation::Electra(_) => ForkRules::PreGloas,
+            Attestation::Gloas(_) => ForkRules::Gloas,
         }
     }
 
     /// The attesters this attestation names, once its aggregate signature and
     /// index ordering have both been checked against `state`.
     ///
-    /// The one place this enum's two shapes actually matter: building the
+    /// The one place this enum's shapes actually matter: building the
     /// indexed form and checking it needs the fork-specific
     /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair, so this
     /// dispatches once here rather than leaving that match to every caller.
@@ -266,7 +330,7 @@ impl Attestation {
         self.indices(state, false, committees)
     }
 
-    /// The body both accessors above share: the one place this enum's two
+    /// The body both accessors above share: the one place this enum's
     /// shapes actually matter, since building the indexed form and checking it
     /// needs the fork-specific
     /// `get_indexed_attestation`/`is_valid_indexed_attestation` pair. Kept as
@@ -301,17 +365,29 @@ impl Attestation {
                 }
                 Ok(indexed.attesting_indices.into_inner())
             }
+            Attestation::Gloas(attestation) => {
+                let indexed =
+                    gloas_helpers::get_indexed_attestation(state, attestation, committees)?;
+                if verify_signature {
+                    verify(
+                        gloas_helpers::is_valid_indexed_attestation(state, &indexed),
+                        "is_valid_indexed_attestation(target_state, indexed_attestation)",
+                    )?;
+                }
+                Ok(indexed.attesting_indices.iter().copied().collect())
+            }
         }
     }
 }
 
 /// Evidence that a set of validators made two conflicting attestations, in
 /// whichever fork's shape it currently has. See [`Attestation`] for why this
-/// has the same two variants and no more.
+/// has the same variants and no more.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttesterSlashing {
     Phase0(phase0::AttesterSlashing),
     Electra(electra::AttesterSlashing),
+    Gloas(gloas::AttesterSlashing),
 }
 
 impl AttesterSlashing {
@@ -325,6 +401,9 @@ impl AttesterSlashing {
                 (slashing.attestation_1.data, slashing.attestation_2.data)
             }
             AttesterSlashing::Electra(slashing) => {
+                (slashing.attestation_1.data, slashing.attestation_2.data)
+            }
+            AttesterSlashing::Gloas(slashing) => {
                 (slashing.attestation_1.data, slashing.attestation_2.data)
             }
         }
@@ -393,6 +472,30 @@ impl AttesterSlashing {
                         .collect(),
                 ))
             }
+            AttesterSlashing::Gloas(slashing) => {
+                verify(
+                    gloas_helpers::is_valid_indexed_attestation(state, &slashing.attestation_1),
+                    "is_valid_indexed_attestation(state, attestation_1)",
+                )?;
+                verify(
+                    gloas_helpers::is_valid_indexed_attestation(state, &slashing.attestation_2),
+                    "is_valid_indexed_attestation(state, attestation_2)",
+                )?;
+                Ok((
+                    slashing
+                        .attestation_1
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                    slashing
+                        .attestation_2
+                        .attesting_indices
+                        .iter()
+                        .copied()
+                        .collect(),
+                ))
+            }
         }
     }
 }
@@ -404,97 +507,79 @@ impl AttesterSlashing {
 /// Lives here, beside the two enums it builds, because the fork-to-shape
 /// mapping is theirs: phase0 through deneb share
 /// [`phase0::Attestation`]/[`phase0::AttesterSlashing`], electra and fulu the
-/// `electra` pair. Both consumers of a block's own operations, the chain actor
-/// and the `fork_choice` fixture runner, read it from here, so a new fork
-/// reshaping `body.attestations` cannot be handled in one and forgotten in the
-/// other.
+/// `electra` pair, and gloas its own. Both consumers of a block's own
+/// operations, the chain actor and the `fork_choice` fixture runner, read it
+/// from here, so a new fork reshaping `body.attestations` cannot be handled in
+/// one and forgotten in the other.
 pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<AttesterSlashing>) {
     match block {
-        SignedBeaconBlock::Electra(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(Attestation::Electra)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(AttesterSlashing::Electra)
-                .collect(),
-        ),
-        SignedBeaconBlock::Fulu(block) => (
-            block
-                .message
-                .body
-                .attestations
-                .iter()
-                .cloned()
-                .map(Attestation::Electra)
-                .collect(),
-            block
-                .message
-                .body
-                .attester_slashings
-                .iter()
-                .cloned()
-                .map(AttesterSlashing::Electra)
-                .collect(),
-        ),
-        SignedBeaconBlock::Phase0(block) => phase0_operations(
+        SignedBeaconBlock::Phase0(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
+            Attestation::Phase0,
+            AttesterSlashing::Phase0,
         ),
-        SignedBeaconBlock::Altair(block) => phase0_operations(
+        SignedBeaconBlock::Altair(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
+            Attestation::Phase0,
+            AttesterSlashing::Phase0,
         ),
-        SignedBeaconBlock::Bellatrix(block) => phase0_operations(
+        SignedBeaconBlock::Bellatrix(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
+            Attestation::Phase0,
+            AttesterSlashing::Phase0,
         ),
-        SignedBeaconBlock::Capella(block) => phase0_operations(
+        SignedBeaconBlock::Capella(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
+            Attestation::Phase0,
+            AttesterSlashing::Phase0,
         ),
-        SignedBeaconBlock::Deneb(block) => phase0_operations(
+        SignedBeaconBlock::Deneb(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
+            Attestation::Phase0,
+            AttesterSlashing::Phase0,
         ),
-        // EIP-7688 makes a gloas block's own `attestations`/`attester_slashings`
-        // a `ProgressiveList`, which `on_block_attestation` and
-        // `on_attester_slashing` are not yet shaped to take, so this cannot
-        // decode them the way every other arm does. Unreachable from network
-        // input today: `crates/blockchain`'s `process_or_pend_block` refuses
-        // every gloas block before this is ever called, precisely so this
-        // arm, `data_availability_for`, and `on_block`'s own
-        // `Error::UnsupportedForFork` are never paid for on a block that
-        // cannot be imported regardless. Empty rather than a panic
-        // regardless, defensively: were that gate ever bypassed, this must
-        // not crash the actor on the way to `on_block`'s own refusal.
-        SignedBeaconBlock::Gloas(_) => (Vec::new(), Vec::new()),
+        SignedBeaconBlock::Electra(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Electra,
+            AttesterSlashing::Electra,
+        ),
+        SignedBeaconBlock::Fulu(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Electra,
+            AttesterSlashing::Electra,
+        ),
+        SignedBeaconBlock::Gloas(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Gloas,
+            AttesterSlashing::Gloas,
+        ),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::block_operations"),
     }
 }
 
-/// Phase0 through deneb share one attestation and slashing shape, so their
-/// five arms above share one body.
+/// Wraps one fork's attestations and slashings in the fork-generic enums, given
+/// the two variant constructors for that fork's shape.
 ///
 /// Takes iterators rather than the lists themselves: each fork's body names
-/// its own `SszList` bound, so a parameter typed on the list would need one
+/// its own list type and bound, so a parameter typed on the list would need one
 /// generic per bound, and `.iter()` erases exactly that difference.
-fn phase0_operations<'a>(
-    attestations: impl Iterator<Item = &'a phase0::Attestation>,
-    slashings: impl Iterator<Item = &'a phase0::AttesterSlashing>,
+fn wrap_operations<'a, A: Clone + 'a, S: Clone + 'a>(
+    attestations: impl Iterator<Item = &'a A>,
+    slashings: impl Iterator<Item = &'a S>,
+    wrap_attestation: fn(A) -> Attestation,
+    wrap_slashing: fn(S) -> AttesterSlashing,
 ) -> (Vec<Attestation>, Vec<AttesterSlashing>) {
     (
-        attestations.cloned().map(Attestation::Phase0).collect(),
-        slashings.cloned().map(AttesterSlashing::Phase0).collect(),
+        attestations.cloned().map(wrap_attestation).collect(),
+        slashings.cloned().map(wrap_slashing).collect(),
     )
 }
 
@@ -905,28 +990,20 @@ pub fn checkpoint_state(
 /// "Trusted" means fork choice will never roll back past this point: a full
 /// client anchors at genesis, and a checkpoint-syncing client anchors at
 /// whatever finalized state and block it fetched instead.
+///
+/// A gloas anchor is accepted and seeds the three gloas-only tables the way
+/// gloas's own `get_forkchoice_store` does: both block timeliness deadlines
+/// met, an empty payload-attestation vote vector for each of the two vote
+/// kinds, and no verified payload. Whether a node can *follow* a gloas chain
+/// from there is the caller's question, not this function's: the live follower
+/// refuses a gloas anchor at startup, since its node wiring cannot deliver
+/// payload envelopes yet.
 pub fn get_forkchoice_store(
     backend: Arc<dyn StorageBackend>,
     mut anchor_state: BeaconState,
     anchor_block: SignedBeaconBlock,
     config: &Config,
 ) -> Result<Store> {
-    // Refused before any other check: a gloas anchor (checkpoint sync
-    // decodes one structurally today, and a loaded network scheduling
-    // `GLOAS_FORK_EPOCH: 0` reaches this from `genesis_anchor_block` too)
-    // would otherwise boot a store this build can never advance past:
-    // `state_transition` already refuses every gloas block and epoch
-    // boundary, so a node anchored here would sit at genesis forever,
-    // looking alive while importing nothing. Checked ahead of the
-    // fork-matching `verify` below so a gloas anchor reports its real reason
-    // rather than a spurious "fork mismatch".
-    if anchor_state.fork_name() == ForkName::Gloas {
-        return Err(Error::UnsupportedForFork {
-            function: "get_forkchoice_store",
-            fork: ForkName::Gloas,
-        });
-    }
-
     // The specification's `BeaconState` and `BeaconBlock` are already one
     // fork's own types, so a mismatch between them cannot even be expressed
     // there; here both are enums, so this module has to enforce the invariant
@@ -938,6 +1015,7 @@ pub fn get_forkchoice_store(
     )?;
 
     let anchor_root = anchor_block.message_hash_tree_root();
+    let anchor_rules = ForkRules::of(anchor_state.fork_name());
 
     // The specification asserts `anchor_block.state_root ==
     // hash_tree_root(anchor_state)`, which holds only when the anchor state is
@@ -1028,6 +1106,20 @@ pub fn get_forkchoice_store(
         .insert_state(anchor_root, anchor_state)
         .expect("insert");
     store.set_unrealized_justification(anchor_root, justified_checkpoint);
+
+    // [New in Gloas:EIP7732] `block_timeliness={anchor_root: [True, True]}`,
+    // both vote vectors seeded with `[None] * PTC_SIZE`, and `payloads={}`
+    // (nothing to insert: the anchor's own payload is not verified until an
+    // envelope arrives for it). Earlier forks record none of these for the
+    // anchor, and nothing reads them there.
+    match anchor_rules {
+        ForkRules::Gloas => {
+            store.set_block_timeliness(anchor_root, [true, true]);
+            store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
+        }
+        ForkRules::PreGloas => {}
+    }
 
     Ok(store)
 }
@@ -2026,13 +2118,13 @@ pub fn get_proposer_head(
 /// Every function in this section assumes `block` is itself gloas-shaped,
 /// which does not hold at the fulu-to-gloas boundary on its own: the first
 /// gloas block's own parent is a fulu block with no bid at all.
-/// [`get_parent_payload_status`], this function's only caller, never reaches
-/// here for a pre-gloas block though: it answers [`PayloadStatus::Full`] for
-/// one directly, per this crate's decided rule for that boundary (see the
-/// module documentation's "Gloas: payload-aware fork choice" section). A
-/// non-gloas block still reaching here is therefore a caller bug, reported
-/// by name rather than assumed away, the same projection
-/// `helpers::gloas::gloas_state_ref` gives a state.
+/// [`get_parent_payload_status`] and [`on_execution_payload_envelope`] call
+/// this. The first never reaches here for a pre-gloas block though: it
+/// answers [`PayloadStatus::Full`] for one directly, per this crate's decided
+/// rule for that boundary (see the module documentation's "Gloas:
+/// payload-aware fork choice" section). A non-gloas block still reaching here
+/// is therefore a caller bug, reported by name rather than assumed away, the
+/// same projection `helpers::gloas::gloas_state_ref` gives a state.
 fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
     match block {
         SignedBeaconBlock::Gloas(inner) => {
@@ -2070,22 +2162,31 @@ fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
 fn is_known_pre_gloas_block(store: &Store, root: Root) -> bool {
     matches!(
         store.get_signed_block(&root).expect("get"),
-        Some(block) if !matches!(block, SignedBeaconBlock::Gloas(_))
+        Some(block) if is_pre_gloas(&block)
     )
+}
+
+/// Whether `block` is handled under the pre-gloas rules, from an exhaustive
+/// match on [`ForkRules`], so a fork added after gloas has to be placed there
+/// rather than being read as "not gloas, therefore pre-gloas" by each caller.
+fn is_pre_gloas(block: &SignedBeaconBlock) -> bool {
+    match ForkRules::of(block.fork_name()) {
+        ForkRules::PreGloas => true,
+        ForkRules::Gloas => false,
+    }
 }
 
 /// `is_payload_verified` (gloas `fork-choice.md`): whether `root`'s execution
 /// payload envelope has been locally delivered and verified via
-/// `on_execution_payload_envelope`, which does not exist in this crate yet:
-/// nothing calls [`Store::insert_verified_payload`](ethlambda_storage::Store::insert_verified_payload)
-/// until the handler that reads a delivered envelope lands.
+/// [`on_execution_payload_envelope`], the only caller of
+/// [`Store::insert_verified_payload`](ethlambda_storage::Store::insert_verified_payload).
 ///
 /// A pre-gloas block has no envelope to deliver at all: its payload ran
 /// inside the block itself, so this answers `true` for one unconditionally,
 /// per this crate's decided rule for the fulu-to-gloas boundary (see the
 /// module documentation's "Gloas: payload-aware fork choice" section).
 pub fn is_payload_verified(store: &Store, root: Root) -> bool {
-    is_known_pre_gloas_block(store, root) || store.has_verified_payload(&root)
+    store.has_verified_payload(&root) || is_known_pre_gloas_block(store, root)
 }
 
 /// `payload_timeliness` (gloas `fork-choice.md`): whether `root`'s payload is
@@ -2170,7 +2271,7 @@ pub fn get_parent_payload_status(
         .get_signed_block(&block.parent_root())
         .expect("get")
         .ok_or(Error::SpecAssert("block.parent_root in store.blocks"))?;
-    if !matches!(parent, SignedBeaconBlock::Gloas(_)) {
+    if is_pre_gloas(&parent) {
         return Ok(PayloadStatus::Full);
     }
     let parent_block_hash = gloas_bid(block)?.parent_block_hash;
@@ -2295,7 +2396,7 @@ pub fn get_supported_node(store: &Store, message: LatestMessage) -> Result<ForkC
         .expect("get")
         .ok_or(Error::SpecAssert("message.root in store.blocks"))?;
     let payload_status = if block.slot() < message.slot {
-        if !matches!(block, SignedBeaconBlock::Gloas(_)) || message.payload_present {
+        if is_pre_gloas(&block) || message.payload_present {
             PayloadStatus::Full
         } else {
             PayloadStatus::Empty
@@ -2642,7 +2743,7 @@ pub fn get_node_children(
             .get_signed_block(&node.root)
             .expect("get")
             .ok_or(Error::SpecAssert("node.root in store.blocks"))?;
-        if !matches!(block, SignedBeaconBlock::Gloas(_)) {
+        if is_pre_gloas(&block) {
             return Ok(vec![ForkChoiceNode {
                 root: node.root,
                 payload_status: PayloadStatus::Full,
@@ -2880,7 +2981,7 @@ pub fn get_pow_block(store: &Store, hash: Root) -> Option<PowBlock> {
 }
 
 /// Records `pow_block` so later [`get_pow_block`] lookups by its own hash can
-/// find it. Not one of the four handlers at the bottom of this file: there is
+/// find it. Not one of the handlers at the bottom of this file: there is
 /// no validity condition to check first, since this only ever adds data a
 /// fixture suite's `on_merge_block` step already trusts.
 pub fn insert_pow_block(store: &mut Store, pow_block: PowBlock) {
@@ -2960,7 +3061,12 @@ pub fn is_data_available_blobs(
 ) -> Result<bool> {
     let (blobs, proofs) = match evidence {
         DataAvailability::Blobs { blobs, proofs } => (blobs.as_slice(), proofs.as_slice()),
-        _ => (&[][..], &[][..]),
+        DataAvailability::NotRequired => (&[][..], &[][..]),
+        DataAvailability::Columns(_) => {
+            return Err(Error::SpecAssert(
+                "a deneb or electra block's data availability is judged on blobs",
+            ));
+        }
     };
     let blob_slices: Vec<&[u8]> = blobs.iter().map(|blob| &blob[..]).collect();
     kzg::verify_blob_kzg_proof_batch(&blob_slices, commitments, proofs)
@@ -2994,18 +3100,73 @@ pub fn verify_data_column_sidecar(sidecar: &fulu::DataColumnSidecar, config: &Co
 /// `sidecar.index` as its cell index, since a column names one cell position
 /// across every blob in the block.
 pub fn verify_data_column_sidecar_kzg_proofs(sidecar: &fulu::DataColumnSidecar) -> Result<bool> {
-    let cell_indices = vec![sidecar.index; sidecar.column.len()];
-    let mut cells = Vec::with_capacity(sidecar.column.len());
-    for cell in sidecar.column.iter() {
+    verify_column_cells(
+        sidecar.index,
+        &sidecar.column,
+        &sidecar.kzg_commitments,
+        &sidecar.kzg_proofs,
+    )
+}
+
+/// The batch check both forks' `verify_data_column_sidecar_kzg_proofs` run.
+///
+/// The one thing that differs between them is where `commitments` comes from:
+/// fulu's sidecar carries them, and gloas's takes them from the bid of the
+/// block it names. The cell check itself is the same, so it takes the four
+/// slices and nothing about either container.
+fn verify_column_cells(
+    index: u64,
+    column: &[fulu::Cell],
+    commitments: &[KzgCommitment],
+    proofs: &[KzgProof],
+) -> Result<bool> {
+    let cell_indices = vec![index; column.len()];
+    let mut cells = Vec::with_capacity(column.len());
+    for cell in column {
         cells.push(
             c_kzg::Cell::from_bytes(&cell[..])
                 .map_err(|_| Error::SpecAssert("len(cell) == BYTES_PER_CELL"))?,
         );
     }
-    kzg::verify_cell_kzg_proof_batch(
-        &sidecar.kzg_commitments,
-        &cell_indices,
-        &cells,
+    kzg::verify_cell_kzg_proof_batch(commitments, &cell_indices, &cells, proofs)
+}
+
+/// `verify_data_column_sidecar` (gloas `p2p-interface.md`, modified): the
+/// structural checks a gloas column sidecar must pass before its KZG proofs
+/// are worth checking, against `kzg_commitments` from the bid of the block the
+/// sidecar names.
+///
+/// Fulu's version reads the commitments off the sidecar and bounds their count
+/// by the blob schedule. Gloas's does neither: the commitments are the
+/// caller's, so the length checks compare the column against them directly.
+pub fn gloas_verify_data_column_sidecar(
+    sidecar: &gloas::DataColumnSidecar,
+    kzg_commitments: &[KzgCommitment],
+) -> bool {
+    // The sidecar index must be within the valid range.
+    if sidecar.index as usize >= preset::NUMBER_OF_COLUMNS {
+        return false;
+    }
+    // A sidecar for zero blobs is invalid.
+    if sidecar.column.is_empty() {
+        return false;
+    }
+    // The column length must be equal to the number of commitments and proofs.
+    sidecar.column.len() == kzg_commitments.len()
+        && sidecar.column.len() == sidecar.kzg_proofs.len()
+}
+
+/// `verify_data_column_sidecar_kzg_proofs` (gloas `p2p-interface.md`,
+/// modified): [`verify_data_column_sidecar_kzg_proofs`] with `kzg_commitments`
+/// supplied by the caller rather than carried by the sidecar.
+pub fn gloas_verify_data_column_sidecar_kzg_proofs(
+    sidecar: &gloas::DataColumnSidecar,
+    kzg_commitments: &[KzgCommitment],
+) -> Result<bool> {
+    verify_column_cells(
+        sidecar.index,
+        &sidecar.column,
+        kzg_commitments,
         &sidecar.kzg_proofs,
     )
 }
@@ -3066,12 +3227,45 @@ pub fn verify_data_column_sidecar_inclusion_proof(sidecar: &fulu::DataColumnSide
 /// than relying on this to do it, since nothing about an empty list is
 /// distinguishable here from "this block needed no sampling at all".
 pub fn is_data_available_columns(evidence: &DataAvailability, config: &Config) -> Result<bool> {
-    let DataAvailability::Columns(sidecars) = evidence else {
-        return Ok(true);
+    let sidecars = match evidence {
+        DataAvailability::Columns(sidecars) => sidecars,
+        DataAvailability::NotRequired => return Ok(true),
+        DataAvailability::Blobs { .. } => {
+            return Err(Error::SpecAssert(
+                "a fulu block's data availability is judged on column sidecars",
+            ));
+        }
     };
     for sidecar in sidecars {
         if !(verify_data_column_sidecar(sidecar, config)
             && verify_data_column_sidecar_kzg_proofs(sidecar)?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `is_data_available` (gloas `fork-choice.md`, modified): every column
+/// sidecar sampled for the payload must be individually valid against
+/// `kzg_commitments`, the commitments on the bid of the block the payload
+/// belongs to.
+///
+/// `sidecars` and `kzg_commitments` are the two values the specification's
+/// `retrieve_column_sidecars_and_kzg_commitments` returns. The caller reads
+/// the commitments off the stored block instead, since the store already holds
+/// that bid. An empty `sidecars` is that retrieval returning none, and
+/// `all()` over an empty list holds, so a live caller must not pass an empty
+/// slice for a payload it has not sampled. That is the only encoding of "no
+/// sidecars": gloas evidence has no variant of [`DataAvailability`], so
+/// neither an older fork's check nor this one can read the other's evidence.
+pub fn is_data_available_gloas_columns(
+    sidecars: &[gloas::DataColumnSidecar],
+    kzg_commitments: &[KzgCommitment],
+) -> Result<bool> {
+    for sidecar in sidecars {
+        if !(gloas_verify_data_column_sidecar(sidecar, kzg_commitments)
+            && gloas_verify_data_column_sidecar_kzg_proofs(sidecar, kzg_commitments)?)
         {
             return Ok(false);
         }
@@ -3136,55 +3330,50 @@ pub fn compute_pulled_up_tip(
 // on_block helpers
 // ---------------------------------------------------------------------------
 
-/// Whether a block at `block_slot` arrived before its slot's attestation
-/// deadline: [`record_block_timeliness`]'s own definition of timely, minus
-/// the write.
+/// `record_block_timeliness`'s verdict for a block at `block_slot`: whether it
+/// arrived before each of its slot's two deadlines,
+/// `[ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX]`, which is the value
+/// [`on_block`] then stores as
+/// [`Store::block_timeliness`](ethlambda_storage::Store::block_timeliness) for
+/// [`update_proposer_boost_root`] and [`is_head_late`] to read back.
 ///
-/// Split out so [`on_block`] can gate the (otherwise unconditional)
-/// proposer-boost head computation on the same answer *before* the block
-/// joins the store, without either recomputing the formula by hand or paying
-/// to look the block back up once it has, the way [`record_block_timeliness`]
-/// does.
-fn is_block_timely(store: &Store, block_slot: Slot, config: &Config) -> bool {
-    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
-    let epoch = get_current_store_epoch(store, config);
-    let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
-    let is_before_attesting_interval = time_into_slot_ms < attestation_threshold_ms;
-    get_current_slot(store, config) == block_slot && is_before_attesting_interval
-}
-
-/// Records whether `root`'s block, at `block_slot`, arrived before its slot's
-/// attestation deadline: the timeliness [`update_proposer_boost_root`] and
-/// [`is_head_late`] both read back out of
-/// [`Store::block_timeliness`](ethlambda_storage::Store::block_timeliness).
+/// Split from the write so [`on_block`] can gate the (otherwise unconditional)
+/// proposer-boost head computation on the same answer *before* the block joins
+/// the store, and take the slot from the block it already holds rather than
+/// decoding it back out of the store (`Store::block_entry` decodes the whole
+/// signed block on a beacon directory).
 ///
-/// Takes `block_slot` directly rather than reading it back out of the block
-/// [`on_block`] just inserted: `Store::block_entry` decodes the whole signed
-/// block to answer it on a beacon directory (see its own documentation), and
-/// the one caller here always already has the slot, from the block it just
-/// inserted.
-///
-/// `pub(crate)` rather than `pub`, unlike most functions in this file: unlike
-/// [`is_block_timely`], which mirrors a piece of the specification's own
-/// `record_block_timeliness`, this one's own signature (`block_slot` as a
-/// parameter) is this crate's adaptation of it rather than a transcription,
-/// and [`on_block`] is its only caller.
-///
-/// Writes the same verdict into both of `store.block_timeliness[root]`'s
-/// entries: this function only ever runs on a pre-gloas chain (gloas's own
-/// `on_block` records its two deadlines separately, per
-/// `record_block_timeliness`'s gloas-modified text), so it has no PTC
-/// deadline of its own to tell apart from the attestation one, and
-/// [`is_head_late`] only ever reads [`constants::ATTESTATION_TIMELINESS_INDEX`]
-/// back regardless.
-pub(crate) fn record_block_timeliness(
-    store: &mut Store,
-    root: Root,
+/// Before gloas there is one deadline, the attestation one, so both entries
+/// repeat its verdict: nothing before gloas tells a PTC deadline apart, and
+/// [`is_head_late`] only reads the attestation entry. Gloas modifies the
+/// function: a block is timely for a deadline only if it arrived in its own
+/// slot and before that deadline, and the two deadlines are gloas's own
+/// attestation deadline ([`gloas_get_attestation_due_ms`]) and the payload
+/// timeliness committee's ([`get_payload_attestation_due_ms`]).
+fn block_timeliness(
+    store: &Store,
     block_slot: Slot,
+    rules: ForkRules,
     config: &Config,
-) {
-    let is_timely = is_block_timely(store, block_slot, config);
-    store.set_block_timeliness(root, [is_timely, is_timely]);
+) -> [bool; 2] {
+    let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
+    let is_current_slot = get_current_slot(store, config) == block_slot;
+    match rules {
+        ForkRules::PreGloas => {
+            let epoch = get_current_store_epoch(store, config);
+            let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
+            let is_timely = is_current_slot && time_into_slot_ms < attestation_threshold_ms;
+            [is_timely, is_timely]
+        }
+        ForkRules::Gloas => {
+            let attestation_threshold_ms = gloas_get_attestation_due_ms(config);
+            let ptc_threshold_ms = get_payload_attestation_due_ms(config);
+            [
+                is_current_slot && time_into_slot_ms < attestation_threshold_ms,
+                is_current_slot && time_into_slot_ms < ptc_threshold_ms,
+            ]
+        }
+    }
 }
 
 /// The first slot of the lookahead window `epoch`'s proposer shuffling opens
@@ -3244,6 +3433,13 @@ fn get_ancestor_or_lowest_indexed(
 /// ancestor of `root` at [`compute_shuffling_dependent_slot`], or the lowest
 /// indexed ancestor on `root`'s chain if that slot is not covered; see
 /// [`get_ancestor_or_lowest_indexed`] for why the second case is sound.
+///
+/// Serves gloas unchanged. Gloas's `get_shuffling_dependent_root` walks from a
+/// `PENDING` node with its payload-aware `get_ancestor` and returns the root of
+/// the node it lands on; that walk picks each step by `block.slot` alone (see
+/// [`gloas_get_checkpoint_block`]), so the root is the one this index walk
+/// answers, and the payload status the gloas walk threads through is
+/// discarded.
 pub fn get_shuffling_dependent_root(
     index: &HashMap<Root, (Slot, Root)>,
     root: Root,
@@ -3261,16 +3457,16 @@ pub fn get_shuffling_dependent_root(
 /// the boost cannot itself be the thing that drags the head onto a branch with
 /// a different, no-longer-relevant view of who was supposed to propose it.
 ///
-/// `head` must be the head [`compute_head`] found *before* `root` joined the
-/// store: [`on_block`] is this function's only caller, and it passes exactly
-/// that. `index` should include `root`'s own entry (`on_block` extends its
-/// own pre-insertion index with it rather than re-scanning `LiveChain`), or
-/// the walk below falls back to whatever the closest indexed ancestor
-/// answers, per [`get_ancestor_or_lowest_indexed`].
+/// `head` must be the head [`compute_head`] (pre-gloas) or [`gloas_get_head`]
+/// (gloas) found *before* `root` joined the store: [`on_block`] is this
+/// function's only caller, and it passes exactly that. `index` should include
+/// `root`'s own entry (`on_block` extends its own pre-insertion index with it
+/// rather than re-scanning `LiveChain`), or the walk below falls back to
+/// whatever the closest indexed ancestor answers, per
+/// [`get_ancestor_or_lowest_indexed`].
 ///
-/// `pub(crate)`, not `pub`: like [`record_block_timeliness`], this one's
-/// `index` parameter is this crate's own adaptation, not a transcription, and
-/// [`on_block`] is its only caller.
+/// `pub(crate)`, not `pub`: this one's `index` parameter is this crate's own
+/// adaptation, not a transcription, and [`on_block`] is its only caller.
 pub(crate) fn update_proposer_boost_root(
     store: &mut Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -3281,7 +3477,7 @@ pub(crate) fn update_proposer_boost_root(
     let is_first_block = store.proposer_boost_root().is_zero();
     let is_timely = store
         .block_timeliness(&root)
-        .expect("record_block_timeliness always runs first, on the same root")
+        .expect("on_block records the block's timeliness before this runs, on the same root")
         [constants::ATTESTATION_TIMELINESS_INDEX];
     let epoch = get_current_store_epoch(store, config);
     let head_dependent_root = get_shuffling_dependent_root(index, head, epoch);
@@ -3341,7 +3537,7 @@ pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
 /// Takes `data` directly rather than an [`Attestation`]: this and
 /// [`validate_on_attestation`] read nothing from an attestation besides its
 /// fork-invariant `data`, so neither needs to know which of
-/// [`Attestation`]'s two shapes the caller actually has. See the module
+/// [`Attestation`]'s shapes the caller actually has. See the module
 /// documentation.
 pub fn validate_target_epoch_against_current_time(
     store: &Store,
@@ -3365,13 +3561,24 @@ pub fn validate_target_epoch_against_current_time(
 /// Every check `on_attestation` requires before it may look up or update
 /// anything in `store`. See [`validate_target_epoch_against_current_time`]
 /// for why this takes `data` rather than an [`Attestation`].
+///
+/// `rules` selects gloas's `data.index` rules where the attestation is a gloas
+/// one; see [`ForkRules`].
 pub fn validate_on_attestation(
     store: &Store,
     data: AttestationData,
+    rules: ForkRules,
     is_from_block: bool,
     config: &Config,
 ) -> Result<()> {
-    validate_on_attestation_indexed(store, data, is_from_block, config, &store.block_index())
+    validate_on_attestation_indexed(
+        store,
+        data,
+        rules,
+        is_from_block,
+        config,
+        &store.block_index(),
+    )
 }
 
 /// [`validate_on_attestation`] against an already-built block index.
@@ -3384,6 +3591,7 @@ pub fn validate_on_attestation(
 fn validate_on_attestation_indexed(
     store: &Store,
     data: AttestationData,
+    rules: ForkRules,
     is_from_block: bool,
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
@@ -3418,7 +3626,28 @@ fn validate_on_attestation_indexed(
         "store.blocks[attestation.data.beacon_block_root].slot <= attestation.data.slot",
     )?;
 
-    // LMD vote must be consistent with FFG vote target.
+    // [New in Gloas:EIP7732] `index` is the payload flag, not a committee index.
+    if rules == ForkRules::Gloas {
+        verify(data.index <= 1, "attestation.data.index in [0, 1]")?;
+        if head_block_slot == data.slot {
+            verify(
+                data.index == 0,
+                "attestation.data.index == 0 for a same-slot vote",
+            )?;
+        }
+        // If attesting for a full node, the payload must be known.
+        if data.index == 1 {
+            verify(
+                is_payload_verified(store, data.beacon_block_root),
+                "is_payload_verified(store, attestation.data.beacon_block_root)",
+            )?;
+        }
+    }
+
+    // LMD vote must be consistent with FFG vote target. Gloas's own
+    // `get_checkpoint_block` answers the same root through a payload-aware walk
+    // (see [`gloas_get_checkpoint_block`]), so the index-only walk serves both
+    // forks and spares a gloas attestation one block decode per hop.
     let checkpoint_block = get_checkpoint_block(index, data.beacon_block_root, target.epoch)?;
     verify(
         target.root == checkpoint_block,
@@ -3438,9 +3667,12 @@ fn validate_on_attestation_indexed(
 /// Records an attestation as each attester's latest message, for every
 /// attesting index that is not a known equivocator.
 ///
-/// An attester's latest message only ever moves to a later target epoch: an
-/// attestation for an epoch already superseded by that attester's own later
-/// vote is simply not the freshest thing known about them anymore.
+/// Before gloas, an attester's latest message only ever moves to a later
+/// target epoch: an attestation for an epoch already superseded by that
+/// attester's own later vote is simply not the freshest thing known about
+/// them anymore. Gloas orders by the attestation's slot instead, and records
+/// whether the vote is for the block's full payload (`data.index == 1`); see
+/// [`ForkRules`].
 ///
 /// Takes `attesting_indices` and `data` rather than an [`Attestation`]: by
 /// the time [`on_attestation`] calls this, [`Attestation::verified_attesting_indices`]
@@ -3449,17 +3681,20 @@ pub fn update_latest_messages(
     store: &mut Store,
     attesting_indices: &[ValidatorIndex],
     data: AttestationData,
+    rules: ForkRules,
 ) {
     let target = data.target;
     let beacon_block_root = data.beacon_block_root;
+    let payload_present = rules == ForkRules::Gloas && data.index == 1;
 
     for &index in attesting_indices {
         if store.is_equivocating(index) {
             continue;
         }
-        let should_update = match store.latest_message(index) {
-            None => true,
-            Some(existing) => target.epoch > existing.epoch,
+        let should_update = match (store.latest_message(index), rules) {
+            (None, _) => true,
+            (Some(existing), ForkRules::PreGloas) => target.epoch > existing.epoch,
+            (Some(existing), ForkRules::Gloas) => data.slot > existing.slot,
         };
         if should_update {
             store.set_latest_message(
@@ -3468,7 +3703,7 @@ pub fn update_latest_messages(
                     epoch: target.epoch,
                     slot: data.slot,
                     root: beacon_block_root,
-                    payload_present: false,
+                    payload_present,
                 },
             );
         }
@@ -3479,14 +3714,16 @@ pub fn update_latest_messages(
 // Handlers
 // ---------------------------------------------------------------------------
 //
-// These four are the only functions in this file the specification itself
+// These six are the only functions in this file the specification itself
 // lists as the sole ways to change `store`; each validates before it mutates
 // anything, so a rejected call leaves `store` exactly as it found it, matching
 // its requirement that "invalid calls to handlers must not modify store".
-// [`get_head`], above, is the one non-handler that also takes `&mut Store`:
-// it records the head it just computed, which is not a validity-gated
-// mutation a rejected call would need rolled back, just a derived value kept
-// in sync with every call.
+// Two non-handlers also take `&mut Store`. [`get_head`], above, records the
+// head it just computed, which is not a validity-gated mutation a rejected
+// call would need rolled back, just a derived value kept in sync with every
+// call. [`notify_ptc_messages`] applies a block's payload attestations through
+// the same checks as [`on_payload_attestation_message`]; a failure partway
+// leaves the votes of the messages before it, which no valid block can cause.
 
 /// Advances `store` to `time` (Unix seconds), running [`on_tick_per_slot`]
 /// once per slot boundary crossed so that none of them are skipped even if
@@ -3539,7 +3776,7 @@ pub fn on_block(
     let parent_root = signed_block.parent_root();
 
     // Return early if the block already has a post-state: a re-delivery must
-    // not re-run `record_block_timeliness`/`update_proposer_boost_root` below
+    // not re-run `set_block_timeliness`/`update_proposer_boost_root` below
     // on a block already fully imported. The chain actor's own import cascade
     // already deduplicates a known root before ever reaching here
     // (`Store::has_state`, which also skips re-running `state_transition`;
@@ -3576,6 +3813,23 @@ pub fn on_block(
         .expect("get")
         .ok_or(Error::SpecAssert("block.parent_root in store.block_states"))?;
     let mut state = (*parent_state).clone();
+
+    // [New in Gloas:EIP7732] If this block builds on its parent's full payload,
+    // that payload must have been verified by `on_execution_payload_envelope`.
+    // A pre-gloas parent is a full node whose payload is verified by
+    // definition (see `is_payload_verified`), so the first gloas block passes.
+    let rules = ForkRules::of(signed_block.fork_name());
+    match rules {
+        ForkRules::Gloas => {
+            if is_parent_node_full(store, &signed_block)? {
+                verify(
+                    is_payload_verified(store, parent_root),
+                    "is_payload_verified(store, block.parent_root)",
+                )?;
+            }
+        }
+        ForkRules::PreGloas => {}
+    }
 
     // Blocks cannot be in the future. If they are, their consideration must
     // be delayed until they are in the past.
@@ -3616,47 +3870,45 @@ pub fn on_block(
     // The same check, over column sidecars instead of blobs. Both run before
     // `state_transition`, matching the specification's own ordering: an
     // unavailable block is not even worth transitioning.
-    match &signed_block {
+    //
+    // The same match hands back the block's payload attestations, which only a
+    // gloas body carries, so the one place that names every fork also decides
+    // whether there is anything to notify the store about below.
+    let payload_attestations: Option<&[gloas::PayloadAttestation]> = match &signed_block {
         SignedBeaconBlock::Deneb(block) => {
             verify(
                 is_data_available_blobs(&block.message.body.blob_kzg_commitments, blob_evidence)?,
                 "is_data_available(hash_tree_root(block), block.body.blob_kzg_commitments)",
             )?;
+            None
         }
         SignedBeaconBlock::Electra(block) => {
             verify(
                 is_data_available_blobs(&block.message.body.blob_kzg_commitments, blob_evidence)?,
                 "is_data_available(hash_tree_root(block), block.body.blob_kzg_commitments)",
             )?;
+            None
         }
         SignedBeaconBlock::Fulu(_) => {
             verify(
                 is_data_available_columns(blob_evidence, config)?,
                 "is_data_available(hash_tree_root(block))",
             )?;
+            None
         }
         SignedBeaconBlock::Phase0(_)
         | SignedBeaconBlock::Altair(_)
         | SignedBeaconBlock::Bellatrix(_)
-        | SignedBeaconBlock::Capella(_) => {}
-        // ePBS (EIP-7732) moves the availability question from the block's
-        // blob/column commitments to the separately gossiped execution
-        // payload envelope; the check above the match on `signed_block` does
-        // not apply to a gloas block at all. This arm refuses because gloas's
-        // own `on_block` is not ported yet, not because `state_transition`
-        // below is missing anything: envelope processing and the payload
-        // timeliness committee's vote still need their own fork-choice
-        // wiring, so this returns the same `Error::UnsupportedForFork` any
-        // other fork-mismatched call in this crate does, rather than
-        // skipping the availability question with a silent `{}` arm.
-        SignedBeaconBlock::Gloas(_) => {
-            return Err(Error::UnsupportedForFork {
-                function: "fork_choice::on_block",
-                fork: ForkName::Gloas,
-            });
-        }
+        | SignedBeaconBlock::Capella(_) => None,
+        // [Modified in Gloas:EIP7732] The block itself is not gated on data
+        // availability: the blob data arrives with the payload, so the check
+        // moves to `on_execution_payload_envelope`, which is where a gloas
+        // payload becomes usable. A block whose data never arrives is still
+        // imported, and its full payload branch stays unreachable, since
+        // building on it requires `is_payload_verified` above.
+        SignedBeaconBlock::Gloas(block) => Some(&block.message.body.payload_attestations),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("fork_choice::on_block"),
-    }
+    };
 
     // Check the block is valid and compute the post-state. The engine's answer
     // is read the way the specification reads it: an `INVALIDATED` verdict makes
@@ -3760,14 +4012,40 @@ pub fn on_block(
     // `compute_weights` for why the last of those matters at scale) is not
     // worth paying for on a block the shuffling check could not change the
     // answer for anyway.
+    //
+    // Gloas gates on its own attestation deadline, and computes the head with
+    // its payload-aware algorithm. When it is computed, its `get_head` failing
+    // fails the import, as the pre-gloas head computation does. The head is
+    // only computed for a block that is timely, which puts it in the current
+    // slot, so `get_head_node`'s dispatch on the current slot's fork would
+    // pick gloas's algorithm here anyway; calling it directly reuses
+    // `committees` instead of building a fresh cache.
     let block_slot = signed_block.slot();
-    let is_timely = is_block_timely(store, block_slot, config);
+    let timeliness = block_timeliness(store, block_slot, rules, config);
+    let is_timely = timeliness[constants::ATTESTATION_TIMELINESS_INDEX];
     let is_first_block = store.proposer_boost_root().is_zero();
     let pre_block_head = if is_timely && is_first_block {
-        Some(compute_head(store, &index, config)?)
+        Some(match rules {
+            ForkRules::Gloas => gloas_get_head(store, config, committees)?.root,
+            ForkRules::PreGloas => compute_head(store, &index, config)?,
+        })
     } else {
         None
     };
+
+    // [New in Gloas:EIP7732] Notify the store about the payload attestations
+    // the block carries. Runs before the block joins the store, unlike the
+    // specification, so a failure leaves no block behind. The votes it writes
+    // are for the parent (`process_payload_attestation` pins
+    // `data.beacon_block_root` to `parent_root`), so nothing here reads the
+    // block being imported. No failure is expected after a valid transition:
+    // `process_payload_attestation` already ran the same `get_ptc` and
+    // membership checks, and the parent's vote vectors always exist. Were one
+    // to fail midway anyway, the parent would keep the votes of the messages
+    // before it.
+    if let Some(payload_attestations) = payload_attestations {
+        notify_ptc_messages(store, &state, payload_attestations, config)?;
+    }
 
     // Add new block to the store, and the new state for this block to the
     // store.
@@ -3776,6 +4054,15 @@ pub fn on_block(
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
     store.insert_state(block_root, state).expect("insert");
+    // [New in Gloas:EIP7732] A new payload timeliness committee vote for this
+    // block, for each of the two questions it votes on.
+    match rules {
+        ForkRules::Gloas => {
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+        }
+        ForkRules::PreGloas => {}
+    }
     // Keep `index` in step with the one block that changed, rather than
     // re-scanning `LiveChain` for it: see this function's earlier comment on
     // `index` for who below still needs it.
@@ -3812,7 +4099,7 @@ pub fn on_block(
     // first, and shares the pre-import head's proposer shuffling. Both calls
     // are infallible: nothing from here to the end of this function can turn
     // into an `Err`, and the store has already been mutated above.
-    record_block_timeliness(store, block_root, block_slot, config);
+    store.set_block_timeliness(block_root, timeliness);
     if let Some(pre_block_head) = pre_block_head {
         update_proposer_boost_root(store, &index, pre_block_head, block_root, config);
     }
@@ -3822,6 +4109,222 @@ pub fn on_block(
 
     // Eagerly compute unrealized justification and finality.
     compute_pulled_up_tip(store, block_root, block_slot, config)?;
+
+    Ok(())
+}
+
+/// `notify_ptc_messages` (gloas `fork-choice.md`): feeds the payload
+/// attestations a block carries to [`on_payload_attestation_message`], one
+/// message per attester, so the store's votes reflect them.
+///
+/// `state` is the block's own post-state, which names the attesters through
+/// `get_indexed_payload_attestation`, and the attestations are taken as
+/// already verified by `process_block`, which is why each message is applied
+/// with `is_from_block` set and a default signature. Each message is judged
+/// against the state of the block its attestation names (the specification's
+/// `store.block_states[data.beacon_block_root]`), read once per payload
+/// attestation rather than once per attester. A genesis-slot state has no
+/// payload attestation to read.
+pub fn notify_ptc_messages(
+    store: &mut Store,
+    state: &BeaconState,
+    payload_attestations: &[gloas::PayloadAttestation],
+    config: &Config,
+) -> Result<()> {
+    if state.slot() == 0 {
+        return Ok(());
+    }
+    for payload_attestation in payload_attestations {
+        let indexed =
+            gloas_helpers::get_indexed_payload_attestation(state, payload_attestation, config)?;
+        if indexed.attesting_indices.is_empty() {
+            continue;
+        }
+        let attested_state = store
+            .get_state(&payload_attestation.data.beacon_block_root)
+            .expect("get")
+            .ok_or(Error::SpecAssert(
+                "data.beacon_block_root in store.block_states",
+            ))?;
+        for &validator_index in indexed.attesting_indices.iter() {
+            let message = gloas::PayloadAttestationMessage {
+                validator_index,
+                data: payload_attestation.data,
+                signature: Default::default(),
+            };
+            apply_payload_attestation_message(store, &attested_state, &message, true, config)?;
+        }
+    }
+    Ok(())
+}
+
+/// `on_payload_attestation_message` (gloas `fork-choice.md`): records a
+/// payload timeliness committee member's vote on whether a block's payload was
+/// revealed on time and its blob data is available.
+///
+/// `is_from_block` marks a vote carried inside a block, which
+/// [`notify_ptc_messages`] has already had verified; a vote received directly
+/// must be for the current slot and carry a valid signature.
+///
+/// A member can hold more than one seat in the committee (it is drawn with
+/// replacement), and the vote lands in every one of them. Every check runs
+/// before either vote vector is written, so a rejected message changes
+/// nothing.
+pub fn on_payload_attestation_message(
+    store: &mut Store,
+    ptc_message: &gloas::PayloadAttestationMessage,
+    is_from_block: bool,
+    config: &Config,
+) -> Result<()> {
+    // PTC attestation must be for a known block. If block is unknown, delay
+    // consideration until the block is found.
+    let state = store
+        .get_state(&ptc_message.data.beacon_block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.block_states",
+        ))?;
+    apply_payload_attestation_message(store, &state, ptc_message, is_from_block, config)
+}
+
+/// The body of [`on_payload_attestation_message`] after its state read, given
+/// `state`, the state of the block `ptc_message` names, so
+/// [`notify_ptc_messages`] can read that state once for every attester of a
+/// payload attestation.
+fn apply_payload_attestation_message(
+    store: &mut Store,
+    state: &BeaconState,
+    ptc_message: &gloas::PayloadAttestationMessage,
+    is_from_block: bool,
+    config: &Config,
+) -> Result<()> {
+    let data = ptc_message.data;
+
+    // PTC votes can only change the vote for their assigned beacon block,
+    // return early otherwise.
+    if data.slot != state.slot() {
+        return Ok(());
+    }
+
+    // Get all positions of the attester in the PTC.
+    let ptc = gloas_helpers::get_ptc(state, data.slot, config)?;
+    let ptc_indices: Vec<usize> = ptc
+        .iter()
+        .enumerate()
+        .filter(|&(_, &validator_index)| validator_index == ptc_message.validator_index)
+        .map(|(ptc_index, _)| ptc_index)
+        .collect();
+
+    // Check that the attester is from the PTC.
+    verify(!ptc_indices.is_empty(), "len(ptc_indices) > 0")?;
+
+    // Verify the signature and check that it is for the current slot if it is
+    // coming from the wire.
+    if !is_from_block {
+        verify(
+            data.slot == get_current_slot(store, config),
+            "data.slot == get_current_slot(store)",
+        )?;
+        let indexed = gloas::IndexedPayloadAttestation {
+            attesting_indices: gloas::PayloadTimelinessCommitteeIndices::try_from(vec![
+                ptc_message.validator_index,
+            ])?,
+            data,
+            signature: ptc_message.signature,
+        };
+        verify(
+            gloas_helpers::is_valid_indexed_payload_attestation(state, &indexed),
+            "is_valid_indexed_payload_attestation(state, indexed_payload_attestation)",
+        )?;
+    }
+
+    // Update the votes for the block.
+    let mut payload_timeliness_vote = store
+        .payload_timeliness_vote(&data.beacon_block_root)
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.payload_timeliness_vote",
+        ))?;
+    let mut payload_data_availability_vote = store
+        .payload_data_availability_vote(&data.beacon_block_root)
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.payload_data_availability_vote",
+        ))?;
+    for ptc_index in ptc_indices {
+        let len = payload_timeliness_vote.len();
+        *payload_timeliness_vote
+            .get_mut(ptc_index)
+            .ok_or(Error::IndexOutOfBounds {
+                index: ptc_index,
+                len,
+            })? = Some(data.payload_present);
+        let len = payload_data_availability_vote.len();
+        *payload_data_availability_vote
+            .get_mut(ptc_index)
+            .ok_or(Error::IndexOutOfBounds {
+                index: ptc_index,
+                len,
+            })? = Some(data.blob_data_available);
+    }
+    store.set_payload_timeliness_vote(data.beacon_block_root, payload_timeliness_vote);
+    store
+        .set_payload_data_availability_vote(data.beacon_block_root, payload_data_availability_vote);
+
+    Ok(())
+}
+
+/// `on_execution_payload_envelope` (gloas `fork-choice.md`): verifies a
+/// builder's payload envelope against the block it belongs to and, if it
+/// holds, records the payload as verified, which is what lets a block build
+/// on its full branch (see [`on_block`]) and a vote name it.
+///
+/// `sidecars` is what the specification's implementation-dependent
+/// `retrieve_column_sidecars_and_kzg_commitments` returns for the block: the
+/// sampled column sidecars. The commitments they are checked against are the
+/// block's bid's own, read from the store. An empty slice reads as available;
+/// see [`is_data_available_gloas_columns`]. `engine` answers the execution
+/// layer's part of `verify_execution_payload_envelope`.
+///
+/// Every check runs before the payload is recorded, so a rejected envelope
+/// changes nothing. An envelope delivered again for a payload already
+/// verified is checked again and recorded again, which is idempotent.
+pub fn on_execution_payload_envelope(
+    store: &mut Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: &[gloas::DataColumnSidecar],
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
+    let envelope = &signed_envelope.message;
+    let block_root = envelope.beacon_block_root;
+
+    // The corresponding beacon block root needs to be known.
+    let state = store
+        .get_state(&block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "envelope.beacon_block_root in store.block_states",
+        ))?;
+
+    // Check if blob data is available. If not, this payload MAY be queued and
+    // subsequently considered when blob data becomes available.
+    let block = store
+        .get_signed_block(&block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "envelope.beacon_block_root in store.blocks",
+        ))?;
+    let kzg_commitments = &gloas_bid(&block)?.blob_kzg_commitments;
+    verify(
+        is_data_available_gloas_columns(sidecars, kzg_commitments)?,
+        "is_data_available(envelope.beacon_block_root)",
+    )?;
+
+    // Verify the execution payload envelope.
+    stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
+
+    // Add execution payload envelope to the store. Only the fact that it is
+    // verified is kept: nothing in fork choice reads the payload itself.
+    store.insert_verified_payload(block_root);
 
     Ok(())
 }
@@ -3841,7 +4344,8 @@ pub fn on_attestation(
     committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
-    validate_on_attestation(store, data, is_from_block, config)?;
+    let rules = attestation.rules();
+    validate_on_attestation(store, data, rules, is_from_block, config)?;
 
     // The state at the `target` to fully validate attestation against.
     // `checkpoint_state` hands back an owned value now, so there is no borrow
@@ -3852,7 +4356,7 @@ pub fn on_attestation(
     let attesting_indices = attestation.verified_attesting_indices(&target_state, committees)?;
 
     // Update latest messages for attesting indices.
-    update_latest_messages(store, &attesting_indices, data);
+    update_latest_messages(store, &attesting_indices, data, rules);
 
     Ok(())
 }
@@ -3900,10 +4404,11 @@ pub fn on_block_attestation(
     committees: &CommitteeCache,
 ) -> Result<()> {
     let data = attestation.data();
-    validate_on_attestation_indexed(store, data, true, config, index)?;
+    let rules = attestation.rules();
+    validate_on_attestation_indexed(store, data, rules, true, config, index)?;
 
     let attesting_indices = attestation.attesting_indices(block_state, committees)?;
-    update_latest_messages(store, &attesting_indices, data);
+    update_latest_messages(store, &attesting_indices, data, rules);
 
     Ok(())
 }
@@ -3928,6 +4433,11 @@ pub fn on_block_attestation(
 /// records it against `attesting_indices`, resolved by the caller's gossip
 /// validation rather than recomputed here.
 ///
+/// The rules are [`ForkRules::PreGloas`]: an aggregate reaches this function
+/// only as a pre-gloas (phase0- or electra-shaped) one, since gloas's own
+/// aggregate is refused when the gossip payload is decoded and never gets as
+/// far as gossip validation.
+///
 /// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
 /// this topic: an aggregate here is by definition not carried in a block, so
 /// the current-or-previous-epoch target check applies.
@@ -3943,8 +4453,8 @@ pub fn apply_verified_aggregate(
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
 ) -> Result<()> {
-    validate_on_attestation_indexed(store, data, false, config, index)?;
-    update_latest_messages(store, attesting_indices, data);
+    validate_on_attestation_indexed(store, data, ForkRules::PreGloas, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data, ForkRules::PreGloas);
     Ok(())
 }
 
@@ -4807,7 +5317,7 @@ mod tests {
         // `on_block` refuses a block from the future (`get_current_slot(store)
         // >= block.slot`), so the store's clock has to have reached the
         // child's own slot before this test's `on_block` call below. Set to
-        // the slot's own start, its first block, so `is_block_timely` is
+        // the slot's own start, its first block, so `block_timeliness` is
         // true and `on_block` runs its pre-import `compute_head` call too
         // (see this test's own doc for why that matters).
         store
@@ -6332,5 +6842,372 @@ mod tests {
             .expect("a pruned vote reached through should_apply_proposer_boost must not be fatal");
         gloas_get_head(&store, &config, &committees)
             .expect("the same tolerance must hold through the whole head walk");
+    }
+
+    // -----------------------------------------------------------------------
+    // Gloas handlers
+    // -----------------------------------------------------------------------
+
+    const UNVERIFIED_PAYLOAD_PARENT: &str = "is_payload_verified(store, block.parent_root)";
+
+    /// The message of the specification assertion `result` failed, or `None`
+    /// if it succeeded or failed some other way. `Error` has no `PartialEq`,
+    /// and what these tests pin is which assertion fired.
+    fn failed_assertion<T>(result: Result<T>) -> Option<&'static str> {
+        match result {
+            Err(Error::SpecAssert(what)) => Some(what),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn on_block_rejects_a_block_built_on_a_full_parent_whose_payload_is_unverified() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let anchor_root = Root::repeat_byte(0xa1);
+        let anchor_hash = ExecutionBlockHash::repeat_byte(0x11);
+        let mut store = store_anchored_at(anchor_root);
+        store
+            .insert_signed_block(
+                anchor_root,
+                gloas_block(0, Root::ZERO, ExecutionBlockHash::ZERO, anchor_hash),
+            )
+            .unwrap();
+        store
+            .insert_state(
+                anchor_root,
+                test_state::with_validators_at(ForkName::Gloas, 1),
+            )
+            .unwrap();
+        store.set_time_ms(2 * config.slot_duration_ms).unwrap();
+
+        let import = |store: &mut Store, block: SignedBeaconBlock| {
+            on_block(
+                store,
+                block,
+                &config,
+                &DataAvailability::NotRequired,
+                &PayloadValidity::NotRequired,
+                &CommitteeCache::default(),
+            )
+        };
+
+        // Names the anchor's own block hash as its parent's, so it builds on
+        // the anchor's full branch.
+        let full_child = gloas_block(
+            1,
+            anchor_root,
+            anchor_hash,
+            ExecutionBlockHash::repeat_byte(0x22),
+        );
+        let full_child_root = full_child.message_hash_tree_root();
+        assert_eq!(
+            failed_assertion(import(&mut store, full_child.clone())),
+            Some(UNVERIFIED_PAYLOAD_PARENT),
+            "a full parent whose envelope was never verified must fail the import"
+        );
+        assert!(
+            !store.has_state(&full_child_root).unwrap(),
+            "a rejected block leaves no post-state behind"
+        );
+
+        // A block on the empty branch needs no envelope, so it gets past this
+        // check (and fails later, on the empty body it carries).
+        let empty_child = gloas_block(
+            1,
+            anchor_root,
+            ExecutionBlockHash::repeat_byte(0xee),
+            ExecutionBlockHash::repeat_byte(0x33),
+        );
+        let rejected = import(&mut store, empty_child);
+        assert!(rejected.is_err());
+        assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
+
+        // Once the envelope is verified the full child clears the check too.
+        store.insert_verified_payload(anchor_root);
+        let rejected = import(&mut store, full_child);
+        assert!(rejected.is_err());
+        assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
+    }
+
+    fn gloas_attestation_data(slot: Slot, index: u64, root: Root, target: Root) -> AttestationData {
+        AttestationData {
+            slot,
+            index,
+            beacon_block_root: root,
+            source: Checkpoint::default(),
+            target: Checkpoint {
+                epoch: 0,
+                root: target,
+            },
+        }
+    }
+
+    #[test]
+    fn validate_on_attestation_applies_the_gloas_index_rules_only_to_a_gloas_attestation() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let anchor_root = Root::repeat_byte(0xa1);
+        let b_root = Root::repeat_byte(0xb1);
+        let mut store = store_anchored_at(anchor_root);
+        store
+            .insert_signed_block(
+                anchor_root,
+                gloas_block(
+                    0,
+                    Root::ZERO,
+                    ExecutionBlockHash::ZERO,
+                    ExecutionBlockHash::repeat_byte(0x11),
+                ),
+            )
+            .unwrap();
+        store
+            .insert_signed_block(
+                b_root,
+                gloas_block(
+                    1,
+                    anchor_root,
+                    ExecutionBlockHash::repeat_byte(0x11),
+                    ExecutionBlockHash::repeat_byte(0x22),
+                ),
+            )
+            .unwrap();
+        store.set_time_ms(4 * config.slot_duration_ms).unwrap();
+
+        let vote =
+            |slot: Slot, index: u64| gloas_attestation_data(slot, index, b_root, anchor_root);
+
+        // `index` is the payload flag: 0 and 1 only.
+        let validate = |store: &Store, data: AttestationData, rules: ForkRules| {
+            validate_on_attestation(store, data, rules, true, &config)
+        };
+        assert!(validate(&store, vote(2, 0), ForkRules::Gloas).is_ok());
+        assert_eq!(
+            failed_assertion(validate(&store, vote(2, 2), ForkRules::Gloas)),
+            Some("attestation.data.index in [0, 1]")
+        );
+        // A vote in the block's own slot cannot name the full branch: the
+        // payload is revealed after the block.
+        assert_eq!(
+            failed_assertion(validate(&store, vote(1, 1), ForkRules::Gloas)),
+            Some("attestation.data.index == 0 for a same-slot vote")
+        );
+        // A later vote for the full branch needs the payload to be verified.
+        assert_eq!(
+            failed_assertion(validate(&store, vote(2, 1), ForkRules::Gloas)),
+            Some("is_payload_verified(store, attestation.data.beacon_block_root)")
+        );
+        // The same attestations before gloas have no such rules.
+        assert!(validate(&store, vote(2, 1), ForkRules::PreGloas).is_ok());
+        assert!(validate(&store, vote(2, 2), ForkRules::PreGloas).is_ok());
+
+        store.insert_verified_payload(b_root);
+        assert!(validate(&store, vote(2, 1), ForkRules::Gloas).is_ok());
+    }
+
+    #[test]
+    fn update_latest_messages_orders_gloas_votes_by_slot_and_records_the_payload_flag() {
+        let root = Root::repeat_byte(0xb1);
+        let mut store = empty_store();
+        let vote = |slot: Slot, index: u64| gloas_attestation_data(slot, index, root, root);
+
+        update_latest_messages(&mut store, &[0], vote(5, 0), ForkRules::Gloas);
+        // Same target epoch, later slot: gloas replaces it, since it orders by
+        // slot, and records that the vote is for the full branch.
+        update_latest_messages(&mut store, &[0], vote(6, 1), ForkRules::Gloas);
+        let message = store.latest_message(0).unwrap();
+        assert_eq!((message.slot, message.payload_present), (6, true));
+        // An earlier slot never replaces a later one.
+        update_latest_messages(&mut store, &[0], vote(4, 0), ForkRules::Gloas);
+        assert_eq!(store.latest_message(0).unwrap().slot, 6);
+
+        // Before gloas the same pair of votes shares a target epoch, so the
+        // second does not replace the first, and no vote is for a full branch.
+        update_latest_messages(&mut store, &[1], vote(5, 0), ForkRules::PreGloas);
+        update_latest_messages(&mut store, &[1], vote(6, 1), ForkRules::PreGloas);
+        let message = store.latest_message(1).unwrap();
+        assert_eq!((message.slot, message.payload_present), (5, false));
+
+        // An equivocator's vote is dropped under either set of rules.
+        store.insert_equivocating_index(2);
+        for rules in [ForkRules::Gloas, ForkRules::PreGloas] {
+            update_latest_messages(&mut store, &[2], vote(5, 0), rules);
+            assert_eq!(store.latest_message(2), None);
+        }
+    }
+
+    #[test]
+    fn on_payload_attestation_message_writes_every_seat_the_validator_holds() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let root = Root::repeat_byte(0xb1);
+        let mut store = store_anchored_at(root);
+        store
+            .insert_signed_block(
+                root,
+                gloas_block(
+                    1,
+                    Root::ZERO,
+                    ExecutionBlockHash::ZERO,
+                    ExecutionBlockHash::repeat_byte(0x22),
+                ),
+            )
+            .unwrap();
+
+        // The committee for slot 1 in a state at slot 1 is the window entry
+        // `get_ptc` reads one epoch of slots in. Validator 3 is seated twice
+        // and every other seat is validator 0.
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("with_validators_at(Gloas) builds a gloas state");
+        };
+        inner.slot = 1;
+        let mut committee = vec![0; preset::PTC_SIZE];
+        committee[2] = 3;
+        committee[7] = 3;
+        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        inner.ptc_window[window_index] = committee.try_into().unwrap();
+        store.insert_state(root, state).unwrap();
+        store.set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
+        store.set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+
+        let message = |validator_index: u64, slot: Slot| gloas::PayloadAttestationMessage {
+            validator_index,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot,
+                payload_present: true,
+                blob_data_available: false,
+            },
+            signature: Default::default(),
+        };
+        let seats = |votes: Vec<Option<bool>>| -> Vec<(usize, bool)> {
+            votes
+                .into_iter()
+                .enumerate()
+                .filter_map(|(seat, vote)| vote.map(|vote| (seat, vote)))
+                .collect()
+        };
+
+        // A vote for a slot other than the block's own changes nothing.
+        on_payload_attestation_message(&mut store, &message(3, 2), true, &config).unwrap();
+        assert!(seats(store.payload_timeliness_vote(&root).unwrap()).is_empty());
+
+        // A validator outside the committee is rejected, and writes nothing.
+        assert_eq!(
+            failed_assertion(on_payload_attestation_message(
+                &mut store,
+                &message(2, 1),
+                true,
+                &config
+            )),
+            Some("len(ptc_indices) > 0")
+        );
+        assert!(seats(store.payload_timeliness_vote(&root).unwrap()).is_empty());
+
+        // Both seats of validator 3 receive both answers.
+        on_payload_attestation_message(&mut store, &message(3, 1), true, &config).unwrap();
+        assert_eq!(
+            seats(store.payload_timeliness_vote(&root).unwrap()),
+            vec![(2, true), (7, true)]
+        );
+        assert_eq!(
+            seats(store.payload_data_availability_vote(&root).unwrap()),
+            vec![(2, false), (7, false)]
+        );
+    }
+
+    #[test]
+    fn get_forkchoice_store_seeds_a_gloas_anchor_and_leaves_an_earlier_one_alone() {
+        // An exact anchor pair, built as `anchor_pair_with` builds a phase0 one.
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 1);
+        let mut signed = gloas_block(
+            state.slot(),
+            Root::ZERO,
+            ExecutionBlockHash::ZERO,
+            ExecutionBlockHash::ZERO,
+        );
+        let SignedBeaconBlock::Gloas(inner) = &mut signed else {
+            unreachable!("`gloas_block` builds a gloas signed block");
+        };
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            slot: inner.message.slot,
+            proposer_index: 0,
+            parent_root: Root::ZERO,
+            state_root: Root::ZERO,
+            body_root: inner.message.body.hash_tree_root(),
+        };
+        inner.message.state_root = state.hash_tree_root();
+        let anchor_root = signed.message_hash_tree_root();
+
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            signed,
+            &Config::active().with_fork_epoch(ForkName::Gloas, 0),
+        )
+        .expect("a gloas anchor is accepted");
+        assert_eq!(store.block_timeliness(&anchor_root), Some([true, true]));
+        assert_eq!(
+            store.payload_timeliness_vote(&anchor_root),
+            Some(vec![None; preset::PTC_SIZE])
+        );
+        assert_eq!(
+            store.payload_data_availability_vote(&anchor_root),
+            Some(vec![None; preset::PTC_SIZE])
+        );
+        assert!(!store.has_verified_payload(&anchor_root));
+
+        // Earlier forks record none of the three for their anchor.
+        let (state, block) = anchor_pair();
+        let anchor_root = block.message_hash_tree_root();
+        let store = get_forkchoice_store(
+            Arc::new(InMemoryBackend::new()),
+            state,
+            block,
+            &Config::active(),
+        )
+        .unwrap();
+        assert_eq!(store.block_timeliness(&anchor_root), None);
+        assert_eq!(store.payload_timeliness_vote(&anchor_root), None);
+        assert_eq!(store.payload_data_availability_vote(&anchor_root), None);
+    }
+
+    #[test]
+    fn gloas_data_availability_is_judged_on_gloas_sidecars_only() {
+        // No sidecars sampled: `all()` over an empty list holds.
+        assert!(is_data_available_gloas_columns(&[], &[]).unwrap());
+
+        // A sidecar for zero blobs is invalid.
+        let empty = gloas::DataColumnSidecar::default();
+        assert!(!is_data_available_gloas_columns(&[empty], &[]).unwrap());
+
+        // One cell and one proof against no commitments: past the zero-blob
+        // rule, and stopped by the length check against the bid.
+        let cell = fulu::Cell::try_from(vec![0u8; preset::BYTES_PER_CELL]).unwrap();
+        let one_blob = gloas::DataColumnSidecar {
+            column: vec![cell].into(),
+            kzg_proofs: vec![KzgProof::default()].into(),
+            ..Default::default()
+        };
+        assert!(!gloas_verify_data_column_sidecar(&one_blob, &[]));
+        assert!(gloas_verify_data_column_sidecar(
+            &one_blob,
+            &[KzgCommitment::default()]
+        ));
+        assert!(!is_data_available_gloas_columns(&[one_blob], &[]).unwrap());
+
+        // Gloas evidence has no `DataAvailability` variant, so an older fork's
+        // check cannot read it as its own, and each of theirs refuses the
+        // other's evidence rather than reading it as available.
+        let config = Config::active();
+        assert!(
+            is_data_available_columns(
+                &DataAvailability::Blobs {
+                    blobs: Vec::new(),
+                    proofs: Vec::new(),
+                },
+                &config,
+            )
+            .is_err()
+        );
+        assert!(is_data_available_blobs(&[], &DataAvailability::Columns(Vec::new())).is_err());
     }
 }
