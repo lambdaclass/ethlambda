@@ -485,6 +485,27 @@ macro_rules! impl_hex_serialize {
 
 impl_hex_serialize!(H160, BlsPubkey, BlsSignature, KzgCommitment, KzgProof);
 
+/// The `Deserialize` counterpart of [`impl_hex_serialize`], for the types the
+/// Beacon API accepts in a request body: a validator's public key (as a
+/// validator id) and a signature (inside a submitted attestation). Hex with or
+/// without the `0x` prefix, of exactly the type's width.
+macro_rules! impl_hex_deserialize {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl<'de> serde::Deserialize<'de> for $ty {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    super::serde_helpers::hex_array::deserialize(deserializer).map(Self)
+                }
+            }
+        )*
+    };
+}
+
+impl_hex_deserialize!(BlsPubkey, BlsSignature);
+
 #[cfg(test)]
 mod tests {
     use libssz::{SszDecode as _, SszEncode as _};

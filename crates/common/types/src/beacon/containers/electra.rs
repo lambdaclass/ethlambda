@@ -184,7 +184,17 @@ pub struct AttesterSlashing {
 /// `committee_index` and `attester_index` explicitly instead, and an
 /// aggregator combines every `SingleAttestation` sharing the same `data` into
 /// one widened [`Attestation`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SingleAttestation {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub committee_index: CommitteeIndex,
@@ -656,6 +666,46 @@ mod tests {
 
         let bytes = deposit.to_ssz();
         assert_eq!(PendingDeposit::from_ssz_bytes(&bytes).unwrap(), deposit);
+    }
+
+    #[test]
+    fn single_attestation_reads_the_beacon_api_json_shape() {
+        // What a validator client POSTs to `/eth/v2/beacon/pool/attestations`:
+        // every integer quoted, every byte string 0x-hex.
+        let json = serde_json::json!({
+            "committee_index": "3",
+            "attester_index": "77",
+            "data": {
+                "slot": "65",
+                "index": "0",
+                "beacon_block_root": format!("0x{}", "11".repeat(32)),
+                "source": { "epoch": "1", "root": format!("0x{}", "22".repeat(32)) },
+                "target": { "epoch": "2", "root": format!("0x{}", "33".repeat(32)) },
+            },
+            "signature": format!("0x{}", "44".repeat(96)),
+        });
+
+        let attestation: SingleAttestation = serde_json::from_value(json.clone()).unwrap();
+
+        assert_eq!(attestation.committee_index, 3);
+        assert_eq!(attestation.attester_index, 77);
+        assert_eq!(attestation.data.slot, 65);
+        assert_eq!(attestation.data.target.epoch, 2);
+        assert_eq!(attestation.data.target.root, Root::repeat_byte(0x33));
+        assert_eq!(attestation.signature, BlsSignature([0x44; 96]));
+        // And it serializes back to the same document.
+        assert_eq!(serde_json::to_value(&attestation).unwrap(), json);
+    }
+
+    #[test]
+    fn single_attestation_rejects_a_short_signature() {
+        let json = serde_json::json!({
+            "committee_index": "0",
+            "attester_index": "0",
+            "data": AttestationData::default(),
+            "signature": format!("0x{}", "44".repeat(95)),
+        });
+        assert!(serde_json::from_value::<SingleAttestation>(json).is_err());
     }
 
     #[test]

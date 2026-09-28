@@ -125,7 +125,17 @@ pub struct ForkData {
 /// An epoch and the block root at its start: what attestations vote on and what
 /// justification and finalization track.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Checkpoint {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -173,7 +183,17 @@ pub struct Validator {
 
 /// What an attestation actually attests to.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct AttestationData {
     /// The slot being attested for.

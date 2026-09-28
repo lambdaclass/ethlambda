@@ -236,6 +236,49 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
+| `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
+| `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
+| `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
+| `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
+| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
+| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Acknowledged, not acted on (see below) |
+| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
+
+### Validator endpoints
+
+These are what `ethlambda validator` needs to attest through this node. Every
+answer is computed from the fork-choice head's post-state, read off the store
+the chain actor writes, so no request waits on the actor.
+
+- **Duties** answer for a window around the head, not any epoch. Proposer
+  duties read fulu's `proposer_lookahead`, which covers the head's epoch and the
+  next; attester duties cover the head's previous, current and next epoch,
+  which is as far as its shuffling is already fixed. Anything else is a `400`.
+  `dependent_root` follows each endpoint's v1 definition. Attester duties walk
+  every committee of the epoch, a full shuffle per request on mainnet.
+- **`attestation_data`** follows phase0's `validator.md`: the head block, the
+  epoch's boundary block as target, and as source the current justified
+  checkpoint of the head state advanced to the slot's epoch (through fork
+  choice's cached `checkpoint_state`, and only when the head is in an earlier
+  epoch). A slot before the head, or past the wall clock, is a `400`.
+- **`pool/attestations`** checks each attestation against the electra
+  `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
+  window, `data.index == 0`, target epoch, the voted block known and the target
+  its checkpoint block, committee membership, BLS signature), then gossips it on
+  its subnet through fanout, without subscribing. A rejected attestation comes
+  back in an `IndexedErrorMessage` with its position; the valid ones in the
+  same batch are still published. There is no seen-attestation cache.
+- **`beacon_committee_subscriptions`** and **`prepare_beacon_proposer`** parse
+  their body and return `200` without acting: this node joins no attestation
+  subnet until it aggregates, and uses no fee recipient until it builds blocks.
+
+Block production and aggregation are not served. Their routes
+(`/eth/v3/validator/blocks/{slot}`, `POST /eth/v2/beacon/blocks`,
+`/eth/v2/validator/aggregate_attestation`, `/eth/v2/validator/aggregate_and_proofs`)
+answer **`501`**, which `ethlambda validator` treats as a node failure and fails
+over on, per call, to the next node in `--beacon-nodes`. That is how
+`tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` attests
+through this node while another still proposes.
 
 ### Encoding
 

@@ -2,7 +2,10 @@ use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::containers::{
+        SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
+        fulu::DataColumnSidecar,
+    },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
@@ -272,6 +275,28 @@ pub struct AggregateArrival {
     /// The aggregate is about to be handed to the chain actor, which is also
     /// the end of the decode.
     pub handed_off: Instant,
+}
+
+// --- Protocol: RPC -> P2P ---
+
+/// What the Beacon API asks of the network.
+///
+/// A protocol of its own rather than more methods on [`BlockChainToP2P`]:
+/// these requests come from a validator client through the HTTP server, not
+/// from the chain actor, and a beacon node's chain actor has nothing to publish
+/// on its own behalf.
+#[protocol]
+pub trait RpcToP2P: Send + Sync {
+    /// Gossip one unaggregated attestation on `beacon_attestation_{subnet_id}`.
+    ///
+    /// The caller has already validated it and computed its subnet: both need
+    /// the committee assignment, which needs a state, and the p2p actor holds
+    /// none.
+    fn publish_beacon_attestation(
+        &self,
+        subnet_id: u64,
+        attestation: SingleAttestation,
+    ) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---

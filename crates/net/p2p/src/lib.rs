@@ -43,6 +43,7 @@ use ethlambda_network_api::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
     },
+    rpc_to_p2p::PublishBeaconAttestation,
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
 use ethlambda_state_transition::beacon::gossip::{
@@ -81,7 +82,7 @@ use crate::{
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_block,
+        publish_attestation, publish_beacon_attestation, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
@@ -1294,6 +1295,12 @@ impl Handler<PublishAttestation> for P2PServer {
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
+    }
+}
+
+impl Handler<PublishBeaconAttestation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAttestation, _ctx: &Context<Self>) {
+        publish_beacon_attestation(self, msg.subnet_id, msg.attestation).await;
     }
 }
 

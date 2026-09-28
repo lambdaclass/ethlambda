@@ -101,7 +101,10 @@ impl SeenAttestations {
 ///
 /// `committees_per_slot` is the caller's, since it is a function of the
 /// state at the attestation's epoch and this function holds no state.
-pub(crate) fn compute_subnet_for_attestation(
+///
+/// Public for the Beacon API, which computes the subnet of each attestation a
+/// validator client submits before publishing it.
+pub fn compute_subnet_for_attestation(
     committees_per_slot: u64,
     slot: Slot,
     committee_index: CommitteeIndex,

@@ -29,6 +29,12 @@ preset-minimal = ["ethlambda-types/preset-minimal"]
 # after downloading the fixtures.
 beacon-spec-tests = []
 
+# Exposes `beacon::helpers::test_state`, the state builder this crate's own
+# tests use, to other crates' tests (the Beacon API's duty endpoints need a
+# state with a real validator registry). Never enabled outside
+# `[dev-dependencies]`.
+test-utils = []
+
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true

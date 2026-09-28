@@ -2,6 +2,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
+use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -186,16 +187,20 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
 ///
 /// The beacon counterpart to [`start_rpc_server`]. It takes no
 /// `AggregatorController` and no `EventBus`: a follower has no aggregator duty
-/// to toggle, and the chain-events stream is part of the lean surface.
+/// to toggle, and the chain-events stream is part of the lean surface. It does
+/// take `p2p`, through which the pool endpoint gossips a validator client's
+/// attestations.
 pub async fn start_beacon_rpc_server(
     config: RpcConfig,
     store: Store,
     sync_status: SyncStatusController,
+    p2p: RpcToP2PRef,
     peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let api_router =
-        build_beacon_api_router(store, config.version, peer_id).layer(Extension(sync_status));
+    let api_router = build_beacon_api_router(store, config.version, peer_id)
+        .layer(Extension(sync_status))
+        .layer(Extension(p2p));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -377,6 +382,63 @@ pub(crate) mod test_utils {
             },
             signature: Default::default(),
         })
+    }
+
+    /// Stands in for the P2P actor: records what the Beacon API would have
+    /// gossiped instead of gossiping it.
+    #[derive(Default)]
+    pub(crate) struct RecordingNetwork {
+        pub(crate) published: std::sync::Mutex<
+            Vec<(
+                u64,
+                ethlambda_types::beacon::containers::electra::SingleAttestation,
+            )>,
+        >,
+    }
+
+    impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
+        fn publish_beacon_attestation(
+            &self,
+            subnet_id: u64,
+            attestation: ethlambda_types::beacon::containers::electra::SingleAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((subnet_id, attestation));
+            Ok(())
+        }
+    }
+
+    /// A beacon store whose anchor, and so head, is `state`, under a block at
+    /// the state's slot. Returns the store and that block's root.
+    ///
+    /// For endpoints that read the validator registry or committees, which the
+    /// empty phase0 state in [`beacon_fixture`] cannot exercise. The block is a
+    /// phase0 one whatever `state`'s fork: these endpoints read the state and
+    /// the block's root and slot, never the block's body.
+    pub(crate) fn beacon_store_at(state: BeaconState) -> (Store, H256) {
+        let slot = state.slot();
+        let block = phase0_beacon_block(slot, H256::ZERO);
+        let root = block.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store
+            .insert_signed_block(root, block)
+            .expect("insert anchor block");
+        store
+            .insert_state(root, state)
+            .expect("insert anchor state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("make the anchor the head");
+        (store, root)
     }
 
     /// Build a beacon store anchored at `anchor_slot`, with a real child block

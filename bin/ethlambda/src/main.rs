@@ -44,7 +44,9 @@ use ethlambda_blockchain::key_manager::ValidatorKeyPair;
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_engine::types::ClientVersionV1;
 use ethlambda_engine::{EngineClient, JwtSecret};
-use ethlambda_network_api::{InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef};
+use ethlambda_network_api::{
+    InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef, ToRpcToP2PRef,
+};
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
     build_swarm, discovery::DiscoverySpawnConfig, parse_enrs,
@@ -656,6 +658,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_aggregator = aggregator.clone();
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
+    let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
 
     // Which HTTP surface this node serves follows from the store's own chain
     // tag rather than from the sub-command, so the two can never disagree.
@@ -670,6 +673,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_config,
                 rpc_store,
                 rpc_sync_status,
+                rpc_p2p,
                 local_peer_id,
                 rpc_shutdown,
             )

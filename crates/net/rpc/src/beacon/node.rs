@@ -26,7 +26,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
 /// Millisecond-denominated, the way `/lean/v0/node/syncing` computes the same
 /// number: `slot_duration_ms` is the value a loaded network can actually
 /// change, and `seconds_per_slot` would truncate a sub-second cadence to zero.
-fn wall_slot(store: &Store) -> u64 {
+pub(crate) fn wall_slot(store: &Store) -> u64 {
     let config = store.config();
     let genesis_ms = config.genesis_time_ms();
     let now_ms = std::time::SystemTime::now()

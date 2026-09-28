@@ -471,7 +471,10 @@ disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
 handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
 same `SyncStatusController` the chain actor writes to. The beacon arm takes no
 `AggregatorController` and no `EventBus`, because a follower has no aggregator duty to
-toggle and the chain-events stream is part of the lean surface.
+toggle and the chain-events stream is part of the lean surface. It does take the P2P
+actor's `RpcToP2PRef` (`crates/net/api`), the one path by which this node gossips on the
+beacon wire: `POST /eth/v2/beacon/pool/attestations` validates a validator client's
+attestations and publishes them through it.
 
 The two API routers are alternatives, never merged. A `/lean/v0` path on a `beacon` run is
 a 404: those handlers read lean state variants and metadata keys a beacon directory never

@@ -20,7 +20,11 @@ pub(crate) mod config;
 pub(crate) mod genesis;
 pub(crate) mod headers;
 pub(crate) mod node;
+pub(crate) mod pool;
 pub(crate) mod states;
+pub(crate) mod validator;
+#[cfg(test)]
+mod validator_client_tests;
 
 /// The wrapper every fork-versioned Beacon API payload travels in.
 ///
@@ -49,6 +53,8 @@ pub(crate) enum ApiError {
     BadRequest(&'static str),
     NotFound(&'static str),
     Internal(&'static str),
+    /// A route the Beacon API defines that this node does not serve yet.
+    NotImplemented(&'static str),
 }
 
 impl From<IdError> for ApiError {
@@ -66,6 +72,7 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::NotImplemented(m) => (StatusCode::NOT_IMPLEMENTED, m),
         };
         let body = serde_json::json!({ "code": status.as_u16(), "message": message });
         let mut response = crate::json_response(body);
@@ -88,6 +95,8 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(genesis::routes())
         .merge(config::routes())
         .merge(node::routes(version, peer_id))
+        .merge(validator::routes())
+        .merge(pool::routes())
 }
 
 #[cfg(test)]

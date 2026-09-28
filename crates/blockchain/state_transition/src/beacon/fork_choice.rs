@@ -843,7 +843,10 @@ pub use ethlambda_storage::Store;
 /// `&self` by design, using interior mutability, which is what lets this
 /// read-only helper record a derived value on a miss without widening to
 /// `&mut Store`.
-fn checkpoint_state(
+///
+/// Public so the Beacon API can take attestation data's source checkpoint
+/// from the same cached, advanced state fork choice uses.
+pub fn checkpoint_state(
     store: &Store,
     checkpoint: &Checkpoint,
     config: &Config,

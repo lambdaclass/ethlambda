@@ -12,13 +12,13 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, Re
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::SignedBeaconBlock,
+    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
 use libp2p::PeerId;
-use libp2p::gossipsub::{Message, MessageId};
+use libp2p::gossipsub::{IdentTopic, Message, MessageId};
 use libssz::{SszDecode, SszEncode};
 use spawned_concurrency::tasks::Context;
 use tracing::{debug, error, info, trace, warn};
@@ -30,6 +30,7 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
+use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
@@ -554,6 +555,44 @@ pub async fn publish_aggregated_attestation(
         source_slot = attestation.data.source.slot,
         source_root = %ShortRoot(&attestation.data.source.root.0),
         "Published aggregated attestation to gossipsub"
+    );
+}
+
+/// Gossip one of a validator client's attestations, handed over by the Beacon
+/// API, on its `beacon_attestation_{subnet_id}` topic.
+///
+/// The API has already validated the attestation and computed `subnet_id`; this
+/// only refuses what would be a programming error on its side (a lean node, or
+/// a subnet id past the last subnet) rather than publish to a topic no peer
+/// listens on.
+pub async fn publish_beacon_attestation(
+    server: &mut P2PServer,
+    subnet_id: u64,
+    attestation: SingleAttestation,
+) {
+    let slot = attestation.data.slot;
+    let validator = attestation.attester_index;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(%slot, validator, "A beacon attestation reached a lean node; dropping it");
+        return;
+    };
+    if subnet_id >= ATTESTATION_SUBNET_COUNT {
+        error!(%slot, validator, subnet_id, "Attestation subnet out of range; dropping it");
+        return;
+    }
+    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
+        beacon.fork_digest,
+        subnet_id,
+    ));
+    let compressed = compress_message(&attestation.to_ssz());
+    server.swarm_handle.publish(topic, compressed);
+    debug!(
+        %slot,
+        validator,
+        subnet_id,
+        target_epoch = attestation.data.target.epoch,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        "Published attestation to gossipsub"
     );
 }
 
