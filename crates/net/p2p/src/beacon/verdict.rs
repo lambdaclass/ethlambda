@@ -127,8 +127,16 @@ impl Validated {
     /// Hand this object on towards the chain actor, given its gossip
     /// `outcome`.
     ///
-    /// A block goes straight to the chain actor whatever the outcome, since
-    /// its import runs the state transition, which judges it again. A column
+    /// A block goes on only on `Accept` or `Queue`, the two outcomes that
+    /// mean its proposer signature verified (see
+    /// `gossip::block::queue_if_signed`). Its import runs the state transition,
+    /// which judges it again, but a block that has to wait first (for its
+    /// parent, then for its custody columns) is kept unjudged the whole time,
+    /// so one whose signature nobody checked must never reach the actor:
+    /// mainnet gossip carries altered copies of real blocks that no peer has
+    /// columns for. Anything else (`Overloaded` included) is dropped, and a
+    /// real block dropped here still arrives through a child's by-root fetch
+    /// or range sync. A column
     /// goes straight there only on `Accept`: the chain actor keeps a column
     /// without checking it, so one gossip did not finish judging goes through
     /// [`column_checks`] first. An aggregate goes on only on `Accept`, and
@@ -166,7 +174,7 @@ impl Validated {
             return;
         };
         match self {
-            Self::Block { block, .. } => {
+            Self::Block { block, .. } if matches!(outcome, Outcome::Accept | Outcome::Queue(_)) => {
                 // `decode_start` is the wire arrival, so the import's decode
                 // section spans the decode and gossip validation.
                 let arrival = BlockArrival {
@@ -196,7 +204,7 @@ impl Validated {
                     .new_beacon_aggregate(aggregate, attesting_indices, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip aggregate"));
             }
-            Self::Aggregate { .. } | Self::Attestation { .. } => {}
+            Self::Block { .. } | Self::Aggregate { .. } | Self::Attestation { .. } => {}
         }
     }
 }
@@ -363,13 +371,14 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 ///
 /// With every permit taken, the object is reported `Ignore(Overloaded)`
 /// instead of queued: queueing it would only make its verdict later than
-/// gossipsub's cache can wait for, so it never propagates unvalidated. A block
-/// still goes on towards the chain actor regardless: its import runs the
-/// state transition, which judges it again. A column goes through
-/// [`column_checks`] instead (see [`Validated::forward`]); dropping either
-/// here would leave the actor to learn of it only through a child's by-root
-/// fetch or range sync, both far slower than gossip. An aggregate or a subnet
-/// attestation is not forwarded on this outcome at all: see
+/// gossipsub's cache can wait for, so it never propagates unvalidated. A
+/// column still goes on, through [`column_checks`] (see
+/// [`Validated::forward`]); dropping it here would leave the actor to learn of
+/// it only through a by-root fetch, far slower than gossip. A block is
+/// dropped: its signature went unchecked, and [`Validated::forward`] keeps
+/// every such block off the chain actor. None was measured overloaded on the
+/// mainnet followers over the 24 hours before this changed. An aggregate or a
+/// subnet attestation is not forwarded on this outcome either: see
 /// [`Validated::forward`]'s own documentation for why.
 pub(crate) fn spawn_stateful_checks(
     server: &P2PServer,
@@ -539,9 +548,10 @@ mod tests {
     }
 
     /// A [`P2PToBlockChain`] stand-in that only records whether
-    /// `new_beacon_aggregate` was called, for the tests that check `forward`
-    /// keeps an aggregate off the chain actor on every outcome but `Accept`.
-    struct RecordingChain(AtomicBool);
+    /// `new_beacon_aggregate` (the first flag) or `new_block` (the second)
+    /// was called, for the tests that check which outcomes `forward` lets
+    /// through to the chain actor.
+    struct RecordingChain(AtomicBool, AtomicBool);
 
     impl P2PToBlockChain for RecordingChain {
         fn new_block(
@@ -550,6 +560,7 @@ mod tests {
             _source: BlockSource,
             _arrival: BlockArrival,
         ) -> Result<(), ActorError> {
+            self.1.store(true, Ordering::SeqCst);
             Ok(())
         }
         fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
@@ -693,7 +704,10 @@ mod tests {
     #[tokio::test]
     async fn an_overloaded_aggregate_is_not_forwarded() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        let chain = Arc::new(RecordingChain(
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ));
         server.blockchain = Some(chain.clone());
         let object = Validated::Aggregate {
             aggregate: Box::new(phase0_aggregate(5, 1)),
@@ -707,6 +721,45 @@ mod tests {
         );
 
         assert!(!chain.0.load(Ordering::SeqCst));
+    }
+
+    /// A block reaches the chain actor only on the outcomes that mean its
+    /// signature verified: a block the validation pool had no permit for was
+    /// never judged at all, so it is dropped rather than handed on.
+    #[tokio::test]
+    async fn only_an_accepted_or_queued_block_is_forwarded() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forwarded = |server: &mut P2PServer, outcome: Outcome| {
+            let chain = Arc::new(RecordingChain(
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ));
+            server.blockchain = Some(chain.clone());
+            let object = Validated::Block {
+                block: Box::new(fulu_block(5, 1)),
+                block_root: Root::repeat_byte(5),
+            };
+            object.forward(server, Instant::now(), outcome);
+            chain.1.load(Ordering::SeqCst)
+        };
+
+        assert!(forwarded(&mut server, Outcome::Accept));
+        assert!(forwarded(
+            &mut server,
+            Outcome::Queue(QueueReason::ParentNotReady)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Ignore(IgnoreReason::Overloaded)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Ignore(IgnoreReason::SignatureUnverified)
+        ));
+        assert!(!forwarded(
+            &mut server,
+            Outcome::Reject(RejectReason::BadSignature)
+        ));
     }
 
     /// An accepted electra aggregate is what block production packs other
@@ -767,7 +820,10 @@ mod tests {
     #[tokio::test]
     async fn a_subnet_attestation_is_never_forwarded_even_on_accept() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        let chain = Arc::new(RecordingChain(
+            AtomicBool::new(false),
+            AtomicBool::new(false),
+        ));
         server.blockchain = Some(chain.clone());
         let object = Validated::Attestation {
             attestation: Box::new(electra_attestation(5, 1)),
