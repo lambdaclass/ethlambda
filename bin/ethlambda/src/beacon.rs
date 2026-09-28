@@ -194,9 +194,10 @@ pub fn wire_params(
     // restart there recomputes the digest and resubscribes to the right
     // topics, the same as any other boundary, but it does not make this
     // build any more able to import a gloas block or cross a gloas epoch
-    // boundary (`state_transition` refuses both). Suggesting a restart
-    // "crosses" it would read as a stall a restart clears, which this is
-    // not.
+    // boundary (the chain actor refuses every gloas block, since nothing
+    // delivers payload envelopes or payload attestations to it yet).
+    // Suggesting a restart "crosses" it would read as a stall a restart
+    // clears, which this is not.
     match next_fork_boundary(&chain, epoch) {
         Some(boundary) if boundary == chain.gloas_fork_epoch => warn!(
             boundary_epoch = boundary,

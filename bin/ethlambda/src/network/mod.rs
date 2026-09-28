@@ -240,22 +240,24 @@ fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
 /// (`ConfigFile::warn_about_ignored_keys`) no longer implies this the way it
 /// used to, now that `GLOAS_*` keys are claimed rather than reported as
 /// unknown, so this says it explicitly instead of leaving it to be
-/// discovered as a stall: this build's state transition and fork choice
-/// refuse every gloas block and epoch boundary, so a follower stops making
-/// progress there regardless of how cleanly its config parsed. A loaded
+/// discovered as a stall: the chain actor refuses every gloas block
+/// (`process_or_pend_block`), because nothing delivers payload envelopes or
+/// payload attestations to it yet, so a follower stops making progress there
+/// regardless of how cleanly its config parsed. A loaded
 /// network reaches this the same as a built-in one, and can even schedule
 /// gloas at epoch 0, in which case its own genesis state already decodes as
-/// gloas and `fork_choice::get_forkchoice_store` refuses it outright at
-/// startup; this warning fires first either way.
+/// gloas and startup refuses it outright (`refuse_unfollowable_fork` in
+/// `main.rs`, since fork choice itself accepts a gloas anchor); this warning
+/// fires first either way.
 fn warn_if_gloas_scheduled(network: &str, config: &Config) {
     if config.gloas_fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
         tracing::warn!(
             network,
             gloas_fork_epoch = config.gloas_fork_epoch,
             "This build stops following this chain at its gloas fork epoch; \
-             crossing it is not a stall a restart clears, since state_transition \
-             refuses every gloas block and epoch boundary until a later release \
-             implements it"
+             crossing it is not a stall a restart clears, since the chain actor \
+             refuses every gloas block until a later release delivers payload \
+             envelopes and payload attestations to it"
         );
     }
 }
