@@ -38,7 +38,7 @@ use crate::beacon::helpers::predicates::{
 };
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Gwei, HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
 
 /// Runs every operation in a block, in the specification's order.
 ///
@@ -152,17 +152,26 @@ pub fn process_operations(
 // Proposer slashings
 // ---------------------------------------------------------------------------
 
-/// Slashes a proposer caught signing two different headers for the same slot.
+/// Checks a proposer slashing's evidence without slashing anyone: the two
+/// headers agree on slot and proposer, differ from each other, name a
+/// still-slashable proposer, and both signatures check out.
+///
+/// Shared between phase0's own [`process_proposer_slashing`] below and
+/// `crate::beacon::stf::gloas::process_proposer_slashing`: gloas's own
+/// specification modifies the function (EIP-7732: it also clears a
+/// `BuilderPendingPayment`), but not this prologue, which the two share line
+/// for line. Returns the slashed proposer's index and the state's current
+/// epoch, both of which gloas's own caller also needs for its own
+/// payment-window check, so neither has to be recomputed.
 ///
 /// The two headers must actually differ: a proposer can be asked to co-sign
 /// the same header twice (by different requesters, or the same one twice),
 /// and that is not evidence of anything. Only a genuine equivocation, two
 /// distinct headers for the one slot, is slashable.
-pub fn process_proposer_slashing(
-    state: &mut BeaconState,
+pub(crate) fn verify_proposer_slashing(
+    state: &BeaconState,
     proposer_slashing: &ProposerSlashing,
-    config: &Config,
-) -> Result<()> {
+) -> Result<(ValidatorIndex, Epoch)> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
 
@@ -201,6 +210,18 @@ pub fn process_proposer_slashing(
         )?;
     }
 
+    Ok((proposer_index, current_epoch))
+}
+
+/// Slashes a proposer caught signing two different headers for the same
+/// slot. See [`verify_proposer_slashing`] for the shared prologue this
+/// delegates to.
+pub fn process_proposer_slashing(
+    state: &mut BeaconState,
+    proposer_slashing: &ProposerSlashing,
+    config: &Config,
+) -> Result<()> {
+    let (proposer_index, _current_epoch) = verify_proposer_slashing(state, proposer_slashing)?;
     slash_validator(state, proposer_index, None, config)?;
     Ok(())
 }
@@ -209,17 +230,61 @@ pub fn process_proposer_slashing(
 // Attester slashings
 // ---------------------------------------------------------------------------
 
-/// Slashes every slashable validator in the overlap of two conflicting
-/// attestations' attesting sets.
+/// Slashes every slashable validator in the overlap of two attesting index
+/// sets, given each attestation's own already-verified indices.
+///
+/// The shared tail of `process_attester_slashing`, unchanged across every
+/// fork that has its own copy (phase0's below, electra's and gloas's own):
+/// what differs between them is only the prologue above this, validating an
+/// indexed attestation against that fork's own container type
+/// (`is_valid_indexed_attestation`). Once both are valid, this walk needs
+/// nothing fork-specific, only the two already-sorted, already-deduplicated
+/// index slices.
 ///
 /// The two indexed attestations must each be independently valid (sorted,
 /// unique, unslashed-signature-correct) before their overlap means anything:
-/// evidence built from a forged or malformed attestation proves nothing.
-/// It is not enough for the overlap to be non-empty either. If every
-/// validator in it has already been slashed (and so is past
+/// evidence built from a forged or malformed attestation proves nothing. It
+/// is not enough for the overlap to be non-empty either. If every validator
+/// in it has already been slashed (and so is past
 /// [`is_slashable_validator`]'s reach) or has already withdrawn, the
 /// operation has no effect and including it would let a block waste space
 /// (or, worse, let a proposer replay old evidence) for free.
+///
+/// `attesting_indices_1` walked in order while filtering by membership in
+/// `attesting_indices_2`'s set yields the intersection already sorted,
+/// matching the specification's `sorted(indices)` without a separate sort:
+/// `is_valid_indexed_attestation` already required both to be sorted and
+/// unique before either reaches here.
+pub(crate) fn slash_attesting_index_intersection(
+    state: &mut BeaconState,
+    attesting_indices_1: &[ValidatorIndex],
+    attesting_indices_2: &[ValidatorIndex],
+    config: &Config,
+) -> Result<()> {
+    let current_epoch = get_current_epoch(state);
+    let indices_2: HashSet<ValidatorIndex> = attesting_indices_2.iter().copied().collect();
+
+    let mut slashed_any = false;
+    for &index in attesting_indices_1 {
+        if !indices_2.contains(&index) {
+            continue;
+        }
+        if is_slashable_validator(state.validator(index)?, current_epoch) {
+            slash_validator(state, index, None, config)?;
+            slashed_any = true;
+        }
+    }
+    verify(
+        slashed_any,
+        "at least one validator in the intersection of the two attesting index sets was slashed",
+    )?;
+    Ok(())
+}
+
+/// Slashes every slashable validator in the overlap of two conflicting
+/// attestations' attesting sets. See [`slash_attesting_index_intersection`]
+/// for the shared walk this delegates to once both indexed attestations
+/// check out against phase0's own container type.
 pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &phase0::AttesterSlashing,
@@ -241,30 +306,12 @@ pub fn process_attester_slashing(
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
-    let current_epoch = get_current_epoch(state);
-    // `is_valid_indexed_attestation` already required both index lists to be
-    // sorted and unique, so walking `attestation_1`'s list in order while
-    // filtering by membership in `attestation_2`'s set yields the
-    // intersection already sorted, matching the specification's
-    // `sorted(indices)` without a separate sort.
-    let indices_2: HashSet<ValidatorIndex> =
-        attestation_2.attesting_indices.iter().copied().collect();
-
-    let mut slashed_any = false;
-    for &index in attestation_1.attesting_indices.iter() {
-        if !indices_2.contains(&index) {
-            continue;
-        }
-        if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
-            slashed_any = true;
-        }
-    }
-    verify(
-        slashed_any,
-        "at least one validator in the intersection of the two attesting index sets was slashed",
-    )?;
-    Ok(())
+    slash_attesting_index_intersection(
+        state,
+        &attestation_1.attesting_indices,
+        &attestation_2.attesting_indices,
+        config,
+    )
 }
 
 // ---------------------------------------------------------------------------

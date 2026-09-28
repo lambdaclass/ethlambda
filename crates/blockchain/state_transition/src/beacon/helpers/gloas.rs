@@ -148,6 +148,59 @@ pub fn is_valid_indexed_attestation(
     bls::fast_aggregate_verify(&pubkeys, signing_root, &indexed_attestation.signature)
 }
 
+// ---------------------------------------------------------------------------
+// Attestations
+// ---------------------------------------------------------------------------
+
+/// The committee members whose bit is set in `attestation`, in ascending
+/// order.
+///
+/// Not modified by gloas's own `beacon-chain.md` (which names no
+/// `get_attesting_indices` of its own): [`gloas::Attestation`]'s
+/// [`gloas::AggregationBits`] is a different Rust type from
+/// [`super::electra::get_attesting_indices`]'s bounded bitlist (EIP-7688), but
+/// that is the one thing
+/// [`super::electra::attesting_indices_from_committee_bits`] already
+/// abstracts over (see its own doc), so this is a thin wrapper over that
+/// shared walk, the same shape electra's own `get_attesting_indices` is.
+/// `committee_bits` is untouched by the EIP-7688 change ([`gloas::Attestation`]
+/// reuses [`electra::CommitteeBits`] outright, see `containers::gloas`'s own
+/// module doc), which is what lets both forks share one walk over one type.
+pub fn get_attesting_indices(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    committees: &CommitteeCache,
+) -> Result<Vec<ValidatorIndex>> {
+    super::electra::attesting_indices_from_committee_bits(
+        state,
+        attestation.data.slot,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
+}
+
+/// The same attestation with its attesters named rather than bit-encoded.
+///
+/// See [`get_attesting_indices`] for why this is gloas's own copy rather than
+/// a call into electra's: [`gloas::IndexedAttestation::attesting_indices`] is
+/// the unbounded [`gloas::AttestingIndices`] (`ProgressiveList`), which is
+/// built with `From<Vec<_>>` rather than electra's bounds-checked
+/// `TryFrom<Vec<_>>`, since a progressive list has no maximum length to
+/// exceed.
+pub fn get_indexed_attestation(
+    state: &BeaconState,
+    attestation: &gloas::Attestation,
+    committees: &CommitteeCache,
+) -> Result<gloas::IndexedAttestation> {
+    let indices = get_attesting_indices(state, attestation, committees)?;
+    Ok(gloas::IndexedAttestation {
+        attesting_indices: gloas::AttestingIndices::from(indices),
+        data: attestation.data,
+        signature: attestation.signature,
+    })
+}
+
 /// Whether `validator_index` actually names a [`gloas::BuilderIndex`]
 /// (EIP-7732): builders and validators share one index space, distinguished
 /// by this one bit.

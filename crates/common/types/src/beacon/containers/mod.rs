@@ -989,6 +989,33 @@ impl BeaconState {
         )
     }
 
+    /// `previous_epoch_participation` or `current_epoch_participation`,
+    /// mutably and as a plain slice, whichever `current` selects: element
+    /// writes only, the same contract [`Self::inactivity_scores_mut`]'s own
+    /// doc gives for why that is enough to include gloas where
+    /// [`Self::altair_validator_lists_mut`] cannot.
+    ///
+    /// `crate::beacon::stf::gloas::process_attestation` is the one caller: like
+    /// every earlier fork's own version, it only ever ORs a newly-satisfied
+    /// flag into an existing validator's entry, never grows or replaces
+    /// either list (that only ever happens through
+    /// [`Self::altair_validator_lists_mut`], on a fork that carries it, or
+    /// through a gloas caller's own per-fork projection, the way
+    /// [`Self::altair_validator_lists_mut`]'s own doc describes).
+    pub fn epoch_participation_mut(&mut self, current: bool) -> Result<&mut [ParticipationFlags]> {
+        dispatch_state_from!(
+            self,
+            "BeaconState::epoch_participation_mut",
+            |state| if current {
+                &mut state.current_epoch_participation[..]
+            } else {
+                &mut state.previous_epoch_participation[..]
+            },
+            carried_by: [Altair, Bellatrix, Capella, Deneb, Electra, Fulu, Gloas],
+            absent_from: [Phase0],
+        )
+    }
+
     /// The current and next sync committee, by reference.
     ///
     /// Both exist from altair on, byte-for-byte the same field in every later
