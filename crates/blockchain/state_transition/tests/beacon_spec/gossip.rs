@@ -375,8 +375,10 @@ pub fn trials() -> Vec<Trial> {
             // fork is ignored rather than run, the same "known gap, not a
             // silent one" treatment `case.in_scope()` already gives a fork
             // past `HIGHEST_IMPLEMENTED_FORK`. `case.in_scope()` alone would
-            // pass every fork up to fulu, since the state transition handles
-            // them all; the gossip rules do not.
+            // pass every fork up to gloas, since the state transition handles
+            // them all; the gossip rules do not. In particular the node does
+            // not validate gloas gossip yet, so a gloas case stays ignored
+            // here even though its state transition runs.
             let ignored = !case.in_scope()
                 || case.fork != ForkName::Fulu
                 || SKIPPED.iter().any(|(name, _)| *name == case.name);

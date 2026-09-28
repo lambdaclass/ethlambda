@@ -14,9 +14,9 @@
 //! cases whose target this crate does not implement yet are counted as
 //! skipped rather than silently dropped, the way `ssz_static` counts
 //! container/fork pairs it does not decode. [`super::HIGHEST_IMPLEMENTED_FORK`]
-//! is now fulu, and [`ethlambda_state_transition::beacon::upgrade::upgrade_state`] routes every
+//! is now gloas, and [`ethlambda_state_transition::beacon::upgrade::upgrade_state`] routes every
 //! fork through its own `upgrade_to_*` function, so the two agree by
-//! construction all the way to fulu; the two are still checking different
+//! construction all the way to gloas; the two are still checking different
 //! things, though: this gate is "has this crate's state transition caught up
 //! to this fork at all," which is deliberately conservative, since running a
 //! fork's upgrade before its state transition exists would let this suite go
