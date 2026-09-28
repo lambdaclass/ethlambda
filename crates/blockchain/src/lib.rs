@@ -1635,11 +1635,9 @@ impl BlockChainServer {
                 // peer is obliged to answer for a column at all, so gating
                 // there would hold a block against data the network has
                 // legitimately forgotten. See `da_check_required_for_slot`.
-                let within_da_window = da_check_required_for_slot(
-                    beacon_block.slot(),
-                    fork_choice::get_current_slot(&self.store, &config),
-                    &config,
-                );
+                let current_slot = fork_choice::get_current_slot(&self.store, &config);
+                let within_da_window =
+                    da_check_required_for_slot(beacon_block.slot(), current_slot, &config);
                 let evidence = if within_da_window {
                     timings.da_check_start = Some(Instant::now());
                     let evidence =
@@ -1650,7 +1648,7 @@ impl BlockChainServer {
                         None => {
                             timings.columns_wait_start =
                                 timings.columns_wait_start.or(timings.da_check_end);
-                            self.hold_block_for_columns(beacon_block, timings);
+                            self.hold_block_for_columns(beacon_block, current_slot, timings);
                             return (timings, Ok(ImportOutcome::Held));
                         }
                     }
@@ -2873,17 +2871,32 @@ impl BlockChainServer {
     /// its pending components at `max(finalized_epoch + 1, the availability
     /// boundary)` instead.
     ///
-    /// Nothing is asked for here. A block's columns are published alongside
-    /// it, so a block that reaches the gate short of them almost always has
-    /// the rest in flight on gossip, and asking peers at this moment races
-    /// that delivery: the peers asked usually do not have the columns yet
-    /// either, so they answer empty and burn the lookup's attempts. Measured
-    /// on mainnet followers at the tip, gossip completed a held block within
+    /// Nothing is asked for here for a block still at or ahead of
+    /// `current_slot`. A block's columns are published alongside it, so a
+    /// block that reaches the gate short of them almost always has the rest
+    /// in flight on gossip, and asking peers at this moment races that
+    /// delivery: the peers asked usually do not have the columns yet either,
+    /// so they answer empty and burn the lookup's attempts. Measured on
+    /// mainnet followers at the tip, gossip completed a held block within
     /// 0.3 s at p99, and every stored column came from gossip. Each arriving
     /// column releases the block through
     /// [`Self::release_block_if_columns_complete`]; whatever is still missing
     /// at the next slot's [`Self::redrive_held_blocks`] is asked for there.
-    fn hold_block_for_columns(&mut self, block: SignedBeaconBlock, timings: ImportTimings) {
+    ///
+    /// A block older than `current_slot` gets no such courtesy: whatever
+    /// gossiped it did so long before this node held it, so there is no
+    /// delivery left in flight to race, and asking immediately is strictly
+    /// better than waiting out a redrive. Range-synced catch-up is exactly
+    /// this case, since every synced block is already older than the slot it
+    /// arrives in; leaving it to the redrive cadence instead made a follower
+    /// recovering from a checkpoint sync import roughly one such block per
+    /// slot.
+    fn hold_block_for_columns(
+        &mut self,
+        block: SignedBeaconBlock,
+        current_slot: u64,
+        timings: ImportTimings,
+    ) {
         let slot = block.slot();
         let block_root = block.message_hash_tree_root();
 
@@ -2912,6 +2925,13 @@ impl BlockChainServer {
         self.store
             .insert_pending_block(block_root, block)
             .expect("DB insert should succeed");
+
+        // See the doc comment above: an old block's columns are not still
+        // arriving on gossip, so this is its first ask rather than the next
+        // redrive's.
+        if slot < current_slot {
+            self.request_missing_columns(block_root, missing);
+        }
 
         self.blocks_awaiting_columns.insert(block_root, slot);
         self.held_timings.insert(block_root, timings);
@@ -3375,11 +3395,14 @@ impl BlockChainServer {
     /// have quietly completed, and ask for whatever the rest are still
     /// missing.
     ///
-    /// The only asker. [`Self::hold_block_for_columns`] leaves a new hold to
-    /// gossip, so a block's first ask is the first tick after it was held,
-    /// by which time a column still missing is unlikely to be on its way. Every
-    /// later tick asks again, which is what a lookup that fails needs: the
-    /// only other thing that revisits a hold is a sidecar for that exact block
+    /// The only repeat asker. [`Self::hold_block_for_columns`] already asks
+    /// once, immediately, for a block old enough that gossip has nothing left
+    /// to deliver; a block still at or ahead of the current slot when held
+    /// gets no such ask and is left to gossip instead, so its first ask is
+    /// the first tick after it was held, by which time a column still
+    /// missing is unlikely to be on its way. Either way, every tick from here
+    /// on asks again, which is what a lookup that fails needs: the only
+    /// other thing that revisits a hold is a sidecar for that exact block
     /// arriving. A block whose missing columns no connected peer custodies
     /// gets neither: every peer answers `DataColumnsByRoot` with an empty
     /// list, the lookup spends its retry ladder against the peer set in a few
@@ -4903,7 +4926,7 @@ mod tests {
         let root = block.message_hash_tree_root();
         let slot = block.slot();
 
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         assert_eq!(server.blocks_awaiting_columns.get(&root), Some(&slot));
         assert!(server.store.get_signed_block(&root).unwrap().is_some());
@@ -4917,7 +4940,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         // Only one of the two custody columns has arrived.
         server
@@ -4938,7 +4961,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block.clone(), ImportTimings::default());
+        server.hold_block_for_columns(block.clone(), slot, ImportTimings::default());
 
         for index in CUSTODY {
             let sidecar = sidecar_for(&block, index);
@@ -5117,7 +5140,7 @@ mod tests {
         let parent = fulu_block_with_commitments(&server.store, 2);
         let parent_root = parent.message_hash_tree_root();
         let slot = parent.slot();
-        server.hold_block_for_columns(parent.clone(), ImportTimings::default());
+        server.hold_block_for_columns(parent.clone(), slot, ImportTimings::default());
 
         // A child parked behind the still-held parent, seeded directly in
         // the same shape `process_or_pend_block`'s "parent missing" branch
@@ -5172,7 +5195,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let block_root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         // Every custody column is written straight to the store, the way a
         // fetched sidecar that never reached `release_block_if_columns_complete`
@@ -5234,7 +5257,7 @@ mod tests {
         let block_root = block.message_hash_tree_root();
         let parent_root = block.parent_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         // The parent's post-state, so the re-import reaches `process_block`
         // rather than parking the block on a missing parent.
@@ -5280,7 +5303,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let block_root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         // All but one column. The re-drive re-asks for the last one; what it
         // must not do is decide the block is available without it.
@@ -5312,7 +5335,7 @@ mod tests {
         let block = fulu_block_with_commitments(&server.store, 2);
         let block_root = block.message_hash_tree_root();
         let slot = block.slot();
-        server.hold_block_for_columns(block, ImportTimings::default());
+        server.hold_block_for_columns(block, slot, ImportTimings::default());
 
         assert!(
             p2p.fetches.lock().unwrap().is_empty(),
@@ -5347,6 +5370,40 @@ mod tests {
             request.columns,
             vec![*last],
             "only the column gossip did not deliver"
+        );
+    }
+
+    /// The counterpart above: a block that is already older than the current
+    /// slot when it is held gets no gossip window left to race, so this is
+    /// where it gets its first ask rather than the next redrive.
+    #[tokio::test]
+    async fn holding_a_block_older_than_the_current_slot_asks_for_its_columns_at_once() {
+        let store = beacon_store_at_slot_10();
+        let config = store.config();
+        let current_slot = fork_choice::get_current_slot(&store, &config);
+        let (mut server, p2p) = beacon_server_recording(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        // One past the store's finalized slot, the shape a range-synced
+        // block arrives in: well behind `current_slot`.
+        let block = fulu_block_with_commitments(&server.store, 2);
+        let block_root = block.message_hash_tree_root();
+
+        server.hold_block_for_columns(block, current_slot, ImportTimings::default());
+
+        let fetches = p2p.fetches.lock().unwrap();
+        let [request] = fetches.as_slice() else {
+            panic!(
+                "an old block must be asked for at hold time, got {} requests",
+                fetches.len()
+            );
+        };
+        assert_eq!(request.block_root, block_root);
+        assert!(!request.needs_block, "the held block is already in the DB");
+        assert_eq!(
+            request.columns,
+            CUSTODY.to_vec(),
+            "neither custody column has arrived yet"
         );
     }
 }
