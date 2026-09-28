@@ -135,7 +135,7 @@ use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BLS_SIGNATURE_SIZE, BlsSignature, Bytes32, CommitteeIndex, Epoch, Gwei, HashTreeRoot as _,
-    ValidatorIndex,
+    Slot, ValidatorIndex,
 };
 
 use super::accessors::{
@@ -413,8 +413,8 @@ pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorInde
     Ok(total)
 }
 
-/// The committee members whose bit is set in `attestation`, in ascending
-/// order.
+/// The attester indices a slot's named committees cover, filtered by
+/// `is_set`, in ascending order.
 ///
 /// EIP-7549 moves the committee index out of `AttestationData` and lets one
 /// attestation cover every committee in a slot, so `aggregation_bits` is now
@@ -448,22 +448,31 @@ pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorInde
 /// than `MAX_COMMITTEES_PER_SLOT` of each: every committee named by one
 /// attestation belongs to the same slot, and so to the same epoch's shuffling.
 /// See [`CommitteeCache`] for how far that sharing reaches beyond this call.
-pub fn get_attesting_indices(
+///
+/// `is_set` is this function's own share of what [`get_attesting_indices`]
+/// otherwise is verbatim: electra's `aggregation_bits` is a bounded
+/// `SszBitlist`, and [`crate::beacon::helpers::gloas::get_attesting_indices`]'s
+/// is EIP-7688's unbounded `ProgressiveBitlist`, two different Rust types
+/// whose only shared operation this walk needs is "is bit `n` set", which is
+/// exactly what a closure abstracts over without either caller allocating or
+/// duplicating the walk itself.
+pub(crate) fn attesting_indices_from_committee_bits(
     state: &BeaconState,
-    attestation: &electra::Attestation,
+    slot: Slot,
+    committee_bits: &electra::CommitteeBits,
+    is_set: impl Fn(usize) -> bool,
     committees: &CommitteeCache,
 ) -> Result<Vec<ValidatorIndex>> {
-    let committee_indices = get_committee_indices(&attestation.committee_bits);
-    let epoch_committees =
-        committees.committees(state, compute_epoch_at_slot(attestation.data.slot));
+    let committee_indices = get_committee_indices(committee_bits);
+    let epoch_committees = committees.committees(state, compute_epoch_at_slot(slot));
 
     let mut indices = Vec::new();
     let mut committee_offset = 0usize;
     for committee_index in committee_indices {
-        let committee = epoch_committees.committee(attestation.data.slot, committee_index)?;
+        let committee = epoch_committees.committee(slot, committee_index)?;
         for (position, attester_index) in committee.iter().enumerate() {
             let bit = committee_offset + position;
-            if attestation.aggregation_bits.get(bit).unwrap_or(false) {
+            if is_set(bit) {
                 indices.push(*attester_index);
             }
         }
@@ -472,6 +481,24 @@ pub fn get_attesting_indices(
 
     indices.sort_unstable();
     Ok(indices)
+}
+
+/// The committee members whose bit is set in `attestation`, in ascending
+/// order. See [`attesting_indices_from_committee_bits`] for the walk itself;
+/// this is a thin wrapper over it, closing over `attestation`'s own
+/// `aggregation_bits`.
+pub fn get_attesting_indices(
+    state: &BeaconState,
+    attestation: &electra::Attestation,
+    committees: &CommitteeCache,
+) -> Result<Vec<ValidatorIndex>> {
+    attesting_indices_from_committee_bits(
+        state,
+        attestation.data.slot,
+        &attestation.committee_bits,
+        |bit| attestation.aggregation_bits.get(bit).unwrap_or(false),
+        committees,
+    )
 }
 
 /// The same attestation with its attesters named rather than bit-encoded.

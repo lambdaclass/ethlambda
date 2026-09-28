@@ -42,8 +42,6 @@
 //! ([`Config::max_blobs_per_block_electra`]) rather than deneb's fixed preset
 //! (see [`process_execution_payload`]).
 
-use std::collections::HashSet;
-
 use libssz::SszEncode as _;
 
 use crate::beacon::bls;
@@ -75,10 +73,8 @@ use crate::beacon::helpers::misc::{
     compute_deposit_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
     is_valid_merkle_branch,
 };
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
-use crate::beacon::helpers::predicates::{
-    is_active_validator, is_slashable_attestation_data, is_slashable_validator,
-};
+use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
@@ -582,7 +578,9 @@ pub fn process_bls_to_execution_change(
 /// [`electra::AttesterSlashing`] and [`crate::beacon::helpers::electra::is_valid_indexed_attestation`]
 /// instead, the same reason that helper exists as its own copy (see its own
 /// documentation): a different concrete `IndexedAttestation` type, not
-/// different logic.
+/// different logic. See
+/// `crate::beacon::stf::operations::slash_attesting_index_intersection` for the
+/// shared walk this delegates to once both indexed attestations check out.
 pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
@@ -604,30 +602,12 @@ pub fn process_attester_slashing(
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
-    let current_epoch = get_current_epoch(state);
-    // `is_valid_indexed_attestation` already required both index lists to be
-    // sorted and unique; see `crate::beacon::stf::operations::process_attester_slashing`
-    // for why walking `attestation_1`'s list in order while filtering by
-    // membership in `attestation_2`'s set yields the intersection already
-    // sorted.
-    let indices_2: HashSet<ValidatorIndex> =
-        attestation_2.attesting_indices.iter().copied().collect();
-
-    let mut slashed_any = false;
-    for &index in attestation_1.attesting_indices.iter() {
-        if !indices_2.contains(&index) {
-            continue;
-        }
-        if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
-            slashed_any = true;
-        }
-    }
-    verify(
-        slashed_any,
-        "at least one validator in the intersection of the two attesting index sets was slashed",
-    )?;
-    Ok(())
+    super::operations::slash_attesting_index_intersection(
+        state,
+        &attestation_1.attesting_indices,
+        &attestation_2.attesting_indices,
+        config,
+    )
 }
 
 // ---------------------------------------------------------------------------

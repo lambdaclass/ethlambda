@@ -44,26 +44,36 @@
 //! read-only counterpart), which abstracts over exactly that type change,
 //! rather than through a gloas-only copy.
 
+use libssz::SszEncode as _;
+
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::DepositMessage;
+use crate::beacon::containers::shared::{DepositMessage, ProposerSlashing};
 use crate::beacon::containers::{BeaconState, capella, gloas};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
-    get_previous_epoch, get_randao_mix,
+    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root_at_slot,
+    get_current_epoch, get_domain, get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::electra::g2_point_at_infinity;
+use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
+use crate::beacon::helpers::electra::{g2_point_at_infinity, get_committee_indices};
 use crate::beacon::helpers::gloas::{
     add_builder_to_registry, can_builder_cover_bid, convert_builder_index_to_validator_index,
-    convert_validator_index_to_builder_index, gloas_state, gloas_state_ref, initiate_builder_exit,
-    is_active_builder, is_builder_index, is_builder_withdrawal_credential, settle_builder_payment,
+    convert_validator_index_to_builder_index, get_attestation_participation_flag_indices,
+    get_indexed_attestation, get_indexed_payload_attestation, gloas_state, gloas_state_ref,
+    initiate_builder_exit, is_active_builder, is_attestation_same_slot, is_builder_index,
+    is_builder_withdrawal_credential, is_valid_indexed_attestation,
+    is_valid_indexed_payload_attestation, settle_builder_payment,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
-use crate::beacon::helpers::mutators::decrease_balance;
+use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
+use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::preset;
-use crate::beacon::primitives::{ExecutionAddress, HashTreeRoot as _, Root, WithdrawalIndex};
+use crate::beacon::primitives::{
+    ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot, ValidatorIndex,
+    WithdrawalIndex,
+};
 
 // ---------------------------------------------------------------------------
 // Withdrawals
@@ -432,6 +442,71 @@ pub fn process_withdrawals(state: &mut BeaconState) -> Result<()> {
     update_next_withdrawal_validator_index(state, &expected.withdrawals)?;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Execution payload
+// ---------------------------------------------------------------------------
+
+/// `get_execution_requests_list` (modified, EIP-8282): electra's three
+/// request-type prefixes, plus [`gloas::ExecutionRequests::builder_deposits`]
+/// and [`gloas::ExecutionRequests::builder_exits`] under their own new
+/// prefixes.
+///
+/// The specification files this under "Execution payload", not "Operations":
+/// it is read by `execution_engine.verify_and_notify_new_payload`'s own
+/// `NewPayloadRequest.execution_requests`, in `verify_execution_payload_envelope`
+/// (gloas `fork-choice.md`), built from the revealed envelope's own
+/// `execution_requests`. Not from `state.latest_execution_payload_bid`: the
+/// bid commits to that list only by its hash
+/// ([`gloas::ExecutionPayloadBid::execution_requests_root`]), it never carries
+/// the list itself. Envelope verification is not transcribed yet, so nothing
+/// calls this today, the same place electra's own
+/// [`crate::beacon::stf::electra::get_execution_requests_list`] already is
+/// (see [`crate::beacon::stf::deneb::process_execution_payload`]'s own
+/// documentation for why: [`crate::beacon::stf::ExecutionEngine`] collapses the whole
+/// `verify_and_notify_new_payload` interface to one boolean and never
+/// inspects the list either implementation builds).
+pub fn get_execution_requests_list(requests: &gloas::ExecutionRequests) -> Vec<Vec<u8>> {
+    let mut list = Vec::new();
+
+    let mut push = |request_type: u8, is_empty: bool, encoded: Vec<u8>| {
+        if is_empty {
+            return;
+        }
+        let mut element = Vec::with_capacity(1 + encoded.len());
+        element.push(request_type);
+        element.extend_from_slice(&encoded);
+        list.push(element);
+    };
+
+    push(
+        constants::DEPOSIT_REQUEST_TYPE,
+        requests.deposits.is_empty(),
+        requests.deposits.to_ssz(),
+    );
+    push(
+        constants::WITHDRAWAL_REQUEST_TYPE,
+        requests.withdrawals.is_empty(),
+        requests.withdrawals.to_ssz(),
+    );
+    push(
+        constants::CONSOLIDATION_REQUEST_TYPE,
+        requests.consolidations.is_empty(),
+        requests.consolidations.to_ssz(),
+    );
+    push(
+        constants::BUILDER_DEPOSIT_REQUEST_TYPE,
+        requests.builder_deposits.is_empty(),
+        requests.builder_deposits.to_ssz(),
+    );
+    push(
+        constants::BUILDER_EXIT_REQUEST_TYPE,
+        requests.builder_exits.is_empty(),
+        requests.builder_exits.to_ssz(),
+    );
+
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -873,6 +948,460 @@ pub fn process_builder_exit_request(
     initiate_builder_exit(inner, builder_index, config)
 }
 
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+/// `process_proposer_slashing` (modified, EIP-7732): the shared
+/// `crate::beacon::stf::operations::verify_proposer_slashing` prologue, plus
+/// clearing the [`gloas::BeaconState::builder_pending_payments`] entry tied
+/// to the slashed proposal, if the slashing lands the slashed validator
+/// itself as the payment's own proposer and the payment is still inside the
+/// live two-epoch window. An unrelated same-slot equivocation (a different
+/// validator's evidence about the same proposal) must not grief an honest
+/// proposer's payment, which is exactly what comparing `payment.proposer_index`
+/// against the slashed proposer's own index, rather than clearing
+/// unconditionally, prevents.
+pub fn process_proposer_slashing(
+    state: &mut BeaconState,
+    proposer_slashing: &ProposerSlashing,
+    config: &Config,
+) -> Result<()> {
+    let (proposer_index, current_epoch) =
+        crate::beacon::stf::operations::verify_proposer_slashing(state, proposer_slashing)?;
+
+    // [New in Gloas:EIP7732] Remove the `BuilderPendingPayment` corresponding
+    // to this proposal if it is still in the 2-epoch window.
+    let slot = proposer_slashing.signed_header_1.message.slot;
+    let proposal_epoch = compute_epoch_at_slot(slot);
+    if proposal_epoch == current_epoch {
+        let payment_index = preset::SLOTS_PER_EPOCH
+            .checked_add(slot % preset::SLOTS_PER_EPOCH)
+            .ok_or(Error::ArithmeticOverflow(
+                "process_proposer_slashing: SLOTS_PER_EPOCH + slot % SLOTS_PER_EPOCH",
+            ))? as usize;
+        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
+    } else if proposal_epoch == get_previous_epoch(state) {
+        let payment_index = (slot % preset::SLOTS_PER_EPOCH) as usize;
+        clear_builder_pending_payment_if_owned_by(state, payment_index, proposer_index)?;
+    }
+
+    slash_validator(state, proposer_index, None, config)?;
+    Ok(())
+}
+
+/// Clears `state.builder_pending_payments[payment_index]` if it is recorded
+/// against `proposer_index`, [`process_proposer_slashing`]'s own helper for
+/// its two (current-epoch, previous-epoch) payment-window branches.
+fn clear_builder_pending_payment_if_owned_by(
+    state: &mut BeaconState,
+    payment_index: usize,
+    proposer_index: ValidatorIndex,
+) -> Result<()> {
+    let inner = gloas_state(state, "process_proposer_slashing")?;
+    let len = inner.builder_pending_payments.len();
+    let payment = inner
+        .builder_pending_payments
+        .get_mut(payment_index)
+        .ok_or(Error::IndexOutOfBounds {
+            index: payment_index,
+            len,
+        })?;
+    if payment.proposer_index == proposer_index {
+        *payment = gloas::BuilderPendingPayment::default();
+    }
+    Ok(())
+}
+
+/// `process_attester_slashing` (unmodified since electra). Transcribed here,
+/// not called through [`crate::beacon::stf::electra::process_attester_slashing`],
+/// only because [`gloas::AttesterSlashing`] is its own Rust type: EIP-7688
+/// makes [`gloas::IndexedAttestation::attesting_indices`] the unbounded
+/// [`gloas::AttestingIndices`] rather than electra's bounded one, the same
+/// reason [`crate::beacon::helpers::gloas::get_attesting_indices`] cannot reuse
+/// electra's copy either. See that function's own doc. The prologue below is
+/// the one part that genuinely cannot be shared (it is checked against
+/// gloas's own [`gloas::IndexedAttestation`]); once both attestations check
+/// out, the rest is
+/// `crate::beacon::stf::operations::slash_attesting_index_intersection`, the same
+/// shared walk phase0's and electra's own versions delegate to.
+pub fn process_attester_slashing(
+    state: &mut BeaconState,
+    attester_slashing: &gloas::AttesterSlashing,
+    config: &Config,
+) -> Result<()> {
+    let attestation_1 = &attester_slashing.attestation_1;
+    let attestation_2 = &attester_slashing.attestation_2;
+
+    verify(
+        is_slashable_attestation_data(&attestation_1.data, &attestation_2.data),
+        "process_attester_slashing: is_slashable_attestation_data(attestation_1.data, attestation_2.data)",
+    )?;
+    verify(
+        is_valid_indexed_attestation(state, attestation_1),
+        "process_attester_slashing: is_valid_indexed_attestation(state, attestation_1)",
+    )?;
+    verify(
+        is_valid_indexed_attestation(state, attestation_2),
+        "process_attester_slashing: is_valid_indexed_attestation(state, attestation_2)",
+    )?;
+
+    crate::beacon::stf::operations::slash_attesting_index_intersection(
+        state,
+        &attestation_1.attesting_indices,
+        &attestation_2.attesting_indices,
+        config,
+    )
+}
+
+/// `process_attestation` (modified, EIP-7732): the new `parent_slot`
+/// parameter (the parent block's slot) is threaded straight into
+/// [`get_attestation_participation_flag_indices`], which is what lets an
+/// attester's payload vote (`data.index`, now 0 or 1 rather than always 0)
+/// be checked against the payload the attested block actually revealed. The
+/// other addition is builder-payment weight accounting: each attester whose
+/// participation for that epoch was still empty (`had_no_participation`, the
+/// specification's own name for it) who newly satisfies a flag via a
+/// same-slot attestation, while a nonzero builder payment for that slot is
+/// still pending, adds their effective balance to that payment's `weight`,
+/// which is what
+/// `crate::beacon::stf::epoch::gloas::process_builder_pending_payments` later
+/// checks against [`crate::beacon::helpers::gloas::get_builder_payment_quorum_threshold`]
+/// to decide whether the builder gets paid in full or not at all.
+///
+/// Structured as the same read-then-write split
+/// [`crate::beacon::stf::altair::process_attestation`] uses, and for the identical
+/// borrow-checker reason: the read phase borrows `state` immutably (through
+/// [`BeaconState::altair_validator_lists`], which covers gloas), and the
+/// write phase borrows it mutably (through
+/// [`BeaconState::epoch_participation_mut`], gloas's own widened element-only
+/// view of the same list; see that accessor's own doc for why it, and not
+/// [`BeaconState::altair_validator_lists_mut`], is the one gloas can use).
+pub fn process_attestation(
+    state: &mut BeaconState,
+    attestation: &gloas::Attestation,
+    parent_slot: Slot,
+    committees: &CommitteeCache,
+) -> Result<()> {
+    let data = attestation.data;
+    let current_epoch = get_current_epoch(state);
+    let previous_epoch = get_previous_epoch(state);
+
+    verify(
+        data.target.epoch == previous_epoch || data.target.epoch == current_epoch,
+        "process_attestation: data.target.epoch in (get_previous_epoch(state), get_current_epoch(state))",
+    )?;
+    verify(
+        data.target.epoch == compute_epoch_at_slot(data.slot),
+        "process_attestation: data.target.epoch == compute_epoch_at_slot(data.slot)",
+    )?;
+    let min_slot = data
+        .slot
+        .checked_add(preset::MIN_ATTESTATION_INCLUSION_DELAY)
+        .ok_or(Error::ArithmeticOverflow(
+            "process_attestation: data.slot + MIN_ATTESTATION_INCLUSION_DELAY",
+        ))?;
+    verify(
+        min_slot <= state.slot(),
+        "process_attestation: data.slot + MIN_ATTESTATION_INCLUSION_DELAY <= state.slot",
+    )?;
+
+    // [Modified in Gloas:EIP7732] `data.index` is now a payload-availability
+    // bit (0 or 1), not always zero.
+    verify(data.index < 2, "process_attestation: data.index < 2")?;
+    let committee_indices = get_committee_indices(&attestation.committee_bits);
+    let epoch_committees = committees.committees(state, data.target.epoch);
+    let mut committee_offset = 0usize;
+    for committee_index in committee_indices {
+        verify(
+            committee_index < epoch_committees.committees_per_slot(),
+            "process_attestation: committee_index < get_committee_count_per_slot(state, data.target.epoch)",
+        )?;
+        let committee = epoch_committees.committee(data.slot, committee_index)?;
+        let committee_has_an_attester = (0..committee.len()).any(|position| {
+            attestation
+                .aggregation_bits
+                .get(committee_offset + position)
+                .unwrap_or(false)
+        });
+        verify(
+            committee_has_an_attester,
+            "process_attestation: len(committee_attesters) > 0",
+        )?;
+        committee_offset += committee.len();
+    }
+    verify(
+        attestation.aggregation_bits.len() == committee_offset,
+        "process_attestation: len(attestation.aggregation_bits) == committee_offset",
+    )?;
+
+    // Safe: `min_slot <= state.slot()` above and `min_slot >= data.slot` (the
+    // inclusion delay is non-negative), so `data.slot <= state.slot()`.
+    let inclusion_delay = state.slot() - data.slot;
+    let participation_flag_indices =
+        get_attestation_participation_flag_indices(state, &data, inclusion_delay, parent_slot)?;
+
+    let indexed_attestation = get_indexed_attestation(state, attestation, committees)?;
+    verify(
+        is_valid_indexed_attestation(state, &indexed_attestation),
+        "process_attestation: is_valid_indexed_attestation(state, get_indexed_attestation(state, attestation))",
+    )?;
+
+    let current_epoch_target = data.target.epoch == current_epoch;
+    let payment_index = if current_epoch_target {
+        preset::SLOTS_PER_EPOCH
+            .checked_add(data.slot % preset::SLOTS_PER_EPOCH)
+            .ok_or(Error::ArithmeticOverflow(
+                "process_attestation: SLOTS_PER_EPOCH + data.slot % SLOTS_PER_EPOCH",
+            ))? as usize
+    } else {
+        (data.slot % preset::SLOTS_PER_EPOCH) as usize
+    };
+    let mut payment = {
+        let inner = gloas_state_ref(state, "process_attestation")?;
+        let len = inner.builder_pending_payments.len();
+        inner
+            .builder_pending_payments
+            .get(payment_index)
+            .cloned()
+            .ok_or(Error::IndexOutOfBounds {
+                index: payment_index,
+                len,
+            })?
+    };
+
+    let attesting_indices: Vec<ValidatorIndex> = indexed_attestation.attesting_indices.to_vec();
+    // The specification calls `is_attestation_same_slot(state, data)` inside
+    // the per-attester short-circuit below, so hoisting it out to a single
+    // call here changes nothing: `get_attestation_participation_flag_indices`
+    // above already called it once against this same, still-unmutated
+    // `state`, so every attester's own check would read the identical
+    // result regardless of where it is evaluated.
+    let is_same_slot = is_attestation_same_slot(state, &data)?;
+    // Hoisted for the same reason `crate::beacon::stf::electra::process_attestation`
+    // hoists it: `get_base_reward(state, index)` is `increments *
+    // get_base_reward_per_increment(state)`, and the second factor is
+    // constant across this whole read phase (nothing here mutates `state`
+    // yet), so computing it once outside the loop below avoids one
+    // `get_total_active_balance` scan of the registry per attester per flag.
+    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+
+    // Read phase: for every attester, decide which flags this attestation
+    // newly satisfies, add up the proposer's reward for granting them, and
+    // credit the pending builder payment's weight where the specification
+    // says to. Nothing here mutates `state`.
+    let mut proposer_reward_numerator: Gwei = 0;
+    let mut flag_updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
+    {
+        let (previous_participation, current_participation, _) = state.altair_validator_lists()?;
+        let epoch_participation = if current_epoch_target {
+            current_participation
+        } else {
+            previous_participation
+        };
+        for index in attesting_indices {
+            let current_flags = epoch_participation.get(index as usize).copied().ok_or(
+                Error::IndexOutOfBounds {
+                    index: index as usize,
+                    len: epoch_participation.len(),
+                },
+            )?;
+            let had_no_participation = current_flags == 0;
+
+            let mut new_flags: ParticipationFlags = 0;
+            for &flag_index in &participation_flag_indices {
+                if has_flag(current_flags, flag_index) {
+                    continue;
+                }
+                new_flags = add_flag(new_flags, flag_index);
+                let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
+                let increments =
+                    state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+                let base_reward = increments.checked_mul(base_reward_per_increment).ok_or(
+                    Error::ArithmeticOverflow("process_attestation: get_base_reward(state, index)"),
+                )?;
+                let reward = base_reward
+                    .checked_mul(weight)
+                    .ok_or(Error::ArithmeticOverflow(
+                        "process_attestation: get_base_reward(state, index) * weight",
+                    ))?;
+                proposer_reward_numerator = proposer_reward_numerator.checked_add(reward).ok_or(
+                    Error::ArithmeticOverflow("process_attestation: proposer_reward_numerator"),
+                )?;
+            }
+            let will_set_new_flag = new_flags != 0;
+
+            if will_set_new_flag
+                && had_no_participation
+                && is_same_slot
+                && payment.withdrawal.amount > 0
+            {
+                let effective_balance = state.validator(index)?.effective_balance;
+                payment.weight = payment.weight.checked_add(effective_balance).ok_or(
+                    Error::ArithmeticOverflow(
+                        "process_attestation: payment.weight + validator.effective_balance",
+                    ),
+                )?;
+            }
+            if will_set_new_flag {
+                flag_updates.push((index, new_flags));
+            }
+        }
+    }
+
+    // Write phase: apply exactly the flags the read phase decided on.
+    {
+        let participation_mut = state.epoch_participation_mut(current_epoch_target)?;
+        let participation_len = participation_mut.len();
+        for (index, new_flags) in flag_updates {
+            let flags =
+                participation_mut
+                    .get_mut(index as usize)
+                    .ok_or(Error::IndexOutOfBounds {
+                        index: index as usize,
+                        len: participation_len,
+                    })?;
+            *flags |= new_flags;
+        }
+    }
+
+    const NON_PROPOSER_WEIGHT: u64 = constants::WEIGHT_DENOMINATOR - constants::PROPOSER_WEIGHT;
+    const PROPOSER_REWARD_DENOMINATOR: u64 =
+        NON_PROPOSER_WEIGHT * constants::WEIGHT_DENOMINATOR / constants::PROPOSER_WEIGHT;
+    let proposer_reward = proposer_reward_numerator / PROPOSER_REWARD_DENOMINATOR;
+    let proposer_index = get_beacon_proposer_index(state)?;
+    increase_balance(state, proposer_index, proposer_reward)?;
+
+    // Update builder payment weight.
+    {
+        let inner = gloas_state(state, "process_attestation")?;
+        let len = inner.builder_pending_payments.len();
+        let entry = inner
+            .builder_pending_payments
+            .get_mut(payment_index)
+            .ok_or(Error::IndexOutOfBounds {
+                index: payment_index,
+                len,
+            })?;
+        *entry = payment;
+    }
+
+    Ok(())
+}
+
+/// `process_payload_attestation` (gloas `beacon-chain.md`): checks a payload
+/// timeliness committee vote against the *parent* block (the previous slot's
+/// proposal, whose payload it is attesting to) rather than against the head
+/// [`process_attestation`] checks attestations against.
+pub fn process_payload_attestation(
+    state: &mut BeaconState,
+    payload_attestation: &gloas::PayloadAttestation,
+    config: &Config,
+) -> Result<()> {
+    let data = payload_attestation.data;
+
+    // Check that the attestation is for the parent beacon block.
+    verify(
+        data.beacon_block_root == state.latest_block_header().parent_root,
+        "process_payload_attestation: data.beacon_block_root == state.latest_block_header.parent_root",
+    )?;
+    // Check that the attestation is for the previous slot.
+    let expected_slot = data.slot.checked_add(1).ok_or(Error::ArithmeticOverflow(
+        "process_payload_attestation: data.slot + 1",
+    ))?;
+    verify(
+        expected_slot == state.slot(),
+        "process_payload_attestation: data.slot + 1 == state.slot",
+    )?;
+
+    // Verify signature.
+    let indexed_payload_attestation =
+        get_indexed_payload_attestation(state, payload_attestation, config)?;
+    verify(
+        is_valid_indexed_payload_attestation(state, &indexed_payload_attestation),
+        "process_payload_attestation: is_valid_indexed_payload_attestation(state, indexed_payload_attestation)",
+    )?;
+    Ok(())
+}
+
+/// `process_operations` (modified, EIP-7732 and EIP-7688): removes the calls
+/// to `process_deposit_request`, `process_withdrawal_request`, and
+/// `process_consolidation_request` (see this module's own doc for where the
+/// five execution-layer-triggered requests go instead), adds the new
+/// `parent_slot` argument [`process_attestation`] needs and the payload
+/// timeliness committee's own operation list, and, since every list here is
+/// now an EIP-7688 progressive one with no SSZ-enforced bound of its own,
+/// checks each list's length against its preset maximum explicitly (bounds
+/// every earlier fork's container shape enforced by construction).
+///
+/// `assert len(body.deposits) == 0` unconditionally, with no `process_deposit`
+/// call at all: like fulu, gloas has no eth1-bridge deposit path left to
+/// drain (`crate::beacon::stf::fulu::process_operations`'s own doc explains why).
+pub fn process_operations(
+    state: &mut BeaconState,
+    body: &gloas::BeaconBlockBody,
+    parent_slot: Slot,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<()> {
+    verify(
+        body.deposits.is_empty(),
+        "process_operations: len(body.deposits) == 0",
+    )?;
+
+    // [New in Gloas:EIP7688]
+    verify(
+        body.proposer_slashings.len() <= preset::MAX_PROPOSER_SLASHINGS,
+        "process_operations: len(body.proposer_slashings) <= MAX_PROPOSER_SLASHINGS",
+    )?;
+    verify(
+        body.attester_slashings.len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA,
+        "process_operations: len(body.attester_slashings) <= MAX_ATTESTER_SLASHINGS_ELECTRA",
+    )?;
+    verify(
+        body.attestations.len() <= preset::MAX_ATTESTATIONS_ELECTRA,
+        "process_operations: len(body.attestations) <= MAX_ATTESTATIONS_ELECTRA",
+    )?;
+    verify(
+        body.voluntary_exits.len() <= preset::MAX_VOLUNTARY_EXITS,
+        "process_operations: len(body.voluntary_exits) <= MAX_VOLUNTARY_EXITS",
+    )?;
+    verify(
+        body.bls_to_execution_changes.len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES,
+        "process_operations: len(body.bls_to_execution_changes) <= MAX_BLS_TO_EXECUTION_CHANGES",
+    )?;
+    verify(
+        body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS,
+        "process_operations: len(body.payload_attestations) <= MAX_PAYLOAD_ATTESTATIONS",
+    )?;
+
+    // [Modified in Gloas:EIP7732]
+    for proposer_slashing in body.proposer_slashings.iter() {
+        process_proposer_slashing(state, proposer_slashing, config)?;
+    }
+    for attester_slashing in body.attester_slashings.iter() {
+        process_attester_slashing(state, attester_slashing, config)?;
+    }
+    // [Modified in Gloas:EIP7732]
+    for attestation in body.attestations.iter() {
+        process_attestation(state, attestation, parent_slot, committees)?;
+    }
+    for voluntary_exit in body.voluntary_exits.iter() {
+        crate::beacon::stf::electra::process_voluntary_exit(state, voluntary_exit, config)?;
+    }
+    for signed_change in body.bls_to_execution_changes.iter() {
+        crate::beacon::stf::capella::process_bls_to_execution_change(state, signed_change, config)?;
+    }
+    // [Modified in Gloas:EIP7732] Removed `process_deposit_request`,
+    // `process_withdrawal_request`, and `process_consolidation_request`.
+    // [New in Gloas:EIP7732]
+    for payload_attestation in body.payload_attestations.iter() {
+        process_payload_attestation(state, payload_attestation, config)?;
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,5 +1492,194 @@ mod tests {
 
         let inner = gloas_state_ref(&state, "test").unwrap();
         assert_eq!(inner.builders.first().unwrap().balance, 0);
+    }
+
+    #[test]
+    fn get_execution_requests_list_orders_every_kind_by_its_own_prefix() {
+        use crate::beacon::containers::electra;
+        use crate::beacon::primitives::Bytes32;
+
+        let requests = gloas::ExecutionRequests {
+            deposits: gloas::DepositRequests::from(vec![electra::DepositRequest {
+                pubkey: Default::default(),
+                withdrawal_credentials: Bytes32::ZERO,
+                amount: 0,
+                signature: Default::default(),
+                index: 0,
+            }]),
+            withdrawals: gloas::WithdrawalRequests::from(vec![electra::WithdrawalRequest {
+                source_address: ExecutionAddress::ZERO,
+                validator_pubkey: Default::default(),
+                amount: 0,
+            }]),
+            consolidations: gloas::ConsolidationRequests::from(vec![
+                electra::ConsolidationRequest {
+                    source_address: ExecutionAddress::ZERO,
+                    source_pubkey: Default::default(),
+                    target_pubkey: Default::default(),
+                },
+            ]),
+            builder_deposits: gloas::BuilderDepositRequests::from(vec![
+                gloas::BuilderDepositRequest::default(),
+            ]),
+            builder_exits: gloas::BuilderExitRequests::from(vec![
+                gloas::BuilderExitRequest::default(),
+            ]),
+        };
+
+        let list = get_execution_requests_list(&requests);
+
+        let prefixes: Vec<u8> = list.iter().map(|element| element[0]).collect();
+        assert_eq!(
+            prefixes,
+            vec![
+                constants::DEPOSIT_REQUEST_TYPE,
+                constants::WITHDRAWAL_REQUEST_TYPE,
+                constants::CONSOLIDATION_REQUEST_TYPE,
+                constants::BUILDER_DEPOSIT_REQUEST_TYPE,
+                constants::BUILDER_EXIT_REQUEST_TYPE,
+            ],
+            "every non-empty list appears, in its own fixed prefix order: \
+             DEPOSIT_REQUEST_TYPE, WITHDRAWAL_REQUEST_TYPE, CONSOLIDATION_REQUEST_TYPE, \
+             BUILDER_DEPOSIT_REQUEST_TYPE, BUILDER_EXIT_REQUEST_TYPE"
+        );
+        assert_eq!(
+            &list[0][1..],
+            requests.deposits.to_ssz(),
+            "the element after the prefix byte is the request list's own SSZ encoding"
+        );
+    }
+
+    #[test]
+    fn get_execution_requests_list_skips_empty_lists() {
+        let requests = gloas::ExecutionRequests {
+            builder_exits: gloas::BuilderExitRequests::from(vec![
+                gloas::BuilderExitRequest::default(),
+            ]),
+            ..Default::default()
+        };
+
+        // Every list but `builder_exits` is empty, so only its own element
+        // appears; an all-empty `ExecutionRequests` produces an empty list.
+        assert_eq!(
+            get_execution_requests_list(&requests)
+                .iter()
+                .map(|element| element[0])
+                .collect::<Vec<_>>(),
+            vec![constants::BUILDER_EXIT_REQUEST_TYPE]
+        );
+        assert!(get_execution_requests_list(&gloas::ExecutionRequests::default()).is_empty());
+    }
+
+    #[test]
+    fn process_operations_rejects_each_length_checked_list_past_its_max() {
+        use crate::beacon::containers::shared;
+
+        // Sanity does not run for gloas yet, so nothing else pins
+        // these EIP-7688 length checks: every list here lost the SSZ bound a
+        // bounded `SszList` used to enforce, so `process_operations` itself
+        // is now the only thing standing between an oversized list and
+        // `for_ops` processing it anyway.
+        let state = gloas_state_with_validators(4);
+        let config = Config::mainnet();
+
+        let empty_indexed_attestation = || gloas::IndexedAttestation {
+            attesting_indices: Default::default(),
+            data: Default::default(),
+            signature: Default::default(),
+        };
+
+        let cases: Vec<(&str, gloas::BeaconBlockBody)> = vec![
+            (
+                "process_operations: len(body.proposer_slashings) <= MAX_PROPOSER_SLASHINGS",
+                gloas::BeaconBlockBody {
+                    proposer_slashings: gloas::ProposerSlashings::from(vec![
+                        shared::ProposerSlashing::default();
+                        preset::MAX_PROPOSER_SLASHINGS + 1
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+            (
+                "process_operations: len(body.attester_slashings) <= MAX_ATTESTER_SLASHINGS_ELECTRA",
+                gloas::BeaconBlockBody {
+                    attester_slashings: gloas::AttesterSlashings::from(vec![
+                        gloas::AttesterSlashing {
+                            attestation_1: empty_indexed_attestation(),
+                            attestation_2: empty_indexed_attestation(),
+                        };
+                        preset::MAX_ATTESTER_SLASHINGS_ELECTRA + 1
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+            (
+                "process_operations: len(body.attestations) <= MAX_ATTESTATIONS_ELECTRA",
+                gloas::BeaconBlockBody {
+                    attestations: gloas::Attestations::from(vec![
+                        gloas::Attestation {
+                            aggregation_bits: Default::default(),
+                            data: Default::default(),
+                            signature: Default::default(),
+                            committee_bits: Default::default(),
+                        };
+                        preset::MAX_ATTESTATIONS_ELECTRA
+                            + 1
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+            (
+                "process_operations: len(body.voluntary_exits) <= MAX_VOLUNTARY_EXITS",
+                gloas::BeaconBlockBody {
+                    voluntary_exits: gloas::VoluntaryExits::from(vec![
+                        shared::SignedVoluntaryExit::default();
+                        preset::MAX_VOLUNTARY_EXITS + 1
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+            (
+                "process_operations: len(body.bls_to_execution_changes) <= MAX_BLS_TO_EXECUTION_CHANGES",
+                gloas::BeaconBlockBody {
+                    bls_to_execution_changes: gloas::BlsToExecutionChanges::from(vec![
+                        capella::SignedBLSToExecutionChange {
+                            message: capella::BLSToExecutionChange {
+                                validator_index: 0,
+                                from_bls_pubkey: Default::default(),
+                                to_execution_address: Default::default(),
+                            },
+                            signature: Default::default(),
+                        };
+                        preset::MAX_BLS_TO_EXECUTION_CHANGES + 1
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+            (
+                "process_operations: len(body.payload_attestations) <= MAX_PAYLOAD_ATTESTATIONS",
+                gloas::BeaconBlockBody {
+                    payload_attestations: gloas::PayloadAttestations::from(vec![
+                        gloas::PayloadAttestation {
+                            aggregation_bits: Default::default(),
+                            data: Default::default(),
+                            signature: Default::default(),
+                        };
+                        (preset::MAX_PAYLOAD_ATTESTATIONS + 1) as usize
+                    ]),
+                    ..gloas::BeaconBlockBody::empty()
+                },
+            ),
+        ];
+
+        for (expected_message, body) in cases {
+            let mut state = state.clone();
+            let committees = CommitteeCache::default();
+            let result = process_operations(&mut state, &body, 0, &config, &committees);
+            assert!(
+                matches!(result, Err(Error::SpecAssert(message)) if message == expected_message),
+                "expected {expected_message:?} to fail, got {result:?}"
+            );
+        }
     }
 }

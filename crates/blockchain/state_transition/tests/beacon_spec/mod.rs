@@ -60,6 +60,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ethlambda_state_transition::beacon::ForkName;
+use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::BeaconState;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
@@ -71,6 +72,29 @@ pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
 } else {
     "mainnet"
 };
+
+/// The compiled-in preset with every fork up to and including `case.fork`
+/// pulled back to genesis, never a later one.
+///
+/// The fallback the gossip and operations runners use when a case carries no
+/// `config.yaml` of its own to read a fork schedule from (see [`gossip`]'s
+/// own `case_config`). Those vectors are generated as if their own fork, and
+/// every one before it, had activated at genesis: the ones that ship a
+/// `config.yaml` set exactly that, apart from deliberate pre-fork cases such
+/// as `payload_attestation`'s `process_payload_attestation_pre_fork_epoch`,
+/// which schedules the fork later. Never a later fork: pulling forward one this
+/// case does not itself reach would let `Config::fork_at_epoch` resolve a
+/// state the case never claims to be, on any config a later runner builds
+/// this way.
+pub fn fork_active_from_genesis(case: &Case) -> Config {
+    ForkName::ALL
+        .into_iter()
+        .take_while(|fork| *fork <= case.fork)
+        .filter(|fork| *fork != ForkName::Phase0)
+        .fold(Config::active(), |config, fork| {
+            config.with_fork_epoch(fork, 0)
+        })
+}
 
 /// The newest fork whose state transition this crate implements.
 ///
@@ -111,14 +135,10 @@ pub const GLOAS_RUNNERS: &[&str] = &[
     "fork",
     "epoch_processing",
     "rewards",
-    "operations/execution_payload_bid",
-    "operations/withdrawals",
-    "operations/parent_execution_payload",
-    "operations/deposit_request",
-    "operations/withdrawal_request",
-    "operations/consolidation_request",
-    "operations/builder_deposit_request",
-    "operations/builder_exit_request",
+    // Every handler `operations` ships for gloas now runs, so the bare
+    // runner name serves all of it, the same way `"ssz_static"` already
+    // does for its own runner.
+    "operations",
 ];
 
 /// The root of the extracted fixture tree.

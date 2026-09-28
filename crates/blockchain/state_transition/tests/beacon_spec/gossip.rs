@@ -30,7 +30,7 @@ use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect, collect_all_handlers};
+use super::{Case, PRESET, collect, collect_all_handlers, fork_active_from_genesis};
 
 /// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
@@ -177,25 +177,12 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
 ///
 /// Most cases carry no `config.yaml` at all. Per the consensus-specs tests
 /// format README, a present `config.yaml` replaces the default runtime
-/// config, and an absent one means the preset default; the README says
-/// nothing about what fork epochs a present one holds. That is instead an
-/// observation of the vectors' own `config.yaml` files (checked by hand):
-/// every one of them sets every fork epoch to zero. So the fallback here
-/// models that same all-forks-at-genesis shape by hand: the compiled preset
-/// with every fork from altair up to and including the case's own fork pulled
-/// back to genesis, which is enough for `Config::fork_at_epoch` to resolve
-/// every case's low-epoch state without leaving a later fork's tree to
-/// inherit an earlier fork's fallback.
+/// config, and an absent one means the preset default; see
+/// [`fork_active_from_genesis`] for what that default is and why.
 fn case_config(case: &Case, state: &BeaconState) -> Config {
-    let mut config: Config = case.yaml_opt("config").unwrap_or_else(|| {
-        ForkName::ALL
-            .into_iter()
-            .take_while(|fork| *fork <= case.fork)
-            .filter(|fork| *fork != ForkName::Phase0)
-            .fold(Config::active(), |config, fork| {
-                config.with_fork_epoch(fork, 0)
-            })
-    });
+    let mut config: Config = case
+        .yaml_opt("config")
+        .unwrap_or_else(|| fork_active_from_genesis(case));
     config.genesis_time = state.genesis_time();
     // Newer configs name only `SLOT_DURATION_MS`; without `SECONDS_PER_SLOT`
     // the field would keep mainnet's default.
