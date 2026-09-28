@@ -514,6 +514,16 @@ pub mod mainnet {
     /// and each row of `BeaconState.ptc_window`.
     pub const PTC_SIZE: usize = 512;
 
+    /// `PTC_SIZE // 2`: how many PTC votes a payload needs, one way or the
+    /// other, before fork choice's `payload_timeliness` trusts the PTC's view
+    /// over "not verified, so not timely".
+    pub const PAYLOAD_TIMELY_THRESHOLD: u64 = (PTC_SIZE / 2) as u64;
+
+    /// `PTC_SIZE // 2`, the `payload_data_availability` counterpart of
+    /// [`PAYLOAD_TIMELY_THRESHOLD`]. Equal to it in the specification's own
+    /// table; kept as its own name since the two answer different questions.
+    pub const DATA_AVAILABILITY_TIMELY_THRESHOLD: u64 = PAYLOAD_TIMELY_THRESHOLD;
+
     // --- Max operations per block ---
 
     /// Bounds `BeaconBlockBody.payload_attestations`
@@ -1017,6 +1027,12 @@ pub mod minimal {
     /// meaningful at minimal's validator counts.
     pub const PTC_SIZE: usize = 16;
 
+    /// `PTC_SIZE // 2`. See mainnet's own doc.
+    pub const PAYLOAD_TIMELY_THRESHOLD: u64 = (PTC_SIZE / 2) as u64;
+
+    /// `PTC_SIZE // 2`. See mainnet's own doc.
+    pub const DATA_AVAILABILITY_TIMELY_THRESHOLD: u64 = PAYLOAD_TIMELY_THRESHOLD;
+
     // --- Max operations per block ---
 
     /// Bounds `BeaconBlockBody.payload_attestations`
@@ -1431,6 +1447,17 @@ mod tests {
         assert_eq!(mainnet::PTC_SIZE, 512);
         assert_eq!(minimal::PTC_SIZE, 16);
 
+        assert_eq!(mainnet::PAYLOAD_TIMELY_THRESHOLD, 256);
+        assert_eq!(minimal::PAYLOAD_TIMELY_THRESHOLD, 8);
+        assert_eq!(
+            mainnet::DATA_AVAILABILITY_TIMELY_THRESHOLD,
+            mainnet::PAYLOAD_TIMELY_THRESHOLD
+        );
+        assert_eq!(
+            minimal::DATA_AVAILABILITY_TIMELY_THRESHOLD,
+            minimal::PAYLOAD_TIMELY_THRESHOLD
+        );
+
         assert_eq!(mainnet::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 16_384);
         assert_eq!(minimal::MAX_BUILDERS_PER_WITHDRAWALS_SWEEP, 16);
     }
@@ -1612,6 +1639,7 @@ mod tests {
         in_both!(u64:
             MAX_PAYLOAD_ATTESTATIONS, MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
             MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD, MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
+            PAYLOAD_TIMELY_THRESHOLD, DATA_AVAILABILITY_TIMELY_THRESHOLD,
         );
     }
 }

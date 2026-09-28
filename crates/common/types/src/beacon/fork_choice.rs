@@ -1,28 +1,86 @@
 //! Fork-choice-adjacent data that is neither a block nor a state.
 //!
-//! Two kinds share this file. `LatestMessage` and `PowBlock` are SSZ
+//! Three kinds share this file. `LatestMessage` and `PowBlock` are SSZ
 //! consensus containers moved out of the `beacon::fork_choice` module of
 //! `ethlambda-state-transition`, which re-exports both at their old paths so
 //! every use site inside it is unchanged. `PayloadStatusEnum` and
 //! `PayloadStatusV1` are plain Engine-API-shaped data with no such former
-//! home. All four live here rather than there for the same reason: the
-//! DB-backed `ethlambda_storage::Store` holds them, and `ethlambda-storage`
-//! cannot depend on `ethlambda-state-transition`, which pulls in `blst` and
-//! `c-kzg`.
+//! home. `PayloadStatus` and `ForkChoiceNode` are gloas's own fork-choice
+//! node types, new here rather than moved, since nothing named them before
+//! gloas. All six live here for the same reason: the DB-backed
+//! `ethlambda_storage::Store` holds `LatestMessage`, `PowBlock` and
+//! `PayloadStatusV1`, and `ethlambda-storage` cannot depend on
+//! `ethlambda-state-transition`, which pulls in `blst` and `c-kzg`;
+//! `PayloadStatus` and `ForkChoiceNode` join them here rather than living
+//! beside `ethlambda-state-transition`'s own fork choice, so that a
+//! `LatestMessage`'s `payload_present` field and a stored node's own
+//! `PayloadStatus` share one crate with no dependency to cross.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
-use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Uint256};
+use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot, Uint256};
 
 /// One validator's most recent attestation: the epoch it targeted, and the
 /// block it attested to (the LMD GHOST vote).
 ///
 /// `Copy`, matching the specification's `@dataclass(eq=True, frozen=True)`:
 /// there is nothing here worth borrowing rather than copying.
+///
+/// `epoch` and `slot` both live here rather than one replacing the other:
+/// every fork through fulu keeps `epoch`, the field gloas's own modified
+/// `LatestMessage` drops in favour of `slot` (gloas compares messages by slot,
+/// since a payload can be revealed a slot late and a slot-grained comparison
+/// is what lets `update_latest_messages` tell such a re-vote apart from a
+/// stale one). Splitting the two into per-fork types would mean every reader
+/// of a [`LatestMessage`] picks a variant instead of a field, for a value that
+/// is otherwise identical; carrying both instead lets every fork's own
+/// constructor fill in the one it has and leave the other at its fork's own
+/// neutral value (pre-gloas: `slot: data.slot, payload_present: false`; gloas
+/// has no use for `epoch`, so nothing in this crate reads it off a gloas
+/// message).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatestMessage {
     pub epoch: Epoch,
+    /// The attestation's slot. Gloas compares messages by slot; earlier
+    /// forks keep comparing `epoch`.
+    pub slot: Slot,
     pub root: Root,
+    /// Gloas: whether the vote is for the block's full node (`data.index ==
+    /// 1`). Always `false` before gloas, which has no payload dimension to
+    /// vote on.
+    pub payload_present: bool,
+}
+
+/// A fork-choice node's payload dimension (gloas `fork-choice.md`'s new
+/// `PayloadStatus`): whether a [`ForkChoiceNode`] stands for a block whose
+/// payload is known to be empty, known to be full, or not yet decided either
+/// way.
+///
+/// Ordered `Empty < Full < Pending`, matching the specification's own integer
+/// values (`PAYLOAD_STATUS_EMPTY = 0`, `PAYLOAD_STATUS_FULL = 1`,
+/// `PAYLOAD_STATUS_PENDING = 2`): nothing in this crate compares two
+/// `PayloadStatus` values by order today, but the derive is kept alongside
+/// the discriminants it agrees with rather than left for a future caller to
+/// get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PayloadStatus {
+    Empty = 0,
+    Full = 1,
+    Pending = 2,
+}
+
+/// A gloas fork-choice node (`fork-choice.md`'s modified `ForkChoiceNode`): a
+/// block, and which of its payload branches.
+///
+/// Every earlier fork's own `ForkChoiceNode` is a one-to-one mapping with a
+/// `BeaconBlock` (see `specs/phase0/fork-choice.md`'s own note), so this
+/// crate collapses it to a bare [`Root`] wherever a pre-gloas function reads
+/// one; only gloas needs the pair, since ePBS (EIP-7732) splits a block into
+/// two branches fork choice must weigh separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForkChoiceNode {
+    pub root: Root,
+    pub payload_status: PayloadStatus,
 }
 
 /// The execution chain's own block header, as far as bellatrix's merge
