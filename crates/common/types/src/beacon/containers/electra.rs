@@ -128,9 +128,19 @@ pub type PendingConsolidations =
 /// required to be zero: `committee_bits` is the only source of which
 /// committees an attestation covers, and `data` is otherwise shared unchanged
 /// with every earlier fork.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct Attestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: AggregationBits,
     pub data: AttestationData,
     /// The aggregate signature of every attester set across every committee
@@ -139,7 +149,7 @@ pub struct Attestation {
     /// Which committees `aggregation_bits` covers. [`AggregationBits`] is the
     /// concatenation of each named committee's member bits, in ascending
     /// committee-index order.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub committee_bits: CommitteeBits,
 }
 
@@ -607,7 +617,17 @@ pub struct BeaconState {
 ///
 /// Unchanged in shape from phase0: `aggregate` simply carries electra's wider
 /// [`Attestation`] now.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct AggregateAndProof {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregator_index: ValidatorIndex,
@@ -617,7 +637,17 @@ pub struct AggregateAndProof {
     pub selection_proof: BlsSignature,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedAggregateAndProof {
     pub message: AggregateAndProof,
     pub signature: BlsSignature,

@@ -648,9 +648,19 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
-    let p2p = P2P::spawn(built, setup.store.clone(), setup.node_names, discovery)
-        .await
-        .wrap_err("failed to start discv5 discovery")?;
+    // Filled by the Beacon API's pool endpoint and the aggregator subnets, and
+    // read by the aggregate endpoint and block production; unused on lean.
+    let attestation_pool =
+        ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool::default();
+    let p2p = P2P::spawn(
+        built,
+        setup.store.clone(),
+        setup.node_names,
+        discovery,
+        attestation_pool.clone(),
+    )
+    .await
+    .wrap_err("failed to start discv5 discovery")?;
 
     let shutdown = CancellationToken::new();
     let rpc_shutdown = shutdown.clone();
@@ -659,6 +669,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
+    // Block production builds its payloads with the same execution client the
+    // chain actor validates them with.
+    let rpc_engine = match &setup.chain {
+        ChainActor::Beacon { engine, .. } => engine.clone(),
+        ChainActor::Lean(..) => None,
+    };
 
     // Which HTTP surface this node serves follows from the store's own chain
     // tag rather than from the sub-command, so the two can never disagree.
@@ -673,7 +689,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_config,
                 rpc_store,
                 rpc_sync_status,
-                rpc_p2p,
+                ethlambda_rpc::BeaconApiHandles {
+                    p2p: rpc_p2p,
+                    attestation_pool: attestation_pool.clone(),
+                    engine: rpc_engine,
+                },
                 local_peer_id,
                 rpc_shutdown,
             )

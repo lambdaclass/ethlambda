@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -183,24 +184,39 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
         .with_state(store)
 }
 
+/// What the Beacon API's validator endpoints reach beyond the store.
+pub struct BeaconApiHandles {
+    /// Through which the pool, aggregate and block endpoints gossip what a
+    /// validator client hands them.
+    pub p2p: RpcToP2PRef,
+    /// Filled by the attestation pool endpoint and the aggregator subnets,
+    /// read by the aggregate endpoint and block production.
+    pub attestation_pool: SharedAttestationPool,
+    /// The execution client block production builds payloads with; `None`
+    /// makes it answer 503.
+    pub engine: Option<ethlambda_engine::EngineClient>,
+}
+
 /// Start the HTTP servers for a beacon node.
 ///
 /// The beacon counterpart to [`start_rpc_server`]. It takes no
 /// `AggregatorController` and no `EventBus`: a follower has no aggregator duty
 /// to toggle, and the chain-events stream is part of the lean surface. It does
-/// take `p2p`, through which the pool endpoint gossips a validator client's
-/// attestations.
+/// take the [`BeaconApiHandles`] the validator endpoints need.
 pub async fn start_beacon_rpc_server(
     config: RpcConfig,
     store: Store,
     sync_status: SyncStatusController,
-    p2p: RpcToP2PRef,
+    handles: BeaconApiHandles,
     peer_id: String,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
-        .layer(Extension(p2p));
+        .layer(Extension(handles.p2p))
+        .layer(Extension(handles.attestation_pool))
+        .layer(Extension(beacon::validator::FeeRecipients::default()))
+        .layer(Extension(handles.engine));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -394,6 +410,11 @@ pub(crate) mod test_utils {
                 ethlambda_types::beacon::containers::electra::SingleAttestation,
             )>,
         >,
+        pub(crate) aggregates:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedAggregateAndProof>>,
+        pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
+        pub(crate) blocks:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -406,6 +427,30 @@ pub(crate) mod test_utils {
                 .lock()
                 .unwrap()
                 .push((subnet_id, attestation));
+            Ok(())
+        }
+
+        fn publish_beacon_aggregate(
+            &self,
+            aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.aggregates.lock().unwrap().push(aggregate);
+            Ok(())
+        }
+
+        fn subscribe_attestation_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.subscriptions.lock().unwrap().extend(subnets);
+            Ok(())
+        }
+
+        fn publish_beacon_block(
+            &self,
+            block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.blocks.lock().unwrap().push(block);
             Ok(())
         }
     }

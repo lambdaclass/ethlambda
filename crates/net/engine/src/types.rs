@@ -61,13 +61,15 @@ pub struct ForkchoiceStateV1 {
 
 /// `engine_forkchoiceUpdatedV3`'s result.
 ///
-/// `payloadId` is deserialized and dropped: this client never sends
-/// `payloadAttributes`, so an execution client has no build process to name, and
-/// a follower would have nothing to do with the identifier if it did.
+/// `payloadId` names the build process a call with `payloadAttributes`
+/// started; it is `null` otherwise, and when the execution client declined to
+/// build (a head it is still syncing, say).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkchoiceUpdatedResponse {
     pub payload_status: PayloadStatusV1,
+    #[serde(default)]
+    pub payload_id: Option<crate::building::PayloadId>,
 }
 
 /// `engine_getClientVersionV1`'s element type, in both directions.

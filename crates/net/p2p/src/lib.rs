@@ -43,9 +43,13 @@ use ethlambda_network_api::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
     },
-    rpc_to_p2p::PublishBeaconAttestation,
+    rpc_to_p2p::{
+        PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
+        SubscribeAttestationSubnets,
+    },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
 };
@@ -82,7 +86,8 @@ use crate::{
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_beacon_attestation, publish_block,
+        publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
+        publish_beacon_block, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
@@ -212,6 +217,11 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
 
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
+/// How often to leave aggregator subnets whose slot has passed. One slot's
+/// worth: a subnet outlives its need by at most this, which costs a little
+/// relayed traffic and nothing else.
+const AGGREGATOR_SUBNET_SWEEP_INTERVAL: Duration = Duration::from_secs(12);
+
 const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
 
 /// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
@@ -950,6 +960,7 @@ impl P2P {
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: DiscoverySpawnConfig,
+        attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = spawn_discovery(discovery).await?;
         let (swarm_stream, swarm_handle) =
@@ -999,8 +1010,15 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            attestation_pool,
+            aggregator_subnets: HashMap::new(),
         };
         let handle = server.start();
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            handle.context(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
         send_after(
             DIAL_INTERVAL_AT_ZERO_PEERS,
             handle.context(),
@@ -1094,6 +1112,18 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+
+    /// Unaggregated attestations for this node's validator clients'
+    /// aggregators, shared with the Beacon API that aggregates from it. Filled
+    /// by `verdict::forward` from the aggregator subnets below; lean never
+    /// touches it.
+    pub(crate) attestation_pool: SharedAttestationPool,
+
+    /// The attestation subnets joined for a validator client's aggregators,
+    /// each with the last slot it is needed for. Short-lived by design: never
+    /// advertised in `attnets`, and left once the slot has passed. The
+    /// backbone subnets are separate and never left.
+    pub(crate) aggregator_subnets: HashMap<u64, u64>,
 }
 
 impl P2PServer {
@@ -1175,6 +1205,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1245,6 +1277,20 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_leave_expired_aggregator_subnets(
+        &mut self,
+        _msg: p2p_protocol::LeaveExpiredAggregatorSubnets,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        gossipsub::leave_expired_aggregator_subnets(self);
+    }
+
+    #[send_handler]
     async fn handle_discover_peers(
         &mut self,
         _msg: p2p_protocol::DiscoverPeers,
@@ -1295,6 +1341,24 @@ impl Handler<PublishAttestation> for P2PServer {
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
+    }
+}
+
+impl Handler<PublishBeaconAggregate> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
+        publish_beacon_aggregate(self, msg.aggregate).await;
+    }
+}
+
+impl Handler<PublishBeaconBlock> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
+        publish_beacon_block(self, msg.block).await;
+    }
+}
+
+impl Handler<SubscribeAttestationSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
+        gossipsub::join_aggregator_subnets(self, msg.subnets);
     }
 }
 
@@ -2365,6 +2429,8 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            attestation_pool: Default::default(),
+            aggregator_subnets: HashMap::new(),
         }
     }
 

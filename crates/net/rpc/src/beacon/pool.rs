@@ -1,5 +1,7 @@
-//! `POST /eth/v2/beacon/pool/attestations`: how a validator client hands this
-//! node its attestations to gossip.
+//! `POST /eth/v2/beacon/pool/attestations`, how a validator client hands this
+//! node its attestations to gossip; `GET /eth/v2/validator/aggregate_attestation`,
+//! how an aggregator gets them back combined; and
+//! `POST /eth/v2/validator/aggregate_and_proofs`, how it publishes the result.
 //!
 //! Each attestation is checked against the electra `beacon_attestation_{subnet_id}`
 //! gossip conditions (p2p-interface) that can be evaluated here, then
@@ -17,38 +19,60 @@
 use axum::{
     Extension, Router,
     body::Bytes,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
+    attestation_pool::SharedAttestationPool,
     bls,
     gossip::attestation::compute_subnet_for_attestation,
+    gossip::{Outcome, aggregate},
     helpers::accessors::{CommitteeCacheExt as _, get_domain},
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
         constants::{DOMAIN_BEACON_ATTESTER, MAXIMUM_GOSSIP_CLOCK_DISPARITY},
-        containers::{BeaconState, electra::SingleAttestation},
+        containers::{
+            BeaconState, SignedAggregateAndProof,
+            electra::{self, SingleAttestation},
+        },
         fork::ForkName,
-        primitives::{Epoch, Root},
+        primitives::{CommitteeIndex, Epoch, Root, Slot},
         signing::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch},
     },
     primitives::HashTreeRoot as _,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::beacon::{ApiError, validator::head};
 
 pub(crate) fn routes() -> Router<Store> {
-    Router::new().route(
-        "/eth/v2/beacon/pool/attestations",
-        post(post_pool_attestations),
-    )
+    Router::new()
+        .route(
+            "/eth/v2/beacon/pool/attestations",
+            post(post_pool_attestations),
+        )
+        .route(
+            "/eth/v2/validator/aggregate_attestation",
+            get(get_aggregate_attestation),
+        )
+        .route(
+            "/eth/v2/validator/aggregate_and_proofs",
+            post(post_aggregate_and_proofs),
+        )
+}
+
+/// What validating a submitted attestation establishes about it: where it is
+/// published, and where it sits in its committee, which the pool needs.
+struct Checked {
+    subnet_id: u64,
+    committee_position: usize,
+    committee_len: usize,
 }
 
 /// One rejected attestation, in the Beacon API's `IndexedErrorMessage` shape:
@@ -62,16 +86,12 @@ struct Failure {
 async fn post_pool_attestations(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
+    Extension(pool): Extension<SharedAttestationPool>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let fork = headers
-        .get("eth-consensus-version")
-        .and_then(|value| value.to_str().ok())
-        .and_then(ForkName::parse);
-    if !fork.is_some_and(|fork| fork >= ForkName::Electra) {
-        return ApiError::BadRequest("Eth-Consensus-Version must name electra or a later fork")
-            .into_response();
+    if let Err(err) = require_electra_or_later(&headers) {
+        return err.into_response();
     }
     let Ok(attestations) = serde_json::from_slice::<Vec<SingleAttestation>>(&body) else {
         return ApiError::BadRequest("invalid request body").into_response();
@@ -90,8 +110,16 @@ async fn post_pool_attestations(
         let slot = attestation.data.slot;
         let validator = attestation.attester_index;
         let checked = validate(&store, &state, &attestation, now_ms);
-        let published = checked.and_then(|subnet_id| {
-            p2p.publish_beacon_attestation(subnet_id, attestation)
+        // Pooled as well as published: gossip never delivers a node its own
+        // messages, so without this an aggregator served by this node would
+        // be missing its own validator client's votes.
+        let published = checked.and_then(|checked| {
+            pool.lock().expect("attestation pool lock poisoned").insert(
+                &attestation,
+                checked.committee_position,
+                checked.committee_len,
+            );
+            p2p.publish_beacon_attestation(checked.subnet_id, attestation)
                 .map_err(|_| "the network actor is not running")
         });
         match published {
@@ -103,20 +131,13 @@ async fn post_pool_attestations(
         }
     }
 
-    if failures.is_empty() {
-        return StatusCode::OK.into_response();
-    }
-    let body = serde_json::json!({
-        "code": 400,
-        "message": "some attestations failed validation and were not published",
-        "failures": failures,
-    });
-    let mut response = crate::json_response(body);
-    *response.status_mut() = StatusCode::BAD_REQUEST;
-    response
+    batch_response(
+        failures,
+        "some attestations failed validation and were not published",
+    )
 }
 
-/// The subnet `attestation` belongs on, if it passes every gossip condition
+/// Where `attestation` belongs, if it passes every gossip condition
 /// this node can check, or the first one it fails.
 ///
 /// `state` is the fork-choice head's post-state, whose shuffling is the
@@ -129,7 +150,7 @@ fn validate(
     state: &BeaconState,
     attestation: &SingleAttestation,
     now_ms: u64,
-) -> Result<u64, &'static str> {
+) -> Result<Checked, &'static str> {
     let data = &attestation.data;
     let config = store.config();
 
@@ -184,9 +205,11 @@ fn validate(
     let committee = epoch_committees
         .committee(data.slot, attestation.committee_index)
         .map_err(|_| "committee computation failed")?;
-    if !committee.contains(&attestation.attester_index) {
-        return Err("attester is not in the named committee");
-    }
+    let committee_position = committee
+        .iter()
+        .position(|&member| member == attestation.attester_index)
+        .ok_or("attester is not in the named committee")?;
+    let committee_len = committee.len();
 
     // [REJECT] The signature is valid, under the attester domain at the target
     // epoch.
@@ -200,12 +223,145 @@ fn validate(
         return Err("invalid signature");
     }
 
-    Ok(compute_subnet_for_attestation(
-        committees_per_slot,
-        data.slot,
-        attestation.committee_index,
-        &config,
-    ))
+    Ok(Checked {
+        subnet_id: compute_subnet_for_attestation(
+            committees_per_slot,
+            data.slot,
+            attestation.committee_index,
+            &config,
+        ),
+        committee_position,
+        committee_len,
+    })
+}
+
+/// The endpoints here take electra's containers, which exist only from that
+/// fork on; `Eth-Consensus-Version` is required to say so.
+fn require_electra_or_later(headers: &HeaderMap) -> Result<(), ApiError> {
+    let fork = headers
+        .get("eth-consensus-version")
+        .and_then(|value| value.to_str().ok())
+        .and_then(ForkName::parse);
+    if fork.is_some_and(|fork| fork >= ForkName::Electra) {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(
+            "Eth-Consensus-Version must name electra or a later fork",
+        ))
+    }
+}
+
+/// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
+/// naming each failed item by position; the rest were still published.
+fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
+    if failures.is_empty() {
+        return StatusCode::OK.into_response();
+    }
+    let body = serde_json::json!({ "code": 400, "message": message, "failures": failures });
+    let mut response = crate::json_response(body);
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
+}
+
+/// `POST /eth/v2/validator/aggregate_and_proofs`: a validator client's signed
+/// aggregates, validated with the same `beacon_aggregate_and_proof` gossip
+/// conditions this node applies to its peers' (`gossip::aggregate`), then
+/// gossiped.
+///
+/// Each is checked against a fresh seen-cache rather than P2P's: that cache
+/// holds what peers sent, and a node never receives its own messages, so it
+/// would say nothing about these; what it guards against, a second aggregate
+/// for one aggregator and epoch, the validator client already guards against
+/// by signing one per duty.
+async fn post_aggregate_and_proofs(
+    State(store): State<Store>,
+    Extension(p2p): Extension<RpcToP2PRef>,
+    Extension(pool): Extension<SharedAttestationPool>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(err) = require_electra_or_later(&headers) {
+        return err.into_response();
+    }
+    let Ok(aggregates) = serde_json::from_slice::<Vec<electra::SignedAggregateAndProof>>(&body)
+    else {
+        return ApiError::BadRequest("invalid request body").into_response();
+    };
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0);
+    let capacity = std::num::NonZeroUsize::MIN;
+    let mut failures = Vec::new();
+    for (index, aggregate) in aggregates.into_iter().enumerate() {
+        let inner = aggregate.message.aggregate.clone();
+        let aggregate = SignedAggregateAndProof::Electra(aggregate);
+        let slot = aggregate.slot();
+        let aggregator = aggregate.aggregator_index();
+        let seen = aggregate::SeenAggregates::new(capacity, capacity);
+        let checked = aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
+            .and_then(|()| aggregate::stateful_checks(&store, &aggregate).map(|_| ()));
+        let published = checked
+            .map_err(|outcome: Outcome| {
+                warn!(%slot, aggregator, ?outcome, "Refused a submitted aggregate");
+                "aggregate failed validation"
+            })
+            .and_then(|()| {
+                // Recorded for block production, which packs the aggregates
+                // this node has validated.
+                pool.lock()
+                    .expect("attestation pool lock poisoned")
+                    .insert_aggregate(inner);
+                p2p.publish_beacon_aggregate(aggregate)
+                    .map_err(|_| "the network actor is not running")
+            });
+        match published {
+            Ok(()) => debug!(%slot, aggregator, "Accepted aggregate for gossip"),
+            Err(message) => failures.push(Failure { index, message }),
+        }
+    }
+    batch_response(
+        failures,
+        "some aggregates failed validation and were not published",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct AggregateQuery {
+    attestation_data_root: Root,
+    slot: Slot,
+    committee_index: CommitteeIndex,
+}
+
+/// `GET /eth/v2/validator/aggregate_attestation`: every vote this node holds
+/// for `attestation_data_root` from `committee_index`'s committee at `slot`,
+/// aggregated. A 404 when it holds none, which is what the endpoint specifies
+/// and what an aggregator reads as "nothing to publish".
+async fn get_aggregate_attestation(
+    State(store): State<Store>,
+    Extension(pool): Extension<SharedAttestationPool>,
+    Query(query): Query<AggregateQuery>,
+) -> Response {
+    let aggregate = pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .aggregate(
+            query.attestation_data_root,
+            query.slot,
+            query.committee_index,
+        );
+    let Some(aggregate) = aggregate else {
+        return ApiError::NotFound("no matching attestations to aggregate").into_response();
+    };
+    let fork = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(query.slot));
+    let response = crate::json_response(serde_json::json!({
+        "version": fork.as_str(),
+        "data": aggregate,
+    }));
+    crate::shared::content::with_consensus_version(response, fork)
 }
 
 /// The root of the latest block at or before `epoch`'s first slot on the chain
@@ -242,6 +398,7 @@ mod tests {
         state: BeaconState,
         head_root: Root,
         network: Arc<RecordingNetwork>,
+        pool: SharedAttestationPool,
     }
 
     /// A fulu head state, stored in the current wall-clock epoch so the
@@ -262,6 +419,7 @@ mod tests {
             state,
             head_root,
             network: Arc::new(RecordingNetwork::default()),
+            pool: SharedAttestationPool::default(),
         }
     }
 
@@ -299,7 +457,8 @@ mod tests {
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network));
+            .layer(Extension(network))
+            .layer(Extension(fixture.pool.clone()));
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("content-type", "application/json")
             .header("eth-consensus-version", "fulu")
@@ -388,13 +547,195 @@ mod tests {
         assert_eq!(published[0].1, good);
     }
 
+    async fn get_aggregate(
+        fixture: &Fixture,
+        data_root: Root,
+        slot: u64,
+        committee: u64,
+    ) -> (StatusCode, serde_json::Value) {
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(fixture.pool.clone()));
+        let uri = format!(
+            "/eth/v2/validator/aggregate_attestation?attestation_data_root={data_root}&slot={slot}&committee_index={committee}"
+        );
+        let response = app
+            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// The aggregator's round trip: its committee's submitted votes come back
+    /// combined, with a signature that verifies over the attesters' keys.
+    #[tokio::test]
+    async fn submitted_attestations_come_back_aggregated() {
+        let fixture = fixture();
+        let committee = get_beacon_committee(&fixture.state, fixture.state.slot(), 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        let (status, _) = submit(&fixture, &votes).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let data = votes[0].data;
+        let (status, json) = get_aggregate(&fixture, data.hash_tree_root(), data.slot, 0).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["version"], "fulu");
+
+        let bits_hex = json["data"]["aggregation_bits"].as_str().unwrap();
+        let bits = hex::decode(bits_hex.trim_start_matches("0x")).unwrap();
+        let set: u32 = bits.iter().map(|byte| byte.count_ones()).sum();
+        // Every member's bit, plus the bitlist's length-marker bit.
+        assert_eq!(set as usize, committee.len() + 1);
+
+        let pubkeys: Vec<_> = committee
+            .iter()
+            .map(|&index| fixture.state.validator(index).unwrap().pubkey)
+            .collect();
+        let signature: ethlambda_types::beacon::primitives::BlsSignature =
+            serde_json::from_value(json["data"]["signature"].clone()).unwrap();
+        let domain = get_domain(
+            &fixture.state,
+            DOMAIN_BEACON_ATTESTER,
+            Some(data.target.epoch),
+        );
+        let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+        assert!(
+            ethlambda_state_transition::beacon::bls::fast_aggregate_verify(
+                &pubkeys,
+                signing_root,
+                &signature
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_aggregate_with_no_votes_is_a_404() {
+        let fixture = fixture();
+        let (status, _) =
+            get_aggregate(&fixture, Root::repeat_byte(7), fixture.state.slot(), 0).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A `SignedAggregateAndProof` from `aggregator` over `aggregate`, signed
+    /// the way phase0's `validator.md` ("Construct aggregate") says.
+    fn signed_aggregate(
+        fixture: &Fixture,
+        aggregator: u64,
+        aggregate: electra::Attestation,
+    ) -> electra::SignedAggregateAndProof {
+        use ethlambda_types::beacon::constants::{
+            DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_SELECTION_PROOF,
+        };
+        let slot = aggregate.data.slot;
+        let epoch = compute_epoch_at_slot(slot);
+        let selection_domain = get_domain(&fixture.state, DOMAIN_SELECTION_PROOF, Some(epoch));
+        let selection_proof = sign_for(
+            aggregator as usize,
+            compute_signing_root(slot.hash_tree_root(), selection_domain),
+        );
+        let message = electra::AggregateAndProof {
+            aggregator_index: aggregator,
+            aggregate,
+            selection_proof,
+        };
+        let domain = get_domain(&fixture.state, DOMAIN_AGGREGATE_AND_PROOF, Some(epoch));
+        let signature = sign_for(
+            aggregator as usize,
+            compute_signing_root(message.hash_tree_root(), domain),
+        );
+        electra::SignedAggregateAndProof { message, signature }
+    }
+
+    async fn submit_aggregates(
+        fixture: &Fixture,
+        aggregates: &[electra::SignedAggregateAndProof],
+    ) -> (StatusCode, serde_json::Value) {
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network))
+            .layer(Extension(fixture.pool.clone()));
+        let request = Request::post("/eth/v2/validator/aggregate_and_proofs")
+            .header("content-type", "application/json")
+            .header("eth-consensus-version", "fulu")
+            .body(Body::from(serde_json::to_vec(aggregates).unwrap()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// An aggregator's whole slot through this node: its committee's votes in,
+    /// the aggregate back out, and the signed aggregate published.
+    #[tokio::test]
+    async fn an_aggregator_can_publish_what_it_aggregated() {
+        let fixture = fixture();
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        submit(&fixture, &votes).await;
+        let aggregate = fixture
+            .pool
+            .lock()
+            .unwrap()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+
+        // With 64 validators a committee has two members, fewer than
+        // TARGET_AGGREGATORS_PER_COMMITTEE, so every member is an aggregator.
+        let signed = signed_aggregate(&fixture, committee[0], aggregate);
+        let (status, json) = submit_aggregates(&fixture, std::slice::from_ref(&signed)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let published = fixture.network.aggregates.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0], SignedAggregateAndProof::Electra(signed));
+    }
+
+    #[tokio::test]
+    async fn an_aggregate_signed_by_someone_else_is_refused() {
+        let fixture = fixture();
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        submit(&fixture, &votes).await;
+        let aggregate = fixture
+            .pool
+            .lock()
+            .unwrap()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+
+        let mut forged = signed_aggregate(&fixture, committee[0], aggregate.clone());
+        forged.signature = signed_aggregate(&fixture, committee[1], aggregate).signature;
+        let (status, json) = submit_aggregates(&fixture, &[forged]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["failures"][0]["index"], 0);
+        assert!(fixture.network.aggregates.lock().unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn a_pre_electra_fork_header_is_refused() {
         let fixture = fixture();
         let network: RpcToP2PRef = fixture.network.clone();
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(network));
+            .layer(Extension(network))
+            .layer(Extension(fixture.pool.clone()));
         let request = Request::post("/eth/v2/beacon/pool/attestations")
             .header("eth-consensus-version", "deneb")
             .body(Body::from("[]"))

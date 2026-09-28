@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
-use ethlambda_storage::Store;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
+use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::electra::SingleAttestation;
 use ethlambda_types::beacon::containers::{
     SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
@@ -139,7 +140,21 @@ impl Validated {
     /// chain actor consumes one, matching a lighthouse follower with no
     /// validators, which verifies and relays its own backbone subnets but
     /// never calls `apply_attestation_to_fork_choice` for them either.
+    ///
+    /// What an accepted subnet attestation does feed is the attestation pool,
+    /// when its subnet is one a validator client's aggregator had this node
+    /// join: that aggregator will ask for exactly these votes. See
+    /// [`pool_aggregator_attestation`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
+        if let Self::Attestation {
+            attestation,
+            subnet_id,
+        } = &self
+            && outcome == Outcome::Accept
+            && server.aggregator_subnets.contains_key(subnet_id)
+        {
+            pool_aggregator_attestation(server, attestation);
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -177,6 +192,40 @@ impl Validated {
             Self::Aggregate { .. } | Self::Attestation { .. } => {}
         }
     }
+}
+
+/// Pool an accepted subnet attestation for a validator client's aggregator.
+///
+/// The pool keys a vote by its position in its committee, which the gossip
+/// checks resolved but do not return; it is read back from the same place
+/// they read it, the voted block's cached post-state and the shared committee
+/// cache, so nothing is derived twice.
+fn pool_aggregator_attestation(server: &P2PServer, attestation: &SingleAttestation) {
+    let data = &attestation.data;
+    let Some(state) = server
+        .store
+        .cached_state(CacheKey::BlockState(data.beacon_block_root))
+    else {
+        return;
+    };
+    let committees = server
+        .store
+        .committee_cache()
+        .committees(&state, data.target.epoch);
+    let Ok(committee) = committees.committee(data.slot, attestation.committee_index) else {
+        return;
+    };
+    let Some(position) = committee
+        .iter()
+        .position(|&member| member == attestation.attester_index)
+    else {
+        return;
+    };
+    server
+        .attestation_pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .insert(attestation, position, committee.len());
 }
 
 /// What to do with a beacon gossip message once the checks that read only the

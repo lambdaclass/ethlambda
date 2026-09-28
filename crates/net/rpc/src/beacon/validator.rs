@@ -5,10 +5,11 @@
 //! the shared `Store` the chain actor writes: the head row is refreshed on each
 //! import and tick, so no message to the actor is needed.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     extract::{Path, Query, State},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -21,15 +22,17 @@ use ethlambda_types::{
             shared::{AttestationData, Checkpoint},
         },
         preset,
-        primitives::{BlsPubkey, CommitteeIndex, Epoch, Slot, ValidatorIndex},
+        primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
         signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
     },
     primitives::H256,
 };
 use serde::{Deserialize, Serialize};
 
+use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     fork_choice::checkpoint_state,
+    gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
 };
 
@@ -57,31 +60,13 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/validator/prepare_beacon_proposer",
             post(post_prepare_beacon_proposer),
         )
-        // Block production and aggregation are not served yet. Named here so a
-        // validator client gets an explicit 501 it can fail over on, rather
-        // than a bare 404 that reads like a wrong URL.
-        .route("/eth/v3/validator/blocks/{slot}", get(not_yet_served))
-        .route("/eth/v2/beacon/blocks", post(not_yet_served))
-        .route(
-            "/eth/v2/validator/aggregate_attestation",
-            get(not_yet_served),
-        )
-        .route(
-            "/eth/v2/validator/aggregate_and_proofs",
-            post(not_yet_served),
-        )
-}
-
-async fn not_yet_served() -> Response {
-    ApiError::NotImplemented("block production and aggregation are not served by this node yet")
-        .into_response()
 }
 
 /// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
-/// is refused, though nothing is read from it yet.
+/// is refused, though `validator_index` is never read.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct CommitteeSubscription {
+    #[allow(dead_code)]
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
@@ -95,43 +80,60 @@ struct CommitteeSubscription {
 
 /// `POST /eth/v1/validator/beacon_committee_subscriptions`.
 ///
-/// Acknowledged and otherwise ignored. The request asks the node to join the
-/// attestation subnets its validators' committees gossip on, which matters
-/// for aggregation (an aggregator has to hear its committee's attestations);
-/// publishing needs no subscription, since gossipsub fanout reaches the
-/// subnet's subscribers. This node joins no attestation subnet until it
-/// aggregates.
+/// Each aggregator's entry has the node join its committee's attestation
+/// subnet until the end of that slot, so the committee's votes reach the pool
+/// the aggregate endpoint answers from (phase0 `validator.md`, "Attestation
+/// subnet subscription"). Non-aggregators' entries need nothing: publishing
+/// reaches a subnet through gossipsub fanout without joining it.
 async fn post_committee_subscriptions(
+    State(store): State<Store>,
+    Extension(p2p): Extension<RpcToP2PRef>,
     Json(subscriptions): Json<Vec<CommitteeSubscription>>,
 ) -> Response {
-    tracing::debug!(
-        count = subscriptions.len(),
-        "Committee subscriptions acknowledged; attestation subnets are not joined yet"
-    );
+    let config = store.config();
+    let subnets: Vec<(u64, Slot)> = subscriptions
+        .iter()
+        .filter(|entry| entry.is_aggregator)
+        .map(|entry| {
+            let subnet_id = compute_subnet_for_attestation(
+                entry.committees_at_slot,
+                entry.slot,
+                entry.committee_index,
+                &config,
+            );
+            (subnet_id, entry.slot)
+        })
+        .collect();
+    if !subnets.is_empty() && p2p.subscribe_attestation_subnets(subnets).is_err() {
+        return ApiError::Internal("the network actor is not running").into_response();
+    }
     axum::http::StatusCode::OK.into_response()
 }
 
-/// One entry of `prepare_beacon_proposer`. Parsed so a malformed body is
-/// refused, though nothing is read from it yet.
+/// Each validator's execution-layer fee recipient, as its validator client
+/// last named it. Read by block production, which puts the proposer's into
+/// the payload attributes. In memory only: a validator client repeats the call
+/// every epoch, so a restarted node relearns the map within one.
+pub(crate) type FeeRecipients = Arc<std::sync::Mutex<HashMap<ValidatorIndex, ExecutionAddress>>>;
+
+/// One entry of `prepare_beacon_proposer`.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct ProposerPreparation {
     #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
     validator_index: ValidatorIndex,
-    fee_recipient: String,
+    fee_recipient: ExecutionAddress,
 }
 
-/// `POST /eth/v1/validator/prepare_beacon_proposer`.
-///
-/// Acknowledged and otherwise ignored: the fee recipient is an input to
-/// building an execution payload, which this node does not do yet.
+/// `POST /eth/v1/validator/prepare_beacon_proposer`: record where each
+/// validator's block rewards should be paid.
 async fn post_prepare_beacon_proposer(
+    Extension(fee_recipients): Extension<FeeRecipients>,
     Json(preparations): Json<Vec<ProposerPreparation>>,
 ) -> Response {
-    tracing::debug!(
-        count = preparations.len(),
-        "Proposer preparations acknowledged; block production is not served yet"
-    );
+    let mut map = fee_recipients.lock().expect("fee recipient lock poisoned");
+    for preparation in preparations {
+        map.insert(preparation.validator_index, preparation.fee_recipient);
+    }
     axum::http::StatusCode::OK.into_response()
 }
 
@@ -733,19 +735,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn block_and_aggregate_routes_answer_501() {
+    async fn a_preparation_records_the_validators_fee_recipient() {
         let (store, _) = beacon_store_at(fulu_state());
-        let app = routes().with_state(store);
-        let requests = [
-            Request::get("/eth/v3/validator/blocks/40").body(Body::empty()),
-            Request::post("/eth/v2/beacon/blocks").body(Body::empty()),
-            Request::get("/eth/v2/validator/aggregate_attestation?slot=1").body(Body::empty()),
-            Request::post("/eth/v2/validator/aggregate_and_proofs").body(Body::empty()),
-        ];
-        for request in requests {
-            let response = app.clone().oneshot(request.unwrap()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
-        }
+        let fee_recipients = FeeRecipients::default();
+        let app = routes()
+            .with_state(store)
+            .layer(Extension(fee_recipients.clone()));
+        let body = serde_json::json!([
+            { "validator_index": "7", "fee_recipient": format!("0x{}", "ab".repeat(20)) }
+        ]);
+        let request = Request::post("/eth/v1/validator/prepare_beacon_proposer")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            fee_recipients.lock().unwrap().get(&7),
+            Some(&ExecutionAddress::from_slice(&[0xab; 20]))
+        );
     }
 
     async fn post_raw(uri: &str, body: serde_json::Value) -> (StatusCode, axum::body::Bytes) {
@@ -754,12 +761,42 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        let network: RpcToP2PRef = Arc::new(crate::test_utils::RecordingNetwork::default());
+        let app = routes()
+            .with_state(store)
+            .layer(Extension(network))
+            .layer(Extension(FeeRecipients::default()));
+        let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         (
             status,
             response.into_body().collect().await.unwrap().to_bytes(),
         )
+    }
+
+    /// An aggregator's entry joins its committee's subnet until its slot; a
+    /// plain attester's joins nothing.
+    #[tokio::test]
+    async fn only_aggregators_join_their_committee_subnet() {
+        let (store, _) = beacon_store_at(fulu_state());
+        let network = Arc::new(crate::test_utils::RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let app = routes().with_state(store).layer(Extension(p2p));
+        let body = serde_json::json!([
+            { "validator_index": "1", "committee_index": "3", "committees_at_slot": "4",
+              "slot": "34", "is_aggregator": true },
+            { "validator_index": "2", "committee_index": "0", "committees_at_slot": "4",
+              "slot": "34", "is_aggregator": false },
+        ]);
+        let request = Request::post("/eth/v1/validator/beacon_committee_subscriptions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Slot 34 is offset 2 in its epoch: committee 3 of 4 per slot is the
+        // epoch's committee 11.
+        assert_eq!(*network.subscriptions.lock().unwrap(), vec![(11, 34)]);
     }
 
     #[tokio::test]

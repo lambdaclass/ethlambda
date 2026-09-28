@@ -241,7 +241,11 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
-| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Acknowledged, not acted on (see below) |
+| `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
+| `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
+| `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
+| `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned block built on the head (`produceBlockV3`) |
+| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed block (`publishBlockV2`, SSZ) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
 
 ### Validator endpoints
@@ -267,18 +271,49 @@ the chain actor writes, so no request waits on the actor.
   its checkpoint block, committee membership, BLS signature), then gossips it on
   its subnet through fanout, without subscribing. A rejected attestation comes
   back in an `IndexedErrorMessage` with its position; the valid ones in the
-  same batch are still published. There is no seen-attestation cache.
-- **`beacon_committee_subscriptions`** and **`prepare_beacon_proposer`** parse
-  their body and return `200` without acting: this node joins no attestation
-  subnet until it aggregates, and uses no fee recipient until it builds blocks.
+  same batch are still published. There is no seen-attestation cache. Each
+  accepted attestation also goes into the node's **attestation pool**, since
+  gossip never delivers a node its own messages.
+- **`beacon_committee_subscriptions`**: each aggregator's entry makes the node
+  join its committee's attestation subnet until the end of that slot, so the
+  committee's votes from other validators reach the pool too: every
+  attestation this node relays has passed the `beacon_attestation_{subnet_id}`
+  checks first, and the ones accepted on a joined subnet are pooled. Joined
+  subnets are left once their slot has passed, and never appear in `attnets`.
+- **`aggregate_attestation`** answers from the pool: every vote held for the
+  data root and committee, as electra's `Attestation` with the BLS aggregate of
+  their signatures. `404` when nothing is held.
+- **`aggregate_and_proofs`** checks each aggregate with the same
+  `beacon_aggregate_and_proof` gossip conditions this node applies to its
+  peers' aggregates (`gossip::aggregate`), signatures included, against a
+  fresh seen-cache (a node never receives its own messages, so P2P's says
+  nothing about them). What passes is gossiped on the topic.
+- **`prepare_beacon_proposer`** records each validator's fee recipient, in
+  memory (a validator client repeats the call every epoch).
+- **`blocks/{slot}`** advances the head state to the slot and asks the node's
+  own execution client to build on the head (`forkchoiceUpdatedV3` with
+  payload attributes, then `getPayloadV5`), with the proposer's fee recipient.
+  The body packs the pool's best aggregates (committees voting alike merged
+  into one EIP-7549 attestation, up to `MAX_ATTESTATIONS_ELECTRA`), votes the
+  state's own `eth1_data`, and carries an empty sync aggregate and no
+  slashings, exits or credential changes. The state root comes from running
+  the block through `process_block`. The answer is fulu `BlockContents`, with
+  `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
+  **`503`** without a configured execution client, or when the payload carries
+  blobs.
+- **`POST beacon/blocks`** takes SSZ `SignedBlockContents`, checks the block
+  is after the head and its proposer signature, then gossips it on
+  `beacon_block` and hands it to the chain actor to import.
 
-Block production and aggregation are not served. Their routes
-(`/eth/v3/validator/blocks/{slot}`, `POST /eth/v2/beacon/blocks`,
-`/eth/v2/validator/aggregate_attestation`, `/eth/v2/validator/aggregate_and_proofs`)
-answer **`501`**, which `ethlambda validator` treats as a node failure and fails
-over on, per call, to the next node in `--beacon-nodes`. That is how
-`tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` attests
-through this node while another still proposes.
+**Blobs are not supported yet.** Publishing a blob-carrying block means
+computing and gossiping its data column sidecars, which this node does not do,
+and peers will not import a block they cannot sample. Such payloads are refused
+at production (`503`, which a validator client fails over on) and such blocks
+at publication (`400`).
+
+`tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` points the
+validator client at this node alone, so every block on that devnet is one this
+node built.
 
 ### Encoding
 

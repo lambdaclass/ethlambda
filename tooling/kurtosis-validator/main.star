@@ -23,8 +23,8 @@
 # package also runs `ethlambda beacon`, paired with a geth of its own over the
 # Engine API, and hands the validator client both nodes, ethlambda's first: the
 # client fails over per call, so everything ethlambda beacon serves goes through
-# it, and what it does not serve yet (block production, aggregation) falls over
-# to the participant's node.
+# it. With `ethlambda_beacon.fallback: false` the participant's node is left
+# out of the list entirely, and ethlambda beacon serves every duty alone.
 
 ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
 
@@ -98,7 +98,12 @@ def run(plan, args={}):
             output.all_participants[0].cl_context.enr,
             vc.get("image", "ghcr.io/lambdaclass/ethlambda:validator-local"),
         )
-        beacon_nodes = [ethlambda_url] + beacon_nodes
+        # With `fallback: false` the client talks to ethlambda beacon alone, so
+        # every duty, proposals included, has to go through it.
+        if beacon.get("fallback", True):
+            beacon_nodes = [ethlambda_url] + beacon_nodes
+        else:
+            beacon_nodes = [ethlambda_url]
     name = vc.get("name", "ethlambda-vc")
     if "dora" in devnet_args.get("additional_services", []):
         label_in_dora(plan, first, last, name)

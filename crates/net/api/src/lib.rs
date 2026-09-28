@@ -297,6 +297,20 @@ pub trait RpcToP2P: Send + Sync {
         subnet_id: u64,
         attestation: SingleAttestation,
     ) -> Result<(), ActorError>;
+    /// Gossip one signed aggregate on `beacon_aggregate_and_proof`, already
+    /// validated by the caller for the same reason as above.
+    fn publish_beacon_aggregate(
+        &self,
+        aggregate: SignedAggregateAndProof,
+    ) -> Result<(), ActorError>;
+    /// Join attestation subnets a validator client's aggregators need, each
+    /// until the end of the paired slot, so their committees' attestations
+    /// reach this node's pool. `(subnet_id, slot)` pairs.
+    fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
+    /// Gossip a block a validator client signed, and import it: gossip never
+    /// delivers a node its own messages, so without the second half this node
+    /// would not follow its own proposal. Checked by the caller as above.
+    fn publish_beacon_block(&self, block: SignedBeaconBlock) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---
