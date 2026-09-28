@@ -138,42 +138,7 @@ pub fn case_config(case: &Case) -> Config {
 /// still need its own edit to *map* a fork's new or changed handlers to the
 /// right function, since that mapping is specific to each runner; only the gate
 /// is one line.
-pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Fulu;
-
-/// Runners (or runner/handler pairs) whose Gloas cases already run, while the
-/// fork is only partly implemented.
-///
-/// An entry is either a bare runner name (`"ssz_static"`), which enables
-/// every handler that runner ships, or `"runner/handler"`
-/// (`"operations/withdrawals"`), which enables only that one handler under
-/// that runner; `handler` is the directory right under the fork
-/// (`gloas/<runner>/<handler>/...`), i.e. [`Case::handler`]. This lets a
-/// runner whose Gloas support lands handler by handler (`operations`, whose
-/// `execution_payload_bid`, `withdrawals`, and `parent_execution_payload`
-/// went green well before `attestation` or `payload_attestation`) turn cases
-/// on incrementally, without also running every other handler under it that
-/// is still unimplemented.
-///
-/// [`case_trial`] checks this alongside [`Case::in_scope`], so a case whose
-/// runner or runner/handler is named here runs (and counts toward pass/fail)
-/// even though [`HIGHEST_IMPLEMENTED_FORK`] has not reached Gloas yet; every
-/// other runner's Gloas cases stay ignored. Emptied, and removed along with
-/// this check, when [`HIGHEST_IMPLEMENTED_FORK`] becomes `Gloas`.
-pub const GLOAS_RUNNERS: &[&str] = &[
-    "ssz_static",
-    "fork",
-    "epoch_processing",
-    "rewards",
-    // Every handler `operations` ships for gloas now runs, so the bare
-    // runner name serves all of it, the same way `"ssz_static"` already
-    // does for its own runner.
-    "operations",
-    "sanity",
-    "finality",
-    "random",
-    "transition",
-    "fork_choice",
-];
+pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Gloas;
 
 /// The root of the extracted fixture tree.
 ///
@@ -239,7 +204,6 @@ pub fn collect_crypto(kind: &str, fork_of: impl Fn(&str) -> ForkName) -> Vec<(St
                 Case {
                     path: case_entry.path(),
                     fork,
-                    handler: handler.clone(),
                     suite: handler.clone(),
                     name: case_entry.file_name().to_string_lossy().into_owned(),
                 },
@@ -256,10 +220,6 @@ pub struct Case {
     pub path: PathBuf,
     /// The fork whose rules apply.
     pub fork: ForkName,
-    /// The handler directory right under the fork's runner directory
-    /// (`gloas/operations/<handler>/...`). [`GLOAS_RUNNERS`]'s
-    /// `"runner/handler"` form is matched against this.
-    pub handler: String,
     /// The suite directory name, which groups related cases.
     pub suite: String,
     /// The case directory name, which is what test output should identify.
@@ -365,7 +325,7 @@ fn collect_in(root: &Path, config: &str, runner: &str, handler: &str) -> Vec<Cas
         };
 
         let handler_dir = fork_entry.path().join(runner).join(handler);
-        collect_suites(&handler_dir, fork, handler, &mut |case| cases.push(case));
+        collect_suites(&handler_dir, fork, &mut |case| cases.push(case));
     }
 
     cases
@@ -394,7 +354,7 @@ pub fn collect_all_handlers(config: &str, runner: &str) -> Vec<(String, Case)> {
             // `collect` here would be wrong: `collect` walks every fork itself,
             // so nesting it inside this fork loop would yield each case once per
             // fork that happens to ship the runner.
-            collect_suites(&handler_entry.path(), fork, &handler, &mut |case| {
+            collect_suites(&handler_entry.path(), fork, &mut |case| {
                 out.push((handler.clone(), case))
             });
         }
@@ -406,10 +366,8 @@ pub fn collect_all_handlers(config: &str, runner: &str) -> Vec<(String, Case)> {
 /// Walks the suite and case directories under one fork's handler directory.
 ///
 /// Shared by both collectors so there is one definition of what a case directory
-/// is, and so neither can drift from the other. `handler` is recorded on each
-/// emitted [`Case`] as [`Case::handler`], for [`GLOAS_RUNNERS`]'s
-/// `"runner/handler"` matching.
-fn collect_suites(handler_dir: &Path, fork: ForkName, handler: &str, emit: &mut impl FnMut(Case)) {
+/// is, and so neither can drift from the other.
+fn collect_suites(handler_dir: &Path, fork: ForkName, emit: &mut impl FnMut(Case)) {
     if !handler_dir.is_dir() {
         return;
     }
@@ -420,7 +378,6 @@ fn collect_suites(handler_dir: &Path, fork: ForkName, handler: &str, emit: &mut 
             emit(Case {
                 path: case_entry.path(),
                 fork,
-                handler: handler.to_string(),
                 suite: suite.clone(),
                 name: case_entry.file_name().to_string_lossy().into_owned(),
             });
@@ -560,12 +517,6 @@ pub fn fixture_fork_trials() -> Vec<Trial> {
 /// itself and print the count; the test harness counts ignored tests already,
 /// and names each one, which is strictly more than the tally said.
 ///
-/// A Gloas case is the one exception: while Gloas is only partly implemented,
-/// [`GLOAS_RUNNERS`] names the runners whose Gloas cases already run, ahead of
-/// [`HIGHEST_IMPLEMENTED_FORK`] reaching Gloas, so those cases run (and are
-/// counted toward pass/fail) even though [`Case::in_scope`] alone would mark
-/// them ignored.
-///
 /// A panic inside `run` fails this case alone: the harness catches it per test.
 /// So a fixture that will not decode takes its own case down and no other.
 pub fn case_trial(
@@ -573,10 +524,7 @@ pub fn case_trial(
     case: Case,
     run: impl FnOnce(&Case) -> Result<(), String> + Send + 'static,
 ) -> Trial {
-    let runner_handler = format!("{runner}/{}", case.handler);
-    let gloas_enabled = case.fork == ForkName::Gloas
-        && (GLOAS_RUNNERS.contains(&runner) || GLOAS_RUNNERS.contains(&runner_handler.as_str()));
-    let ignored = !(case.in_scope() || gloas_enabled);
+    let ignored = !case.in_scope();
     let name = format!("{runner}/{}", case.id());
     Trial::test(name, move || run(&case).map_err(Failed::from)).with_ignored_flag(ignored)
 }
