@@ -16,6 +16,7 @@ use ethlambda_types::{
     },
     beacon::{
         config::Config,
+        constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
         fork::ForkName,
         fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
@@ -627,23 +628,68 @@ impl GossipSignatureBuffer {
 /// for again, and `el_block_hashes` is a cache over data already decodable
 /// from the block itself.
 ///
+/// Gloas's own four (`verified_payloads`, `payload_timeliness_vote`,
+/// `payload_data_availability_vote`, and `block_timeliness`'s widened shape)
+/// do not all fit the "a restarted node just gets it again" pattern above,
+/// even though they live in this same scratch. `payload_timeliness_vote` and
+/// `payload_data_availability_vote` do: they are the payload timeliness
+/// committee's per-slot ballot, gone the moment the slot it was cast for is
+/// no longer being decided, the same kind of throwaway `pow_blocks` is.
+/// `verified_payloads` and `block_timeliness` do not, and both must be
+/// persisted before this runs against a live, restarting node: losing
+/// `verified_payloads` on restart does not error, it silently drops every
+/// full payload branch from fork choice (`is_payload_verified` answers
+/// `false` for a block this store genuinely verified before restarting),
+/// and losing a `block_timeliness` entry the gloas fork choice's
+/// `should_apply_proposer_boost` needs makes that call fail outright with
+/// `Error::SpecAssert`. Unlike pre-gloas, where `block_timeliness` is read
+/// only by the same-slot reorg helpers, gloas's own weight computation
+/// reads it on the ordinary head-computation path, so that failure aborts
+/// the whole `gloas_get_weight`/`gloas_get_head` walk, not just an optional
+/// reorg decision. Nothing in this crate persists either yet.
+///
 /// Most of this is uncapped: the per-validator maps are bounded by the
 /// validator set, and the per-block ones (`block_timeliness`,
-/// `unrealized_justifications`) grow with the blocks this process has
-/// imported. Two are the exception, `el_block_hashes` and `optimistic_roots`,
-/// each pruned to the unfinalized window by its own `prune_*` method. Both
-/// fill on a path that runs for the whole life of the process and has no other
-/// way of emptying them: `forkchoiceUpdated` reads the first once per head
-/// move, and an execution client doing a long state sync answers
-/// `NOT_VALIDATED` to every block, which writes the second once per import.
+/// `unrealized_justifications`, and gloas's own three) grow with the blocks
+/// this process has imported. Two are the exception, `el_block_hashes` and
+/// `optimistic_roots`, each pruned to the unfinalized window by its own
+/// `prune_*` method. Both fill on a path that runs for the whole life of the
+/// process and has no other way of emptying them: `forkchoiceUpdated` reads
+/// the first once per head move, and an execution client doing a long state
+/// sync answers `NOT_VALIDATED` to every block, which writes the second once
+/// per import.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
-    pub(crate) block_timeliness: HashMap<H256, bool>,
+    /// Gloas widens this from one bool to two, `[ATTESTATION_TIMELINESS_INDEX,
+    /// PTC_TIMELINESS_INDEX]`: a block is now timed against both the
+    /// attestation deadline and the (later) payload-attestation-committee
+    /// deadline. Pre-gloas code reads `ATTESTATION_TIMELINESS_INDEX` only,
+    /// the same deadline it always checked.
+    pub(crate) block_timeliness: HashMap<H256, [bool; NUM_BLOCK_TIMELINESS_DEADLINES]>,
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
+    /// Gloas: beacon block roots whose execution payload envelope has been
+    /// locally delivered and verified (`on_execution_payload_envelope`'s own
+    /// `store.payloads[root] = envelope`), standing in for the specification's
+    /// `store.payloads` for exactly the question this crate asks of it today,
+    /// `is_payload_verified`'s membership test. The envelope itself is not
+    /// kept: nothing here reads one back out yet, and it is not clear this
+    /// scratch is even where a kept envelope should live, since (see this
+    /// struct's own doc) `verified_payloads` needs to survive a restart and
+    /// nothing else here does.
+    pub(crate) verified_payloads: HashSet<H256>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
+    /// `None` until that member votes. Keyed by beacon block root, like
+    /// `block_timeliness`.
+    pub(crate) payload_timeliness_vote: HashMap<H256, Vec<Option<bool>>>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's blob data was available, the sibling of
+    /// `payload_timeliness_vote`.
+    pub(crate) payload_data_availability_vote: HashMap<H256, Vec<Option<bool>>>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
     /// against the slot the unfinalized-window bound prunes them by.
     ///
@@ -3038,9 +3084,17 @@ impl Store {
         self.beacon.lock().unwrap().proposer_boost_root = root;
     }
 
-    /// Whether `root` arrived within the same-slot reorg window. `None` when
-    /// no timeliness has been recorded for the block yet.
-    pub fn block_timeliness(&self, root: &H256) -> Option<bool> {
+    /// `root`'s two timeliness deadlines,
+    /// `[ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX]`. `None` when no
+    /// timeliness has been recorded for the block yet.
+    ///
+    /// A pre-gloas caller wants `ATTESTATION_TIMELINESS_INDEX`, the same-slot
+    /// reorg deadline this answered alone before gloas added the second;
+    /// `is_head_late` reads exactly that index rather than a narrower
+    /// accessor existing beside this one, since gloas and pre-gloas share
+    /// one record per block and pre-gloas code writes both entries of it
+    /// (see [`Store::set_block_timeliness`]).
+    pub fn block_timeliness(&self, root: &H256) -> Option<[bool; NUM_BLOCK_TIMELINESS_DEADLINES]> {
         self.beacon
             .lock()
             .unwrap()
@@ -3049,8 +3103,12 @@ impl Store {
             .copied()
     }
 
-    /// Records whether `root` arrived within the same-slot reorg window.
-    pub fn set_block_timeliness(&mut self, root: H256, timely: bool) {
+    /// Records `root`'s two timeliness deadlines. See [`Store::block_timeliness`].
+    pub fn set_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
         self.beacon
             .lock()
             .unwrap()
@@ -3077,6 +3135,18 @@ impl Store {
             .insert(index);
     }
 
+    /// Gloas: whether `root`'s execution payload envelope has been locally
+    /// delivered and verified, the specification's `is_payload_verified`.
+    pub fn has_verified_payload(&self, root: &H256) -> bool {
+        self.beacon.lock().unwrap().verified_payloads.contains(root)
+    }
+
+    /// Gloas: records that `root`'s execution payload envelope has been
+    /// verified.
+    pub fn insert_verified_payload(&mut self, root: H256) {
+        self.beacon.lock().unwrap().verified_payloads.insert(root);
+    }
+
     /// The latest attestation recorded for validator `index`, if any.
     pub fn latest_message(&self, index: u64) -> Option<LatestMessage> {
         self.beacon
@@ -3094,6 +3164,49 @@ impl Store {
             .unwrap()
             .latest_messages
             .insert(index, message);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s payload was timely, one entry per PTC member and `None` for a
+    /// member that has not voted yet. `None` when `root` has no vote vector at
+    /// all yet (`get_forkchoice_store`/`on_block` seed one per block).
+    pub fn payload_timeliness_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-timeliness vote vector.
+    pub fn set_payload_timeliness_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .insert(root, votes);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s blob data was available. The sibling of
+    /// [`Store::payload_timeliness_vote`].
+    pub fn payload_data_availability_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-data-availability vote vector.
+    pub fn set_payload_data_availability_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .insert(root, votes);
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
@@ -6282,8 +6395,11 @@ mod tests {
         assert!(store.is_equivocating(42));
         assert!(!store.is_equivocating(43));
 
-        clone.set_block_timeliness(H256::from([1u8; 32]), true);
-        assert_eq!(store.block_timeliness(&H256::from([1u8; 32])), Some(true));
+        clone.set_block_timeliness(H256::from([1u8; 32]), [true, false]);
+        assert_eq!(
+            store.block_timeliness(&H256::from([1u8; 32])),
+            Some([true, false])
+        );
         assert_eq!(store.block_timeliness(&H256::from([2u8; 32])), None);
     }
 
@@ -6292,7 +6408,9 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 3,
+            slot: 24,
             root: H256::from([7u8; 32]),
+            payload_present: false,
         };
 
         store.set_latest_message(1, message);

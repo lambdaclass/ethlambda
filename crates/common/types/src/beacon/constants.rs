@@ -400,6 +400,22 @@ pub const BUILDER_DEPOSIT_REQUEST_TYPE: u8 = 0x03;
 /// request.
 pub const BUILDER_EXIT_REQUEST_TYPE: u8 = 0x04;
 
+/// Index into `store.block_timeliness[root]` for whether the block itself
+/// arrived before the (ordinary) attestation deadline: the one deadline every
+/// fork before gloas checked, and still what `is_head_late` reads. See
+/// [`PTC_TIMELINESS_INDEX`] for the other.
+pub const ATTESTATION_TIMELINESS_INDEX: usize = 0;
+
+/// Index into `store.block_timeliness[root]` for whether the block arrived
+/// before the payload timeliness committee's own, later deadline
+/// (`get_payload_attestation_due_ms`). `should_apply_proposer_boost`'s
+/// equivocation scan reads this index.
+pub const PTC_TIMELINESS_INDEX: usize = 1;
+
+/// How many deadlines `store.block_timeliness[root]` records against: the
+/// length every entry has, one slot per index above.
+pub const NUM_BLOCK_TIMELINESS_DEADLINES: usize = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
