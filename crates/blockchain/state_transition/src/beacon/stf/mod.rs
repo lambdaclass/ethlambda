@@ -61,6 +61,7 @@ pub mod deneb;
 pub mod electra;
 pub mod epoch;
 pub mod fulu;
+pub mod gloas;
 pub mod operations;
 
 use crate::beacon::containers;

@@ -228,9 +228,14 @@ pub fn upgrade_to_altair(
 // here that mutates a post-state field-by-field rather than only building
 // one, and the fields it reaches for that [`BeaconState`]'s own accessors do
 // not cover (`exit_balance_to_consume`, `consolidation_balance_to_consume`,
-// `pending_deposits`) already have a projection to reuse in
-// `crate::beacon::helpers::electra` (`electra_state`, returning `ElectraOrFuluMut`),
-// so this file does not need a second one of its own.
+// `pending_deposits`) already have projections to reuse in
+// `crate::beacon::helpers::electra`: the first two through `churn_cursors_mut`
+// (returning `ChurnCursorsMut`), and `pending_deposits` indirectly, through
+// [`crate::beacon::helpers::electra::queue_excess_active_balance`] and
+// [`crate::beacon::helpers::electra::queue_entire_balance_and_reset_validator`]
+// (both reaching it through `pending_queue_fields`, returning
+// `PendingQueueFields`), so this file does not need a second projection of
+// its own.
 
 /// The bellatrix state, or an error naming the function that needs one.
 fn bellatrix_state_ref<'a>(

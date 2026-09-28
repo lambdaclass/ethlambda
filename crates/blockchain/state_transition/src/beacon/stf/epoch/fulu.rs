@@ -59,7 +59,7 @@ use crate::beacon::containers::electra as electra_containers;
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::get_current_epoch;
-use crate::beacon::helpers::electra::get_activation_exit_churn_limit;
+use crate::beacon::helpers::electra::{get_activation_exit_churn_limit, pending_queue_fields};
 use crate::beacon::helpers::fulu::{get_beacon_proposer_indices, proposer_lookahead_mut};
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::lean_state_unreachable;
@@ -134,15 +134,14 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
     // See `electra::process_pending_deposits`'s own doc for why the queue is
     // taken by value here rather than iterated in place.
     let (available_for_processing, deposits) = {
-        let mut fields = electra::pending_queue_fields(state, "process_pending_deposits")?;
+        let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
         let available_for_processing = fields
             .deposit_balance_to_consume()
             .checked_add(churn_limit)
             .ok_or(Error::ArithmeticOverflow(
                 "deposit_balance_to_consume + get_activation_exit_churn_limit",
             ))?;
-        let deposits: Vec<electra_containers::PendingDeposit> =
-            core::mem::take(fields.pending_deposits_mut()?).into_inner();
+        let deposits: Vec<electra_containers::PendingDeposit> = fields.take_pending_deposits()?;
         (available_for_processing, deposits)
     };
 
@@ -218,8 +217,8 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
         0
     };
 
-    let mut fields = electra::pending_queue_fields(state, "process_pending_deposits")?;
-    *fields.pending_deposits_mut()? = electra_containers::PendingDeposits::try_from(remaining)?;
+    let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
+    fields.set_pending_deposits(remaining)?;
     *fields.deposit_balance_to_consume_mut() = deposit_balance_to_consume;
 
     Ok(())
@@ -394,7 +393,7 @@ mod tests {
     fn a_test_state_starts_with_deposit_requests_start_index_unset() {
         let mut state = fulu_state_with_validators(2);
         assert_eq!(
-            electra::pending_queue_fields(&mut state, "test assertion")
+            pending_queue_fields(&mut state, "test assertion")
                 .unwrap()
                 .deposit_requests_start_index(),
             constants::UNSET_DEPOSIT_REQUESTS_START_INDEX
@@ -410,11 +409,9 @@ mod tests {
         // this deposit through; only the eth1-bridge gate is under test.
         state.finalized_checkpoint_mut().epoch = 1;
         let deposit = request_sourced_pending_deposit(&state, 0);
-        electra::pending_queue_fields(&mut state, "test setup")
+        pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .pending_deposits_mut()
-            .unwrap()
-            .push(deposit)
+            .push_pending_deposit(deposit)
             .unwrap();
 
         let balance_before = state.balance(0).unwrap();
@@ -426,8 +423,10 @@ mod tests {
             state.balance(0).unwrap(),
             balance_before + preset::EFFECTIVE_BALANCE_INCREMENT
         );
-        let mut fields = electra::pending_queue_fields(&mut state, "test assertion").unwrap();
-        assert!(fields.pending_deposits_mut().unwrap().is_empty());
+        let BeaconState::Fulu(inner) = &state else {
+            unreachable!("built as Fulu");
+        };
+        assert!(inner.pending_deposits.is_empty());
     }
 
     #[test]
@@ -438,11 +437,9 @@ mod tests {
         // eth1-bridge gate, not the unrelated finality gate, is under test.
         state.finalized_checkpoint_mut().epoch = 1;
         let deposit = request_sourced_pending_deposit(&state, 0);
-        electra::pending_queue_fields(&mut state, "test setup")
+        pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .pending_deposits_mut()
-            .unwrap()
-            .push(deposit.clone())
+            .push_pending_deposit(deposit.clone())
             .unwrap();
 
         let balance_before = state.balance(0).unwrap();
@@ -457,9 +454,10 @@ mod tests {
         // this request-sourced entry and the whole pass breaks before ever
         // reaching it.
         assert_eq!(state.balance(0).unwrap(), balance_before);
-        let mut fields = electra::pending_queue_fields(&mut state, "test assertion").unwrap();
-        let remaining = fields.pending_deposits_mut().unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0], deposit);
+        let BeaconState::Fulu(inner) = &state else {
+            unreachable!("built as Fulu");
+        };
+        assert_eq!(inner.pending_deposits.len(), 1);
+        assert_eq!(inner.pending_deposits[0], deposit);
     }
 }
