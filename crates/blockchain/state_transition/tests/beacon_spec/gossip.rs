@@ -30,7 +30,7 @@ use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect, collect_all_handlers, fork_active_from_genesis};
+use super::{Case, PRESET, collect, collect_all_handlers};
 
 /// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
@@ -171,22 +171,20 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
     }
 }
 
-/// The case's own `config.yaml`, when it carries one: the vectors that pin a
-/// non-default blob schedule ship a full config alongside their blocks and
-/// state, which the compiled-in preset config does not share.
+/// [`super::case_config`], plus this suite's own `genesis_time` override.
 ///
-/// Most cases carry no `config.yaml` at all. Per the consensus-specs tests
-/// format README, a present `config.yaml` replaces the default runtime
-/// config, and an absent one means the preset default; see
-/// [`fork_active_from_genesis`] for what that default is and why.
+/// The vectors that pin a non-default blob schedule ship a full
+/// `config.yaml` alongside their blocks and state, which the compiled-in
+/// preset config does not share; [`super::case_config`] is what reads it (or
+/// falls back) and corrects `seconds_per_slot`. Gossip validation additionally
+/// checks timestamps against the wall clock relative to `state.genesis_time`,
+/// which no case's `config.yaml` carries (every one of them was generated
+/// under [`super::PRESET`]'s own preset default), so this suite alone
+/// overrides it from the decoded state rather than trusting whatever
+/// `case_config` returned.
 fn case_config(case: &Case, state: &BeaconState) -> Config {
-    let mut config: Config = case
-        .yaml_opt("config")
-        .unwrap_or_else(|| fork_active_from_genesis(case));
+    let mut config = super::case_config(case);
     config.genesis_time = state.genesis_time();
-    // Newer configs name only `SLOT_DURATION_MS`; without `SECONDS_PER_SLOT`
-    // the field would keep mainnet's default.
-    config.seconds_per_slot = config.slot_duration_ms / 1000;
     config
 }
 

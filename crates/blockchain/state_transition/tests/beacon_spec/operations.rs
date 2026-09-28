@@ -143,9 +143,7 @@ use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
-use super::{
-    Case, PRESET, collect_all_handlers, fork_active_from_genesis, lean_is_not_a_fixture_fork,
-};
+use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
 
 /// The `{execution_valid: bool}` an `execution_payload` case ships alongside
 /// its block, standing in for whatever a real execution client would have
@@ -630,26 +628,6 @@ fn apply(
     outcome.map_err(|err| format!("{err:?}"))
 }
 
-/// The config to process one case's operation against.
-///
-/// Most cases carry no `config.yaml` of their own, and
-/// [`fork_active_from_genesis`]'s all-forks-at-genesis default serves
-/// them; see its own doc for why that is the right fallback. Only
-/// `gloas_stf::get_ptc` (reached through `process_payload_attestation`) reads
-/// a fork-epoch config field directly in this whole suite
-/// (`config.gloas_fork_epoch`, for the spec's own `assert epoch >=
-/// GLOAS_FORK_EPOCH`), which is why gloas's own `payload_attestation` cases
-/// are the ones that need a real answer here rather than the default: every
-/// one of them ships a full `config.yaml`, and
-/// `process_payload_attestation_pre_fork_epoch` specifically sets
-/// `GLOAS_FORK_EPOCH: 1` to exercise that assertion's rejection path, so
-/// reading the case's own file first (rather than always overriding) is what
-/// keeps that case's expected rejection intact.
-fn case_config(case: &Case) -> Config {
-    case.yaml_opt("config")
-        .unwrap_or_else(|| fork_active_from_genesis(case))
-}
-
 pub fn trials() -> Vec<Trial> {
     let cases = collect_all_handlers(PRESET, "operations");
     let mut trials = vec![super::discovery_trial("operations", cases.len())];
@@ -659,7 +637,7 @@ pub fn trials() -> Vec<Trial> {
             let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
-            let config = case_config(case);
+            let config = super::case_config(case);
             let outcome = apply(&handler, case, &mut state, &config);
             super::check_transition(case, outcome, &state)
         }));

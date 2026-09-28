@@ -3642,11 +3642,13 @@ pub fn on_block(
         // ePBS (EIP-7732) moves the availability question from the block's
         // blob/column commitments to the separately gossiped execution
         // payload envelope; the check above the match on `signed_block` does
-        // not apply to a gloas block at all. `state_transition` below is the
-        // gloas gap this repository has not closed yet (Part B), so this
-        // returns the same `Error::UnsupportedForFork` any other
-        // fork-mismatched call in this crate does, rather than skipping the
-        // availability question with a silent `{}` arm.
+        // not apply to a gloas block at all. This arm refuses because gloas's
+        // own `on_block` is not ported yet, not because `state_transition`
+        // below is missing anything: envelope processing and the payload
+        // timeliness committee's vote still need their own fork-choice
+        // wiring, so this returns the same `Error::UnsupportedForFork` any
+        // other fork-mismatched call in this crate does, rather than
+        // skipping the availability question with a silent `{}` arm.
         SignedBeaconBlock::Gloas(_) => {
             return Err(Error::UnsupportedForFork {
                 function: "fork_choice::on_block",
