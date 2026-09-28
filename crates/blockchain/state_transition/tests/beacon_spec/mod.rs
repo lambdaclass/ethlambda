@@ -76,16 +76,15 @@ pub const PRESET: &str = if cfg!(feature = "preset-minimal") {
 /// The compiled-in preset with every fork up to and including `case.fork`
 /// pulled back to genesis, never a later one.
 ///
-/// The fallback the gossip and operations runners use when a case carries no
-/// `config.yaml` of its own to read a fork schedule from (see [`gossip`]'s
-/// own `case_config`). Those vectors are generated as if their own fork, and
-/// every one before it, had activated at genesis: the ones that ship a
-/// `config.yaml` set exactly that, apart from deliberate pre-fork cases such
-/// as `payload_attestation`'s `process_payload_attestation_pre_fork_epoch`,
-/// which schedules the fork later. Never a later fork: pulling forward one this
-/// case does not itself reach would let `Config::fork_at_epoch` resolve a
-/// state the case never claims to be, on any config a later runner builds
-/// this way.
+/// The fallback [`case_config`] uses when a case carries no `config.yaml` of
+/// its own to read a fork schedule from. Those vectors are generated as if
+/// their own fork, and every one before it, had activated at genesis: the
+/// ones that ship a `config.yaml` set exactly that, apart from deliberate
+/// pre-fork cases such as `payload_attestation`'s
+/// `process_payload_attestation_pre_fork_epoch`, which schedules the fork
+/// later. Never a later fork: pulling forward one this case does not itself
+/// reach would let `Config::fork_at_epoch` resolve a state the case never
+/// claims to be, on any config a later runner builds this way.
 pub fn fork_active_from_genesis(case: &Case) -> Config {
     ForkName::ALL
         .into_iter()
@@ -94,6 +93,39 @@ pub fn fork_active_from_genesis(case: &Case) -> Config {
         .fold(Config::active(), |config, fork| {
             config.with_fork_epoch(fork, 0)
         })
+}
+
+/// The config to process one case against: its own `config.yaml` when it
+/// ships one, [`fork_active_from_genesis`]'s all-forks-at-genesis default
+/// otherwise. Shared by [`gossip`], [`operations`] and [`sanity`], the three
+/// runners whose cases can carry a fork schedule (or, for gossip, a blob
+/// schedule) of their own.
+///
+/// The fork schedule matters in these suites because gloas's `get_ptc`,
+/// reached through attestation and payload attestation processing, reads
+/// `config.gloas_fork_epoch` for the specification's `assert epoch >=
+/// GLOAS_FORK_EPOCH`. [`Config::active`] alone leaves that epoch at
+/// `FAR_FUTURE_EPOCH`, which would reject every gloas case's attestations.
+/// The case's own file is read first, rather than always overridden, because
+/// deliberate pre-fork cases depend on it: `payload_attestation`'s
+/// `process_payload_attestation_pre_fork_epoch` sets `GLOAS_FORK_EPOCH: 1` to
+/// exercise that assertion's rejection path.
+///
+/// `seconds_per_slot` is corrected from `slot_duration_ms` unconditionally,
+/// whichever branch supplied `config`: per the consensus-specs tests format
+/// README, a case's `config.yaml` may name only `SLOT_DURATION_MS`, the field
+/// newer configs use, and leaving `seconds_per_slot` alone would keep
+/// whatever [`Config`]'s own `#[serde(default)]` gives it
+/// ([`Config::mainnet`]'s `12`, via `Config::default`) rather than the value
+/// that config's own slot duration actually implies. [`fork_active_from_genesis`]'s
+/// own default already keeps the two fields in agreement, so the correction
+/// is a no-op on that branch.
+pub fn case_config(case: &Case) -> Config {
+    let mut config: Config = case
+        .yaml_opt("config")
+        .unwrap_or_else(|| fork_active_from_genesis(case));
+    config.seconds_per_slot = config.slot_duration_ms / 1000;
+    config
 }
 
 /// The newest fork whose state transition this crate implements.
@@ -127,9 +159,6 @@ pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Fulu;
 /// even though [`HIGHEST_IMPLEMENTED_FORK`] has not reached Gloas yet; every
 /// other runner's Gloas cases stay ignored. Emptied, and removed along with
 /// this check, when [`HIGHEST_IMPLEMENTED_FORK`] becomes `Gloas`.
-///
-/// `"transition"` is not listed: its Gloas cases also exercise Gloas block
-/// processing, which does not exist yet.
 pub const GLOAS_RUNNERS: &[&str] = &[
     "ssz_static",
     "fork",
@@ -139,6 +168,10 @@ pub const GLOAS_RUNNERS: &[&str] = &[
     // runner name serves all of it, the same way `"ssz_static"` already
     // does for its own runner.
     "operations",
+    "sanity",
+    "finality",
+    "random",
+    "transition",
 ];
 
 /// The root of the extracted fixture tree.

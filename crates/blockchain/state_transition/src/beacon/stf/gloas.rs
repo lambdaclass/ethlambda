@@ -1,5 +1,6 @@
-//! Gloas's withdrawals, execution payload bid, and parent execution payload
-//! processing (EIP-7732).
+//! Gloas's block processing, withdrawals, execution payload bid, parent
+//! execution payload processing, and execution payload envelope verification
+//! (EIP-7732).
 //!
 //! Withdrawals gain two new sweeps of their own: builders can be paid out
 //! ([`get_builder_withdrawals`], draining
@@ -71,9 +72,61 @@ use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash
 use crate::beacon::helpers::predicates::is_slashable_attestation_data;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot, ValidatorIndex,
-    WithdrawalIndex,
+    Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _, ParticipationFlags, Root, Slot,
+    ValidatorIndex, WithdrawalIndex,
 };
+
+use super::ExecutionEngine;
+
+// ---------------------------------------------------------------------------
+// Block processing
+// ---------------------------------------------------------------------------
+
+/// `process_block` (gloas `beacon-chain.md`).
+///
+/// No execution payload is embedded in a gloas block, unlike every earlier
+/// fork's own `process_block`: the body only commits to a builder's bid
+/// ([`process_execution_payload_bid`]), and the payload itself is verified
+/// separately, once revealed, by [`verify_execution_payload_envelope`]. So,
+/// unlike [`crate::beacon::stf::fulu::process_block`] and its own siblings,
+/// this function takes no [`ExecutionEngine`].
+///
+/// `parent_slot` is read from `state.latest_block_header` before anything
+/// else runs: [`process_parent_execution_payload`], the very next step,
+/// processes the payload that header's own slot names, and
+/// [`super::block::process_block_header`], two steps after that, overwrites
+/// the header with this block's own. Reading it any later would read this
+/// block's slot instead of its parent's.
+pub fn process_block(
+    state: &mut BeaconState,
+    block: &gloas::BeaconBlock,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<()> {
+    // [New in Gloas:EIP7732]
+    let parent_slot = state.latest_block_header().slot;
+
+    // [New in Gloas:EIP7732]
+    process_parent_execution_payload(state, block, config)?;
+    super::block::process_block_header(
+        state,
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.body.hash_tree_root(),
+    )?;
+    // [Modified in Gloas:EIP7732]
+    process_withdrawals(state)?;
+    // [Modified in Gloas:EIP7732] Removed `process_execution_payload`.
+    // [New in Gloas:EIP7732]
+    process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)?;
+    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_eth1_data(state, &block.body.eth1_data)?;
+    // [Modified in Gloas:EIP7732]
+    process_operations(state, &block.body, parent_slot, config, committees)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Withdrawals
@@ -455,16 +508,15 @@ pub fn process_withdrawals(state: &mut BeaconState) -> Result<()> {
 ///
 /// The specification files this under "Execution payload", not "Operations":
 /// it is read by `execution_engine.verify_and_notify_new_payload`'s own
-/// `NewPayloadRequest.execution_requests`, in `verify_execution_payload_envelope`
-/// (gloas `fork-choice.md`), built from the revealed envelope's own
-/// `execution_requests`. Not from `state.latest_execution_payload_bid`: the
-/// bid commits to that list only by its hash
-/// ([`gloas::ExecutionPayloadBid::execution_requests_root`]), it never carries
-/// the list itself. Envelope verification is not transcribed yet, so nothing
-/// calls this today, the same place electra's own
+/// `NewPayloadRequest.execution_requests`, in [`verify_execution_payload_envelope`],
+/// built from the revealed envelope's own `execution_requests`. Not from
+/// `state.latest_execution_payload_bid`: the bid commits to that list only
+/// by its hash ([`gloas::ExecutionPayloadBid::execution_requests_root`]), it
+/// never carries the list itself. Nothing calls this even now that envelope
+/// verification is transcribed, the same place electra's own
 /// [`crate::beacon::stf::electra::get_execution_requests_list`] already is
 /// (see [`crate::beacon::stf::deneb::process_execution_payload`]'s own
-/// documentation for why: [`crate::beacon::stf::ExecutionEngine`] collapses the whole
+/// documentation for why: [`ExecutionEngine`] collapses the whole
 /// `verify_and_notify_new_payload` interface to one boolean and never
 /// inspects the list either implementation builds).
 pub fn get_execution_requests_list(requests: &gloas::ExecutionRequests) -> Vec<Vec<u8>> {
@@ -507,6 +559,163 @@ pub fn get_execution_requests_list(requests: &gloas::ExecutionRequests) -> Vec<V
     );
 
     list
+}
+
+/// `verify_execution_payload_envelope_signature` (gloas `beacon-chain.md`).
+///
+/// `Result<bool>` rather than a bare `bool`, the same deviation
+/// [`verify_execution_payload_bid_signature`]'s own doc explains: a
+/// self-build reads a real validator index
+/// (`state.latest_block_header.proposer_index`) into `state.validators`,
+/// and a non-self-build one reads `builder_index` into `state.builders`;
+/// either can be out of range for a caller that has not already checked it,
+/// which this reports rather than folding into "signature invalid".
+pub fn verify_execution_payload_envelope_signature(
+    state: &BeaconState,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+) -> Result<bool> {
+    let builder_index = signed_envelope.message.builder_index;
+    let pubkey = if builder_index == constants::BUILDER_INDEX_SELF_BUILD {
+        let validator_index = state.latest_block_header().proposer_index;
+        state.validator(validator_index)?.pubkey
+    } else {
+        let inner = gloas_state_ref(state, "verify_execution_payload_envelope_signature")?;
+        inner
+            .builders
+            .get(builder_index as usize)
+            .ok_or(Error::IndexOutOfBounds {
+                index: builder_index as usize,
+                len: inner.builders.len(),
+            })?
+            .pubkey
+    };
+
+    let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
+    let signing_root = compute_signing_root(signed_envelope.message.hash_tree_root(), domain);
+    Ok(bls::verify(
+        &pubkey,
+        signing_root,
+        &signed_envelope.signature,
+    ))
+}
+
+/// `verify_execution_payload_envelope` (gloas `fork-choice.md`).
+///
+/// A pure verification helper: it mutates nothing, matching the
+/// specification's own note that `process_execution_payload` has been
+/// replaced by this function plus the deferred [`apply_parent_execution_payload`]
+/// (see this module's own doc). Called once a builder's envelope for the
+/// slot's committed bid has been received, in addition to the checks
+/// [`process_execution_payload_bid`] already made against the bid itself:
+/// this checks the *envelope* is the one thing that bid actually promised.
+///
+/// The engine check has the same collapsed shape
+/// [`crate::beacon::stf::fulu::process_execution_payload`]'s own: see
+/// [`ExecutionEngine`]'s own doc for why the versioned hashes below are
+/// computed but never themselves checked against anything beyond the
+/// engine's own opaque verdict.
+pub fn verify_execution_payload_envelope(
+    state: &BeaconState,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    engine: &ExecutionEngine,
+) -> Result<()> {
+    let envelope = &signed_envelope.message;
+    let payload = &envelope.payload;
+
+    // Verify signature.
+    verify(
+        verify_execution_payload_envelope_signature(state, signed_envelope)?,
+        "verify_execution_payload_envelope: verify_execution_payload_envelope_signature(state, signed_envelope)",
+    )?;
+
+    // Verify consistency with the beacon block.
+    //
+    // `BeaconState::compute_state_root`, not a bare `hash_tree_root`. The
+    // specification's own `header.state_root = hash_tree_root(state)` is
+    // exactly right for a state fresh out of block processing, whose own
+    // `latest_block_header.state_root` is still left zero (see
+    // `super::process_slot`'s own doc for why). But this function's
+    // real caller, `on_execution_payload_envelope`, hands in a *stored*
+    // state, and this repository caches the real root into that same field
+    // right after `state_transition` returns (`fork_choice::on_block`, the
+    // checkpoint anchor), not one slot later the way a raw spec state would.
+    // Hashing such a state unconditionally would hash a header whose own
+    // `state_root` is already set, a different value from the one the
+    // header actually committed to when it was still zero, so every stored
+    // state's envelope would be rejected. `compute_state_root` returns the
+    // cached value directly once it is set and only falls back to a fresh
+    // hash while it is still zero, so both shapes resolve to the same root.
+    let mut header = state.latest_block_header().clone();
+    header.state_root = state.compute_state_root();
+    verify(
+        envelope.beacon_block_root == header.hash_tree_root(),
+        "verify_execution_payload_envelope: envelope.beacon_block_root == hash_tree_root(header)",
+    )?;
+    verify(
+        envelope.parent_beacon_block_root == state.latest_block_header().parent_root,
+        "verify_execution_payload_envelope: envelope.parent_beacon_block_root == state.latest_block_header.parent_root",
+    )?;
+
+    // Verify consistency with the committed bid.
+    let inner = gloas_state_ref(state, "verify_execution_payload_envelope")?;
+    let bid = &inner.latest_execution_payload_bid;
+    verify(
+        envelope.builder_index == bid.builder_index,
+        "verify_execution_payload_envelope: envelope.builder_index == bid.builder_index",
+    )?;
+    verify(
+        payload.prev_randao == bid.prev_randao,
+        "verify_execution_payload_envelope: payload.prev_randao == bid.prev_randao",
+    )?;
+    verify(
+        payload.gas_limit == bid.gas_limit,
+        "verify_execution_payload_envelope: payload.gas_limit == bid.gas_limit",
+    )?;
+    verify(
+        payload.block_hash == bid.block_hash,
+        "verify_execution_payload_envelope: payload.block_hash == bid.block_hash",
+    )?;
+    verify(
+        envelope.execution_requests.hash_tree_root() == bid.execution_requests_root,
+        "verify_execution_payload_envelope: hash_tree_root(envelope.execution_requests) == bid.execution_requests_root",
+    )?;
+
+    // Verify the execution payload is valid.
+    verify(
+        payload.slot_number == state.slot(),
+        "verify_execution_payload_envelope: payload.slot_number == state.slot",
+    )?;
+    verify(
+        payload.parent_hash == inner.latest_block_hash,
+        "verify_execution_payload_envelope: payload.parent_hash == state.latest_block_hash",
+    )?;
+    verify(
+        payload.timestamp
+            == super::bellatrix::compute_timestamp_at_slot(state, state.slot(), config),
+        "verify_execution_payload_envelope: payload.timestamp == compute_time_at_slot(state, state.slot)",
+    )?;
+    verify(
+        payload.withdrawals.hash_tree_root() == inner.payload_expected_withdrawals.hash_tree_root(),
+        "verify_execution_payload_envelope: hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)",
+    )?;
+
+    // Compute versioned hashes.
+    let _versioned_hashes: Vec<Bytes32> = bid
+        .blob_kzg_commitments
+        .iter()
+        .map(super::deneb::kzg_commitment_to_versioned_hash)
+        .collect();
+
+    verify(
+        engine.execution_valid,
+        "verify_execution_payload_envelope: execution_engine.verify_and_notify_new_payload(\
+         NewPayloadRequest(execution_payload=payload, versioned_hashes=versioned_hashes, \
+         parent_beacon_block_root=envelope.parent_beacon_block_root, \
+         execution_requests=envelope.execution_requests))",
+    )?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1405,7 +1614,9 @@ pub fn process_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::containers::BeaconBlockHeader;
     use crate::beacon::fork::ForkName;
+    use crate::beacon::primitives::{BlsPubkey, BlsSignature, ExecutionBlockHash, Uint256};
 
     fn gloas_state_with_validators(count: usize) -> BeaconState {
         crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, count)
@@ -1681,5 +1892,341 @@ mod tests {
                 "expected {expected_message:?} to fail, got {result:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_execution_payload_envelope
+    // -----------------------------------------------------------------------
+
+    /// A syntactically valid but otherwise arbitrary [`gloas::ExecutionPayload`],
+    /// for a test that only cares about the envelope wrapping it, not the
+    /// payload's own contents. [`gloas::ExecutionPayload`] has no
+    /// `#[derive(Default)]` (see its own doc: `logs_bloom` has no meaningful
+    /// empty value), so every field is filled by hand instead.
+    fn arbitrary_execution_payload() -> gloas::ExecutionPayload {
+        gloas::ExecutionPayload {
+            parent_hash: ExecutionBlockHash::ZERO,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: crate::beacon::containers::bellatrix::LogsBloom::try_from(vec![
+                0u8;
+                preset::BYTES_PER_LOGS_BLOOM
+            ])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Bytes32::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: ExecutionBlockHash::ZERO,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        }
+    }
+
+    /// A self-build gloas state and the unsigned message an envelope for its
+    /// current slot must match field for field to pass every check in
+    /// [`verify_execution_payload_envelope`] but the engine's own.
+    ///
+    /// Returned unsigned and paired with the proposer's real secret key, so
+    /// a test can tamper with exactly one field before signing: signing
+    /// *after* the tamper keeps the signature real, over the tampered
+    /// message, rather than merely malformed, which is what lets a test
+    /// isolate the one assertion downstream of the signature check that the
+    /// tamper is meant to trip. `tweak_bid` runs before the state's own
+    /// fields (and so its `hash_tree_root`) are finalized, for a tamper that
+    /// must land in the committed bid itself; `tweak_message` runs after,
+    /// against the otherwise-consistent message, for one that must not.
+    fn consistent_envelope_message(
+        tweak_bid: impl FnOnce(&mut gloas::ExecutionPayloadBid),
+        tweak_message: impl FnOnce(&mut gloas::ExecutionPayloadEnvelope),
+    ) -> (
+        BeaconState,
+        Config,
+        blst::min_pk::SecretKey,
+        gloas::ExecutionPayloadEnvelope,
+    ) {
+        let mut state = gloas_state_with_validators(1);
+        let secret = crate::beacon::helpers::test_state::secret_key_for(0);
+        state.validator_mut(0).unwrap().pubkey = BlsPubkey(secret.sk_to_pk().to_bytes());
+
+        let slot = state.slot();
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            slot,
+            proposer_index: 0,
+            parent_root: Root::repeat_byte(0x11),
+            state_root: Root::ZERO,
+            body_root: Root::repeat_byte(0x22),
+        };
+
+        let config = Config::mainnet();
+        let parent_hash = ExecutionBlockHash::repeat_byte(0x33);
+        let execution_requests = gloas::ExecutionRequests::default();
+        let mut bid = gloas::ExecutionPayloadBid {
+            parent_block_hash: ExecutionBlockHash::ZERO,
+            parent_block_root: Root::ZERO,
+            block_hash: ExecutionBlockHash::repeat_byte(0x44),
+            prev_randao: Bytes32::repeat_byte(0x55),
+            fee_recipient: ExecutionAddress::ZERO,
+            gas_limit: 30_000_000,
+            builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+            slot,
+            value: 0,
+            execution_payment: 0,
+            blob_kzg_commitments: Default::default(),
+            execution_requests_root: execution_requests.hash_tree_root(),
+        };
+        tweak_bid(&mut bid);
+
+        {
+            let inner = gloas_state(&mut state, "test").unwrap();
+            inner.latest_block_hash = parent_hash;
+            inner.latest_execution_payload_bid = bid.clone();
+            inner.payload_expected_withdrawals = gloas::Withdrawals::default();
+        }
+        // `validators` is the tree-backed field `validator_mut` above
+        // buffered a write against; flush it before `state.compute_state_root()`
+        // below, the same way `gossip::test_support::fulu_parent` does.
+        state.apply_pending_mutations();
+
+        // The same `compute_state_root` call `verify_execution_payload_envelope`
+        // itself now makes; see that function's own doc for why. The header's
+        // own `state_root` is still zero at this point, so this falls to a
+        // fresh `hash_tree_root`, matching a state fresh out of block
+        // processing.
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.compute_state_root();
+        let beacon_block_root = header.hash_tree_root();
+
+        let payload = gloas::ExecutionPayload {
+            parent_hash,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: crate::beacon::containers::bellatrix::LogsBloom::try_from(vec![
+                0u8;
+                preset::BYTES_PER_LOGS_BLOOM
+            ])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: bid.prev_randao,
+            block_number: 0,
+            gas_limit: bid.gas_limit,
+            gas_used: 0,
+            timestamp: crate::beacon::stf::bellatrix::compute_timestamp_at_slot(
+                &state, slot, &config,
+            ),
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: bid.block_hash,
+            transactions: Default::default(),
+            withdrawals: gloas::Withdrawals::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: slot,
+        };
+
+        let mut message = gloas::ExecutionPayloadEnvelope {
+            payload,
+            execution_requests,
+            builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root,
+            parent_beacon_block_root: state.latest_block_header().parent_root,
+        };
+        tweak_message(&mut message);
+
+        (state, config, secret, message)
+    }
+
+    /// Signs `message` the way a builder (or, for a self-build, the
+    /// proposer) would: over `hash_tree_root(message)` under
+    /// `DOMAIN_BEACON_BUILDER`, matching
+    /// [`verify_execution_payload_envelope_signature`] exactly.
+    fn sign_envelope(
+        state: &BeaconState,
+        secret: &blst::min_pk::SecretKey,
+        message: gloas::ExecutionPayloadEnvelope,
+    ) -> gloas::SignedExecutionPayloadEnvelope {
+        let domain = get_domain(state, constants::DOMAIN_BEACON_BUILDER, None);
+        let signing_root = compute_signing_root(message.hash_tree_root(), domain);
+        let signature = BlsSignature(
+            secret
+                .sign(signing_root.as_slice(), bls::DST, &[])
+                .to_bytes(),
+        );
+        gloas::SignedExecutionPayloadEnvelope { message, signature }
+    }
+
+    #[test]
+    fn a_consistent_envelope_only_fails_the_engine_check() {
+        let (state, config, secret, message) = consistent_envelope_message(|_| {}, |_| {});
+        let signed = sign_envelope(&state, &secret, message);
+
+        assert!(
+            matches!(
+                verify_execution_payload_envelope(
+                    &state,
+                    &signed,
+                    &config,
+                    &ExecutionEngine::invalid()
+                ),
+                Err(Error::SpecAssert(
+                    "verify_execution_payload_envelope: execution_engine.verify_and_notify_new_payload(\
+                     NewPayloadRequest(execution_payload=payload, versioned_hashes=versioned_hashes, \
+                     parent_beacon_block_root=envelope.parent_beacon_block_root, \
+                     execution_requests=envelope.execution_requests))"
+                ))
+            ),
+            "every check but the engine's should have already passed"
+        );
+        verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid())
+            .expect("a consistent envelope passes every check, including a valid engine's");
+    }
+
+    #[test]
+    fn a_stored_states_cached_state_root_still_matches_the_envelope() {
+        // `consistent_envelope_message` builds the state the way a state
+        // fresh out of block processing looks: `latest_block_header.state_root`
+        // still zero. This repository's stored states do not stay that way:
+        // `fork_choice::on_block` (and the checkpoint anchor) cache the real
+        // root into that same field right after `state_transition` returns,
+        // which is what `verify_execution_payload_envelope`'s only real
+        // caller, `on_execution_payload_envelope`, actually hands in.
+        let (mut state, config, secret, message) = consistent_envelope_message(|_| {}, |_| {});
+        let signed = sign_envelope(&state, &secret, message);
+
+        // Computed, not asserted: `compute_state_root` on this still-zero
+        // state falls to a fresh hash, the same value
+        // `consistent_envelope_message` already built `envelope.beacon_block_root`
+        // from. Caching it into the header mimics the stored shape without
+        // changing what that value actually is.
+        let cached_root = state.compute_state_root();
+        state.latest_block_header_mut().state_root = cached_root;
+
+        verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid())
+            .expect("a stored state's cached header.state_root must still match the envelope");
+    }
+
+    #[test]
+    fn a_wrong_beacon_block_root_is_rejected() {
+        let (state, config, secret, message) = consistent_envelope_message(
+            |_| {},
+            |message| message.beacon_block_root = Root::repeat_byte(0xee),
+        );
+        // Signed *after* the tamper, so the signature itself still checks
+        // out: what should fail is the block-root consistency check, not
+        // the signature.
+        let signed = sign_envelope(&state, &secret, message);
+
+        let result =
+            verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid());
+        assert!(
+            matches!(
+                result,
+                Err(Error::SpecAssert(
+                    "verify_execution_payload_envelope: envelope.beacon_block_root == hash_tree_root(header)"
+                ))
+            ),
+            "expected the beacon_block_root check to fail, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_builder_index_is_rejected() {
+        // Only the committed bid's own `builder_index` disagrees; the
+        // envelope stays self-build-consistent (signed by the proposer,
+        // `builder_index == BUILDER_INDEX_SELF_BUILD`), so the signature
+        // check still passes and the mismatch is isolated to the one
+        // assertion it is meant to trip. `bid.builder_index` is otherwise
+        // unread by `verify_execution_payload_envelope`.
+        let (state, config, secret, message) =
+            consistent_envelope_message(|bid| bid.builder_index = 0, |_| {});
+        let signed = sign_envelope(&state, &secret, message);
+
+        let result =
+            verify_execution_payload_envelope(&state, &signed, &config, &ExecutionEngine::valid());
+        assert!(
+            matches!(
+                result,
+                Err(Error::SpecAssert(
+                    "verify_execution_payload_envelope: envelope.builder_index == bid.builder_index"
+                ))
+            ),
+            "expected the builder_index check to fail, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_execution_payload_envelope_signature
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_builder_signed_envelope_passes_the_signature_check() {
+        let mut state = gloas_state_with_validators(1);
+        let secret = crate::beacon::helpers::test_state::secret_key_for(1);
+        let builder_index: gloas::BuilderIndex = {
+            let inner = gloas_state(&mut state, "test").unwrap();
+            inner.builders.push(gloas::Builder {
+                pubkey: BlsPubkey(secret.sk_to_pk().to_bytes()),
+                ..Default::default()
+            });
+            (inner.builders.len() - 1) as gloas::BuilderIndex
+        };
+        state.apply_pending_mutations();
+
+        let message = gloas::ExecutionPayloadEnvelope {
+            payload: arbitrary_execution_payload(),
+            execution_requests: gloas::ExecutionRequests::default(),
+            builder_index,
+            beacon_block_root: Root::ZERO,
+            parent_beacon_block_root: Root::ZERO,
+        };
+        let signed = sign_envelope(&state, &secret, message);
+
+        assert!(
+            verify_execution_payload_envelope_signature(&state, &signed).unwrap(),
+            "a builder's own signature over an envelope naming its own index must verify"
+        );
+    }
+
+    #[test]
+    fn a_self_build_envelope_signed_with_a_builders_key_is_rejected() {
+        let mut state = gloas_state_with_validators(1);
+        // The proposer's own key, distinct from the builder's below, so a
+        // self-build envelope genuinely needs it rather than accepting any
+        // signature.
+        let proposer_secret = crate::beacon::helpers::test_state::secret_key_for(0);
+        state.validator_mut(0).unwrap().pubkey = BlsPubkey(proposer_secret.sk_to_pk().to_bytes());
+        *state.latest_block_header_mut() = BeaconBlockHeader {
+            proposer_index: 0,
+            ..Default::default()
+        };
+        state.apply_pending_mutations();
+
+        let builder_secret = crate::beacon::helpers::test_state::secret_key_for(1);
+        let message = gloas::ExecutionPayloadEnvelope {
+            payload: arbitrary_execution_payload(),
+            execution_requests: gloas::ExecutionRequests::default(),
+            builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root: Root::ZERO,
+            parent_beacon_block_root: Root::ZERO,
+        };
+        // Signed with the builder's key, not the proposer's: a self-build
+        // envelope must verify against the proposer named in
+        // `state.latest_block_header.proposer_index`, so this signature must
+        // not check out.
+        let signed = sign_envelope(&state, &builder_secret, message);
+
+        assert!(
+            !verify_execution_payload_envelope_signature(&state, &signed).unwrap(),
+            "a self-build envelope signed by a builder, not the proposer, must not verify"
+        );
     }
 }
