@@ -45,20 +45,18 @@
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::{
-    Deposit, ProposerSlashing, SignedVoluntaryExit, Validator,
-};
+use crate::beacon::containers::shared::{Deposit, ProposerSlashing, SignedVoluntaryExit};
 use crate::beacon::containers::{BeaconState, capella, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
 use crate::beacon::helpers::capella::{
-    is_fully_withdrawable_validator, is_partially_withdrawable_validator,
+    is_fully_withdrawable_validator, is_partially_withdrawable_validator, withdrawal_address,
 };
 use crate::beacon::helpers::misc::{compute_domain, compute_signing_root};
 use crate::beacon::helpers::mutators::decrease_balance;
 use crate::beacon::preset;
-use crate::beacon::primitives::{ExecutionAddress, H256, HashTreeRoot as _};
+use crate::beacon::primitives::{H256, HashTreeRoot as _};
 
 use super::ExecutionEngine;
 
@@ -109,14 +107,6 @@ pub fn process_block(
 // ---------------------------------------------------------------------------
 // Withdrawals
 // ---------------------------------------------------------------------------
-
-/// The execution address a validator's payout is sent to: the low bytes of
-/// its eth1 withdrawal credentials, the same bytes
-/// [`process_bls_to_execution_change`] writes when a validator upgrades into
-/// this form.
-fn withdrawal_address(validator: &Validator) -> ExecutionAddress {
-    ExecutionAddress::from_slice(&validator.withdrawal_credentials.0[12..])
-}
 
 /// The withdrawals this block's sweep owes, without applying them.
 ///
@@ -509,7 +499,8 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::primitives::{
-        BlsPubkey, BlsSignature, ExecutionBlockHash, Gwei, Root, Uint256, ValidatorIndex,
+        BlsPubkey, BlsSignature, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
+        ValidatorIndex,
     };
     use libssz_types::SszVector;
 

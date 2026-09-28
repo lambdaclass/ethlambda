@@ -113,9 +113,11 @@
 //! accessor on [`BeaconState`]. Unlike altair's participation flags (see
 //! [`crate::beacon::helpers::altair::altair_state`]'s doc), these fields are not
 //! electra-only: fulu keeps every one of them unchanged (see the [`fulu`]
-//! module doc), so [`electra_state`] and [`electra_state_ref`] match both
-//! `BeaconState::Electra` and `BeaconState::Fulu` rather than only the
-//! former. A projection that matched only `Electra`, the way
+//! module doc), and gloas keeps the churn cursors and (behind a slice view;
+//! see [`PendingQueueFields`]'s own doc) the pending queues unchanged too, so
+//! [`churn_cursors_mut`] and [`pending_queue_fields`]/[`pending_queue_fields_ref`]
+//! match `BeaconState::Electra`, `BeaconState::Fulu`, and `BeaconState::Gloas`
+//! rather than only the first. A projection that matched only `Electra`, the way
 //! [`crate::beacon::helpers::altair::altair_state`] matches only `Altair`, would
 //! silently break every one of these functions on a fulu state, which is the
 //! single easiest mistake to make copying that shape without also copying
@@ -387,14 +389,23 @@ pub fn get_consolidation_churn_limit(state: &BeaconState, config: &Config) -> Re
 /// The total amount queued in [`electra::PendingPartialWithdrawal`]s for
 /// `index`, not yet paid out.
 ///
-/// Read by electra's execution layer consolidation request processing (not
-/// implemented in this file) to refuse consolidating a validator that still
-/// has a partial withdrawal in flight: consolidating it out from under that
-/// withdrawal would leave nothing left to pay the withdrawal from.
+/// Read by [`crate::beacon::stf::electra::process_withdrawal_request`] and
+/// [`crate::beacon::stf::electra::process_consolidation_request`] to refuse consolidating,
+/// or fully exiting, a validator that still has a partial withdrawal in
+/// flight: doing either out from under that withdrawal would leave nothing
+/// left to pay it from.
+///
+/// Also served, unmodified, by gloas: nothing in gloas's own `beacon-chain.md`
+/// touches this function, and the only thing that kept a gloas state from
+/// calling this exact copy was the queue's own type
+/// ([`crate::beacon::containers::gloas::PendingPartialWithdrawals`], a
+/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// [`PendingQueueFieldsRef::pending_partial_withdrawals`] already abstracts
+/// over as a slice.
 pub fn get_pending_balance_to_withdraw(state: &BeaconState, index: ValidatorIndex) -> Result<Gwei> {
-    let fields = electra_state_ref(state, "get_pending_balance_to_withdraw")?;
+    let fields = pending_queue_fields_ref(state, "get_pending_balance_to_withdraw")?;
     let mut total: Gwei = 0;
-    for withdrawal in fields.pending_partial_withdrawals().iter() {
+    for withdrawal in fields.pending_partial_withdrawals() {
         if withdrawal.validator_index == index {
             total = total.saturating_add(withdrawal.amount);
         }
@@ -582,7 +593,7 @@ pub fn initiate_validator_exit(
 /// budget rather than [`get_activation_exit_churn_limit`]'s combined one.
 /// Nothing past that line differs, so gloas does not get a copy of its own:
 /// this picks the limit by fork and otherwise runs the one shared cursor
-/// update, through [`ChurnCursorsMut`] rather than [`ElectraOrFuluMut`] (see
+/// update, through [`ChurnCursorsMut`] rather than [`PendingQueueFields`] (see
 /// that enum's own doc for why). Gloas modifies neither
 /// `initiate_validator_exit` (so neither voluntary exits nor registry
 /// ejections) nor `process_withdrawal_request`, so calling this from any
@@ -804,10 +815,7 @@ pub fn queue_excess_active_balance(state: &mut BeaconState, index: ValidatorInde
     *state.balance_mut(index)? = preset::MIN_ACTIVATION_BALANCE;
 
     let deposit = placeholder_pending_deposit(state.validator(index)?, excess_balance);
-    electra_state(state, "queue_excess_active_balance")?
-        .pending_deposits_mut()
-        .push(deposit)?;
-    Ok(())
+    pending_queue_fields(state, "queue_excess_active_balance")?.push_pending_deposit(deposit)
 }
 
 /// Zeroes a validator's balance and effective balance, resets its activation
@@ -836,10 +844,8 @@ pub fn queue_entire_balance_and_reset_validator(
     validator.activation_eligibility_epoch = FAR_FUTURE_EPOCH;
 
     let deposit = placeholder_pending_deposit(state.validator(index)?, balance);
-    electra_state(state, "queue_entire_balance_and_reset_validator")?
-        .pending_deposits_mut()
-        .push(deposit)?;
-    Ok(())
+    pending_queue_fields(state, "queue_entire_balance_and_reset_validator")?
+        .push_pending_deposit(deposit)
 }
 
 // ---------------------------------------------------------------------------
@@ -855,7 +861,12 @@ pub fn queue_entire_balance_and_reset_validator(
 /// `eth_fast_aggregate_verify`'s empty-committee case, but does not export
 /// it, so this file builds its own rather than reaching into that module's
 /// internals.
-fn g2_point_at_infinity() -> BlsSignature {
+///
+/// `pub(crate)`: gloas's
+/// [`crate::beacon::stf::gloas::process_execution_payload_bid`] requires a
+/// self-built bid to carry exactly this signature, since a self-build is
+/// not signed by a builder.
+pub(crate) fn g2_point_at_infinity() -> BlsSignature {
     let mut bytes = [0u8; BLS_SIGNATURE_SIZE];
     // The top two bits are the compression and infinity flags; setting both
     // and leaving every other bit zero is the point at infinity's compressed
@@ -879,55 +890,283 @@ fn placeholder_pending_deposit(validator: &Validator, amount: Gwei) -> electra::
     }
 }
 
-/// Either fork whose state carries electra's balance-churn accounting and
-/// pending-deposit/withdrawal queues (EIP-7251) unchanged: electra itself, or
-/// fulu, which never redefines any of the fields read through this. See this
-/// module's doc for why both are accepted, and [`electra_state`] for the
-/// mutable counterpart.
-pub(crate) enum ElectraOrFulu<'a> {
-    Electra(&'a electra::BeaconState),
-    Fulu(&'a fulu::BeaconState),
-}
-
-impl<'a> ElectraOrFulu<'a> {
-    /// Partial withdrawals queued but not yet paid out, read by
-    /// [`get_pending_balance_to_withdraw`].
-    pub(crate) fn pending_partial_withdrawals(&self) -> &electra::PendingPartialWithdrawals {
-        match self {
-            ElectraOrFulu::Electra(state) => &state.pending_partial_withdrawals,
-            ElectraOrFulu::Fulu(state) => &state.pending_partial_withdrawals,
-        }
-    }
-}
-
-/// The mutable counterpart of [`ElectraOrFulu`]. See [`electra_state`].
-pub(crate) enum ElectraOrFuluMut<'a> {
+/// Fields the execution-layer-triggered request processors gloas leaves
+/// unmodified need, gathered from wherever they sit on electra's, fulu's, or
+/// gloas's own state: `deposit_requests_start_index`, the
+/// `deposit_balance_to_consume` churn cursor, a new validator's empty
+/// participation and inactivity entries
+/// ([`Self::push_empty_participation_and_inactivity`]), and the
+/// three pending queues (`pending_deposits`, `pending_partial_withdrawals`,
+/// `pending_consolidations`), both as element-level slice views (`len()`,
+/// `iter()`/`get()` through the returned `&[T]`, one-at-a-time `push_*`) and
+/// as a whole (`take_*`/`set_*`, for epoch processing's own whole-queue
+/// drains).
+///
+/// Electra's, fulu's, and gloas's `pending_deposits` (and the other two
+/// queues) share one element type each but not one container: electra's and
+/// fulu's is the bounded `SszList` (`electra::PendingDeposits` and friends),
+/// gloas's is EIP-7688's unbounded [`libssz_types::ProgressiveList`]
+/// (`crate::beacon::containers::gloas::PendingDeposits` and friends). Both
+/// deref to `[T]` with the same element type, which is what lets the
+/// slice-view and element-`push_*` methods below serve all three forks
+/// through one match rather than needing a gloas copy of every caller.
+///
+/// Epoch processing's whole-queue drains and the block-level request
+/// processors (`crate::beacon::stf::electra`'s `process_deposit_request`
+/// and friends) share this one projection rather than each keeping a
+/// near-identical one.
+///
+/// Deliberately separate from [`ChurnCursorsMut`]: that one carries the four
+/// exit/consolidation churn cursor fields, which nothing here reads or
+/// writes, and every gloas caller that needs those reaches them through
+/// `ChurnCursorsMut` directly, not through this projection.
+pub(crate) enum PendingQueueFields<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
+    Gloas(&'a mut gloas::BeaconState),
 }
 
-impl<'a> ElectraOrFuluMut<'a> {
-    /// Deposits queued but not yet credited to the validator registry, pushed
-    /// to by [`queue_excess_active_balance`] and
-    /// [`queue_entire_balance_and_reset_validator`].
-    pub(crate) fn pending_deposits_mut(&mut self) -> &mut electra::PendingDeposits {
+impl<'a> PendingQueueFields<'a> {
+    /// The execution-layer deposit request index at which the state switched
+    /// from crediting deposits off `Eth1Data` votes to crediting them off
+    /// `DepositRequest`s directly, read by
+    /// `crate::beacon::stf::epoch::electra::process_pending_deposits` to know
+    /// whether any eth1-bridge deposit is still outstanding.
+    ///
+    /// `pub(crate)`: fulu's own tests read this to assert a test state starts
+    /// with it at [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`].
+    /// Fulu's and gloas's own `process_pending_deposits` never read this
+    /// field at all.
+    pub(crate) fn deposit_requests_start_index(&self) -> u64 {
         match self {
-            ElectraOrFuluMut::Electra(state) => &mut state.pending_deposits,
-            ElectraOrFuluMut::Fulu(state) => &mut state.pending_deposits,
+            PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
+            PendingQueueFields::Fulu(state) => state.deposit_requests_start_index,
+            PendingQueueFields::Gloas(state) => state.deposit_requests_start_index,
         }
+    }
+
+    /// How much of this epoch's deposit balance churn limit remains unused.
+    pub(crate) fn deposit_balance_to_consume(&self) -> Gwei {
+        match self {
+            PendingQueueFields::Electra(state) => state.deposit_balance_to_consume,
+            PendingQueueFields::Fulu(state) => state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => state.deposit_balance_to_consume,
+        }
+    }
+
+    pub(crate) fn deposit_balance_to_consume_mut(&mut self) -> &mut Gwei {
+        match self {
+            PendingQueueFields::Electra(state) => &mut state.deposit_balance_to_consume,
+            PendingQueueFields::Fulu(state) => &mut state.deposit_balance_to_consume,
+            PendingQueueFields::Gloas(state) => &mut state.deposit_balance_to_consume,
+        }
+    }
+
+    /// Queues one more [`electra::PendingDeposit`], pushed by
+    /// [`queue_excess_active_balance`], [`queue_entire_balance_and_reset_validator`],
+    /// and the deposit-request processors. Infallible on gloas's unbounded
+    /// queue; electra's and fulu's bounded one can still reject a length over
+    /// its own SSZ limit.
+    pub(crate) fn push_pending_deposit(&mut self, deposit: electra::PendingDeposit) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => state.pending_deposits.push(deposit)?,
+            PendingQueueFields::Fulu(state) => state.pending_deposits.push(deposit)?,
+            PendingQueueFields::Gloas(state) => state.pending_deposits.push(deposit),
+        }
+        Ok(())
+    }
+
+    /// Takes the whole pending-deposits queue out, leaving an empty one
+    /// behind; [`Self::set_pending_deposits`] puts a (possibly shorter) one
+    /// back. `Vec`-level, the same shape
+    /// [`Self::take_pending_consolidations`]/[`Self::set_pending_consolidations`]
+    /// already use, for the same reason:
+    /// `crate::beacon::stf::epoch::electra::process_pending_deposits` needs
+    /// to drain the whole queue into a `Vec` it can freely mutate `state`
+    /// around, not a reference still borrowing it.
+    ///
+    /// Refuses gloas: gloas modifies `process_pending_deposits` and drains
+    /// the queue through its own state, so a gloas state reaching electra's
+    /// or fulu's copy is a dispatch mistake, not a caller to serve.
+    pub(crate) fn take_pending_deposits(&mut self) -> Result<Vec<electra::PendingDeposit>> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                Ok(core::mem::take(&mut state.pending_deposits).into_inner())
+            }
+            PendingQueueFields::Fulu(state) => {
+                Ok(core::mem::take(&mut state.pending_deposits).into_inner())
+            }
+            PendingQueueFields::Gloas(_) => Err(Error::UnsupportedForFork {
+                function: "process_pending_deposits",
+                fork: ForkName::Gloas,
+            }),
+        }
+    }
+
+    /// See [`Self::take_pending_deposits`], including why gloas is refused.
+    /// Also fails when the queue outgrows electra's and fulu's bounded
+    /// `SszList`.
+    pub(crate) fn set_pending_deposits(
+        &mut self,
+        deposits: Vec<electra::PendingDeposit>,
+    ) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.pending_deposits = electra::PendingDeposits::try_from(deposits)?;
+            }
+            PendingQueueFields::Fulu(state) => {
+                state.pending_deposits = electra::PendingDeposits::try_from(deposits)?;
+            }
+            PendingQueueFields::Gloas(_) => {
+                return Err(Error::UnsupportedForFork {
+                    function: "process_pending_deposits",
+                    fork: ForkName::Gloas,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Partial withdrawals queued but not yet paid out, as a slice. Read by
+    /// [`get_pending_balance_to_withdraw`] and by
+    /// [`crate::beacon::stf::electra::process_withdrawal_request`]'s own queue-length
+    /// check.
+    pub(crate) fn pending_partial_withdrawals(&self) -> &[electra::PendingPartialWithdrawal] {
+        match self {
+            PendingQueueFields::Electra(state) => &state.pending_partial_withdrawals,
+            PendingQueueFields::Fulu(state) => &state.pending_partial_withdrawals,
+            PendingQueueFields::Gloas(state) => &state.pending_partial_withdrawals,
+        }
+    }
+
+    /// Queues one more [`electra::PendingPartialWithdrawal`], pushed by
+    /// [`crate::beacon::stf::electra::process_withdrawal_request`].
+    pub(crate) fn push_pending_partial_withdrawal(
+        &mut self,
+        withdrawal: electra::PendingPartialWithdrawal,
+    ) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.pending_partial_withdrawals.push(withdrawal)?
+            }
+            PendingQueueFields::Fulu(state) => {
+                state.pending_partial_withdrawals.push(withdrawal)?
+            }
+            PendingQueueFields::Gloas(state) => state.pending_partial_withdrawals.push(withdrawal),
+        }
+        Ok(())
+    }
+
+    /// Queued consolidations, as a slice. Read by
+    /// [`crate::beacon::stf::electra::process_consolidation_request`]'s own queue-length
+    /// check.
+    pub(crate) fn pending_consolidations(&self) -> &[electra::PendingConsolidation] {
+        match self {
+            PendingQueueFields::Electra(state) => &state.pending_consolidations,
+            PendingQueueFields::Fulu(state) => &state.pending_consolidations,
+            PendingQueueFields::Gloas(state) => &state.pending_consolidations,
+        }
+    }
+
+    /// Queues one more [`electra::PendingConsolidation`], pushed by
+    /// [`crate::beacon::stf::electra::process_consolidation_request`].
+    pub(crate) fn push_pending_consolidation(
+        &mut self,
+        consolidation: electra::PendingConsolidation,
+    ) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.pending_consolidations.push(consolidation)?
+            }
+            PendingQueueFields::Fulu(state) => state.pending_consolidations.push(consolidation)?,
+            PendingQueueFields::Gloas(state) => state.pending_consolidations.push(consolidation),
+        }
+        Ok(())
+    }
+
+    /// Takes the whole pending-consolidations queue out, leaving an empty one
+    /// behind; [`Self::set_pending_consolidations`] puts a (possibly
+    /// shorter) one back. `Vec`-level, alongside the element-level
+    /// [`Self::pending_consolidations`]/[`Self::push_pending_consolidation`],
+    /// because `crate::beacon::stf::epoch::electra::process_pending_consolidations`
+    /// needs the whole queue in a `Vec` it can freely mutate `state` around
+    /// while draining it, not a reference still borrowing it.
+    pub(crate) fn take_pending_consolidations(&mut self) -> Vec<electra::PendingConsolidation> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
+            PendingQueueFields::Fulu(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
+            PendingQueueFields::Gloas(state) => {
+                core::mem::take(&mut state.pending_consolidations).into_inner()
+            }
+        }
+    }
+
+    /// See [`Self::take_pending_consolidations`]. Fallible only for electra's
+    /// and fulu's bounded `SszList`; gloas's progressive one never rejects a
+    /// length.
+    pub(crate) fn set_pending_consolidations(
+        &mut self,
+        consolidations: Vec<electra::PendingConsolidation>,
+    ) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.pending_consolidations =
+                    electra::PendingConsolidations::try_from(consolidations)?;
+            }
+            PendingQueueFields::Fulu(state) => {
+                state.pending_consolidations =
+                    electra::PendingConsolidations::try_from(consolidations)?;
+            }
+            PendingQueueFields::Gloas(state) => {
+                state.pending_consolidations = gloas::PendingConsolidations::from(consolidations);
+            }
+        }
+        Ok(())
+    }
+
+    /// Extends `previous_epoch_participation`, `current_epoch_participation`,
+    /// and `inactivity_scores` by one all-zero entry each, keeping them
+    /// exactly as long as the registry after a new validator is appended.
+    ///
+    /// Gloas's own three lists are progressive (`libssz_types::ProgressiveList`),
+    /// so their `push` is infallible, unlike electra's and fulu's bounded
+    /// `SszList`.
+    pub(crate) fn push_empty_participation_and_inactivity(&mut self) -> Result<()> {
+        match self {
+            PendingQueueFields::Electra(state) => {
+                state.previous_epoch_participation.push(0)?;
+                state.current_epoch_participation.push(0)?;
+                state.inactivity_scores.push(0)?;
+            }
+            PendingQueueFields::Fulu(state) => {
+                state.previous_epoch_participation.push(0)?;
+                state.current_epoch_participation.push(0)?;
+                state.inactivity_scores.push(0)?;
+            }
+            PendingQueueFields::Gloas(state) => {
+                state.previous_epoch_participation.push(0);
+                state.current_epoch_participation.push(0);
+                state.inactivity_scores.push(0);
+            }
+        }
+        Ok(())
     }
 }
 
-/// The electra-or-fulu state, mutably, or an error naming the function that
-/// needs one. See [`ElectraOrFuluMut`] and this module's doc for why both
-/// forks are accepted.
-pub(crate) fn electra_state<'a>(
+/// The electra, fulu, or gloas state, mutably, through [`PendingQueueFields`].
+/// See that enum's own doc for why gloas joins electra and fulu here.
+pub(crate) fn pending_queue_fields<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
-) -> Result<ElectraOrFuluMut<'a>> {
+) -> Result<PendingQueueFields<'a>> {
     match state {
-        BeaconState::Electra(state) => Ok(ElectraOrFuluMut::Electra(state)),
-        BeaconState::Fulu(state) => Ok(ElectraOrFuluMut::Fulu(state)),
+        BeaconState::Electra(state) => Ok(PendingQueueFields::Electra(state)),
+        BeaconState::Fulu(state) => Ok(PendingQueueFields::Fulu(state)),
+        BeaconState::Gloas(state) => Ok(PendingQueueFields::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -935,14 +1174,34 @@ pub(crate) fn electra_state<'a>(
     }
 }
 
-/// The electra-or-fulu state, immutably. See [`electra_state`].
-pub(crate) fn electra_state_ref<'a>(
+/// The read-only counterpart of [`PendingQueueFields`], for a caller (like
+/// [`get_pending_balance_to_withdraw`]) that only ever reads a pending queue
+/// and so only ever holds a `&BeaconState`.
+pub(crate) enum PendingQueueFieldsRef<'a> {
+    Electra(&'a electra::BeaconState),
+    Fulu(&'a fulu::BeaconState),
+    Gloas(&'a gloas::BeaconState),
+}
+
+impl<'a> PendingQueueFieldsRef<'a> {
+    pub(crate) fn pending_partial_withdrawals(&self) -> &[electra::PendingPartialWithdrawal] {
+        match self {
+            PendingQueueFieldsRef::Electra(state) => &state.pending_partial_withdrawals,
+            PendingQueueFieldsRef::Fulu(state) => &state.pending_partial_withdrawals,
+            PendingQueueFieldsRef::Gloas(state) => &state.pending_partial_withdrawals,
+        }
+    }
+}
+
+/// The electra, fulu, or gloas state, immutably. See [`pending_queue_fields`].
+pub(crate) fn pending_queue_fields_ref<'a>(
     state: &'a BeaconState,
     function: &'static str,
-) -> Result<ElectraOrFulu<'a>> {
+) -> Result<PendingQueueFieldsRef<'a>> {
     match state {
-        BeaconState::Electra(state) => Ok(ElectraOrFulu::Electra(state)),
-        BeaconState::Fulu(state) => Ok(ElectraOrFulu::Fulu(state)),
+        BeaconState::Electra(state) => Ok(PendingQueueFieldsRef::Electra(state)),
+        BeaconState::Fulu(state) => Ok(PendingQueueFieldsRef::Fulu(state)),
+        BeaconState::Gloas(state) => Ok(PendingQueueFieldsRef::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
             fork: other.fork_name(),
@@ -959,14 +1218,10 @@ pub(crate) fn electra_state_ref<'a>(
 /// (`compute_exit_epoch_and_update_churn`,
 /// [`get_consolidation_churn_limit_for_fork`]).
 ///
-/// Deliberately narrower than [`ElectraOrFuluMut`]: that enum also exposes
-/// `pending_deposits_mut`, whose gloas type
-/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
-/// [`libssz_types::ProgressiveList`], EIP-7688) is not electra's and fulu's
-/// bounded [`electra::PendingDeposits`], so widening `ElectraOrFuluMut`
-/// itself to gloas would leave that one method with no honest gloas arm to
-/// give it. This projection carries only the four fields every one of the
-/// three forks actually shares.
+/// Deliberately separate from [`PendingQueueFields`]: that one carries the
+/// deposit-balance churn cursor and the three pending queues, none of which
+/// this projection reads or writes. This one carries only the four
+/// exit/consolidation churn cursor fields.
 pub(crate) enum ChurnCursorsMut<'a> {
     Electra(&'a mut electra::BeaconState),
     Fulu(&'a mut fulu::BeaconState),
@@ -1040,7 +1295,7 @@ impl<'a> ChurnCursorsMut<'a> {
 }
 
 /// The electra-or-fulu-or-gloas state, mutably, through [`ChurnCursorsMut`].
-/// See that enum's own doc for why it exists apart from [`electra_state`].
+/// See that enum's own doc for why it exists apart from [`pending_queue_fields`].
 pub(crate) fn churn_cursors_mut<'a>(
     state: &'a mut BeaconState,
     function: &'static str,
@@ -1076,10 +1331,18 @@ mod tests {
     }
 
     /// A fulu state, otherwise identical to [`electra_state_with_validators`],
-    /// used only to prove [`electra_state`]/[`electra_state_ref`] accept fulu
-    /// too and are not accidentally scoped to `BeaconState::Electra` alone.
+    /// used only to prove [`pending_queue_fields`]/[`pending_queue_fields_ref`]
+    /// accept fulu too and are not accidentally scoped to `BeaconState::Electra`
+    /// alone.
     fn fulu_state_with_validators(count: usize) -> BeaconState {
         crate::beacon::helpers::test_state::with_validators_at(ForkName::Fulu, count)
+    }
+
+    /// A gloas state, otherwise identical to [`electra_state_with_validators`],
+    /// used to prove [`pending_queue_fields`]/[`pending_queue_fields_ref`]
+    /// accept gloas too.
+    fn gloas_state_with_validators(count: usize) -> BeaconState {
+        crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, count)
     }
 
     // -- Predicates ---------------------------------------------------------
@@ -1504,27 +1767,65 @@ mod tests {
     // -- Fork projection ------------------------------------------------------
 
     #[test]
-    fn electra_state_ref_accepts_both_electra_and_fulu_but_not_phase0() {
+    fn pending_queue_fields_ref_accepts_electra_fulu_and_gloas_but_not_phase0() {
         let electra_state_value = electra_state_with_validators(4);
-        assert!(electra_state_ref(&electra_state_value, "test").is_ok());
+        assert!(pending_queue_fields_ref(&electra_state_value, "test").is_ok());
 
         let fulu_state_value = fulu_state_with_validators(4);
-        assert!(electra_state_ref(&fulu_state_value, "test").is_ok());
+        assert!(pending_queue_fields_ref(&fulu_state_value, "test").is_ok());
+
+        let gloas_state_value = gloas_state_with_validators(4);
+        assert!(pending_queue_fields_ref(&gloas_state_value, "test").is_ok());
 
         let phase0_state_value = crate::beacon::helpers::test_state::with_validators(4);
-        assert!(electra_state_ref(&phase0_state_value, "test").is_err());
+        assert!(pending_queue_fields_ref(&phase0_state_value, "test").is_err());
     }
 
     #[test]
-    fn electra_state_mut_accepts_both_electra_and_fulu_but_not_phase0() {
+    fn pending_queue_fields_accepts_electra_fulu_and_gloas_but_not_phase0() {
         let mut electra_state_value = electra_state_with_validators(4);
-        assert!(electra_state(&mut electra_state_value, "test").is_ok());
+        assert!(pending_queue_fields(&mut electra_state_value, "test").is_ok());
 
         let mut fulu_state_value = fulu_state_with_validators(4);
-        assert!(electra_state(&mut fulu_state_value, "test").is_ok());
+        assert!(pending_queue_fields(&mut fulu_state_value, "test").is_ok());
+
+        let mut gloas_state_value = gloas_state_with_validators(4);
+        assert!(pending_queue_fields(&mut gloas_state_value, "test").is_ok());
 
         let mut phase0_state_value = crate::beacon::helpers::test_state::with_validators(4);
-        assert!(electra_state(&mut phase0_state_value, "test").is_err());
+        assert!(pending_queue_fields(&mut phase0_state_value, "test").is_err());
+    }
+
+    #[test]
+    fn get_pending_balance_to_withdraw_works_on_a_gloas_state() {
+        let mut state = gloas_state_with_validators(4);
+        {
+            let mut fields = pending_queue_fields(&mut state, "test").unwrap();
+            fields
+                .push_pending_partial_withdrawal(electra::PendingPartialWithdrawal {
+                    validator_index: 2,
+                    amount: 7,
+                    withdrawable_epoch: 0,
+                })
+                .unwrap();
+        }
+        assert_eq!(get_pending_balance_to_withdraw(&state, 2).unwrap(), 7);
+        assert_eq!(get_pending_balance_to_withdraw(&state, 0).unwrap(), 0);
+    }
+
+    #[test]
+    fn queue_excess_active_balance_works_on_a_gloas_state() {
+        let mut state = gloas_state_with_validators(4);
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 5;
+
+        queue_excess_active_balance(&mut state, 0).unwrap();
+
+        assert_eq!(state.balance(0).unwrap(), preset::MIN_ACTIVATION_BALANCE);
+        let BeaconState::Gloas(inner) = &state else {
+            unreachable!("just built as Gloas");
+        };
+        assert_eq!(inner.pending_deposits.len(), 1);
+        assert_eq!(inner.pending_deposits[0].amount, 5);
     }
 
     #[test]

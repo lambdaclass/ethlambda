@@ -44,7 +44,7 @@ use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
-use crate::beacon::helpers::electra::electra_state;
+use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
@@ -287,6 +287,15 @@ pub fn process_execution_requests(
 /// which is exactly the case [`super::epoch::fulu::process_pending_deposits`]'s
 /// own doc explains this fork's specification means to prevent: the field
 /// stays unset for good, not merely until this fork's own first request.
+///
+/// Also served, unmodified, by gloas: gloas's own `beacon-chain.md` does not
+/// redefine `process_deposit_request` either, so it inherits this fork's
+/// version rather than electra's, and the only thing that kept a gloas state
+/// from calling this exact copy was the queue's own type
+/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
+/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// [`crate::beacon::helpers::electra::PendingQueueFields::push_pending_deposit`]
+/// already abstracts over.
 pub fn process_deposit_request(
     state: &mut BeaconState,
     request: &electra::DepositRequest,
@@ -298,10 +307,7 @@ pub fn process_deposit_request(
         signature: request.signature,
         slot: state.slot(),
     };
-    electra_state(state, "process_deposit_request")?
-        .pending_deposits_mut()
-        .push(deposit)?;
-    Ok(())
+    pending_queue_fields(state, "process_deposit_request")?.push_pending_deposit(deposit)
 }
 
 #[cfg(test)]

@@ -35,8 +35,8 @@
 //!   `SszList` and `ProgressiveList` `Deref` to a plain `[T]`.
 //! - **[`super::electra::process_pending_consolidations`]** takes the queue
 //!   as a `Vec` and writes it back, through
-//!   [`super::electra::PendingQueueFields::take_pending_consolidations`] and
-//!   [`super::electra::PendingQueueFields::set_pending_consolidations`], which
+//!   [`crate::beacon::helpers::electra::PendingQueueFields::take_pending_consolidations`] and
+//!   [`crate::beacon::helpers::electra::PendingQueueFields::set_pending_consolidations`], which
 //!   accept a gloas state.
 //! - **[`super::fulu::process_proposer_lookahead`]** shifts the window
 //!   through an accessor both forks share, and chooses the proposer draw by
@@ -142,7 +142,7 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
 /// dropping it changes nothing observable once a chain has reached this far).
 /// The queue is gloas's own progressive one (EIP-7688), read and written
 /// directly through [`gloas_state`] rather than through
-/// [`super::electra::pending_queue_fields`]'s [`PendingQueueFields`](super::electra::PendingQueueFields),
+/// [`crate::beacon::helpers::electra::pending_queue_fields`]'s [`PendingQueueFields`](crate::beacon::helpers::electra::PendingQueueFields),
 /// which refuses that field for a gloas state (see its own doc). Once a
 /// deposit is dequeued and cleared to apply, though,
 /// [`super::electra::apply_pending_deposit`] is the identical function electra
