@@ -97,9 +97,9 @@ pub fn fork_active_from_genesis(case: &Case) -> Config {
 
 /// The config to process one case against: its own `config.yaml` when it
 /// ships one, [`fork_active_from_genesis`]'s all-forks-at-genesis default
-/// otherwise. Shared by [`gossip`], [`operations`] and [`sanity`], the three
-/// runners whose cases can carry a fork schedule (or, for gossip, a blob
-/// schedule) of their own.
+/// otherwise. Shared by [`gossip`], [`operations`], [`sanity`] and
+/// [`fork_choice`], the runners whose cases can carry a fork schedule (or, for
+/// gossip, a blob schedule) of their own.
 ///
 /// The fork schedule matters in these suites because gloas's `get_ptc`,
 /// reached through attestation and payload attestation processing, reads
@@ -172,6 +172,7 @@ pub const GLOAS_RUNNERS: &[&str] = &[
     "finality",
     "random",
     "transition",
+    "fork_choice",
 ];
 
 /// The root of the extracted fixture tree.
