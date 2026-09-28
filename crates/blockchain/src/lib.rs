@@ -2621,6 +2621,19 @@ impl BlockChainServer {
                     .has_state(&ancestor_parent_root)
                     .expect("DB read should succeed")
                 {
+                    // Held for its custody columns: its parent has a state
+                    // because it already reached the availability gate, and
+                    // re-importing it would only hold it again. Its release
+                    // (`release_block_if_columns_complete`) is what imports it
+                    // and cascades to this block through `pending_blocks`.
+                    // Without this, every child of a held block re-ran its
+                    // import: on a mainnet follower's first range batch after
+                    // a checkpoint sync, the 68 blocks behind the first one
+                    // re-held it 68 times over 54 s while its columns were
+                    // already on their way.
+                    if self.blocks_awaiting_columns.contains_key(&missing_root) {
+                        return None;
+                    }
                     // Parent state available — enqueue for processing, cascade
                     // handles the rest via the outer loop.
                     let fetched = self
@@ -2709,13 +2722,13 @@ impl BlockChainServer {
             }
             // A hold writes no post-state, so nothing pending on this root is
             // actually unblocked yet. Calling `collect_pending_children` here
-            // regardless — as a bare `Ok(())` from `process_block` used to
-            // make this arm do — would re-queue a child whose own ancestor
-            // walk (see the "Block parent missing" branch above) re-fetches
-            // this very block from `BlockHeaders` and re-enqueues it too,
-            // which re-holds it and reaches this same arm again: an infinite
-            // cycle on this function's own queue, with no yield point, on
-            // every fan-out delivery of one of this block's children.
+            // regardless, as a bare `Ok(())` from `process_block` used to make
+            // this arm do, re-queues children that can only pend again. It
+            // was an infinite cycle, with no yield point, while a child's
+            // ancestor walk (see the "Block parent missing" branch above)
+            // still re-fetched and re-enqueued a held block: that walk now
+            // stops at a block in `blocks_awaiting_columns`, but collecting
+            // here would still be work for nothing.
             // `release_block_if_columns_complete` is what reaches
             // `collect_pending_children` for real, once this root actually
             // has a post-state to unblock anything with.
@@ -5081,6 +5094,67 @@ mod tests {
         // ordering) — so this holds whether or not that attempt itself
         // succeeds, and it does not hang either way.
         assert!(!server.blocks_awaiting_columns.contains_key(&parent_root));
+    }
+
+    #[tokio::test]
+    async fn the_descendants_of_a_held_block_wait_for_it_without_re_importing_it() {
+        // A range batch hands the actor a whole chain at once. When its first
+        // block is held for columns, every later block names a held ancestor,
+        // and each used to re-queue that ancestor for another import that
+        // could only hold it again: 68 re-holds of one block on a mainnet
+        // follower's first batch after a checkpoint sync.
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
+        // The held block's parent, as in the test above: a known state is what
+        // lets it reach the availability gate at all.
+        store
+            .insert_signed_block(H256::ZERO, bare_block(0, H256::repeat_byte(0xcc)))
+            .expect("insert");
+        store
+            .insert_state(H256::ZERO, bare_state())
+            .expect("insert");
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 5 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        let mut server = beacon_server(store);
+        server.custody_columns = CUSTODY.to_vec();
+
+        let held = fulu_block_with_commitments(&server.store, 2);
+        let held_root = held.message_hash_tree_root();
+        server
+            .on_block(held.clone(), ImportTimings::default())
+            .await;
+        assert!(server.blocks_awaiting_columns.contains_key(&held_root));
+
+        let child = fulu_block(held_root, held.slot() + 1, 0);
+        let child_root = child.message_hash_tree_root();
+        let grandchild = fulu_block(child_root, held.slot() + 2, 0);
+        let grandchild_root = grandchild.message_hash_tree_root();
+
+        for block in [child, grandchild] {
+            let mut queue = VecDeque::new();
+            let outcome = server
+                .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+                .await;
+            assert_eq!(outcome, None, "a block with a held ancestor pends");
+            assert!(
+                queue.is_empty(),
+                "the held ancestor must not be queued for another import"
+            );
+        }
+
+        // Each waits on its own parent, so the held block's release cascades
+        // down the chain one import at a time.
+        assert!(server.blocks_awaiting_columns.contains_key(&held_root));
+        assert_eq!(
+            server.pending_blocks.get(&held_root),
+            Some(&HashSet::from([child_root]))
+        );
+        assert_eq!(
+            server.pending_blocks.get(&child_root),
+            Some(&HashSet::from([grandchild_root]))
+        );
     }
 
     // -----------------------------------------------------------------
