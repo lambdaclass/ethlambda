@@ -63,14 +63,15 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     // [IGNORE] The parent has been seen and passed validation (MAY queue).
     // A parent without a post-state may have failed, which the specification
     // rejects; without a bad-block cache this cannot tell failed from not yet
-    // imported, so it queues. See the design spec's deviations.
+    // imported, so it queues. See the design spec's deviations. Queues only
+    // a block whose signature verified, though: see `queue_if_signed`.
     let Some(parent_state) = parent_state else {
         let reason = if parent_known {
             QueueReason::ParentNotReady
         } else {
             QueueReason::ParentUnknown
         };
-        return queue_unless_forged(store, block, block_root, reason);
+        return queue_if_signed(store, block, block_root, reason);
     };
     // [REJECT] After its parent, expected proposer (when the parent's
     // lookahead can answer), known proposer, valid signature.
@@ -111,13 +112,28 @@ pub fn validate(
     stateful_checks(store, block, block.message_hash_tree_root())
 }
 
-/// `Queue(reason)`, unless the head state already shows the signature is forged.
+/// `Queue(reason)` for a block whose signature the head state verifies;
+/// `Reject` for one it shows is forged; `Ignore(SignatureUnverified)` for one
+/// it cannot judge.
 ///
 /// A block that cannot be judged against its parent yet can still be judged
 /// on its signature: validator indices never move, so the head state's key for
 /// the proposer is the one the block was signed with. Prysm does the same
 /// before queueing.
-fn queue_unless_forged(
+///
+/// A block that cannot be judged even that far is dropped, not queued. A
+/// queued block goes on to the chain actor, which parks it until its parent
+/// imports and then holds it until its custody columns arrive. Mainnet gossip
+/// carries altered copies of real blocks (a blob transaction re-encoded after
+/// signing, the original signature kept): no peer has columns for such a
+/// root, so a queued one sat held until finality evicted it, its columns
+/// asked for again every slot. Dropping costs a real block only its gossip
+/// delivery; a child's by-root fetch or range sync still brings it in.
+///
+/// The head state is read only through [`Store::cached_state`], for the
+/// reason [`stateful_checks`] gives. A resumed node caches it at startup, so
+/// the window before its first import is covered too.
+fn queue_if_signed(
     store: &Store,
     block: &SignedBeaconBlock,
     block_root: Root,
@@ -128,7 +144,7 @@ fn queue_unless_forged(
         .ok()
         .and_then(|head| store.cached_state(CacheKey::BlockState(head)));
     let Some(head_state) = head_state else {
-        return Outcome::Queue(reason);
+        return Outcome::Ignore(IgnoreReason::SignatureUnverified);
     };
     match precheck_block(
         block,
@@ -136,8 +152,11 @@ fn queue_unless_forged(
         Reference::Recent(&head_state),
         &store.config(),
     ) {
+        Ok(()) => Outcome::Queue(reason),
         Err(PrecheckError::BadSignature) => Outcome::Reject(RejectReason::BadSignature),
-        _ => Outcome::Queue(reason),
+        // `UnknownProposer`, the only other error a recent state reports: a
+        // validator newer than the head state, whose key it does not hold.
+        Err(_) => Outcome::Ignore(IgnoreReason::SignatureUnverified),
     }
 }
 
@@ -282,18 +301,39 @@ mod tests {
     }
 
     #[test]
-    fn a_block_whose_parent_was_never_seen_is_queued() {
+    fn a_block_whose_parent_was_never_seen_is_dropped_with_no_state_to_check_it() {
         let store = store(0);
         let SignedBeaconBlock::Fulu(mut orphan) = fulu_block(5, 1, 0) else {
             unreachable!("fulu_block builds a fulu block");
         };
         orphan.message.parent_root = Root::repeat_byte(0x11);
         let orphan = SignedBeaconBlock::Fulu(orphan);
-        // No head state is cached either, so the signature cannot be judged
-        // and the block is queued as it is.
+        // No head state is cached either, so the signature cannot be judged,
+        // and a block that cannot be judged is not queued.
         assert_eq!(
             stateful_checks(&store, &orphan, Root::repeat_byte(5)),
-            Outcome::Queue(QueueReason::ParentUnknown)
+            Outcome::Ignore(IgnoreReason::SignatureUnverified)
+        );
+    }
+
+    #[test]
+    fn an_unknown_parent_by_a_proposer_the_head_state_lacks_is_dropped() {
+        let store = store(0);
+        let head_state = fulu_parent(3);
+        store.cache_state(CacheKey::BlockState(Root::ZERO), Arc::new(head_state));
+
+        let proposer = 1_000;
+        let SignedBeaconBlock::Fulu(mut orphan) = fulu_block(5, proposer, 0) else {
+            unreachable!("fulu_block builds a fulu block");
+        };
+        orphan.message.parent_root = Root::repeat_byte(0x11);
+        let orphan = SignedBeaconBlock::Fulu(orphan);
+
+        // Neither forged nor verified: the head state holds no key for the
+        // proposer to check the signature with.
+        assert_eq!(
+            stateful_checks(&store, &orphan, orphan.message_hash_tree_root()),
+            Outcome::Ignore(IgnoreReason::SignatureUnverified)
         );
     }
 
@@ -303,7 +343,7 @@ mod tests {
         let config = store.config();
         let proposer: ValidatorIndex = 3;
         // `store()` sets the head to `Root::ZERO`, the same root
-        // `queue_unless_forged` reads through `Store::head`.
+        // `queue_if_signed` reads through `Store::head`.
         let head_state = fulu_parent(proposer);
         store.cache_state(
             CacheKey::BlockState(Root::ZERO),

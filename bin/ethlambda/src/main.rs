@@ -1724,12 +1724,17 @@ async fn fetch_initial_beacon_state(
                 .expect("repair_head leaves the head naming a real block");
             let gap = current_slot.saturating_sub(head_slot);
 
+            // Both resuming returns cache the head's state first, so gossip
+            // validation can check a parentless block's signature from the
+            // first message on; see `Store::cache_head_state`.
             if gap <= MAX_RESUMABLE_DB_STATE_AGE {
                 info!(head_slot, current_slot, gap, "Resuming from existing DB");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             if checkpoint_urls.is_empty() {
                 warn!(head_slot, current_slot, gap, "DB is stale; resuming anyway");
+                store.cache_head_state()?;
                 return Ok(store);
             }
             warn!(head_slot, current_slot, gap, "DB is stale; checkpoint sync");
