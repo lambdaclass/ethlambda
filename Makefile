@@ -8,6 +8,9 @@ fmt: ## 🎨 Format all code using rustfmt
 
 lint: ## 🔍 Run clippy on all workspace crates
 	cargo clippy --locked --workspace --all-targets -- -D warnings
+	# The spectests are `test = false` (stale leanSpec fixtures), which
+	# `--all-targets` skips: lint them by name so they keep compiling
+	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
 
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during

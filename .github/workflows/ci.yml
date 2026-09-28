@@ -49,6 +49,12 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      # The leanSpec spectests are `test = false` while the released fixtures
+      # lag leanVM, and `--all-targets` leaves such targets out. Name them so
+      # they keep compiling until they run again.
+      - name: Clippy (skipped spectests)
+        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+
       # tooling/event-monitor declares its own [workspace] table, so every step
       # above stops at the root workspace members and never reaches it. Its
       # tests run in this job rather than in `test` because clippy has already
