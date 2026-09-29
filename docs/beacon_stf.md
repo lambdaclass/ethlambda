@@ -293,6 +293,19 @@ over the registry should walk `validators().iter()`, zipped with
 candidate for computing once per epoch rather than per call, once it is shown
 that no block operation changes it mid-epoch.
 
+Epoch steps 1-3 (justification, inactivity updates, rewards) follow that rule
+through `helpers::participation`. One walk of `validators().iter()`, zipped with
+the flat participation slices, produces each validator's flags, its effective
+balance and the balance totals (an `EpochSummary`); the three steps then run
+over flat data and write back only the balances that changed. The summary lives
+for those three steps only, since registry updates change what it read. The
+per-block pulled-up tip needs just the totals, which `ParticipationTotals`
+computes without allocating. The fixtures still call each step alone, so the
+public step functions stay and each builds what it needs. The
+specification-shaped implementation is kept in `participation_reference` and
+`stf::epoch::altair_reference` for tests and debug builds: the driver runs it on
+a clone for registries of up to 4096 validators and asserts the outcomes agree.
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that
