@@ -131,3 +131,102 @@ answers `404`, since no candidate matches.
 This was found by running a mainnet follower and pointing a second one at its
 API: before the fallback existed, the second died with `peer served no block at
 the anchor slot 15265888`.
+
+## The fulu-to-gloas fork-choice boundary
+
+The gloas fork-choice text describes only a store anchored at a gloas block, so
+it says nothing about a tree that crosses from fulu into gloas, which is the
+tree every live follower holds at the fork epoch.
+
+- **The specification:** `get_parent_payload_status` reads the parent block's
+  execution payload bid, which a fulu parent does not have. Consensus-specs
+  issue #5096 asked what a pre-gloas parent should answer and was closed as
+  not planned. Pull request #5125 is open, as of this writing, and proposes
+  `PENDING`.
+- **ethlambda:** a pre-gloas block is a single node whose payload status is
+  `FULL`, since its payload ran inside the block and never had an empty branch.
+  Concretely, `get_parent_payload_status` of a gloas block with a pre-gloas
+  parent answers `FULL`; a pre-gloas block's only child (`get_node_children`) is
+  its `FULL` node; a vote for one (`get_supported_node`) supports that node
+  whatever its `payload_present` says; and `gloas_get_ancestor` stepping onto
+  one lands on `FULL`. Its payload also counts as verified, timely and available
+  (`is_payload_verified`, `payload_timeliness`, `payload_data_availability`), so
+  the first gloas block passes `on_block` and an `index == 1` vote for the last
+  fulu block passes `validate_on_attestation`.
+- **Which head runs:** `get_head_node` follows the current slot's fork, not the
+  head block's or the justified checkpoint's. From `GLOAS_FORK_EPOCH` on,
+  `gloas_get_head` runs over the whole tree, pre-gloas blocks included; before
+  it, the unchanged `compute_head` runs.
+- **Other clients:** Lodestar and Prysm also treat a pre-gloas parent as
+  `FULL`. Lighthouse (v8.2.2) answers `EMPTY` for a pre-gloas parent, although
+  #5125 describes its handling as `PENDING`.
+- **Consequence:** if #5125 lands, only the answers above change, and each is
+  named in the header comment of `fork_choice.rs`'s gloas section.
+
+## The gloas head tolerates state the specification asserts on
+
+Three places in the gloas head read something the specification would abort on,
+because a live node holds gaps a fixture tree never has. Each is marked
+"Implementation choice, not spec text" at its definition.
+
+- **Pruned votes** (`get_attestation_score`, and through it `is_head_weak` and
+  `is_parent_strong`; the gloas head reaches `is_head_weak` from
+  `should_apply_proposer_boost`, and the gloas proposer head reaches
+  `is_parent_strong`). A vote whose ancestor walk meets a root missing
+  from the block index contributes nothing, where `get_ancestor` would raise.
+  Pruning removes only entries below the finalized slot, and every root scored is
+  indexed at or above it, so such a walk cannot descend from the scored root and
+  the specification's own contribution for that vote is zero too.
+- **Unknown voters** (`gloas_get_attestation_score`). A vote for a root the store
+  never held is skipped, where `get_supported_node` would raise, so one stale
+  voter cannot abort a head computation. A block pruned from the index but still
+  in the store is not skipped: its vote walks the block table and contributes
+  nothing.
+- **Missing timeliness** (`should_apply_proposer_boost`). A candidate with no
+  `block_timeliness` entry reads as not timely by either deadline, where the
+  specification indexes the entry directly. The entries are in memory only, so a
+  restart empties them. The reading can only miss withholding a boost from an
+  early equivocation, never withhold one wrongly.
+- **Equivalence:** each is the specification's answer wherever the specification
+  has one; they differ only where it would have raised.
+
+## The envelope check reads the cached state root
+
+`verify_execution_payload_envelope` compares `envelope.beacon_block_root` with
+the root of the state's latest block header.
+
+- **The specification:** sets `header.state_root = hash_tree_root(state)` on a
+  copy of the header. That is exact for a state fresh out of block processing,
+  whose `latest_block_header.state_root` is still zero.
+- **ethlambda:** uses `BeaconState::compute_state_root`. The function's caller
+  hands it a stored state, and this repository writes the real root into that
+  header field as soon as the block's transition returns. Hashing such a state
+  would hash a header whose `state_root` is already set, a different value from
+  the one the header committed to, and every stored state's envelope would fail.
+  `compute_state_root` returns the cached value only while the state is still
+  at that block's slot and the field is set, and hashes otherwise, so both
+  shapes give the same root.
+- **Equivalence:** the same check, on both kinds of state.
+
+## Gloas `get_weight` is the specification's walk, with its cost
+
+`gloas_get_weight` transcribes the specification statement by statement, where
+the pre-gloas head folds weights bottom-up once per tree.
+
+- **ethlambda:** every node the head visits re-walks every latest message, each
+  ancestor step decodes signed blocks (the node's own and its parent's, and a
+  third per voter in `get_supported_node`), telling a pre-gloas root from a gloas
+  one costs a decode the pre-gloas tree never paid, and
+  `should_apply_proposer_boost` reruns a full `is_head_weak` score although its
+  answer does not depend on the node. `get_head_node` passes the store's shared
+  committee cache, so committees are not rebuilt per call.
+- **Why:** the port is checked against the fixtures statement by statement, and
+  a faster form is a second implementation to keep in step with the spec.
+- **Consequence:** fine for fixture trees, which are a handful of blocks.
+  `get_head_node` switches on the clock, so any follower on a network that
+  schedules gloas (Sepolia's built-in config does) runs `gloas_get_head` every
+  slot from `GLOAS_FORK_EPOCH`, over its pre-gloas tree, whether or not it can
+  import a gloas block. The remaining costs need a bottom-up form before that
+  epoch, not only before a gloas follower is deployed. The pre-gloas
+  form's own measurement, in `compute_weights`' documentation, is the estimate
+  of what the walk costs on a mainnet tree.
