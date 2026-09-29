@@ -20,9 +20,9 @@ use ethlambda_network_api::BlockAnnouncement;
 use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_slot;
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::ShortRoot;
-use ethlambda_types::attestation::AttestationData;
+use ethlambda_types::attestation::{AttestationData, SignedAttestation};
 use ethlambda_types::beacon::containers::{
-    BeaconState, SignedAggregateAndProof, SignedBeaconBlock, electra, phase0,
+    BeaconState, SignedAggregateAndProof, SignedBeaconBlock, electra, fulu, phase0,
 };
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
@@ -489,39 +489,27 @@ impl Default for EventBus {
 ///
 /// One field on [`crate::BlockChainServer`], so the rules for publishing live
 /// together rather than beside the actor's other state: the subscriber guard,
-/// which chain's payload shape an event takes, lean's snapshot diff around a
-/// store call, and beacon's persistent [`BeaconEventView`]. The actor only
-/// says what happened.
+/// which chain's payload shape an event takes, and the [`EventView`] the head
+/// and checkpoint events diff against. The actor only says what happened;
+/// it never builds a [`ChainEvent`] itself.
 ///
 /// The [`EventBus`] inside stays the cloneable handle the HTTP server
 /// subscribes through; this wrapper is the actor's alone, so nothing outside
 /// it can move the view or publish.
 pub(crate) struct ChainEvents {
     bus: EventBus,
-    /// Captured on both chains, since the actor's constructor is shared, but
-    /// read only by [`ChainEvents::publish_beacon_changes`].
-    beacon_view: BeaconEventView,
+    view: EventView,
 }
 
 impl ChainEvents {
-    /// Wrap `bus`, with the beacon view starting at `store`'s current head and
-    /// finalized checkpoint, so the first diff reports only what moves after
-    /// the actor starts.
+    /// Wrap `bus`, with the view starting at `store`'s current head and
+    /// checkpoints, so the first diff reports only what moves after the actor
+    /// starts.
     pub(crate) fn new(bus: EventBus, store: &Store) -> Self {
         Self {
             bus,
-            beacon_view: BeaconEventView::capture(store),
+            view: EventView::capture(store),
         }
-    }
-
-    /// Publish `event` as it is. See [`EventBus::emit`].
-    pub(crate) fn emit(&self, event: ChainEvent) {
-        self.bus.emit(event);
-    }
-
-    /// See [`EventBus::has_subscribers`].
-    pub(crate) fn has_subscribers(&self) -> bool {
-        self.bus.has_subscribers()
     }
 
     #[cfg(test)]
@@ -529,31 +517,71 @@ impl ChainEvents {
         self.bus.subscribe()
     }
 
-    /// Lean: capture the head and checkpoints before a store call whose moves
-    /// should be announced. Hand the result to
-    /// [`ChainEvents::publish_lean_changes`] once the call returns.
-    pub(crate) fn lean_snapshot(&self, store: &Store) -> ChainEventSnapshot {
-        ChainEventSnapshot::capture(store)
+    /// Lean: `head`, `justified_checkpoint` and `finalized_checkpoint`, in
+    /// that order, for whatever moved since the last diff.
+    ///
+    /// Called after each store call that can move them (`store::on_tick`,
+    /// `store::on_block`, and the proposer's pre-build catch-up), so a move
+    /// surfaces right after the call that made it, and several moves inside
+    /// one call coalesce into one event each. Only `head` is gated, against
+    /// [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`.
+    pub(crate) fn publish_lean_changes(&mut self, store: &Store, wall_clock_slot: u64) {
+        let Some(previous) = self.advance_view(store) else {
+            return;
+        };
+        let current = &self.view;
+        if current.head != previous.head {
+            publish_lean_head(store, &self.bus, current.head, wall_clock_slot);
+        }
+        if current.justified != previous.justified {
+            publish_lean_checkpoint(
+                store,
+                &self.bus,
+                current.justified,
+                LeanCheckpoint::Justified,
+            );
+        }
+        if current.finalized != previous.finalized {
+            publish_lean_checkpoint(
+                store,
+                &self.bus,
+                current.finalized,
+                LeanCheckpoint::Finalized,
+            );
+        }
     }
 
-    /// Lean: emit `head`, `justified_checkpoint` and `finalized_checkpoint`
-    /// for whatever moved since `snapshot`. See
-    /// [`ChainEventSnapshot::diff_and_emit`].
-    pub(crate) fn publish_lean_changes(
-        &self,
-        snapshot: ChainEventSnapshot,
-        store: &Store,
-        wall_clock_slot: u64,
-    ) {
-        snapshot.diff_and_emit(store, &self.bus, wall_clock_slot);
-    }
-
-    /// Beacon: emit `chain_reorg`, `head` and `finalized_checkpoint` for
-    /// whatever moved since the last call. See
-    /// [`BeaconEventView::publish_changes`].
+    /// Beacon: `chain_reorg`, `head` and `finalized_checkpoint`, in that order,
+    /// for whatever moved since the last diff.
+    ///
+    /// Called at the end of `recompute_beacon_head`, where every beacon head
+    /// and finality move ends. Only `head` is gated, against
+    /// [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`; beacon has no
+    /// justified-checkpoint topic.
     pub(crate) fn publish_beacon_changes(&mut self, store: &Store, wall_clock_slot: u64) {
-        self.beacon_view
-            .publish_changes(store, &self.bus, wall_clock_slot);
+        let Some(previous) = self.advance_view(store) else {
+            return;
+        };
+        if self.view.head != previous.head {
+            publish_beacon_head_change(
+                store,
+                &self.bus,
+                &previous,
+                self.view.head,
+                wall_clock_slot,
+            );
+        }
+        if self.view.finalized != previous.finalized {
+            publish_beacon_finalized_checkpoint(store, &self.bus, self.view.finalized);
+        }
+    }
+
+    /// Move the view to `store`'s current values, whether or not anything is
+    /// emitted, and hand back the previous one when there is a subscriber to
+    /// report the difference to.
+    fn advance_view(&mut self, store: &Store) -> Option<EventView> {
+        let previous = std::mem::replace(&mut self.view, EventView::capture(store));
+        self.bus.has_subscribers().then_some(previous)
     }
 
     /// `block`: `block` was imported at `slot`, in the store's chain's shape.
@@ -566,7 +594,7 @@ impl ChainEvents {
                 execution_optimistic: store.is_beacon_optimistic(block),
             }),
         };
-        self.emit(event);
+        self.bus.emit(event);
     }
 
     /// `block_gossip` for an arriving block, if its sender asked for it.
@@ -580,7 +608,7 @@ impl ChainEvents {
         block: &SignedBeaconBlock,
         announcement: BlockAnnouncement,
     ) {
-        if announcement == BlockAnnouncement::Silent || !self.has_subscribers() {
+        if announcement == BlockAnnouncement::Silent || !self.bus.has_subscribers() {
             return;
         }
         let slot = block.slot();
@@ -591,18 +619,51 @@ impl ChainEvents {
                 ChainEvent::BeaconBlockGossip(BeaconBlockGossipEvent { slot, block: root })
             }
         };
-        self.emit(event);
+        self.bus.emit(event);
+    }
+
+    /// Lean `attestation`: a single vote that passed validation and signature
+    /// verification. The ~3 KB XMSS signature is not carried.
+    pub(crate) fn publish_lean_attestation(&self, attestation: &SignedAttestation) {
+        if !self.bus.has_subscribers() {
+            return;
+        }
+        self.bus.emit(ChainEvent::Attestation {
+            validator_id: attestation.validator_id,
+            data: attestation.data.clone(),
+        });
+    }
+
+    /// Lean `aggregate`: one produced here or accepted from gossip. The proof
+    /// bytes are not carried.
+    ///
+    /// Owned inputs, since the gossip path has to take them out of an
+    /// aggregate the store is about to consume.
+    pub(crate) fn publish_lean_aggregate(&self, participants: Vec<u64>, data: AttestationData) {
+        self.bus.emit(ChainEvent::Aggregate { participants, data });
     }
 
     /// Beacon `attestation` for an aggregate that passed the gossip
     /// conditions. Behind the subscriber check, since building the payload
     /// clones the attestation.
     pub(crate) fn publish_beacon_aggregate(&self, aggregate: &SignedAggregateAndProof) {
-        if !self.has_subscribers() {
+        if !self.bus.has_subscribers() {
             return;
         }
         let attestation = BeaconAttestationEvent::from(aggregate);
-        self.emit(ChainEvent::BeaconAttestation(Box::new(attestation)));
+        self.bus
+            .emit(ChainEvent::BeaconAttestation(Box::new(attestation)));
+    }
+
+    /// Beacon `data_column_sidecar`: `sidecar`, of the block under
+    /// `block_root`, was stored.
+    pub(crate) fn publish_data_column(&self, block_root: H256, sidecar: &fulu::DataColumnSidecar) {
+        self.bus
+            .emit(ChainEvent::DataColumnSidecar(DataColumnSidecarEvent {
+                block_root,
+                index: sidecar.index,
+                slot: sidecar.signed_block_header.message.slot,
+            }));
     }
 }
 
@@ -616,32 +677,33 @@ impl ChainEvents {
 /// lagging head is far more common here during multi-slot catch-up ticks.
 pub(crate) const HEAD_EVENT_RECENCY_SLOTS: u64 = 32;
 
-/// Pre-call snapshot of the store values the lean chain-event bus reports on.
+/// The head and checkpoints the chain events last reported on, kept by
+/// [`ChainEvents`] between diffs.
 ///
-/// The actor — not the store — publishes chain events: it captures this
-/// snapshot before a store call (`store::on_tick`, `store::on_block`) and
-/// diffs the store against it afterwards, both through [`ChainEvents`], so
-/// `store.rs` needs no event plumbing.
+/// Why a persistent view rather than a snapshot taken before each store call
+/// and diffed after it: a window can be missed and a view cannot. A beacon
+/// head moves in `recompute_beacon_head`, after the import cascade and after
+/// the tick's clock advance, so a window around either call misses it, and
+/// the next window starts from the head it already moved to. Whatever moved
+/// the head since the last diff, the next diff against a view sees it. Lean's
+/// head moves only inside the store calls the actor diffs after, so a window
+/// was enough there, but the view makes that a property nobody has to keep
+/// true.
 ///
-/// Lean only. A beacon head moves in `recompute_beacon_head`, outside any one
-/// store call, so the beacon chain diffs against a [`BeaconEventView`] kept
-/// between calls instead.
-///
-/// Multiple head moves within one store call coalesce into a single `head`
-/// event; subscribers only care about the latest.
-///
-/// The proposer's pre-build catch-up (`get_proposal_head`) advances the store
-/// too, so `propose_block` wraps that call in its own snapshot: the
-/// head/justified/finalized moves it triggers surface exactly as they would on
-/// a non-proposing node's interval-0 tick, rather than being silently folded
-/// into the later block-import diff's baseline.
-pub(crate) struct ChainEventSnapshot {
+/// Roots only (checkpoints are roots with their slots). The previous head's
+/// slot and state root are read back from the store when a diff has a
+/// subscriber to report to, so a node nobody listens to pays three metadata
+/// reads per diff and nothing more. Its block stays readable: neither chain
+/// prunes `Table::BlockHeaders`, and an invalidated beacon branch loses only
+/// its `LiveChain` rows.
+struct EventView {
     head: H256,
+    /// Lean only: beacon has no justified-checkpoint topic.
     justified: Checkpoint,
     finalized: Checkpoint,
 }
 
-impl ChainEventSnapshot {
+impl EventView {
     fn capture(store: &Store) -> Self {
         Self {
             head: store.head().expect("head block exists"),
@@ -653,75 +715,67 @@ impl ChainEventSnapshot {
                 .expect("latest finalized checkpoint exists"),
         }
     }
+}
 
-    /// Emit one event per value that changed since the snapshot, in a fixed
-    /// order: `head` → `justified_checkpoint` → `finalized_checkpoint`.
-    /// (`block` is emitted separately by the import path, ahead of this diff.)
-    ///
-    /// `wall_clock_slot` is the caller's current slot, used only to gate the
-    /// `head` event against [`HEAD_EVENT_RECENCY_SLOTS`]; the other events are
-    /// ungated.
-    fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
-        let head = store.head().expect("head block exists");
-        if head != self.head {
-            // Read the block once and reuse it for slot and state root so they
-            // stay consistent. Through `block_slot_and_state_root` rather than
-            // `Store::get_block_header`, which decodes a lean `BlockHeader`
-            // and so is lean-only: a beacon directory keeps the whole signed
-            // block in that table, and this diff runs on both chains.
-            if let Some((slot, state_root)) = store.block_slot_and_state_root(&head) {
-                // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
-                if slot + HEAD_EVENT_RECENCY_SLOTS >= wall_clock_slot {
-                    events.emit(ChainEvent::Head {
-                        slot,
-                        block: head,
-                        state: state_root,
-                    });
-                }
-            } else {
-                warn!(
-                    head_root = %ShortRoot(&head.0),
-                    "Head header missing while emitting head event; skipping"
-                );
-            }
-        }
-
-        let justified = store
-            .latest_justified()
-            .expect("latest justified checkpoint exists");
-        if justified != self.justified {
-            if let Some(state) = checkpoint_state_root(store, justified.root) {
-                events.emit(ChainEvent::JustifiedCheckpoint {
-                    slot: justified.slot,
-                    block: justified.root,
-                    state,
-                });
-            } else {
-                warn!(
-                    justified_root = %ShortRoot(&justified.root.0),
-                    "Justified block header missing while emitting event; skipping"
-                );
-            }
-        }
-
-        let finalized = store
-            .latest_finalized()
-            .expect("latest finalized checkpoint exists");
-        if finalized != self.finalized {
-            if let Some(state) = checkpoint_state_root(store, finalized.root) {
-                events.emit(ChainEvent::FinalizedCheckpoint {
-                    slot: finalized.slot,
-                    block: finalized.root,
-                    state,
-                });
-            } else {
-                warn!(
-                    finalized_root = %ShortRoot(&finalized.root.0),
-                    "Finalized block header missing while emitting event; skipping"
-                );
-            }
-        }
+/// Lean `head`, if the new head is within [`HEAD_EVENT_RECENCY_SLOTS`] of the
+/// wall clock.
+fn publish_lean_head(store: &Store, events: &EventBus, head: H256, wall_clock_slot: u64) {
+    // Read the block once and reuse it for slot and state root so they stay
+    // consistent. Through `block_slot_and_state_root`, the chain-generic
+    // accessor the beacon diff reads too, rather than the lean-only
+    // `Store::get_block_header`.
+    let Some((slot, state_root)) = store.block_slot_and_state_root(&head) else {
+        warn!(
+            head_root = %ShortRoot(&head.0),
+            "Head header missing while emitting head event; skipping"
+        );
+        return;
+    };
+    // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
+    if slot + HEAD_EVENT_RECENCY_SLOTS < wall_clock_slot {
+        return;
     }
+    events.emit(ChainEvent::Head {
+        slot,
+        block: head,
+        state: state_root,
+    });
+}
+
+/// Which lean checkpoint event [`publish_lean_checkpoint`] emits.
+#[derive(Clone, Copy)]
+enum LeanCheckpoint {
+    Justified,
+    Finalized,
+}
+
+/// Lean `justified_checkpoint` or `finalized_checkpoint` for `checkpoint`.
+fn publish_lean_checkpoint(
+    store: &Store,
+    events: &EventBus,
+    checkpoint: Checkpoint,
+    kind: LeanCheckpoint,
+) {
+    let Some(state) = checkpoint_state_root(store, checkpoint.root) else {
+        let root = ShortRoot(&checkpoint.root.0);
+        match kind {
+            LeanCheckpoint::Justified => warn!(
+                justified_root = %root,
+                "Justified block header missing while emitting event; skipping"
+            ),
+            LeanCheckpoint::Finalized => warn!(
+                finalized_root = %root,
+                "Finalized block header missing while emitting event; skipping"
+            ),
+        }
+        return;
+    };
+    let (slot, block) = (checkpoint.slot, checkpoint.root);
+    let event = match kind {
+        LeanCheckpoint::Justified => ChainEvent::JustifiedCheckpoint { slot, block, state },
+        LeanCheckpoint::Finalized => ChainEvent::FinalizedCheckpoint { slot, block, state },
+    };
+    events.emit(event);
 }
 
 /// Look up the state root of a checkpoint's block for the `{block, state}`
@@ -729,70 +783,21 @@ impl ChainEventSnapshot {
 /// emission; finalized/justified blocks are never pruned from
 /// `Table::BlockHeaders`, so this only fails on genuine store inconsistency.
 ///
-/// Chain-generic, for the reason [`ChainEventSnapshot::diff_and_emit`] gives
-/// where it reads the head's own pair.
+/// Chain-generic, for the reason [`publish_lean_head`] gives where it reads
+/// the head's own pair.
 fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
     store
         .block_slot_and_state_root(&root)
         .map(|(_, state_root)| state_root)
 }
 
-/// The head and finalized checkpoint the beacon chain events last reported
-/// on, kept by [`ChainEvents`] between calls.
-///
-/// Why a persistent view rather than a [`ChainEventSnapshot`] around each
-/// store call: a beacon head moves in `recompute_beacon_head`, after the
-/// import cascade and after the tick's clock advance, so a snapshot window
-/// around either call misses it, and the next window captures the head it
-/// already moved to. A view cannot be missed: whatever moved the head since
-/// the last diff, the next diff sees it. Several moves between two diffs
-/// coalesce into one event.
-///
-/// Roots only. The previous head's slot and state root are read back from the
-/// store when a diff has a subscriber to report to, so a node nobody listens
-/// to pays two metadata reads per diff and nothing more. Its block stays
-/// readable: `Table::BlockHeaders` is not pruned on beacon, and an
-/// invalidated branch loses only its `LiveChain` rows.
-struct BeaconEventView {
-    head: H256,
-    finalized: Checkpoint,
-}
-
-impl BeaconEventView {
-    fn capture(store: &Store) -> Self {
-        Self {
-            head: store.head().expect("head block exists"),
-            finalized: store
-                .latest_finalized()
-                .expect("latest finalized checkpoint exists"),
-        }
-    }
-
-    /// Emit what changed since the last call, then remember the store's
-    /// current values whether or not anything was emitted.
-    ///
-    /// Order: `chain_reorg` -> `head` -> `finalized_checkpoint`. Only `head`
-    /// is gated, against [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`.
-    fn publish_changes(&mut self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
-        let previous = std::mem::replace(self, Self::capture(store));
-        if !events.has_subscribers() {
-            return;
-        }
-        if self.head != previous.head {
-            publish_head_change(store, events, &previous, self.head, wall_clock_slot);
-        }
-        if self.finalized != previous.finalized {
-            publish_finalized_checkpoint(store, events, self.finalized);
-        }
-    }
-}
-
-/// `chain_reorg` (if the new head does not descend from the previous one) and
-/// `head` (if recent enough) for a head move from `previous.head` to `head`.
-fn publish_head_change(
+/// Beacon `chain_reorg` (if the new head does not descend from the previous
+/// one) and `head` (if recent enough) for a head move from `previous.head` to
+/// `head`.
+fn publish_beacon_head_change(
     store: &Store,
     events: &EventBus,
-    previous: &BeaconEventView,
+    previous: &EventView,
     head: H256,
     wall_clock_slot: u64,
 ) {
@@ -854,7 +859,7 @@ fn publish_head_change(
     }));
 }
 
-fn publish_finalized_checkpoint(store: &Store, events: &EventBus, finalized: Checkpoint) {
+fn publish_beacon_finalized_checkpoint(store: &Store, events: &EventBus, finalized: Checkpoint) {
     let Some(state) = checkpoint_state_root(store, finalized.root) else {
         warn!(
             finalized_root = %ShortRoot(&finalized.root.0),
@@ -930,11 +935,7 @@ impl NewChain<'_> {
 /// meets the new chain by then; it stops once it has checked a block below
 /// that checkpoint's slot and answers with that slot, which only a store
 /// missing blocks reaches.
-fn common_ancestor_slot(
-    store: &Store,
-    new_chain: &NewChain<'_>,
-    previous: &BeaconEventView,
-) -> u64 {
+fn common_ancestor_slot(store: &Store, new_chain: &NewChain<'_>, previous: &EventView) -> u64 {
     let floor = previous.finalized.slot;
     let mut root = previous.head;
     while let Some((slot, parent)) = store.block_entry(&root) {
@@ -1180,11 +1181,10 @@ mod tests {
     #[test]
     fn chain_event_diff_emits_nothing_when_unchanged() {
         let store = test_store();
-        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut events = ChainEvents::new(EventBus::new(8), &store);
         let mut rx = events.subscribe();
 
-        let snapshot = events.lean_snapshot(&store);
-        events.publish_lean_changes(snapshot, &store, 0);
+        events.publish_lean_changes(&store, 0);
 
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
@@ -1196,10 +1196,8 @@ mod tests {
     fn chain_event_diff_gates_stale_head() {
         let mut store = test_store();
         let genesis = store.head().expect("store head exists");
-        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut events = ChainEvents::new(EventBus::new(8), &store);
         let mut rx = events.subscribe();
-
-        let snapshot = events.lean_snapshot(&store);
 
         let new_root = H256([9u8; 32]);
         let new_state = H256([99u8; 32]);
@@ -1219,7 +1217,7 @@ mod tests {
         // Wall clock far ahead of the new head's slot (1): well past
         // HEAD_EVENT_RECENCY_SLOTS, so the head event must be suppressed.
         let wall_clock_slot = 1 + HEAD_EVENT_RECENCY_SLOTS + 100;
-        events.publish_lean_changes(snapshot, &store, wall_clock_slot);
+        events.publish_lean_changes(&store, wall_clock_slot);
 
         match rx.try_recv().unwrap() {
             ChainEvent::JustifiedCheckpoint { slot, block, state } => {
@@ -1242,10 +1240,8 @@ mod tests {
     fn chain_event_diff_emits_recent_head() {
         let mut store = test_store();
         let genesis = store.head().expect("store head exists");
-        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut events = ChainEvents::new(EventBus::new(8), &store);
         let mut rx = events.subscribe();
-
-        let snapshot = events.lean_snapshot(&store);
 
         let new_root = H256([9u8; 32]);
         let new_state = H256([99u8; 32]);
@@ -1255,7 +1251,7 @@ mod tests {
             .expect("update_checkpoints should succeed");
 
         // Wall clock equal to the head's own slot: as recent as it gets.
-        events.publish_lean_changes(snapshot, &store, 1);
+        events.publish_lean_changes(&store, 1);
 
         match rx.try_recv().unwrap() {
             ChainEvent::Head { slot, block, state } => {
@@ -1264,6 +1260,49 @@ mod tests {
             other => panic!("expected head event, got: {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// The view persists between diffs: a move is reported by the first diff
+    /// after it, once, whatever happened in between, and a later diff with no
+    /// new move reports nothing.
+    #[test]
+    fn a_lean_move_is_reported_once_by_the_next_diff() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let mut events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
+
+        let new_root = H256([9u8; 32]);
+        insert_test_block(&mut store, new_root, 1, genesis, H256([99u8; 32]));
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(new_root))
+            .expect("update_checkpoints should succeed");
+
+        events.publish_lean_changes(&store, 1);
+        events.publish_lean_changes(&store, 1);
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChainEvent::Head { slot: 1, .. })
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_lean_aggregate_carries_its_participants_and_data() {
+        let store = test_store();
+        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
+
+        events.publish_lean_aggregate(vec![0, 3], test_attestation_data(5));
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::Aggregate { participants, data } => {
+                assert_eq!(participants, vec![0, 3]);
+                assert_eq!(data.slot, 5);
+            }
+            other => panic!("expected aggregate event, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------
