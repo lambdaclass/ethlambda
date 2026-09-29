@@ -23,6 +23,7 @@ use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
 use crate::beacon::containers::shared::{Checkpoint, DepositMessage};
 use crate::beacon::containers::{BeaconState, electra as electra_containers};
 use crate::beacon::fork::ForkName;
+use crate::beacon::helpers::accessors::get_previous_epoch;
 use crate::beacon::helpers::electra::ExitChurnCursor;
 use crate::beacon::helpers::misc::{
     compute_deposit_domain, compute_signing_root, compute_start_slot_at_epoch,
@@ -129,19 +130,28 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
     let hysteresis_up =
         INCREMENT / preset::HYSTERESIS_QUOTIENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
     let participation_density = rng.pick(&[0, 30, 70, 95, 100]);
+    // A balance within a hysteresis threshold of `u64::MAX` overflows the
+    // effective-balance update and fails the whole epoch, so only a few states
+    // carry one: enough to check both paths fail together, few enough to
+    // leave the rest to compare.
+    let extreme_balances = rng.chance(10);
     let near = |rng: &mut SplitMix64| (epoch + rng.below(5)).saturating_sub(2);
 
-    // Finality first: the activation branch reads the finalized epoch.
+    // Finality first: the activation branch reads the finalized epoch. It
+    // stays at or behind the previous epoch, as in any reachable state:
+    // `get_finality_delay` subtracts it from the previous epoch, and fails
+    // otherwise.
     let checkpoint = |epoch: u64| Checkpoint {
         epoch,
         root: Root::ZERO,
     };
+    let previous_epoch = get_previous_epoch(&state);
     *state.previous_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(4)));
     *state.current_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(3)));
     let finalized_epoch = if rng.chance(30) {
         0
     } else {
-        epoch.saturating_sub(rng.below(3))
+        previous_epoch.saturating_sub(rng.below(3))
     };
     *state.finalized_checkpoint_mut() = checkpoint(finalized_epoch);
     for bit in 0..constants::JUSTIFICATION_BITS_LENGTH {
@@ -201,7 +211,7 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
             4 => effective + hysteresis_up + 1,
             5 => effective + hysteresis_up,
             6 => effective + rng.below(3 * INCREMENT),
-            7 if rng.chance(20) => u64::MAX - rng.below(3),
+            7 if extreme_balances && rng.chance(20) => u64::MAX - rng.below(3),
             _ => effective,
         });
     }

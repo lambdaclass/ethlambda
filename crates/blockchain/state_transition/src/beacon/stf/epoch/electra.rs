@@ -705,11 +705,8 @@ pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config)
 /// toward is [`get_max_effective_balance`], read per validator, rather than
 /// the single `MAX_EFFECTIVE_BALANCE` every validator shared before
 /// EIP-7251, since a compounding validator's ceiling can be far higher. The
-/// hysteresis arithmetic itself is copied unchanged from that version, down
-/// to computing `HYSTERESIS_INCREMENT` by dividing first and only then
-/// multiplying it up to each threshold: multiplying before dividing is
-/// algebraically equivalent but rounds differently, and only the
-/// specification's own order reproduces its integer rounding.
+/// hysteresis test itself is [`super::leaves_hysteresis_band`], shared with
+/// that version.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
     // Two passes for the same reason `super::process_effective_balance_updates`
     // needs them: `state` is an enum over per-fork structs, so there is no
@@ -725,7 +722,7 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         .zip(state.balances().iter())
         .enumerate()
     {
-        if let Some(effective) = updated_effective_balance(validator, balance) {
+        if let Some(effective) = updated_effective_balance(validator, balance)? {
             updates.push((index, effective));
         }
     }
@@ -739,20 +736,19 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
 
 /// The effective balance `validator` moves to given its `balance`, or `None`
 /// when the balance is still inside the hysteresis band.
-pub(super) fn updated_effective_balance(validator: &Validator, balance: Gwei) -> Option<Gwei> {
-    const HYSTERESIS_INCREMENT: Gwei =
-        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
-    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
-    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
-
-    if balance + DOWNWARD_THRESHOLD < validator.effective_balance
-        || validator.effective_balance + UPWARD_THRESHOLD < balance
-    {
-        let max_effective_balance = get_max_effective_balance(validator);
-        Some((balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT).min(max_effective_balance))
-    } else {
-        None
+///
+/// Fails where [`super::leaves_hysteresis_band`] does.
+pub(super) fn updated_effective_balance(
+    validator: &Validator,
+    balance: Gwei,
+) -> Result<Option<Gwei>> {
+    if !super::leaves_hysteresis_band(validator.effective_balance, balance)? {
+        return Ok(None);
     }
+    let max_effective_balance = get_max_effective_balance(validator);
+    Ok(Some(
+        (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT).min(max_effective_balance),
+    ))
 }
 
 // ---------------------------------------------------------------------------
