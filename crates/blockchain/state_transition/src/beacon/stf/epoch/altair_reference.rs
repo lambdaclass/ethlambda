@@ -82,7 +82,7 @@ pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> R
         constants::TIMELY_TARGET_FLAG_INDEX,
         previous_epoch,
     )?;
-    let leaking = is_in_inactivity_leak(state);
+    let leaking = is_in_inactivity_leak(state)?;
 
     let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
     let score_count = inactivity_scores.len();

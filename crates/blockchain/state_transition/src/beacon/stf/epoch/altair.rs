@@ -114,7 +114,7 @@ fn update_inactivity_scores(
     config: &Config,
     summary: &EpochSummary,
 ) -> Result<()> {
-    let leaking = is_in_inactivity_leak(state);
+    let leaking = is_in_inactivity_leak(state)?;
 
     let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
     let score_count = inactivity_scores.len();
@@ -177,7 +177,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
     }
 
     let summary = EpochSummary::build(state, false)?;
-    let context = RewardContext::new(state, summary.totals());
+    let context = RewardContext::new(state, summary.totals())?;
     apply_rewards_and_penalties(state, config, &summary, &context)
 }
 
@@ -291,7 +291,7 @@ fn run_participation_steps(state: &mut BeaconState, config: &Config) -> Result<(
         weigh_with_totals(state, summary.totals())?;
     }
     update_inactivity_scores(state, config, &summary)?;
-    let context = RewardContext::new(state, summary.totals());
+    let context = RewardContext::new(state, summary.totals())?;
     apply_rewards_and_penalties(state, config, &summary, &context)
 }
 
