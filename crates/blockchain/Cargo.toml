@@ -42,6 +42,7 @@ libssz-types.workspace = true
 datatest-stable = "0.3.3"
 leansig.workspace = true
 rand.workspace = true
+serde_json.workspace = true
 
 [[test]]
 name = "forkchoice_spectests"

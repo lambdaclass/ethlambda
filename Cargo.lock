@@ -1973,6 +1973,7 @@ dependencies = [
  "rand 0.10.1",
  "rayon",
  "serde",
+ "serde_json",
  "spawned-concurrency",
  "thiserror 2.0.18",
  "tokio",
