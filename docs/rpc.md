@@ -273,7 +273,9 @@ the chain actor writes, so no request waits on the actor.
   back in an `IndexedErrorMessage` with its position; the valid ones in the
   same batch are still published. There is no seen-attestation cache. Each
   accepted attestation also goes into the node's **attestation pool**, since
-  gossip never delivers a node its own messages.
+  gossip never delivers a node its own messages. `Eth-Consensus-Version:
+  gloas` is refused with a `400` here and on `aggregate_and_proofs`, as is a
+  gloas slot on the aggregate query below: the pool holds electra-shaped votes.
 - **`beacon_committee_subscriptions`**: each aggregator's entry makes the node
   join its committee's attestation subnet until the end of that slot, so the
   committee's votes from other validators reach the pool too: every
@@ -339,8 +341,11 @@ the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.
 
-The key set is lighthouse's, less gloas-only keys (this build cannot process
-gloas) and three keys the specification does not define
+The key set is lighthouse's, less gloas's preset and constant keys
+(`beacon::preset` and `beacon::constants` hold them, such as
+`DOMAIN_BEACON_BUILDER` and `DOMAIN_PTC_ATTESTER`, but this list does not
+report them yet; gloas's schedule, timing and churn keys are reported, since
+they are `Config` fields) and three keys the specification does not define
 (`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`, `TTFB_TIMEOUT`). Domain types
 and withdrawal prefixes are `0x`-prefixed hex; `VERSIONED_HASH_VERSION_KZG` is
 a decimal, as lighthouse reports it. `GENESIS_TIME` is absent:

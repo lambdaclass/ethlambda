@@ -3,7 +3,7 @@
 The `beacon` module of `ethlambda-state-transition`
 (`crates/blockchain/state_transition/src/beacon/`) implements the Ethereum
 **Beacon Chain** consensus specification,
-[`ethereum/consensus-specs`][specs], phase0 through fulu.
+[`ethereum/consensus-specs`][specs], phase0 through gloas.
 
 This is not the Lean consensus protocol the rest of the crate implements. The two
 sit in one crate for the reason their types sit in one crate: a caller
@@ -184,16 +184,20 @@ per-fork field lists are not a growing tail:
   `current_epoch_participation`, which have a different type.
 - `latest_execution_payload_header` keeps its name from bellatrix on, but is a
   different container only in bellatrix, capella, and deneb; electra and fulu
-  reuse deneb's shape unchanged.
+  reuse deneb's shape unchanged, and gloas drops it for a block hash and the
+  latest bid.
 - The field count crosses a power of two at electra, so the state's merkle tree is
   five levels deep through deneb and six from electra on. The same logical field
-  has a different generalized index in different forks.
+  has a different generalized index in different forks. Gloas's state is a
+  progressive container (EIP-7495), whose tree has no fixed depth at all.
 - `SignedBeaconBlock::Fulu` wraps `electra::SignedBeaconBlock` rather than a
   `fulu` type of its own, since fulu changes no field of a block. It still
   needs to be its own variant: fulu changes how a block is *processed*, since
   the blob commitment limit becomes epoch-dependent, so code that dispatches
   on fork still has to tell a fulu block from an electra one even though both
-  carry the identical payload.
+  carry the identical payload. Gloas is a different case: its block body
+  changes (a bid in place of a payload, payload attestations, the parent's
+  execution requests), so `SignedBeaconBlock::Gloas` has a type of its own.
 
 | Fork | State fields | HTR leaves | Depth |
 |------|--------------|------------|-------|
@@ -203,6 +207,7 @@ per-fork field lists are not a growing tail:
 | capella, deneb | 28 | 32 | 5 |
 | electra | 37 | 64 | 6 |
 | fulu | 38 | 64 | 6 |
+| gloas | 46 | progressive | none |
 
 A single container with fork-conditional serialization would have to reproduce all
 of that by hand. Derived codecs get it from the struct definition, which is
@@ -211,7 +216,7 @@ checked field by field against the spec text and then verified by `ssz_static`.
 Since SSZ carries no type tag, the fork cannot be recovered from the bytes, so
 decoding takes it from context: `BeaconState::from_ssz(fork, bytes)`.
 
-### Not duplicating the state transition seven times
+### Not duplicating the state transition once per fork
 
 The cost of per-fork structs is that a naive implementation would copy every
 function once per fork. Two things prevent that:
@@ -259,9 +264,10 @@ impossible.
 
 `validators` and `balances` hold one entry per validator, about 2.4M on
 mainnet, so they dominate both the cost of a state root and the memory of every
-cached state. They are `ethlambda_ssz_tree::List`s rather than `SszList`s:
-persistent Merkle trees in the shape of the SSZ one, modeled on the `milhouse`
-lists lighthouse keeps its state in.
+cached state. They are `ethlambda_ssz_tree::List`s rather than `SszList`s (from
+gloas on, `ethlambda_ssz_tree::ProgressiveList`s, described in the Gloas section
+below): persistent Merkle trees in the shape of the SSZ one, modeled on the
+`milhouse` lists lighthouse keeps its state in.
 
 - **Nodes cache their hash, and states share nodes.** A state derived from
   another shares every subtree the block did not touch through `Arc`, and its
@@ -296,6 +302,121 @@ over the registry should walk `iter_validators()`, zipped with
 `iter_balances()` where it needs both. The total active balance is the obvious
 candidate for computing once per epoch rather than per call, once it is shown
 that no block operation changes it mid-epoch.
+
+## Gloas
+
+Five of gloas's EIPs shape this module: ePBS (EIP-7732), progressive lists and
+containers (EIP-7688), proposer selection that skips slashed validators
+(EIP-8045), increased exit and consolidation churn (EIP-8061), and builder
+deposits and exits (EIP-8282). EIP-7843 and EIP-7928 only add payload fields
+(`slot_number`, which `verify_execution_payload_envelope` checks, and
+`block_access_list`). It is the one fork whose containers change shape
+wholesale, so its code sits beside the pre-gloas code rather than inside it: `stf/gloas.rs` and
+`stf/epoch/gloas.rs` (transition), `helpers/gloas.rs` (helpers), the gloas
+section of `fork_choice.rs` (fork choice), and `containers/gloas.rs` in
+`ethlambda-types`. Every gloas case that is not ignored passes on both presets.
+
+The live follower does not follow gloas yet. `process_or_pend_block` refuses a
+gloas block and `refuse_unfollowable_fork` refuses a gloas anchor at startup,
+because nothing delivers payload envelopes or payload attestations to the chain
+actor. Gloas gossip is answered with `Ignore(UnsupportedFork)` rather than
+scored, so an honest peer past the fork epoch is not penalized.
+
+### The deferred payload
+
+A gloas block has no execution payload. Its body commits to a builder's bid
+(`process_execution_payload_bid`), and the builder reveals the payload later in
+a `SignedExecutionPayloadEnvelope`. The payload is applied by the *next*
+block: `process_parent_execution_payload` compares that block's bid against the
+parent's committed one to tell whether the parent was full or empty, and for a
+full parent `apply_parent_execution_payload` runs the execution-layer requests
+carried in `parent_execution_requests` and settles the builder's payment. An
+empty parent must carry no requests.
+
+`verify_execution_payload_envelope` is the checking half that used to sit in
+`process_execution_payload`, and it mutates nothing: fork choice calls it on a
+stored state when an envelope arrives, and only the next block changes state.
+Block processing therefore takes no `ExecutionEngine`, and `process_withdrawals`
+takes no payload, since the expected withdrawals are a function of the state
+alone.
+
+Execution-layer requests moved with the payload. Deposit, withdrawal and
+consolidation requests, and the two builder requests, are reached only through
+`apply_parent_execution_payload`; gloas's `process_operations` no longer calls
+the first three. Their behavior did not change, so
+`apply_parent_execution_payload` calls the fulu and electra processors instead
+of keeping copies.
+
+### Progressive lists and the registry
+
+EIP-7688 makes most lists in the gloas state and body unbounded, merkleized as a
+chain of growing subtrees (EIP-7916), and makes the big containers progressive
+(EIP-7495); a progressive container has no fixed depth. The other progressive
+lists are libssz's `ProgressiveList`. The registry is the exception:
+`validators` and `balances` stay tree-backed, through
+`ethlambda_ssz_tree::ProgressiveList`, which has the same persistent nodes,
+update buffer and rebase as the bounded `List` and the same method set, so a
+gloas state shares subtrees with its parent the way earlier ones do.
+
+The registry therefore has two list types across the forks, and an accessor
+cannot return either one. The whole-registry accessors were replaced by
+element-level ones on `BeaconState`: `validator_count`, `validator`,
+`validator_mut`, `balance`, `balance_mut`, `push_validator`, `iter_validators`,
+`iter_balances` and `validators_root`. Each dispatches once and hands back an
+element, a count or an iterator. Only the few that need the list itself
+(`iter_validators`, `iter_balances`, rebasing onto a cached state, pointer
+equality) match on the private `Registry` enum.
+
+### One function for both list types
+
+The spec modifies a small part of what gloas touches, and the rest is electra's
+text run against a differently typed list. Copying it would fork every fix, so
+the shared functions take narrow views instead:
+
+| View | Reaches |
+|------|---------|
+| `PendingQueueFields` | The deposit balance cursor and the three pending queues, on electra, fulu and gloas |
+| `ChurnCursorsMut` | The four exit and consolidation churn cursors, on the same three forks |
+| `gloas_state`, `gloas_state_ref` | Gloas's own concrete state, for fields only gloas has |
+
+Both list types deref to a slice of the same element type, so a view can expose
+slices and element-level methods and let electra's `process_withdrawal_request`,
+`process_consolidation_request`, exit and slashing paths serve a gloas state
+unchanged. The churn limit is the one input that differs: electra's cursor
+functions read gloas's own limits on a gloas state, which is a fork dispatch
+inside them rather than a second copy. A function gets a gloas copy only where
+the spec marks it modified. The rule for choosing between the views and a
+projection is the one in "A recurring bug" below: project only when the return
+type must be gloas's own.
+
+### Fork choice
+
+Gloas gives each block two branches to weigh: *empty*, where no payload was
+revealed or attested as timely and available, and *full*, where the builder's
+payload was. A gloas fork-choice node is therefore `(root, PayloadStatus)`
+with `Empty`, `Full` and `Pending`, where every earlier fork's node is a bare
+root. Nodes are derived on demand from the block tree, each block's bid and the
+set of verified payloads (`get_node_children` builds them), not stored, which
+mirrors the spec's `Store`.
+
+`ForkRules` (`PreGloas` or `Gloas`) is the other new dimension. It is derived
+from an exhaustive match on a fork or a container, and it is what
+`validate_on_attestation` and `update_latest_messages` read, since gloas turns
+`data.index` into the payload flag and orders votes by slot instead of target
+epoch. A vote's rules follow its own container, not the clock.
+
+The head algorithm follows the current slot's fork: from `GLOAS_FORK_EPOCH` on,
+`get_head_node` runs `gloas_get_head` over the whole tree, pre-gloas blocks
+included; before it, the unchanged `compute_head` runs. The switch follows the
+clock, so any follower on a network that schedules gloas (Sepolia's built-in
+config does) runs `gloas_get_head` every slot from that epoch, over its
+pre-gloas tree, whether or not it can import a gloas block; its cost is the
+subject of [spec_deviations.md](spec_deviations.md). The spec never describes a
+tree that crosses the boundary, so that page also records the rule this module
+chose.
+Two new handlers, `on_execution_payload_envelope` and
+`on_payload_attestation_message`, join the spec's list of ways to change the
+store.
 
 ## Macros and traits
 
@@ -396,45 +517,40 @@ Two things that arrangement has to be careful about:
 
 ## Status
 
-All seven forks, phase0 through fulu, have containers, fork upgrades, state
-transitions, and epoch processing. As of the v1.6.1 fixture pin, every case
-passed on both presets:
+All eight forks, phase0 through gloas, have containers, fork upgrades, state
+transitions, and epoch processing. At the pinned fixture release every case
+that is not ignored passes on both presets:
 
-| Preset | Fixture cases | Ignored | Lib tests |
-|--------|---------------|---------|-----------|
-| mainnet | 5705, all green | 152 | 195 |
-| minimal | 40009, all green | 3692 | 196 |
+| Preset | Fixture cases passed | Ignored | Lib tests |
+|--------|----------------------|---------|-----------|
+| mainnet | 7175 | 1285 | 422 passed, 1 ignored |
+| minimal | 49261 | 5403 | 423 passed, 1 ignored |
 
-The v1.7.0-beta.2 bump (see "Fixture suites" below) adds failures the fixture
-release itself brought rather than any change here: `ssz_static` cases for
-`NewPayloadRequest` and the four new `PartialDataColumn*` containers, a
-fork-choice rule change, and one `transition` case. (A fourth item, the whole
-new `networking/gossip_*` format, is fixed: the gossip validation vectors this
-crate's `gossip.rs` runner covers now come from this same tree instead of a
-separate v1.7.0-beta.1 download, and every other `gossip_*` handler or fork is
-ignored by name rather than left unmatched.) The remaining commits fix each of
-the rest in turn; this table is stale until they land.
-
-The lib counts were 244 and 245 while the containers, presets, configuration and
-primitives were defined here. Their 48 unit tests moved with them and run in
-`ethlambda-types`; the fixture counts, which are what defines correctness here,
-are unchanged.
+The lib counts are with `beacon-spec-tests` on, and include lean's own unit
+tests, since the two chains share one lib target. The one ignored lib test is
+a timing measurement, not a fixture.
 
 Minimal runs more cases because the release ships more fixtures for it, and it
 runs two runners mainnet does not: `genesis`'s `initialization` and `validity`.
 The release ships no mainnet `genesis` fixtures, so that whole runner is gated
-behind the `preset-minimal` feature (`tests/spec/genesis.rs`).
+behind the `preset-minimal` feature (`tests/beacon_spec/genesis.rs`).
 
-Nothing is ignored for being unimplemented, with one exception now that
-`ForkName::Gloas` exists: every gloas case is individually ignored, by the
-same `HIGHEST_IMPLEMENTED_FORK`/`Case::in_scope` gate that would ignore any
-other fork past the last one this crate implements (`HIGHEST_IMPLEMENTED_FORK`
-stays `Fulu` through Part A). Every other ignored case is one of two
-deliberate exclusions:
+The gossip validation vectors this crate's `gossip.rs` runner covers come from
+the same tree as every other suite. The node validates four topics under fulu's
+rules; every other case is ignored by name rather than left unmatched.
+
+Nothing is ignored for being unimplemented in the state transition or fork
+choice: `HIGHEST_IMPLEMENTED_FORK` is gloas, and every gloas case that is not
+ignored runs. The ignored cases are deliberate exclusions:
 
 - `LightClient*` containers under `ssz_static`, 5 container types across altair
-  through fulu. The light-client sync protocol is a different layer from the
+  through gloas. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
+- `networking/gossip_*` cases outside what the node validates: every fork's
+  cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
+  of the four it validates, and the fulu vectors in `SKIPPED`, which assume a
+  bad-block cache. A gloas message is refused with `Ignore(UnsupportedFork)`
+  before any rule runs.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
 
@@ -445,16 +561,14 @@ a name that does not parse is skipped. That skip is silent in a way the
 `HIGHEST_IMPLEMENTED_FORK` gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.
 
-`gloas` no longer takes this silent path: `ForkName::parse("gloas")` succeeds,
-so its cases become ordinary tests, individually named and ignored through ordinary
-`Case::in_scope` gating, the same as fulu's cases would be if
-`HIGHEST_IMPLEMENTED_FORK` were dropped back a fork. `heze`, the one fork after
-gloas, is still unparseable and still silently skipped without this section's
-own accounting.
+`gloas` does not take this silent path: `ForkName::parse("gloas")` succeeds, so
+its cases become ordinary tests, individually named and run. `heze`, the one
+fork after gloas, is still unparseable and would be silently skipped without
+this section's own accounting.
 
 So `UNMODELED_FORKS` names `heze` alone, it reports as one ignored test, and
 `fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
-directory that is neither parseable nor listed. A release that adds a fork now
+directory that is neither parseable nor listed. A release that adds a fork
 forces a decision instead of quietly widening the gap.
 
 | Suite | Covers |
@@ -471,10 +585,14 @@ forces a decision instead of quietly widening the gap.
 
 ### Fork choice is fixture-verified
 
-150 mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
+205 mainnet `fork_choice` cases pass, covering bellatrix's `on_merge_block`/
 terminal-PoW validation, the `v1.7.0` proposer-boost dependent-root gate and
 `get_proposer_head`'s proposer-equivocation branch, deneb's blob data
-availability, and fulu's column data availability.
+availability, fulu's column data availability, and gloas's payload-aware
+suites: `get_head`, `get_parent_payload_status`, `on_block`, `on_attestation`,
+`on_execution_payload_envelope`, `on_payload_attestation_message`,
+`payload_data_availability`, `payload_timeliness` and `ex_ante`. Gloas
+accounts for 54 of the 205.
 
 The release still ships no phase0 `fork_choice` suite: the earliest is
 altair's, built from altair-shaped states even though altair changes nothing
@@ -504,8 +622,8 @@ This caused five separate bugs during implementation:
 
 - Capella's withdrawal sweep, projected to capella's own state.
 - Deneb reusing that same sweep, still projected to capella's state.
-- Altair's participation fields, projected to altair's state, so every one of
-  the five later forks that also carries participation failed.
+- Altair's participation fields, projected to altair's state, so every later
+  fork that also carries participation failed.
 - Deneb's `process_attestation`, projected to deneb's state.
 - `slash_validator` calling phase0's `initiate_validator_exit` at electra,
   which also left electra's EIP-7251 churn cursor unadvanced, mispricing every

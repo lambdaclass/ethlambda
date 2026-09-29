@@ -413,9 +413,12 @@ against them. `beacon::tests::the_built_in_network_derives_what_it_always_did`
 pins the parsed mainnet config to `Config::mainnet()`, so the file and the
 Rust constant cannot drift apart. Sepolia's config schedules gloas: its
 `GLOAS_*` keys are claimed (`ForkName::Gloas` exists, and `Config` carries the
-fork's schedule, timing and churn fields), but its state transition and fork
-choice do not exist yet, so a Sepolia follower stops tracking the chain at
-`GLOAS_FORK_EPOCH` regardless. `network::warn_if_gloas_scheduled` (shared by
+fork's schedule, timing and churn fields), and its state transition and fork
+choice exist, but the live follower refuses gloas blocks
+(`process_or_pend_block`) and a gloas anchor (`refuse_unfollowable_fork` in
+`main.rs`), since nothing delivers payload envelopes or payload attestations to
+it, so a Sepolia follower stops tracking the chain at `GLOAS_FORK_EPOCH`
+regardless. `network::warn_if_gloas_scheduled` (shared by
 `BuiltInNetwork::resolve` and a loaded `NetworkDir`) warns about this
 explicitly at startup (checked against `config.gloas_fork_epoch`), separately
 from the ignored-keys warning, which now only ever names heze's keys and
@@ -503,7 +506,7 @@ See [`docs/rpc.md`](docs/rpc.md) for the full reference: CLI flags and defaults,
 ## Beacon Chain types (`crates/common/types/src/beacon/`)
 
 `ethlambda-types` carries the **Ethereum Beacon Chain** containers (phase0
-through fulu) alongside lean's own types. The Beacon Chain is a different
+through gloas) alongside lean's own types. The Beacon Chain is a different
 protocol from the Lean consensus this repo implements; the types share a crate
 so that one `BlockChainServer` can dispatch on a single state type instead of
 existing once per chain.
@@ -516,7 +519,7 @@ existing once per chain.
   silent wrong answer.
 - **`ForkName::Lean` is deliberately absent from `ForkName::ALL`.** `ALL` is
   what `parse`, `previous` and `next` search, so its absence keeps
-  `parse("lean")` at `None` and `Fulu.next()` at `None`, meaning a fork upgrade
+  `parse("lean")` at `None` and `Gloas.next()` at `None`, meaning a fork upgrade
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
@@ -529,6 +532,9 @@ existing once per chain.
 - Per-fork containers are plain structs behind an enum, so SSZ stays derived:
   two of phase0's fields are *replaced* in altair, one field changes type in
   five separate forks, and the state's merkle tree gains a level at electra.
+  Gloas's big containers and most lists are progressive (EIP-7688), in
+  `containers/gloas.rs`, with their own `SignedBeaconBlock::Gloas` body; a
+  progressive container has no fixed depth.
 - **`beacon::primitives::Root` *is* `primitives::H256`**, not a second 32-byte
   hash converted at the boundary, and `beacon::primitives::HashTreeRoot`
   re-exports lean's convenience trait rather than declaring its own. The
@@ -549,20 +555,21 @@ existing once per chain.
   `lambdaclass/libssz` (for lambdaclass/libssz#33), pinned by `rev` rather than
   tracking `main`: this is the SSZ encoder and merkleizer behind every
   `hash_tree_root`, so a routine `cargo update` must not be able to move it.
-  Return them to a crates.io version once a release carries #33. A git dependency rather than a
+  Return them to a crates.io version once a release carries #33 and #37. A git dependency rather than a
   `[patch.crates-io]` override because nothing outside this workspace depends on
   libssz, so there is no second copy to unify; that also keeps the manifest free
   of a `[patch]` table, which `shadow/cargo-patch.toml` would collide with.
-- The state transition consuming these containers is **not** in this repo yet;
-  it lives on `feat/beacon-chain-stf`, where these types are verified against
-  consensus-specs v1.7.0-beta.2. What runs here is the containers' own
-  round-trip and shape tests.
-- **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s**, persistent
+- **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s** (gloas:
+  `ethlambda_ssz_tree::ProgressiveList`, same method set), persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
-  states through `Arc`; they have no slices and no `iter_mut`. A leaf holds a
-  page-sized run of elements rather than one chunk, and an inner node a page of
-  child pointers spanning several binary levels, so a lookup crosses a handful
-  of nodes and a rebuilt leaf or node copies one page. Writes are
+  states through `Arc`; they have no slices and no `iter_mut`. The registry is
+  therefore reached through element-level `BeaconState` accessors
+  (`validator`/`validator_mut`, `balance`/`balance_mut`, `push_validator`,
+  `iter_validators`/`iter_balances`, `validator_count`, `validators_root`), so
+  no accessor has to return two list types. A leaf holds a page-sized run of
+  elements rather than one chunk, and an inner node a page of child pointers
+  spanning several binary levels, so a lookup crosses a handful of nodes and a
+  rebuilt leaf or node copies one page. Writes are
   buffered until `BeaconState::apply_pending_mutations`, which the state
   transition calls before every state-root computation. A state decoded from
   storage is rebased onto a cached one (`Store::get_state`).
@@ -575,7 +582,7 @@ existing once per chain.
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
-The **Ethereum Beacon Chain** consensus specs (phase0 through fulu), a different
+The **Ethereum Beacon Chain** consensus specs (phase0 through gloas), a different
 protocol from the Lean consensus the rest of this repo implements, live in the
 `beacon` module of `ethlambda-state-transition` beside lean's own state
 transition. The module holds the *behavior* (state transition, fork choice,
@@ -661,28 +668,34 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   release plus `DerefMut`/`IndexMut` on `SszList` (lambdaclass/libssz#33),
   `as_chunks` in the merkleize fold loop (#35), and the same `DerefMut`/
   `IndexMut` for `ProgressiveList` (#37, an unmerged PR branch head for now).
-  This module needs the `SszList` commit (#33) for the same reason.
-- **Status:** all seven forks (phase0 through fulu) have containers, fork
-  upgrades, state transitions, and epoch processing. As of the v1.6.1 fixture
-  pin, every case passed on both presets: mainnet is 5705 cases and minimal
-  40009. The v1.7.0-beta.2 bump adds failures the fixture release itself
-  brought: `ssz_static` cases for `NewPayloadRequest` and the four new
-  `PartialDataColumn*` containers, a fork-choice rule change, and one
-  `transition` case, each fixed by the commits that follow the bump. (The
-  bump's new `networking/gossip_*` format is already handled: the gossip
-  validation vectors come from this same tree now, not the separate
-  v1.7.0-beta.1 download #38 used to fetch.) The crate's lib
-  target holds 200 tests with `beacon-spec-tests` on, 185 plus 15 ignored
-  without; both figures cover lean's own unit tests as well, since the two
-  chains now share one lib target. Fork choice is fixture-verified too: 150 mainnet
-  `fork_choice` cases pass, covering bellatrix's `on_merge_block`/terminal-PoW
-  validation, the `v1.7.0` proposer-boost dependent-root gate and
-  `get_proposer_head`'s proposer-equivocation branch, deneb's blob data
-  availability, and fulu's column data availability.
-- Nothing is ignored for being unimplemented. Ignored cases are the
-  `LightClient*` containers (a different layer, out of scope) and the `gloas`
-  and `heze` fixture trees. Those two do not parse as a `ForkName`, so
-  `collect` would skip them silently; `UNMODELED_FORKS` names them and
+  This module needs the `SszList` commit (#33) for the same reason, and gloas's
+  progressive lists need #37.
+- **Status:** all eight forks (phase0 through gloas) have containers, fork
+  upgrades, state transitions, and epoch processing, and every fixture case
+  that is not ignored passes on both presets at the pinned consensus-specs
+  release. The counts live in the Status section of
+  [`docs/beacon_stf.md`](docs/beacon_stf.md), so they are kept in one place.
+  Fork choice is fixture-verified too, including bellatrix's terminal-PoW
+  validation, deneb's and fulu's data availability, and gloas's payload-aware
+  suites.
+- **Gloas** lives in `stf/gloas.rs`, `stf/epoch/gloas.rs`, `helpers/gloas.rs`,
+  the gloas section of `fork_choice.rs`, and `containers/gloas.rs` in
+  `ethlambda-types`. **The live follower does not follow gloas**: it refuses
+  gloas blocks and a gloas anchor until envelopes and payload attestations are
+  delivered to it. `get_head_node` switches on the clock, so a follower on any
+  network that schedules gloas (Sepolia does) runs the spec-literal
+  `gloas_get_head` every slot from `GLOAS_FORK_EPOCH`, whatever it can import.
+  [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
+  [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
+  from the spec, in particular the fulu-to-gloas fork-choice boundary rule.
+- Nothing is ignored for being unimplemented in the state transition or fork
+  choice. Ignored cases are the `LightClient*` containers (a different layer,
+  out of scope), `networking/gossip_*` cases outside what the node validates
+  (every fork's cases for topics it has no validator for, non-fulu cases of the
+  four it validates, and the fulu vectors in `SKIPPED`, which assume a
+  bad-block cache), and the `heze` fixture tree. `heze` does
+  not parse as a `ForkName`, so `collect` would skip it silently;
+  `UNMODELED_FORKS` names it and
   `fixture_forks/every_directory_is_accounted_for` fails on any fork directory
   that is neither parseable nor listed, so a new fork forces a decision.
 - A fixture case with no `post` state asserts the input must be **rejected**. That

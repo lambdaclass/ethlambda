@@ -16,10 +16,13 @@
 //! `GENESIS_TIME` is absent by design: it is not a `config.yaml` key, and
 //! `/eth/v1/beacon/genesis` is where it is reported.
 //!
-//! The preset and constant keys are the ones lighthouse reports, less two
-//! kinds: gloas-only keys, since this build cannot process gloas (the same
-//! reason `Config` leaves out `GLOAS_*`), and keys the specification does not
-//! define at all (`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`,
+//! The configuration keys include gloas's (`GLOAS_*` and the other gloas
+//! timing and churn keys), since `Config` holds them and this serializes the
+//! whole of it. The preset and constant keys are the ones lighthouse reports,
+//! less two kinds: gloas's own preset and constant keys (`DOMAIN_BEACON_BUILDER`
+//! and `DOMAIN_PTC_ATTESTER` among them), which `beacon::preset` and
+//! `beacon::constants` hold but this list does not report yet, and keys the
+//! specification does not define at all (`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`,
 //! `TTFB_TIMEOUT`). Constants lighthouse leaves out, such as
 //! `JUSTIFICATION_BITS_LENGTH`, are left out here too.
 
