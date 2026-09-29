@@ -1040,11 +1040,13 @@ impl Store {
     /// Iterates only the LiveChain table, avoiding Block deserialization.
     /// Returns only non-finalized blocks, automatically pruned on finalization.
     pub fn get_live_chain(&self) -> Result<HashMap<H256, (u64, H256)>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+
+        Ok(entries
+            .into_iter()
             .map(|(k, v)| {
                 let (slot, root) = decode_slot_root_key(&k);
                 let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
@@ -1055,11 +1057,12 @@ impl Store {
 
     /// Return the highest slot in the live chain.
     pub fn max_live_chain_slot(&self) -> Result<Option<u64>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+        Ok(entries
+            .into_iter()
             .map(|(key, _)| decode_slot_root_key(&key).0)
             .max())
     }
@@ -1068,11 +1071,12 @@ impl Store {
     ///
     /// Useful for checking block existence without deserializing.
     pub fn get_block_roots(&self) -> Result<HashSet<H256>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+        Ok(entries
+            .into_iter()
             .map(|(k, _)| {
                 let (_, root) = decode_slot_root_key(&k);
                 root
@@ -1087,32 +1091,33 @@ impl Store {
     ///
     /// Returns the number of entries pruned.
     pub fn prune_live_chain(&mut self, finalized_slot: u64) -> Result<usize, Error> {
-        let view = self.backend.begin_read().expect("read view");
-
         // Collect keys to delete - stop once we hit finalized_slot
         // Keys are sorted by slot (big-endian encoding) so we can stop early
-        let keys_to_delete: Vec<_> = view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .take_while(|(k, _)| {
-                let (slot, _) = decode_slot_root_key(k);
-                slot < finalized_slot
-            })
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        drop(view);
+        let keys_to_delete: Vec<_> = {
+            let view = self.backend.begin_read()?;
+
+            let entries: Vec<_> = view
+                .prefix_iterator(Table::LiveChain, &[])?
+                .take_while(|res| match res {
+                    Ok((k, _)) => {
+                        let (slot, _) = decode_slot_root_key(k);
+                        slot < finalized_slot
+                    }
+                    _ => true,
+                })
+                .collect::<Result<_, _>>()?;
+
+            entries.into_iter().map(|(k, _)| k.to_vec()).collect()
+        };
 
         let count = keys_to_delete.len();
         if count == 0 {
             return Ok(0);
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::LiveChain, keys_to_delete)
-            .expect("delete non-finalized chain entries");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.delete_batch(Table::LiveChain, keys_to_delete)?;
+        batch.commit()?;
         Ok(count)
     }
 
@@ -1171,25 +1176,22 @@ impl Store {
         // before it, and keys at the cutoff sort after it (they extend it with
         // a root). A single range delete drops them all without reading the
         // table (and without walking the tombstones left by earlier prunes).
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_range(
-                Table::BlockProof,
-                &0u64.to_be_bytes(),
-                &cutoff.to_be_bytes(),
-            )
-            .expect("delete finalized block proofs");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.delete_range(
+            Table::BlockProof,
+            &0u64.to_be_bytes(),
+            &cutoff.to_be_bytes(),
+        )?;
+        batch.commit()?;
 
         Ok(cutoff)
     }
 
     /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         Ok(view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
+            .get(Table::BlockHeaders, &root.to_ssz())?
             .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header")))
     }
 
@@ -1248,10 +1250,10 @@ impl Store {
     /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
     /// genesis block, which has no signature entry.
     pub fn get_block(&self, root: &H256) -> Result<Option<Block>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key)? else {
             return Ok(None);
         };
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
@@ -1259,7 +1261,7 @@ impl Store {
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
                 return Ok(None);
             };
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
@@ -1333,10 +1335,9 @@ impl Store {
     /// bootstrapped from. Callers that use this to *reject* something must treat
     /// `None` as "unknown" rather than "not canonical".
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         Ok(view
-            .get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
+            .get(Table::BlockRoots, &encode_block_root_key(slot))?
             .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root")))
     }
 
@@ -1449,10 +1450,10 @@ impl Store {
     ///
     /// True if a snapshot exists or the state can be reconstructed from a diff.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let key = root.to_ssz();
-        let states = view.get(Table::States, &key).expect("get");
-        let diffs = view.get(Table::StateDiffs, &key).expect("get");
+        let states = view.get(Table::States, &key)?;
+        let diffs = view.get(Table::StateDiffs, &key)?;
         Ok(states.is_some() || diffs.is_some())
     }
 
