@@ -24,7 +24,9 @@ use crate::beacon::helpers::accessors::get_current_epoch;
 use crate::beacon::helpers::altair::get_next_sync_committee;
 use crate::beacon::helpers::finality::is_in_inactivity_leak;
 use crate::beacon::helpers::math::saturating_sub;
-use crate::beacon::helpers::participation::{EpochSummary, ParticipationTotals, RewardContext};
+use crate::beacon::helpers::participation::{
+    EpochFlags, EpochSummary, ParticipationTotals, RewardContext,
+};
 use crate::beacon::preset;
 use crate::beacon::primitives::{Gwei, ValidatorIndex};
 
@@ -72,7 +74,10 @@ pub fn process_justification_and_finalization(state: &mut BeaconState) -> Result
 }
 
 /// Feeds `totals` to [`weigh_justification_and_finalization`].
-fn weigh_with_totals(state: &mut BeaconState, totals: &ParticipationTotals) -> Result<()> {
+pub(super) fn weigh_with_totals(
+    state: &mut BeaconState,
+    totals: &ParticipationTotals,
+) -> Result<()> {
     weigh_justification_and_finalization(
         state,
         totals.total_active_balance,
@@ -129,22 +134,7 @@ fn update_inactivity_scores(
                 len: score_count,
             })?;
 
-        let mut updated = *score;
-        if flags.participated(constants::TIMELY_TARGET_FLAG_INDEX) {
-            // `x -= min(1, x)`, written with `saturating_sub` so a
-            // already-zero score cannot underflow.
-            updated = saturating_sub(updated, 1);
-        } else {
-            // The specification treats a `uint64` overflow here as an invalid
-            // state rather than a wrapped one, so this is checked rather than
-            // left to release-mode wrapping.
-            updated = updated.checked_add(config.inactivity_score_bias).ok_or(
-                Error::ArithmeticOverflow("inactivity_scores[index] + INACTIVITY_SCORE_BIAS"),
-            )?;
-        }
-        if !leaking {
-            updated = saturating_sub(updated, config.inactivity_score_recovery_rate);
-        }
+        let updated = next_inactivity_score(*score, flags, leaking, config)?;
 
         if updated != *score {
             *score = updated;
@@ -152,6 +142,39 @@ fn update_inactivity_scores(
     }
 
     Ok(())
+}
+
+/// One eligible validator's post-step-2 inactivity score.
+///
+/// Shared by the standalone step and the electra single pass, so both apply
+/// the same rule and raise the same overflow error. `leaking` must be read
+/// after justification.
+pub(super) fn next_inactivity_score(
+    score: u64,
+    flags: EpochFlags,
+    leaking: bool,
+    config: &Config,
+) -> Result<u64> {
+    let mut updated = score;
+    if flags.participated(constants::TIMELY_TARGET_FLAG_INDEX) {
+        // `x -= min(1, x)`, written with `saturating_sub` so a
+        // already-zero score cannot underflow.
+        updated = saturating_sub(updated, 1);
+    } else {
+        // The specification treats a `uint64` overflow here as an invalid
+        // state rather than a wrapped one, so this is checked rather than
+        // left to release-mode wrapping.
+        updated =
+            updated
+                .checked_add(config.inactivity_score_bias)
+                .ok_or(Error::ArithmeticOverflow(
+                    "inactivity_scores[index] + INACTIVITY_SCORE_BIAS",
+                ))?;
+    }
+    if !leaking {
+        updated = saturating_sub(updated, config.inactivity_score_recovery_rate);
+    }
+    Ok(updated)
 }
 
 /// Applies the epoch's flag-index and inactivity deltas to every validator's

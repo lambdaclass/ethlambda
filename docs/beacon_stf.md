@@ -309,6 +309,19 @@ The leak flag is read once per step rather than once per validator, which fails
 some states the specification accepts; see
 [Spec Deviations](spec_deviations.md#the-inactivity-leak-check-runs-once-per-epoch-step-not-once-per-validator).
 
+Electra and fulu go further (`stf::epoch::single_pass`): steps 2-9 (inactivity,
+rewards, registry updates, slashings, pending deposits, effective-balance
+updates) run in one loop over the registry, each validator on a local copy, with
+the changes written back afterwards. What depends on more than one validator is
+handled outside the loop: the exit-churn cursor is advanced locally in index
+order, the pending-deposit queue is planned before the loop (top-ups of existing
+validators inside it, deposits that create validators after it), and pending
+consolidations run after it, with the effective-balance update of every
+validator they name deferred until they are done. The genesis epoch and states
+whose registry-sized lists differ in length fall back to the step-by-step path.
+The debug oracle runs the specification-shaped steps on a clone and asserts the
+two full states hash equal.
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that

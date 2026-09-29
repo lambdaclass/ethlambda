@@ -25,6 +25,9 @@ pub mod justification;
 mod participation_equivalence;
 pub mod registry;
 pub mod rewards;
+mod single_pass;
+#[cfg(test)]
+mod single_pass_equivalence;
 
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::containers::{BeaconState, HistoricalBatch};
