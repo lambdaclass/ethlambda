@@ -46,6 +46,10 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/beacon/states/{state_id}/validators",
             get(get_validators).post(post_validators),
         )
+        .route(
+            "/eth/v1/beacon/states/{state_id}/validators/{validator_id}",
+            get(get_validator),
+        )
 }
 
 /// Resolve a `state_id` to the block root its state is stored under.
@@ -346,6 +350,61 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
     }))
 }
 
+/// `GET .../validators/{validator_id}`: one registry entry, by index or by
+/// public key, as the `data` object itself rather than a one-element list.
+///
+/// What a validator client resolves its keys' indices with: Lighthouse calls
+/// it once per key and knows no index for a key it gets a 404 for, which
+/// leaves that validator unable to take any duty. A key looked up this way is
+/// found by one scan of the registry.
+async fn get_validator(
+    Path((state_id, validator_id)): Path<(String, String)>,
+    State(store): State<Store>,
+) -> Response {
+    match validator_response(&store, &state_id, &validator_id) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+fn validator_response(
+    store: &Store,
+    state_id: &str,
+    validator_id: &str,
+) -> Result<serde_json::Value, ApiError> {
+    let id = ValidatorId::parse(validator_id)?;
+    let (root, state) = load(store, state_id)?;
+    let index = match id {
+        ValidatorId::Index(index) => index,
+        ValidatorId::Pubkey(pubkey) => state
+            .validators()
+            .iter()
+            .position(|validator| validator.pubkey == pubkey)
+            .ok_or(ApiError::NotFound("validator not found"))?
+            as ValidatorIndex,
+    };
+    let validator = state
+        .validator(index)
+        .map_err(|_| ApiError::NotFound("validator not found"))?;
+    let balance = *state
+        .balances()
+        .get(index as usize)
+        .ok_or(ApiError::Internal(
+            "the registry and balances disagree in length",
+        ))?;
+    let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
+    Ok(serde_json::json!({
+        "execution_optimistic": store.is_beacon_optimistic(root),
+        "finalized": is_finalized(store, state.slot()),
+        "data": ValidatorEntry {
+            index,
+            balance,
+            status: status.name(),
+            validator,
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +579,49 @@ mod tests {
         }
 
         /// What `ethlambda validator` sends: its keys, to learn their indices.
+        async fn get_one(validator_id: &str) -> axum::response::Response {
+            let (app, _) = app();
+            let uri = format!("/eth/v1/beacon/states/head/validators/{validator_id}");
+            app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        }
+
+        /// What Lighthouse's validator client resolves each key's index with.
+        /// The answer is the same entry the list endpoint gives, as an object.
+        #[tokio::test]
+        async fn one_validator_by_pubkey_or_index_is_the_list_entry() {
+            let (_, state) = app();
+            let listed = body_json(post(serde_json::json!({ "ids": ["5"] })).await).await;
+            let expected = &listed["data"][0];
+
+            for id in [pubkey_hex(&state, 5), "5".to_owned()] {
+                let response = get_one(&id).await;
+                assert_eq!(response.status(), StatusCode::OK, "{id}");
+                let json = body_json(response).await;
+                assert_eq!(&json["data"], expected, "{id}");
+                assert!(json["execution_optimistic"].is_boolean());
+                assert!(json["finalized"].is_boolean());
+            }
+        }
+
+        /// Unlike the list endpoint, which omits an id naming no validator,
+        /// this one has nothing to answer with.
+        #[tokio::test]
+        async fn one_unknown_validator_is_a_404() {
+            let unknown_key = format!("0x{}", "ab".repeat(48));
+            for id in [unknown_key, COUNT.to_string()] {
+                assert_eq!(get_one(&id).await.status(), StatusCode::NOT_FOUND, "{id}");
+            }
+        }
+
+        #[tokio::test]
+        async fn one_malformed_validator_id_is_a_400() {
+            for id in ["0x1234", "not-an-index"] {
+                assert_eq!(get_one(id).await.status(), StatusCode::BAD_REQUEST, "{id}");
+            }
+        }
+
         #[tokio::test]
         async fn a_pubkey_resolves_to_its_index() {
             let (_, state) = app();
