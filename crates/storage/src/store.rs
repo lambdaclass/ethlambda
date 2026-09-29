@@ -7,6 +7,7 @@ use lru::LruCache;
 use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
+use crate::liveness::ObservedLiveness;
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -881,6 +882,12 @@ pub struct Store {
     ///
     /// Always empty on lean, which has no beacon committees.
     committee_cache: Arc<CommitteeCache>,
+    /// Validators this node has seen act, by epoch, for the Beacon API's
+    /// liveness endpoint. Written by P2P (accepted gossip), the chain actor
+    /// (imported blocks' proposers) and the RPC (submissions through this
+    /// node's own API), which is why it lives on the `Store` all three share.
+    /// See [`ObservedLiveness`]. Always empty on lean.
+    observed_liveness: Arc<ObservedLiveness>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
@@ -1515,6 +1522,7 @@ impl Store {
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
+            observed_liveness: Arc::new(ObservedLiveness::default()),
             beacon: Default::default(),
             state_writer,
         }
@@ -2681,6 +2689,12 @@ impl Store {
     /// returned cache takes `&self` regardless of which handle reaches it.
     pub fn committee_cache(&self) -> Arc<CommitteeCache> {
         Arc::clone(&self.committee_cache)
+    }
+
+    /// The validators this node has seen act, shared by every clone of this
+    /// `Store`. See [`ObservedLiveness`].
+    pub fn observed_liveness(&self) -> &ObservedLiveness {
+        &self.observed_liveness
     }
 
     /// Returns whether a state is available for the given block root.
@@ -5693,6 +5707,14 @@ mod tests {
 
         clone.cache_state(key, Arc::new(beacon_test_state(7)));
         assert!(store.cached_state(key).is_some());
+    }
+
+    #[test]
+    fn observed_liveness_is_shared_across_store_clones() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let clone = store.clone();
+        clone.observed_liveness().record(3, 7);
+        assert!(store.observed_liveness().is_live(3, 7));
     }
 
     #[test]
