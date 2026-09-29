@@ -16,11 +16,14 @@
 //! surface accepts its own set of [`Topic`] names ([`Topic::LEAN`],
 //! [`Topic::BEACON`]).
 
+use ethlambda_network_api::BlockAnnouncement;
 use ethlambda_state_transition::beacon::helpers::accessors::get_block_root_at_slot;
-use ethlambda_storage::Store;
+use ethlambda_storage::{Chain, Store};
 use ethlambda_types::ShortRoot;
 use ethlambda_types::attestation::AttestationData;
-use ethlambda_types::beacon::containers::{BeaconState, SignedAggregateAndProof, electra, phase0};
+use ethlambda_types::beacon::containers::{
+    BeaconState, SignedAggregateAndProof, SignedBeaconBlock, electra, phase0,
+};
 use ethlambda_types::beacon::serde_helpers::quoted_or_bare;
 use ethlambda_types::beacon::signing::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use ethlambda_types::checkpoint::Checkpoint;
@@ -428,12 +431,11 @@ const CHAIN_EVENT_CHANNEL_CAPACITY: usize = 8192;
 
 /// Cloneable handle to the chain-event broadcast channel.
 ///
-/// Owned solely by [`crate::BlockChainServer`] (never `Option`, never
-/// threaded into `store.rs`): on lean the actor snapshots store state before a
-/// call to `store::on_tick`/`store::on_block`, runs it unchanged, then diffs
-/// and calls [`EventBus::emit`] itself; on beacon it diffs a
-/// [`BeaconEventView`] it keeps between calls. Call sites that must stay
-/// eventless (spec tests, `test_driver.rs`) simply never construct a live bus.
+/// What `main` builds and hands out: the HTTP server subscribes through a
+/// clone, and [`crate::BlockChainServer`] publishes through the one it wraps
+/// in its [`ChainEvents`] (never `Option`, never threaded into `store.rs`).
+/// Call sites that must stay eventless (spec tests, `test_driver.rs`) simply
+/// never construct a live bus.
 #[derive(Clone)]
 pub struct EventBus {
     tx: broadcast::Sender<ChainEvent>,
@@ -482,6 +484,128 @@ impl Default for EventBus {
     }
 }
 
+/// The chain actor's side of the event bus: the [`EventBus`] it publishes on,
+/// and everything that decides what goes out on it.
+///
+/// One field on [`crate::BlockChainServer`], so the rules for publishing live
+/// together rather than beside the actor's other state: the subscriber guard,
+/// which chain's payload shape an event takes, lean's snapshot diff around a
+/// store call, and beacon's persistent [`BeaconEventView`]. The actor only
+/// says what happened.
+///
+/// The [`EventBus`] inside stays the cloneable handle the HTTP server
+/// subscribes through; this wrapper is the actor's alone, so nothing outside
+/// it can move the view or publish.
+pub(crate) struct ChainEvents {
+    bus: EventBus,
+    /// Captured on both chains, since the actor's constructor is shared, but
+    /// read only by [`ChainEvents::publish_beacon_changes`].
+    beacon_view: BeaconEventView,
+}
+
+impl ChainEvents {
+    /// Wrap `bus`, with the beacon view starting at `store`'s current head and
+    /// finalized checkpoint, so the first diff reports only what moves after
+    /// the actor starts.
+    pub(crate) fn new(bus: EventBus, store: &Store) -> Self {
+        Self {
+            bus,
+            beacon_view: BeaconEventView::capture(store),
+        }
+    }
+
+    /// Publish `event` as it is. See [`EventBus::emit`].
+    pub(crate) fn emit(&self, event: ChainEvent) {
+        self.bus.emit(event);
+    }
+
+    /// See [`EventBus::has_subscribers`].
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.bus.has_subscribers()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ChainEvent> {
+        self.bus.subscribe()
+    }
+
+    /// Lean: capture the head and checkpoints before a store call whose moves
+    /// should be announced. Hand the result to
+    /// [`ChainEvents::publish_lean_changes`] once the call returns.
+    pub(crate) fn lean_snapshot(&self, store: &Store) -> ChainEventSnapshot {
+        ChainEventSnapshot::capture(store)
+    }
+
+    /// Lean: emit `head`, `justified_checkpoint` and `finalized_checkpoint`
+    /// for whatever moved since `snapshot`. See
+    /// [`ChainEventSnapshot::diff_and_emit`].
+    pub(crate) fn publish_lean_changes(
+        &self,
+        snapshot: ChainEventSnapshot,
+        store: &Store,
+        wall_clock_slot: u64,
+    ) {
+        snapshot.diff_and_emit(store, &self.bus, wall_clock_slot);
+    }
+
+    /// Beacon: emit `chain_reorg`, `head` and `finalized_checkpoint` for
+    /// whatever moved since the last call. See
+    /// [`BeaconEventView::publish_changes`].
+    pub(crate) fn publish_beacon_changes(&mut self, store: &Store, wall_clock_slot: u64) {
+        self.beacon_view
+            .publish_changes(store, &self.bus, wall_clock_slot);
+    }
+
+    /// `block`: `block` was imported at `slot`, in the store's chain's shape.
+    pub(crate) fn publish_block(&self, store: &Store, slot: u64, block: H256) {
+        let event = match store.chain() {
+            Chain::Lean => ChainEvent::Block { slot, block },
+            Chain::Beacon => ChainEvent::BeaconBlock(BeaconBlockEvent {
+                slot,
+                block,
+                execution_optimistic: store.is_beacon_optimistic(block),
+            }),
+        };
+        self.emit(event);
+    }
+
+    /// `block_gossip` for an arriving block, if its sender asked for it.
+    ///
+    /// The sender decides: see [`BlockAnnouncement`]. Behind the subscriber
+    /// check, since a beacon block root is a merkleization of the whole block,
+    /// payload included, and the import computes it again anyway.
+    pub(crate) fn publish_block_gossip(
+        &self,
+        store: &Store,
+        block: &SignedBeaconBlock,
+        announcement: BlockAnnouncement,
+    ) {
+        if announcement == BlockAnnouncement::Silent || !self.has_subscribers() {
+            return;
+        }
+        let slot = block.slot();
+        let root = block.message_hash_tree_root();
+        let event = match store.chain() {
+            Chain::Lean => ChainEvent::BlockGossip { slot, block: root },
+            Chain::Beacon => {
+                ChainEvent::BeaconBlockGossip(BeaconBlockGossipEvent { slot, block: root })
+            }
+        };
+        self.emit(event);
+    }
+
+    /// Beacon `attestation` for an aggregate that passed the gossip
+    /// conditions. Behind the subscriber check, since building the payload
+    /// clones the attestation.
+    pub(crate) fn publish_beacon_aggregate(&self, aggregate: &SignedAggregateAndProof) {
+        if !self.has_subscribers() {
+            return;
+        }
+        let attestation = BeaconAttestationEvent::from(aggregate);
+        self.emit(ChainEvent::BeaconAttestation(Box::new(attestation)));
+    }
+}
+
 /// Suppresses `head` events whose slot has fallen too far behind the wall
 /// clock: during startup catch-up or backfill, fork choice can walk through
 /// many historical heads on its way to the tip, and none of those are
@@ -496,12 +620,12 @@ pub(crate) const HEAD_EVENT_RECENCY_SLOTS: u64 = 32;
 ///
 /// The actor — not the store — publishes chain events: it captures this
 /// snapshot before a store call (`store::on_tick`, `store::on_block`) and
-/// diffs the store against it afterwards, so `store.rs` needs no event
-/// plumbing.
+/// diffs the store against it afterwards, both through [`ChainEvents`], so
+/// `store.rs` needs no event plumbing.
 ///
 /// Lean only. A beacon head moves in `recompute_beacon_head`, outside any one
-/// store call, so the beacon chain diffs against a [`BeaconEventView`] the
-/// actor keeps between calls instead.
+/// store call, so the beacon chain diffs against a [`BeaconEventView`] kept
+/// between calls instead.
 ///
 /// Multiple head moves within one store call coalesce into a single `head`
 /// event; subscribers only care about the latest.
@@ -518,7 +642,7 @@ pub(crate) struct ChainEventSnapshot {
 }
 
 impl ChainEventSnapshot {
-    pub(crate) fn capture(store: &Store) -> Self {
+    fn capture(store: &Store) -> Self {
         Self {
             head: store.head().expect("head block exists"),
             justified: store
@@ -537,7 +661,7 @@ impl ChainEventSnapshot {
     /// `wall_clock_slot` is the caller's current slot, used only to gate the
     /// `head` event against [`HEAD_EVENT_RECENCY_SLOTS`]; the other events are
     /// ungated.
-    pub(crate) fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
+    fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
         let head = store.head().expect("head block exists");
         if head != self.head {
             // Read the block once and reuse it for slot and state root so they
@@ -614,7 +738,7 @@ fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
 }
 
 /// The head and finalized checkpoint the beacon chain events last reported
-/// on, kept by the actor between calls.
+/// on, kept by [`ChainEvents`] between calls.
 ///
 /// Why a persistent view rather than a [`ChainEventSnapshot`] around each
 /// store call: a beacon head moves in `recompute_beacon_head`, after the
@@ -629,13 +753,13 @@ fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
 /// to pays two metadata reads per diff and nothing more. Its block stays
 /// readable: `Table::BlockHeaders` is not pruned on beacon, and an
 /// invalidated branch loses only its `LiveChain` rows.
-pub(crate) struct BeaconEventView {
+struct BeaconEventView {
     head: H256,
     finalized: Checkpoint,
 }
 
 impl BeaconEventView {
-    pub(crate) fn capture(store: &Store) -> Self {
+    fn capture(store: &Store) -> Self {
         Self {
             head: store.head().expect("head block exists"),
             finalized: store
@@ -649,12 +773,7 @@ impl BeaconEventView {
     ///
     /// Order: `chain_reorg` -> `head` -> `finalized_checkpoint`. Only `head`
     /// is gated, against [`HEAD_EVENT_RECENCY_SLOTS`] of `wall_clock_slot`.
-    pub(crate) fn publish_changes(
-        &mut self,
-        store: &Store,
-        events: &EventBus,
-        wall_clock_slot: u64,
-    ) {
+    fn publish_changes(&mut self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
         let previous = std::mem::replace(self, Self::capture(store));
         if !events.has_subscribers() {
             return;
@@ -1061,11 +1180,11 @@ mod tests {
     #[test]
     fn chain_event_diff_emits_nothing_when_unchanged() {
         let store = test_store();
-        let bus = EventBus::new(8);
-        let mut rx = bus.subscribe();
+        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
 
-        let snapshot = ChainEventSnapshot::capture(&store);
-        snapshot.diff_and_emit(&store, &bus, 0);
+        let snapshot = events.lean_snapshot(&store);
+        events.publish_lean_changes(snapshot, &store, 0);
 
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
@@ -1077,10 +1196,10 @@ mod tests {
     fn chain_event_diff_gates_stale_head() {
         let mut store = test_store();
         let genesis = store.head().expect("store head exists");
-        let bus = EventBus::new(8);
-        let mut rx = bus.subscribe();
+        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
 
-        let snapshot = ChainEventSnapshot::capture(&store);
+        let snapshot = events.lean_snapshot(&store);
 
         let new_root = H256([9u8; 32]);
         let new_state = H256([99u8; 32]);
@@ -1100,7 +1219,7 @@ mod tests {
         // Wall clock far ahead of the new head's slot (1): well past
         // HEAD_EVENT_RECENCY_SLOTS, so the head event must be suppressed.
         let wall_clock_slot = 1 + HEAD_EVENT_RECENCY_SLOTS + 100;
-        snapshot.diff_and_emit(&store, &bus, wall_clock_slot);
+        events.publish_lean_changes(snapshot, &store, wall_clock_slot);
 
         match rx.try_recv().unwrap() {
             ChainEvent::JustifiedCheckpoint { slot, block, state } => {
@@ -1123,10 +1242,10 @@ mod tests {
     fn chain_event_diff_emits_recent_head() {
         let mut store = test_store();
         let genesis = store.head().expect("store head exists");
-        let bus = EventBus::new(8);
-        let mut rx = bus.subscribe();
+        let events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
 
-        let snapshot = ChainEventSnapshot::capture(&store);
+        let snapshot = events.lean_snapshot(&store);
 
         let new_root = H256([9u8; 32]);
         let new_state = H256([99u8; 32]);
@@ -1136,7 +1255,7 @@ mod tests {
             .expect("update_checkpoints should succeed");
 
         // Wall clock equal to the head's own slot: as recent as it gets.
-        snapshot.diff_and_emit(&store, &bus, 1);
+        events.publish_lean_changes(snapshot, &store, 1);
 
         match rx.try_recv().unwrap() {
             ChainEvent::Head { slot, block, state } => {
