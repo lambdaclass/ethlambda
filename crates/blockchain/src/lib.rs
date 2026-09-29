@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::ProposerConfig;
-use crate::events::{ChainEvents, DataColumnSidecarEvent};
+use crate::events::ChainEvents;
 use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
 use crate::store::StoreError;
 
@@ -933,18 +933,16 @@ impl BlockChainServer {
         // which nothing arrived, the block path having one of its own (see
         // [`Self::recompute_beacon_head`], which both share).
         //
-        // Lean snapshots/diffs around its call so attestation-driven head or
-        // finalization moves surface as chain events. Beacon's recompute
-        // publishes its own, against the actor's persistent view.
+        // Both chains then diff the events' view, so attestation-driven head
+        // or finalization moves surface as chain events: lean right after its
+        // store call, beacon at the end of its head recompute.
         match self.store.chain() {
             Chain::Lean => {
-                let pre_tick = self.events.lean_snapshot(&self.store);
                 store::on_tick(&mut self.store, timestamp_ms, is_proposer);
                 // `slot` above is already derived from `timestamp_ms` (the
                 // wall clock at tick time), so it doubles as the wall-clock
                 // slot for the gate.
-                self.events
-                    .publish_lean_changes(pre_tick, &self.store, slot);
+                self.events.publish_lean_changes(&self.store, slot);
             }
             Chain::Beacon => {
                 let config = self.store.config();
@@ -1473,11 +1471,9 @@ impl BlockChainServer {
         //
         // That interval-0 catch-up can move head/justified/finalized (it is the
         // same attestation-acceptance step a non-proposing node runs at its
-        // interval-0 tick). Snapshot around the build so those moves surface as
-        // chain events here, matching an observer node; otherwise they would
-        // land outside every snapshot window and be silently absorbed into the
-        // later block-import diff's baseline.
-        let pre_build = self.events.lean_snapshot(&self.store);
+        // interval-0 tick). Diffed right after the build so those moves surface
+        // as chain events here, matching an observer node, rather than being
+        // folded into the later block import's own diff.
         let timing = metrics::time_block_building();
         let build_result = store::produce_block_with_signatures(
             &mut self.store,
@@ -1490,12 +1486,11 @@ impl BlockChainServer {
         // `get_proposal_head` advances the store (interval-0 catch-up) inside
         // `produce_block_with_signatures` *before* the build can fail, so emit
         // the resulting head/checkpoint moves on both paths — a build failure
-        // must not strand a real finalization move outside every snapshot
-        // window. Ordered before the freshly built block's own import (which
+        // must not leave a real finalization move to be reported late, by the
+        // next diff. Ordered before the freshly built block's own import (which
         // emits its `block` + head/checkpoint events). The catch-up advanced
         // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
-        self.events
-            .publish_lean_changes(pre_build, &self.store, slot);
+        self.events.publish_lean_changes(&self.store, slot);
 
         let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
@@ -1600,11 +1595,6 @@ impl BlockChainServer {
             .store
             .has_state(&block_root)
             .expect("DB read should succeed");
-        // Lean only: a beacon import moves no head of its own, and the
-        // cascade's head recompute publishes beacon's events once it runs.
-        let pre_import =
-            (self.store.chain() == Chain::Lean).then(|| self.events.lean_snapshot(&self.store));
-
         let outcome = match signed_block {
             SignedBeaconBlock::Lean(lean_block) => {
                 match store::on_block(&mut self.store, lean_block) {
@@ -1816,12 +1806,14 @@ impl BlockChainServer {
         if is_new {
             self.events.publish_block(&self.store, slot, block_root);
         }
-        // Block import has no ready-made "now" slot like `on_tick`'s, so
-        // read the wall-clock slot fresh for the head-recency gate.
-        if let Some(pre_import) = pre_import {
+        // Lean only: a beacon import moves no head of its own, and the
+        // cascade's head recompute publishes beacon's events once it runs.
+        // Block import has no ready-made "now" slot like `on_tick`'s, so read
+        // the wall-clock slot fresh for the head-recency gate.
+        if self.store.chain() == Chain::Lean {
             let wall_clock_slot = self.wall_clock_slot();
             self.events
-                .publish_lean_changes(pre_import, &self.store, wall_clock_slot);
+                .publish_lean_changes(&self.store, wall_clock_slot);
         }
 
         // A genuine import is one of the two places (with `on_tick`) beacon
@@ -3110,21 +3102,17 @@ impl BlockChainServer {
 
         // Surface only votes that passed data validation and signature
         // verification, so subscribers see the same attestations fork choice
-        // does. The ~3 KB XMSS signature is not carried. `emit`'s own guard
-        // drops the event on a node with no subscribers.
+        // does.
         if accepted {
-            self.events.emit(ChainEvent::Attestation {
-                validator_id: attestation.validator_id,
-                data: attestation.data.clone(),
-            });
+            self.events.publish_lean_attestation(attestation);
         }
     }
 
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
-        // The store consumes the aggregate, so snapshot the event inputs first.
+        // The store consumes the aggregate, so take the event inputs first.
         // Aggregates are low-rate (~one per subnet per slot), so building these
-        // unconditionally is cheap; `emit`'s own guard drops them on an
-        // unsubscribed node. The SNARK proof bytes are not carried.
+        // unconditionally is cheap; the bus drops them on an unsubscribed
+        // node.
         let participants: Vec<u64> = attestation.proof.participant_indices().collect();
         let data = attestation.data.clone();
         let accepted = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
@@ -3133,8 +3121,7 @@ impl BlockChainServer {
 
         // Emit only for aggregates the store accepted, mirroring `attestation`.
         if accepted {
-            self.events
-                .emit(ChainEvent::Aggregate { participants, data });
+            self.events.publish_lean_aggregate(participants, data);
         }
     }
 
@@ -3201,12 +3188,7 @@ impl BlockChainServer {
             return;
         }
         metrics::inc_data_column_stored();
-        self.events
-            .emit(ChainEvent::DataColumnSidecar(DataColumnSidecarEvent {
-                block_root,
-                index: sidecar.index,
-                slot,
-            }));
+        self.events.publish_data_column(block_root, &sidecar);
 
         // A held block may now be complete.
         self.release_block_if_columns_complete(block_root).await;
@@ -3956,11 +3938,11 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
         // Surface our own freshly produced aggregate, the counterpart of the
         // gossip-received path in `on_gossip_aggregated_attestation` (we never
-        // receive our own aggregate back over gossip). Low-rate; proof omitted.
-        self.events.emit(ChainEvent::Aggregate {
-            participants: msg.output.participants.clone(),
-            data: msg.output.hashed.data().clone(),
-        });
+        // receive our own aggregate back over gossip). Low-rate.
+        self.events.publish_lean_aggregate(
+            msg.output.participants.clone(),
+            msg.output.hashed.data().clone(),
+        );
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
@@ -5539,7 +5521,7 @@ mod tests {
 
     use crate::events::{
         BeaconAttestationEvent, BeaconFinalizedCheckpointEvent, BeaconHeadEvent, ChainReorgEvent,
-        HEAD_EVENT_RECENCY_SLOTS,
+        DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
     };
     use ethlambda_storage::ForkCheckpoints;
     use tokio::sync::broadcast;
