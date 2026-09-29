@@ -305,6 +305,9 @@ public step functions stay and each builds what it needs. The
 specification-shaped implementation is kept in `participation_reference` and
 `stf::epoch::altair_reference` for tests and debug builds: the driver runs it on
 a clone for registries of up to 4096 validators and asserts the outcomes agree.
+The leak flag is read once per step rather than once per validator, which fails
+some states the specification accepts; see
+[Spec Deviations](spec_deviations.md#the-inactivity-leak-check-runs-once-per-epoch-step-not-once-per-validator).
 
 ## Macros and traits
 

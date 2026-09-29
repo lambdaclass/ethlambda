@@ -131,3 +131,30 @@ answers `404`, since no candidate matches.
 This was found by running a mainnet follower and pointing a second one at its
 API: before the fallback existed, the second died with `peer served no block at
 the anchor slot 15265888`.
+
+## The inactivity-leak check runs once per epoch step, not once per validator
+
+A state whose finalized checkpoint is past its previous epoch fails epoch
+processing here even where the specification never reaches the failing check.
+
+- **ethlambda:** `get_finality_delay`
+  (`crates/blockchain/state_transition/src/beacon/helpers/finality.rs`) returns
+  `ArithmeticOverflow` when `previous_epoch - finalized_checkpoint.epoch`
+  underflows. From altair on, the inactivity-score update and
+  `RewardContext::new` read the leak flag once, before their loop over
+  validators, so either fails whenever the delay does. altair's
+  `get_inactivity_penalty_deltas` also builds a `RewardContext`, so it fails
+  too. phase0 reads the flag where the specification does.
+- **consensus-specs:** the subtraction is the same, and a `uint64` underflow
+  makes the transition invalid. But `process_inactivity_updates` and
+  `get_flag_index_deltas` call `is_in_inactivity_leak` inside their loops, for
+  eligible (and, for rewards, participating) validators only, and altair's
+  `get_inactivity_penalty_deltas` never calls it. A state where no validator
+  reaches the check passes.
+- **Consequence:** none on a real chain. Justification only finalizes an epoch
+  behind the current one, so the finalized epoch never passes the previous
+  epoch, and only a crafted pre-state tells the two apart. Lighthouse reads
+  the leak once per epoch as well (`process_epoch_single_pass`), failing on the
+  same `safe_sub`. The randomized equivalence tests keep the finalized epoch
+  behind the previous one for this reason: past it, the fast path and the
+  specification-shaped reference fail at different points.
