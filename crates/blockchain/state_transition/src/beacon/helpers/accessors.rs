@@ -129,8 +129,10 @@ pub fn get_seed(state: &BeaconState, epoch: Epoch, domain_type: DomainType) -> B
 /// split out so [`build_epoch_committees`] can share one
 /// [`get_active_validator_indices`] scan between this and its own committee
 /// derivation, rather than [`get_committee_count_per_slot`] repeating the scan
-/// the caller already did to get `active_count` in the first place.
-fn committee_count_per_slot(active_count: u64) -> u64 {
+/// the caller already did to get `active_count` in the first place. Public
+/// for p2p's gossipsub scoring, which sizes expected aggregate traffic from
+/// a validator count rather than from a state.
+pub fn committee_count_per_slot(active_count: u64) -> u64 {
     let ideal = active_count / preset::SLOTS_PER_EPOCH / preset::TARGET_COMMITTEE_SIZE;
     ideal.clamp(1, preset::MAX_COMMITTEES_PER_SLOT as u64)
 }
