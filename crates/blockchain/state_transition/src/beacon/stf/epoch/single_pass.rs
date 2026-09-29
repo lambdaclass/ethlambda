@@ -239,7 +239,7 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
             while deferred_cursor.next_if(|&&at| at < index).is_some() {}
             let is_deferred = deferred_cursor.next_if(|&&at| at == index).is_some();
             if !is_deferred
-                && let Some(effective) = updated_effective_balance(&current, new_balance)
+                && let Some(effective) = updated_effective_balance(&current, new_balance)?
                 && effective != current.effective_balance
             {
                 current.to_mut().effective_balance = effective;
@@ -287,7 +287,7 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
     for index in patched {
         let validator = state.validator(index as ValidatorIndex)?;
         let balance = state.balance(index as ValidatorIndex)?;
-        if let Some(effective) = updated_effective_balance(validator, balance) {
+        if let Some(effective) = updated_effective_balance(validator, balance)? {
             effective_updates.push((index, effective));
         }
     }

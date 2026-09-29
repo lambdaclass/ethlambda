@@ -31,7 +31,7 @@ mod single_pass_equivalence;
 
 use crate::beacon::containers::phase0::PendingAttestation;
 use crate::beacon::containers::{BeaconState, HistoricalBatch};
-use crate::beacon::error::{Result, verify};
+use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
     CommitteeCache, CommitteeCacheExt, get_block_root, get_block_root_at_slot, get_current_epoch,
@@ -267,11 +267,6 @@ pub fn process_eth1_data_reset(state: &mut BeaconState) -> Result<()> {
 /// and since effective balance feeds the shuffling seed's weighting and every
 /// reward, that would churn far more than it measures.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    const HYSTERESIS_INCREMENT: Gwei =
-        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
-    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
-    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
-
     // Decided in one pass and applied in another. The state is an enum over
     // per-fork structs, so the accessors hand out a borrow of the whole state
     // rather than of one field, and there is no way to hold `validators` mutably
@@ -287,9 +282,7 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         .zip(state.balances().iter())
         .enumerate()
     {
-        if balance + DOWNWARD_THRESHOLD < validator.effective_balance
-            || validator.effective_balance + UPWARD_THRESHOLD < balance
-        {
+        if leaves_hysteresis_band(validator.effective_balance, balance)? {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
             updates.push((index, effective));
@@ -301,6 +294,37 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
         validators[index].effective_balance = effective;
     }
     Ok(())
+}
+
+/// Whether `balance` has moved far enough from `effective_balance` for the
+/// effective balance to follow it: the hysteresis test every fork's
+/// effective-balance update shares.
+///
+/// `HYSTERESIS_INCREMENT` is divided first and only then multiplied up to each
+/// threshold: multiplying first is algebraically equivalent but rounds
+/// differently, and only the specification's order reproduces its integer
+/// rounding. Both sums are checked, since the specification treats a `uint64`
+/// overflow as an invalid transition, where a wrapped sum would compare as a
+/// small number and move the effective balance. The upward sum is only taken
+/// when the downward comparison fails, as the specification's `or`
+/// short-circuits.
+pub(super) fn leaves_hysteresis_band(effective_balance: Gwei, balance: Gwei) -> Result<bool> {
+    const HYSTERESIS_INCREMENT: Gwei =
+        preset::EFFECTIVE_BALANCE_INCREMENT / preset::HYSTERESIS_QUOTIENT;
+    const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
+    const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
+
+    let below = balance
+        .checked_add(DOWNWARD_THRESHOLD)
+        .ok_or(Error::ArithmeticOverflow("balance + DOWNWARD_THRESHOLD"))?
+        < effective_balance;
+    Ok(below
+        || effective_balance
+            .checked_add(UPWARD_THRESHOLD)
+            .ok_or(Error::ArithmeticOverflow(
+                "effective_balance + UPWARD_THRESHOLD",
+            ))?
+            < balance)
 }
 
 /// Zeroes the slot the slashings ring buffer is about to reuse.
