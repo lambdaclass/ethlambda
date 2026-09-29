@@ -105,8 +105,20 @@ lean-quickstart:
 	git clone $(LEAN_QUICKSTART_REPO) --branch $(LEAN_QUICKSTART_BRANCH) --depth 1 --single-branch
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
-	@[ "$$(git -C lean-quickstart rev-parse --abbrev-ref HEAD)" = "$(LEAN_QUICKSTART_BRANCH)" ] \
-		|| echo "⚠️  lean-quickstart/ is not on the pinned $(LEAN_QUICKSTART_BRANCH) branch; delete it to re-clone"
+	@# The branch name check works offline. On the right branch, also compare against the
+	@# remote tip, so a clone left behind by a moved pin is caught too. ls-remote reads the
+	@# ref without touching the clone
+	@if [ "$$(git -C lean-quickstart rev-parse --abbrev-ref HEAD)" != "$(LEAN_QUICKSTART_BRANCH)" ]; then \
+		echo "⚠️  lean-quickstart/ is not on the pinned $(LEAN_QUICKSTART_BRANCH) branch; delete it to re-clone"; \
+	else \
+		have=$$(git -C lean-quickstart rev-parse HEAD); \
+		want=$$(git ls-remote $(LEAN_QUICKSTART_REPO) refs/heads/$(LEAN_QUICKSTART_BRANCH) 2>/dev/null | cut -f1); \
+		if [ -z "$$want" ]; then \
+			echo "⚠️  could not resolve $(LEAN_QUICKSTART_BRANCH) at $(LEAN_QUICKSTART_REPO); skipping the lean-quickstart/ freshness check"; \
+		elif [ "$$have" != "$$want" ]; then \
+			echo "⚠️  lean-quickstart/ is at $$(printf '%.8s' "$$have"), but $(LEAN_QUICKSTART_BRANCH) is at $$(printf '%.8s' "$$want"); delete it to re-clone"; \
+		fi; \
+	fi
 	@# Remove local devnet data folder to avoid stale data
 	@# NOTE: --cleanData flag in spin-node.sh doesn't work
 	@rm -rf lean-quickstart/local-devnet/data/
