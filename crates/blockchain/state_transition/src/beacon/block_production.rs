@@ -38,10 +38,12 @@ use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_previous_epoch,
-    get_randao_mix,
+    CommitteeCache, get_beacon_proposer_index, get_block_root, get_current_epoch,
+    get_previous_epoch, get_randao_mix,
 };
-use super::helpers::electra::get_attesting_indices;
+use super::helpers::electra::{
+    get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
+};
 use super::stf::{self, ExecutionEngine};
 
 /// `state` advanced through empty slots to `slot`, as a block for `slot` is
@@ -139,13 +141,25 @@ pub fn parse_execution_requests(list: &[Vec<u8>]) -> Result<ExecutionRequests> {
 /// Keeps only what `process_attestation` accepts at this slot: included at
 /// least `MIN_ATTESTATION_INCLUSION_DELAY` after its own slot, targeting the
 /// current or previous epoch, and sourced from the justified checkpoint that
-/// target implies. Of those, only candidates with at least one attester the
-/// state has not yet credited for that epoch: an attestation already on chain
-/// earns nothing again, and with room for only `MAX_ATTESTATIONS_ELECTRA`
-/// per block, re-including it would crowd out ones that still count.
-/// Candidates voting on the same `AttestationData` are merged into one electra
-/// `Attestation` spanning their committees (EIP-7549's on-chain aggregation),
-/// ordered by how many new attesters they bring, then newest first.
+/// target implies. The target root must also be this state's block root at
+/// the start of the target epoch. `process_attestation` does not check that,
+/// but an attestation for another branch was aggregated against that branch's
+/// committees, and its bits may name different validators here.
+///
+/// Of those, only candidates with at least one attester the state has not yet
+/// credited for that epoch: an attestation already on chain earns nothing
+/// again, and with room for only `MAX_ATTESTATIONS_ELECTRA` per block,
+/// re-including it would crowd out ones that still count. Candidates voting on
+/// the same `AttestationData` are merged into one electra `Attestation`
+/// spanning their committees (EIP-7549's on-chain aggregation), ordered by how
+/// many new attesters they bring, then newest first.
+///
+/// Each merged attestation's aggregate signature is then checked against
+/// `state` in that order, and one that fails is dropped and the next taken in
+/// its place. One invalid attestation fails `process_block` for the whole
+/// block, and a candidate from gossip was verified against its own target
+/// state, not this one. That is one signature check per packed attestation,
+/// plus one per dropped one.
 pub fn pack_attestations(state: &BeaconState, candidates: Vec<Attestation>) -> Vec<Attestation> {
     let current_epoch = get_current_epoch(state);
     let previous_epoch = get_previous_epoch(state);
@@ -161,6 +175,7 @@ pub fn pack_attestations(state: &BeaconState, candidates: Vec<Attestation>) -> V
             && (target_epoch == current_epoch || target_epoch == previous_epoch)
             && target_epoch == compute_epoch_at_slot(data.slot)
             && data.source == expected_source
+            && get_block_root(state, target_epoch).is_ok_and(|root| root == data.target.root)
     };
 
     // How many of an attestation's attesters the state has not yet credited
@@ -220,10 +235,14 @@ pub fn pack_attestations(state: &BeaconState, candidates: Vec<Attestation>) -> V
             std::cmp::Reverse(attestation.data.slot),
         )
     });
-    merged.truncate(preset::MAX_ATTESTATIONS_ELECTRA);
     merged
         .into_iter()
         .map(|(_, attestation)| attestation)
+        .filter(|attestation| {
+            get_indexed_attestation(state, attestation, &committees)
+                .is_ok_and(|indexed| is_valid_indexed_attestation(state, &indexed))
+        })
+        .take(preset::MAX_ATTESTATIONS_ELECTRA)
         .collect()
 }
 
@@ -333,16 +352,24 @@ pub fn assemble_block(
 mod tests {
     use super::*;
     use crate::beacon::ForkName;
-    use crate::beacon::helpers::accessors::get_domain;
+    use crate::beacon::helpers::accessors::{get_beacon_committee, get_domain};
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
 
     /// A fulu state one epoch in, its lookahead and sync committee filled from
     /// its real registry (the builder leaves both as placeholders), advanced one
     /// slot so a block can be built on it.
     fn state_to_build_on() -> BeaconState {
-        let mut state = with_signing_validators_at(ForkName::Fulu, 64);
+        state_to_build_on_with(64)
+    }
+
+    /// [`state_to_build_on`] with `validators` in the registry. Mainnet's
+    /// preset splits a slot into more than one committee only from
+    /// `2 * SLOTS_PER_EPOCH * TARGET_COMMITTEE_SIZE` active validators.
+    fn state_to_build_on_with(validators: usize) -> BeaconState {
+        let mut state = with_signing_validators_at(ForkName::Fulu, validators);
         let lookahead = initialize_proposer_lookahead(&state).unwrap();
         let sync_committee =
             crate::beacon::helpers::altair::get_next_sync_committee(&state).unwrap();
@@ -429,62 +456,92 @@ mod tests {
         assert!(assemble_block(&state, inputs, &Config::mainnet()).is_err());
     }
 
-    /// A single-committee aggregate over `data` with the given member bits.
-    fn committee_aggregate(
-        data: ethlambda_types::beacon::containers::shared::AttestationData,
-        committee: usize,
-        bits: &[bool],
-        signer: usize,
-    ) -> Attestation {
-        let mut aggregation_bits = AggregationBits::with_length(bits.len()).unwrap();
-        for (i, bit) in bits.iter().enumerate() {
-            aggregation_bits.set(i, *bit).unwrap();
+    /// An attestation at `slot` voting for this state's own chain: sourced from
+    /// its current justified checkpoint, targeting its current epoch at the
+    /// state's block root there.
+    fn attestation_data(state: &BeaconState, slot: Slot) -> AttestationData {
+        let epoch = get_current_epoch(state);
+        AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: Root::repeat_byte(1),
+            source: state.current_justified_checkpoint(),
+            target: Checkpoint {
+                epoch,
+                root: get_block_root(state, epoch).unwrap(),
+            },
         }
+    }
+
+    /// A single-committee aggregate over `data` from `committee`, with the
+    /// members at `positions` set and signed by exactly those members, so it
+    /// verifies against `state`.
+    fn committee_aggregate(
+        state: &BeaconState,
+        data: AttestationData,
+        committee: u64,
+        positions: &[usize],
+    ) -> Attestation {
+        let members = get_beacon_committee(state, data.slot, committee).unwrap();
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_BEACON_ATTESTER,
+            Some(data.target.epoch),
+        );
+        let signing_root = compute_signing_root(data.hash_tree_root(), domain);
+        let mut aggregation_bits = AggregationBits::with_length(members.len()).unwrap();
+        let signatures: Vec<_> = positions
+            .iter()
+            .map(|&position| {
+                aggregation_bits.set(position, true).unwrap();
+                sign_for(members[position] as usize, signing_root)
+            })
+            .collect();
         let mut committee_bits = CommitteeBits::default();
-        committee_bits.set(committee, true).unwrap();
+        committee_bits.set(committee as usize, true).unwrap();
         Attestation {
             aggregation_bits,
             data,
-            signature: sign_for(signer, data.hash_tree_root()),
+            signature: bls::aggregate(&signatures).unwrap(),
             committee_bits,
         }
     }
 
     #[test]
     fn committees_voting_alike_are_merged_and_the_too_recent_left_out() {
-        let state = state_to_build_on();
-        let data = ethlambda_types::beacon::containers::shared::AttestationData {
-            slot: state.slot() - 1,
-            index: 0,
-            beacon_block_root: Root::repeat_byte(1),
-            source: state.current_justified_checkpoint(),
-            target: ethlambda_types::beacon::containers::shared::Checkpoint {
-                epoch: get_current_epoch(&state),
-                root: Root::repeat_byte(2),
-            },
-        };
-        let too_recent = ethlambda_types::beacon::containers::shared::AttestationData {
+        // Enough validators for at least two committees a slot: exactly two
+        // under mainnet's preset, more under minimal's smaller committees. The
+        // test only uses committees 0 and 1.
+        let state = state_to_build_on_with(8192);
+        let committees_per_slot = crate::beacon::helpers::accessors::get_committee_count_per_slot(
+            &state,
+            get_current_epoch(&state),
+        );
+        assert!(committees_per_slot >= 2, "got {committees_per_slot}");
+        let data = attestation_data(&state, state.slot() - 1);
+        let too_recent = AttestationData {
             slot: state.slot(),
             ..data
         };
-        let first = committee_aggregate(data, 1, &[true, false], 1);
-        let second = committee_aggregate(data, 0, &[false, true, true], 2);
+        let first = committee_aggregate(&state, data, 1, &[0]);
+        let second = committee_aggregate(&state, data, 0, &[1, 2]);
+        let committee_0_len = second.aggregation_bits.len();
         let packed = pack_attestations(
             &state,
             vec![
                 first.clone(),
                 second.clone(),
-                committee_aggregate(too_recent, 0, &[true], 3),
+                committee_aggregate(&state, too_recent, 0, &[0]),
             ],
         );
 
         assert_eq!(packed.len(), 1);
         let merged = &packed[0];
-        // Committee 0's three bits, then committee 1's two.
-        let bits: Vec<bool> = (0..merged.aggregation_bits.len())
-            .map(|i| merged.aggregation_bits.get(i).unwrap())
+        // Committee 0's bits, then committee 1's.
+        let set: Vec<usize> = (0..merged.aggregation_bits.len())
+            .filter(|&i| merged.aggregation_bits.get(i).unwrap())
             .collect();
-        assert_eq!(bits, [false, true, true, true, false]);
+        assert_eq!(set, [1, 2, committee_0_len]);
         assert!(merged.committee_bits.get(0).unwrap() && merged.committee_bits.get(1).unwrap());
         assert_eq!(
             merged.signature,
@@ -495,21 +552,10 @@ mod tests {
     #[test]
     fn an_attestation_already_credited_on_chain_is_not_packed_again() {
         let mut state = state_to_build_on();
-        let data = ethlambda_types::beacon::containers::shared::AttestationData {
-            slot: state.slot() - 1,
-            index: 0,
-            beacon_block_root: Root::repeat_byte(1),
-            source: state.current_justified_checkpoint(),
-            target: ethlambda_types::beacon::containers::shared::Checkpoint {
-                epoch: get_current_epoch(&state),
-                root: Root::repeat_byte(2),
-            },
-        };
-        let committee_len =
-            crate::beacon::helpers::accessors::get_beacon_committee(&state, data.slot, 0)
-                .unwrap()
-                .len();
-        let candidate = committee_aggregate(data, 0, &vec![true; committee_len], 1);
+        let data = attestation_data(&state, state.slot() - 1);
+        let committee_len = get_beacon_committee(&state, data.slot, 0).unwrap().len();
+        let everyone: Vec<usize> = (0..committee_len).collect();
+        let candidate = committee_aggregate(&state, data, 0, &everyone);
         assert_eq!(pack_attestations(&state, vec![candidate.clone()]).len(), 1);
 
         // Every validator credited for the current epoch, as if the same
@@ -521,6 +567,37 @@ mod tests {
             *flags = 0b111;
         }
         assert!(pack_attestations(&state, vec![candidate]).is_empty());
+    }
+
+    /// A vote for another branch was aggregated against that branch's
+    /// committees, so its bits cannot be trusted to name the same validators
+    /// on this one, however valid it was where it came from.
+    #[test]
+    fn an_attestation_targeting_another_branch_is_not_packed() {
+        let state = state_to_build_on();
+        let mut data = attestation_data(&state, state.slot() - 1);
+        data.target.root = Root::repeat_byte(2);
+        let candidate = committee_aggregate(&state, data, 0, &[0]);
+        assert!(pack_attestations(&state, vec![candidate]).is_empty());
+    }
+
+    /// One attestation whose signature does not verify against this state
+    /// would fail the whole block, so it is dropped and the rest are packed.
+    #[test]
+    fn an_attestation_that_does_not_verify_is_dropped_and_the_rest_packed() {
+        let state = state_to_build_on();
+        let valid =
+            committee_aggregate(&state, attestation_data(&state, state.slot() - 1), 0, &[0]);
+
+        // Different data, so the two are not merged, signed by the wrong
+        // member of the committee.
+        let mut forged_data = attestation_data(&state, state.slot() - 1);
+        forged_data.beacon_block_root = Root::repeat_byte(3);
+        let mut forged = committee_aggregate(&state, forged_data, 0, &[0]);
+        forged.signature = committee_aggregate(&state, forged_data, 0, &[1]).signature;
+
+        let packed = pack_attestations(&state, vec![forged, valid.clone()]);
+        assert_eq!(packed, vec![valid]);
     }
 
     #[test]

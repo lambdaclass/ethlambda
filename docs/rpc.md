@@ -287,15 +287,26 @@ the chain actor writes, so no request waits on the actor.
   `beacon_aggregate_and_proof` gossip conditions this node applies to its
   peers' aggregates (`gossip::aggregate`), signatures included, against a
   fresh seen-cache (a node never receives its own messages, so P2P's says
-  nothing about them). What passes is gossiped on the topic.
+  nothing about them). What passes is gossiped on the topic and goes into the
+  pool.
+- **The attestation pool** holds, the best-covered per data root and
+  committee: votes from `pool/attestations` and the aggregator subnets,
+  aggregates from `aggregate_and_proofs`, and every electra gossip aggregate
+  P2P accepts, once all three of its signatures have verified. Gossip
+  aggregates are pooled on arrival, so a slot's aggregates are there when the
+  next slot's block is asked for. Entries more than an epoch old are dropped
+  once a slot.
 - **`prepare_beacon_proposer`** records each validator's fee recipient, in
   memory (a validator client repeats the call every epoch).
 - **`blocks/{slot}`** advances the head state to the slot and asks the node's
   own execution client to build on the head (`forkchoiceUpdatedV3` with
   payload attributes, then `getPayloadV5`), with the proposer's fee recipient.
   The body packs the pool's best aggregates (committees voting alike merged
-  into one EIP-7549 attestation, up to `MAX_ATTESTATIONS_ELECTRA`), votes the
-  state's own `eth1_data`, and carries an empty sync aggregate and no
+  into one EIP-7549 attestation, up to `MAX_ATTESTATIONS_ELECTRA`). A candidate
+  is packed only if its target root is the advanced state's own block root for
+  that epoch and its aggregate signature verifies against that state, so an
+  aggregate made on another branch cannot fail the whole block. The body also
+  votes the state's own `eth1_data`, and carries an empty sync aggregate and no
   slashings, exits or credential changes. The state root comes from running
   the block through `process_block`. The answer is fulu `BlockContents`, with
   `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
