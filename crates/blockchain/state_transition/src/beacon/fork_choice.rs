@@ -1255,9 +1255,10 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// equal, the scored root, and the specification's own contribution for
 /// such a vote is `0` too. This function is not only
 /// [`get_weight`]'s own attestation half; [`is_head_weak`] and
-/// [`is_parent_strong`] call it too, and both run underneath
+/// [`is_parent_strong`] call it too. [`is_head_weak`] runs underneath
 /// [`should_apply_proposer_boost`], which the gloas head visits on every
-/// call whose boosted block's parent is from the previous slot, so a pruned
+/// call whose boosted block's parent is from the previous slot, and
+/// [`is_parent_strong`] underneath `gloas_get_proposer_head`, so a pruned
 /// vote reaching this function is not only a pre-gloas concern.
 pub fn get_attestation_score(
     store: &Store,
@@ -1644,18 +1645,18 @@ fn compute_head(
 /// one, and says Lighthouse does the same; our FULL rule differs from both.
 /// Adopt PENDING here if that PR lands.
 ///
-/// A fresh [`CommitteeCache`] on the gloas arm: gloas's own weight
-/// (`gloas_get_weight` by way of `should_apply_proposer_boost`) now needs
-/// committees a pre-gloas head computation never did, and this is the one
-/// entry point both [`get_head`] and the fixture harness reach it through,
-/// with no longer-lived cache to hand down instead. See [`gloas_get_weight`]'s
-/// own performance note for what that costs repeated across a whole tree
-/// walk.
+/// The gloas arm reads committees through the store's shared
+/// [`Store::committee_cache`], the cache `on_block` and the gossip checks use:
+/// gloas's own weight (`gloas_get_weight` by way of
+/// `should_apply_proposer_boost`) needs committees a pre-gloas head
+/// computation never did, and this runs every slot, so a cache of its own
+/// would recompute every committee on every call. See [`gloas_get_weight`]'s
+/// own performance note for what that costs across a whole tree walk.
 pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
     let current_slot = get_current_slot(store, config);
     match config.fork_at_epoch(compute_epoch_at_slot(current_slot)) {
         ForkName::Gloas => {
-            let committees = CommitteeCache::default();
+            let committees = store.committee_cache();
             gloas_get_head(store, config, &committees)
         }
         ForkName::Phase0

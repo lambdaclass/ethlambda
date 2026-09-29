@@ -45,9 +45,10 @@ pub struct NewPayloadRequest<'a> {
 /// Gloas is `None` too, genuinely rather than temporarily: ePBS (EIP-7732)
 /// moves the payload out of the block into a separately gossiped envelope
 /// (see `containers::gloas::SignedExecutionPayloadEnvelope`), so a gloas
-/// block carries nothing this function could ask about at all. A later task
-/// answers the engine question gloas actually asks, from that envelope
-/// rather than from the block.
+/// block carries nothing this function could ask about at all. The engine
+/// question gloas does ask, whether a payload is valid, belongs to that
+/// envelope rather than to the block, and this follower does not receive
+/// envelopes yet, so nothing here asks it.
 pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadRequest<'_>> {
     let inner = match block {
         SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner) => inner,

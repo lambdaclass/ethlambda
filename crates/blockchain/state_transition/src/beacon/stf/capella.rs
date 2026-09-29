@@ -7,11 +7,10 @@
 //! validator a way to get its balance out without ever submitting anything:
 //! [`process_withdrawals`] sweeps a bounded slice of the validator registry
 //! on every single block, pays out anyone it finds fully or partially
-//! withdrawable, and [`BeaconState::next_withdrawal_index`] /
-//! [`BeaconState::next_withdrawal_validator_index`] (reached here through
-//! [`capella::BeaconState`]'s own fields) are the cursor that makes each
-//! block's share of that sweep bounded regardless of how large the registry
-//! grows. [`get_expected_withdrawals`] is the sweep itself;
+//! withdrawable, and [`capella::BeaconState::next_withdrawal_index`] /
+//! [`capella::BeaconState::next_withdrawal_validator_index`] are the cursor
+//! that makes each block's share of that sweep bounded regardless of how
+//! large the registry grows. [`get_expected_withdrawals`] is the sweep itself;
 //! [`process_bls_to_execution_change`] is the one new operation, a
 //! validator's one-time upgrade from a raw BLS withdrawal credential to an
 //! execution address, which is what makes it eligible for a payout in the

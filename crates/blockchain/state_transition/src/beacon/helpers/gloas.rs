@@ -867,9 +867,9 @@ pub fn initiate_builder_exit(
 /// [`gloas::BeaconState::builder_pending_withdrawals`] if it carries a real
 /// amount, then clears the slot.
 ///
-/// Called by `apply_parent_execution_payload` (parent-payload block
-/// processing, a later task; SPEC `beacon-chain.md`'s "Settle the builder
-/// payment", ~1767-1780), not by
+/// Called by [`crate::beacon::stf::gloas::apply_parent_execution_payload`]
+/// (parent-payload block processing; gloas `beacon-chain.md`'s "Settle the
+/// builder payment"), not by
 /// [`crate::beacon::stf::epoch::gloas::process_builder_pending_payments`]: that
 /// epoch step evicts and settles the *older* half of `builder_pending_payments`
 /// by weight, against [`get_builder_payment_quorum_threshold`]; this settles

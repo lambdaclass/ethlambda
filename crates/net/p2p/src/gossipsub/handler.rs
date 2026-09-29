@@ -429,6 +429,12 @@ fn triage_attestation(
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
     let attestation = match beacon_decode::decode_attestation(wire.fork, payload) {
         Ok(attestation) => attestation,
+        // As on the aggregate topic: an honest peer on a fork this node has no
+        // attestation rules for must not be scored as a bad decoder.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -947,6 +953,25 @@ mod tests {
         ));
     }
 
+    /// Gloas's aggregate has no modeled container here, and an honest gloas
+    /// peer sends exactly this once the clock reaches the fork, so the decode
+    /// error must not become a `Reject`, which would penalize it.
+    #[tokio::test]
+    async fn a_gloas_aggregate_is_ignored_as_an_unsupported_fork() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+        ));
+    }
+
     #[tokio::test]
     async fn garbage_bytes_on_an_attestation_subnet_are_rejected_as_undecodable() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -996,6 +1021,25 @@ mod tests {
         assert!(matches!(
             triage_attestation(&server, wire, &payload, 0),
             Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
+        ));
+    }
+
+    /// A gloas `SingleAttestation` has electra's bytes, but its `data.index`
+    /// is the payload flag, so an honest `1` must not reach electra's rules
+    /// and be rejected as a nonzero index.
+    #[tokio::test]
+    async fn a_gloas_attestation_is_ignored_as_an_unsupported_fork() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_single_attestation(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_attestation(&server, wire, &payload, 0),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
         ));
     }
 

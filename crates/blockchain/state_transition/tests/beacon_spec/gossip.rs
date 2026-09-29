@@ -369,11 +369,14 @@ pub fn trials() -> Vec<Trial> {
             cases.len(),
         ));
         for case in cases {
-            // The rules `beacon::gossip::block` and `beacon::gossip::column`
-            // implement are fulu's own `validate_beacon_block_gossip` and
-            // `validate_data_column_sidecar_gossip`; a case from any other
-            // fork is ignored rather than run, the same "known gap, not a
-            // silent one" treatment `case.in_scope()` already gives a fork
+            // The block and column rules (`beacon::gossip::{block, column}`)
+            // are fulu's own `validate_beacon_block_gossip` and
+            // `validate_data_column_sidecar_gossip`. The aggregate and
+            // attestation rules (`beacon::gossip::{aggregate, attestation}`)
+            // are electra's (`p2p-interface.md`), which fulu keeps. Either
+            // way a case from any other fork is ignored rather than run, the
+            // same "known gap, not a silent one" treatment `case.in_scope()`
+            // already gives a fork
             // past `HIGHEST_IMPLEMENTED_FORK`. `case.in_scope()` alone would
             // pass every fork up to gloas, since the state transition handles
             // them all; the gossip rules do not. In particular the node does
