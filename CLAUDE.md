@@ -682,9 +682,14 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the gloas section of `fork_choice.rs`, and `containers/gloas.rs` in
   `ethlambda-types`. **The live follower does not follow gloas**: it refuses
   gloas blocks and a gloas anchor until envelopes and payload attestations are
-  delivered to it. `get_head_node` switches on the clock, so a follower on any
-  network that schedules gloas (Sepolia does) runs the spec-literal
-  `gloas_get_head` every slot from `GLOAS_FORK_EPOCH`, whatever it can import.
+  delivered to it. `get_head_node` is one bottom-up walk for every fork, with
+  the current slot's fork selecting the payload rules and the boost gate, so a
+  follower on any network that schedules gloas (Sepolia does) pays work
+  proportional to its votes plus blocks every slot and decodes no block in the
+  ordinary case (each block's payload link is recorded at import; only the rare
+  weak-parent equivocation scan and the one-time derivation of a link lost to a
+  restart decode, see `docs/spec_deviations.md`). `compute_head` and the
+  spec-literal `gloas_get_head` are the references its tests compare it with.
   [`docs/beacon_stf.md`](docs/beacon_stf.md) has the design and
   [`docs/spec_deviations.md`](docs/spec_deviations.md) the deliberate departures
   from the spec, in particular the fulu-to-gloas fork-choice boundary rule.

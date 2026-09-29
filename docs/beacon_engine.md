@@ -96,10 +96,10 @@ head to fall back when the `SYNCING` branch turns out to be invalid.
 
 An invalidated block leaves fork choice by having its `LiveChain` index row
 deleted. That is sufficient because `Store::block_index()` is the only source
-`filter_block_tree`, `compute_weights` and `get_head` read: a root with no row
-contributes no weight to any ancestor and can never be walked to. The block and
-its state stay in their own tables, so an operator can still inspect what was
-rejected.
+`filter_block_tree`, `compute_node_weights` and `walk_head` read: a root with no
+row contributes no weight to any ancestor and can never be walked to. The block
+and its state stay in their own tables, so an operator can still inspect what
+was rejected.
 
 That an `INVALIDATED` block is never imported is enforced on the verdict itself,
 in `on_block`, not on the state transition having failed. The transition still

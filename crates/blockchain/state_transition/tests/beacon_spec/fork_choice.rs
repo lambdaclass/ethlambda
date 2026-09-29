@@ -127,7 +127,7 @@ use ethlambda_state_transition::beacon::containers::{
     gloas, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
-    self, DataAvailability, ForkChoiceNode, PayloadStatus, Store,
+    self, DataAvailability, ForkChoiceNode, ForkRules, PayloadStatus, Store,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::preset;
@@ -688,12 +688,91 @@ fn check_checkpoint(
     }
 }
 
+/// Checks that the node's head computation ([`fork_choice::get_head_node`], the
+/// one bottom-up walk) names the same node as the spec-literal reference for
+/// the current slot's fork: [`fork_choice::gloas_get_head`] from
+/// `GLOAS_FORK_EPOCH` on, the pre-gloas [`fork_choice::compute_head`] (reported
+/// as a full node) before it. Run at every `head` check, so every step of every
+/// fixture is also a differential test of the walk.
+fn check_head_against_reference(store: &Store, config: &Config) -> Result<(), String> {
+    let walked = fork_choice::get_head_node(store, config)
+        .map_err(|err| format!("get_head_node: {err:?}"))?;
+    let current_slot = fork_choice::get_current_slot(store, config);
+    let fork = config.fork_at_epoch(current_slot / preset::SLOTS_PER_EPOCH);
+    let reference = match ForkRules::of(fork) {
+        ForkRules::Gloas => {
+            let committees = store.committee_cache();
+            fork_choice::gloas_get_head(store, config, &committees)
+                .map_err(|err| format!("reference gloas_get_head: {err:?}"))?
+        }
+        ForkRules::PreGloas => {
+            let index = store.block_index();
+            let root = fork_choice::compute_head(store, &index, config)
+                .map_err(|err| format!("reference compute_head: {err:?}"))?;
+            ForkChoiceNode {
+                root,
+                payload_status: PayloadStatus::Full,
+            }
+        }
+    };
+    if walked == reference {
+        Ok(())
+    } else {
+        Err(format!(
+            "the bottom-up walk chose 0x{} ({:?}) but the reference chose 0x{} ({:?})",
+            hex::encode(walked.root.0),
+            walked.payload_status,
+            hex::encode(reference.root.0),
+            reference.payload_status,
+        ))
+    }
+}
+
+/// Checks that every payload link `on_block` recorded is what decoding the block
+/// and its parent gives: the walk reads the link instead of the blocks.
+fn check_payload_links(store: &Store) -> Result<(), String> {
+    for root in store.block_index().into_keys() {
+        let Some(link) = store.payload_link(&root) else {
+            continue;
+        };
+        let block = store
+            .get_signed_block(&root)
+            .expect("get")
+            .ok_or("a linked block is missing from the store")?;
+        let is_gloas = match ForkRules::of(block.fork_name()) {
+            ForkRules::Gloas => true,
+            ForkRules::PreGloas => false,
+        };
+        if link.is_gloas() != is_gloas {
+            return Err(format!(
+                "payload link of 0x{} has the wrong fork",
+                hex::encode(root.0)
+            ));
+        }
+        if let Some(parent_status) = link.parent_status()
+            && store.has_block(&block.parent_root())
+        {
+            let expected = fork_choice::get_parent_payload_status(store, &block)
+                .map_err(|err| format!("get_parent_payload_status: {err:?}"))?;
+            if parent_status != expected {
+                return Err(format!(
+                    "payload link of 0x{} says {parent_status:?}, the blocks say {expected:?}",
+                    hex::encode(root.0)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks `head` against [`fork_choice::get_head`]'s root, and that root's
 /// slot (read through [`fork_choice::get_forkchoice_store`]'s store) against
 /// the fixture's redundant `slot` field.
 fn check_head(expected: &HeadCheck, store: &mut Store, config: &Config) -> Result<(), String> {
     let actual_root =
         fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
+    check_head_against_reference(store, config)?;
+    check_payload_links(store)?;
     let actual_slot = store
         .get_signed_block(&actual_root)
         .expect("get")
@@ -785,6 +864,17 @@ fn check_viable_for_head(
         payload_status: PayloadStatus::Pending,
     }];
     let mut actual: Vec<(Root, u64, u8)> = Vec::new();
+    // The bottom-up table the node's head computation weighs with, checked
+    // against the spec-literal weight at every leaf. This check only runs in
+    // gloas cases, so the current slot's rules are gloas's.
+    let walked_weights = fork_choice::compute_node_weights(
+        store,
+        &index,
+        config,
+        committees,
+        fork_choice::ForkRules::Gloas,
+    )
+    .map_err(|err| format!("viable_for_head_roots_and_weights: compute_node_weights: {err:?}"))?;
     while let Some(node) = pending.pop() {
         let children = fork_choice::get_node_children(store, &blocks, node).map_err(|err| {
             format!("viable_for_head_roots_and_weights: get_node_children: {err:?}")
@@ -792,6 +882,19 @@ fn check_viable_for_head(
         if children.is_empty() {
             let weight = fork_choice::gloas_get_weight(store, node, config, committees)
                 .map_err(|err| format!("viable_for_head_roots_and_weights: get_weight: {err:?}"))?;
+            let block_slot = index
+                .get(&node.root)
+                .map(|&(slot, _)| slot)
+                .ok_or("viable_for_head_roots_and_weights: a leaf is not in the block index")?;
+            let walked = walked_weights.weight(node, block_slot);
+            if walked != weight {
+                return Err(format!(
+                    "viable_for_head_roots_and_weights: the bottom-up weight of 0x{} ({}) is {walked}, \
+                     the reference is {weight}",
+                    hex::encode(node.root.0),
+                    node.payload_status as u8,
+                ));
+            }
             actual.push((node.root, weight, node.payload_status as u8));
         } else {
             pending.extend(children);

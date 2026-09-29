@@ -210,7 +210,8 @@ use crate::beacon::stf;
 // keyed on plain `Root`s, and nothing about either type needs storage of its
 // own beyond what `BeaconScratch` already keeps.
 pub use ethlambda_types::beacon::fork_choice::{
-    ForkChoiceNode, LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1, PowBlock,
+    BlockPayloadLink, ForkChoiceNode, LatestMessage, PayloadStatus, PayloadStatusEnum,
+    PayloadStatusV1, PowBlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -273,6 +274,18 @@ impl ForkRules {
             | ForkName::Fulu => ForkRules::PreGloas,
             ForkName::Gloas => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
+        }
+    }
+
+    /// The [`BlockPayloadLink`] of a block handled under these rules, given
+    /// the parent payload branch it builds on where the rules record one. The
+    /// one place the rules' payload shape is stated: a pre-gloas block is a
+    /// single FULL node whose payload ran inside it, so it has no payload
+    /// branch of its parent to choose, and `parent_status` is ignored.
+    fn payload_link(self, parent_status: Option<PayloadStatus>) -> BlockPayloadLink {
+        match self {
+            ForkRules::PreGloas => BlockPayloadLink::PreGloas,
+            ForkRules::Gloas => BlockPayloadLink::Gloas { parent_status },
         }
     }
 }
@@ -753,10 +766,10 @@ pub fn resolve_invalid_block(
 /// blocks MUST NOT be applied to any `VALID` or `NOT_VALIDATED` ancestors."
 /// Deleting the `LiveChain` rows satisfies both halves at once, because
 /// `Store::block_index` is the only source fork choice reads:
-/// [`compute_weights`] folds a subtree total only into parents it finds in that
-/// index and gates the proposer-boost walk on the same membership, so a vote
-/// naming a removed root seeds an entry that is never folded anywhere;
-/// [`filter_block_tree`] and [`get_head`] are index-derived too.
+/// [`compute_node_weights`] folds a subtree total only into parents it finds in
+/// that index and gates the proposer-boost walk on the same membership, so a
+/// vote naming a removed root seeds an entry that is never folded anywhere;
+/// [`filter_block_tree`] and [`walk_head`] are index-derived too.
 ///
 /// One index scan builds the whole child map rather than rescanning per level:
 /// the descendants of one root are a tiny fraction of the tree, but finding
@@ -769,14 +782,14 @@ pub fn resolve_invalid_block(
 /// whose freshest vote named a branch the execution layer has since rejected
 /// keeps pointing at a root no longer in the index, until it attests again.
 ///
-/// [`compute_weights`] already drops such a vote rather than raising, so
+/// [`compute_node_weights`] already drops such a vote rather than raising, so
 /// [`get_head`] is unaffected. [`get_weight`] deliberately does not: it is the
 /// specification's own version, and
 /// `tests::a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing` pins
 /// that divergence on purpose. Nothing on this node's paths calls it today
 /// ([`get_proposer_head`] has no callers outside this file), but wiring up a
 /// beacon proposer duty would make it reachable, and it should get
-/// `compute_weights`' treatment first.
+/// `compute_node_weights`' treatment first.
 pub fn invalidate_subtree(store: &mut Store, invalid_root: Root) -> usize {
     let index = store.block_index();
 
@@ -1016,6 +1029,7 @@ pub fn get_forkchoice_store(
 
     let anchor_root = anchor_block.message_hash_tree_root();
     let anchor_rules = ForkRules::of(anchor_state.fork_name());
+    let anchor_slot = anchor_block.slot();
 
     // The specification asserts `anchor_block.state_root ==
     // hash_tree_root(anchor_state)`, which holds only when the anchor state is
@@ -1112,6 +1126,12 @@ pub fn get_forkchoice_store(
     // (nothing to insert: the anchor's own payload is not verified until an
     // envelope arrives for it). Earlier forks record none of these for the
     // anchor, and nothing reads them there.
+    //
+    // The anchor's payload link is recorded here as well. Its parent is not in
+    // this store, so a gloas anchor has no parent status to compare bids for;
+    // nothing reads one, since the head walk only asks for a status when the
+    // parent is indexed.
+    store.set_payload_link(anchor_root, anchor_slot, anchor_rules.payload_link(None));
     match anchor_rules {
         ForkRules::Gloas => {
             store.set_block_timeliness(anchor_root, [true, true]);
@@ -1255,11 +1275,10 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// equal, the scored root, and the specification's own contribution for
 /// such a vote is `0` too. This function is not only
 /// [`get_weight`]'s own attestation half; [`is_head_weak`] and
-/// [`is_parent_strong`] call it too. [`is_head_weak`] runs underneath
-/// [`should_apply_proposer_boost`], which the gloas head visits on every
-/// call whose boosted block's parent is from the previous slot, and
-/// [`is_parent_strong`] underneath `gloas_get_proposer_head`, so a pruned
-/// vote reaching this function is not only a pre-gloas concern.
+/// [`is_parent_strong`] call it too, [`is_head_weak`] underneath the public
+/// [`should_apply_proposer_boost`] and [`is_parent_strong`] underneath
+/// `gloas_get_proposer_head`. The head walk does not: it reads the same scores
+/// from [`compute_node_weights`], which drops such a vote too.
 pub fn get_attestation_score(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1293,8 +1312,9 @@ pub fn get_attestation_score(
 /// justified checkpoint's state, plus the proposer boost if it applies.
 ///
 /// The specification's own per-root definition, kept as written. [`get_head`]
-/// calls [`compute_weights`] instead, which produces the same numbers for the
-/// whole tree at once; this is what that is tested against.
+/// weighs with [`compute_node_weights`] instead, which produces the same
+/// numbers for the whole tree at once; this is what [`compute_weights`], its
+/// pre-gloas reference, is tested against.
 pub fn get_weight(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
@@ -1557,28 +1577,27 @@ pub fn get_filtered_block_tree(
     Ok(blocks)
 }
 
-/// The LMD GHOST head: starting from the justified checkpoint, repeatedly
-/// step to the child with the greatest weight until a leaf is reached.
+/// The pre-gloas LMD GHOST head: starting from the justified checkpoint,
+/// repeatedly step to the child with the greatest weight until a leaf is
+/// reached.
+///
+/// **A reference, not the node's head computation.** [`get_head_node`] runs
+/// [`walk_head`] for every fork, and on a pre-gloas tree the two agree; this
+/// is kept, public, as the independent [`compute_weights`] algorithm the walk
+/// is tested against (the fork-choice fixture harness and the randomized
+/// differential test both call it).
 ///
 /// The children scan in the loop below reads `blocks`, [`get_filtered_block_tree`]'s
 /// already-filtered, already in-memory result, not [`Store::block_index`]
 /// itself: it is the specification's own second whole-`Dict` scan the module
 /// documentation calls out, but it never costs a further backend round trip.
 ///
-/// Takes `&Store` rather than `&mut Store`: unlike [`get_head`], which records
-/// the head it finds, this is the read-only walk underneath it. [`on_block`]
-/// is the other caller, which needs the head *before* the block it is
-/// importing joins the store (see `update_proposer_boost_root` in the
-/// specification's `on_block`) and must not record that transient answer as
-/// the store's own head.
+/// Takes `&Store` rather than `&mut Store`: nothing here records the head it
+/// finds. No node code calls it; only tests do.
 ///
 /// Takes `index` rather than building it, matching [`get_filtered_block_tree`]
-/// and [`compute_weights`], which this hands the same one to: [`get_head`]
-/// has nothing else to build it from, but [`on_block`] already scanned
-/// `LiveChain` once for its own finalized-descendant check by the time it
-/// gets here, and passes that scan's result on rather than paying for a
-/// second one just to compute the head.
-fn compute_head(
+/// and [`compute_weights`], which this hands the same one to.
+pub fn compute_head(
     store: &Store,
     index: &HashMap<Root, (Slot, Root)>,
     config: &Config,
@@ -1617,17 +1636,489 @@ fn compute_head(
     Ok(head)
 }
 
-/// [`compute_head`] pre-gloas, gloas's own [`gloas_get_head`] once the chain
-/// has upgraded, as a full [`ForkChoiceNode`] rather than just a root.
+// ---------------------------------------------------------------------------
+// The head computation: one bottom-up walk for every fork
+// ---------------------------------------------------------------------------
+//
+// One weight table and one descent serve both kinds of block. Every block is
+// a `PENDING` node with two payload nodes under it (`EMPTY`, and `FULL` once
+// its payload is verified), and a child block hangs off whichever of those its
+// bid says it builds on. A pre-gloas block is the degenerate case: its only
+// payload node is `FULL` (its payload ran inside the block), and every child
+// builds on it. That is the fulu-to-gloas rule this crate decided on, stated
+// once, in [`BlockPayloadLink`], instead of being repeated in a second head
+// algorithm.
+//
+// # Why one pass over the votes gives the specification's weight
+//
+// The specification's `get_attestation_score(node)` adds the balance of every
+// vote whose supported node `is_ancestor` of `node` matches: the chain from
+// the supported node up through `get_ancestor`, where the wildcard `PENDING`
+// ancestor matches either payload branch.
+//
+// Follow that chain from a vote's supported node `S = (r, s)`. `get_ancestor`
+// at the slot of `node.root` returns `S` itself while `r`'s slot is at or
+// below it, so `S` matches `node` exactly when `node.root == r` and either the
+// statuses agree or `node` is `PENDING`. When `r`'s slot is above it, the
+// descent replaces `S` by `(parent(r), status of r's parent payload)` and
+// asks again. So the nodes a vote counts for are exactly those on this chain,
+// in the node tree of the section above:
+//
+// ```text
+//   S = (r, s)  ->  PENDING(r)  ->  (parent(r), ps(r))  ->  PENDING(parent(r)) -> ...
+// ```
+//
+// where `ps(r)` is `get_parent_payload_status` of `r`, the first arrow exists
+// only for `s` of `EMPTY` or `FULL`, and `PENDING(r)` is the last node of `r`
+// on the chain (a vote for `PENDING(r)` counts for no `EMPTY` or `FULL` node of
+// `r`, since the statuses differ and `node` is not the wildcard). The score of
+// a node is therefore the sum, over the votes whose chain contains it, of the
+// voter's balance; adding each vote at `S` and folding every node's total into
+// the next node on its chain, children before parents, computes that sum for
+// every node at once. `compute_weights` does the same for the pre-gloas tree,
+// where the chain is the block chain.
+//
+// Children before parents needs a topological order, and processing blocks
+// from the highest slot down gives one: a parent is at a strictly earlier
+// slot, and a block's own `EMPTY` and `FULL` nodes are complete before its
+// `PENDING` node reads them, since everything folded into them comes from a
+// later slot.
+//
+// The proposer boost is the same sum with one extra voter at `PENDING(boost)`:
+// `is_ancestor(PENDING(boost), node)` holds for exactly the nodes on that
+// node's chain. It cannot be folded with the votes, because whether it applies
+// depends on the parent's attestation score, which the fold produces; it is
+// added along the chain afterwards.
+
+/// How a head computation reads a block's payload dimension.
 ///
-/// Dispatches on the current slot's own fork, via [`Config::fork_at_epoch`],
-/// not on the head's fork or the justified checkpoint's: from
-/// `GLOAS_FORK_EPOCH` on, every call runs [`gloas_get_head`] over the whole
-/// tree, pre-gloas blocks included, so the payload-aware algorithm takes
-/// over as soon as the chain could hold a gloas block at all, rather than
-/// waiting for a block, or justification, to actually reach one. Before that
-/// epoch, the pre-gloas [`compute_head`]/[`compute_weights`] path runs
-/// exactly as it did before gloas existed.
+/// From `GLOAS_FORK_EPOCH` on, every block's payload dimension is read from
+/// its [`BlockPayloadLink`]. Before it, no payload dimension exists: every
+/// block is a single `FULL` node, whatever its bytes are, exactly as the
+/// pre-gloas head algorithm treated it. Reading the links would change
+/// nothing on a real chain (a gloas block cannot exist before the fork epoch),
+/// but a store holding one anyway must give the answer the pre-gloas rules
+/// give, so the rules, not the block, decide.
+#[derive(Clone, Copy)]
+struct PayloadTree<'a> {
+    store: &'a Store,
+    rules: ForkRules,
+}
+
+impl PayloadTree<'_> {
+    /// `root`'s payload link under this tree's rules.
+    fn link(&self, root: Root) -> Result<BlockPayloadLink> {
+        match self.rules {
+            ForkRules::PreGloas => Ok(self.rules.payload_link(None)),
+            ForkRules::Gloas => block_payload_link(self.store, root)?
+                .ok_or(Error::SpecAssert("root in store.blocks")),
+        }
+    }
+
+    /// Which of its parent's payload branches `root` builds on.
+    fn parent_status(&self, root: Root) -> Result<PayloadStatus> {
+        self.link(root)?
+            .parent_status()
+            .ok_or(Error::SpecAssert("block.parent_root in store.blocks"))
+    }
+}
+
+/// Every node's LMD GHOST weight, from one pass over the votes and one over the
+/// blocks; see the section documentation above for why this equals the
+/// specification's per-node `get_weight`.
+///
+/// Work is proportional to the number of latest messages plus the number of
+/// indexed blocks at or above the finalized block (times two lookups each),
+/// which is the unfinalized window, not the history since the anchor (see
+/// [`compute_node_weights`]'s bound), against the specification's
+/// messages times candidate nodes, each with block decodes along the ancestor
+/// walk. Once the payload links are recorded, the only decodes left are the
+/// equivocation scan under a weak previous-slot parent and the one-time
+/// derivation of a link that was never recorded (after a restart); see
+/// `docs/spec_deviations.md`.
+///
+/// A vote for a block no longer in `index` is dropped rather than raising, the
+/// tolerance [`compute_weights`] documents; a missing `block_timeliness` entry
+/// reads as not timely, the one [`should_apply_proposer_boost`] documents.
+#[derive(Debug)]
+pub struct NodeWeights {
+    rules: ForkRules,
+    current_slot: Slot,
+    weights: HashMap<ForkChoiceNode, Gwei>,
+}
+
+impl NodeWeights {
+    /// `node`'s weight, `block_slot` being its block's slot.
+    ///
+    /// Under gloas rules a `EMPTY` or `FULL` node of the previous slot's block
+    /// weighs `0`: its votes are still arriving, so only the tiebreaker
+    /// decides between the two (`is_previous_slot_payload_decision`). The
+    /// pre-gloas rules have no such node.
+    pub fn weight(&self, node: ForkChoiceNode, block_slot: Slot) -> Gwei {
+        if self.rules == ForkRules::Gloas
+            && is_payload_decision_at(block_slot, node.payload_status, self.current_slot)
+        {
+            return 0;
+        }
+        self.raw(node)
+    }
+
+    /// `node`'s weight before the previous-slot rule, the value the votes and
+    /// the boost add up to.
+    fn raw(&self, node: ForkChoiceNode) -> Gwei {
+        self.weights.get(&node).copied().unwrap_or_default()
+    }
+
+    fn set(&mut self, node: ForkChoiceNode, weight: Gwei) {
+        self.weights.insert(node, weight);
+    }
+
+    fn add(&mut self, node: ForkChoiceNode, amount: Gwei) {
+        let entry = self.weights.entry(node).or_default();
+        *entry = entry.saturating_add(amount);
+    }
+}
+
+/// The node a block's own `PENDING` total is folded into: the parent block's
+/// payload node that this block builds on.
+fn parent_node(parent_root: Root, parent_status: PayloadStatus) -> ForkChoiceNode {
+    ForkChoiceNode {
+        root: parent_root,
+        payload_status: parent_status,
+    }
+}
+
+/// The lowest slot [`compute_node_weights`] weighs: the least of the finalized
+/// block's slot, the justified block's slot and, when a proposer boost root is
+/// set and indexed, its parent's slot. All three come from `index`.
+///
+/// A root that is not indexed gives `0` for the finalized and justified
+/// blocks, which weighs everything. Why each term is there, and why the least
+/// is the finalized block's slot on a live node, is argued once, in
+/// [`compute_node_weights`]'s `# The bound` section.
+fn walk_bound(store: &Store, index: &HashMap<Root, (Slot, Root)>) -> Slot {
+    let slot_of = |root: Root| index.get(&root).map_or(0, |&(slot, _)| slot);
+    let mut bound = slot_of(store.beacon_finalized_checkpoint().root)
+        .min(slot_of(store.beacon_justified_checkpoint().root));
+    let boost_root = store.proposer_boost_root();
+    if let Some(&(_, parent_root)) = index.get(&boost_root)
+        && let Some(&(parent_slot, _)) = index.get(&parent_root)
+    {
+        bound = bound.min(parent_slot);
+    }
+    bound
+}
+
+/// [`NodeWeights`] for `rules`, on the block tree `index`.
+///
+/// `rules` selects the two fork-dependent rules: how a block's payload
+/// dimension is read (see [`PayloadTree`]) and whether the proposer boost is
+/// gated by `should_apply_proposer_boost` (gloas) or applies whenever a boost
+/// root is set (pre-gloas).
+///
+/// # The bound
+///
+/// Vote placement, the fold and the boost chain all stop at [`walk_bound`]'s
+/// slot: a block below it gets no weight and is never read, so a head
+/// computation covers the unfinalized window, not the history since the
+/// anchor. (A beacon store never prunes its block index, so without the bound
+/// every call would fold, and read the payload link of, every block down to
+/// the anchor.) The bound is the least of the finalized block's slot, the
+/// justified block's slot and the boosted block's parent's slot, and it
+/// changes no answer the head reads, whichever of the three is least:
+/// - The descent compares only descendants of the justified root, so every
+///   node it weighs is at or above the justified block's slot, hence at or
+///   above the bound.
+/// - A vote for a block below the bound supports only nodes at or below that
+///   block, since a vote counts for the nodes on its chain toward the root, so
+///   it adds nothing to a node at or above the bound.
+/// - The boost chain from a block adds to that block's ancestors, and it is
+///   walked down to the bound, so every node at or above the bound gets what
+///   the specification gives it. The gloas gate reads only the boosted block's
+///   parent's score, and that parent is at or above the bound by
+///   construction.
+///
+/// On a live node the least of the three is the finalized block's slot: the
+/// justified block is at or above it, and the boosted block is a current-slot
+/// block, which descends from the finalized root, so its parent is too. That
+/// is what keeps the walk to the unfinalized window.
+///
+/// The weight of a node below the bound is not computed, and reads as `0`.
+pub fn compute_node_weights(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+    committees: &CommitteeCache,
+    rules: ForkRules,
+) -> Result<NodeWeights> {
+    let tree = PayloadTree { store, rules };
+    let justified_checkpoint = store.beacon_justified_checkpoint();
+    let state = checkpoint_state(store, &justified_checkpoint, config)?;
+    let current_epoch = get_current_epoch(&state);
+    let bound = walk_bound(store, index);
+    let in_window = |root: &Root| index.get(root).is_some_and(|&(slot, _)| slot >= bound);
+
+    // Votes, summed by what determines the node they support. Nothing that
+    // reads the store's own scratch may run inside the closure: see
+    // `for_each_non_equivocating_latest_message` for why asking it per voter
+    // from in here would deadlock, and a payload link is such a read.
+    let mut votes: HashMap<(Root, Slot, bool), Gwei> = HashMap::new();
+    store.for_each_non_equivocating_latest_message(|validator_index, message| {
+        // Not `get_active_validator_indices`, for the reason
+        // `compute_weights` gives; a validator past this state's registry
+        // did not exist at the justified checkpoint, which is a skip.
+        let Ok(validator) = state.validator(validator_index) else {
+            return;
+        };
+        if validator.slashed || !is_active_validator(validator, current_epoch) {
+            return;
+        }
+        let entry = votes
+            .entry((message.root, message.slot, message.payload_present))
+            .or_default();
+        *entry = entry.saturating_add(validator.effective_balance);
+    });
+
+    let mut weights = NodeWeights {
+        rules,
+        current_slot: get_current_slot(store, config),
+        weights: HashMap::new(),
+    };
+    for ((root, message_slot, payload_present), balance) in votes {
+        let Some(&(block_slot, _)) = index.get(&root) else {
+            continue;
+        };
+        if block_slot < bound {
+            continue;
+        }
+        // `get_supported_node`: a vote made after its block's own slot names
+        // one of the block's payload branches, and a pre-gloas block has only
+        // the full one.
+        let payload_status = if block_slot < message_slot {
+            if !tree.link(root)?.is_gloas() || payload_present {
+                PayloadStatus::Full
+            } else {
+                PayloadStatus::Empty
+            }
+        } else {
+            PayloadStatus::Pending
+        };
+        weights.add(
+            ForkChoiceNode {
+                root,
+                payload_status,
+            },
+            balance,
+        );
+    }
+
+    // Fold, highest slot first. A block's total is its own votes plus what its
+    // two payload nodes gathered from later blocks; it then moves into the
+    // payload node of its parent that it builds on.
+    let mut blocks: Vec<(Slot, Root, Root)> = index
+        .iter()
+        .filter(|&(_, &(slot, _))| slot >= bound)
+        .map(|(root, (slot, parent_root))| (*slot, *root, *parent_root))
+        .collect();
+    blocks.sort_unstable_by_key(|block| std::cmp::Reverse(block.0));
+    for &(_slot, root, parent_root) in &blocks {
+        let pending = ForkChoiceNode {
+            root,
+            payload_status: PayloadStatus::Pending,
+        };
+        let total = [
+            pending,
+            ForkChoiceNode {
+                root,
+                payload_status: PayloadStatus::Empty,
+            },
+            ForkChoiceNode {
+                root,
+                payload_status: PayloadStatus::Full,
+            },
+        ]
+        .into_iter()
+        .fold(0, |sum: Gwei, node| sum.saturating_add(weights.raw(node)));
+        if total == 0 {
+            continue;
+        }
+        weights.set(pending, total);
+        // Only into a parent that is still indexed and at or above the bound:
+        // the finalized block's own parent is below it, and the anchor's is
+        // below the retained window; there is nothing there to weigh.
+        if in_window(&parent_root) {
+            let parent_status = tree.parent_status(root)?;
+            weights.add(parent_node(parent_root, parent_status), total);
+        }
+    }
+
+    // The boost. Gloas asks `should_apply_proposer_boost`, fed the parent's
+    // score from the table just built; before gloas it applies whenever a boost
+    // root is set and still indexed, the tolerance `compute_weights` documents.
+    let boost_root = store.proposer_boost_root();
+    let boost_applies = match rules {
+        ForkRules::PreGloas => !boost_root.is_zero() && in_window(&boost_root),
+        ForkRules::Gloas => {
+            should_apply_proposer_boost_with(store, config, committees, index, &state, |parent| {
+                Ok(weights.raw(ForkChoiceNode {
+                    root: parent,
+                    payload_status: PayloadStatus::Pending,
+                }))
+            })?
+        }
+    };
+    if boost_applies {
+        let proposer_score = get_proposer_score(store, config)?;
+        let mut root = boost_root;
+        loop {
+            weights.add(
+                ForkChoiceNode {
+                    root,
+                    payload_status: PayloadStatus::Pending,
+                },
+                proposer_score,
+            );
+            let Some(&(_, parent_root)) = index.get(&root) else {
+                break;
+            };
+            if !in_window(&parent_root) {
+                break;
+            }
+            let parent_status = tree.parent_status(root)?;
+            weights.add(parent_node(parent_root, parent_status), proposer_score);
+            root = parent_root;
+        }
+    }
+
+    Ok(weights)
+}
+
+/// The nodes directly under `node` in the payload-aware tree, for the head
+/// descent: [`get_node_children`], answered from `children_of` (the filtered
+/// tree's parent-to-children map) and the payload links instead of decoding
+/// every block it touches.
+fn walk_children(
+    tree: PayloadTree,
+    children_of: &HashMap<Root, Vec<Root>>,
+    node: ForkChoiceNode,
+) -> Result<Vec<ForkChoiceNode>> {
+    if node.payload_status == PayloadStatus::Pending {
+        if !tree.link(node.root)?.is_gloas() {
+            return Ok(vec![ForkChoiceNode {
+                root: node.root,
+                payload_status: PayloadStatus::Full,
+            }]);
+        }
+        let mut children = vec![ForkChoiceNode {
+            root: node.root,
+            payload_status: PayloadStatus::Empty,
+        }];
+        if tree.store.has_verified_payload(&node.root) {
+            children.push(ForkChoiceNode {
+                root: node.root,
+                payload_status: PayloadStatus::Full,
+            });
+        }
+        return Ok(children);
+    }
+    let mut children = Vec::new();
+    for &child in children_of.get(&node.root).into_iter().flatten() {
+        if tree.parent_status(child)? == node.payload_status {
+            children.push(ForkChoiceNode {
+                root: child,
+                payload_status: PayloadStatus::Pending,
+            });
+        }
+    }
+    Ok(children)
+}
+
+/// The LMD GHOST head as a [`ForkChoiceNode`], for `rules`: the descent from
+/// the justified checkpoint that both [`compute_head`] and [`gloas_get_head`]
+/// perform, over the one weight table of [`compute_node_weights`].
+///
+/// At every step the heaviest child wins, ties going to the higher root and
+/// then to [`get_payload_status_tiebreaker`], the key gloas's `get_head` sorts
+/// by. Before gloas a step has one payload node and siblings always differ by
+/// root, so neither of the last two keys can decide, and the answer is the
+/// pre-gloas head, reported as `(root, Full)`.
+///
+/// Takes `index` rather than building it, like [`get_filtered_block_tree`]:
+/// [`on_block`] already holds one.
+fn walk_head(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    config: &Config,
+    committees: &CommitteeCache,
+    rules: ForkRules,
+) -> Result<ForkChoiceNode> {
+    let tree = PayloadTree { store, rules };
+    let blocks = get_filtered_block_tree(store, index, config)?;
+    let weights = compute_node_weights(store, index, config, committees, rules)?;
+    let current_slot = get_current_slot(store, config);
+
+    let mut children_of: HashMap<Root, Vec<Root>> = HashMap::new();
+    for (&root, &(_, parent_root)) in &blocks {
+        children_of.entry(parent_root).or_default().push(root);
+    }
+    let block_entry = |root: Root| index.get(&root).copied();
+
+    let mut head = ForkChoiceNode {
+        root: store.beacon_justified_checkpoint().root,
+        payload_status: PayloadStatus::Pending,
+    };
+    loop {
+        let children = walk_children(tree, &children_of, head)?;
+        if children.len() <= 1 {
+            let Some(only) = children.first() else {
+                return Ok(head);
+            };
+            head = *only;
+            continue;
+        }
+
+        let mut best: Option<((Gwei, Root, u8), ForkChoiceNode)> = None;
+        for child in children {
+            let (block_slot, _) =
+                block_entry(child.root).ok_or(Error::SpecAssert("node.root in store.blocks"))?;
+            let tiebreak = match rules {
+                ForkRules::Gloas => payload_status_tiebreaker_with(
+                    store,
+                    child,
+                    current_slot,
+                    block_entry,
+                    proposer_parent_is_full_from_link,
+                )?,
+                ForkRules::PreGloas => child.payload_status as u8,
+            };
+            let key = (weights.weight(child, block_slot), child.root, tiebreak);
+            if best.is_none_or(|(best_key, _)| key > best_key) {
+                best = Some((key, child));
+            }
+        }
+        head = best.expect("more than one child, checked above").1;
+    }
+}
+
+/// The LMD GHOST head as a full [`ForkChoiceNode`] rather than just a root,
+/// from the one bottom-up walk ([`compute_node_weights`] and the descent over
+/// it) that serves every fork.
+///
+/// The current slot's own fork, via [`Config::fork_at_epoch`], not the head's
+/// or the justified checkpoint's, selects the two rules that differ by fork
+/// (see [`walk_head`]): from `GLOAS_FORK_EPOCH` on, blocks carry the payload
+/// dimension their bids give them and the proposer boost is gated by
+/// `should_apply_proposer_boost`, so the payload-aware rules take over as soon
+/// as the chain could hold a gloas block at all, rather than waiting for a
+/// block, or justification, to actually reach one. Before that epoch every
+/// block is a single full node and the boost applies whenever it is set,
+/// which is the head algorithm every pre-gloas fork uses.
+///
+/// [`gloas_get_head`] is the spec-literal algorithm this walk replaced, and
+/// [`compute_head`] the [`compute_weights`] fold kept as the pre-gloas
+/// reference. Neither is on the node's path any more: they are the references
+/// its tests compare it with, at every `head` check of every fork-choice
+/// fixture and on randomized trees.
 ///
 /// A pre-gloas block has no payload dimension of its own: this crate treats
 /// it as a single-variant node whose status is always
@@ -1645,35 +2136,16 @@ fn compute_head(
 /// one, and says Lighthouse does the same; our FULL rule differs from both.
 /// Adopt PENDING here if that PR lands.
 ///
-/// The gloas arm reads committees through the store's shared
-/// [`Store::committee_cache`], the cache `on_block` and the gossip checks use:
-/// gloas's own weight (`gloas_get_weight` by way of
-/// `should_apply_proposer_boost`) needs committees a pre-gloas head
-/// computation never did, and this runs every slot, so a cache of its own
-/// would recompute every committee on every call. See [`gloas_get_weight`]'s
-/// own performance note for what that costs across a whole tree walk.
+/// Committees are read through the store's shared [`Store::committee_cache`],
+/// the cache `on_block` and the gossip checks use: gloas's boost gate reads
+/// the committees of a weak parent's slot, and this runs every slot, so a
+/// cache of its own would recompute every committee on every call.
 pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
     let current_slot = get_current_slot(store, config);
-    match config.fork_at_epoch(compute_epoch_at_slot(current_slot)) {
-        ForkName::Gloas => {
-            let committees = store.committee_cache();
-            gloas_get_head(store, config, &committees)
-        }
-        ForkName::Phase0
-        | ForkName::Altair
-        | ForkName::Bellatrix
-        | ForkName::Capella
-        | ForkName::Deneb
-        | ForkName::Electra
-        | ForkName::Fulu => {
-            let index = store.block_index();
-            Ok(ForkChoiceNode {
-                root: compute_head(store, &index, config)?,
-                payload_status: PayloadStatus::Full,
-            })
-        }
-        ForkName::Lean => lean_fork_unreachable("fork_choice::get_head_node"),
-    }
+    let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(current_slot)));
+    let index = store.block_index();
+    let committees = store.committee_cache();
+    walk_head(store, &index, config, &committees, rules)
 }
 
 /// [`get_head_node`], recorded as the store's own head.
@@ -1876,19 +2348,49 @@ pub fn is_head_weak(
 ) -> Result<bool> {
     let justified_checkpoint = store.beacon_justified_checkpoint();
     let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let reorg_threshold =
-        calculate_committee_fraction(&justified_state, config.reorg_head_weight_threshold)?;
-
     let index = store.block_index();
-    let mut head_weight = get_attestation_score(store, &index, head_root, &justified_state)?;
+    let attestation_score = get_attestation_score(store, &index, head_root, &justified_state)?;
+    let &(head_slot, _) = index
+        .get(&head_root)
+        .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
+    is_head_weak_with(
+        store,
+        head_root,
+        head_slot,
+        config,
+        committees,
+        &justified_state,
+        attestation_score,
+    )
+}
+
+/// [`is_head_weak`], given `head_root`'s [`get_attestation_score`] and its slot
+/// instead of computing them.
+///
+/// The score is the one piece of [`is_head_weak`] that walks every vote, and
+/// the head computation already holds it for every node in its weight table,
+/// so [`should_apply_proposer_boost_with`] hands it in rather than paying for a
+/// second pass over the votes. The slot comes from the same block index, which
+/// spares the block decode that
+/// [`Store::block_entry`](ethlambda_storage::Store::block_entry) costs on a
+/// beacon store.
+fn is_head_weak_with(
+    store: &Store,
+    head_root: Root,
+    head_slot: Slot,
+    config: &Config,
+    committees: &CommitteeCache,
+    justified_state: &BeaconState,
+    attestation_score: Gwei,
+) -> Result<bool> {
+    let reorg_threshold =
+        calculate_committee_fraction(justified_state, config.reorg_head_weight_threshold)?;
+    let mut head_weight = attestation_score;
 
     let head_state = store
         .get_state(&head_root)
         .expect("get")
         .ok_or(Error::SpecAssert("head_root in store.block_states"))?;
-    let (head_slot, _) = store
-        .block_entry(&head_root)
-        .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
     let epoch = compute_epoch_at_slot(head_slot);
     let epoch_committees = committees.committees(&head_state, epoch);
     for committee_index in 0..epoch_committees.committees_per_slot() {
@@ -2119,8 +2621,9 @@ pub fn get_proposer_head(
 /// Every function in this section assumes `block` is itself gloas-shaped,
 /// which does not hold at the fulu-to-gloas boundary on its own: the first
 /// gloas block's own parent is a fulu block with no bid at all.
-/// [`get_parent_payload_status`] and [`on_execution_payload_envelope`] call
-/// this. The first never reaches here for a pre-gloas block though: it
+/// [`parent_payload_status_of`] (behind both [`get_parent_payload_status`]
+/// and [`derive_payload_link`]) and [`on_execution_payload_envelope`] call
+/// this. The first never reaches here for a pre-gloas parent though: it
 /// answers [`PayloadStatus::Full`] for one directly, per this crate's decided
 /// rule for that boundary (see the module documentation's "Gloas:
 /// payload-aware fork choice" section). A non-gloas block still reaching here
@@ -2153,18 +2656,72 @@ fn gloas_bid(block: &SignedBeaconBlock) -> Result<&gloas::ExecutionPayloadBid> {
 /// [`is_payload_verified`] `true` for a root the specification would never
 /// call verified.
 ///
-/// Decodes `root`'s full signed block to answer, which every caller here
-/// otherwise avoids doing more than once: [`is_payload_verified`],
-/// [`payload_timeliness`] and [`payload_data_availability`] call this first
-/// and then read [`Store::has_verified_payload`](ethlambda_storage::Store::has_verified_payload)
-/// directly rather than back through [`is_payload_verified`], and
-/// [`get_node_children`]'s own decode of a `Pending` node's block answers
-/// this same question without a second call here.
+/// Needs only the block's fork, so it reads the recorded [`BlockPayloadLink`]
+/// when there is one and otherwise decodes the block, without deriving (or
+/// recording) the parent comparison a full link needs.
 fn is_known_pre_gloas_block(store: &Store, root: Root) -> bool {
+    if let Some(link) = store.payload_link(&root) {
+        return !link.is_gloas();
+    }
     matches!(
         store.get_signed_block(&root).expect("get"),
         Some(block) if is_pre_gloas(&block)
     )
+}
+
+/// `block`'s [`BlockPayloadLink`], derived from the block and, for a gloas
+/// block, its parent's bid through [`parent_payload_status_of`].
+///
+/// The parent's status is `None` only when the parent block is not in the
+/// store. A gloas block that is not the anchor always has its parent there
+/// (`on_block` refuses it otherwise), and `on_block` records the link with the
+/// status [`get_parent_payload_status`] returned, so the two agree by
+/// construction; `the_recorded_payload_links_match_the_specifications_parent_status`
+/// checks that they do.
+fn derive_payload_link(store: &Store, block: &SignedBeaconBlock) -> Result<BlockPayloadLink> {
+    let rules = ForkRules::of(block.fork_name());
+    let parent_status = match rules {
+        ForkRules::PreGloas => None,
+        ForkRules::Gloas => store
+            .get_signed_block(&block.parent_root())
+            .expect("get")
+            .map(|parent| parent_payload_status_of(block, &parent))
+            .transpose()?,
+    };
+    Ok(rules.payload_link(parent_status))
+}
+
+/// `root`'s [`BlockPayloadLink`]: the entry `on_block` recorded, or, for a
+/// block imported before the last restart (the scratch is in memory only) or
+/// whose entry was pruned, one derived by decoding the block and recorded for
+/// next time.
+///
+/// `None` when the store does not hold `root` at all. A link whose parent
+/// status is unknown is recorded like any other: it is the anchor's, whose
+/// parent is not in the store by construction, and re-deriving it on every
+/// read would decode two blocks each time. A block persisted ahead of its
+/// parent is not read here before `on_block` imports it, and `on_block`
+/// records its own link over whatever is there.
+fn block_payload_link(store: &Store, root: Root) -> Result<Option<BlockPayloadLink>> {
+    if let Some(link) = store.payload_link(&root) {
+        return Ok(Some(link));
+    }
+    let Some(block) = store.get_signed_block(&root).expect("get") else {
+        return Ok(None);
+    };
+    let link = derive_payload_link(store, &block)?;
+    store.set_payload_link(root, block.slot(), link);
+    Ok(Some(link))
+}
+
+/// Makes sure `root`'s [`BlockPayloadLink`] is recorded, deriving it by
+/// decoding the block if it is not (after a restart, which loses the scratch).
+///
+/// For the actor to call before pruning links at the finalized block, whose
+/// own link the prune keys its bound on. Costs at most one derivation for a
+/// finalized root that was imported before the restart.
+pub fn ensure_payload_link(store: &Store, root: Root) -> Result<()> {
+    block_payload_link(store, root).map(|_| ())
 }
 
 /// Whether `block` is handled under the pre-gloas rules, from an exhaustive
@@ -2272,11 +2829,22 @@ pub fn get_parent_payload_status(
         .get_signed_block(&block.parent_root())
         .expect("get")
         .ok_or(Error::SpecAssert("block.parent_root in store.blocks"))?;
-    if is_pre_gloas(&parent) {
+    parent_payload_status_of(block, &parent)
+}
+
+/// [`get_parent_payload_status`]'s comparison, given the parent block: the one
+/// place a child's bid is read against its parent's, shared with
+/// [`derive_payload_link`] so a recorded link cannot disagree with the
+/// specification's function.
+fn parent_payload_status_of(
+    block: &SignedBeaconBlock,
+    parent: &SignedBeaconBlock,
+) -> Result<PayloadStatus> {
+    if is_pre_gloas(parent) {
         return Ok(PayloadStatus::Full);
     }
     let parent_block_hash = gloas_bid(block)?.parent_block_hash;
-    let message_block_hash = gloas_bid(&parent)?.block_hash;
+    let message_block_hash = gloas_bid(parent)?.block_hash;
     Ok(if parent_block_hash == message_block_hash {
         PayloadStatus::Full
     } else {
@@ -2423,12 +2991,24 @@ pub fn is_previous_slot_payload_decision(
     let (block_slot, _) = store
         .block_entry(&node.root)
         .ok_or(Error::SpecAssert("node.root in store.blocks"))?;
-    let is_previous_slot = block_slot.checked_add(1) == Some(get_current_slot(store, config));
-    let is_payload_decision = matches!(
+    Ok(is_payload_decision_at(
+        block_slot,
         node.payload_status,
-        PayloadStatus::Empty | PayloadStatus::Full
-    );
-    Ok(is_previous_slot && is_payload_decision)
+        get_current_slot(store, config),
+    ))
+}
+
+/// [`is_previous_slot_payload_decision`]'s test, with the block's slot and the
+/// current slot already in hand, for the head computation that reads the slot
+/// from its block index instead of decoding the block.
+fn is_payload_decision_at(
+    block_slot: Slot,
+    payload_status: PayloadStatus,
+    current_slot: Slot,
+) -> bool {
+    let is_previous_slot = block_slot.checked_add(1) == Some(current_slot);
+    let is_payload_decision = matches!(payload_status, PayloadStatus::Empty | PayloadStatus::Full);
+    is_previous_slot && is_payload_decision
 }
 
 /// `should_build_on_full` (gloas `fork-choice.md`): whether a proposer at
@@ -2462,11 +3042,33 @@ pub fn should_build_on_full(store: &Store, head: ForkChoiceNode, slot: Slot) -> 
 /// build empty, favoring extension unless the PTC view is against it and the
 /// current proposer-boosted block itself chose empty.
 pub fn should_extend_payload(store: &Store, root: Root, config: &Config) -> Result<bool> {
-    let (block_slot, _) = store
-        .block_entry(&root)
-        .ok_or(Error::SpecAssert("root in store.blocks"))?;
+    should_extend_payload_with(
+        store,
+        root,
+        get_current_slot(store, config),
+        |block_root| store.block_entry(&block_root),
+        proposer_parent_is_full_from_blocks,
+    )
+}
+
+/// [`should_extend_payload`] with the current slot, a block's
+/// `(slot, parent_root)` lookup and the answer to the specification's
+/// `is_parent_node_full` for the proposer-boosted block supplied by the
+/// caller. The head computation answers both from its block index and the
+/// payload links rather than decoding blocks
+/// ([`proposer_parent_is_full_from_link`]); the public function keeps the
+/// specification's own decode ([`proposer_parent_is_full_from_blocks`]), so
+/// a test comparing the two does not compare the walk with itself on that leg.
+fn should_extend_payload_with(
+    store: &Store,
+    root: Root,
+    current_slot: Slot,
+    block_entry: impl Fn(Root) -> Option<(Slot, Root)>,
+    proposer_parent_is_full: impl Fn(&Store, Root) -> Result<bool>,
+) -> Result<bool> {
+    let (block_slot, _) = block_entry(root).ok_or(Error::SpecAssert("root in store.blocks"))?;
     verify(
-        block_slot.checked_add(1) == Some(get_current_slot(store, config)),
+        block_slot.checked_add(1) == Some(current_slot),
         "store.blocks[root].slot + 1 == get_current_slot(store)",
     )?;
     if !is_payload_verified(store, root) {
@@ -2481,6 +3083,18 @@ pub fn should_extend_payload(store: &Store, root: Root, config: &Config) -> Resu
     if proposer_root.is_zero() {
         return Ok(true);
     }
+    let (_, proposer_parent_root) = block_entry(proposer_root).ok_or(Error::SpecAssert(
+        "store.proposer_boost_root in store.blocks",
+    ))?;
+    if proposer_parent_root != root {
+        return Ok(true);
+    }
+    proposer_parent_is_full(store, proposer_root)
+}
+
+/// `is_parent_node_full(store, store.blocks[proposer_root])`, the
+/// specification's own call: both blocks decoded.
+fn proposer_parent_is_full_from_blocks(store: &Store, proposer_root: Root) -> Result<bool> {
     let proposer_block =
         store
             .get_signed_block(&proposer_root)
@@ -2488,10 +3102,19 @@ pub fn should_extend_payload(store: &Store, root: Root, config: &Config) -> Resu
             .ok_or(Error::SpecAssert(
                 "store.proposer_boost_root in store.blocks",
             ))?;
-    if proposer_block.parent_root() != root {
-        return Ok(true);
-    }
     is_parent_node_full(store, &proposer_block)
+}
+
+/// The same answer from the block's [`BlockPayloadLink`], which records what
+/// [`is_parent_node_full`] would compute; see [`derive_payload_link`].
+fn proposer_parent_is_full_from_link(store: &Store, proposer_root: Root) -> Result<bool> {
+    let link = block_payload_link(store, proposer_root)?.ok_or(Error::SpecAssert(
+        "store.proposer_boost_root in store.blocks",
+    ))?;
+    let parent_status = link
+        .parent_status()
+        .ok_or(Error::SpecAssert("block.parent_root in store.blocks"))?;
+    Ok(parent_status == PayloadStatus::Full)
 }
 
 /// `get_payload_status_tiebreaker` (gloas `fork-choice.md`): [`gloas_get_head`]'s
@@ -2503,11 +3126,38 @@ pub fn get_payload_status_tiebreaker(
     node: ForkChoiceNode,
     config: &Config,
 ) -> Result<u8> {
-    if is_previous_slot_payload_decision(store, node, config)? {
+    let current_slot = get_current_slot(store, config);
+    payload_status_tiebreaker_with(
+        store,
+        node,
+        current_slot,
+        |root| store.block_entry(&root),
+        proposer_parent_is_full_from_blocks,
+    )
+}
+
+/// [`get_payload_status_tiebreaker`] with the current slot and the block
+/// lookup supplied by the caller; see [`should_extend_payload_with`].
+fn payload_status_tiebreaker_with(
+    store: &Store,
+    node: ForkChoiceNode,
+    current_slot: Slot,
+    block_entry: impl Fn(Root) -> Option<(Slot, Root)>,
+    proposer_parent_is_full: impl Fn(&Store, Root) -> Result<bool>,
+) -> Result<u8> {
+    let (block_slot, _) =
+        block_entry(node.root).ok_or(Error::SpecAssert("node.root in store.blocks"))?;
+    if is_payload_decision_at(block_slot, node.payload_status, current_slot) {
         if node.payload_status == PayloadStatus::Empty {
             return Ok(1);
         }
-        if should_extend_payload(store, node.root, config)? {
+        if should_extend_payload_with(
+            store,
+            node.root,
+            current_slot,
+            &block_entry,
+            proposer_parent_is_full,
+        )? {
             return Ok(2);
         }
         Ok(0)
@@ -2538,18 +3188,52 @@ pub fn should_apply_proposer_boost(
     config: &Config,
     committees: &CommitteeCache,
 ) -> Result<bool> {
+    if store.proposer_boost_root().is_zero() {
+        return Ok(false);
+    }
+    let justified_checkpoint = store.beacon_justified_checkpoint();
+    let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
+    let index = store.block_index();
+    should_apply_proposer_boost_with(
+        store,
+        config,
+        committees,
+        &index,
+        &justified_state,
+        |parent_root| get_attestation_score(store, &index, parent_root, &justified_state),
+    )
+}
+
+/// [`should_apply_proposer_boost`] with the block index, the justified state
+/// and the parent's attestation score supplied by the caller.
+///
+/// The decision does not depend on which node is being weighed, and its only
+/// expensive input is the parent's attestation score. The head computation
+/// already holds that score for every node it weighs, so it passes a lookup
+/// into its own table here, where the specification's per-node `get_weight`
+/// recomputes it from the votes on every call.
+///
+/// `parent_score` is called at most once, with the parent's root, and only
+/// when the parent is from the previous slot. It must return the same number
+/// [`get_attestation_score`] does for that root.
+fn should_apply_proposer_boost_with(
+    store: &Store,
+    config: &Config,
+    committees: &CommitteeCache,
+    index: &HashMap<Root, (Slot, Root)>,
+    justified_state: &BeaconState,
+    parent_score: impl FnOnce(Root) -> Result<Gwei>,
+) -> Result<bool> {
     let proposer_boost_root = store.proposer_boost_root();
     if proposer_boost_root.is_zero() {
         return Ok(false);
     }
 
-    let (slot, parent_root) = store
-        .block_entry(&proposer_boost_root)
-        .ok_or(Error::SpecAssert(
-            "store.proposer_boost_root in store.blocks",
-        ))?;
-    let (parent_slot, _) = store
-        .block_entry(&parent_root)
+    let &(slot, parent_root) = index.get(&proposer_boost_root).ok_or(Error::SpecAssert(
+        "store.proposer_boost_root in store.blocks",
+    ))?;
+    let &(parent_slot, _) = index
+        .get(&parent_root)
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
 
     // Apply proposer boost if `parent` is not from the previous slot.
@@ -2559,7 +3243,16 @@ pub fn should_apply_proposer_boost(
     // Apply proposer boost if `parent` is not weak. Scored through the
     // pre-gloas `is_head_weak`, not a gloas copy: see `is_ancestor`'s own
     // doc for why a `Pending` node's score is the same either way.
-    if !is_head_weak(store, parent_root, config, committees)? {
+    let parent_attestation_score = parent_score(parent_root)?;
+    if !is_head_weak_with(
+        store,
+        parent_root,
+        parent_slot,
+        config,
+        committees,
+        justified_state,
+        parent_attestation_score,
+    )? {
         return Ok(true);
     }
 
@@ -2569,9 +3262,8 @@ pub fn should_apply_proposer_boost(
         .get_signed_block(&parent_root)
         .expect("get")
         .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let index = store.block_index();
     let mut has_equivocation = false;
-    for (&candidate_root, &(candidate_slot, _)) in &index {
+    for (&candidate_root, &(candidate_slot, _)) in index {
         if candidate_root == parent_root {
             continue;
         }
@@ -2646,40 +3338,24 @@ fn gloas_get_attestation_score(
 
 /// `get_weight` (gloas `fork-choice.md`, modified).
 ///
-/// **Performance note**: this is spec-literal, not the bottom-up form
-/// pre-gloas [`get_weight`]/[`compute_weights`] moved to, and carries
-/// several costs a later change must close before any live use, not only
-/// the walk [`compute_weights`]'s own doc measured at 62% of a live mainnet
-/// follower's CPU before that fold replaced repeated per-root calls:
-/// - every latest message is walked afresh for every node [`gloas_get_head`]
-///   visits, rather than folded bottom-up once per tree;
-/// - each [`gloas_get_ancestor`] hop decodes two signed blocks (the node's
-///   own, then its parent's inside [`get_parent_payload_status`]), and
-///   [`get_supported_node`] decodes a third, once per voter, where the
-///   pre-gloas, index-only [`get_ancestor`] decodes none;
-/// - telling a pre-gloas root from a gloas one is itself a decode a
-///   pre-gloas tree never needed at all, paid by [`is_payload_verified`],
-///   [`payload_timeliness`], [`payload_data_availability`], and
-///   [`get_node_children`]'s own check on every `Pending` node it visits;
-/// - [`should_apply_proposer_boost`] reruns a full [`is_head_weak`] score
-///   and its own `store.block_index()` scan on every call, even though its
-///   answer does not depend on `node` at all and so is identical for every
-///   candidate one [`gloas_get_head`] call weighs.
+/// **A reference, not the node's weight.** The node weighs with
+/// [`compute_node_weights`], one bottom-up pass; this stays spec-literal, as the
+/// per-node definition that table is tested against (the fork-choice harness
+/// compares every `viable_for_head_roots_and_weights` leaf, and the randomized
+/// differential test every node). Its costs are why the node does not call it:
+/// - every latest message is walked afresh for every node visited;
+/// - each [`gloas_get_ancestor`] hop decodes two signed blocks, and
+///   [`get_supported_node`] a third, once per voter;
+/// - telling a pre-gloas root from a gloas one is itself a decode;
+/// - [`should_apply_proposer_boost`] reruns a full [`is_head_weak`] score on
+///   every call, although its answer does not depend on `node`.
 ///
-/// One cost this list used to carry is closed: a vote for a block this
-/// store has pruned below its finalized anchor no longer aborts the whole
-/// head computation with `Error::SpecAssert`, the failure
-/// [`compute_weights`]'s own doc describes pre-gloas `get_weight` having.
-/// Closing it took two fixes, not one: [`gloas_get_attestation_score`]'s
-/// own doc has the direct one; the other is reached indirectly, through
-/// [`should_apply_proposer_boost`] (called above regardless of `node`) into
-/// pre-gloas [`is_head_weak`]'s own [`get_attestation_score`], which fires
-/// whenever the boosted block's parent is from the previous slot, the
-/// ordinary case rather than a corner one; [`get_attestation_score`]'s own
-/// doc has that fix.
-///
-/// Fine for spec tests, where the tree is a handful of blocks and never
-/// prunes; live use needs the remaining costs addressed.
+/// A vote for a block this store has pruned below its finalized anchor does not
+/// abort the computation with `Error::SpecAssert`, the failure
+/// [`compute_weights`]'s own doc describes pre-gloas `get_weight` having:
+/// [`gloas_get_attestation_score`]'s own doc has the direct fix, and
+/// [`get_attestation_score`]'s the one reached through
+/// [`should_apply_proposer_boost`] into [`is_head_weak`].
 pub fn gloas_get_weight(
     store: &Store,
     node: ForkChoiceNode,
@@ -2725,11 +3401,10 @@ pub fn gloas_get_weight(
 /// section). The specification's own gloas `fork-choice.md` never describes
 /// this case, since it only ever anchors a gloas `Store`.
 ///
-/// **Performance note**: telling a pre-gloas `node` apart from a gloas one
-/// costs a full block decode, on every `Pending` node this walks, that a
-/// pre-gloas tree never needed. See [`gloas_get_weight`]'s own performance
-/// note for the other costs this section's spec-literal walk carries above
-/// pre-gloas [`compute_weights`]'s bottom-up fold.
+/// **A reference, not the node's descent.** Telling a pre-gloas `node` apart
+/// from a gloas one costs a full block decode here, on every `Pending` node.
+/// The head walk answers the same question from `walk_children`, which reads
+/// the payload links instead; see [`gloas_get_weight`] for the rest.
 ///
 /// `blocks` is [`Store::block_index`]'s own shape, not the specification's
 /// `Dict[Root, BeaconBlock]`: see the section documentation above for why
@@ -2793,8 +3468,11 @@ pub fn get_node_children(
 ///
 /// Reuses the pre-gloas, index-only [`get_filtered_block_tree`] for the
 /// candidate tree: see [`gloas_get_checkpoint_block`]'s own doc for why that
-/// is sound rather than a shortcut. [`get_head_node`] is the dispatching
-/// entry point this and pre-gloas's own [`compute_head`] share.
+/// is sound rather than a shortcut.
+///
+/// **A reference, not the node's head computation.** [`get_head_node`] runs
+/// [`walk_head`], which reaches the same node from one bottom-up weight table;
+/// this is the spec-literal transcription its tests compare it with.
 pub fn gloas_get_head(
     store: &Store,
     config: &Config,
@@ -3458,8 +4136,8 @@ pub fn get_shuffling_dependent_root(
 /// the boost cannot itself be the thing that drags the head onto a branch with
 /// a different, no-longer-relevant view of who was supposed to propose it.
 ///
-/// `head` must be the head [`compute_head`] (pre-gloas) or [`gloas_get_head`]
-/// (gloas) found *before* `root` joined the store: [`on_block`] is this
+/// `head` must be the head [`walk_head`] found *before* `root` joined the
+/// store: [`on_block`] is this
 /// function's only caller, and it passes exactly that. `index` should include
 /// `root`'s own entry (`on_block` extends its own pre-insertion index with it
 /// rather than re-scanning `LiveChain`), or the walk below falls back to
@@ -3819,18 +4497,26 @@ pub fn on_block(
     // that payload must have been verified by `on_execution_payload_envelope`.
     // A pre-gloas parent is a full node whose payload is verified by
     // definition (see `is_payload_verified`), so the first gloas block passes.
+    //
+    // The parent status is also what the head computation needs to place this
+    // block in the payload tree, so it is kept as this block's payload link
+    // (recorded once the block is stored, below) rather than decoded again on
+    // every head computation.
     let rules = ForkRules::of(signed_block.fork_name());
-    match rules {
+    let parent_status = match rules {
         ForkRules::Gloas => {
-            if is_parent_node_full(store, &signed_block)? {
+            let parent_status = get_parent_payload_status(store, &signed_block)?;
+            if parent_status == PayloadStatus::Full {
                 verify(
                     is_payload_verified(store, parent_root),
                     "is_payload_verified(store, block.parent_root)",
                 )?;
             }
+            Some(parent_status)
         }
-        ForkRules::PreGloas => {}
-    }
+        ForkRules::PreGloas => None,
+    };
+    let payload_link = rules.payload_link(parent_status);
 
     // Blocks cannot be in the future. If they are, their consideration must
     // be delayed until they are in the past.
@@ -3854,11 +4540,11 @@ pub fn on_block(
     //
     // `mut`, and kept alive for the rest of this function: the pre-import
     // head computation and the proposer-boost shuffling check further down
-    // both want this same pre-insertion snapshot of `LiveChain` (`compute_head`
-    // takes it as a parameter, matching `get_filtered_block_tree`/
-    // `compute_weights`), so it is built once here rather than three times
-    // over. Once `block_root` itself joins the store below, one `insert`
-    // keeps this index in step with it instead of re-scanning for that alone.
+    // both want this same pre-insertion snapshot of `LiveChain` (`walk_head`
+    // takes it as a parameter, matching `get_filtered_block_tree`), so it is
+    // built once here rather than three times over. Once `block_root` itself
+    // joins the store below, one `insert` keeps this index in step with it
+    // instead of re-scanning for that alone.
     let mut index = store.block_index();
     let finalized_checkpoint_block =
         get_checkpoint_block(&index, parent_root, finalized_checkpoint.epoch)?;
@@ -4008,28 +4694,24 @@ pub fn on_block(
     // `is_timely and is_first_block and <same shuffling as the pre-import
     // head>`; the first two conditions are cheap and already decide most
     // blocks, especially every block a follower receives while syncing, which
-    // is never timely. Computing that head (`compute_head`: a `LiveChain`
-    // scan, a filtered-tree walk, and a pass over every latest message; see
-    // `compute_weights` for why the last of those matters at scale) is not
+    // is never timely. Computing that head (`walk_head`: a filtered-tree walk
+    // and a pass over every latest message and every block; see
+    // `compute_weights` for why the votes matter at scale) is not
     // worth paying for on a block the shuffling check could not change the
     // answer for anyway.
     //
-    // Gloas gates on its own attestation deadline, and computes the head with
-    // its payload-aware algorithm. When it is computed, its `get_head` failing
-    // fails the import, as the pre-gloas head computation does. The head is
-    // only computed for a block that is timely, which puts it in the current
-    // slot, so `get_head_node`'s dispatch on the current slot's fork would
-    // pick gloas's algorithm here anyway; calling it directly reuses
-    // `committees` instead of building a fresh cache.
+    // Gloas gates on its own attestation deadline. The head is computed by the
+    // one walk under the block's own rules; when it is computed, its failing
+    // fails the import. The head is only computed for a block that is timely,
+    // which puts it in the current slot, so `get_head_node`'s choice of rules
+    // by the current slot's fork would be the same here; calling the walk
+    // directly reuses `committees` and `index` instead of building them.
     let block_slot = signed_block.slot();
     let timeliness = block_timeliness(store, block_slot, rules, config);
     let is_timely = timeliness[constants::ATTESTATION_TIMELINESS_INDEX];
     let is_first_block = store.proposer_boost_root().is_zero();
     let pre_block_head = if is_timely && is_first_block {
-        Some(match rules {
-            ForkRules::Gloas => gloas_get_head(store, config, committees)?.root,
-            ForkRules::PreGloas => compute_head(store, &index, config)?,
-        })
+        Some(walk_head(store, &index, config, committees, rules)?.root)
     } else {
         None
     };
@@ -4055,6 +4737,7 @@ pub fn on_block(
         .insert_signed_block(block_root, signed_block)
         .expect("insert");
     store.insert_state(block_root, state).expect("insert");
+    store.set_payload_link(block_root, block_slot, payload_link);
     // [New in Gloas:EIP7732] A new payload timeliness committee vote for this
     // block, for each of the two questions it votes on.
     match rules {
@@ -4525,7 +5208,12 @@ mod tests {
     /// `BlockRoots` index across the two, so a store cannot be pointed at a
     /// root whose block it does not hold yet.
     fn store_anchored_at(root: Root) -> Store {
-        let backend = Arc::new(InMemoryBackend::new());
+        store_anchored_at_on(Arc::new(InMemoryBackend::new()), root)
+    }
+
+    /// [`store_anchored_at`] over a backend the caller supplies, for tests
+    /// that watch what the store reads.
+    fn store_anchored_at_on(backend: Arc<dyn StorageBackend>, root: Root) -> Store {
         let anchor = Checkpoint {
             epoch: constants::GENESIS_EPOCH,
             root,
@@ -7210,5 +7898,838 @@ mod tests {
             .is_err()
         );
         assert!(is_data_available_blobs(&[], &DataAvailability::Columns(Vec::new())).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // The bottom-up head walk against the spec-literal references
+    // ------------------------------------------------------------------
+
+    /// SplitMix64: a seeded generator small enough to live in a test, so the
+    /// crate needs no `rand` dependency and a failing seed reproduces.
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next_u64() % bound
+        }
+
+        fn chance(&mut self, numerator: u64, denominator: u64) -> bool {
+            self.below(denominator) < numerator
+        }
+
+        fn root(&mut self) -> Root {
+            let mut bytes = [0u8; 32];
+            for chunk in bytes.chunks_mut(8) {
+                chunk.copy_from_slice(&self.next_u64().to_le_bytes());
+            }
+            Root::from_slice(&bytes)
+        }
+    }
+
+    const TREE_VALIDATORS: usize = 12;
+
+    /// A random block tree over the fulu-to-gloas boundary, written straight
+    /// into a store: a fulu prefix, gloas blocks whose bids make each parent
+    /// status vary, some verified payloads, PTC votes of every shape, latest
+    /// messages with random `payload_present`, equivocators and a boost root.
+    ///
+    /// Two seeds in three also move the justified checkpoint above the anchor,
+    /// with each block's unrealized justification random, so that
+    /// `filter_block_tree` has branches to drop once the store is far enough
+    /// past them and some votes sit below the justified block. One of those
+    /// two also stores blocks beside the anchor (at its slot) that the block
+    /// index does not hold, as finality pruning leaves them, and some votes
+    /// name them.
+    struct RandomTree {
+        store: Store,
+        config: Config,
+        roots: Vec<Root>,
+        slots: Vec<Slot>,
+        first_gloas_slot: Slot,
+        justified_moved: bool,
+    }
+
+    fn random_tree(seed: u64, backend: Arc<dyn StorageBackend>) -> RandomTree {
+        let mut rng = TestRng(seed);
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 1);
+        let first_gloas_slot = compute_start_slot_at_epoch(1);
+        let slot_cap = 2 * preset::SLOTS_PER_EPOCH - 1;
+        // The anchor stays at slot 0, the finalized slot every walk stops at;
+        // the first block after it jumps to just before the fork epoch, so a
+        // short chain crosses the boundary.
+        let anchor_slot: Slot = 0;
+        let phase = seed % 3;
+        let justified_moved = phase != 0;
+        let prunes_index = phase == 2;
+
+        let anchor_root = rng.root();
+        let mut store = store_anchored_at_on(backend, anchor_root);
+        let fulu_state = test_state::with_validators_at(ForkName::Fulu, TREE_VALIDATORS);
+        let gloas_state = test_state::with_validators_at(ForkName::Gloas, TREE_VALIDATORS);
+        store
+            .insert_signed_block(anchor_root, fulu_block(anchor_slot, Root::ZERO))
+            .unwrap();
+        store.insert_state(anchor_root, fulu_state.clone()).unwrap();
+        store.set_unrealized_justification(anchor_root, Checkpoint::default());
+
+        let mut roots = vec![anchor_root];
+        let mut slots: Vec<Slot> = vec![anchor_slot];
+        let mut hashes: Vec<Option<ExecutionBlockHash>> = vec![None];
+        let mut parent_indices: Vec<usize> = vec![0];
+        // The tree is built ancestors first, so a block's parent is always
+        // earlier in these vectors.
+        let count = 8 + rng.below(12) as usize;
+        for i in 0..count {
+            // Mostly extend a recent block so the tree reaches the gloas
+            // epoch, and now and then add a same-slot sibling of an existing
+            // block, which is what an early equivocation looks like.
+            let (parent_index, slot) = if roots.len() > 1 && rng.chance(1, 4) {
+                let sibling = 1 + rng.below(roots.len() as u64 - 1) as usize;
+                (parent_indices[sibling], slots[sibling])
+            } else {
+                let recent = rng.below(roots.len().min(3) as u64) as usize;
+                let parent_index = roots.len() - 1 - recent;
+                let slot = if parent_index == 0 {
+                    first_gloas_slot - 3 + rng.below(3)
+                } else {
+                    slots[parent_index] + 1 + rng.below(4)
+                };
+                (parent_index, slot)
+            };
+            if slot > slot_cap {
+                continue;
+            }
+            let root = rng.root();
+            let parent_root = roots[parent_index];
+            if slot >= first_gloas_slot {
+                let hash = ExecutionBlockHash::repeat_byte(1 + i as u8);
+                let parent_hash = match hashes[parent_index] {
+                    Some(parent_hash) if rng.chance(1, 2) => parent_hash,
+                    _ => ExecutionBlockHash::repeat_byte(0xf0 + rng.below(8) as u8),
+                };
+                store
+                    .insert_signed_block(root, gloas_block(slot, parent_root, parent_hash, hash))
+                    .unwrap();
+                store.insert_state(root, gloas_state.clone()).unwrap();
+                if rng.chance(1, 2) {
+                    store.insert_verified_payload(root);
+                }
+                for timely_votes in [true, false] {
+                    let votes = match rng.below(4) {
+                        0 => vec![None; preset::PTC_SIZE],
+                        1 => vec![Some(true); preset::PTC_SIZE],
+                        2 => vec![Some(false); preset::PTC_SIZE],
+                        _ => (0..preset::PTC_SIZE)
+                            .map(|_| rng.chance(2, 3).then(|| rng.chance(1, 2)))
+                            .collect(),
+                    };
+                    if timely_votes {
+                        store.set_payload_timeliness_vote(root, votes);
+                    } else {
+                        store.set_payload_data_availability_vote(root, votes);
+                    }
+                }
+                hashes.push(Some(hash));
+            } else {
+                store
+                    .insert_signed_block(root, fulu_block(slot, parent_root))
+                    .unwrap();
+                store.insert_state(root, fulu_state.clone()).unwrap();
+                hashes.push(None);
+            }
+            let unrealized_epoch = if justified_moved { rng.below(2) } else { 0 };
+            store.set_unrealized_justification(
+                root,
+                Checkpoint {
+                    epoch: unrealized_epoch,
+                    root: Root::ZERO,
+                },
+            );
+            if rng.chance(3, 4) {
+                store.set_block_timeliness(root, [rng.chance(1, 2), rng.chance(1, 2)]);
+            }
+            roots.push(root);
+            slots.push(slot);
+            parent_indices.push(parent_index);
+        }
+
+        // Justified above the anchor: the store follows the justified block's
+        // own state, cached under the checkpoint so that no slot processing
+        // is needed to reach it.
+        if justified_moved && roots.len() > 1 {
+            let pick = 1 + rng.below(roots.len() as u64 - 1) as usize;
+            let justified = Checkpoint {
+                epoch: 1,
+                root: roots[pick],
+            };
+            let justified_state = store.get_state(&justified.root).unwrap().unwrap();
+            store.cache_state(
+                CacheKey::CheckpointState {
+                    epoch: justified.epoch,
+                    root: justified.root,
+                },
+                justified_state,
+            );
+            let finalized = store.beacon_finalized_checkpoint();
+            update_checkpoints(&mut store, justified, finalized);
+        }
+
+        // Blocks the store holds but the index does not: what pruning at the
+        // finalized anchor leaves behind, and what a stale vote can name.
+        let mut outside_index: Vec<Root> = Vec::new();
+        if prunes_index {
+            for _ in 0..1 + rng.below(3) {
+                let root = rng.root();
+                store
+                    .insert_signed_block(root, fulu_block(anchor_slot, Root::ZERO))
+                    .unwrap();
+                store.insert_state(root, fulu_state.clone()).unwrap();
+                store.delete_live_chain_entries(&[(anchor_slot, root)]);
+                outside_index.push(root);
+            }
+        }
+
+        for validator_index in 0..TREE_VALIDATORS as u64 {
+            if rng.chance(1, 6) {
+                continue;
+            }
+            let (root, block_slot) = if !outside_index.is_empty() && rng.chance(1, 4) {
+                (
+                    outside_index[rng.below(outside_index.len() as u64) as usize],
+                    anchor_slot,
+                )
+            } else if rng.chance(1, 12) {
+                (rng.root(), 0)
+            } else {
+                let pick = rng.below(roots.len() as u64) as usize;
+                (roots[pick], slots[pick])
+            };
+            store.set_latest_message(
+                validator_index,
+                LatestMessage {
+                    epoch: 0,
+                    slot: block_slot + rng.below(3),
+                    root,
+                    payload_present: rng.chance(1, 2),
+                },
+            );
+            if rng.chance(1, 8) {
+                store.insert_equivocating_index(validator_index);
+            }
+        }
+        if roots.len() > 1 && rng.chance(2, 3) {
+            let pick = 1 + rng.below(roots.len() as u64 - 1) as usize;
+            store.set_proposer_boost_root(roots[pick]);
+        }
+
+        RandomTree {
+            store,
+            config,
+            roots,
+            slots,
+            first_gloas_slot,
+            justified_moved,
+        }
+    }
+
+    /// What the differential test saw, so it can insist it was not vacuous.
+    #[derive(Default, Debug)]
+    struct WalkStats {
+        full_heads: usize,
+        empty_heads: usize,
+        boost_applied: usize,
+        boost_withheld: usize,
+        previous_slot_decisions: usize,
+        pre_fork_weights: usize,
+        branches_filtered_out: usize,
+    }
+
+    /// Whether `root` is `justified` or a block below it in `index`.
+    fn descends_from_justified(
+        index: &HashMap<Root, (Slot, Root)>,
+        root: Root,
+        justified: Root,
+    ) -> bool {
+        let justified_slot = index[&justified].0;
+        let mut cursor = root;
+        while index[&cursor].0 > justified_slot {
+            cursor = index[&cursor].1;
+            if !index.contains_key(&cursor) {
+                return false;
+            }
+        }
+        cursor == justified
+    }
+
+    /// Runs the bottom-up walk and both references at `current_slot` and
+    /// panics, naming the seed, on any disagreement.
+    ///
+    /// Node weights are compared only for nodes at or above `walk_bound`, which
+    /// can be lower than the finalized slot: the walk weighs nothing below it
+    /// (see `compute_node_weights`' bound), so those nodes read as `0` where
+    /// the references count their votes.
+    fn check_walk_against_references(
+        seed: u64,
+        tree: &mut RandomTree,
+        current_slot: Slot,
+        stats: &mut WalkStats,
+    ) {
+        let config = tree.config.clone();
+        tree.store
+            .set_time_ms(current_slot * config.slot_duration_ms)
+            .unwrap();
+        let store = &tree.store;
+        let committees = store.committee_cache();
+        let index = store.block_index();
+        let walked = get_head_node(store, &config)
+            .unwrap_or_else(|err| panic!("seed {seed} slot {current_slot}: walk failed: {err:?}"));
+        let justified = store.beacon_justified_checkpoint().root;
+        let bound = walk_bound(store, &index);
+        let justified_subtree = tree
+            .roots
+            .iter()
+            .filter(|&&root| descends_from_justified(&index, root, justified))
+            .count();
+        let kept = get_filtered_block_tree(store, &index, &config)
+            .unwrap()
+            .len();
+        if kept < justified_subtree {
+            stats.branches_filtered_out += 1;
+        }
+
+        if current_slot >= tree.first_gloas_slot {
+            let reference = gloas_get_head(store, &config, &committees).unwrap_or_else(|err| {
+                panic!("seed {seed} slot {current_slot}: gloas_get_head failed: {err:?}")
+            });
+            assert_eq!(
+                walked, reference,
+                "seed {seed} slot {current_slot}: head differs from gloas_get_head"
+            );
+
+            let weights =
+                compute_node_weights(store, &index, &config, &committees, ForkRules::Gloas)
+                    .unwrap_or_else(|err| panic!("seed {seed}: weights failed: {err:?}"));
+            for (&root, &slot) in tree.roots.iter().zip(&tree.slots) {
+                if slot < bound {
+                    continue;
+                }
+                for payload_status in [
+                    PayloadStatus::Pending,
+                    PayloadStatus::Empty,
+                    PayloadStatus::Full,
+                ] {
+                    let node = ForkChoiceNode {
+                        root,
+                        payload_status,
+                    };
+                    let expected = gloas_get_weight(store, node, &config, &committees)
+                        .unwrap_or_else(|err| panic!("seed {seed}: reference weight: {err:?}"));
+                    assert_eq!(
+                        weights.weight(node, slot),
+                        expected,
+                        "seed {seed} slot {current_slot}: weight of {node:?} differs"
+                    );
+                    if is_payload_decision_at(slot, payload_status, current_slot) {
+                        stats.previous_slot_decisions += 1;
+                    }
+                }
+            }
+
+            match walked.payload_status {
+                PayloadStatus::Full => stats.full_heads += 1,
+                PayloadStatus::Empty => stats.empty_heads += 1,
+                PayloadStatus::Pending => {}
+            }
+            if !store.proposer_boost_root().is_zero() {
+                if should_apply_proposer_boost(store, &config, &committees).unwrap() {
+                    stats.boost_applied += 1;
+                } else {
+                    stats.boost_withheld += 1;
+                }
+            }
+        } else {
+            let root = compute_head(store, &index, &config).unwrap();
+            assert_eq!(
+                walked,
+                ForkChoiceNode {
+                    root,
+                    payload_status: PayloadStatus::Full,
+                },
+                "seed {seed} slot {current_slot}: head differs from compute_head"
+            );
+
+            // Weights too, not only the head. `compute_weights` gives the boost
+            // to a chain only down to the justified block, so the comparison
+            // covers the blocks at or above it that descend from it.
+            let reference = compute_weights(store, &index, &config).unwrap();
+            let weights =
+                compute_node_weights(store, &index, &config, &committees, ForkRules::PreGloas)
+                    .unwrap_or_else(|err| panic!("seed {seed}: weights failed: {err:?}"));
+            for (&root, &slot) in tree.roots.iter().zip(&tree.slots) {
+                if slot < bound || !descends_from_justified(&index, root, justified) {
+                    continue;
+                }
+                let node = ForkChoiceNode {
+                    root,
+                    payload_status: PayloadStatus::Pending,
+                };
+                assert_eq!(
+                    weights.weight(node, slot),
+                    reference.get(&root).copied().unwrap_or_default(),
+                    "seed {seed} slot {current_slot}: weight of {root:?} differs from compute_weights"
+                );
+                stats.pre_fork_weights += 1;
+            }
+        }
+    }
+
+    /// The walk agrees with the spec-literal references on random trees, for a
+    /// current slot before the fork epoch (against `compute_head`, gloas blocks
+    /// in the tree read as single full nodes) and after it (against
+    /// `gloas_get_head`, and node by node against `gloas_get_weight`).
+    #[test]
+    fn the_bottom_up_walk_matches_the_spec_literal_references_on_random_trees() {
+        let mut stats = WalkStats::default();
+        for seed in 0..400 {
+            let mut tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
+            let max_slot = tree.slots.iter().copied().max().unwrap();
+            let first = tree.first_gloas_slot;
+            let mut current_slots = vec![
+                first - 1,
+                max_slot.max(first),
+                max_slot.max(first) + 1,
+                max_slot.max(first) + 2,
+                max_slot.max(first) + 5,
+            ];
+            if tree.justified_moved {
+                // Far enough past every block that a branch whose voting
+                // source is stale is dropped from the filtered tree.
+                current_slots.push(first + 3 * preset::SLOTS_PER_EPOCH);
+            }
+            for current_slot in current_slots {
+                check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
+            }
+        }
+        assert!(stats.full_heads > 0, "no full head was chosen: {stats:?}");
+        assert!(stats.empty_heads > 0, "no empty head was chosen: {stats:?}");
+        assert!(
+            stats.boost_applied > 0,
+            "the boost never applied: {stats:?}"
+        );
+        assert!(
+            stats.boost_withheld > 0,
+            "the boost was never withheld: {stats:?}"
+        );
+        assert!(
+            stats.previous_slot_decisions > 0,
+            "no previous-slot decision was weighed: {stats:?}"
+        );
+        assert!(
+            stats.pre_fork_weights > 0,
+            "no weight was compared before the fork: {stats:?}"
+        );
+        assert!(
+            stats.branches_filtered_out > 0,
+            "the block filter never dropped a branch: {stats:?}"
+        );
+    }
+
+    /// The payload link derived lazily from the blocks is the specification's
+    /// parent payload status.
+    ///
+    /// `random_tree` writes its blocks straight into the store instead of
+    /// importing them, so this covers the derivation only; the fork-choice
+    /// fixture harness checks the links `on_block` records.
+    #[test]
+    fn the_recorded_payload_links_match_the_specifications_parent_status() {
+        for seed in 0..100 {
+            let tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
+            for &root in &tree.roots {
+                let block = tree.store.get_signed_block(&root).unwrap().unwrap();
+                let link = block_payload_link(&tree.store, root).unwrap().unwrap();
+                assert_eq!(link.is_gloas(), !is_pre_gloas(&block), "seed {seed}");
+                if root == tree.roots[0] {
+                    assert_eq!(link.parent_status(), Some(PayloadStatus::Full));
+                } else {
+                    assert_eq!(
+                        link.parent_status(),
+                        Some(get_parent_payload_status(&tree.store, &block).unwrap()),
+                        "seed {seed}"
+                    );
+                }
+                assert_eq!(tree.store.payload_link(&root), Some(link), "seed {seed}");
+            }
+        }
+    }
+
+    type StorageError = Box<dyn std::error::Error + Send + Sync>;
+
+    thread_local! {
+        /// Block-table reads made by the current thread. Per thread, not
+        /// per backend: the store's background state writer reads the same
+        /// table from its own thread at times of its choosing, and only the
+        /// reads the head computation itself makes are in question.
+        static BLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A backend that counts reads of the block table, to show the head walk
+    /// decodes no block once the payload links are recorded.
+    struct CountingBackend {
+        inner: InMemoryBackend,
+    }
+
+    struct CountingView<'a> {
+        inner: Box<dyn ethlambda_storage::StorageReadView + 'a>,
+    }
+
+    impl StorageBackend for CountingBackend {
+        fn begin_read(
+            &self,
+        ) -> std::result::Result<Box<dyn ethlambda_storage::StorageReadView + '_>, StorageError>
+        {
+            Ok(Box::new(CountingView {
+                inner: self.inner.begin_read()?,
+            }))
+        }
+
+        fn begin_write(
+            &self,
+        ) -> std::result::Result<
+            Box<dyn ethlambda_storage::StorageWriteBatch + 'static>,
+            StorageError,
+        > {
+            self.inner.begin_write()
+        }
+    }
+
+    impl ethlambda_storage::StorageReadView for CountingView<'_> {
+        fn get(
+            &self,
+            table: ethlambda_storage::Table,
+            key: &[u8],
+        ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
+            if table == ethlambda_storage::Table::BlockHeaders {
+                BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+            }
+            self.inner.get(table, key)
+        }
+
+        fn prefix_iterator(
+            &self,
+            table: ethlambda_storage::Table,
+            prefix: &[u8],
+        ) -> std::result::Result<
+            Box<
+                dyn Iterator<Item = std::result::Result<(Box<[u8]>, Box<[u8]>), StorageError>> + '_,
+            >,
+            StorageError,
+        > {
+            self.inner.prefix_iterator(table, prefix)
+        }
+    }
+
+    /// The first head computation after a restart fills the payload links by
+    /// decoding each block once; every later one decodes none, however many
+    /// votes and blocks it weighs.
+    ///
+    /// The proposer boost stays set, and the current slot is the one after the
+    /// latest block's, so the previous-slot payload decision, the tiebreaker
+    /// and `should_extend_payload_with` all run. The one branch that decodes
+    /// blocks is the equivocation scan under a weak previous-slot parent,
+    /// rare and bounded by the candidates at one slot; a seed whose boost gate
+    /// reaches it is left out of the comparison, and the test insists that
+    /// enough seeds keep the boost set without reaching it.
+    #[test]
+    fn the_head_walk_decodes_no_block_once_the_payload_links_are_recorded() {
+        let mut checked = 0;
+        let mut boosted = 0;
+        for seed in 0..40 {
+            let backend = Arc::new(CountingBackend {
+                inner: InMemoryBackend::new(),
+            });
+            let mut tree = random_tree(seed, backend);
+            let max_slot = tree.slots.iter().copied().max().unwrap();
+            let latest = max_slot.max(tree.first_gloas_slot);
+            let scans = boost_gate_scans_for_equivocation(&tree);
+            for (attempt, current_slot) in [latest + 1, latest + 2].into_iter().enumerate() {
+                tree.store
+                    .set_time_ms(current_slot * tree.config.slot_duration_ms)
+                    .unwrap();
+
+                let before = BLOCK_READS.with(|reads| reads.get());
+                let first = get_head_node(&tree.store, &tree.config).unwrap();
+                let after_first = BLOCK_READS.with(|reads| reads.get());
+                let second = get_head_node(&tree.store, &tree.config).unwrap();
+                let after_second = BLOCK_READS.with(|reads| reads.get());
+                assert_eq!(first, second);
+                if scans {
+                    continue;
+                }
+                assert_eq!(
+                    after_second, after_first,
+                    "seed {seed} slot {current_slot}: the second head computation read a block"
+                );
+                if attempt == 0 && after_first > before {
+                    checked += 1;
+                    if !tree.store.proposer_boost_root().is_zero() {
+                        boosted += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 0, "the counter never moved, so it proves nothing");
+        assert!(boosted > 0, "no seed kept the boost without the scan");
+    }
+
+    /// Moves finality of `tree`'s store to a checkpoint that names its
+    /// justified block: the first epoch that starts at or after that block's
+    /// slot. Returns the justified checkpoint, whose root is now the finalized
+    /// root too.
+    fn finalize_at_justified(tree: &mut RandomTree) -> Checkpoint {
+        let justified = tree.store.beacon_justified_checkpoint();
+        let (justified_slot, _) = tree.store.block_index()[&justified.root];
+        let finalized = Checkpoint {
+            epoch: justified_slot.div_ceil(preset::SLOTS_PER_EPOCH),
+            root: justified.root,
+        };
+        let before = tree.store.beacon_finalized_checkpoint();
+        update_checkpoints(&mut tree.store, justified, finalized);
+        assert_ne!(finalized, before);
+        justified
+    }
+
+    /// Clears a boost root that a live node could not hold: the boosted block
+    /// is a current-slot block, so it descends from the finalized block and is
+    /// not that block itself.
+    fn keep_only_a_live_boost(tree: &mut RandomTree, finalized_root: Root) {
+        let boost_root = tree.store.proposer_boost_root();
+        let index = tree.store.block_index();
+        if boost_root == finalized_root
+            || (!boost_root.is_zero()
+                && !descends_from_justified(&index, boost_root, finalized_root))
+        {
+            tree.store.set_proposer_boost_root(Root::ZERO);
+        }
+    }
+
+    /// The current slots the bounded walk is compared at: before the fork
+    /// epoch, just after the latest block, and far enough on for the block
+    /// filter to drop stale branches.
+    fn comparison_slots(tree: &RandomTree) -> [Slot; 4] {
+        let latest = tree
+            .slots
+            .iter()
+            .copied()
+            .max()
+            .unwrap()
+            .max(tree.first_gloas_slot);
+        [
+            tree.first_gloas_slot - 1,
+            latest + 1,
+            latest + 2,
+            tree.first_gloas_slot + 3 * preset::SLOTS_PER_EPOCH,
+        ]
+    }
+
+    /// Once finality has moved, the actor's prune of the payload links below the
+    /// finalized block costs the head computation nothing: it weighs only blocks
+    /// at or above the bound, so it neither reads the pruned links nor derives
+    /// them again by decoding. The bounded walk still names the head, and gives
+    /// every node at or above the bound the weight, that the unbounded
+    /// references do, with a nonzero bound.
+    #[test]
+    fn pruning_links_below_the_finalized_block_changes_nothing_the_head_reads() {
+        let mut stats = WalkStats::default();
+        let mut pruned_some = 0;
+        let mut read_nothing = 0;
+        for seed in 0..200 {
+            let backend = Arc::new(CountingBackend {
+                inner: InMemoryBackend::new(),
+            });
+            let mut tree = random_tree(seed, backend);
+            if !tree.justified_moved {
+                continue;
+            }
+            let justified = finalize_at_justified(&mut tree);
+            keep_only_a_live_boost(&mut tree, justified.root);
+            if boost_gate_scans_for_equivocation(&tree) {
+                continue;
+            }
+
+            // Every block's link is recorded, as `on_block` would have.
+            for &root in &tree.roots {
+                block_payload_link(&tree.store, root).unwrap().unwrap();
+            }
+            let linked = |tree: &RandomTree| {
+                tree.roots
+                    .iter()
+                    .filter(|&&root| tree.store.payload_link(&root).is_some())
+                    .count()
+            };
+            let before_prune = linked(&tree);
+
+            // The actor's own prune.
+            let checkpoint = tree.store.latest_finalized().unwrap();
+            ensure_payload_link(&tree.store, checkpoint.root).unwrap();
+            tree.store
+                .prune_beacon_payload_links(checkpoint.slot, checkpoint.root);
+            assert!(
+                linked(&tree) < before_prune,
+                "seed {seed}: nothing was pruned"
+            );
+            pruned_some += 1;
+
+            let current_slot = comparison_slots(&tree)[2];
+            tree.store
+                .set_time_ms(current_slot * tree.config.slot_duration_ms)
+                .unwrap();
+            let before = BLOCK_READS.with(|reads| reads.get());
+            get_head_node(&tree.store, &tree.config).unwrap();
+            let after = BLOCK_READS.with(|reads| reads.get());
+            assert_eq!(after, before, "seed {seed}: a pruned link was read again");
+            read_nothing += 1;
+
+            for current_slot in comparison_slots(&tree) {
+                check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
+            }
+        }
+        assert!(pruned_some > 0, "no link was pruned, so nothing was tested");
+        assert!(read_nothing > 0, "no seed checked that no block was read");
+        assert!(
+            stats.pre_fork_weights > 0,
+            "no weight was compared: {stats:?}"
+        );
+    }
+
+    /// The bound is the least of three slots so that it holds without assuming
+    /// the boosted block descends from the finalized one: with the boost on the
+    /// finalized block itself, the boost gate reads the score of a parent below
+    /// the finalized slot, and the walk still agrees with the unbounded
+    /// references on the head and on every node at or above the bound.
+    #[test]
+    fn the_bound_covers_a_boosted_finalized_block() {
+        let mut stats = WalkStats::default();
+        let mut boosted_finalized = 0;
+        for seed in 0..200 {
+            let mut tree = random_tree(seed, Arc::new(InMemoryBackend::new()));
+            if !tree.justified_moved {
+                continue;
+            }
+            let justified = finalize_at_justified(&mut tree);
+            tree.store.set_proposer_boost_root(justified.root);
+            if boost_gate_scans_for_equivocation(&tree) {
+                continue;
+            }
+            boosted_finalized += 1;
+            for current_slot in comparison_slots(&tree) {
+                check_walk_against_references(seed, &mut tree, current_slot, &mut stats);
+            }
+        }
+        assert!(
+            boosted_finalized > 0,
+            "the finalized block was never boosted"
+        );
+    }
+
+    /// After a restart no link is recorded. Each cycle of the actor's sequence
+    /// (record the finalized root's link, prune, compute the head) derives what
+    /// it finds missing once, so the first cycle reads blocks and the next two
+    /// read none.
+    #[test]
+    fn the_actors_prune_cycle_derives_links_once_after_a_restart() {
+        let mut derived_first = 0;
+        for seed in 0..60 {
+            let backend = Arc::new(CountingBackend {
+                inner: InMemoryBackend::new(),
+            });
+            let mut tree = random_tree(seed, backend);
+            if !tree.justified_moved {
+                continue;
+            }
+            let justified = finalize_at_justified(&mut tree);
+            keep_only_a_live_boost(&mut tree, justified.root);
+            if boost_gate_scans_for_equivocation(&tree) {
+                continue;
+            }
+            let current_slot = comparison_slots(&tree)[2];
+            tree.store
+                .set_time_ms(current_slot * tree.config.slot_duration_ms)
+                .unwrap();
+
+            let mut reads_per_cycle = Vec::new();
+            for _ in 0..3 {
+                let before = BLOCK_READS.with(|reads| reads.get());
+                let checkpoint = tree.store.latest_finalized().unwrap();
+                ensure_payload_link(&tree.store, checkpoint.root).unwrap();
+                tree.store
+                    .prune_beacon_payload_links(checkpoint.slot, checkpoint.root);
+                get_head_node(&tree.store, &tree.config).unwrap();
+                reads_per_cycle.push(BLOCK_READS.with(|reads| reads.get()) - before);
+            }
+            assert_eq!(
+                reads_per_cycle[1..],
+                [0, 0],
+                "seed {seed}: a later cycle read a block, reads {reads_per_cycle:?}"
+            );
+            if reads_per_cycle[0] > 0 {
+                derived_first += 1;
+            }
+        }
+        assert!(
+            derived_first > 0,
+            "no seed derived a link after the restart"
+        );
+    }
+
+    /// Whether the boost gate of `tree`'s store reaches the equivocation scan:
+    /// a boosted block whose parent is from the previous slot and weak.
+    fn boost_gate_scans_for_equivocation(tree: &RandomTree) -> bool {
+        let store = &tree.store;
+        let boost_root = store.proposer_boost_root();
+        if boost_root.is_zero() {
+            return false;
+        }
+        let index = store.block_index();
+        let (slot, parent_root) = index[&boost_root];
+        if index[&parent_root].0 + 1 < slot {
+            return false;
+        }
+        let committees = store.committee_cache();
+        is_head_weak(store, parent_root, &tree.config, &committees).unwrap()
+    }
+
+    /// A gloas block whose parent the store does not hold, the anchor of a
+    /// resumed directory, gets its link derived once and then recorded,
+    /// although its parent status is unknown.
+    #[test]
+    fn the_link_of_a_gloas_block_without_its_parent_is_recorded_once() {
+        let mut store = empty_store();
+        let root = Root::repeat_byte(0xa1);
+        let block = gloas_block(
+            5,
+            Root::repeat_byte(0xee),
+            ExecutionBlockHash::repeat_byte(1),
+            ExecutionBlockHash::repeat_byte(2),
+        );
+        store.insert_signed_block(root, block).unwrap();
+        assert_eq!(store.payload_link(&root), None);
+
+        let link = block_payload_link(&store, root).unwrap().unwrap();
+
+        assert_eq!(
+            link,
+            BlockPayloadLink::Gloas {
+                parent_status: None
+            }
+        );
+        assert_eq!(store.payload_link(&root), Some(link));
     }
 }

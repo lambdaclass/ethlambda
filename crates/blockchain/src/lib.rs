@@ -3058,16 +3058,16 @@ impl BlockChainServer {
     /// import — the two places beacon finality can move — bounds that by the
     /// unfinalized window rather than by this node's uptime.
     ///
-    /// Also bounds the two beacon scratch caches with the same horizon, the
-    /// execution-hash cache and the optimistic-root set, which is why the
-    /// finalized slot is read before the "nothing is held" early return rather
-    /// than after it: all three share a horizon and these two call sites, but
-    /// the caches fill on every beacon import whether or not anything is being
-    /// held for its columns.
+    /// Also bounds the three beacon scratch caches with the same horizon, the
+    /// execution-hash cache, the payload-link cache and the optimistic-root
+    /// set, which is why the finalized slot is read before the "nothing is
+    /// held" early return rather than after it: all four share a horizon and
+    /// these two call sites, but the caches fill on every beacon import
+    /// whether or not anything is being held for its columns.
     ///
     /// The held-block half is a no-op whenever nothing is held, which is always
     /// true on lean; the cache halves are no-ops there too, since only a beacon
-    /// import ever writes either.
+    /// import ever writes to them.
     fn evict_held_blocks_at_or_below_finality(&mut self) {
         let finalized = self
             .store
@@ -3083,6 +3083,20 @@ impl BlockChainServer {
         // checkpoint is stored as was itself skipped.
         self.store
             .prune_beacon_el_block_hashes(finalized_slot, finalized.root);
+
+        // The head walk's per-block payload links share that horizon: the walk
+        // weighs only blocks at or above the finalized block, so a link below
+        // it is never read again. The prune keys its bound on the finalized
+        // block's own link, which a restart loses, so it is recorded first.
+        if self.store.chain() == Chain::Beacon {
+            fork_choice::ensure_payload_link(&self.store, finalized.root)
+                .inspect_err(|err| {
+                    warn!(?err, "Could not record the finalized block's payload link")
+                })
+                .ok();
+        }
+        self.store
+            .prune_beacon_payload_links(finalized_slot, finalized.root);
 
         // Same horizon, same reason. An execution client doing a long state
         // sync answers `NOT_VALIDATED` to every block, so the optimistic set
