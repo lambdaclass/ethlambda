@@ -147,7 +147,14 @@ impl Validated {
     /// [`pool_aggregator_attestation`]. An accepted aggregate goes into the
     /// pool too, whatever else happens to it, so block production can pack
     /// other nodes' votes; see [`pool_gossip_aggregate`].
+    ///
+    /// Every accepted aggregate or subnet attestation also marks the
+    /// validators it names as live for its target epoch; see
+    /// [`record_liveness`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
+        if outcome == Outcome::Accept {
+            record_liveness(server, &self);
+        }
         if let Self::Aggregate { aggregate, .. } = &self
             && outcome == Outcome::Accept
         {
@@ -198,6 +205,33 @@ impl Validated {
             }
             Self::Aggregate { .. } | Self::Attestation { .. } => {}
         }
+    }
+}
+
+/// Mark the validators an accepted aggregate or subnet attestation names as
+/// live for its target epoch, for `/eth/v1/validator/liveness`.
+///
+/// An aggregate names its aggregator and every attester its aggregate
+/// signature verified, which is what makes an aggregate worth more here than
+/// the attestation subnets alone: this node joins only a few of those. A
+/// block's proposer is recorded where the chain actor imports it instead, so
+/// a block that reached it by range sync or through this node's own API
+/// counts too.
+fn record_liveness(server: &P2PServer, object: &Validated) {
+    let observed = server.store.observed_liveness();
+    match object {
+        Validated::Aggregate {
+            aggregate,
+            attesting_indices,
+        } => {
+            let (epoch, _root) = aggregate.target();
+            let aggregator = std::iter::once(aggregate.aggregator_index());
+            observed.record_all(epoch, aggregator.chain(attesting_indices.iter().copied()));
+        }
+        Validated::Attestation { attestation, .. } => {
+            observed.record(attestation.data.target.epoch, attestation.attester_index);
+        }
+        Validated::Block { .. } | Validated::Column(_) => {}
     }
 }
 
@@ -735,6 +769,56 @@ mod tests {
             pool.lock().unwrap().block_candidates(),
             vec![expected.message.aggregate]
         );
+    }
+
+    /// An accepted aggregate names its aggregator and every attester its
+    /// signature verified; all of them count as live for its target epoch.
+    #[tokio::test]
+    async fn an_accepted_aggregate_marks_its_aggregator_and_attesters_live() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let slot = 40;
+        Validated::Aggregate {
+            aggregate: Box::new(electra_aggregate(slot, 7)),
+            attesting_indices: vec![11, 12],
+        }
+        .forward(&server, Instant::now(), Outcome::Accept);
+
+        let observed = server.store.observed_liveness();
+        let epoch = slot / 32;
+        for validator in [7, 11, 12] {
+            assert!(observed.is_live(epoch, validator), "{validator}");
+        }
+        assert!(!observed.is_live(epoch, 13));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_subnet_attestation_marks_its_attester_live() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        Validated::Attestation {
+            attestation: Box::new(electra_attestation(40, 5)),
+            subnet_id: 0,
+        }
+        .forward(&server, Instant::now(), Outcome::Accept);
+        assert!(server.store.observed_liveness().is_live(40 / 32, 5));
+    }
+
+    /// Liveness rests on the same verdict the pool does: an object that was
+    /// not accepted proves nothing about the validators it names.
+    #[tokio::test]
+    async fn an_object_that_was_not_accepted_marks_nobody_live() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        Validated::Aggregate {
+            aggregate: Box::new(electra_aggregate(40, 7)),
+            attesting_indices: vec![11],
+        }
+        .forward(
+            &server,
+            Instant::now(),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+        );
+        let observed = server.store.observed_liveness();
+        assert!(!observed.is_live(1, 7));
+        assert!(!observed.is_live(1, 11));
     }
 
     /// Only `Accept` means the signatures were verified; anything else must

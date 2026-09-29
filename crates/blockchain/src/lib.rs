@@ -2702,6 +2702,15 @@ impl BlockChainServer {
                     "Block imported successfully"
                 );
 
+                // The proposer acted in this block's epoch, for the Beacon
+                // API's liveness endpoint. Recorded here rather than where
+                // gossip accepts a block, so a block that arrived by range
+                // sync or through this node's own API counts too.
+                if self.store.chain() == Chain::Beacon {
+                    let epoch = ethlambda_types::beacon::signing::compute_epoch_at_slot(slot);
+                    self.store.observed_liveness().record(epoch, proposer);
+                }
+
                 // Recover per-attestation single-message aggregates from the
                 // block's merged multi-message aggregate and fold them into
                 // the local pool. `Some` only for a lean block imported while
