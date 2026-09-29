@@ -5592,8 +5592,8 @@ mod tests {
     // -----------------------------------------------------------------
 
     use crate::events::{
-        BeaconAttestationEvent, BeaconFinalizedCheckpointEvent, BeaconHeadEvent, ChainReorgEvent,
-        DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
+        BeaconAttestationEvent, BeaconChainReorgEvent, BeaconFinalizedCheckpointEvent,
+        BeaconHeadEvent, DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
     };
     use ethlambda_storage::ForkCheckpoints;
     use tokio::sync::broadcast;
@@ -5677,9 +5677,9 @@ mod tests {
         }
     }
 
-    fn as_reorg(event: &ChainEvent) -> &ChainReorgEvent {
+    fn as_reorg(event: &ChainEvent) -> &BeaconChainReorgEvent {
         match event {
-            ChainEvent::ChainReorg(reorg) => reorg,
+            ChainEvent::BeaconChainReorg(reorg) => reorg,
             other => panic!("expected a chain_reorg event, got {other:?}"),
         }
     }
@@ -5737,7 +5737,7 @@ mod tests {
         assert_eq!(emitted.len(), 2, "{emitted:?}");
         assert_eq!(
             as_reorg(&emitted[0]),
-            &ChainReorgEvent {
+            &BeaconChainReorgEvent {
                 slot: 3,
                 // B at slot 2, the common ancestor A at slot 1.
                 depth: 1,

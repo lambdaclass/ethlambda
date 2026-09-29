@@ -346,14 +346,42 @@ mod tests {
     async fn events_beacon_only_topic_returns_400() {
         let events = EventBus::new(16);
 
-        let resp = events_response(&events, "/lean/v0/events?topics=head,chain_reorg").await;
+        let resp =
+            events_response(&events, "/lean/v0/events?topics=head,data_column_sidecar").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let text = String::from_utf8_lossy(&body);
         assert!(
-            text.contains("unknown topic: 'chain_reorg'"),
+            text.contains("unknown topic: 'data_column_sidecar'"),
             "unhelpful 400 body: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_streams_chain_reorg_with_bare_integers() {
+        let events = EventBus::new(16);
+
+        let resp = events_response(&events, "/lean/v0/events?topics=chain_reorg").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        events.emit(ChainEvent::ChainReorg {
+            slot: 9,
+            depth: 2,
+            old_head_block: Default::default(),
+            new_head_block: Default::default(),
+            old_head_state: Default::default(),
+            new_head_state: Default::default(),
+        });
+
+        let text = first_frame(resp).await;
+        assert!(
+            text.contains("event:chain_reorg") || text.contains("event: chain_reorg"),
+            "missing chain_reorg event name in frame: {text}"
+        );
+        assert!(
+            text.contains("\"slot\":9") && text.contains("\"depth\":2"),
+            "missing bare slot/depth in frame: {text}"
         );
     }
 

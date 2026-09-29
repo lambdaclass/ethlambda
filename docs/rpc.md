@@ -94,7 +94,7 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 
 ### `GET /lean/v0/events`
 
-Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Seven event types:
+Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Eight event types:
 
 Payload fields mirror the Ethereum beacon-API eventstream where an analog exists: `block` is the block root, `state` the state root, and `slot` stands in for the beacon `epoch`. `justified_checkpoint` and `aggregate` are ethlambda extensions with no beacon topic.
 
@@ -107,6 +107,7 @@ Payload fields mirror the Ethereum beacon-API eventstream where an analog exists
 | `block_gossip` | `{ "slot": 128, "block": "0x…" }` | A block is seen on the network, before import |
 | `attestation` | `{ "validator_id": 4, "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A single validator vote passes gossip validation (signature omitted) |
 | `aggregate` | `{ "participants": [0, 3, 4], "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A committee-signature aggregate is produced locally or accepted from gossip (proof omitted) |
+| `chain_reorg` | `{ "slot": 130, "depth": 1, "old_head_block": "0x…", "new_head_block": "0x…", "old_head_state": "0x…", "new_head_state": "0x…" }` | The new head does not descend from the previous one; sent ahead of that `head`, and never gated on recency. `slot` is the new head's; `depth` is how many slots the old head sat above the two heads' common ancestor (the Beacon API's definition, in slots; the `lean_fork_choice_reorg_depth` metric counts blocks walked instead) |
 
 The topic name travels only on the SSE `event:` line; the `data:` line carries the flat JSON payload. Example frame:
 
@@ -123,7 +124,7 @@ A **required** comma-separated list of event names selects which events to strea
 curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
 ```
 
-Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`. A Beacon API topic this surface does not serve (`chain_reorg`, say) is refused as unknown. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
+Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`, `chain_reorg`. A Beacon API topic this surface does not serve (`data_column_sidecar`, say) is refused as unknown. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
 
 | Status | Condition |
 |--------|-----------|
