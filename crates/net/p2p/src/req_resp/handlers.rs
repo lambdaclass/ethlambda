@@ -1318,13 +1318,33 @@ fn range_batch_needs_columns(server: &P2PServer, batch: &std::ops::Range<u64>) -
 /// slot is at or after fulu, and the custody set is not empty. Lighthouse's
 /// range sync skips its custody-peer check before PeerDAS for the same reason:
 /// a batch with no columns to fetch has no custodian to wait for.
+///
+/// Gloas answers yes as fulu does, though its columns have a different shape.
+/// A batch ending in gloas can begin in fulu, whose blocks need their columns.
+/// A batch lying entirely in gloas also reaches this, since
+/// `beacon_fetched_through` advances past the gloas blocks the chain actor
+/// refuses. It is then held for custody for nothing, and its column prefetch
+/// fails to decode against fulu's shape; that failure logs at debug and
+/// penalizes no peer. No gloas column is ever consumed from here.
 fn range_needs_columns(
     config: &Config,
     custody_columns: &[u64],
     batch: &std::ops::Range<u64>,
 ) -> bool {
     let last_slot = batch.end.saturating_sub(1);
-    !custody_columns.is_empty() && fork_at_slot(config, last_slot) >= ForkName::Fulu
+    let has_columns = match fork_at_slot(config, last_slot) {
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra => false,
+        ForkName::Fulu | ForkName::Gloas => true,
+        ForkName::Lean => {
+            unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
+        }
+    };
+    !custody_columns.is_empty() && has_columns
 }
 
 /// This node's custody columns that no connected peer is known to custody.

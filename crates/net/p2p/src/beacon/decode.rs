@@ -294,10 +294,23 @@ impl Attestation {
 /// lighthouse decodes this one on that digest too. `fork` is the fork the
 /// subscribed digest was computed at.
 pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, DecodeError> {
-    if fork >= ForkName::Electra {
-        electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
-    } else {
-        phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0)
+    match fork {
+        ForkName::Electra | ForkName::Fulu => {
+            electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0),
+        // Gloas's `SingleAttestation` has the same bytes as electra's, but its
+        // `data.index` carries the payload-availability signal instead of
+        // being zero, so electra's gossip rules would reject an honest vote.
+        // `UnsupportedFork`, not `Ssz`: the sender did nothing wrong.
+        ForkName::Gloas => return Err(DecodeError::UnsupportedFork),
+        ForkName::Lean => {
+            unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
+        }
     }
     .map_err(|_| DecodeError::Ssz)
 }
@@ -560,6 +573,18 @@ mod tests {
         assert_eq!(
             decode_attestation(ForkName::Electra, &phase0),
             Err(DecodeError::Ssz)
+        );
+    }
+
+    #[test]
+    fn a_subnet_attestation_at_gloas_is_unsupported_rather_than_malformed() {
+        // Gloas reads `data.index` as the payload-availability signal, so
+        // decoding these bytes with electra's rules would reject honest
+        // votes. The bytes are valid, so the refusal must not be `Ssz`.
+        let single = single_attestation(slot_of(10)).to_ssz();
+        assert_eq!(
+            decode_attestation(ForkName::Gloas, &single),
+            Err(DecodeError::UnsupportedFork)
         );
     }
 

@@ -111,14 +111,14 @@
 //! `earliest_exit_epoch`, `consolidation_balance_to_consume`, and
 //! `earliest_consolidation_epoch` are state fields with no fork-invariant
 //! accessor on [`BeaconState`]. Unlike altair's participation flags (see
-//! [`crate::beacon::helpers::altair::altair_state`]'s doc), these fields are not
+//! `crate::beacon::helpers::altair::altair_state_ref`'s doc), these fields are not
 //! electra-only: fulu keeps every one of them unchanged (see the [`fulu`]
 //! module doc), and gloas keeps the churn cursors and (behind a slice view;
 //! see [`PendingQueueFields`]'s own doc) the pending queues unchanged too, so
 //! [`churn_cursors_mut`] and [`pending_queue_fields`]/[`pending_queue_fields_ref`]
 //! match `BeaconState::Electra`, `BeaconState::Fulu`, and `BeaconState::Gloas`
 //! rather than only the first. A projection that matched only `Electra`, the way
-//! [`crate::beacon::helpers::altair::altair_state`] matches only `Altair`, would
+//! `crate::beacon::helpers::altair::altair_state_ref` matches only `Altair`, would
 //! silently break every one of these functions on a fulu state, which is the
 //! single easiest mistake to make copying that shape without also copying
 //! the reasoning behind it.
