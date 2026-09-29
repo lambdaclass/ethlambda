@@ -200,17 +200,20 @@ fn random_state(rng: &mut SplitMix64, fork: ForkName) -> BeaconState {
     *inactivity = scores.try_into().unwrap();
 
     // Finality positioned so the four finalization rules can fire and the leak
-    // can start or not.
+    // can start or not. The finalized epoch stays at or behind the previous
+    // one, as in any reachable state: `get_finality_delay` subtracts it from
+    // the previous epoch, which underflows otherwise.
     let checkpoint = |epoch: u64| Checkpoint {
         epoch,
         root: Root::ZERO,
     };
+    let previous_epoch = get_previous_epoch(&state);
     *state.previous_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(4)));
     *state.current_justified_checkpoint_mut() = checkpoint(epoch.saturating_sub(rng.below(3)));
     *state.finalized_checkpoint_mut() = if rng.chance(50) {
         checkpoint(0)
     } else {
-        checkpoint(epoch.saturating_sub(rng.below(3)))
+        checkpoint(previous_epoch.saturating_sub(rng.below(3)))
     };
     for bit in 0..constants::JUSTIFICATION_BITS_LENGTH {
         let value = rng.chance(50);
