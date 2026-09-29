@@ -487,7 +487,7 @@ fn summary_matches_the_reference() {
 
         // Each component of `RewardContext::deltas` against the reference's
         // vectors, and the balance it applies to against the spec's order.
-        let context = RewardContext::new(state, summary.totals());
+        let context = RewardContext::new(state, summary.totals()).unwrap();
         let (_, _, scores) = state.altair_validator_lists().unwrap();
         let flag_deltas: Vec<_> = (0..flag_count)
             .map(|flag| reference::get_flag_index_deltas(state, flag).unwrap())

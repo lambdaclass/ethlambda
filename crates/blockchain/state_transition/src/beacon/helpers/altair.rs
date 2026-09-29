@@ -327,7 +327,7 @@ pub fn get_flag_index_deltas(
     // at a time, so each call pays its own scan, which the epoch driver does
     // not (it builds a single summary for all steps).
     let summary = EpochSummary::build(state, false)?;
-    let context = RewardContext::new(state, summary.totals());
+    let context = RewardContext::new(state, summary.totals())?;
 
     let mut rewards = vec![0; summary.len()];
     let mut penalties = vec![0; summary.len()];
@@ -364,7 +364,7 @@ pub fn get_inactivity_penalty_deltas(
     config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
     let summary = EpochSummary::build(state, false)?;
-    let context = RewardContext::new(state, summary.totals());
+    let context = RewardContext::new(state, summary.totals())?;
     let (_, _, inactivity_scores) = state.altair_validator_lists()?;
 
     let rewards = vec![0; summary.len()];

@@ -309,9 +309,12 @@ impl RewardContext {
     /// Derives the constants from `totals` (taken before or after
     /// justification alike) and the state's finality, which must be the
     /// post-justification one.
-    pub fn new(state: &BeaconState, totals: &ParticipationTotals) -> Self {
-        Self {
-            leaking: super::finality::is_in_inactivity_leak(state),
+    ///
+    /// Fails when that finality is past the previous epoch (see
+    /// [`get_finality_delay`](super::finality::get_finality_delay)).
+    pub fn new(state: &BeaconState, totals: &ParticipationTotals) -> Result<Self> {
+        Ok(Self {
+            leaking: super::finality::is_in_inactivity_leak(state)?,
             fork: state.fork_name(),
             base_reward_per_increment: preset::EFFECTIVE_BALANCE_INCREMENT
                 * preset::BASE_REWARD_FACTOR
@@ -320,7 +323,7 @@ impl RewardContext {
             participating_increments: totals
                 .previous_epoch_flags
                 .map(|total| total / preset::EFFECTIVE_BALANCE_INCREMENT),
-        }
+        })
     }
 
     /// Whether the chain is in an inactivity leak.

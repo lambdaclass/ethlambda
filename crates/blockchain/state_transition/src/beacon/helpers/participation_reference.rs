@@ -114,7 +114,7 @@ pub fn get_flag_index_deltas(
             .binary_search(&index)
             .is_ok()
         {
-            if !is_in_inactivity_leak(state) {
+            if !is_in_inactivity_leak(state)? {
                 let reward_numerator = base_reward * weight * unslashed_participating_increments;
                 rewards[index as usize] +=
                     reward_numerator / (active_increments * constants::WEIGHT_DENOMINATOR);
