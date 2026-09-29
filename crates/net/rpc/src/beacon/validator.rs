@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::checkpoint_state,
+    fork_choice::{checkpoint_state, get_current_store_epoch},
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
@@ -54,6 +54,7 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/validator/duties/sync/{epoch}",
             post(post_sync_duties),
         )
+        .route("/eth/v1/validator/liveness/{epoch}", post(post_liveness))
         .route(
             "/eth/v1/validator/attestation_data",
             get(get_attestation_data),
@@ -161,6 +162,94 @@ fn sync_duties(
         "execution_optimistic": store.is_beacon_optimistic(head_root),
         "data": duties,
     }))
+}
+
+#[derive(Debug, Serialize)]
+struct Liveness {
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
+    index: ValidatorIndex,
+    is_live: bool,
+}
+
+/// `POST /eth/v1/validator/liveness/{epoch}`: whether this node saw each
+/// validator act in `epoch`, which is what a validator client's doppelganger
+/// protection asks before it signs anything.
+///
+/// The Beacon API leaves the source to the node's own view. A validator is
+/// live if either:
+/// - the head state credits it for `epoch` (a non-zero participation byte),
+///   which covers everything already included on chain; or
+/// - the node observed it act in `epoch`: an accepted gossip aggregate or
+///   subnet attestation, an imported block's proposer, or a submission
+///   through this API. That covers what no block has included yet, most of
+///   the current epoch. See [`ethlambda_storage::ObservedLiveness`].
+///
+/// Answered for the store clock's previous, current and next epoch; the next
+/// one is always `false`, and is accepted because a doppelganger check made
+/// at an epoch boundary can land on it. Anything else, and an index outside
+/// the head state's registry, is a `400`; the node syncing is a `503`.
+async fn post_liveness(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+    Json(indices): Json<Vec<String>>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match liveness(&store, &epoch, &indices) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+fn liveness(store: &Store, epoch: &str, indices: &[String]) -> Result<serde_json::Value, ApiError> {
+    let epoch = parse_epoch(epoch)?;
+    let indices = indices
+        .iter()
+        .map(|index| index.parse::<ValidatorIndex>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+
+    let current = get_current_store_epoch(store, &store.config());
+    if epoch + 1 < current || epoch > current + 1 {
+        return Err(ApiError::BadRequest(
+            "epoch is not the previous, current or next epoch",
+        ));
+    }
+
+    let (_head_root, state) = head(store)?;
+    let state_epoch = compute_epoch_at_slot(state.slot());
+    // The head state's flags for `epoch`, if it keeps them: its own epoch's
+    // and the one before. `None` before altair, which keeps no flags.
+    let participation = state
+        .altair_validator_lists()
+        .ok()
+        .and_then(|(previous, current, _)| {
+            if epoch == state_epoch {
+                Some(current)
+            } else if epoch + 1 == state_epoch {
+                Some(previous)
+            } else {
+                None
+            }
+        });
+
+    let observed = store.observed_liveness();
+    let mut data = Vec::with_capacity(indices.len());
+    for index in indices {
+        state
+            .validator(index)
+            .map_err(|_| ApiError::BadRequest("unknown validator index"))?;
+        let credited = participation
+            .and_then(|flags| flags.get(index as usize))
+            .is_some_and(|flags| *flags != 0);
+        data.push(Liveness {
+            index,
+            is_live: credited || observed.is_live(epoch, index),
+        });
+    }
+    Ok(serde_json::json!({ "data": data }))
 }
 
 /// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
@@ -1049,6 +1138,133 @@ mod tests {
             let epoch = compute_epoch_at_slot(state.slot());
             let syncing = SyncStatusController::new(SyncStatus::Syncing);
             let (status, _) = post_sync(state, epoch, &["3"], syncing).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    // --- liveness --------------------------------------------------------
+
+    mod liveness {
+        use super::*;
+
+        /// The epoch every test's state and store clock sit in: far enough
+        /// from genesis that the epoch two before it exists.
+        const EPOCH: u64 = 5;
+
+        /// A fulu state at [`EPOCH`]'s first slot in which validator 2 is
+        /// credited for this epoch and validator 3 for the previous one.
+        fn credited_state() -> BeaconState {
+            let mut state = fulu_state();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = compute_start_slot_at_epoch(EPOCH);
+            fulu.current_epoch_participation[2] = 0b001;
+            fulu.previous_epoch_participation[3] = 0b111;
+            state
+        }
+
+        /// `state`'s store, its clock moved to `state`'s slot, as the chain
+        /// actor's tick keeps it.
+        fn store_for(state: BeaconState) -> Store {
+            let slot = state.slot();
+            let (mut store, _root) = beacon_store_at(state);
+            let config = store.config();
+            let now = config.genesis_time_ms() + slot * config.slot_duration_ms;
+            store.set_time_ms(now).unwrap();
+            store
+        }
+
+        async fn post_liveness(
+            store: Store,
+            epoch: u64,
+            indices: &[&str],
+            sync_status: SyncStatusController,
+        ) -> (StatusCode, serde_json::Value) {
+            let request = Request::post(format!("/eth/v1/validator/liveness/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes().with_state(store).layer(Extension(sync_status));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// `(index, is_live)` pairs, in the order answered.
+        fn answers(json: &serde_json::Value) -> Vec<(String, bool)> {
+            json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    (
+                        entry["index"].as_str().unwrap().to_owned(),
+                        entry["is_live"].as_bool().unwrap(),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_participation_flag_makes_a_validator_live() {
+            let store = store_for(credited_state());
+            let (status, json) =
+                post_liveness(store.clone(), EPOCH, &["2", "3"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                answers(&json),
+                [("2".into(), true), ("3".into(), false)],
+                "2 is credited for this epoch, 3 only for the previous one"
+            );
+
+            let (_, json) = post_liveness(store, EPOCH - 1, &["2", "3"], Default::default()).await;
+            assert_eq!(answers(&json), [("2".into(), false), ("3".into(), true)]);
+        }
+
+        /// What no block has included yet: a validator the node saw act is
+        /// live without any flag.
+        #[tokio::test]
+        async fn an_observed_validator_is_live_without_a_flag() {
+            let store = store_for(credited_state());
+            store.observed_liveness().record(EPOCH, 9);
+            let (status, json) =
+                post_liveness(store, EPOCH, &["9", "10"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(answers(&json), [("9".into(), true), ("10".into(), false)]);
+        }
+
+        #[tokio::test]
+        async fn the_next_epoch_is_answered_and_nobody_is_live_in_it() {
+            let store = store_for(credited_state());
+            let (status, json) = post_liveness(store, EPOCH + 1, &["2"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(answers(&json), [("2".into(), false)]);
+        }
+
+        #[tokio::test]
+        async fn epochs_outside_the_window_are_a_400() {
+            for epoch in [EPOCH - 2, EPOCH + 2] {
+                let store = store_for(credited_state());
+                let (status, _) = post_liveness(store, epoch, &["2"], Default::default()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "epoch {epoch}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unknown_validator_is_a_400() {
+            let store = store_for(credited_state());
+            let unknown = (COUNT as u64).to_string();
+            let (status, _) = post_liveness(store, EPOCH, &[&unknown], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_syncing_node_answers_503() {
+            let store = store_for(credited_state());
+            let syncing = SyncStatusController::new(SyncStatus::Syncing);
+            let (status, _) = post_liveness(store, EPOCH, &["2"], syncing).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
