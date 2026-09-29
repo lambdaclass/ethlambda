@@ -3,6 +3,7 @@ mod handler;
 mod messages;
 
 pub use encoding::decompress_message;
+pub(crate) use handler::beacon_wall_slot;
 pub use handler::{
     handle_gossip_message, join_aggregator_subnets, leave_expired_aggregator_subnets,
     prune_attestation_pool, publish_aggregated_attestation, publish_attestation,
