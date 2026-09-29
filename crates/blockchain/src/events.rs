@@ -62,6 +62,7 @@ pub enum Topic {
     /// ethlambda extension, lean only: a committee-signature aggregate
     /// (produced locally or seen on gossip).
     Aggregate,
+    /// The new head does not descend from the previous one. On both surfaces.
     ChainReorg,
     DataColumnSidecar,
     // Accepted on the beacon surface, never emitted. See `docs/rpc.md`.
@@ -129,6 +130,7 @@ impl Topic {
         Topic::BlockGossip,
         Topic::Attestation,
         Topic::Aggregate,
+        Topic::ChainReorg,
     ];
 
     /// The names `/eth/v1/events` accepts: every topic in the Beacon API's
@@ -240,9 +242,8 @@ impl FromStr for Topic {
 /// [`ChainEvent::JustifiedCheckpoint`] has no beacon analog; it mirrors
 /// [`ChainEvent::FinalizedCheckpoint`]'s shape as an ethlambda extension.
 ///
-/// The `Beacon*` variants, [`ChainEvent::ChainReorg`] and
-/// [`ChainEvent::DataColumnSidecar`] are the Beacon API's own payloads, field
-/// for field, with every integer a quoted decimal. Each wraps a struct, so the
+/// The `Beacon*` variants and [`ChainEvent::DataColumnSidecar`] are the Beacon
+/// API's own payloads, field for field, with every integer a quoted decimal. Each wraps a struct, so the
 /// shape a variant serializes to is stated once, on that struct.
 ///
 /// `#[serde(untagged)]` serializes only the active variant's fields, so the SSE
@@ -278,6 +279,18 @@ pub enum ChainEvent {
         participants: Vec<u64>,
         data: AttestationData,
     },
+    /// The new head does not descend from the previous one. Beacon
+    /// `chain_reorg`'s fields less `epoch` and `execution_optimistic`: `slot`
+    /// is the new head's, and `depth` is how many slots the previous head sat
+    /// above the two heads' common ancestor.
+    ChainReorg {
+        slot: u64,
+        depth: u64,
+        old_head_block: H256,
+        new_head_block: H256,
+        old_head_state: H256,
+        new_head_state: H256,
+    },
     /// Beacon `head`.
     BeaconHead(BeaconHeadEvent),
     /// Beacon `block`: a block was imported.
@@ -288,7 +301,7 @@ pub enum ChainEvent {
     BeaconFinalizedCheckpoint(BeaconFinalizedCheckpointEvent),
     /// Beacon `chain_reorg`: the new head does not descend from the previous
     /// one.
-    ChainReorg(ChainReorgEvent),
+    BeaconChainReorg(BeaconChainReorgEvent),
     /// Beacon `attestation`: an accepted aggregate's attestation. Boxed, since
     /// it is the one payload much larger than the rest and every slot of the
     /// broadcast ring is sized for the largest variant.
@@ -309,7 +322,7 @@ impl ChainEvent {
             ChainEvent::BlockGossip { .. } | ChainEvent::BeaconBlockGossip(_) => Topic::BlockGossip,
             ChainEvent::Attestation { .. } | ChainEvent::BeaconAttestation(_) => Topic::Attestation,
             ChainEvent::Aggregate { .. } => Topic::Aggregate,
-            ChainEvent::ChainReorg(_) => Topic::ChainReorg,
+            ChainEvent::ChainReorg { .. } | ChainEvent::BeaconChainReorg(_) => Topic::ChainReorg,
             ChainEvent::DataColumnSidecar(_) => Topic::DataColumnSidecar,
         }
     }
@@ -369,7 +382,7 @@ pub struct BeaconFinalizedCheckpointEvent {
 /// `slot` and `epoch` are the new head's; `depth` is how many slots the
 /// previous head sat above the two heads' common ancestor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct ChainReorgEvent {
+pub struct BeaconChainReorgEvent {
     #[serde(serialize_with = "quoted_or_bare::serialize")]
     pub slot: u64,
     #[serde(serialize_with = "quoted_or_bare::serialize")]
@@ -517,8 +530,9 @@ impl ChainEvents {
         self.bus.subscribe()
     }
 
-    /// Lean: `head`, `justified_checkpoint` and `finalized_checkpoint`, in
-    /// that order, for whatever moved since the last diff.
+    /// Lean: `chain_reorg`, `head`, `justified_checkpoint` and
+    /// `finalized_checkpoint`, in that order, for whatever moved since the
+    /// last diff.
     ///
     /// Called after each store call that can move them (`store::on_tick`,
     /// `store::on_block`, and the proposer's pre-build catch-up), so a move
@@ -531,7 +545,7 @@ impl ChainEvents {
         };
         let current = &self.view;
         if current.head != previous.head {
-            publish_lean_head(store, &self.bus, current.head, wall_clock_slot);
+            publish_lean_head_change(store, &self.bus, &previous, current.head, wall_clock_slot);
         }
         if current.justified != previous.justified {
             publish_lean_checkpoint(
@@ -717,9 +731,16 @@ impl EventView {
     }
 }
 
-/// Lean `head`, if the new head is within [`HEAD_EVENT_RECENCY_SLOTS`] of the
-/// wall clock.
-fn publish_lean_head(store: &Store, events: &EventBus, head: H256, wall_clock_slot: u64) {
+/// Lean `chain_reorg` (if the new head does not descend from the previous
+/// one) and `head` (if the new head is within [`HEAD_EVENT_RECENCY_SLOTS`] of
+/// the wall clock) for a head move from `previous.head` to `head`.
+fn publish_lean_head_change(
+    store: &Store,
+    events: &EventBus,
+    previous: &EventView,
+    head: H256,
+    wall_clock_slot: u64,
+) {
     // Read the block once and reuse it for slot and state root so they stay
     // consistent. Through `block_slot_and_state_root`, the chain-generic
     // accessor the beacon diff reads too, rather than the lean-only
@@ -731,6 +752,9 @@ fn publish_lean_head(store: &Store, events: &EventBus, head: H256, wall_clock_sl
         );
         return;
     };
+    if let Some(reorg) = lean_reorg(store, previous, head, slot, state_root) {
+        events.emit(reorg);
+    }
     // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
     if slot + HEAD_EVENT_RECENCY_SLOTS < wall_clock_slot {
         return;
@@ -740,6 +764,68 @@ fn publish_lean_head(store: &Store, events: &EventBus, head: H256, wall_clock_sl
         block: head,
         state: state_root,
     });
+}
+
+/// The lean `chain_reorg` for a head move from `previous.head` to `head`, or
+/// `None` when the new head descends from the previous one.
+///
+/// Not gated on recency, as beacon's is not. Missing the previous head's
+/// block reports nothing rather than a guess: headers are never pruned, so
+/// that is a store inconsistency, not a reorg.
+fn lean_reorg(
+    store: &Store,
+    previous: &EventView,
+    head: H256,
+    new_slot: u64,
+    new_state: H256,
+) -> Option<ChainEvent> {
+    let (old_slot, old_state) = store.block_slot_and_state_root(&previous.head)?;
+    let floor = previous.finalized.slot;
+    let ancestor_slot = match common_ancestor(store, previous.head, head, floor) {
+        Some((root, _)) if root == previous.head => return None,
+        Some((_, slot)) => slot,
+        None => {
+            warn!(
+                old_head = %ShortRoot(&previous.head.0),
+                new_head = %ShortRoot(&head.0),
+                "No common ancestor above the finalized checkpoint; reporting reorg depth from it"
+            );
+            floor
+        }
+    };
+    Some(ChainEvent::ChainReorg {
+        slot: new_slot,
+        depth: old_slot.saturating_sub(ancestor_slot),
+        old_head_block: previous.head,
+        new_head_block: head,
+        old_head_state: old_state,
+        new_head_state: new_state,
+    })
+}
+
+/// The latest block both `a` and `b` are or descend from, as `(root, slot)`.
+///
+/// Walks parent links with one header read per step, always stepping the side
+/// at the higher slot (`a` on a tie), so the two walks meet at the common
+/// ancestor. For a head that simply moved forward that is the old head itself,
+/// a step or two away. `None` when a walk would step below `floor_slot`
+/// without the two meeting, or reaches a block the store lacks.
+///
+/// A header read is cheap on lean. Beacon finds its own ancestor through the
+/// new head's post-state instead (see [`NewChain`]), since a beacon read
+/// decodes the whole block.
+fn common_ancestor(store: &Store, a: H256, b: H256, floor_slot: u64) -> Option<(H256, u64)> {
+    let mut a = (a, store.block_entry(&a)?);
+    let mut b = (b, store.block_entry(&b)?);
+    while a.0 != b.0 {
+        let side = if a.1.0 >= b.1.0 { &mut a } else { &mut b };
+        let (slot, parent) = side.1;
+        if slot < floor_slot {
+            return None;
+        }
+        *side = (parent, store.block_entry(&parent)?);
+    }
+    Some((a.0, a.1.0))
 }
 
 /// Which lean checkpoint event [`publish_lean_checkpoint`] emits.
@@ -831,7 +917,7 @@ fn publish_beacon_head_change(
 
     if !new_chain.contains(previous.head, old_slot) {
         let ancestor_slot = common_ancestor_slot(store, &new_chain, previous);
-        events.emit(ChainEvent::ChainReorg(ChainReorgEvent {
+        events.emit(ChainEvent::BeaconChainReorg(BeaconChainReorgEvent {
             slot: new_slot,
             depth: old_slot.saturating_sub(ancestor_slot),
             old_head_block: previous.head,
@@ -1014,10 +1100,10 @@ mod tests {
         assert_eq!(names.len(), Topic::ALL.len());
     }
 
-    /// The lean surface's accepted set is exactly the seven it has always
-    /// served, so adding beacon names changes nothing there.
+    /// The lean surface's accepted set: the seven it has always served, plus
+    /// `chain_reorg`. The other beacon names stay beacon-only.
     #[test]
-    fn the_lean_set_is_the_original_seven() {
+    fn the_lean_set_is_the_original_seven_and_chain_reorg() {
         let names: Vec<&str> = Topic::LEAN.iter().map(|topic| topic.as_str()).collect();
         assert_eq!(
             names,
@@ -1029,6 +1115,7 @@ mod tests {
                 "block_gossip",
                 "attestation",
                 "aggregate",
+                "chain_reorg",
             ]
         );
     }
@@ -1073,8 +1160,8 @@ mod tests {
     #[test]
     fn a_topic_outside_the_accepted_set_is_unknown() {
         assert_eq!(Topic::parse_accepted("head", Topic::LEAN), Ok(Topic::Head));
-        let err = Topic::parse_accepted("chain_reorg", Topic::LEAN).unwrap_err();
-        assert_eq!(err.name(), "chain_reorg");
+        let err = Topic::parse_accepted("data_column_sidecar", Topic::LEAN).unwrap_err();
+        assert_eq!(err.name(), "data_column_sidecar");
         assert!(Topic::parse_accepted("aggregate", Topic::BEACON).is_err());
         assert!(Topic::parse_accepted("justified_checkpoint", Topic::BEACON).is_err());
         assert!(Topic::parse_accepted("weather_forecast", Topic::BEACON).is_err());
@@ -1305,6 +1392,69 @@ mod tests {
         }
     }
 
+    /// genesis <- A(1) <- B(2), and C(3) a second child of A. Moving the head
+    /// from B to C is a reorg one slot deep (B at 2, the common ancestor A at
+    /// 1), announced ahead of the head it moved to.
+    #[test]
+    fn a_lean_head_moving_to_another_branch_emits_chain_reorg_then_head() {
+        let mut store = test_store();
+        let genesis = store.head().expect("store head exists");
+        let (a, b, c) = (H256([0xa; 32]), H256([0xb; 32]), H256([0xc; 32]));
+        let state_of = |root: H256| H256([root.0[0] ^ 0xff; 32]);
+        insert_test_block(&mut store, a, 1, genesis, state_of(a));
+        insert_test_block(&mut store, b, 2, a, state_of(b));
+        insert_test_block(&mut store, c, 3, a, state_of(c));
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(b))
+            .expect("update_checkpoints should succeed");
+        let mut events = ChainEvents::new(EventBus::new(8), &store);
+        let mut rx = events.subscribe();
+
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(c))
+            .expect("update_checkpoints should succeed");
+        events.publish_lean_changes(&store, 3);
+
+        match rx.try_recv().unwrap() {
+            ChainEvent::ChainReorg {
+                slot,
+                depth,
+                old_head_block,
+                new_head_block,
+                old_head_state,
+                new_head_state,
+            } => {
+                assert_eq!((slot, depth), (3, 1));
+                assert_eq!((old_head_block, new_head_block), (b, c));
+                assert_eq!((old_head_state, new_head_state), (state_of(b), state_of(c)));
+            }
+            other => panic!("expected chain_reorg first, got: {other:?}"),
+        }
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ChainEvent::Head { slot: 3, .. })
+        ));
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn a_lean_chain_reorg_serializes_with_bare_integers() {
+        let event = ChainEvent::ChainReorg {
+            slot: 3,
+            depth: 1,
+            old_head_block: H256::ZERO,
+            new_head_block: H256::ZERO,
+            old_head_state: H256::ZERO,
+            new_head_state: H256::ZERO,
+        };
+        assert_eq!(event.topic(), Topic::ChainReorg);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["slot"], 3);
+        assert_eq!(json["depth"], 1);
+        assert!(json.get("epoch").is_none());
+        assert!(json.get("execution_optimistic").is_none());
+    }
+
     // -----------------------------------------------------------------
     // Beacon payloads against the specification's own examples
     // (beacon-APIs `apis/eventstream/index.yaml`)
@@ -1388,7 +1538,7 @@ mod tests {
 
     #[test]
     fn chain_reorg_matches_the_specification_example() {
-        let event = ChainEvent::ChainReorg(ChainReorgEvent {
+        let event = ChainEvent::BeaconChainReorg(BeaconChainReorgEvent {
             slot: 200,
             depth: 50,
             old_head_block: root(BLOCK),
