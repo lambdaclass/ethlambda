@@ -1,0 +1,45 @@
+# network_params_ethlambda_beacon.yaml's devnet, with Lighthouse's validator
+# client in place of ethlambda's, talking to `ethlambda beacon` alone, and with
+# doppelganger protection on.
+#
+# This is how the Beacon API ethlambda beacon serves is checked against a
+# validator client other than its own. In particular:
+#   - `/eth/v1/validator/liveness`: with doppelganger protection on, Lighthouse
+#     keeps its validators muted until liveness has answered `false` for them
+#     for a couple of epochs, and forever if the endpoint is missing.
+#   - `/eth/v1/validator/duties/sync`: with 128 validators and a 512-seat sync
+#     committee, every validator holds sync committee seats, so Lighthouse
+#     asks for sync duties from the first epoch.
+#
+# Run from the repository root, after
+# `make docker-build DOCKER_TAG=beacon-api-liveness`:
+#
+#   kurtosis run --enclave ethlambda-lighthouse-vc tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params_lighthouse_vc.yaml
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    validator_count: 0
+    supernode: true
+    count: 2
+    cl_extra_params:
+      - --subscribe-all-subnets
+network_params:
+  preset: mainnet
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  preregistered_validator_count: 128
+additional_services:
+  - dora
+
+ethlambda_validator:
+  client: lighthouse
+  doppelganger: true
+  # ethlambda beacon's image; the validator client is Lighthouse's.
+  image: ghcr.io/lambdaclass/ethlambda:beacon-api-liveness
+  name: lighthouse-vc
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
+
+ethlambda_beacon:
+  enabled: true
+  fallback: false
