@@ -86,5 +86,9 @@ pub(crate) fn fulu_parent(proposer: ValidatorIndex) -> BeaconState {
             *entry = proposer;
         }
     }
+    // The pubkey writes above are buffered in the registry tree, and the
+    // tests cache this state behind an `Arc`, which `Store::cache_state`
+    // refuses to hold unflushed.
+    state.apply_pending_mutations();
     state
 }

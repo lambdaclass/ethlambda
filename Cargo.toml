@@ -7,6 +7,7 @@ members = [
     "crates/blockchain/fork_choice",
     "crates/blockchain/state_transition",
     "crates/common/crypto",
+    "crates/common/ssz-tree",
     "crates/common/metrics",
     "crates/common/test-fixtures",
     "crates/common/types",
@@ -69,6 +70,7 @@ ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
 ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
+ethlambda-ssz-tree = { path = "crates/common/ssz-tree" }
 ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }

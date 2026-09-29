@@ -9,7 +9,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (12 workspace crates)
+## Codebase Structure (13 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -40,6 +40,7 @@ crates/
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
     ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
@@ -550,6 +551,21 @@ existing once per chain.
   it lives on `feat/beacon-chain-stf`, where these types are verified against
   consensus-specs v1.6.1 (5705 mainnet / 40009 minimal cases). What runs here
   is the containers' own round-trip and shape tests.
+- **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s**, persistent
+  Merkle trees that cache node hashes and share unchanged subtrees between
+  states through `Arc`; they have no slices and no `iter_mut`. A leaf holds a
+  page-sized run of elements rather than one chunk, and an inner node a page of
+  child pointers spanning several binary levels, so a lookup crosses a handful
+  of nodes and a rebuilt leaf or node copies one page. Writes are
+  buffered until `BeaconState::apply_pending_mutations`, which the state
+  transition calls before every state-root computation. A state decoded from
+  storage is rebased onto a cached one (`Store::get_state`).
+  - **`state.validator(i)` and `balances()[i]` are tree descents, not array
+    indexing.** A loop over the registry should walk `validators().iter()`
+    (zipped with `balances().iter()` where it needs both), not index per
+    validator: helpers that build the active-index `Vec` and then read each
+    index back were the largest cost left in the import profile
+    (`docs/beacon_stf.md`, "Registry and balances").
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 

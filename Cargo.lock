@@ -2097,6 +2097,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-ssz-tree"
+version = "0.1.0"
+dependencies = [
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "proptest",
+ "rayon",
+]
+
+[[package]]
 name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
@@ -2164,6 +2176,7 @@ name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
  "datatest-stable",
+ "ethlambda-ssz-tree",
  "ethlambda-test-fixtures",
  "hex",
  "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",

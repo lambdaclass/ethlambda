@@ -298,9 +298,12 @@ distinguishable from one that never ran at all.
   each block is written as its response completes rather than accumulated. A
   long range costs disk and time, not memory.
 - **A replay's RAM floor is the store's own state cache.** `replay` shares the
-  same `STATE_CACHE_CAPACITY`-bounded LRU (32 states) every node runs with,
-  which at 2.4M validators is roughly 11 GB. That ceiling belongs to the
-  store, not to this harness.
+  same `STATE_CACHE_CAPACITY`-bounded LRU every node runs with. With the
+  registry and balances in persistent trees, cached states share every
+  unchanged subtree, so the cache costs far less than its capacity times one
+  state: a 128-block mainnet replay at 2.4M validators measured 2.9 GiB of RSS
+  once every block was in, against 11.6 GiB when each state held flat copies.
+  That ceiling belongs to the store, not to this harness.
 - **`--network` selects the decoder, not just a genesis check.**
   `decode_block` resolves each block's fork from its own slot through that
   network's fork schedule, so replaying against the wrong network can decode a

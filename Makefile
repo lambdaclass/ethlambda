@@ -28,7 +28,7 @@ TEST=cargo test --locked --profile release-fast
 # exhaustive by construction and a crate added later cannot silently go
 # untested. Keep them roughly even by build weight; the boundary means nothing
 # else.
-CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto
+CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto ethlambda-ssz-tree
 
 test: test-consensus test-node ## 🧪 Run all tests
 

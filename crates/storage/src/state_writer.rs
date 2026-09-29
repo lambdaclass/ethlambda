@@ -191,13 +191,44 @@ pub(crate) fn read_state(
             // `reconstruct_beacon_state_bytes`'s doc comment for why an SSZ
             // decode per hop instead would be the whole cost that delta layer
             // exists to avoid.
-            decode_state_value(&bytes)
+            let mut state = decode_state_value(&bytes);
+            rebase_onto_resident(cache, &mut state);
+            state
         }
     };
 
+    // A cached `Arc` cannot be flushed later, so every root taken through it
+    // would pay the slow, uncached hashing path.
+    let mut state = state;
+    state.apply_pending_mutations();
     let state = Arc::new(state);
     cache.lock().unwrap().put(key, state.clone());
     Ok(Some(state))
+}
+
+/// Makes a state just decoded from storage share memory with a resident one.
+///
+/// A decoded state's tree-backed fields (see `BeaconState::rebase_on`) are
+/// fresh allocations, so without this every cache miss would hold a full
+/// private copy of the registry next to cached states it is nearly identical
+/// to. The parent's state is the closest relative when it is resident;
+/// otherwise the most recently used state still shares nearly all of the
+/// registry. The rebased state is equal to the decoded one: only which
+/// allocations back it change.
+///
+/// The cache lock is released before rebasing, which walks the whole registry.
+fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
+    let parent = CacheKey::BlockState(state.latest_block_header().parent_root);
+    let base = {
+        let cache = cache.lock().unwrap();
+        cache
+            .peek(&parent)
+            .or_else(|| cache.iter().next().map(|(_, state)| state))
+            .cloned()
+    };
+    if let Some(base) = base {
+        state.rebase_on(&base);
+    }
 }
 
 /// Reconstructs a beacon state's raw *encoded* bytes (see

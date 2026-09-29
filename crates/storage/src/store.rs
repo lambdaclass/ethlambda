@@ -2609,6 +2609,10 @@ impl Store {
     /// what makes that sound, and it is why `checkpoint_state` and the helpers
     /// that reach it can stay `&Store`.
     pub fn cache_state(&self, key: CacheKey, state: Arc<BeaconState>) {
+        debug_assert!(
+            !state.has_pending_mutations(),
+            "a cached Arc cannot be flushed later; flush before wrapping the state in one"
+        );
         self.state_cache.lock().unwrap().put(key, state);
     }
 
@@ -2694,7 +2698,10 @@ impl Store {
     /// The invariant that a child state's parent must already be persisted is
     /// still enforced, and still panics on violation, but on the writer
     /// thread now rather than in this call.
-    pub fn insert_state(&mut self, root: H256, state: BeaconState) -> Result<(), Error> {
+    pub fn insert_state(&mut self, root: H256, mut state: BeaconState) -> Result<(), Error> {
+        // A cached `Arc` cannot be flushed later, so every root taken
+        // through it would pay the slow, uncached hashing path.
+        state.apply_pending_mutations();
         let state = Arc::new(state);
         // Both the cache and the buffer take a handle to the same state. The
         // cache is the hot path for the immediate next read; the buffer is
@@ -5214,6 +5221,56 @@ mod tests {
         assert_eq!(first.slot(), 9);
         assert_eq!(second.slot(), 9);
         assert!(store.cached_state(CacheKey::BlockState(root)).is_some());
+    }
+
+    #[test]
+    fn a_decoded_beacon_state_shares_its_registry_with_the_resident_parent() {
+        use ethlambda_types::beacon::containers::Validator;
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let parent_root = H256::from([1u8; 32]);
+        let child_root = H256::from([2u8; 32]);
+
+        let mut parent = beacon_test_state(10);
+        for i in 0..8u64 {
+            let validator = Validator {
+                effective_balance: i,
+                ..Default::default()
+            };
+            parent.validators_mut().push(validator).unwrap();
+            parent.balances_mut().push(i).unwrap();
+        }
+        parent.apply_pending_mutations();
+        store
+            .insert_signed_block(parent_root, beacon_test_block(10, H256::ZERO))
+            .expect("insert parent block");
+        store
+            .insert_state(parent_root, parent.clone())
+            .expect("insert parent state");
+
+        let mut child = parent;
+        *child.slot_mut() = 11;
+        child.latest_block_header_mut().parent_root = parent_root;
+        child.balances_mut()[0] += 1;
+        child.apply_pending_mutations();
+        store
+            .insert_signed_block(child_root, beacon_test_block(11, parent_root))
+            .expect("insert child block");
+        store
+            .insert_state(child_root, child.clone())
+            .expect("insert child state");
+
+        // Dropping the store joins the writer, so both states are on the
+        // backend. A fresh store then has to decode them: the parent first,
+        // so that it is resident when the child is decoded.
+        drop(store);
+        let cold = beacon_test_store(backend);
+        let resident_parent = cold.get_state(&parent_root).expect("get").expect("present");
+        let decoded = cold.get_state(&child_root).expect("get").expect("present");
+
+        assert!(decoded.validators().ptr_eq(resident_parent.validators()));
+        assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
     /// `beacon_test_state` with its parent linked in, the way `insert_state`'s
