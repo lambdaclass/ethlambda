@@ -405,15 +405,18 @@ from an exhaustive match on a fork or a container, and it is what
 `data.index` into the payload flag and orders votes by slot instead of target
 epoch. A vote's rules follow its own container, not the clock.
 
-The head algorithm follows the current slot's fork: from `GLOAS_FORK_EPOCH` on,
-`get_head_node` runs `gloas_get_head` over the whole tree, pre-gloas blocks
-included; before it, the unchanged `compute_head` runs. The switch follows the
-clock, so any follower on a network that schedules gloas (Sepolia's built-in
-config does) runs `gloas_get_head` every slot from that epoch, over its
-pre-gloas tree, whether or not it can import a gloas block; its cost is the
-subject of [spec_deviations.md](spec_deviations.md). The spec never describes a
-tree that crosses the boundary, so that page also records the rule this module
-chose.
+One head computation serves every fork: `get_head_node` builds a weight table
+for the node tree in one bottom-up pass and descends over it. The current
+slot's fork selects the two rules that differ: from `GLOAS_FORK_EPOCH` on,
+blocks carry the payload dimension their bids give them and the proposer boost
+is gated by `should_apply_proposer_boost`; before it, every block is a single
+full node and the boost applies whenever it is set. A block's fork and parent
+payload status are recorded at import (`BlockPayloadLink`), so the walk decodes
+no block in the ordinary case; the two exceptions are in
+[spec_deviations.md](spec_deviations.md). `compute_head` and the spec-literal
+`gloas_get_head` are kept as the references it is tested against; the cost
+argument is in the same page. The spec never describes a tree that
+crosses the boundary, so that page also records the rule this module chose.
 Two new handlers, `on_execution_payload_envelope` and
 `on_payload_attestation_message`, join the spec's list of ways to change the
 store.
