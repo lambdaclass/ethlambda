@@ -1,4 +1,5 @@
 mod beacon;
+mod banner;
 mod benchmark;
 mod checkpoint_sync;
 mod cli;
@@ -74,14 +75,6 @@ use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
     Chain, MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
 };
-
-const ASCII_ART: &str = r#"
-      _   _     _                 _         _
-  ___| |_| |__ | | __ _ _ __ ___ | |__   __| | __ _
- / _ \ __| '_ \| |/ _` | '_ ` _ \| '_ \ / _` |/ _` |
-|  __/ |_| | | | | (_| | | | | | | |_) | (_| | (_| |
- \___|\__|_| |_|_|\__,_|_| |_| |_|_.__/ \__,_|\__,_|
-"#;
 
 fn main() -> eyre::Result<()> {
     match command::parse() {
@@ -309,7 +302,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         version: version::CLIENT_VERSION,
     };
 
-    println!("{ASCII_ART}");
+    println!("\n{}", banner::for_locale());
 
     info!(version = version::CLIENT_VERSION, "Starting ethlambda");
 
