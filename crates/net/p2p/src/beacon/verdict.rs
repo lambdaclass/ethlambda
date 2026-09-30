@@ -20,7 +20,7 @@ use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as
 use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::electra::SingleAttestation;
 use ethlambda_types::beacon::containers::{
-    SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
+    DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
 };
 use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
@@ -86,7 +86,12 @@ impl Validated {
             Self::Block { block, block_root } => {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
-            Self::Column(sidecar) => gossip::column::stateful_checks(store, sidecar),
+            Self::Column(sidecar) => match &**sidecar {
+                DataColumnSidecar::Fulu(sidecar) => gossip::column::stateful_checks(store, sidecar),
+                DataColumnSidecar::Gloas(sidecar) => {
+                    gossip::column::stateful_checks_gloas(store, sidecar)
+                }
+            },
             Self::Aggregate {
                 aggregate,
                 attesting_indices,
@@ -113,12 +118,17 @@ impl Validated {
                     .seen_blocks
                     .record(block.slot(), block.proposer_index(), *block_root)
             }
-            Self::Column(sidecar) => {
-                let header = &sidecar.signed_block_header.message;
-                server
-                    .seen_columns
-                    .record(header.slot, header.proposer_index, sidecar.index)
-            }
+            Self::Column(sidecar) => match &**sidecar {
+                DataColumnSidecar::Fulu(sidecar) => {
+                    let header = &sidecar.signed_block_header.message;
+                    server
+                        .seen_columns
+                        .record(header.slot, header.proposer_index, sidecar.index)
+                }
+                DataColumnSidecar::Gloas(sidecar) => server
+                    .seen_block_columns
+                    .record(sidecar.beacon_block_root, sidecar.index),
+            },
             Self::Aggregate { aggregate, .. } => server.seen_aggregates.record(aggregate),
             Self::Attestation { attestation, .. } => server.seen_attestations.record(attestation),
         }
@@ -637,7 +647,9 @@ mod tests {
     #[tokio::test]
     async fn the_first_accept_for_a_column_key_stands_and_the_second_is_marked_seen() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let object = Validated::Column(Box::new(valid_shaped_sidecar(5, 0)));
+        let object = Validated::Column(Box::new(DataColumnSidecar::Fulu(valid_shaped_sidecar(
+            5, 0,
+        ))));
 
         assert_eq!(
             settle(&mut server, Outcome::Accept, &object),

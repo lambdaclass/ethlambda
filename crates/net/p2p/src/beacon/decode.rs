@@ -6,9 +6,9 @@
 //! other four topics carry containers whose shape has not changed since the
 //! fork that introduced them, so they decode with no fork lookup at all.
 //! `data_column_sidecar_{subnet_id}`, the one family among the subscribed
-//! topics rather than a fixed name, decodes with no lookup either, for a
-//! different reason: fulu is the only fork that defines the container, so
-//! there is no ladder to begin with (see [`decode_data_column_sidecar`]).
+//! topics rather than a fixed name, decodes by the fork its topic's digest
+//! names, since fulu and gloas define different containers under the one name
+//! (see [`decode_data_column_sidecar`]).
 //! `beacon_attestation_{subnet_id}` is the exception to reading the fork off
 //! the payload: electra moved its slot, so its fork comes from the topic's
 //! digest instead (see [`decode_attestation`]).
@@ -22,11 +22,11 @@
 //! | `voluntary_exit`, `proposer_slashing` | No |
 //! | `bls_to_execution_change` | No, capella onward |
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
-//! | `data_column_sidecar_{subnet_id}` | No, fulu only |
+//! | `data_column_sidecar_{subnet_id}` | Yes, at gloas, by topic digest |
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    SignedBeaconBlock, altair, capella, electra, fulu, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -204,21 +204,19 @@ pub fn decode_block(config: &Config, bytes: &[u8]) -> Result<SignedBeaconBlock, 
     })
 }
 
-/// Decode a data column sidecar off a subnet topic.
+/// Decode a data column sidecar at `fork`.
 ///
-/// Takes no `Config` and no fork, unlike [`decode_block`]: only fulu defines
-/// this container, so there is no fork ladder to choose from. A sidecar whose
-/// slot predates fulu is rejected later, by the checks that know the schedule.
-///
-/// Gloas redefines this container too (no header, a `slot` field of its own;
-/// see `containers::gloas::DataColumnSidecar`'s doc), so a gloas sidecar
-/// fails here indistinguishably from a malformed one: nothing about these
-/// bytes alone says which fork sent them. The caller on the gossip path
-/// (where a wrong verdict scores an honest peer) tells the two apart from the
-/// outside instead, once this call has failed, by the fork the message's own
-/// topic digest names.
-pub fn decode_data_column_sidecar(bytes: &[u8]) -> Result<fulu::DataColumnSidecar, DecodeError> {
-    fulu::DataColumnSidecar::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+/// Fulu and gloas define different containers under this name (gloas drops the
+/// header and inclusion proof for a `slot` and a block root; see
+/// `containers::gloas::DataColumnSidecar`'s doc), and the bytes alone do not say
+/// which one they are. The fork therefore comes from context: a gossip topic's
+/// digest, or a req/resp chunk's context bytes. A fork with no data columns
+/// fails like a malformed payload.
+pub fn decode_data_column_sidecar(
+    fork: ForkName,
+    bytes: &[u8],
+) -> Result<DataColumnSidecar, DecodeError> {
+    DataColumnSidecar::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
 }
 
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
@@ -369,6 +367,7 @@ pub fn decode_gossip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::containers::fulu;
     use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32, Root};
     use libssz::SszEncode as _;
 
@@ -519,8 +518,28 @@ mod tests {
             .expect("exactly the required depth"),
         };
         let bytes = sidecar.to_ssz();
-        assert_eq!(decode_data_column_sidecar(&bytes).unwrap().index, 3);
-        assert!(decode_data_column_sidecar(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(
+            decode_data_column_sidecar(ForkName::Fulu, &bytes)
+                .unwrap()
+                .index(),
+            3
+        );
+        assert!(decode_data_column_sidecar(ForkName::Fulu, &bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_gloas_sidecar_decodes_by_the_topics_fork_and_not_as_fulu() {
+        let sidecar = ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+            index: 5,
+            slot: 77,
+            ..Default::default()
+        };
+        let bytes = sidecar.to_ssz();
+        let decoded = decode_data_column_sidecar(ForkName::Gloas, &bytes).unwrap();
+        assert_eq!((decoded.index(), decoded.slot()), (5, 77));
+        assert_eq!(decoded, DataColumnSidecar::Gloas(sidecar));
+        assert!(decode_data_column_sidecar(ForkName::Fulu, &bytes).is_err());
+        assert!(decode_data_column_sidecar(ForkName::Electra, &bytes).is_err());
     }
 
     /// One attester's vote at `slot`, in the shape electra puts on a subnet.

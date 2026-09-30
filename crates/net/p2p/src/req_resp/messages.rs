@@ -1,6 +1,7 @@
 use ethlambda_types::ShortRoot;
+use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::{DataColumnSidecar, DataColumnsByRootIdentifier};
+use ethlambda_types::beacon::containers::fulu::DataColumnsByRootIdentifier;
 use libssz_types::SszList;
 
 use crate::beacon::messages::{
