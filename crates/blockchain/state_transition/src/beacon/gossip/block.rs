@@ -3,6 +3,7 @@
 //! (`specs/gloas/p2p-interface.md`), with the deviations the design spec lists.
 
 use ethlambda_storage::CacheKey;
+use tracing::warn;
 
 use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, finalized_ancestry,
@@ -135,13 +136,13 @@ fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
 
 /// `verify_execution_requests_limits` (`specs/gloas/p2p-interface.md`).
 ///
-/// The specification's text names the withdrawal and consolidation lists; the
-/// conformance vectors also reject builder deposit and exit requests over
-/// their bounds, and a deposit list over its own, which every list's type
-/// bound implies.
+/// The four lists the specification names: withdrawals, consolidations,
+/// builder deposits and builder exits. Deposit requests are deliberately not
+/// checked: gloas's `DepositRequests` is progressive and neither the
+/// specification nor the state transition bounds it, so a limit here would
+/// reject a block that import accepts.
 fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
-    requests.deposits.len() <= preset::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD
-        && requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
+    requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
         && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
         && requests.builder_deposits.len() as u64
             <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
@@ -182,21 +183,32 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     }
     // [IGNORE] (gloas) If the parent block is full, the parent payload is
     // valid. The specification checks this between the signature and the
-    // slot-order rule, both inside `precheck_block` here, so a block that
-    // fails either is rejected even with an unverified parent payload.
-    if gloas_block.is_some() {
+    // slot-order rule, but the slot-order and expected-proposer rules are both
+    // inside `precheck_block` here, so a block that fails either is rejected
+    // even with an unverified parent payload. The parent's fullness is read
+    // once: it decodes the parent block, which the bounded validation pool
+    // should not do twice.
+    let parent_full = if gloas_block.is_some() {
         match fork_choice::is_parent_node_full(store, block) {
-            Ok(true) if !fork_choice::is_payload_verified(store, parent_root) => {
-                return Outcome::Ignore(IgnoreReason::ParentPayloadUnverified);
+            Ok(full) => full,
+            Err(err) => {
+                warn!(%err, "Could not read a gloas block's parent payload status");
+                return Outcome::Ignore(IgnoreReason::Internal);
             }
-            Ok(_) => {}
-            Err(_) => return Outcome::Queue(QueueReason::ParentNotReady),
         }
+    } else {
+        true
+    };
+    if gloas_block.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
+    {
+        return Outcome::Ignore(IgnoreReason::ParentPayloadUnverified);
     }
     // [REJECT] The finalized checkpoint is an ancestor of the block.
     if let Err(outcome) = finalized_ancestry(store, parent_root).verdict() {
         return outcome;
     }
+    // A gloas block has no payload to time; earlier forks: [REJECT] the
+    // execution payload's timestamp is the slot's.
     if let Some(gloas_block) = gloas_block {
         // [REJECT] The bid's parent equals the block's parent.
         let bid = &gloas_block
@@ -210,15 +222,10 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
         // [REJECT] If the parent is not full, the bid builds on the parent's
         // execution head. `process_slots` leaves `latest_block_hash` alone,
         // so the parent's post-state answers for the advanced one.
-        match fork_choice::is_parent_node_full(store, block) {
-            Ok(false) if latest_block_hash(&parent_state) != Some(bid.parent_block_hash) => {
-                return Outcome::Reject(RejectReason::BidNotOnParentHead);
-            }
-            Ok(_) => {}
-            Err(_) => return Outcome::Queue(QueueReason::ParentNotReady),
+        if !parent_full && latest_block_hash(&parent_state) != Some(bid.parent_block_hash) {
+            return Outcome::Reject(RejectReason::BidNotOnParentHead);
         }
     } else if let Some(timestamp) = block.execution_payload_timestamp()
-        // [REJECT] The execution payload's timestamp is the slot's.
         && timestamp != compute_timestamp_at_slot(&parent_state, block.slot(), &config)
     {
         return Outcome::Reject(RejectReason::PayloadTimestamp);
@@ -301,7 +308,8 @@ mod tests {
     use crate::beacon::bls;
     use crate::beacon::config::Config;
     use crate::beacon::constants::{
-        DOMAIN_BEACON_PROPOSER, MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
+        DEPOSIT_CONTRACT_TREE_DEPTH, DOMAIN_BEACON_PROPOSER,
+        MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
     use crate::beacon::containers::{BeaconState, electra};
     use crate::beacon::gossip::test_support::{fulu_parent, seen_blocks, slot_start_ms, store};
@@ -374,9 +382,9 @@ mod tests {
 
         let mut with_deposit = body.clone();
         let deposit = crate::beacon::containers::Deposit {
-            proof: vec![Root::ZERO; 33]
+            proof: vec![Root::ZERO; DEPOSIT_CONTRACT_TREE_DEPTH + 1]
                 .try_into()
-                .expect("a deposit proof is thirty-three roots"),
+                .expect("a deposit proof has the contract tree's depth plus one roots"),
             data: Default::default(),
         };
         with_deposit.deposits = vec![deposit]
@@ -389,6 +397,24 @@ mod tests {
             .try_into()
             .expect("progressive lists are unbounded");
         assert!(!body_operations_within_limits(&too_many_exits));
+    }
+
+    #[test]
+    fn deposit_requests_are_not_limited_by_gossip() {
+        let request = crate::beacon::containers::electra::DepositRequest {
+            pubkey: Default::default(),
+            withdrawal_credentials: Default::default(),
+            amount: 0,
+            signature: Default::default(),
+            index: 0,
+        };
+        let requests = gloas::ExecutionRequests {
+            deposits: vec![request; preset::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD + 1]
+                .try_into()
+                .expect("progressive lists are unbounded"),
+            ..Default::default()
+        };
+        assert!(execution_requests_within_limits(&requests));
     }
 
     #[test]
