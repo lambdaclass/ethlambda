@@ -93,6 +93,14 @@ impl BeaconWire {
             .digest_at(slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH)
     }
 
+    /// [`Self::digest_for_slot`], but only if this node holds that digest's
+    /// topics: a slot far in the past or beyond the next boundary names a digest
+    /// nobody is listening to, and publishing there would only fan out to peers
+    /// that never subscribed.
+    pub fn publish_digest(&self, slot: Slot) -> Option<ForkDigest> {
+        Some(self.digest_for_slot(slot)).filter(|&digest| self.holds_digest(digest))
+    }
+
     /// Whether this node is subscribed under `digest`, so whether a peer on it
     /// is on a digest this node still speaks.
     pub fn holds_digest(&self, digest: ForkDigest) -> bool {

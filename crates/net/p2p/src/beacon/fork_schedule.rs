@@ -313,7 +313,9 @@ mod tests {
         let plain = ForkSchedule::new(&fulu_then_gloas(), gvr());
         let mut config = fulu_then_gloas();
         config.blob_schedule = SszList::try_from(vec![BlobScheduleEntry {
-            epoch: 4,
+            // An epoch no fork uses, so the entry reaches the digest
+            // comparison instead of being dropped as a duplicate epoch.
+            epoch: 500,
             max_blobs_per_block: 9,
         }])
         .expect("within capacity");

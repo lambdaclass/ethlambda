@@ -101,7 +101,7 @@ pub(crate) fn advance(server: &mut P2PServer) -> Option<Duration> {
         delay_until_epoch(&wire.config, wire.genesis_time, next, now_ms)
             .max(Duration::from_millis(1))
     });
-    let _ = apply(server, epoch);
+    apply(server, epoch);
     next
 }
 
@@ -423,6 +423,22 @@ mod tests {
             wire.digest_for_slot(first_gloas_slot - 1),
             wire.schedule.digest_at(GLOAS - 1)
         );
+    }
+
+    #[tokio::test]
+    async fn a_digest_that_is_not_held_is_not_published_to() {
+        let mut server = unconnected_beacon_server(config(), 0).await;
+        apply(&mut server, GLOAS - 2);
+        let wire = server.wire.beacon().unwrap();
+        let slot_of = |epoch: Epoch| epoch * preset::SLOTS_PER_EPOCH;
+        // The current digest, and the next one once its window has opened.
+        assert!(wire.publish_digest(slot_of(GLOAS - 2)).is_some());
+        assert!(wire.publish_digest(slot_of(GLOAS)).is_none());
+        apply(&mut server, GLOAS - 1);
+        let wire = server.wire.beacon().unwrap();
+        assert!(wire.publish_digest(slot_of(GLOAS)).is_some());
+        // A slot long past names a digest that is no longer held.
+        assert!(wire.publish_digest(slot_of(FULU)).is_none());
     }
 
     #[tokio::test]

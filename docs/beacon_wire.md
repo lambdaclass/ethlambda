@@ -44,8 +44,9 @@ bootnodes are largely seed-only, so a crawl is how a peer is reached.
 
 ## The fork digest
 
-Computed once at startup from the resolved network's genesis state, never
-hardcoded as a digest:
+Computed from the resolved network's genesis state and fork schedule, never
+hardcoded as a digest. Startup derives the first one and a running node follows
+the schedule from there (see below):
 
 ```
 epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
