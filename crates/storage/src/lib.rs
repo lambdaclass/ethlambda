@@ -19,6 +19,6 @@ pub use error::Error;
 // is unaffected by which module owns it.
 pub use state_writer::CacheKey;
 pub use store::{
-    Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, MAX_RESUMABLE_DB_STATE_AGE,
-    NEW_PAYLOAD_CAP, Store,
+    Chain, DB_VERSION, ForkCheckpoints, GetForkchoiceStoreError, HeadVoteWindow,
+    MAX_RESUMABLE_DB_STATE_AGE, NEW_PAYLOAD_CAP, Store,
 };
