@@ -140,13 +140,8 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "  {} leansig={} leanvm={} os={} arch={} threads={}",
-            env.client_version,
-            env.leansig_rev,
-            env.leanvm_rev,
-            env.os,
-            env.arch,
-            env.available_parallelism
+            "  {} leanvm={} os={} arch={} threads={}",
+            env.client_version, env.leanvm_rev, env.os, env.arch, env.available_parallelism
         );
         let _ = writeln!(out);
 

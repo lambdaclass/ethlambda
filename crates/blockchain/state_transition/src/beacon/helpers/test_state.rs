@@ -2,8 +2,10 @@
 //!
 //! Several helpers can only be exercised against a state with a populated
 //! validator registry and correctly sized history vectors, and building one by
-//! hand in each test would bury the assertion under setup. Test-only: nothing in
-//! the crate's public surface depends on it.
+//! hand in each test would bury the assertion under setup. Test-only: compiled
+//! for this crate's tests, and for other crates' tests through the `test-utils`
+//! feature (the Beacon API's endpoints need a real registry too); nothing in the
+//! crate's public surface depends on it.
 //!
 //! [`with_validators`] builds a phase0 state; [`with_validators_at`]
 //! generalises it to every other fork. Each fork used to grow its own
@@ -34,7 +36,7 @@ use crate::beacon::fork::ForkName;
 use crate::beacon::lean_fork_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, Bytes32, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
+    BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Gwei, Root, Uint256,
 };
 
 /// A deterministic but genuinely valid BLS public key for validator `index`.
@@ -46,6 +48,14 @@ use crate::beacon::primitives::{
 /// keeps the state reproducible while letting the BLS paths run.
 fn pubkey_for(index: usize) -> BlsPubkey {
     BlsPubkey(secret_key_for(index).sk_to_pk().to_bytes())
+}
+
+/// Validator `index`'s signature over `message`, under the key every state this
+/// module builds registers for it, so a test can produce signatures those
+/// states verify.
+pub fn sign_for(index: usize, message: Root) -> BlsSignature {
+    let signature = secret_key_for(index).sign(message.as_slice(), crate::beacon::bls::DST, &[]);
+    BlsSignature(signature.to_bytes())
 }
 
 /// The secret key behind [`pubkey_for`]`(index)`, for a test that needs a
@@ -135,6 +145,23 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         // whole input.
         ForkName::Lean => lean_fork_unreachable("with_validators_at"),
     }
+}
+
+/// [`with_validators_at`], with every validator's public key replaced by the
+/// real one [`sign_for`] signs under.
+///
+/// Every fork but phase0 leaves the keys at the all-zero default, which is
+/// cheaper to build and all most tests need; a test that looks validators up
+/// by key, or verifies their signatures, needs them distinct and real.
+pub fn with_signing_validators_at(fork: ForkName, count: usize) -> BeaconState {
+    let mut state = with_validators_at(fork, count);
+    for index in 0..count {
+        state
+            .validator_mut(index as u64)
+            .expect("index is within the registry just built")
+            .pubkey = pubkey_for(index);
+    }
+    state
 }
 
 // -- Pieces shared by every fork's state literal below -----------------------

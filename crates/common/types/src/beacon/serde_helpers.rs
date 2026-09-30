@@ -210,6 +210,23 @@ pub mod ssz_hex {
     {
         serializer.collect_str(&HexPrefixed(&value.to_ssz()))
     }
+
+    /// The inverse: hex (with or without `0x`) of the value's SSZ encoding,
+    /// decoded through `SszDecode`, so a bitlist's delimiter bit and a
+    /// bitvector's width are checked by the same code that checks them on the
+    /// wire.
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        T: libssz::SszDecode,
+    {
+        let text = <String as serde::Deserialize>::deserialize(deserializer)?;
+        let digits = text.trim();
+        let bytes = hex::decode(digits.strip_prefix("0x").unwrap_or(digits))
+            .map_err(serde::de::Error::custom)?;
+        T::from_ssz_bytes(&bytes)
+            .map_err(|err| serde::de::Error::custom(format!("invalid SSZ encoding: {err:?}")))
+    }
 }
 
 /// A sequence of SSZ-encodable byte strings, each written as its own

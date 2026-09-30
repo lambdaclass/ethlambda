@@ -416,8 +416,8 @@ mod tests {
         state.slot += 1;
         let epoch = state.slot / preset::SLOTS_PER_EPOCH;
 
-        for (index, balance) in state.balances.iter_mut().enumerate() {
-            *balance = balance_for_index(index);
+        for index in 0..state.balances.len() {
+            state.balances[index] = balance_for_index(index);
         }
         for (index, score) in state.inactivity_scores.iter_mut().enumerate() {
             *score = inactivity_score_for_index(index);
@@ -426,11 +426,13 @@ mod tests {
         // Most validators' effective balance moves; hysteresis means a
         // validator only updates once its real balance crosses a threshold,
         // which a minority miss in any given epoch.
-        for (index, validator) in state.validators.iter_mut().enumerate() {
+        for index in 0..state.validators.len() {
             if index % 997 != 0 {
-                validator.effective_balance = balance_for_index(index);
+                state.validators[index].effective_balance = balance_for_index(index);
             }
         }
+        state.balances.apply_updates();
+        state.validators.apply_updates();
 
         let zeroed_participation = vec![0u8; VALIDATOR_COUNT]
             .try_into()

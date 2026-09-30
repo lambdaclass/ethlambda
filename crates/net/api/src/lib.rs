@@ -2,7 +2,10 @@ use std::time::Instant;
 
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar},
+    beacon::containers::{
+        SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
+        fulu::DataColumnSidecar,
+    },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
@@ -272,6 +275,42 @@ pub struct AggregateArrival {
     /// The aggregate is about to be handed to the chain actor, which is also
     /// the end of the decode.
     pub handed_off: Instant,
+}
+
+// --- Protocol: RPC -> P2P ---
+
+/// What the Beacon API asks of the network.
+///
+/// A protocol of its own rather than more methods on [`BlockChainToP2P`]:
+/// these requests come from a validator client through the HTTP server, not
+/// from the chain actor, and a beacon node's chain actor has nothing to publish
+/// on its own behalf.
+#[protocol]
+pub trait RpcToP2P: Send + Sync {
+    /// Gossip one unaggregated attestation on `beacon_attestation_{subnet_id}`.
+    ///
+    /// The caller has already validated it and computed its subnet: both need
+    /// the committee assignment, which needs a state, and the p2p actor holds
+    /// none.
+    fn publish_beacon_attestation(
+        &self,
+        subnet_id: u64,
+        attestation: SingleAttestation,
+    ) -> Result<(), ActorError>;
+    /// Gossip one signed aggregate on `beacon_aggregate_and_proof`, already
+    /// validated by the caller for the same reason as above.
+    fn publish_beacon_aggregate(
+        &self,
+        aggregate: SignedAggregateAndProof,
+    ) -> Result<(), ActorError>;
+    /// Join attestation subnets a validator client's aggregators need, each
+    /// until the end of the paired slot, so their committees' attestations
+    /// reach this node's pool. `(subnet_id, slot)` pairs.
+    fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
+    /// Gossip a block a validator client signed, and import it: gossip never
+    /// delivers a node its own messages, so without the second half this node
+    /// would not follow its own proposal. Checked by the caller as above.
+    fn publish_beacon_block(&self, block: SignedBeaconBlock) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---
