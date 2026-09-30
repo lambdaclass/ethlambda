@@ -1,6 +1,6 @@
 //! Sub-command definition and dispatch.
 //!
-//! `node`, `beacon`, `benchmark` and `validator` are ordinary clap
+//! `node`, `beacon`, `benchmark`, `validator` and `keygen` are ordinary clap
 //! sub-commands, so clap owns their help, usage lines and error messages. The
 //! one thing clap cannot express is a *default* sub-command, and the node
 //! needs one: the Dockerfile, lean-quickstart, the hive shim and the devnet
@@ -15,6 +15,7 @@ use clap::Parser;
 
 use crate::benchmark::BenchmarkOptions;
 use crate::cli::{BeaconOptions, NodeOptions};
+use crate::keygen::KeygenOptions;
 use crate::version;
 
 /// Tokens that already say what to run, so no default is inserted ahead of
@@ -27,6 +28,7 @@ const EXPLICIT: &[&str] = &[
     BEACON,
     BENCHMARK,
     VALIDATOR,
+    KEYGEN,
     "help",
     "-h",
     "--help",
@@ -38,6 +40,7 @@ const NODE: &str = "node";
 const BEACON: &str = "beacon";
 const BENCHMARK: &str = "benchmark";
 const VALIDATOR: &str = "validator";
+const KEYGEN: &str = "keygen";
 
 #[derive(Debug, clap::Parser)]
 #[command(
@@ -76,6 +79,8 @@ pub(crate) enum Command {
     Benchmark(BenchmarkOptions),
     /// Run the beacon-chain validator client against a beacon node's HTTP API.
     Validator(crate::validator::ValidatorOptions),
+    /// Generate validator XMSS keys for a genesis.
+    Keygen(KeygenOptions),
 }
 
 /// Parse the process arguments, exiting the way clap does on a parse error,
@@ -398,6 +403,72 @@ mod tests {
         .collect();
         assert_eq!(printed[0], printed[1]);
         assert_eq!(printed[0], printed[2]);
+    }
+
+    /// Every sub-command token has to be in `EXPLICIT`, or the default is
+    /// inserted ahead of it and `ethlambda keygen ...` parses as
+    /// `ethlambda node keygen ...`, which fails on a stray positional.
+    #[test]
+    fn sub_command_tokens_do_not_get_the_default_inserted() {
+        for token in [NODE, BEACON, BENCHMARK, VALIDATOR, KEYGEN] {
+            let args = [OsString::from("ethlambda"), OsString::from(token)];
+            assert_eq!(
+                default_subcommand(&args),
+                None,
+                "`{token}` must be recognised as a sub-command"
+            );
+        }
+    }
+
+    #[test]
+    fn keygen_parses_as_its_own_sub_command() {
+        let args = [
+            "ethlambda",
+            KEYGEN,
+            "--num-validators",
+            "4",
+            "--output-dir",
+            "keys",
+        ];
+        match try_parse_from(args.iter().map(OsString::from)).expect("keygen parses") {
+            Command::Keygen(_) => {}
+            other => panic!("expected a keygen invocation, got {other:?}"),
+        }
+    }
+
+    /// The output directory is the only thing keygen cannot guess, so a bare
+    /// `keygen --output-dir` has to parse. The default it lands on is asserted
+    /// through `Debug`, as the node options are above, rather than by widening
+    /// the parser's fields for a test.
+    #[test]
+    fn keygen_defaults_to_a_single_validator() {
+        let args = ["ethlambda", KEYGEN, "--output-dir", "keys"];
+        match try_parse_from(args.iter().map(OsString::from)).expect("keygen parses") {
+            Command::Keygen(options) => {
+                assert!(
+                    format!("{options:?}").contains("num_validators: 1"),
+                    "{options:?}"
+                );
+            }
+            other => panic!("expected a keygen invocation, got {other:?}"),
+        }
+    }
+
+    /// `--num-validators 0` would write a manifest with no validators in it,
+    /// which a genesis generator then sums to a zero validator count.
+    #[test]
+    fn keygen_rejects_an_empty_validator_set() {
+        let args = [
+            "ethlambda",
+            KEYGEN,
+            "--num-validators",
+            "0",
+            "--output-dir",
+            "keys",
+        ];
+        let err = try_parse_from(args.iter().map(OsString::from))
+            .expect_err("zero validators must be rejected");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 
     #[test]

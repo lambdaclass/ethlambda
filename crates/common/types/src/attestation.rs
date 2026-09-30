@@ -35,6 +35,28 @@ pub struct AttestationData {
     pub source: Checkpoint,
 }
 
+impl AttestationData {
+    /// Whether this vote supersedes `other` as a validator's latest message.
+    ///
+    /// The LMD-GHOST latest-message rule: the later slot wins, and a tie is
+    /// broken by data root. Breaking the tie on a total order rather than on
+    /// arrival matters because the seen-votes map is written from more than
+    /// one place (block import, gossip payload insertion, the aggregation
+    /// worker), so an order-dependent rule would let two nodes that saw the
+    /// same votes in different orders disagree about the head. The on-chain
+    /// vote map is the exception, written only on block import, and relies on
+    /// the same total order to stay independent of import interleaving.
+    ///
+    /// Lives here rather than beside fork choice because the vote map is
+    /// maintained in the storage layer, which does not depend on the fork
+    /// choice crate; `ethlambda-types` is what storage, blockchain and fork
+    /// choice all share.
+    pub fn supersedes(&self, other: &AttestationData) -> bool {
+        self.slot > other.slot
+            || (self.slot == other.slot && self.hash_tree_root() > other.hash_tree_root())
+    }
+}
+
 /// Validator attestation bundled with its signature.
 ///
 /// <div class="warning">
@@ -54,44 +76,27 @@ pub struct SignedAttestation {
     pub signature: XmssSignature,
 }
 
-/// Size of an XMSS signature in bytes.
+/// Size of an SSZ-encoded XMSS signature in bytes.
 ///
-/// Computed from: path(32*8*4) + rho(7*4) + hashes(46*8*4) + ssz_offsets(3*4) = 2536.
-/// This is the SSZ wire size, independent of the `leansig` scheme itself, so it
-/// lives here (leansig-free) rather than in `ethlambda-crypto`.
-pub const SIGNATURE_SIZE: usize = 2536;
+/// Mirrors leanVM's `xmss::SIGNATURE_SSZ_LEN`, hardcoded so this crate stays
+/// free of the signing backend: parent containers only need the length, not the
+/// scheme. `ethlambda-crypto` static-asserts the two agree, so a leanVM bump
+/// that changes the scheme parameters breaks the build rather than silently
+/// producing blobs of the wrong length.
+pub const SIGNATURE_SIZE: usize = 1208;
 
 /// XMSS signature as a fixed-length byte vector (`SIGNATURE_SIZE` bytes).
 pub type XmssSignature = SszVector<u8, SIGNATURE_SIZE>;
 
-/// SSZ offset (in bytes) of the `path` body inside an XMSS `Signature` container.
-///
-/// Layout: 4-byte path offset + 28-byte rho + 4-byte hashes offset = 36.
-const SIGNATURE_PATH_OFFSET: u32 = 36;
-
-/// SSZ offset (in bytes) of the `hashes` body inside an XMSS `Signature`.
-///
-/// `path` body is 4-byte siblings offset + LOG_LIFETIME (32) siblings × 32-byte
-/// digest = 1028, starting at byte 36, so hashes start at 36 + 1028 = 1064.
-const SIGNATURE_HASHES_OFFSET: u32 = 1064;
-
-/// SSZ offset (in bytes) of the `siblings` list inside the `path` container.
-const SIGNATURE_PATH_SIBLINGS_OFFSET: u32 = 4;
-
-/// Build a placeholder XMSS signature that decodes as a structurally valid
-/// leanSpec `Signature` container of all-zero hashes.
+/// Build a placeholder XMSS signature of all-zero field elements.
 ///
 /// Used for genesis-style anchor blocks that were never proposed and therefore
-/// have no real signature. Parent containers inline this as an opaque
-/// `SIGNATURE_SIZE`-byte blob; consumers that decode the inner `Signature`
-/// container see `path = HashTreeOpening { siblings = [0; 32] }`, `rho = 0`,
-/// `hashes = [0; 46]`. Matches ream's `Signature::blank()` so the wire format
-/// is byte-identical across clients.
+/// have no real signature. leanVM's `XmssSignature` SSZ-encodes as a
+/// fixed-length sequence of field elements (no variable-length offsets), and a
+/// zero word is a valid canonical field element, so an all-zero blob decodes as
+/// a structurally valid (but unverifiable) signature.
 pub fn blank_xmss_signature() -> XmssSignature {
-    let mut bytes = vec![0u8; SIGNATURE_SIZE];
-    bytes[..4].copy_from_slice(&SIGNATURE_PATH_OFFSET.to_le_bytes());
-    bytes[32..36].copy_from_slice(&SIGNATURE_HASHES_OFFSET.to_le_bytes());
-    bytes[36..40].copy_from_slice(&SIGNATURE_PATH_SIBLINGS_OFFSET.to_le_bytes());
+    let bytes = vec![0u8; SIGNATURE_SIZE];
     XmssSignature::try_from(bytes).expect("size matches SIGNATURE_SIZE")
 }
 
@@ -205,6 +210,52 @@ impl From<AttestationData> for HashedAttestationData {
 mod tests {
     use super::*;
 
+    fn att_data(slot: u64, head_root: u8) -> AttestationData {
+        AttestationData {
+            slot,
+            head: Checkpoint {
+                slot,
+                root: H256([head_root; 32]),
+            },
+            target: Checkpoint::default(),
+            source: Checkpoint::default(),
+        }
+    }
+
+    #[test]
+    fn supersedes_prefers_the_later_slot() {
+        let earlier = att_data(4, 1);
+        let later = att_data(5, 1);
+
+        assert!(later.supersedes(&earlier));
+        assert!(!earlier.supersedes(&later));
+    }
+
+    #[test]
+    fn supersedes_is_irreflexive() {
+        let vote = att_data(4, 1);
+
+        assert!(
+            !vote.supersedes(&vote),
+            "a vote does not replace an identical one, or record_vote would clone every duplicate"
+        );
+    }
+
+    /// Same slot: the data root decides, so two nodes that saw the same votes
+    /// in different orders still agree on which one is a validator's latest.
+    #[test]
+    fn supersedes_breaks_a_slot_tie_on_data_root_and_is_antisymmetric() {
+        let a = att_data(4, 1);
+        let b = att_data(4, 2);
+
+        assert_ne!(a.hash_tree_root(), b.hash_tree_root());
+        assert_eq!(
+            a.supersedes(&b),
+            !b.supersedes(&a),
+            "exactly one of the two must win the tie"
+        );
+    }
+
     /// Build an `AggregationBits` of `len` bits with the indices in `set` flipped on.
     fn bits(len: usize, set: &[usize]) -> AggregationBits {
         let mut b = AggregationBits::with_length(len).unwrap();
@@ -317,35 +368,14 @@ mod tests {
         assert!(!bits_is_subset(&a, &b));
     }
 
-    /// Guard the three SSZ offsets at fixed byte positions so a one-off in any
-    /// constant doesn't silently produce a blob that still has the right outer
-    /// length but decodes incorrectly at the inner `Signature` container level.
+    /// The blank placeholder is exactly `SIGNATURE_SIZE` all-zero bytes and
+    /// decodes back as a structurally valid signature.
     #[test]
-    fn blank_xmss_signature_has_expected_ssz_offsets() {
+    fn blank_xmss_signature_is_zero_and_decodes() {
         let sig = blank_xmss_signature();
         let bytes: Vec<u8> = sig.into_iter().collect();
 
         assert_eq!(bytes.len(), SIGNATURE_SIZE);
-        assert_eq!(
-            u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
-            SIGNATURE_PATH_OFFSET,
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
-            SIGNATURE_HASHES_OFFSET,
-        );
-        assert_eq!(
-            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
-            SIGNATURE_PATH_SIBLINGS_OFFSET,
-        );
-
-        // Everything outside the three offset slots must be zero — the
-        // placeholder is "all-zero hashes" once the offsets locate them.
-        for (i, b) in bytes.iter().enumerate() {
-            let in_offset_slot = matches!(i, 0..4 | 32..36 | 36..40);
-            if !in_offset_slot {
-                assert_eq!(*b, 0, "non-offset byte at index {i} should be zero");
-            }
-        }
+        assert!(bytes.iter().all(|b| *b == 0));
     }
 }

@@ -1180,8 +1180,8 @@ mod tests {
         crate::state::State::from_genesis(
             genesis_time,
             vec![crate::state::Validator {
-                attestation_pubkey: [attestation_pubkey; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [attestation_pubkey; crate::state::PUBLIC_KEY_SIZE],
+                proposal_pubkey: [2u8; crate::state::PUBLIC_KEY_SIZE],
                 index: 0,
             }],
         )

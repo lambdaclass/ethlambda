@@ -651,12 +651,12 @@ mod tests {
     use super::*;
     use ethlambda_types::block::BlockHeader;
     use ethlambda_types::primitives::HashTreeRoot as _;
-    use ethlambda_types::state::Validator;
+    use ethlambda_types::state::{PUBLIC_KEY_SIZE, Validator};
 
     fn base_state() -> State {
         let validators = vec![Validator {
-            attestation_pubkey: [7u8; 52],
-            proposal_pubkey: [9u8; 52],
+            attestation_pubkey: [7u8; PUBLIC_KEY_SIZE],
+            proposal_pubkey: [9u8; PUBLIC_KEY_SIZE],
             index: 0,
         }];
         State::from_genesis(1_000, validators)
