@@ -2353,7 +2353,14 @@ mod tests {
 
     #[test]
     fn a_data_column_sidecar_does_not_decode_before_fulu_or_as_lean() {
-        assert!(DataColumnSidecar::from_ssz(ForkName::Electra, &[]).is_err());
-        assert!(DataColumnSidecar::from_ssz(ForkName::Lean, &[]).is_err());
+        let valid = DataColumnSidecar::Fulu(fulu_sidecar(7, BeaconBlockHeader::default())).to_ssz();
+        // Bytes that decode fine as fulu's, so the error can only be the fork.
+        assert!(DataColumnSidecar::from_ssz(ForkName::Fulu, &valid).is_ok());
+        for fork in [ForkName::Electra, ForkName::Lean] {
+            assert!(matches!(
+                DataColumnSidecar::from_ssz(fork, &valid),
+                Err(Error::UnsupportedForFork { fork: got, .. }) if got == fork
+            ));
+        }
     }
 }
