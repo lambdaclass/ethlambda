@@ -4863,9 +4863,11 @@ pub fn on_execution_payload_envelope(
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
 
-    // Add execution payload envelope to the store. Only the fact that it is
-    // verified is kept: nothing in fork choice reads the payload itself.
-    store.insert_verified_payload(block_root);
+    // Add execution payload envelope to the store. Persisted, so a restarted
+    // follower keeps the full branch of this block.
+    store
+        .insert_verified_payload(signed_envelope)
+        .expect("insert");
 
     Ok(())
 }
@@ -5154,6 +5156,50 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// Marks `root`'s payload verified by storing a default envelope for it.
+    /// The block must already be in the store: the envelope's row is keyed by
+    /// the block's slot.
+    fn verify_payload(store: &mut Store, root: Root) {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: crate::beacon::containers::bellatrix::LogsBloom::try_from(vec![
+                0u8;
+                preset::BYTES_PER_LOGS_BLOOM
+            ])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        let envelope = gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 0,
+                beacon_block_root: root,
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
+        };
+        store
+            .insert_verified_payload(&envelope)
+            .expect("the block is in the store");
     }
 
     /// A fulu signed block with an empty body and a zero signature, for the
@@ -6232,7 +6278,7 @@ mod tests {
             "no verified payload yet: only the empty branch exists"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         assert_eq!(
             get_node_children(&store, &blocks, node).unwrap(),
             vec![
@@ -6431,7 +6477,7 @@ mod tests {
             "a payload nobody verified must not be extended, so full loses the tiebreak"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         let strong_votes = vec![Some(true); preset::PTC_SIZE];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
@@ -6460,7 +6506,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let exactly_threshold = vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize];
         store.set_payload_timeliness_vote(a_root, exactly_threshold.clone());
@@ -6529,7 +6575,7 @@ mod tests {
             "a payload nobody verified must not be extended"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         let weak_votes = vec![Some(false); preset::PTC_SIZE];
         store.set_payload_timeliness_vote(a_root, weak_votes.clone());
         store.set_payload_data_availability_vote(a_root, weak_votes);
@@ -6589,7 +6635,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let state = test_state::with_validators_at(ForkName::Gloas, 4);
         store.insert_state(anchor_root, state.clone()).unwrap();
@@ -6965,7 +7011,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let state = test_state::with_validators_at(ForkName::Gloas, 4);
         store.insert_state(anchor_root, state.clone()).unwrap();
@@ -7469,7 +7515,7 @@ mod tests {
         assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
 
         // Once the envelope is verified the full child clears the check too.
-        store.insert_verified_payload(anchor_root);
+        verify_payload(&mut store, anchor_root);
         let rejected = import(&mut store, full_child);
         assert!(rejected.is_err());
         assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
@@ -7545,7 +7591,7 @@ mod tests {
         assert!(validate(&store, vote(2, 1), ForkRules::PreGloas).is_ok());
         assert!(validate(&store, vote(2, 2), ForkRules::PreGloas).is_ok());
 
-        store.insert_verified_payload(b_root);
+        verify_payload(&mut store, b_root);
         assert!(validate(&store, vote(2, 1), ForkRules::Gloas).is_ok());
     }
 
@@ -7877,7 +7923,7 @@ mod tests {
                     .unwrap();
                 store.insert_state(root, gloas_state.clone()).unwrap();
                 if rng.chance(1, 2) {
-                    store.insert_verified_payload(root);
+                    verify_payload(&mut store, root);
                 }
                 for timely_votes in [true, false] {
                     let votes = match rng.below(4) {
