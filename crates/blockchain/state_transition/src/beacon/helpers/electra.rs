@@ -352,11 +352,20 @@ pub fn get_max_effective_balance(validator: &Validator) -> Gwei {
 /// `EFFECTIVE_BALANCE_INCREMENT` so the budget always divides evenly into the
 /// unit every balance change is already rounded to.
 pub fn get_balance_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    let total_active_balance = get_total_active_balance(state)?;
+    Ok(balance_churn_limit_for(
+        get_total_active_balance(state)?,
+        config,
+    ))
+}
+
+/// [`get_balance_churn_limit`] for a caller that already holds the total
+/// active balance, so the epoch's single pass does not rescan the registry
+/// for it.
+pub(crate) fn balance_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
     let churn = config
         .min_per_epoch_churn_limit_electra
         .max(total_active_balance / config.churn_limit_quotient);
-    Ok(churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT)
+    churn - churn % preset::EFFECTIVE_BALANCE_INCREMENT
 }
 
 /// The portion of [`get_balance_churn_limit`] set aside for activations and
@@ -367,9 +376,18 @@ pub fn get_balance_churn_limit(state: &BeaconState, config: &Config) -> Result<G
 /// large validator set, activations and exits cannot alone consume the whole
 /// churn budget and starve consolidations of any share at all.
 pub fn get_activation_exit_churn_limit(state: &BeaconState, config: &Config) -> Result<Gwei> {
-    Ok(config
+    Ok(activation_exit_churn_limit_for(
+        get_total_active_balance(state)?,
+        config,
+    ))
+}
+
+/// [`get_activation_exit_churn_limit`] for a caller that already holds the
+/// total active balance.
+pub(crate) fn activation_exit_churn_limit_for(total_active_balance: Gwei, config: &Config) -> Gwei {
+    config
         .max_per_epoch_activation_exit_churn_limit
-        .min(get_balance_churn_limit(state, config)?))
+        .min(balance_churn_limit_for(total_active_balance, config))
 }
 
 /// The portion of [`get_balance_churn_limit`] left over for consolidations
@@ -583,57 +601,106 @@ pub fn compute_exit_epoch_and_update_churn(
 
     let mut fields = electra_state(state, "compute_exit_epoch_and_update_churn")?;
 
-    let mut earliest_exit_epoch = fields
-        .earliest_exit_epoch()
-        .max(compute_activation_exit_epoch(current_epoch));
-
-    // A later epoch than the cursor currently sits on: that epoch has not
-    // spent any of its churn yet, so its budget starts full. Otherwise the
-    // cursor has not moved, and whatever it left unspent carries over.
-    let mut exit_balance_to_consume = if fields.earliest_exit_epoch() < earliest_exit_epoch {
-        per_epoch_churn
-    } else {
-        fields.exit_balance_to_consume()
+    let mut cursor = ExitChurnCursor {
+        earliest_exit_epoch: fields.earliest_exit_epoch(),
+        exit_balance_to_consume: fields.exit_balance_to_consume(),
     };
+    let exit_epoch = cursor.advance(exit_balance, per_epoch_churn, current_epoch)?;
+    *fields.exit_balance_to_consume_mut() = cursor.exit_balance_to_consume;
+    *fields.earliest_exit_epoch_mut() = cursor.earliest_exit_epoch;
 
-    if exit_balance > exit_balance_to_consume {
-        let balance_to_process = exit_balance - exit_balance_to_consume;
-        // Ceiling division: how many additional epochs' worth of churn this
-        // exit needs beyond what the current epoch has left.
-        let additional_epochs = balance_to_process
-            .checked_sub(1)
-            .and_then(|value| value.checked_div(per_epoch_churn))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(Error::ArithmeticOverflow(
-                "(exit_balance - exit_balance_to_consume - 1) / per_epoch_churn + 1",
-            ))?;
-        let additional_churn =
-            additional_epochs
-                .checked_mul(per_epoch_churn)
-                .ok_or(Error::ArithmeticOverflow(
-                    "additional_epochs * per_epoch_churn",
-                ))?;
-        earliest_exit_epoch =
-            earliest_exit_epoch
-                .checked_add(additional_epochs)
-                .ok_or(Error::ArithmeticOverflow(
-                    "earliest_exit_epoch + additional_epochs",
-                ))?;
-        exit_balance_to_consume = exit_balance_to_consume
-            .checked_add(additional_churn)
-            .ok_or(Error::ArithmeticOverflow(
-                "exit_balance_to_consume + additional_epochs * per_epoch_churn",
-            ))?;
+    Ok(exit_epoch)
+}
+
+/// Electra's exit-queue cursor, the pair of state fields
+/// [`compute_exit_epoch_and_update_churn`] advances.
+///
+/// Held by value so the epoch's single pass can advance it locally, in
+/// registry order, without a state borrow per ejection, and write it back
+/// once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExitChurnCursor {
+    pub(crate) earliest_exit_epoch: Epoch,
+    pub(crate) exit_balance_to_consume: Gwei,
+}
+
+impl ExitChurnCursor {
+    /// The cursor as `state` holds it (an electra or fulu state).
+    pub(crate) fn read(state: &mut BeaconState) -> Result<Self> {
+        let fields = electra_state(state, "ExitChurnCursor::read")?;
+        Ok(Self {
+            earliest_exit_epoch: fields.earliest_exit_epoch(),
+            exit_balance_to_consume: fields.exit_balance_to_consume(),
+        })
     }
 
-    *fields.exit_balance_to_consume_mut() = exit_balance_to_consume
-        .checked_sub(exit_balance)
-        .ok_or(Error::ArithmeticOverflow(
-            "exit_balance_to_consume - exit_balance",
-        ))?;
-    *fields.earliest_exit_epoch_mut() = earliest_exit_epoch;
+    /// Stores the cursor back into `state`.
+    pub(crate) fn write(self, state: &mut BeaconState) -> Result<()> {
+        let mut fields = electra_state(state, "ExitChurnCursor::write")?;
+        *fields.earliest_exit_epoch_mut() = self.earliest_exit_epoch;
+        *fields.exit_balance_to_consume_mut() = self.exit_balance_to_consume;
+        Ok(())
+    }
 
-    Ok(earliest_exit_epoch)
+    /// The body of [`compute_exit_epoch_and_update_churn`]: advances the
+    /// cursor for an exit of `exit_balance` and returns the epoch it takes
+    /// effect at. On error the cursor is left untouched.
+    pub(crate) fn advance(
+        &mut self,
+        exit_balance: Gwei,
+        per_epoch_churn: Gwei,
+        current_epoch: Epoch,
+    ) -> Result<Epoch> {
+        let mut earliest_exit_epoch = self
+            .earliest_exit_epoch
+            .max(compute_activation_exit_epoch(current_epoch));
+
+        // A later epoch than the cursor currently sits on: that epoch has not
+        // spent any of its churn yet, so its budget starts full. Otherwise the
+        // cursor has not moved, and whatever it left unspent carries over.
+        let mut exit_balance_to_consume = if self.earliest_exit_epoch < earliest_exit_epoch {
+            per_epoch_churn
+        } else {
+            self.exit_balance_to_consume
+        };
+
+        if exit_balance > exit_balance_to_consume {
+            let balance_to_process = exit_balance - exit_balance_to_consume;
+            // Ceiling division: how many additional epochs' worth of churn this
+            // exit needs beyond what the current epoch has left.
+            let additional_epochs = balance_to_process
+                .checked_sub(1)
+                .and_then(|value| value.checked_div(per_epoch_churn))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::ArithmeticOverflow(
+                    "(exit_balance - exit_balance_to_consume - 1) / per_epoch_churn + 1",
+                ))?;
+            let additional_churn =
+                additional_epochs
+                    .checked_mul(per_epoch_churn)
+                    .ok_or(Error::ArithmeticOverflow(
+                        "additional_epochs * per_epoch_churn",
+                    ))?;
+            earliest_exit_epoch = earliest_exit_epoch.checked_add(additional_epochs).ok_or(
+                Error::ArithmeticOverflow("earliest_exit_epoch + additional_epochs"),
+            )?;
+            exit_balance_to_consume = exit_balance_to_consume
+                .checked_add(additional_churn)
+                .ok_or(Error::ArithmeticOverflow(
+                    "exit_balance_to_consume + additional_epochs * per_epoch_churn",
+                ))?;
+        }
+
+        let remaining =
+            exit_balance_to_consume
+                .checked_sub(exit_balance)
+                .ok_or(Error::ArithmeticOverflow(
+                    "exit_balance_to_consume - exit_balance",
+                ))?;
+        self.exit_balance_to_consume = remaining;
+        self.earliest_exit_epoch = earliest_exit_epoch;
+        Ok(earliest_exit_epoch)
+    }
 }
 
 /// Advances electra's consolidation-queue cursor for a consolidation moving
