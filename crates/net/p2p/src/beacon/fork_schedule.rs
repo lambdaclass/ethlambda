@@ -10,8 +10,9 @@
 //! The transition rules are the spec's ("Transitioning the gossip" in altair's
 //! `p2p-interface.md`): "In advance of the fork, a node SHOULD subscribe to the
 //! post-fork variants of the topics", and the pre-fork topics are dropped "two
-//! epochs after the fork". A digest is therefore held from one epoch before it
-//! activates until two epochs after the next one does, and the node is
+//! epochs after the fork". A digest is therefore held from
+//! [`SUBSCRIBE_LEAD_EPOCHS`] before it activates until
+//! [`UNSUBSCRIBE_LAG_EPOCHS`] after the next one does, and the node is
 //! subscribed to whichever digests that window covers at the current epoch.
 //! Everything here is a pure function of the epoch, so applying it is
 //! idempotent and a node started inside a window lands in the same state as one
@@ -23,8 +24,8 @@
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::fork_digest::{compute_fork_digest, enr_fork_id};
-use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root};
+use ethlambda_types::beacon::fork_digest::compute_fork_digest;
+use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root, Version};
 use ethlambda_types::enr::EnrForkId;
 
 /// Epochs before a digest activates at which its topics are joined.
@@ -40,6 +41,9 @@ pub struct ScheduledDigest {
     /// The first epoch this digest is current at.
     pub activation_epoch: Epoch,
     pub digest: ForkDigest,
+    /// The fork version in effect at `activation_epoch`, for the `eth2` entry's
+    /// `next_fork_version` when this is the next boundary.
+    pub version: Version,
     /// The fork in effect at `activation_epoch`, so the fork of everything
     /// published under `digest`.
     pub fork: ForkName,
@@ -48,8 +52,6 @@ pub struct ScheduledDigest {
 /// Every digest a chain will use, in activation order.
 #[derive(Debug, Clone)]
 pub struct ForkSchedule {
-    config: Config,
-    genesis_validators_root: Root,
     /// Never empty: the first entry is the genesis digest. Consecutive equal
     /// digests are merged, so each entry is a real change on the wire.
     entries: Vec<ScheduledDigest>,
@@ -72,22 +74,22 @@ impl ForkSchedule {
         let mut entries: Vec<ScheduledDigest> = Vec::with_capacity(epochs.len());
         for epoch in epochs {
             let digest = compute_fork_digest(config, genesis_validators_root, epoch);
-            // A blob-schedule entry that restates the parameters already in
-            // force leaves the digest alone; nothing changes on the wire there.
+            // Only a blob-schedule entry before fulu, or one landing on an
+            // epoch another entry already covers, leaves the digest alone:
+            // from fulu on the digest hashes the entry's own epoch as well as
+            // its limit, so a later entry always moves it, even one restating
+            // the limit already in force.
             if entries.last().is_some_and(|last| last.digest == digest) {
                 continue;
             }
             entries.push(ScheduledDigest {
                 activation_epoch: epoch,
                 digest,
+                version: config.fork_version(config.fork_at_epoch(epoch)),
                 fork: config.fork_at_epoch(epoch),
             });
         }
-        Self {
-            config: config.clone(),
-            genesis_validators_root,
-            entries,
-        }
+        Self { entries }
     }
 
     /// Every scheduled digest, in activation order.
@@ -174,8 +176,24 @@ impl ForkSchedule {
     }
 
     /// The `eth2` ENR entry at `epoch`.
+    ///
+    /// `next_fork_*` name the next entry of this schedule, so never an epoch at
+    /// which the digest does not change. With none ahead, the spec says to
+    /// repeat the current version and name the far-future epoch.
     pub fn enr_fork_id(&self, epoch: Epoch) -> EnrForkId {
-        enr_fork_id(&self.config, self.genesis_validators_root, epoch)
+        let current = self.current_at(epoch);
+        match self.next_boundary_after(epoch) {
+            Some(next) => EnrForkId {
+                fork_digest: current.digest,
+                next_fork_version: next.version,
+                next_fork_epoch: next.activation_epoch,
+            },
+            None => EnrForkId {
+                fork_digest: current.digest,
+                next_fork_version: current.version,
+                next_fork_epoch: FAR_FUTURE_EPOCH,
+            },
+        }
     }
 }
 
@@ -235,9 +253,27 @@ mod tests {
     fn every_scheduled_digest_resolves_to_its_fork() {
         let config = with_bpos();
         let schedule = ForkSchedule::new(&config, gvr());
-        // Genesis, altair..fulu, two BPOs, gloas: as many entries as distinct
-        // digests, each mapped back to the fork in force at its activation.
-        assert!(schedule.entries().len() >= 4);
+        // Genesis, each fork through fulu, two BPOs, gloas.
+        let shape: Vec<(Epoch, ForkName)> = schedule
+            .entries()
+            .iter()
+            .map(|entry| (entry.activation_epoch, entry.fork))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (0, ForkName::Phase0),
+                (1, ForkName::Altair),
+                (2, ForkName::Bellatrix),
+                (3, ForkName::Capella),
+                (4, ForkName::Deneb),
+                (5, ForkName::Electra),
+                (FULU, ForkName::Fulu),
+                (2_000, ForkName::Fulu),
+                (3_000, ForkName::Fulu),
+                (GLOAS, ForkName::Gloas),
+            ]
+        );
         for entry in schedule.entries() {
             assert_eq!(schedule.fork_for_digest(entry.digest), Some(entry.fork));
             assert_eq!(
@@ -271,19 +307,44 @@ mod tests {
     }
 
     #[test]
-    fn a_blob_entry_restating_the_current_parameters_is_not_a_boundary() {
+    fn a_blob_entry_before_fulu_is_not_a_boundary() {
+        // The digest only hashes blob parameters from fulu on, so an entry
+        // placed before it cannot move anything on the wire.
+        let plain = ForkSchedule::new(&fulu_then_gloas(), gvr());
         let mut config = fulu_then_gloas();
-        // Electra's parameters, at fulu's own epoch: the digest cannot move.
-        let (_, max_blobs) = config.blob_parameters(FULU);
         config.blob_schedule = SszList::try_from(vec![BlobScheduleEntry {
-            epoch: config.electra_fork_epoch,
-            max_blobs_per_block: max_blobs,
+            epoch: 4,
+            max_blobs_per_block: 9,
         }])
         .expect("within capacity");
+        let with_entry = ForkSchedule::new(&config, gvr());
+        assert_eq!(with_entry.entries().len(), plain.entries().len());
+    }
+
+    #[test]
+    fn a_bpo_restating_the_previous_limit_is_still_a_boundary() {
+        // `compute_fork_digest` hashes the entry's epoch as well as its limit,
+        // so a later entry with the same limit moves the digest.
+        let mut config = fulu_then_gloas();
+        config.blob_schedule = SszList::try_from(vec![
+            BlobScheduleEntry {
+                epoch: 2_000,
+                max_blobs_per_block: 15,
+            },
+            BlobScheduleEntry {
+                epoch: 3_000,
+                max_blobs_per_block: 15,
+            },
+        ])
+        .expect("within capacity");
         let schedule = ForkSchedule::new(&config, gvr());
-        for pair in schedule.entries().windows(2) {
-            assert_ne!(pair[0].digest, pair[1].digest);
-        }
+        assert_ne!(schedule.digest_at(2_999), schedule.digest_at(3_000));
+        assert!(
+            schedule
+                .entries()
+                .iter()
+                .any(|entry| entry.activation_epoch == 3_000)
+        );
     }
 
     #[test]
@@ -319,7 +380,7 @@ mod tests {
     #[test]
     fn the_current_digest_is_always_held() {
         let schedule = ForkSchedule::new(&with_bpos(), gvr());
-        for epoch in (0..6_000).step_by(1) {
+        for epoch in 0..6_000 {
             assert!(
                 digests_held(&schedule, epoch).contains(&schedule.digest_at(epoch)),
                 "epoch {epoch}"

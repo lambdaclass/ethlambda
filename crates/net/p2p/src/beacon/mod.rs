@@ -28,7 +28,7 @@ pub mod verdict;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{ForkDigest, Root};
+use ethlambda_types::beacon::primitives::{ForkDigest, Root, Slot};
 
 /// Everything the beacon wire needs after startup has computed it.
 ///
@@ -50,8 +50,9 @@ pub struct BeaconWire {
     /// The topics under `fork_digest`.
     pub topics: topics::BeaconTopics,
     /// The topics of every other digest the subscription window holds: the
-    /// next one from an epoch ahead of its boundary, the previous one until two
-    /// epochs after. Empty outside a window.
+    /// next one from [`fork_schedule::SUBSCRIBE_LEAD_EPOCHS`] ahead of its
+    /// boundary, the previous one until [`fork_schedule::UNSUBSCRIBE_LAG_EPOCHS`]
+    /// after. Empty outside a window.
     pub window_topics: Vec<topics::BeaconTopics>,
     pub config: Config,
     pub genesis_time: u64,
@@ -81,6 +82,15 @@ impl BeaconWire {
     /// the window's.
     pub fn held_topics(&self) -> impl Iterator<Item = &topics::BeaconTopics> {
         std::iter::once(&self.topics).chain(self.window_topics.iter())
+    }
+
+    /// The digest a message for `slot` is published under: the one the schedule
+    /// names for that slot's epoch, rather than whichever this node has
+    /// switched to so far, so a slot-B block goes out on the new topics even if
+    /// the switch has not run yet.
+    pub fn digest_for_slot(&self, slot: Slot) -> ForkDigest {
+        self.schedule
+            .digest_at(slot / ethlambda_types::beacon::preset::SLOTS_PER_EPOCH)
     }
 
     /// Whether this node is subscribed under `digest`, so whether a peer on it

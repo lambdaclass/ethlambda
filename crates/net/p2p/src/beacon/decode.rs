@@ -31,7 +31,6 @@ use ethlambda_types::beacon::containers::{
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::Slot;
-use ethlambda_types::time::unix_now_ms;
 use libssz::SszDecode as _;
 
 use super::topics;
@@ -183,25 +182,6 @@ pub fn fork_at_slot(config: &Config, slot: Slot) -> ForkName {
     config.fork_at_epoch(slot / preset::SLOTS_PER_EPOCH)
 }
 
-/// The fork this node's own wall clock says is active right now.
-///
-/// [`decode_data_column_sidecar`] has no slot to look a fork up by the way
-/// [`fork_at_slot`] does: only fulu's container is modeled, so nothing reads
-/// a slot out of the bytes first. A caller on the gossip path uses this to
-/// approximate, once that decode has already failed, whether the failure is
-/// this build's own gap rather than the sender's fault. An approximation
-/// only, since gossip topic subscriptions are frozen at startup and this
-/// reads the live clock instead of whatever fork the topic was actually
-/// built for; see [`decode_data_column_sidecar`]'s own doc and its caller in
-/// `gossipsub::handler::triage_data_column`.
-pub(crate) fn current_fork(config: &Config) -> ForkName {
-    let slot = unix_now_ms()
-        .saturating_sub(config.genesis_time_ms())
-        .checked_div(config.slot_duration_ms)
-        .unwrap_or(0);
-    fork_at_slot(config, slot)
-}
-
 /// Decode a `beacon_block` payload, at the fork its own slot names.
 ///
 /// Separate from [`decode_gossip`] because the two topics worth logging in
@@ -233,11 +213,10 @@ pub fn decode_block(config: &Config, bytes: &[u8]) -> Result<SignedBeaconBlock, 
 /// Gloas redefines this container too (no header, a `slot` field of its own;
 /// see `containers::gloas::DataColumnSidecar`'s doc), so a gloas sidecar
 /// fails here indistinguishably from a malformed one: nothing about these
-/// bytes alone says which fork sent them. [`current_fork`] is what lets a
-/// caller on the gossip path (where a wrong verdict scores an honest peer)
-/// approximate the two apart from the outside instead, once this call has
-/// already failed; see [`current_fork`]'s own doc for why it is only an
-/// approximation.
+/// bytes alone says which fork sent them. The caller on the gossip path
+/// (where a wrong verdict scores an honest peer) tells the two apart from the
+/// outside instead, once this call has failed, by the fork the message's own
+/// topic digest names.
 pub fn decode_data_column_sidecar(bytes: &[u8]) -> Result<fulu::DataColumnSidecar, DecodeError> {
     fulu::DataColumnSidecar::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }

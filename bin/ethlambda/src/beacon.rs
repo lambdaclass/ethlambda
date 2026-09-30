@@ -46,7 +46,12 @@ pub fn time_at_epoch(config: &Config, genesis_time: u64, epoch: Epoch) -> u64 {
     genesis_time + epoch * config.seconds_per_slot * preset::SLOTS_PER_EPOCH
 }
 
-pub use ethlambda_types::beacon::fork_digest::enr_fork_id;
+/// The `eth2` ENR entry for this chain at this epoch, from the same schedule
+/// the running node follows, so the record it starts with and the one it would
+/// switch to name the same boundaries.
+pub fn enr_fork_id(config: &Config, genesis_validators_root: Root, epoch: Epoch) -> EnrForkId {
+    ForkSchedule::new(config, genesis_validators_root).enr_fork_id(epoch)
+}
 
 /// Ethereum mainnet's genesis `BeaconState`, SSZ-encoded: a test fixture.
 ///
@@ -172,9 +177,9 @@ pub fn wire_params(
 
     // The digest moves at every fork and blob-schedule boundary, and the p2p
     // actor follows it without a restart (`ethlambda_p2p::beacon::transition`):
-    // next-digest topics are joined one epoch ahead, the switch happens at the
-    // boundary, and the old topics are left two epochs after. Say what is
-    // coming.
+    // the next digest's topics are joined ahead of the boundary, the switch
+    // happens at it, and the old topics are left after it, per
+    // `SUBSCRIBE_LEAD_EPOCHS` and `UNSUBSCRIBE_LAG_EPOCHS`. Say what is coming.
     //
     // The gloas boundary keeps its own warning: crossing its digest works like
     // any other, but the chain actor refuses every gloas block (nothing
