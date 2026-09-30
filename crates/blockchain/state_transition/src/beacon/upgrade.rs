@@ -884,15 +884,12 @@ fn initialize_ptc_window(state: &BeaconState) -> Result<gloas::PayloadTimeliness
 /// growing `pending_deposits` list, by pubkey, with each entry's deposit
 /// signature verdict memoized the first time it is needed.
 ///
-/// [`is_pending_validator`](crate::beacon::helpers::gloas::is_pending_validator)
-/// is the specification's own literal transcription (kept as-is: a general,
-/// spec-named function, not tied to this one caller's bookkeeping), and its
-/// own doc already carries the specification's note that a caller iterating
-/// many pubkeys should cache verification results rather than calling it in
-/// a loop. This is that cache: the specification notes the pending deposit
-/// queue might be large at the fork, and this index turns a query that would otherwise
-/// rescan the whole list and re-verify a signature per matching entry into a
-/// pubkey lookup plus, at most once per entry, one signature check.
+/// The specification's `is_pending_validator` scans the list and re-verifies
+/// a signature per matching entry, and its own text notes that a caller
+/// iterating many pubkeys should cache verification results rather than
+/// calling it in a loop. This is that cache: the pending deposit queue might
+/// be large at the fork, and this index turns that query into a pubkey lookup
+/// plus, at most once per entry, one signature check.
 #[derive(Default)]
 struct PendingValidatorIndex {
     by_pubkey: HashMap<BlsPubkey, Vec<usize>>,
@@ -907,8 +904,8 @@ impl PendingValidatorIndex {
         self.verdicts.push(None);
     }
 
-    /// [`is_pending_validator`](crate::beacon::helpers::gloas::is_pending_validator)'s
-    /// exact result for `pubkey`, reached through the pubkey index instead of
+    /// The result the specification's `is_pending_validator` gives
+    /// for `pubkey`, reached through the pubkey index instead of
     /// a linear scan, with each candidate's signature verdict computed at
     /// most once no matter how many later deposits ask the same question.
     fn is_pending_validator(
@@ -966,7 +963,7 @@ fn requeue(
 /// deposit whose pubkey neither registry recognizes yet is onboarded as a
 /// builder only if its withdrawal credential is builder-prefixed, no deposit
 /// already re-queued in this same pass could still turn that pubkey into a
-/// validator instead ([`is_pending_validator`](crate::beacon::helpers::gloas::is_pending_validator)),
+/// validator instead (the specification's `is_pending_validator`),
 /// and its signature checks out. A deposit that fails the credential or
 /// pending-validator check stays queued instead; one that fails the
 /// signature check is dropped outright, matching phase0's own "an invalid

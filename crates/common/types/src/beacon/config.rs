@@ -363,7 +363,9 @@ pub struct Config {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub attestation_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] by which an aggregate
-    /// attestation is due; read by `get_aggregate_due_ms`.
+    /// attestation is due; the specification's `get_aggregate_due_ms`. Nothing
+    /// in the state transition's fork choice calls it: the reader is the
+    /// validator's `SlotClock`.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub aggregate_due_bps: u64,
     /// Basis points of [`Self::slot_duration_ms`] past which a proposer must

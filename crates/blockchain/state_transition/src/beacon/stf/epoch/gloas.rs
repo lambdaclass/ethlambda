@@ -48,13 +48,13 @@
 //!   [`super::capella::process_historical_summaries_update`],
 //!   [`super::altair::process_sync_committee_updates`]) call straight through,
 //!   through accessors that already list gloas among the forks they serve.
-//! - **[`process_pending_deposits`] and [`process_participation_flag_updates`]
-//!   are gloas's own copy**, over [`gloas::BeaconState`] directly (through
-//!   `helpers::gloas::gloas_state`). `process_pending_deposits` is
-//!   spec-modified (EIP-8061: gloas's own activation-only churn budget) and
-//!   still calls the shared [`super::electra::apply_pending_deposit`] for the
-//!   "credit one dequeued deposit" sub-step.
-//!   `process_participation_flag_updates` is unmodified in the specification,
+//! - **[`process_pending_deposits`]** is spec-modified (EIP-8061: gloas's own
+//!   activation-only churn budget), and that budget is all it changes: it
+//!   passes it to `super::electra::drain_pending_deposits`, the loop electra
+//!   and fulu run.
+//! - **[`process_participation_flag_updates`] is gloas's own copy**, over
+//!   [`gloas::BeaconState`] directly (through `helpers::gloas::gloas_state`).
+//!   It is unmodified in the specification,
 //!   but replaces the whole list (a new length, not an element write), which
 //!   only the fork's own concrete container type can do: electra's and
 //!   fulu's `EpochParticipation::try_from` is fallible where gloas's
@@ -62,8 +62,7 @@
 //!   `dispatch_state_from!` body could give both.
 
 use crate::beacon::config::Config;
-use crate::beacon::constants::FAR_FUTURE_EPOCH;
-use crate::beacon::containers::{BeaconState, electra, gloas};
+use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch};
 use crate::beacon::helpers::gloas::{
@@ -71,7 +70,6 @@ use crate::beacon::helpers::gloas::{
 };
 use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::preset;
-use crate::beacon::primitives::Gwei;
 
 /// Gloas's epoch-boundary driver, in the specification's own order
 /// (`beacon-chain.md`'s "Modified `process_epoch`"): fulu's own step list,
@@ -136,110 +134,19 @@ pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()>
 /// Modified from electra's and fulu's (EIP-8061): the churn budget is
 /// [`get_activation_churn_limit`]'s own, independent activation-only budget,
 /// not electra's combined activation/exit one
-/// (`crate::beacon::helpers::electra::get_activation_exit_churn_limit`); like fulu's
-/// own copy, the eth1-bridge-ahead-of-requests gate is gone outright (see
+/// (`crate::beacon::helpers::electra::get_activation_exit_churn_limit`); like fulu's,
+/// the eth1-bridge-ahead-of-requests gate is gone outright (see
 /// `crate::beacon::stf::epoch::fulu::process_pending_deposits`'s own doc for why
 /// dropping it changes nothing observable once a chain has reached this far).
-/// The queue is gloas's own progressive one (EIP-7688), read and written
-/// directly through [`gloas_state`] rather than through
-/// [`crate::beacon::helpers::electra::pending_queue_fields`]'s [`PendingQueueFields`](crate::beacon::helpers::electra::PendingQueueFields),
-/// which refuses that field for a gloas state (see its own doc). Once a
-/// deposit is dequeued and cleared to apply, though,
-/// [`super::electra::apply_pending_deposit`] is the identical function electra
-/// and fulu use: nothing about crediting one already-dequeued deposit differs
-/// for gloas.
+/// The drain itself is `super::electra::drain_pending_deposits`, the loop
+/// electra and fulu run: the specification leaves everything but the churn
+/// budget and the retired gate unmodified. The queue is gloas's progressive
+/// one (EIP-7688), which
+/// [`PendingQueueFields`](crate::beacon::helpers::electra::PendingQueueFields)
+/// hands over as a `Vec` like the bounded one.
 pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
-    let next_epoch = get_current_epoch(state) + 1;
     let churn_limit = get_activation_churn_limit(state, config)?;
-    let finalized_slot = compute_start_slot_at_epoch(state.finalized_checkpoint().epoch);
-
-    // See `crate::beacon::stf::epoch::electra::process_pending_deposits`'s own doc
-    // for why the queue is taken by value here rather than iterated in place.
-    let (available_for_processing, deposits) = {
-        let inner = gloas_state(state, "process_pending_deposits")?;
-        let available_for_processing = inner
-            .deposit_balance_to_consume
-            .checked_add(churn_limit)
-            .ok_or(Error::ArithmeticOverflow(
-                "deposit_balance_to_consume + get_activation_churn_limit",
-            ))?;
-        let deposits: Vec<electra::PendingDeposit> =
-            core::mem::take(&mut inner.pending_deposits).into_inner();
-        (available_for_processing, deposits)
-    };
-
-    let mut processed_amount: Gwei = 0;
-    let mut next_deposit_index = 0usize;
-    let mut deposits_to_postpone: Vec<electra::PendingDeposit> = Vec::new();
-    let mut is_churn_limit_reached = false;
-
-    for deposit in &deposits {
-        // A deposit whose queue position could still be reorged out must
-        // wait: crediting it now and reverting later is not an option, since
-        // nothing else in the state transition undoes a balance change.
-        if deposit.slot > finalized_slot {
-            break;
-        }
-
-        if next_deposit_index >= preset::MAX_PENDING_DEPOSITS_PER_EPOCH as usize {
-            break;
-        }
-
-        let (is_validator_exited, is_validator_withdrawn) = state
-            .iter_validators()
-            .find(|validator| validator.pubkey == deposit.pubkey)
-            .map(|validator| {
-                (
-                    validator.exit_epoch < FAR_FUTURE_EPOCH,
-                    validator.withdrawable_epoch < next_epoch,
-                )
-            })
-            .unwrap_or((false, false));
-
-        if is_validator_withdrawn {
-            super::electra::apply_pending_deposit(state, deposit, config)?;
-        } else if is_validator_exited {
-            deposits_to_postpone.push(deposit.clone());
-        } else {
-            match processed_amount.checked_add(deposit.amount) {
-                Some(sum) if sum <= available_for_processing => {
-                    processed_amount = sum;
-                    super::electra::apply_pending_deposit(state, deposit, config)?;
-                }
-                // Either the sum overflowed (certainly too much) or it fit in
-                // a `u64` but still exceeded the budget: both mean this
-                // epoch's processing stops here.
-                _ => {
-                    is_churn_limit_reached = true;
-                    break;
-                }
-            }
-        }
-
-        next_deposit_index += 1;
-    }
-
-    let remaining: Vec<electra::PendingDeposit> = deposits
-        .into_iter()
-        .skip(next_deposit_index)
-        .chain(deposits_to_postpone)
-        .collect();
-
-    let deposit_balance_to_consume = if is_churn_limit_reached {
-        available_for_processing
-            .checked_sub(processed_amount)
-            .ok_or(Error::ArithmeticOverflow(
-                "available_for_processing - processed_amount",
-            ))?
-    } else {
-        0
-    };
-
-    let inner = gloas_state(state, "process_pending_deposits")?;
-    inner.pending_deposits = gloas::PendingDeposits::from(remaining);
-    inner.deposit_balance_to_consume = deposit_balance_to_consume;
-
-    Ok(())
+    super::electra::drain_pending_deposits(state, config, churn_limit)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +234,8 @@ pub fn process_ptc_window(state: &mut BeaconState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon::constants;
+    use crate::beacon::constants::{self, FAR_FUTURE_EPOCH};
+    use crate::beacon::containers::electra;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::accessors::get_total_active_balance;
     use crate::beacon::helpers::gloas::{get_ptc, gloas_state_ref};

@@ -178,7 +178,7 @@ that the tests compare like with like.
 
 - **Pruned votes** (`compute_node_weights`; in the references,
   `get_attestation_score`, and through it `is_head_weak` and
-  `is_parent_strong`, the latter reached from the gloas proposer head). A vote
+  `is_parent_strong`, the latter reached from `get_proposer_head`). A vote
   for a root missing from the block index contributes nothing, where
   `get_ancestor` would raise. Pruning removes only entries below the finalized
   slot, and every root scored is indexed at or above it, so such a vote cannot
@@ -215,6 +215,16 @@ the root of the state's latest block header.
   at that block's slot and the field is set, and hashes otherwise, so both
   shapes give the same root.
 - **Equivalence:** the same check, on both kinds of state.
+
+## The attestation deadline takes the epoch that picks the fork's rule
+
+- **The specification:** `get_attestation_due_ms()` takes no argument, and
+  gloas replaces it with a function that reads `ATTESTATION_DUE_BPS_GLOAS`.
+- **ethlambda:** one `get_attestation_due_ms(epoch, config)`
+  (`fork_choice.rs`) that reads the basis points of the fork `epoch` falls in
+  (`ForkRules::of`), so both sides of the fulu-to-gloas boundary share it.
+- **Equivalence:** the same deadline for every slot, since the epoch is the
+  one the specification's own per-fork function would have been selected for.
 
 ## The head is one bottom-up walk, not the specification's per-node `get_weight`
 

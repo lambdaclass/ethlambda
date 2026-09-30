@@ -53,18 +53,14 @@
 //! only the registry and balance state matters for the ordering here.
 
 use crate::beacon::config::Config;
-use crate::beacon::constants::FAR_FUTURE_EPOCH;
 use crate::beacon::containers::BeaconState;
-use crate::beacon::containers::electra as electra_containers;
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::get_current_epoch;
-use crate::beacon::helpers::electra::{get_activation_exit_churn_limit, pending_queue_fields};
+use crate::beacon::helpers::electra::get_activation_exit_churn_limit;
 use crate::beacon::helpers::fulu::{get_beacon_proposer_indices, proposer_lookahead_mut};
-use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
 use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::Gwei;
 
 use super::electra;
 
@@ -96,7 +92,7 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 // Pending deposits
 // ---------------------------------------------------------------------------
 
-/// Drains a balance-churn-limited amount of [`electra_containers::PendingDeposit`]s
+/// Drains a balance-churn-limited amount of [`crate::beacon::containers::electra::PendingDeposit`]s
 /// into the validator registry.
 ///
 /// [`electra::process_pending_deposits`]'s own doc covers the shape this
@@ -123,105 +119,14 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// still unset or set but not yet caught up: see
 /// [`super::super::fulu::process_deposit_request`]'s own doc for why fulu
 /// never writes it, and why pairing that with electra's gate here would stall
-/// the queue for good rather than merely once. This function reads neither
-/// field.
+/// the queue for good rather than merely once. The drain is
+/// `electra::drain_pending_deposits`, which derives from the state's fork that
+/// the gate is retired here and so reads neither `eth1_deposit_index` nor
+/// `deposit_requests_start_index`.
 // [Modified in Fulu]
 pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
-    let next_epoch = get_current_epoch(state) + 1;
     let churn_limit = get_activation_exit_churn_limit(state, config)?;
-    let finalized_slot = compute_start_slot_at_epoch(state.finalized_checkpoint().epoch);
-
-    // See `electra::process_pending_deposits`'s own doc for why the queue is
-    // taken by value here rather than iterated in place.
-    let (available_for_processing, deposits) = {
-        let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
-        let available_for_processing = fields
-            .deposit_balance_to_consume()
-            .checked_add(churn_limit)
-            .ok_or(Error::ArithmeticOverflow(
-                "deposit_balance_to_consume + get_activation_exit_churn_limit",
-            ))?;
-        let deposits: Vec<electra_containers::PendingDeposit> = fields.take_pending_deposits()?;
-        (available_for_processing, deposits)
-    };
-
-    let mut processed_amount: Gwei = 0;
-    let mut next_deposit_index = 0usize;
-    let mut deposits_to_postpone: Vec<electra_containers::PendingDeposit> = Vec::new();
-    let mut is_churn_limit_reached = false;
-
-    for deposit in &deposits {
-        // A deposit whose queue position could still be reorged out must
-        // wait: crediting it now and reverting later is not an option, since
-        // nothing else in the state transition undoes a balance change.
-        if deposit.slot > finalized_slot {
-            break;
-        }
-
-        if next_deposit_index >= preset::MAX_PENDING_DEPOSITS_PER_EPOCH as usize {
-            break;
-        }
-
-        let (is_validator_exited, is_validator_withdrawn) = state
-            .iter_validators()
-            .find(|validator| validator.pubkey == deposit.pubkey)
-            .map(|validator| {
-                (
-                    validator.exit_epoch < FAR_FUTURE_EPOCH,
-                    validator.withdrawable_epoch < next_epoch,
-                )
-            })
-            .unwrap_or((false, false));
-
-        if is_validator_withdrawn {
-            electra::apply_pending_deposit(state, deposit, config)?;
-        } else if is_validator_exited {
-            deposits_to_postpone.push(deposit.clone());
-        } else {
-            match processed_amount.checked_add(deposit.amount) {
-                Some(sum) if sum <= available_for_processing => {
-                    processed_amount = sum;
-                    electra::apply_pending_deposit(state, deposit, config)?;
-                }
-                // Either the sum overflowed (certainly too much) or it fit in
-                // a `u64` but still exceeded the budget: both mean this
-                // epoch's processing stops here.
-                _ => {
-                    is_churn_limit_reached = true;
-                    break;
-                }
-            }
-        }
-
-        next_deposit_index += 1;
-    }
-
-    let remaining: Vec<electra_containers::PendingDeposit> = deposits
-        .into_iter()
-        .skip(next_deposit_index)
-        .chain(deposits_to_postpone)
-        .collect();
-
-    // Leftover churn is only worth remembering when it was actually the
-    // reason processing stopped: if the queue simply ran out, or the
-    // finality or per-epoch-cap gate stopped it first, next epoch's budget
-    // starts fresh rather than inheriting room this epoch never even tried
-    // to spend.
-    let deposit_balance_to_consume = if is_churn_limit_reached {
-        available_for_processing
-            .checked_sub(processed_amount)
-            .ok_or(Error::ArithmeticOverflow(
-                "available_for_processing - processed_amount",
-            ))?
-    } else {
-        0
-    };
-
-    let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
-    fields.set_pending_deposits(remaining)?;
-    *fields.deposit_balance_to_consume_mut() = deposit_balance_to_consume;
-
-    Ok(())
+    electra::drain_pending_deposits(state, config, churn_limit)
 }
 
 /// Shifts `proposer_lookahead` forward by one epoch.
@@ -283,7 +188,9 @@ pub fn process_proposer_lookahead(state: &mut BeaconState) -> Result<()> {
 mod tests {
     use super::*;
     use crate::beacon::constants;
+    use crate::beacon::containers::electra as electra_containers;
     use crate::beacon::fork::ForkName;
+    use crate::beacon::helpers::electra::pending_queue_fields;
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
     use crate::beacon::primitives::BlsSignature;
 
@@ -430,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_queue_stalls_forever_under_electras_own_gate() {
+    fn electras_entry_point_applies_the_state_forks_gate_to_a_fulu_state() {
         let config = Config::mainnet();
         let mut state = fulu_state_with_validators(2);
         // See the previous test: past the deposit's own slot, so only the
@@ -439,25 +346,20 @@ mod tests {
         let deposit = request_sourced_pending_deposit(&state, 0);
         pending_queue_fields(&mut state, "test setup")
             .unwrap()
-            .push_pending_deposit(deposit.clone())
+            .push_pending_deposit(deposit)
             .unwrap();
 
         let balance_before = state.balance(0).unwrap();
-        // `electra::process_pending_deposits` accepts a fulu state too (its
-        // `PendingQueueFields` projection covers both), which is exactly what
-        // let the pre-fix code call it here unnoticed.
+        // `electra::process_pending_deposits` accepts a fulu state too. The
+        // gate is derived from the state's fork, not chosen by the caller, so
+        // it cannot stall a fulu queue whose `deposit_requests_start_index`
+        // fulu never writes (the same scenario stalls on an electra state:
+        // see `electra::tests`).
         electra::process_pending_deposits(&mut state, &config).unwrap();
 
-        // Blocked: `deposit_requests_start_index` is still
-        // `UNSET_DEPOSIT_REQUESTS_START_INDEX`, so electra's
-        // `eth1_deposit_index < deposit_requests_start_index` gate holds for
-        // this request-sourced entry and the whole pass breaks before ever
-        // reaching it.
-        assert_eq!(state.balance(0).unwrap(), balance_before);
-        let BeaconState::Fulu(inner) = &state else {
-            unreachable!("built as Fulu");
-        };
-        assert_eq!(inner.pending_deposits.len(), 1);
-        assert_eq!(inner.pending_deposits[0], deposit);
+        assert_eq!(
+            state.balance(0).unwrap(),
+            balance_before + preset::EFFECTIVE_BALANCE_INCREMENT
+        );
     }
 }

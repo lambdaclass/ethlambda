@@ -1277,7 +1277,7 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
 /// [`get_weight`]'s own attestation half; [`is_head_weak`] and
 /// [`is_parent_strong`] call it too, [`is_head_weak`] underneath the public
 /// [`should_apply_proposer_boost`] and [`is_parent_strong`] underneath
-/// `gloas_get_proposer_head`. The head walk does not: it reads the same scores
+/// [`get_proposer_head`]. The head walk does not: it reads the same scores
 /// from [`compute_node_weights`], which drops such a vote too.
 pub fn get_attestation_score(
     store: &Store,
@@ -2240,23 +2240,26 @@ pub fn get_slot_component_duration_ms(basis_points: u64, config: &Config) -> u64
 
 /// How far into a slot, in milliseconds, an attestation is due.
 ///
-/// `epoch` is accepted, matching the specification's signature, but not read:
-/// the deadline is a fixed fraction of the slot in every epoch this module
-/// implements.
-pub fn get_attestation_due_ms(_epoch: Epoch, config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.attestation_due_bps, config)
+/// Gloas modifies the function (`fork-choice.md`'s "Modified
+/// `get_attestation_due_ms`"): its deadline is the earlier
+/// `ATTESTATION_DUE_BPS_GLOAS`, leaving room in the same slot for the payload
+/// and payload attestation deadlines that follow.
+///
+/// Implementation choice, not spec text: the specification's function takes no
+/// argument and each fork has its own. `epoch` is how this crate picks the
+/// fork's rule, so one function serves both sides of the boundary.
+pub fn get_attestation_due_ms(epoch: Epoch, config: &Config) -> u64 {
+    let basis_points = match ForkRules::of(config.fork_at_epoch(epoch)) {
+        ForkRules::PreGloas => config.attestation_due_bps,
+        ForkRules::Gloas => config.attestation_due_bps_gloas,
+    };
+    get_slot_component_duration_ms(basis_points, config)
 }
 
 /// How far into a slot, in milliseconds, a proposer must stop attempting a
-/// late-block reorg. See [`get_attestation_due_ms`] for why `epoch` is unused.
-pub fn get_proposer_reorg_cutoff_ms(_epoch: Epoch, config: &Config) -> u64 {
+/// late-block reorg. Gloas does not modify this deadline.
+pub fn get_proposer_reorg_cutoff_ms(config: &Config) -> u64 {
     get_slot_component_duration_ms(config.proposer_reorg_cutoff_bps, config)
-}
-
-/// How far into a slot, in milliseconds, an aggregate attestation is due. See
-/// [`get_attestation_due_ms`] for why `epoch` is unused.
-pub fn get_aggregate_due_ms(_epoch: Epoch, config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.aggregate_due_bps, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -2319,8 +2322,7 @@ pub fn is_finalization_ok(store: &Store, slot: Slot, config: &Config) -> bool {
 /// building now still counts as on time.
 pub fn is_proposing_on_time(store: &Store, config: &Config) -> bool {
     let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
-    let epoch = get_current_store_epoch(store, config);
-    time_into_slot_ms <= get_proposer_reorg_cutoff_ms(epoch, config)
+    time_into_slot_ms <= get_proposer_reorg_cutoff_ms(config)
 }
 
 /// Whether `head_root` has few enough votes to be overpowered by the
@@ -2468,9 +2470,9 @@ pub fn is_proposer_equivocation(
 /// Fulu (EIP-7917) drops the `shuffling_stable` requirement: `shuffling_stable`
 /// is folded into `true` rather than left out of the `&&` chain, which reads
 /// the same as the specification's own two near-identical copies of this
-/// function without keeping two Rust copies to drift apart. Every fork this
-/// module implements shares one copy for the same reason no other condition
-/// here has a per-fork variant.
+/// function without keeping two Rust copies to drift apart. Every fork through
+/// fulu shares that one copy. Gloas modifies the function and has no version
+/// here, since this node proposes on no gloas slot.
 pub fn get_proposer_head(
     store: &Store,
     head_root: Root,
@@ -2596,24 +2598,21 @@ pub fn get_proposer_head(
 //
 // Functions here are named exactly as the specification names them, with a
 // `gloas_` prefix only where a pre-gloas function of the same name already
-// exists in this file: `gloas_get_ancestor`, `gloas_get_checkpoint_block`,
-// `gloas_get_weight`, `gloas_get_head`, and the four `*_due_ms` functions
-// gloas narrows to its own basis-point fields (`gloas_get_attestation_due_ms`,
-// `gloas_get_aggregate_due_ms`, `gloas_get_sync_message_due_ms`,
-// `gloas_get_contribution_due_ms`; the last two rename an altair-shaped name
-// no pre-gloas function of this file actually carries, since a bare
-// `get_sync_message_due_ms` would otherwise misname a function that only
-// ever reads gloas's own basis points). Two further functions
+// exists in this file and the two cannot be one function: `gloas_get_ancestor`,
+// `gloas_get_weight`, `gloas_get_head`, `gloas_verify_data_column_sidecar` and
+// `gloas_verify_data_column_sidecar_kzg_proofs`. The functions the specification
+// modifies in a way one function can dispatch on (`get_attestation_due_ms`
+// reads the fork of its `epoch`) are not split at all. Two further functions
 // (`gloas_bid`, `gloas_get_attestation_score`) are private and have no name
 // of their own in the specification at all; they stay `gloas_`-prefixed for
 // the same reason, since both exist only to bind gloas's own semantics
 // (a block's bid, an ancestor check with a payload dimension) into either a
 // projection this crate needs or spec-unmodified text (`get_attestation_score`)
 // that the specification's own per-fork composition binds differently per
-// fork. `is_head_weak` and `is_parent_strong` need no gloas copy at all: see
-// their own call sites below for why the pre-gloas functions already answer
-// gloas's question. Every other function below is new to this file,
-// pre-gloas and gloas alike, and keeps the specification's bare name.
+// fork. `is_head_weak` needs no gloas copy at all: see its call site below
+// for why the pre-gloas function already answers gloas's question. Every
+// other function below is new to this file, pre-gloas and gloas alike, and
+// keeps the specification's bare name.
 
 /// `block`'s own execution payload bid, projected out of the fork-generic
 /// [`SignedBeaconBlock`] enum.
@@ -2864,6 +2863,17 @@ pub fn is_parent_node_full(store: &Store, block: &SignedBeaconBlock) -> Result<b
 /// A loop rather than the specification's recursion, matching pre-gloas
 /// [`get_ancestor`] for the same reason: a long unfinalized suffix must not
 /// risk a stack overflow.
+///
+/// The descent picks each next root by `block.slot` alone, so the payload
+/// status threaded through it never changes which root it lands on, only the
+/// label a caller may then discard. That is why the specification's
+/// `get_checkpoint_block`, which is this walk from a `Pending` node keeping
+/// only `.root`, has no gloas function here: it answers what the pre-gloas,
+/// index-only [`get_checkpoint_block`] does on any chain both could answer.
+/// [`filter_block_tree`] (the only caller of [`get_checkpoint_block`] in this
+/// file; [`get_voting_source`] never calls it) therefore keeps calling the
+/// pre-gloas version, which is what lets [`get_filtered_block_tree`] serve
+/// [`gloas_get_head`] with no per-block fetch.
 pub fn gloas_get_ancestor(
     store: &Store,
     node: ForkChoiceNode,
@@ -2898,14 +2908,13 @@ pub fn gloas_get_ancestor(
 /// Against a `Pending` `ancestor`, the wildcard above makes this reduce to
 /// `gloas_get_ancestor(node, ancestor_slot).root == ancestor.root`, and
 /// `gloas_get_ancestor`'s own descent picks its next root by `block.slot`
-/// alone (see [`gloas_get_checkpoint_block`]'s own doc), so that root is
+/// alone (see [`gloas_get_ancestor`]'s own doc), so that root is
 /// exactly what the pre-gloas, index-only [`get_ancestor`] would answer for
 /// the same walk. The specification's `is_head_weak` and `is_parent_strong`
 /// always score a `Pending` node (a bare block root), so the attestation
 /// score they need takes this reduction and equals the pre-gloas,
-/// root-based one; that is what lets `should_apply_proposer_boost` and
-/// `gloas_get_proposer_head` call the pre-gloas [`is_head_weak`]/
-/// [`is_parent_strong`] directly rather than keep a gloas copy of either.
+/// root-based one; that is what lets `should_apply_proposer_boost` call the
+/// pre-gloas [`is_head_weak`] directly rather than keep a gloas copy of it.
 /// `gloas_get_weight` also scores `Empty` and `Full` nodes, which do not
 /// reduce this way, so it keeps its own attestation score.
 pub fn is_ancestor(store: &Store, node: ForkChoiceNode, ancestor: ForkChoiceNode) -> Result<bool> {
@@ -2918,27 +2927,6 @@ pub fn is_ancestor(store: &Store, node: ForkChoiceNode, ancestor: ForkChoiceNode
     }
     Ok(node_ancestor.payload_status == ancestor.payload_status
         || ancestor.payload_status == PayloadStatus::Pending)
-}
-
-/// `get_checkpoint_block` (gloas `fork-choice.md`, modified): the checkpoint
-/// block for `epoch` on `root`'s chain.
-///
-/// Its `.root` agrees with the pre-gloas, index-only [`get_checkpoint_block`]
-/// on any chain both could answer: [`gloas_get_ancestor`]'s descent picks its
-/// next step by `block.slot` alone, so the payload status threaded through
-/// the walk never changes which root it lands on, only the label this
-/// function then discards. [`filter_block_tree`] (the only caller of
-/// [`get_checkpoint_block`] in this file; [`get_voting_source`] never calls
-/// it) therefore keeps calling the pre-gloas version rather than growing a
-/// gloas copy of its own, which is what lets [`get_filtered_block_tree`]
-/// serve [`gloas_get_head`] with no per-block fetch.
-pub fn gloas_get_checkpoint_block(store: &Store, root: Root, epoch: Epoch) -> Result<Root> {
-    let epoch_first_slot = compute_start_slot_at_epoch(epoch);
-    let node = ForkChoiceNode {
-        root,
-        payload_status: PayloadStatus::Pending,
-    };
-    Ok(gloas_get_ancestor(store, node, epoch_first_slot)?.root)
 }
 
 /// `get_supported_node` (gloas `fork-choice.md`): the node `message`
@@ -3467,7 +3455,7 @@ pub fn get_node_children(
 /// alone.
 ///
 /// Reuses the pre-gloas, index-only [`get_filtered_block_tree`] for the
-/// candidate tree: see [`gloas_get_checkpoint_block`]'s own doc for why that
+/// candidate tree: see [`gloas_get_ancestor`]'s own doc for why that
 /// is sound rather than a shortcut.
 ///
 /// **A reference, not the node's head computation.** [`get_head_node`] runs
@@ -3507,144 +3495,10 @@ pub fn gloas_get_head(
     }
 }
 
-/// `get_latest_message_epoch` (gloas `fork-choice.md`, modified): the epoch
-/// `message`'s slot falls in, now that gloas keeps a [`LatestMessage`]'s slot
-/// rather than its epoch directly. No pre-gloas counterpart exists in this
-/// file: every pre-gloas reader of a [`LatestMessage`] reads its `epoch`
-/// field directly instead.
-pub fn get_latest_message_epoch(message: LatestMessage) -> Epoch {
-    compute_epoch_at_slot(message.slot)
-}
-
-/// `get_attestation_due_ms` (gloas `fork-choice.md`, modified): gloas moves
-/// the attestation deadline to its own `ATTESTATION_DUE_BPS_GLOAS`, earlier
-/// than pre-gloas's [`get_attestation_due_ms`], to leave room in the same slot
-/// for the payload and payload-attestation deadlines that follow it.
-pub fn gloas_get_attestation_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.attestation_due_bps_gloas, config)
-}
-
-/// `get_aggregate_due_ms` (gloas `fork-choice.md`, modified). See
-/// [`gloas_get_attestation_due_ms`].
-pub fn gloas_get_aggregate_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.aggregate_due_bps_gloas, config)
-}
-
-/// `get_sync_message_due_ms` (gloas `fork-choice.md`, modified): reads
-/// `SYNC_MESSAGE_DUE_BPS_GLOAS`. `gloas_`-prefixed like its four siblings
-/// above even though no altair-named `get_sync_message_due_ms` exists in
-/// this file to collide with: the plain name takes altair's own, and this
-/// function only ever reads gloas's basis points, never altair's, so the
-/// bare name would misname what it does.
-pub fn gloas_get_sync_message_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.sync_message_due_bps_gloas, config)
-}
-
-/// `get_contribution_due_ms` (gloas `fork-choice.md`, modified): reads
-/// `CONTRIBUTION_DUE_BPS_GLOAS`. See [`gloas_get_sync_message_due_ms`].
-pub fn gloas_get_contribution_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.contribution_due_bps_gloas, config)
-}
-
-/// `get_payload_due_ms` (gloas `fork-choice.md`): how far into a slot, in
-/// milliseconds, a builder's execution payload envelope is due.
-pub fn get_payload_due_ms(config: &Config) -> u64 {
-    get_slot_component_duration_ms(config.payload_due_bps, config)
-}
-
 /// `get_payload_attestation_due_ms` (gloas `fork-choice.md`): how far into a
 /// slot, in milliseconds, the payload timeliness committee's votes are due.
 pub fn get_payload_attestation_due_ms(config: &Config) -> u64 {
     get_slot_component_duration_ms(config.payload_attestation_due_bps, config)
-}
-
-/// `get_proposer_head` (gloas `fork-choice.md`, modified): the node a
-/// proposer at `slot` should build on, as a full [`ForkChoiceNode`] so a
-/// re-org preserves the parent's own payload status rather than collapsing
-/// it back to `Pending`.
-///
-/// Drops the pre-gloas `shuffling_stable` condition entirely, matching the
-/// specification's own text: pre-gloas [`get_proposer_head`] still gates it
-/// on `head_block.fork_name() >= ForkName::Fulu` for the forks before fulu.
-/// [`get_head_node`] only ever reaches this function's gloas arm once the
-/// chain has reached `GLOAS_FORK_EPOCH`, so `head_block` here is gloas, or
-/// fulu right at the fulu-to-gloas boundary (this crate's decided rule for
-/// a pre-gloas head; see the module documentation's "Gloas: payload-aware
-/// fork choice" section), so `>= ForkName::Fulu` holds unconditionally for
-/// every call this function gets, and the specification's own gloas text
-/// simply omits the condition rather than spell out an always-true check.
-pub fn gloas_get_proposer_head(
-    store: &Store,
-    head_node: ForkChoiceNode,
-    slot: Slot,
-    config: &Config,
-    committees: &CommitteeCache,
-) -> Result<ForkChoiceNode> {
-    let head_block = store
-        .get_signed_block(&head_node.root)
-        .expect("get")
-        .ok_or(Error::SpecAssert("head_node.root in store.blocks"))?;
-    let parent_root = head_block.parent_root();
-    let (parent_slot, _) = store
-        .block_entry(&parent_root)
-        .ok_or(Error::SpecAssert("parent_root in store.blocks"))?;
-    let parent_payload_status = get_parent_payload_status(store, &head_block)?;
-    let parent_node = ForkChoiceNode {
-        root: parent_root,
-        payload_status: parent_payload_status,
-    };
-
-    // Only re-org the head block if it arrived later than the attestation
-    // deadline.
-    let head_late = is_head_late(store, head_node.root)?;
-    // Ensure that the FFG information of the new head will be competitive
-    // with the current head.
-    let ffg_competitive = is_ffg_competitive(store, head_node.root, parent_root)?;
-    // Do not re-org if the chain is not finalizing with acceptable frequency.
-    let finalization_ok = is_finalization_ok(store, slot, config);
-    // Only re-org if we are proposing on-time.
-    let proposing_on_time = is_proposing_on_time(store, config);
-
-    let head_slot = head_block.slot();
-    // Only re-org a single slot at most.
-    let parent_slot_ok = parent_slot.checked_add(1) == Some(head_slot);
-    let current_time_ok = head_slot.checked_add(1) == Some(slot);
-    let single_slot_reorg = parent_slot_ok && current_time_ok;
-
-    // Check that the head has few enough votes to be overpowered by our
-    // proposer boost.
-    verify(
-        store.proposer_boost_root() != head_node.root,
-        "store.proposer_boost_root != head_node.root",
-    )?;
-    // Pre-gloas `is_head_weak`, not a gloas copy: see `is_ancestor`'s own
-    // doc for why a `Pending` node's score is the same either way.
-    let head_weak = is_head_weak(store, head_node.root, config, committees)?;
-
-    // Check that the missing votes are assigned to the parent and not being
-    // hoarded. Pre-gloas `is_parent_strong`, for the same reason.
-    let parent_strong = is_parent_strong(store, head_node.root, config)?;
-
-    // Re-org more aggressively if there is a proposer equivocation in the
-    // previous slot.
-    let index = store.block_index();
-    let proposer_equivocation = is_proposer_equivocation(store, &index, head_node.root)?;
-
-    if head_late
-        && ffg_competitive
-        && finalization_ok
-        && proposing_on_time
-        && single_slot_reorg
-        && head_weak
-        && parent_strong
-    {
-        // We can re-org the current head by building upon its parent node.
-        Ok(parent_node)
-    } else if head_weak && current_time_ok && proposer_equivocation {
-        Ok(parent_node)
-    } else {
-        Ok(head_node)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4027,8 +3881,12 @@ pub fn compute_pulled_up_tip(
 /// [`is_head_late`] only reads the attestation entry. Gloas modifies the
 /// function: a block is timely for a deadline only if it arrived in its own
 /// slot and before that deadline, and the two deadlines are gloas's own
-/// attestation deadline ([`gloas_get_attestation_due_ms`]) and the payload
+/// attestation deadline ([`get_attestation_due_ms`]) and the payload
 /// timeliness committee's ([`get_payload_attestation_due_ms`]).
+///
+/// The attestation deadline is chosen by the clock's epoch and the PTC entry
+/// by the block's own `rules`; they can disagree only when the block is not
+/// from the current slot, where every entry is `false` either way.
 fn block_timeliness(
     store: &Store,
     block_slot: Slot,
@@ -4037,15 +3895,14 @@ fn block_timeliness(
 ) -> [bool; 2] {
     let time_into_slot_ms = store.ms_since_genesis() % config.slot_duration_ms;
     let is_current_slot = get_current_slot(store, config) == block_slot;
+    let epoch = get_current_store_epoch(store, config);
+    let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
     match rules {
         ForkRules::PreGloas => {
-            let epoch = get_current_store_epoch(store, config);
-            let attestation_threshold_ms = get_attestation_due_ms(epoch, config);
             let is_timely = is_current_slot && time_into_slot_ms < attestation_threshold_ms;
             [is_timely, is_timely]
         }
         ForkRules::Gloas => {
-            let attestation_threshold_ms = gloas_get_attestation_due_ms(config);
             let ptc_threshold_ms = get_payload_attestation_due_ms(config);
             [
                 is_current_slot && time_into_slot_ms < attestation_threshold_ms,
@@ -4116,7 +3973,7 @@ fn get_ancestor_or_lowest_indexed(
 /// Serves gloas unchanged. Gloas's `get_shuffling_dependent_root` walks from a
 /// `PENDING` node with its payload-aware `get_ancestor` and returns the root of
 /// the node it lands on; that walk picks each step by `block.slot` alone (see
-/// [`gloas_get_checkpoint_block`]), so the root is the one this index walk
+/// [`gloas_get_ancestor`]), so the root is the one this index walk
 /// answers, and the payload status the gloas walk threads through is
 /// discarded.
 pub fn get_shuffling_dependent_root(
@@ -4325,7 +4182,7 @@ fn validate_on_attestation_indexed(
 
     // LMD vote must be consistent with FFG vote target. Gloas's own
     // `get_checkpoint_block` answers the same root through a payload-aware walk
-    // (see [`gloas_get_checkpoint_block`]), so the index-only walk serves both
+    // (see [`gloas_get_ancestor`]), so the index-only walk serves both
     // forks and spares a gloas attestation one block decode per hop.
     let checkpoint_block = get_checkpoint_block(index, data.beacon_block_root, target.epoch)?;
     verify(
