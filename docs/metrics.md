@@ -385,9 +385,9 @@ other topics: `unsupported_fork` is an ignore reason for a message of a fork thi
 build has no gossip rules for (gloas today), on the block, data column,
 aggregate, attestation and attester-slashing topics, so an honest peer past the
 fork epoch is not scored as a bad decoder. The same label value appears as
-`result` on `lean_beacon_gossip_messages_total` for every one of those but the
-block topic: a gloas block decodes, so it counts as `decoded` there and
-`unsupported_fork` shows only as a verdict reason.
+`result` on `lean_beacon_gossip_messages_total` for the topics without gloas
+rules. Gloas blocks and data columns are validated, so they carry their own
+verdict reasons instead.
 
 Two permit pools bound the blocking-thread half of validation:
 `gossip_validation_permits` for blocks and columns,

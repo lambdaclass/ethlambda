@@ -1,43 +1,38 @@
 //! `beacon_block` gossip validation: fulu's `validate_beacon_block_gossip`
-//! (`specs/fulu/p2p-interface.md`), with the deviations the design spec lists.
+//! (`specs/fulu/p2p-interface.md`) and gloas's modified one
+//! (`specs/gloas/p2p-interface.md`), with the deviations the design spec lists.
 
 use ethlambda_storage::CacheKey;
+use tracing::warn;
 
 use super::{
     IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, finalized_ancestry,
     finalized_start_slot, is_future_slot,
 };
-use crate::beacon::containers::SignedBeaconBlock;
-use crate::beacon::fork_choice::Store;
+use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
+use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
+use crate::beacon::lean_boundary::{lean_block_unreachable, lean_state_unreachable};
 use crate::beacon::precheck::{self, PrecheckError, Reference, precheck_block};
-use crate::beacon::primitives::Root;
+use crate::beacon::preset;
+use crate::beacon::primitives::{ExecutionBlockHash, Root};
 use crate::beacon::stf::bellatrix::compute_timestamp_at_slot;
 
 /// The rules that read only the block, the clock and the store's metadata.
 ///
 /// `Err` carries the verdict; `Ok` sends the block on to [`stateful_checks`].
+/// A gloas block runs [`cheap_checks_gloas`] instead.
 pub fn cheap_checks(
     seen: &SeenBlocks,
     store: &Store,
     block: &SignedBeaconBlock,
     now_ms: u64,
 ) -> Result<(), Outcome> {
+    if let Some(gloas_block) = as_gloas(block, "block::cheap_checks") {
+        return cheap_checks_gloas(seen, store, gloas_block, now_ms);
+    }
     let config = store.config();
     let slot = block.slot();
-    // [IGNORE] This build does not validate a gloas-shaped block against
-    // these (fulu) rules: EIP-7732 changes what a block commits to enough
-    // that accepting one here would propagate something this node cannot
-    // itself follow (its node wiring cannot deliver a gloas block's payload
-    // envelope yet, though `fork_choice::on_block` accepts the block). Checked
-    // first, so a gloas block never reaches a rule below whose fields it
-    // happens to still answer (its `blob_kzg_commitment_count` reads the
-    // builder's bid) but whose verdict would misdescribe it. `Ignore`, not
-    // `Reject`: the sender did nothing wrong, and every honest peer sends
-    // exactly this once this node's own clock reaches gloas.
-    if !block.fork_name().is_followed() {
-        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
-    }
     // [IGNORE] The block is not from a future slot.
     if is_future_slot(&config, slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
@@ -59,12 +54,108 @@ pub fn cheap_checks(
     Ok(())
 }
 
+/// `block` as a gloas block, or `None` for every earlier fork.
+///
+/// Spelled out arm by arm so that a new fork breaks this match rather than
+/// silently taking fulu's rules.
+fn as_gloas<'a>(
+    block: &'a SignedBeaconBlock,
+    function: &str,
+) -> Option<&'a gloas::SignedBeaconBlock> {
+    match block {
+        SignedBeaconBlock::Gloas(block) => Some(block),
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => None,
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable(function),
+    }
+}
+
+/// The gloas rules that read only the block, the clock and the store's
+/// metadata: the first half of gloas's modified `validate_beacon_block_gossip`
+/// (`specs/gloas/p2p-interface.md`), in the specification's order.
+///
+/// The blob-count rule sits later in the specification, after the parent
+/// lookups, but reads only the bid; it runs here for the reason fulu's does,
+/// so a block with too many commitments is refused before any state is read.
+fn cheap_checks_gloas(
+    seen: &SeenBlocks,
+    store: &Store,
+    signed_block: &gloas::SignedBeaconBlock,
+    now_ms: u64,
+) -> Result<(), Outcome> {
+    let config = store.config();
+    let block = &signed_block.message;
+    // [IGNORE] The block is the first with a valid signature for its slot and
+    // proposer.
+    if seen.contains(block.slot, block.proposer_index) {
+        return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
+    }
+    // [IGNORE] The block is not from a future slot.
+    if is_future_slot(&config, block.slot, now_ms) {
+        return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
+    }
+    // [IGNORE] The block is from a slot greater than the latest finalized slot.
+    if block.slot <= finalized_start_slot(store) {
+        return Err(Outcome::Ignore(IgnoreReason::Finalized));
+    }
+    // [REJECT] The body's operation counts, and the parent execution
+    // requests' counts, are within their limits.
+    if !body_operations_within_limits(&block.body)
+        || !execution_requests_within_limits(&block.body.parent_execution_requests)
+    {
+        return Err(Outcome::Reject(RejectReason::OperationLimit));
+    }
+    // [REJECT] The bid's blob KZG commitment count is within the per-epoch
+    // limit.
+    let bid = &block.body.signed_execution_payload_bid.message;
+    let max_blobs = config.max_blobs_per_block(compute_epoch_at_slot(block.slot));
+    if bid.blob_kzg_commitments.len() as u64 > max_blobs {
+        return Err(Outcome::Reject(RejectReason::TooManyBlobs));
+    }
+    Ok(())
+}
+
+/// `verify_block_body_operation_limits` (`specs/gloas/p2p-interface.md`).
+///
+/// Gloas's operation lists are progressive, so unlike every earlier fork's
+/// they carry no bound of their own and decoding does not enforce it.
+fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
+    body.proposer_slashings.len() <= preset::MAX_PROPOSER_SLASHINGS
+        && body.attester_slashings.len() <= preset::MAX_ATTESTER_SLASHINGS_ELECTRA
+        && body.attestations.len() <= preset::MAX_ATTESTATIONS_ELECTRA
+        && body.deposits.is_empty()
+        && body.voluntary_exits.len() <= preset::MAX_VOLUNTARY_EXITS
+        && body.bls_to_execution_changes.len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
+        && body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
+}
+
+/// `verify_execution_requests_limits` (`specs/gloas/p2p-interface.md`).
+///
+/// The four lists the specification names: withdrawals, consolidations,
+/// builder deposits and builder exits. Deposit requests are deliberately not
+/// checked: gloas's `DepositRequests` is progressive and neither the
+/// specification nor the state transition bounds it, so a limit here would
+/// reject a block that import accepts.
+fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
+    requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
+        && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
+        && requests.builder_deposits.len() as u64
+            <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
+        && requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
+}
+
 /// The rules that need the parent's post-state. Runs on a blocking thread.
 ///
 /// Reads states only through [`Store::cached_state`]: a miss would otherwise
 /// rebuild the state from diffs, which is far too slow for a verdict that
 /// gossipsub waits on. A miss queues the block instead.
 pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Root) -> Outcome {
+    let gloas_block = as_gloas(block, "block::stateful_checks");
     let config = store.config();
     let parent_root = block.parent_root();
     let parent_known = store.has_block(&parent_root);
@@ -90,12 +181,51 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
     if let Err(err) = precheck_block(block, block_root, Reference::Parent(&parent_state), &config) {
         return Outcome::Reject(err.into());
     }
+    // [IGNORE] (gloas) If the parent block is full, the parent payload is
+    // valid. The specification checks this between the signature and the
+    // slot-order rule, but the slot-order and expected-proposer rules are both
+    // inside `precheck_block` here, so a block that fails either is rejected
+    // even with an unverified parent payload. The parent's fullness is read
+    // once: it decodes the parent block, which the bounded validation pool
+    // should not do twice.
+    let parent_full = if gloas_block.is_some() {
+        match fork_choice::is_parent_node_full(store, block) {
+            Ok(full) => full,
+            Err(err) => {
+                warn!(%err, "Could not read a gloas block's parent payload status");
+                return Outcome::Ignore(IgnoreReason::Internal);
+            }
+        }
+    } else {
+        true
+    };
+    if gloas_block.is_some() && parent_full && !fork_choice::is_payload_verified(store, parent_root)
+    {
+        return Outcome::Ignore(IgnoreReason::ParentPayloadUnverified);
+    }
     // [REJECT] The finalized checkpoint is an ancestor of the block.
     if let Err(outcome) = finalized_ancestry(store, parent_root).verdict() {
         return outcome;
     }
-    // [REJECT] The execution payload's timestamp is the slot's.
-    if let Some(timestamp) = block.execution_payload_timestamp()
+    // A gloas block has no payload to time; earlier forks: [REJECT] the
+    // execution payload's timestamp is the slot's.
+    if let Some(gloas_block) = gloas_block {
+        // [REJECT] The bid's parent equals the block's parent.
+        let bid = &gloas_block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message;
+        if bid.parent_block_root != gloas_block.message.parent_root {
+            return Outcome::Reject(RejectReason::BidParentMismatch);
+        }
+        // [REJECT] If the parent is not full, the bid builds on the parent's
+        // execution head. `process_slots` leaves `latest_block_hash` alone,
+        // so the parent's post-state answers for the advanced one.
+        if !parent_full && latest_block_hash(&parent_state) != Some(bid.parent_block_hash) {
+            return Outcome::Reject(RejectReason::BidNotOnParentHead);
+        }
+    } else if let Some(timestamp) = block.execution_payload_timestamp()
         && timestamp != compute_timestamp_at_slot(&parent_state, block.slot(), &config)
     {
         return Outcome::Reject(RejectReason::PayloadTimestamp);
@@ -108,6 +238,22 @@ pub fn stateful_checks(store: &Store, block: &SignedBeaconBlock, block_root: Roo
         return Outcome::Queue(QueueReason::ShufflingUnavailable);
     }
     Outcome::Accept
+}
+
+/// `state.latest_block_hash`, for a gloas state. `None` for an earlier fork,
+/// which has none: its parent counts as full, so no caller asks.
+fn latest_block_hash(state: &BeaconState) -> Option<ExecutionBlockHash> {
+    match state {
+        BeaconState::Gloas(state) => Some(state.latest_block_hash),
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_)
+        | BeaconState::Electra(_)
+        | BeaconState::Fulu(_) => None,
+        BeaconState::Lean(_) => lean_state_unreachable("block::latest_block_hash"),
+    }
 }
 
 /// `cheap_checks` then `stateful_checks`, the order the p2p actor runs them in.
@@ -162,7 +308,8 @@ mod tests {
     use crate::beacon::bls;
     use crate::beacon::config::Config;
     use crate::beacon::constants::{
-        DOMAIN_BEACON_PROPOSER, MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
+        DEPOSIT_CONTRACT_TREE_DEPTH, DOMAIN_BEACON_PROPOSER,
+        MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
     use crate::beacon::containers::{BeaconState, electra};
     use crate::beacon::gossip::test_support::{fulu_parent, seen_blocks, slot_start_ms, store};
@@ -226,6 +373,61 @@ mod tests {
         };
         inner.signature = BlsSignature(signature.to_bytes());
         block
+    }
+
+    #[test]
+    fn a_gloas_body_is_limited_per_operation_and_carries_no_deposits() {
+        let body = gloas::BeaconBlockBody::default();
+        assert!(body_operations_within_limits(&body));
+
+        let mut with_deposit = body.clone();
+        let deposit = crate::beacon::containers::Deposit {
+            proof: vec![Root::ZERO; DEPOSIT_CONTRACT_TREE_DEPTH + 1]
+                .try_into()
+                .expect("a deposit proof has the contract tree's depth plus one roots"),
+            data: Default::default(),
+        };
+        with_deposit.deposits = vec![deposit]
+            .try_into()
+            .expect("progressive lists are unbounded");
+        assert!(!body_operations_within_limits(&with_deposit));
+
+        let mut too_many_exits = body;
+        too_many_exits.voluntary_exits = vec![Default::default(); preset::MAX_VOLUNTARY_EXITS + 1]
+            .try_into()
+            .expect("progressive lists are unbounded");
+        assert!(!body_operations_within_limits(&too_many_exits));
+    }
+
+    #[test]
+    fn deposit_requests_are_not_limited_by_gossip() {
+        let request = crate::beacon::containers::electra::DepositRequest {
+            pubkey: Default::default(),
+            withdrawal_credentials: Default::default(),
+            amount: 0,
+            signature: Default::default(),
+            index: 0,
+        };
+        let requests = gloas::ExecutionRequests {
+            deposits: vec![request; preset::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD + 1]
+                .try_into()
+                .expect("progressive lists are unbounded"),
+            ..Default::default()
+        };
+        assert!(execution_requests_within_limits(&requests));
+    }
+
+    #[test]
+    fn gloas_execution_requests_are_limited_per_list() {
+        let requests = gloas::ExecutionRequests::default();
+        assert!(execution_requests_within_limits(&requests));
+
+        let mut too_many = requests;
+        too_many.builder_exits =
+            vec![Default::default(); preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD as usize + 1]
+                .try_into()
+                .expect("progressive lists are unbounded");
+        assert!(!execution_requests_within_limits(&too_many));
     }
 
     #[test]

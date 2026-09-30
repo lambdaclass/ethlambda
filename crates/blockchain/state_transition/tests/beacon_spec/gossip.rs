@@ -17,7 +17,7 @@ use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
-    electra, phase0,
+    electra, gloas, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, PayloadValidity, Store,
@@ -28,6 +28,7 @@ use ethlambda_state_transition::beacon::gossip::{
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
+use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
@@ -48,16 +49,14 @@ const HANDLERS: &[&str] = &[
 ///
 /// `case.in_scope()` alone would pass every fork up to gloas, since the state
 /// transition handles them all; the gossip rules do not. The block rules
-/// (`beacon::gossip::block`) are fulu's `validate_beacon_block_gossip`, and the
-/// aggregate and attestation rules (`beacon::gossip::{aggregate, attestation}`)
-/// are electra's, which fulu keeps. The column rules have both fulu's and
-/// gloas's (`beacon::gossip::column`).
+/// (`beacon::gossip::block`) and the column rules (`beacon::gossip::column`)
+/// have both fulu's and gloas's, and the aggregate and attestation rules
+/// (`beacon::gossip::{aggregate, attestation}`) are electra's, which fulu
+/// keeps.
 fn validated_forks(handler: &str) -> &'static [ForkName] {
     match handler {
-        "gossip_data_column_sidecar" => &[ForkName::Fulu, ForkName::Gloas],
-        "gossip_beacon_block"
-        | "gossip_beacon_aggregate_and_proof"
-        | "gossip_beacon_attestation" => &[ForkName::Fulu],
+        "gossip_data_column_sidecar" | "gossip_beacon_block" => &[ForkName::Fulu, ForkName::Gloas],
+        "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => &[ForkName::Fulu],
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
 }
@@ -101,6 +100,10 @@ const SKIPPED: &[(&str, &str)] = &[
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
     ),
     (
+        "gossip_beacon_block__reject_parent_failed_validation",
+        "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
         "gossip_data_column_sidecar__reject_parent_failed_validation",
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
     ),
@@ -139,6 +142,9 @@ struct StoreBlock {
     #[serde(default)]
     pending: bool,
     payload_status: Option<String>,
+    /// The block's execution payload envelope, delivered once the block is
+    /// imported so `is_payload_verified` answers true for its root.
+    payload: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -239,6 +245,31 @@ fn case_config(case: &Case, state: &BeaconState) -> Config {
     config
 }
 
+/// Delivers `entry`'s execution payload envelope, if it lists one, so
+/// `is_payload_verified` answers true for its block.
+fn deliver_payload(
+    store: &mut Store,
+    case: &Case,
+    entry: &StoreBlock,
+    config: &Config,
+) -> Result<(), String> {
+    let Some(name) = &entry.payload else {
+        return Ok(());
+    };
+    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&case.ssz_bytes(name))
+        .map_err(|err| format!("decoding {name}: {err:?}"))?;
+    // No sampled columns are named, so the empty retrieval reads as available,
+    // as in the fork-choice runner's envelope step.
+    fork_choice::on_execution_payload_envelope(
+        store,
+        &envelope,
+        config,
+        &[],
+        &ExecutionEngine::valid(),
+    )
+    .map_err(|err| format!("delivering {name}: {err:?}"))
+}
+
 /// The store the case describes: its anchor, then each listed block.
 fn build_store(
     case: &Case,
@@ -261,6 +292,7 @@ fn build_store(
     // slot a clock-disparity case sends its sidecar for.
     let mut clock_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
     fork_choice::on_tick(&mut store, clock_s, config);
+    deliver_payload(&mut store, case, anchor, config)?;
 
     for entry in rest {
         let block = decode_block(case, &entry.block)?;
@@ -295,6 +327,7 @@ fn build_store(
             &CommitteeCache::default(),
         )
         .map_err(|err| format!("importing {}: {err:?}", entry.block))?;
+        deliver_payload(&mut store, case, entry, config)?;
     }
 
     if let Some(finalized) = &meta.finalized_checkpoint {
