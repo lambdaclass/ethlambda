@@ -155,6 +155,27 @@ pub(crate) fn head(store: &Store) -> Result<(H256, Arc<BeaconState>), ApiError> 
     Ok((root, state))
 }
 
+/// Refuses with a `503` while `root`'s execution payload is still unvalidated.
+///
+/// For the endpoints whose answer a validator signs over a block root:
+/// `optimistic-sync.md` forbids an optimistic validator to attest, and the
+/// Beacon API makes it the node's job to refuse ("A 503 error must be returned
+/// if the block identified by the response `beacon_block_root` is
+/// optimistic"). The validator client cannot tell on its own, since execution
+/// status never reaches it, and a `503` is also what sends it to its next
+/// beacon node.
+///
+/// Not a lasting refusal: a `VALID` from the execution client clears the root,
+/// and the actor asks through `forkchoiceUpdated` at least once a slot.
+pub(crate) fn require_validated(store: &Store, root: H256) -> Result<(), ApiError> {
+    if store.is_beacon_optimistic(root) {
+        return Err(ApiError::ServiceUnavailable(
+            "the block's execution payload has not been validated yet",
+        ));
+    }
+    Ok(())
+}
+
 /// The root of the latest block at or before `slot`, on the chain ending in
 /// `head_root`, whose post-state is `head_state`.
 ///
@@ -377,7 +398,9 @@ struct AttestationDataQuery {
 /// - `index` is zero, as electra requires.
 ///
 /// A slot before the head's, or more than one slot past the wall clock, is
-/// refused: neither is a slot a validator is asked to attest to.
+/// refused: neither is a slot a validator is asked to attest to. So is an
+/// optimistic head, with a `503` (see [`require_validated`]); because of the
+/// first refusal, the head is always the `beacon_block_root` answered.
 async fn get_attestation_data(
     Query(query): Query<AttestationDataQuery>,
     State(store): State<Store>,
@@ -396,6 +419,7 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
     if slot > crate::beacon::node::wall_slot(store) + 1 {
         return Err(ApiError::BadRequest("slot is in the future"));
     }
+    require_validated(store, head_root)?;
 
     let epoch = compute_epoch_at_slot(slot);
     let epoch_start = compute_start_slot_at_epoch(epoch);
@@ -703,6 +727,32 @@ mod tests {
             json["data"]["source"]["root"],
             format!("{}", H256::repeat_byte(0xaa))
         );
+    }
+
+    /// No vote for a head the execution client has not validated, and an
+    /// answer again once it has. The refusal is a 503, the status the Beacon
+    /// API names and the one a validator client fails over on.
+    #[tokio::test]
+    async fn an_optimistic_head_is_a_503_until_it_is_validated() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (mut store, head_root) = beacon_store_at(state);
+        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
+        let fetch = |store: Store| {
+            let request = Request::get(&uri).body(Body::empty()).unwrap();
+            routes().with_state(store).oneshot(request)
+        };
+
+        store.insert_beacon_optimistic_root(head_root, slot);
+        let response = fetch(store.clone()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], 503);
+
+        store.remove_beacon_optimistic_root(head_root);
+        let response = fetch(store).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

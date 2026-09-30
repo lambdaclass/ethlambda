@@ -679,12 +679,11 @@ pub(crate) struct BeaconScratch {
     /// `prune_beacon_optimistic_roots` nothing would ever take those entries
     /// back out.
     ///
-    /// Nothing outside `fork_choice::mark_validated`'s own ancestor walk reads
-    /// [`Store::is_beacon_optimistic`] yet, so outside that walk this is
-    /// write-only. The readers it is waiting for are the ones that need to
-    /// answer "is my head optimistic?": the Beacon API's `execution_optimistic`
-    /// response field, and a sync status that distinguishes a head this node
-    /// has vouched for from one it has merely imported.
+    /// Read through [`Store::is_beacon_optimistic`] by
+    /// `fork_choice::mark_validated`'s ancestor walk and by the Beacon API:
+    /// every `execution_optimistic` response field, `/eth/v1/node/syncing` and
+    /// `/eth/v1/node/health`, and the validator endpoints that refuse with a
+    /// `503` rather than hand out a vote for an unvalidated block.
     pub(crate) optimistic_roots: HashMap<H256, u64>,
     /// Payload statuses keyed by execution block hash, standing in for a call
     /// to an execution client exactly as `pow_blocks` does. Written only by
