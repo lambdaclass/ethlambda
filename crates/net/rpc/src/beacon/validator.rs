@@ -177,6 +177,21 @@ pub(crate) fn require_validated(store: &Store, root: H256) -> Result<(), ApiErro
     Ok(())
 }
 
+/// Refuses with a `503` on a node run without an execution client.
+///
+/// [`require_validated`]'s companion, for the same endpoints. Nothing
+/// validates a payload on such a node: blocks import as
+/// `PayloadValidity::NotRequired` and never join the optimistic set, so
+/// [`require_validated`] alone would pass a block that nobody checked.
+pub(crate) fn require_execution_client(engine: &Option<EngineClient>) -> Result<(), ApiError> {
+    if engine.is_none() {
+        return Err(ApiError::ServiceUnavailable(
+            "no execution client configured to validate payloads with",
+        ));
+    }
+    Ok(())
+}
+
 /// The root of the latest block at or before `slot`, on the chain ending in
 /// `head_root`, whose post-state is `head_state`.
 ///
@@ -404,20 +419,15 @@ struct AttestationDataQuery {
 /// first refusal, the head is always the `beacon_block_root` answered.
 ///
 /// So is every request, with a `503`, on a node run without an execution
-/// client. Nothing validates a payload there: blocks import as
-/// `PayloadValidity::NotRequired` and never join the optimistic set, so
-/// [`require_validated`] would pass a head that nobody checked. Block
-/// production refuses the same way, for its own reason.
+/// client (see [`require_execution_client`]). Block production refuses the
+/// same way, for its own reason.
 async fn get_attestation_data(
     Query(query): Query<AttestationDataQuery>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
 ) -> Response {
-    if engine.is_none() {
-        return ApiError::ServiceUnavailable(
-            "no execution client configured to validate the head's payload with",
-        )
-        .into_response();
+    if let Err(err) = require_execution_client(&engine) {
+        return err.into_response();
     }
     match attestation_data(&store, query.slot) {
         Ok(data) => crate::json_response(serde_json::json!({ "data": data })),

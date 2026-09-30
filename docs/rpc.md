@@ -288,7 +288,8 @@ the chain actor writes, so no request waits on the actor.
 - **`aggregate_attestation`** answers from the pool: every vote held for the
   data root and committee, as electra's `Attestation` with the BLS aggregate of
   their signatures. `404` when nothing is held, and `503` when the block the
-  votes name is optimistic, whether or not it is the head.
+  votes name is optimistic, whether or not it is the head, or when no
+  execution client is configured.
 - **`aggregate_and_proofs`** checks each aggregate with the same
   `beacon_aggregate_and_proof` gossip conditions this node applies to its
   peers' aggregates (`gossip::aggregate`), signatures included, against a

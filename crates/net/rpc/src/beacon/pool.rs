@@ -24,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ethlambda_engine::EngineClient;
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool,
@@ -51,7 +52,7 @@ use tracing::{debug, warn};
 
 use crate::beacon::{
     ApiError,
-    validator::{head, require_validated},
+    validator::{head, require_execution_client, require_validated},
 };
 
 pub(crate) fn routes() -> Router<Store> {
@@ -344,12 +345,18 @@ struct AggregateQuery {
 ///
 /// A 503 when the aggregate votes for a block whose execution payload is still
 /// unvalidated (see [`require_validated`]). That block is the one the votes
-/// name, which need not be this node's head.
+/// name, which need not be this node's head. Also a 503 on a node run without
+/// an execution client (see [`require_execution_client`]), whose blocks all
+/// go unvalidated.
 async fn get_aggregate_attestation(
     State(store): State<Store>,
     Extension(pool): Extension<SharedAttestationPool>,
+    Extension(engine): Extension<Option<EngineClient>>,
     Query(query): Query<AggregateQuery>,
 ) -> Response {
+    if let Err(err) = require_execution_client(&engine) {
+        return err.into_response();
+    }
     let aggregate = pool
         .lock()
         .expect("attestation pool lock poisoned")
@@ -393,7 +400,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::test_utils::{RecordingNetwork, beacon_store_at};
+    use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
     use axum::{body::Body, http::Request};
     use ethlambda_state_transition::beacon::helpers::{
         accessors::get_beacon_committee,
@@ -563,9 +570,21 @@ mod tests {
         slot: u64,
         committee: u64,
     ) -> (StatusCode, serde_json::Value) {
+        get_aggregate_with(fixture, idle_engine(), data_root, slot, committee).await
+    }
+
+    /// [`get_aggregate`] from a node whose execution client is `engine`.
+    async fn get_aggregate_with(
+        fixture: &Fixture,
+        engine: Option<EngineClient>,
+        data_root: Root,
+        slot: u64,
+        committee: u64,
+    ) -> (StatusCode, serde_json::Value) {
         let app = routes()
             .with_state(fixture.store.clone())
-            .layer(Extension(fixture.pool.clone()));
+            .layer(Extension(fixture.pool.clone()))
+            .layer(Extension(engine));
         let uri = format!(
             "/eth/v2/validator/aggregate_attestation?attestation_data_root={data_root}&slot={slot}&committee_index={committee}"
         );
@@ -646,6 +665,24 @@ mod tests {
         store.remove_beacon_optimistic_root(data.beacon_block_root);
         let (status, _) = get_aggregate(&fixture, data.hash_tree_root(), data.slot, 0).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// With no execution client nothing is ever optimistic, so the check above
+    /// would let every aggregate through. The node refuses outright instead,
+    /// even with votes pooled for the block.
+    #[tokio::test]
+    async fn an_aggregate_from_a_node_without_an_execution_client_is_a_503() {
+        let fixture = fixture();
+        let votes = [attestation(&fixture, 0, 0)];
+        let (status, _) = submit(&fixture, &votes).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = votes[0].data;
+        assert!(!fixture.store.is_beacon_optimistic(data.beacon_block_root));
+
+        let (status, json) =
+            get_aggregate_with(&fixture, None, data.hash_tree_root(), data.slot, 0).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 503);
     }
 
     #[tokio::test]
