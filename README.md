@@ -13,12 +13,65 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 ### Beacon Chain follower
 
 Follows Ethereum mainnet from a checkpoint-synced anchor and serves the
-standard Beacon API on port 5052. It runs from the pre-built
-`ghcr.io/lambdaclass/ethlambda:beacon` image, so only
-[Docker](https://www.docker.com/get-started) is needed.
+standard Beacon API on port 5052, paired with an
+[ethrex](https://github.com/lambdaclass/ethrex) execution client that validates
+each block's execution payload. Both run from pre-built images
+(`ghcr.io/lambdaclass/ethlambda:beacon` and `ghcr.io/lambdaclass/ethrex`), so
+only [Docker](https://www.docker.com/get-started) is needed.
 
-This runs the consensus layer only, with no execution client: blocks are
-imported without validating their execution payloads.
+> **Warning:** this uses a lot of disk. ethrex needs at least 500 GB for
+> mainnet (1 TB recommended; see its
+> [hardware requirements](https://docs.ethrex.xyz/getting-started/hardware_requirements.html)).
+
+```sh
+docker pull ghcr.io/lambdaclass/ethlambda:beacon
+docker pull ghcr.io/lambdaclass/ethrex
+
+mkdir -p beacon-data ethrex-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# The secret both clients authenticate the Engine API with
+openssl rand -hex 32 > jwt.hex
+# This host's public address, published in the node's ENR (see below)
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+
+# A private network, so the beacon node reaches ethrex's Engine API by name
+# without publishing it on the host
+docker network create ethereum
+
+docker run -d --name ethrex --network ethereum \
+  -p 30303:30303 -p 30303:30303/udp \
+  -v "$PWD/ethrex-data:/data" \
+  -v "$PWD/jwt.hex:/jwt.hex:ro" \
+  ghcr.io/lambdaclass/ethrex \
+  --network           mainnet \
+  --datadir           /data \
+  --authrpc.addr      0.0.0.0 \
+  --authrpc.jwtsecret /jwt.hex
+
+# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
+docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
+  -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
+  -p 127.0.0.1:5052:5052 \
+  -v "$PWD/beacon-data:/data" \
+  -v "$PWD/jwt.hex:/jwt.hex:ro" \
+  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  --network                mainnet \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               /data/node-key \
+  --data-dir               /data/db \
+  --http-address           0.0.0.0 \
+  --discovery.advertise-ip "$PUBLIC_IP" \
+  --execution-endpoint     http://ethrex:8551 \
+  --execution-jwt-secret   /jwt.hex
+```
+
+<details>
+<summary>Running without an execution client</summary>
+
+To run the consensus layer only, drop ethrex, the shared network, the JWT secret
+and the two `--execution-*` flags. The node then follows the chain without
+validating execution payloads:
 
 ```sh
 docker pull ghcr.io/lambdaclass/ethlambda:beacon
@@ -35,12 +88,15 @@ docker run -d --name ethlambda-beacon --stop-signal SIGINT \
   -p 127.0.0.1:5052:5052 \
   -v "$PWD/beacon-data:/data" \
   ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  --network                mainnet \
   --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
   --node-key               /data/node-key \
   --data-dir               /data/db \
   --http-address           0.0.0.0 \
   --discovery.advertise-ip "$PUBLIC_IP"
 ```
+
+</details>
 
 `--discovery.advertise-ip` is the address published in the node's ENR. Behind
 Docker's port mapping the node cannot see its own public address, so without
@@ -54,6 +110,11 @@ downloads the finalized state (several hundred MB) and logs
 `Block parent missing, storing as pending` before `Block imported successfully`
 lines start. Later starts resume from `beacon-data/db`.
 
+ethrex logs `No messages from the consensus layer` until the beacon node's
+first fork choice update, then starts snap sync (`docker logs -f ethrex`).
+Until that finishes, which takes hours on mainnet, ethrex answers each payload
+`SYNCING` and the beacon node imports blocks optimistically.
+
 Check progress from another terminal:
 
 ```sh
@@ -64,12 +125,12 @@ The node has caught up once `sync_distance` (the chain's current slot minus
 `head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
 `false` during catch-up as well.
 
-For Sepolia or Hoodi, add
-`--network sepolia` or `--network hoodi` and point `--checkpoint-sync-url` at
-that network's provider. To validate payloads, pair the node with an execution
-client through `--execution-endpoint` and `--execution-jwt-secret`; see
+For Sepolia or Hoodi, change `--network mainnet` to `--network sepolia` or
+`--network hoodi` in both the ethrex and the beacon node arguments (not Docker's
+own `--network ethereum`), and point `--checkpoint-sync-url` at that network's
+provider. See
 [`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
-those and the remaining flags.
+the remaining flags.
 
 ### Lean consensus devnet
 
