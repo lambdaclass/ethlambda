@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ethlambda_engine::EngineClient;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
@@ -401,10 +402,23 @@ struct AttestationDataQuery {
 /// refused: neither is a slot a validator is asked to attest to. So is an
 /// optimistic head, with a `503` (see [`require_validated`]); because of the
 /// first refusal, the head is always the `beacon_block_root` answered.
+///
+/// So is every request, with a `503`, on a node run without an execution
+/// client. Nothing validates a payload there: blocks import as
+/// `PayloadValidity::NotRequired` and never join the optimistic set, so
+/// [`require_validated`] would pass a head that nobody checked. Block
+/// production refuses the same way, for its own reason.
 async fn get_attestation_data(
     Query(query): Query<AttestationDataQuery>,
     State(store): State<Store>,
+    Extension(engine): Extension<Option<EngineClient>>,
 ) -> Response {
+    if engine.is_none() {
+        return ApiError::ServiceUnavailable(
+            "no execution client configured to validate the head's payload with",
+        )
+        .into_response();
+    }
     match attestation_data(&store, query.slot) {
         Ok(data) => crate::json_response(serde_json::json!({ "data": data })),
         Err(err) => err.into_response(),
@@ -451,7 +465,7 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::beacon_store_at;
+    use crate::test_utils::{beacon_store_at, idle_engine};
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -660,17 +674,29 @@ mod tests {
         state
     }
 
+    /// `attestation_data` for `slot`, from a node whose execution client is
+    /// `engine`.
+    async fn fetch_attestation_data(
+        store: Store,
+        slot: Slot,
+        engine: Option<EngineClient>,
+    ) -> (StatusCode, serde_json::Value) {
+        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
+        let request = Request::get(uri).body(Body::empty()).unwrap();
+        let app = routes().with_state(store).layer(Extension(engine));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
     async fn attestation_data_for(
         state: BeaconState,
         slot: Slot,
     ) -> (StatusCode, serde_json::Value, H256) {
         let (store, head_root) = beacon_store_at(state);
-        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
-        let request = Request::get(uri).body(Body::empty()).unwrap();
-        let response = routes().with_state(store).oneshot(request).await.unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, serde_json::from_slice(&body).unwrap(), head_root)
+        let (status, json) = fetch_attestation_data(store, slot, idle_engine()).await;
+        (status, json, head_root)
     }
 
     #[tokio::test]
@@ -737,22 +763,30 @@ mod tests {
         let state = fulu_state_at(0);
         let slot = state.slot();
         let (mut store, head_root) = beacon_store_at(state);
-        let uri = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=0");
-        let fetch = |store: Store| {
-            let request = Request::get(&uri).body(Body::empty()).unwrap();
-            routes().with_state(store).oneshot(request)
-        };
 
         store.insert_beacon_optimistic_root(head_root, slot);
-        let response = fetch(store.clone()).await.unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let (status, json) = fetch_attestation_data(store.clone(), slot, idle_engine()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["code"], 503);
 
         store.remove_beacon_optimistic_root(head_root);
-        let response = fetch(store).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let (status, _) = fetch_attestation_data(store, slot, idle_engine()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Without an execution client no head is ever optimistic, since nothing
+    /// was asked, so the optimistic check alone would answer. The node refuses
+    /// outright instead.
+    #[tokio::test]
+    async fn a_node_without_an_execution_client_is_a_503() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (store, head_root) = beacon_store_at(state);
+        assert!(!store.is_beacon_optimistic(head_root));
+
+        let (status, json) = fetch_attestation_data(store, slot, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 503);
     }
 
     #[tokio::test]

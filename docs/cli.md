@@ -129,7 +129,8 @@ finished filling until it backfills the difference.
 
 With neither execution flag, the follower contacts no execution client and
 imports blocks without validating their payloads, which is what it did before
-those flags existed. Supplying one without the other is refused at startup: an
+those flags existed. It then answers `attestation_data` and block production
+with `503`, so a validator client cannot use it. Supplying one without the other is refused at startup: an
 Engine API endpoint always requires authentication. See
 [the execution layer pairing](./beacon_engine.md) for what each verdict does and
 for the limitations that go with the retry ladder.
