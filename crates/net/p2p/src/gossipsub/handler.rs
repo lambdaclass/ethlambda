@@ -311,11 +311,12 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 /// node holds topics under two digests (see `beacon::transition`), so a late
 /// but perfectly legitimate sidecar can still arrive on the old digest's
 /// topic, and a clock check ahead of the decode would drop it, mistaking it for
-/// the new fork's shape just because the clock has moved on. Only on a decode
-/// failure does the fork matter, and `fork` is the one the message's own topic
-/// digest names: a failure under a fork this build does not follow is its own
-/// gap, so `Ignore`; under a followed fork it is the sender's fault, so
-/// `Reject`.
+/// the new fork's shape just because the clock has moved on. `fork` is the one
+/// the message's own topic digest names, and it picks the container to decode
+/// (fulu's and gloas's differ) and the cheap rules to run. On a decode failure
+/// it also decides the verdict: a failure under a fork this build does not
+/// follow is its own gap, so `Ignore`; under a followed fork it is the
+/// sender's fault, so `Reject`.
 fn triage_data_column(
     server: &P2PServer,
     fork: ForkName,

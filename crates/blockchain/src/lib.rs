@@ -44,7 +44,7 @@ use spawned_concurrency::tasks::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::beacon_columns::ParkedColumn;
+use crate::beacon_columns::{ColumnParking, ParkedColumn};
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEventSnapshot;
 use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
@@ -403,6 +403,7 @@ impl BlockChain {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             beacon_aggregates: Default::default(),
             custody_columns,
             engine,
@@ -506,6 +507,9 @@ pub struct BlockChainServer {
     /// is not one: a replay checks and stores each sidecar on its own, and a
     /// held block is released by its last column arriving, whichever that is.
     sidecars_awaiting_parent: HashMap<H256, HashSet<ParkedColumn>>,
+    /// What bounds [`Self::sidecars_awaiting_parent`]: its running size, and
+    /// which gloas roots are parked at each slot.
+    column_parking: ColumnParking,
 
     /// The columns this node samples, computed once at startup from its node
     /// id (see `das::custody_columns`). Empty on lean.
@@ -1957,6 +1961,7 @@ impl BlockChainServer {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             custody_columns: Vec::new(),
             engine,
             safe_slots_to_import_optimistically,
@@ -4223,6 +4228,7 @@ mod tests {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             beacon_aggregates: Default::default(),
             custody_columns: Vec::new(),
             engine: None,
@@ -4275,7 +4281,7 @@ mod tests {
     /// what `Store::insert_signed_block` writes into `LiveChain`, which is
     /// all `get_checkpoint_block`'s ancestry walk ever reads. The fork is
     /// irrelevant to that walk, so the cheapest shape to build stands in.
-    fn bare_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+    pub(crate) fn bare_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
         SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot,
@@ -4522,12 +4528,17 @@ mod tests {
         store
     }
 
+    /// One blob's worth of column and proof, the smallest shape the parking
+    /// lot accepts.
     pub(crate) fn gloas_sidecar_at(slot: u64, block_root: H256, index: u64) -> DataColumnSidecar {
+        let cell: fulu::Cell = libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL])
+            .expect("exact cell size");
         DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
             index,
             slot,
             beacon_block_root: block_root,
-            ..Default::default()
+            column: vec![cell].try_into().expect("one cell"),
+            kzg_proofs: vec![Default::default()].try_into().expect("one proof"),
         })
     }
 
