@@ -362,7 +362,7 @@ static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock
 static LEAN_BEACON_FORK_DIGEST: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     register_int_gauge_vec!(
         "lean_beacon_fork_digest",
-        "The fork digest this node computed at startup, as a label",
+        "The fork digest this node currently publishes under, as a label",
         &["digest"]
     )
     .unwrap()
@@ -478,9 +478,13 @@ pub fn inc_beacon_status_digest_mismatch() {
     LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
 }
 
-/// Publish the computed fork digest as a label, so a dashboard can tell at a
+/// Publish the current fork digest as a label, so a dashboard can tell at a
 /// glance whether a node is stranded on a boundary it failed to cross.
+///
+/// Resets the vector first: the digest changes at runtime, and a label left
+/// behind at 1 would read as two current digests.
 pub fn set_beacon_fork_digest(digest: &str) {
+    LEAN_BEACON_FORK_DIGEST.reset();
     LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
 }
 
@@ -614,4 +618,27 @@ pub fn observe_beacon_aggregate_decode(duration: std::time::Duration) {
         .unwrap()
     });
     LEAN_BEACON_AGGREGATE_DECODE_SECONDS.observe(duration.as_secs_f64());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_current_fork_digest_reads_one() {
+        set_beacon_fork_digest("aaaaaaaa");
+        set_beacon_fork_digest("bbbbbbbb");
+        assert_eq!(
+            LEAN_BEACON_FORK_DIGEST
+                .with_label_values(&["bbbbbbbb"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            LEAN_BEACON_FORK_DIGEST
+                .with_label_values(&["aaaaaaaa"])
+                .get(),
+            0
+        );
+    }
 }

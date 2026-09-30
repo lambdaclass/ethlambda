@@ -14,7 +14,6 @@ use crate::beacon::constants;
 use crate::beacon::containers::shared::ForkData;
 use crate::beacon::fork::ForkName;
 use crate::beacon::primitives::{Epoch, ForkDigest, HashTreeRoot as _, Root, Version};
-use crate::enr::EnrForkId;
 
 /// The root binding a fork version to a chain's genesis validator set.
 ///
@@ -70,24 +69,6 @@ pub fn next_fork_boundary(config: &Config, epoch: Epoch) -> Option<Epoch> {
         .chain(config.blob_schedule.iter().map(|entry| entry.epoch))
         .filter(|&boundary| boundary != constants::FAR_FUTURE_EPOCH && boundary > epoch)
         .min()
-}
-
-/// The `eth2` ENR entry for this chain at this epoch.
-///
-/// `next_fork_*` point at the next boundary that moves the digest, which
-/// includes blob-parameter-only forks. Peers tolerate a difference here by
-/// design: only `fork_digest` has to match.
-pub fn enr_fork_id(config: &Config, genesis_validators_root: Root, epoch: Epoch) -> EnrForkId {
-    let fork_digest = compute_fork_digest(config, genesis_validators_root, epoch);
-    // With no boundary ahead, the spec says to repeat the current fork's own
-    // version and name `FAR_FUTURE_EPOCH` as the epoch it activates at.
-    let boundary = next_fork_boundary(config, epoch);
-    let named_epoch = boundary.unwrap_or(epoch);
-    EnrForkId {
-        fork_digest,
-        next_fork_version: config.fork_version(config.fork_at_epoch(named_epoch)),
-        next_fork_epoch: boundary.unwrap_or(constants::FAR_FUTURE_EPOCH),
-    }
 }
 
 #[cfg(test)]

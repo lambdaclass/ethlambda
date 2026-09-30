@@ -235,20 +235,20 @@ fn handle_beacon_gossip(
         debug!(kind, "Beacon gossip arrived on a lean node");
         return;
     };
+    // The fork comes from the topic's own digest: while a boundary's window is
+    // open the node is subscribed under two, and `wire.fork` is only the one it
+    // publishes under.
+    let topic_fork = beacon_topics::topic_digest(topic)
+        .and_then(|digest| wire.schedule.fork_for_digest(digest))
+        .unwrap_or(wire.fork);
     let dispatch = if kind == beacon_topics::BEACON_BLOCK {
         triage_block(server, wire, payload)
     } else if let Some(subnet_id) = beacon_topics::data_column_subnet(kind) {
-        triage_data_column(server, payload, subnet_id)
+        triage_data_column(server, topic_fork, payload, subnet_id)
     } else if kind == beacon_topics::BEACON_AGGREGATE_AND_PROOF {
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
-        // The fork comes from the topic's own digest: while a boundary's
-        // window is open the node is subscribed under two, and `wire.fork` is
-        // only the one it publishes under.
-        let fork = beacon_topics::topic_digest(topic)
-            .and_then(|digest| wire.schedule.fork_for_digest(digest))
-            .unwrap_or(wire.fork);
-        triage_attestation(server, fork, payload, subnet_id)
+        triage_attestation(server, topic_fork, payload, subnet_id)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -307,32 +307,26 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 /// Decode a data column sidecar and run its cheap gossip checks. Same shape as
 /// [`triage_block`].
 ///
-/// Decodes first, unlike the clock-based gate this used to be: gossipsub
-/// topic subscriptions are frozen at startup (`build_swarm` does not
-/// resubscribe as a fork boundary is crossed), so a node running across the
-/// gloas boundary stays on its fulu-digest topic the whole time, where a
-/// late but perfectly legitimate fulu sidecar can still legally arrive. A
-/// clock check ahead of the decode would drop that one too, mistaking it for
-/// gloas-shaped just because the clock has moved on. Only on a decode
-/// failure does the clock matter, and only as an approximation: this node's
-/// *topic* fork (whichever one gossip actually subscribed under at startup)
-/// is not threaded down to this handler today, so [`beacon_decode::current_fork`]
-/// (the wall clock) stands in for it. That is exactly backwards for a node
-/// stuck on stale fulu topics past the boundary, the same case this doc
-/// opens with: a genuinely malformed fulu sidecar arriving there reads as
-/// `Ignore` instead of `Reject`, since the clock alone cannot tell "stale
-/// topic, bad bytes" apart from "current topic, gloas-shaped bytes". Safe
-/// either way, since `Ignore` never down-scores a peer; a future change that
-/// carries the topic's own fork into `BeaconWire` (or wherever else carries
-/// the fork digest to this handler) can make this exact instead of merely
-/// safe.
-fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
+/// Decodes first rather than gating on the clock: around a fork boundary the
+/// node holds topics under two digests (see `beacon::transition`), so a late
+/// but perfectly legitimate sidecar can still arrive on the old digest's
+/// topic, and a clock check ahead of the decode would drop it, mistaking it for
+/// the new fork's shape just because the clock has moved on. Only on a decode
+/// failure does the fork matter, and `fork` is the one the message's own topic
+/// digest names: a failure under a fork this build does not follow is its own
+/// gap, so `Ignore`; under a followed fork it is the sender's fault, so
+/// `Reject`.
+fn triage_data_column(
+    server: &P2PServer,
+    fork: ForkName,
+    payload: &[u8],
+    subnet_id: u64,
+) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
     let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
-            let config = server.store.config();
-            if !beacon_decode::current_fork(&config).is_followed() {
+            if !fork.is_followed() {
                 metrics::inc_beacon_gossip(KIND, "unsupported_fork");
                 return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
             }
@@ -641,7 +635,7 @@ pub async fn publish_beacon_attestation(
         return;
     }
     let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
-        beacon.fork_digest,
+        beacon.digest_for_slot(slot),
         subnet_id,
     ));
     let compressed = compress_message(&attestation.to_ssz());
@@ -671,7 +665,7 @@ pub async fn publish_beacon_aggregate(
         return;
     };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        beacon.digest_for_slot(slot),
         beacon_topics::BEACON_AGGREGATE_AND_PROOF,
     ));
     // Each fork's container encodes as itself on the wire; the enum is only
@@ -699,7 +693,7 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         return;
     };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        beacon.digest_for_slot(slot),
         beacon_topics::BEACON_BLOCK,
     ));
     server
@@ -959,7 +953,7 @@ mod tests {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
 
         assert!(matches!(
-            triage_data_column(&server, &[0xff; 3], 0),
+            triage_data_column(&server, ForkName::Fulu, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -974,7 +968,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::FutureSlot))
         ));
     }
@@ -995,7 +989,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Validate(Validated::Column(_))
         ));
     }
@@ -1013,7 +1007,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 1),
+            triage_data_column(&server, ForkName::Fulu, &payload, 1),
             Dispatch::Report(Outcome::Reject(RejectReason::WrongSubnet))
         ));
     }

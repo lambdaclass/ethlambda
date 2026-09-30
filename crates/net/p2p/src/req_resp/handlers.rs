@@ -46,6 +46,7 @@ use crate::beacon::messages::{
 use crate::beacon::protocols::{
     MAX_REQUEST_BLOCKS as MAX_BEACON_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB,
 };
+use crate::beacon::transition;
 use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::MAX_REQUEST_BLOCKS;
@@ -56,6 +57,7 @@ use crate::{
     RangeSyncState, ReqRespProtocol, ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics,
     p2p_protocol,
 };
+use ethlambda_types::time::unix_now_ms;
 use libp2p::request_response::ResponseChannel;
 
 /// `protocol` names which [`ReqResp`](super::ReqResp) field `event` came
@@ -1696,6 +1698,18 @@ async fn handle_status_response(
             "Handshake answered from another fork digest"
         );
         metrics::inc_beacon_status_digest_mismatch();
+        return;
+    }
+    // Answered at any held digest, but only synced from on the current one (or
+    // the next, within clock skew): after a boundary, a peer still on the old
+    // digest has not upgraded, and its chain is not the one being followed.
+    if !transition::is_syncable_digest(wire, status.fork_digest(), unix_now_ms()) {
+        debug!(
+            %peer,
+            peer_digest = %hex::encode(status.fork_digest()),
+            our_digest = %hex::encode(wire.fork_digest),
+            "Not syncing from a peer on a superseded fork digest"
+        );
         return;
     }
     let peer_head_slot = status.head_slot();

@@ -211,17 +211,31 @@ impl BeaconTopics {
     /// The topics to hold under `fork_digest`, for the fork that digest names.
     ///
     /// The one place a fork may change which topic kinds exist: a fork that adds
-    /// a kind extends what this returns for its own digest, and the transition
-    /// then joins those topics at the pre-boundary epoch the spec asks for.
-    /// Today every fork subscribes to the same kinds, so `fork` is read by
-    /// nothing yet.
+    /// a kind extends its own arm, and the transition then joins those topics
+    /// ahead of the boundary as the spec asks. Every arm is named so a new fork
+    /// forces a decision here.
     pub fn for_fork(
-        _fork: ForkName,
+        fork: ForkName,
         fork_digest: ForkDigest,
         column_subnets: &[u64],
         attestation_subnets: &[u64],
     ) -> Self {
-        Self::new(fork_digest, column_subnets, attestation_subnets)
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
+            // Gloas adds topics of its own (payload envelopes, payload
+            // attestations) that the follower does not yet consume, so for now
+            // it holds the same set.
+            ForkName::Gloas => Self::new(fork_digest, column_subnets, attestation_subnets),
+            ForkName::Lean => {
+                unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
+            }
+        }
     }
 
     pub fn new(
