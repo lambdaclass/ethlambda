@@ -164,8 +164,9 @@ reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.
 
-The rules above are fulu's. A message from a fork this build has no rules for,
-gloas today, is IGNOREd with the reason `unsupported_fork` and is never scored
+The rules above are fulu's, except that blocks and data columns also have
+gloas rules. An aggregate, attester slashing or attestation from a fork this
+build has no rules for, gloas today, is IGNOREd with the reason `unsupported_fork` and is never scored
 against the peer: the decoders answer `DecodeError::UnsupportedFork`, not `Ssz`,
 for a gloas aggregate, attester slashing or subnet attestation, or for a block
 at a gloas slot that fails to decode, since an honest

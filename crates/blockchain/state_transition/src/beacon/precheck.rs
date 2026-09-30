@@ -264,12 +264,15 @@ mod tests {
         let BeaconState::Gloas(inner) = &mut parent else {
             unreachable!("with_validators_at(Gloas) builds a gloas state");
         };
-        for entry in inner.proposer_lookahead.iter_mut() {
-            *entry = 6;
+        for (offset, entry) in inner.proposer_lookahead.iter_mut().enumerate() {
+            *entry = offset as ValidatorIndex;
         }
-        let slot = parent.slot() + 1;
-        assert_eq!(fixed_proposer(&parent, slot), Some(6));
         let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
+        let slot = parent.slot() + 1;
+        assert_eq!(
+            fixed_proposer(&parent, slot),
+            Some((slot - window_start) as ValidatorIndex)
+        );
         let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
         assert_eq!(fixed_proposer(&parent, beyond), None);
     }

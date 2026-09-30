@@ -319,7 +319,8 @@ section of `fork_choice.rs` (fork choice), and `containers/gloas.rs` in
 The live follower does not follow gloas yet. `process_or_pend_block` refuses a
 gloas block and `refuse_unfollowable_fork` refuses a gloas anchor at startup,
 because nothing delivers payload envelopes or payload attestations to the chain
-actor. Gloas gossip is answered with `Ignore(UnsupportedFork)` rather than
+actor. Gloas blocks and data columns are validated by their own gossip rules;
+the other gloas topics are answered with `Ignore(UnsupportedFork)` rather than
 scored, so an honest peer past the fork epoch is not penalized.
 
 ### The deferred payload
@@ -551,9 +552,8 @@ ignored runs. The ignored cases are deliberate exclusions:
   state transition and fork choice, and is not in this module's scope.
 - `networking/gossip_*` cases outside what the node validates: every fork's
   cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
-  of the four it validates, and the fulu vectors in `SKIPPED`, which assume a
-  bad-block cache. A gloas message is refused with `Ignore(UnsupportedFork)`
-  before any rule runs.
+  of the aggregate and attestation topics (block and data column validate fulu
+  and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
 
