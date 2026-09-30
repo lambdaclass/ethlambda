@@ -35,11 +35,12 @@ use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot, Uint256};
 /// is what lets `update_latest_messages` tell such a re-vote apart from a
 /// stale one). Splitting the two into per-fork types would mean every reader
 /// of a [`LatestMessage`] picks a variant instead of a field, for a value that
-/// is otherwise identical; carrying both instead lets every fork's own
-/// constructor fill in the one it has and leave the other at its fork's own
-/// neutral value (pre-gloas: `slot: data.slot, payload_present: false`; gloas
-/// has no use for `epoch`, so nothing in this crate reads it off a gloas
-/// message).
+/// is otherwise identical; carrying both instead lets one constructor,
+/// `update_latest_messages`, fill in both for every fork (`epoch` from the
+/// attestation's target, `slot` from its data), with only the fork's own
+/// comparison reading one of them: pre-gloas orders by `epoch`, gloas by
+/// `slot`. `payload_present` is the one field a fork leaves neutral
+/// (`false` before gloas).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatestMessage {
     pub epoch: Epoch,
