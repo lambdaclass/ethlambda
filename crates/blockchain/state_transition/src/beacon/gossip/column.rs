@@ -19,6 +19,7 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{DATA_COLUMN_SIDECAR_SUBNET_COUNT, DOMAIN_BEACON_PROPOSER};
 use crate::beacon::containers::BeaconState;
+use crate::beacon::containers::DataColumnSidecar as AnyDataColumnSidecar;
 use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
@@ -105,8 +106,10 @@ pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
 pub enum ChainVerdict {
     /// Passed every rule: the chain stores it as it is.
     Keep,
-    /// Its parent has no post-state yet. The chain parks it and sends it back
-    /// through [`chain_checks`] once the parent imports.
+    /// The block it is judged against has no post-state yet: its parent for a
+    /// fulu sidecar, its own block for a gloas one (whose commitments are in
+    /// that block's bid). The chain parks it and sends it back through
+    /// [`chain_checks_for`] once that block imports.
     AwaitParent,
     /// Not kept. The outcome says why: an `Ignore` or a `Reject`, or
     /// `Queue(ParentNotReady)` when the parent has a post-state but its
@@ -166,6 +169,55 @@ pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> 
     };
     match judge_against_parent(store, sidecar, &parent_state, PastLookahead::Advance) {
         Outcome::Accept => ChainVerdict::Keep,
+        outcome => ChainVerdict::Drop(outcome),
+    }
+}
+
+/// [`chain_checks`] or [`chain_checks_gloas`], by the sidecar's shape.
+pub fn chain_checks_for(
+    store: &Store,
+    sidecar: &AnyDataColumnSidecar,
+    now_ms: u64,
+) -> ChainVerdict {
+    match sidecar {
+        AnyDataColumnSidecar::Fulu(sidecar) => chain_checks(store, sidecar, now_ms),
+        AnyDataColumnSidecar::Gloas(sidecar) => chain_checks_gloas(store, sidecar, now_ms),
+    }
+}
+
+/// [`chain_checks`] for a gloas sidecar: the gloas gossip rules minus the two
+/// that only mean something on a gossip topic (the subnet match and the seen
+/// cache).
+///
+/// What the stateful half cannot yet judge is [`ChainVerdict::AwaitParent`]:
+/// a block not seen, or seen without a post-state. Unlike a fulu header, a
+/// gloas sidecar carries no signature, so nothing here can refuse a forged one
+/// before it is parked; the future-slot and finalized rules bound how long a
+/// made-up key can sit there.
+pub fn chain_checks_gloas(
+    store: &Store,
+    sidecar: &gloas::DataColumnSidecar,
+    now_ms: u64,
+) -> ChainVerdict {
+    let config = store.config();
+    // [IGNORE] Not from a future slot. Also what bounds how far ahead a
+    // parked row can name.
+    if is_future_slot(&config, sidecar.slot, now_ms) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::FutureSlot));
+    }
+    // [IGNORE] From a slot greater than the latest finalized slot.
+    if sidecar.slot <= finalized_start_slot(store) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized));
+    }
+    // [IGNORE] Already stored, as in [`chain_checks`].
+    if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
+    }
+    match stateful_checks_gloas(store, sidecar) {
+        Outcome::Accept => ChainVerdict::Keep,
+        Outcome::Queue(QueueReason::BlockUnknown | QueueReason::BlockNotReady) => {
+            ChainVerdict::AwaitParent
+        }
         outcome => ChainVerdict::Drop(outcome),
     }
 }

@@ -15,7 +15,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
+        containers::{DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock},
         preset,
         primitives::ValidatorIndex,
         signing::compute_epoch_at_slot,
@@ -25,7 +25,6 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
     time::unix_now_ms,
 };
-use libssz::{SszDecode as _, SszEncode as _};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -145,6 +144,18 @@ struct ParkedColumn {
     slot: u64,
     block_root: H256,
     index: u64,
+}
+
+/// The root whose post-state `sidecar` cannot be checked without.
+///
+/// A fulu sidecar is verified against its parent's state (its proposer and
+/// signature live there). A gloas sidecar carries neither, but reads its
+/// commitments from its own block's bid, so it waits for that block instead.
+fn awaited_root(sidecar: &DataColumnSidecar) -> H256 {
+    match sidecar {
+        DataColumnSidecar::Fulu(sidecar) => sidecar.signed_block_header.message.parent_root,
+        DataColumnSidecar::Gloas(sidecar) => sidecar.beacon_block_root,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,7 +519,11 @@ pub struct BlockChainServer {
     /// never have can therefore grow it until finality reclaims the slots;
     /// see [`Self::queue_sidecar_awaiting_parent`]. Always empty on lean.
     ///
-    /// A set per parent, so "the same column is never parked twice" is the
+    /// Keyed by the root whose post-state the sidecar is judged against: its
+    /// parent for a fulu sidecar, its own block for a gloas one, whose
+    /// commitments are in that block's bid ([`awaited_root`]).
+    ///
+    /// A set per root, so "the same column is never parked twice" is the
     /// container's own rule rather than a scan every arrival pays for. Order
     /// is not one: a replay checks and stores each sidecar on its own, and a
     /// held block is released by its last column arriving, whichever that is.
@@ -826,12 +841,18 @@ fn data_availability_for(
             let sidecars = custody_columns
                 .iter()
                 .map(|&index| {
-                    let encoded = store
-                        .get_data_column_sidecar(slot, &block_root, index)
-                        .expect("DB read should succeed")
-                        .expect("presence just confirmed above");
-                    fulu::DataColumnSidecar::from_ssz_bytes(&encoded)
+                    let sidecar = store
+                        .get_data_column(slot, &block_root, index)
                         .expect("a sidecar this node verified before storing decodes")
+                        .expect("presence just confirmed above");
+                    match sidecar {
+                        DataColumnSidecar::Fulu(sidecar) => sidecar,
+                        // The row decodes by its slot's fork, and this arm is
+                        // the fulu block at that slot.
+                        DataColumnSidecar::Gloas(_) => {
+                            unreachable!("a fulu block's slot decodes its rows as fulu")
+                        }
+                    }
                 })
                 .collect();
 
@@ -3261,15 +3282,15 @@ impl BlockChainServer {
     ///
     /// Beacon-only: a lean node subscribes to no column subnet, so nothing
     /// ever delivers this message there.
-    async fn on_checked_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
+    async fn on_checked_data_columns(&mut self, sidecars: Vec<DataColumnSidecar>) {
         for sidecar in sidecars {
             #[cfg(debug_assertions)]
             {
                 use ethlambda_state_transition::beacon::gossip::{
                     Outcome,
-                    column::{ChainVerdict, chain_checks},
+                    column::{ChainVerdict, chain_checks_for},
                 };
-                let verdict = chain_checks(&self.store, &sidecar, unix_now_ms());
+                let verdict = chain_checks_for(&self.store, &sidecar, unix_now_ms());
                 assert!(
                     matches!(
                         verdict,
@@ -3283,10 +3304,10 @@ impl BlockChainServer {
     }
 
     /// Store a checked sidecar and release the held block it may complete.
-    async fn keep_data_column(&mut self, sidecar: fulu::DataColumnSidecar) {
-        let header = &sidecar.signed_block_header.message;
-        let slot = header.slot;
-        let block_root = header.hash_tree_root();
+    async fn keep_data_column(&mut self, sidecar: DataColumnSidecar) {
+        let slot = sidecar.slot();
+        let block_root = sidecar.block_root();
+        let index = sidecar.index();
 
         // Two copies of one column can pass the checks at once (from gossip
         // and from a fetch, say). The second write would store the same row
@@ -3295,14 +3316,11 @@ impl BlockChainServer {
             .store
             .data_column_indices_for(slot, &block_root)
             .expect("DB read should succeed");
-        if stored.contains(&sidecar.index) {
+        if stored.contains(&index) {
             return;
         }
 
-        if let Err(err) =
-            self.store
-                .put_data_column_sidecar(slot, &block_root, sidecar.index, sidecar.to_ssz())
-        {
+        if let Err(err) = self.store.put_data_column(&sidecar) {
             error!(%err, "Failed to store a data column sidecar");
             return;
         }
@@ -3322,23 +3340,22 @@ impl BlockChainServer {
     /// run again, so a sidecar parked now would wait for nothing until
     /// finality evicts it. Asked with the same `get_state` the checks use, so
     /// a sidecar sent back is one they will find a parent state for.
-    fn park_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
+    fn park_data_columns(&mut self, sidecars: Vec<DataColumnSidecar>) {
         let mut ready = Vec::new();
         for sidecar in sidecars {
-            let parent_root = sidecar.signed_block_header.message.parent_root;
-            if matches!(self.store.get_state(&parent_root), Ok(Some(_))) {
+            let awaited = awaited_root(&sidecar);
+            if matches!(self.store.get_state(&awaited), Ok(Some(_))) {
                 ready.push(sidecar);
                 continue;
             }
-            let block_root = sidecar.signed_block_header.message.hash_tree_root();
-            self.queue_sidecar_awaiting_parent(block_root, sidecar);
+            self.queue_sidecar_awaiting_parent(awaited, sidecar);
         }
         self.send_data_columns_for_checks(ready);
     }
 
     /// Hand sidecars to the p2p layer's chain checks, which send back the
     /// ones that pass through `new_data_column_sidecars`.
-    fn send_data_columns_for_checks(&self, sidecars: Vec<fulu::DataColumnSidecar>) {
+    fn send_data_columns_for_checks(&self, sidecars: Vec<DataColumnSidecar>) {
         if sidecars.is_empty() {
             return;
         }
@@ -3384,17 +3401,11 @@ impl BlockChainServer {
     /// header still reaches here and parks a row. A peer exploiting either
     /// gap can still park rows as fast as it can invent a slot, proposer and
     /// index, until finality catches up.
-    fn queue_sidecar_awaiting_parent(
-        &mut self,
-        block_root: H256,
-        sidecar: fulu::DataColumnSidecar,
-    ) {
-        let header = &sidecar.signed_block_header.message;
-        let parent_root = header.parent_root;
+    fn queue_sidecar_awaiting_parent(&mut self, awaited: H256, sidecar: DataColumnSidecar) {
         let parked = ParkedColumn {
-            slot: header.slot,
-            block_root,
-            index: sidecar.index,
+            slot: sidecar.slot(),
+            block_root: sidecar.block_root(),
+            index: sidecar.index(),
         };
 
         // A re-delivery of something already parked. The by-root and by-range
@@ -3407,7 +3418,7 @@ impl BlockChainServer {
         // because the write is what costs.
         if self
             .sidecars_awaiting_parent
-            .get(&parent_root)
+            .get(&awaited)
             .is_some_and(|parked_columns| parked_columns.contains(&parked))
         {
             return;
@@ -3415,12 +3426,7 @@ impl BlockChainServer {
 
         // The bytes go to disk before the key goes in the map, so a failed
         // write leaves no key pointing at a row that is not there.
-        if let Err(err) = self.store.put_pending_data_column_sidecar(
-            parked.slot,
-            &parked.block_root,
-            parked.index,
-            sidecar.to_ssz(),
-        ) {
+        if let Err(err) = self.store.put_pending_data_column(&sidecar) {
             error!(%err, "Failed to park a data column sidecar");
             return;
         }
@@ -3428,11 +3434,11 @@ impl BlockChainServer {
         trace!(
             slot = parked.slot,
             column = parked.index,
-            parent_root = %ShortRoot(&parent_root.0),
-            "Queueing a data column sidecar until its parent has a post-state"
+            awaited = %ShortRoot(&awaited.0),
+            "Queueing a data column sidecar until the block it is judged against has a post-state"
         );
         self.sidecars_awaiting_parent
-            .entry(parent_root)
+            .entry(awaited)
             .or_default()
             .insert(parked);
         self.publish_sidecars_awaiting_parent();
@@ -3471,12 +3477,12 @@ impl BlockChainServer {
             // replay that passes is written to `DataColumns`, and one that
             // fails a check has been judged, so neither leaves anything worth
             // keeping here.
-            let encoded = match self.store.take_pending_data_column_sidecar(
+            let sidecar = match self.store.take_pending_data_column(
                 parked.slot,
                 &parked.block_root,
                 parked.index,
             ) {
-                Ok(Some(encoded)) => encoded,
+                Ok(Some(sidecar)) => sidecar,
                 Ok(None) => {
                     error!(
                         slot = parked.slot,
@@ -3490,14 +3496,6 @@ impl BlockChainServer {
                     error!(%err, "Failed to read back a parked data column sidecar");
                     continue;
                 }
-            };
-            let Ok(sidecar) = fulu::DataColumnSidecar::from_ssz_bytes(&encoded) else {
-                error!(
-                    slot = parked.slot,
-                    column = parked.index,
-                    "A parked data column sidecar did not decode"
-                );
-                continue;
             };
             sidecars.push(sidecar);
         }
@@ -4167,11 +4165,14 @@ mod tests {
     use ethlambda_state_transition::beacon::fork_choice::seconds_to_milliseconds;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{BeaconState, deneb, electra, phase0, shared};
+    use ethlambda_types::beacon::containers::{
+        BeaconState, deneb, electra, fulu, gloas, phase0, shared,
+    };
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::state::State;
+    use libssz::SszEncode as _;
 
     const GENESIS_TIME: u64 = 1_000;
 
@@ -4644,7 +4645,7 @@ mod tests {
     /// recorded: nothing under test here sends the others.
     #[derive(Default)]
     struct RecordingP2P {
-        checks: std::sync::Mutex<Vec<Vec<fulu::DataColumnSidecar>>>,
+        checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
         fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
@@ -4676,7 +4677,7 @@ mod tests {
         }
         fn check_data_column_sidecars(
             &self,
-            sidecars: Vec<fulu::DataColumnSidecar>,
+            sidecars: Vec<DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.checks.lock().unwrap().push(sidecars);
             Ok(())
@@ -4692,9 +4693,10 @@ mod tests {
     }
 
     /// A beacon store whose clock reads slot 10, so a sidecar at slot 10 is
-    /// neither future nor finalized.
+    /// neither future nor finalized. Fulu is active from genesis, since a
+    /// stored sidecar is decoded as the fork its slot names.
     fn beacon_store_at_slot_10() -> Store {
-        let mut store = beacon_store(GENESIS_TIME, 0);
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
         store
             .set_time_ms(seconds_to_milliseconds(
                 GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
@@ -4713,7 +4715,9 @@ mod tests {
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.keep_data_column(sidecar).await;
+        server
+            .keep_data_column(DataColumnSidecar::Fulu(sidecar))
+            .await;
 
         assert_eq!(
             server
@@ -4737,7 +4741,9 @@ mod tests {
         // keep it.
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
 
-        server.on_checked_data_columns(vec![sidecar]).await;
+        server
+            .on_checked_data_columns(vec![DataColumnSidecar::Fulu(sidecar)])
+            .await;
     }
 
     #[test]
@@ -4749,7 +4755,7 @@ mod tests {
         let sidecar = sidecar_at(10, parent_root);
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.park_data_columns(vec![sidecar]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar)]);
 
         // Not stored: it has not been checked, so it has not been accepted.
         assert_eq!(
@@ -4787,10 +4793,13 @@ mod tests {
             .expect("insert");
         let sidecar = sidecar_at(10, parent_root);
 
-        server.park_data_columns(vec![sidecar.clone()]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar.clone())]);
 
         assert!(server.sidecars_awaiting_parent.is_empty());
-        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+        assert_eq!(
+            *p2p.checks.lock().unwrap(),
+            vec![vec![DataColumnSidecar::Fulu(sidecar)]]
+        );
     }
 
     #[test]
@@ -4805,7 +4814,7 @@ mod tests {
         let sidecar = sidecar_at(10, parent_root);
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.park_data_columns(vec![sidecar.clone()]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar.clone())]);
         assert!(server.sidecars_awaiting_parent.contains_key(&parent_root));
 
         server.drain_sidecars_awaiting_parent(parent_root);
@@ -4820,7 +4829,113 @@ mod tests {
                 .expect("DB read should succeed")
                 .is_none()
         );
+        assert_eq!(
+            *p2p.checks.lock().unwrap(),
+            vec![vec![DataColumnSidecar::Fulu(sidecar)]]
+        );
+    }
+
+    /// [`beacon_store_at_slot_10`] with gloas active from genesis too, so a
+    /// slot-10 sidecar decodes as gloas's shape.
+    fn gloas_store_at_slot_10() -> Store {
+        let mut store = beacon_store_with_config(
+            GENESIS_TIME,
+            0,
+            Config::mainnet()
+                .with_fork_epoch(ForkName::Fulu, 0)
+                .with_fork_epoch(ForkName::Gloas, 0),
+        );
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        store
+    }
+
+    fn gloas_sidecar_at(slot: u64, block_root: H256, index: u64) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index,
+            slot,
+            beacon_block_root: block_root,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_gloas_sidecar_for_an_unimported_block_parks_on_its_own_block_and_replays_when_it_imports()
+    {
+        // A gloas sidecar is judged against its own block (the commitments are
+        // in its bid), so it waits on that block's post-state where a fulu one
+        // waits on its parent's.
+        let (mut server, p2p) = beacon_server_recording(gloas_store_at_slot_10());
+        let block_root = H256::repeat_byte(5);
+        let sidecar = gloas_sidecar_at(10, block_root, 3);
+
+        server.park_data_columns(vec![sidecar.clone()]);
+
+        assert_eq!(
+            server.sidecars_awaiting_parent.get(&block_root),
+            Some(&HashSet::from([ParkedColumn {
+                slot: 10,
+                block_root,
+                index: 3,
+            }]))
+        );
+        // Parked and not custodied.
+        assert!(!server.store.has_data_column(10, &block_root, 3));
+        assert!(p2p.checks.lock().unwrap().is_empty());
+
+        // The block imports: what was waiting on it goes back for checks, as
+        // it was parked.
+        server.drain_sidecars_awaiting_parent(block_root);
+
+        assert!(server.sidecars_awaiting_parent.is_empty());
+        assert!(
+            server
+                .store
+                .take_pending_data_column(10, &block_root, 3)
+                .expect("DB read should succeed")
+                .is_none()
+        );
         assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+    }
+
+    #[test]
+    fn a_gloas_sidecar_whose_block_has_a_state_goes_straight_back_for_checks() {
+        let (mut server, p2p) = beacon_server_recording(gloas_store_at_slot_10());
+        let block_root = H256::repeat_byte(5);
+        server
+            .store
+            .insert_state(block_root, bare_state())
+            .expect("insert");
+        let sidecar = gloas_sidecar_at(10, block_root, 3);
+
+        server.park_data_columns(vec![sidecar.clone()]);
+
+        assert!(server.sidecars_awaiting_parent.is_empty());
+        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+    }
+
+    #[tokio::test]
+    async fn a_checked_gloas_sidecar_is_stored_as_it_is() {
+        let mut server = beacon_server(gloas_store_at_slot_10());
+        let block_root = H256::repeat_byte(5);
+        let sidecar = gloas_sidecar_at(10, block_root, 3);
+
+        server.keep_data_column(sidecar.clone()).await;
+
+        assert_eq!(
+            server
+                .store
+                .data_column_indices_for(10, &block_root)
+                .expect("DB read should succeed"),
+            vec![3]
+        );
+        assert_eq!(
+            server.store.get_data_column(10, &block_root, 3).unwrap(),
+            Some(sidecar)
+        );
     }
 
     #[test]
@@ -4833,7 +4948,7 @@ mod tests {
         let sidecar = sidecar_at(10, parent_root);
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.park_data_columns(vec![sidecar]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar)]);
 
         assert_eq!(
             server.sidecars_awaiting_parent.get(&parent_root),
@@ -4863,7 +4978,7 @@ mod tests {
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.park_data_columns(vec![sidecar]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar)]);
 
         assert_eq!(
             server
@@ -4885,8 +5000,8 @@ mod tests {
         let mut server = beacon_server(beacon_store_at_slot_10());
         let parent_root = H256::repeat_byte(9);
 
-        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
-        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar_at(10, parent_root))]);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar_at(10, parent_root))]);
 
         assert_eq!(
             server
@@ -5070,7 +5185,8 @@ mod tests {
 
     #[test]
     fn a_block_with_every_custody_column_is_available() {
-        let store = beacon_store(0, 0);
+        // Fulu at genesis: stored rows decode by the fork their slot names.
+        let store = beacon_store_fulu_at_genesis(0, 0);
         let block = fulu_block_with_commitments(&store, 2);
         let root = block.message_hash_tree_root();
         for index in CUSTODY {

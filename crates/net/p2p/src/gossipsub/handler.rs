@@ -12,7 +12,7 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, Re
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
+    beacon::containers::{DataColumnSidecar, SignedBeaconBlock, electra::SingleAttestation},
     beacon::fork::ForkName,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
@@ -323,7 +323,7 @@ fn triage_data_column(
     subnet_id: u64,
 ) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
-    let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
+    let sidecar = match beacon_decode::decode_data_column_sidecar(fork, payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
             if !fork.is_followed() {
@@ -337,13 +337,23 @@ fn triage_data_column(
     };
     metrics::inc_beacon_gossip(KIND, "decoded");
     let now_ms = unix_now_ms();
-    if let Err(outcome) = gossip::column::cheap_checks(
-        &server.seen_columns,
-        &server.store,
-        &sidecar,
-        subnet_id,
-        now_ms,
-    ) {
+    let cheap = match &sidecar {
+        DataColumnSidecar::Fulu(sidecar) => gossip::column::cheap_checks(
+            &server.seen_columns,
+            &server.store,
+            sidecar,
+            subnet_id,
+            now_ms,
+        ),
+        DataColumnSidecar::Gloas(sidecar) => gossip::column::cheap_checks_gloas(
+            &server.seen_block_columns,
+            &server.store,
+            sidecar,
+            subnet_id,
+            now_ms,
+        ),
+    };
+    if let Err(outcome) = cheap {
         return Dispatch::Report(outcome);
     }
     Dispatch::Validate(Validated::Column(Box::new(sidecar)))
@@ -1003,6 +1013,39 @@ mod tests {
         assert!(matches!(
             triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Validate(Validated::Column(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gloas_sidecar_decodes_by_its_topics_fork_and_is_judged_by_gloas_rules() {
+        let now_ms = unix_now_ms();
+        let config = Config {
+            genesis_time: now_ms / 1_000 - 5,
+            slot_duration_ms: 1_000,
+            ..Config::mainnet()
+        };
+        let server = unconnected_beacon_server(config, 0).await;
+        let sidecar = ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+            index: 0,
+            slot: 4,
+            ..Default::default()
+        };
+        let payload = sidecar.to_ssz();
+
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Gloas, &payload, 0),
+            Dispatch::Validate(Validated::Column(_))
+        ));
+        // Gloas's rule has no header to read a proposer from, but it does have
+        // a subnet rule.
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Gloas, &payload, 1),
+            Dispatch::Report(Outcome::Reject(RejectReason::WrongSubnet))
+        ));
+        // The same bytes under fulu's topic are not a fulu sidecar.
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
 

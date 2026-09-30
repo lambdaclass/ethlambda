@@ -23,10 +23,8 @@ use tracing::{debug, error, info, trace, warn};
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants;
-use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::{
-    ColumnIndices, DataColumnSidecar, DataColumnsByRootIdentifier,
-};
+use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRootIdentifier};
+use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
@@ -38,7 +36,7 @@ use super::{
 };
 use crate::beacon::BeaconWire;
 use crate::beacon::column_checks;
-use crate::beacon::decode::{decode_data_column_sidecar, fork_at_slot};
+use crate::beacon::decode::fork_at_slot;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
@@ -1321,13 +1319,11 @@ fn range_batch_needs_columns(server: &P2PServer, batch: &std::ops::Range<u64>) -
 /// range sync skips its custody-peer check before PeerDAS for the same reason:
 /// a batch with no columns to fetch has no custodian to wait for.
 ///
-/// Gloas answers yes as fulu does, though its columns have a different shape.
-/// A batch ending in gloas can begin in fulu, whose blocks need their columns.
-/// A batch lying entirely in gloas also reaches this, since
-/// `beacon_fetched_through` advances past the gloas blocks the chain actor
-/// refuses. It is then held for custody for nothing, and its column prefetch
-/// fails to decode against fulu's shape; that failure logs at debug and
-/// penalizes no peer. No gloas column is ever consumed from here.
+/// Gloas answers yes as fulu does, though its columns have a different shape
+/// and decode as gloas sidecars by the chunk's context bytes. A batch ending in
+/// gloas can begin in fulu, whose blocks need their columns; a batch lying
+/// entirely in gloas still needs them too, since the chain actor will gate a
+/// block's payload envelope on its columns.
 fn range_needs_columns(
     config: &Config,
     custody_columns: &[u64],
@@ -1941,21 +1937,18 @@ async fn handle_data_column_sidecars_by_root_request(
             continue;
         };
         for &column in identifier.columns.iter() {
-            let Ok(Some(encoded)) =
-                server
-                    .store
-                    .get_data_column_sidecar(slot, &identifier.block_root, column)
-            else {
-                continue;
-            };
-            match decode_data_column_sidecar(&encoded) {
-                Ok(sidecar) => sidecars.push(sidecar),
+            match server
+                .store
+                .get_data_column(slot, &identifier.block_root, column)
+            {
+                Ok(Some(sidecar)) => sidecars.push(sidecar),
+                Ok(None) => {}
                 Err(err) => error!(
                     %peer,
                     slot,
                     column,
                     %err,
-                    "Stored data column sidecar failed to decode"
+                    "Stored data column sidecar failed to read"
                 ),
             }
         }
@@ -2039,7 +2032,7 @@ async fn handle_data_column_sidecars_by_range_request(
     let columns = request.columns.to_vec();
     let sidecars: Vec<_> = server
         .store
-        .data_column_sidecars_in_range(request.start_slot, end_slot, &columns)
+        .data_column_rows_in_range(request.start_slot, end_slot, &columns)
         .inspect_err(|err| {
             warn!(
                 start_slot = request.start_slot,
@@ -2050,8 +2043,10 @@ async fn handle_data_column_sidecars_by_range_request(
         })
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|encoded| {
-            decode_data_column_sidecar(&encoded)
+        .filter_map(|(slot, encoded)| {
+            server
+                .store
+                .decode_data_column_sidecar(slot, &encoded)
                 .inspect_err(
                     |err| error!(%peer, %err, "Stored data column sidecar failed to decode"),
                 )
@@ -2328,7 +2323,7 @@ async fn handle_data_column_sidecars_range_response(
     let in_range: Vec<DataColumnSidecar> = sidecars
         .into_iter()
         .filter(|sidecar| {
-            let slot = sidecar.signed_block_header.message.slot;
+            let slot = sidecar.slot();
             let keep = slot >= start_slot && slot <= end_slot;
             if !keep {
                 debug!(%peer, slot, start_slot, end_slot, "Dropping an out-of-range data column sidecar");
@@ -2552,6 +2547,9 @@ mod tests {
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
             seen_aggregates:
