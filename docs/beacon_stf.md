@@ -526,8 +526,8 @@ that is not ignored passes on both presets:
 
 | Preset | Fixture cases passed | Ignored | Lib tests |
 |--------|----------------------|---------|-----------|
-| mainnet | 7175 | 1285 | 422 passed, 1 ignored |
-| minimal | 49261 | 5403 | 423 passed, 1 ignored |
+| mainnet | 7175 | 1285 | 433 passed, 1 ignored |
+| minimal | 49261 | 5403 | 434 passed, 1 ignored |
 
 The lib counts are with `beacon-spec-tests` on, and include lean's own unit
 tests, since the two chains share one lib target. The one ignored lib test is
