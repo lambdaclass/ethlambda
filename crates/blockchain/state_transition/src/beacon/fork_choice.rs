@@ -929,7 +929,9 @@ pub fn is_optimistic_candidate_block(
 /// unrealized justifications in their own table, and the per-slot/per-epoch
 /// scratch (`proposer_boost_root`, `block_timeliness`, `equivocating_indices`,
 /// `latest_messages`, `pow_blocks`) in an in-memory struct cheap enough to
-/// rebuild after a restart rather than worth persisting. See
+/// rebuild after a restart rather than worth persisting; the exceptions are
+/// a gloas block's timeliness and verified payload, which are also stored
+/// and reloaded on resume. See
 /// [`ethlambda_storage::Store`]'s own documentation for the full
 /// field-by-field accounting; this module reads and writes it exclusively
 /// through its public accessors.
@@ -1134,7 +1136,7 @@ pub fn get_forkchoice_store(
     store.set_payload_link(anchor_root, anchor_slot, anchor_rules.payload_link(None));
     match anchor_rules {
         ForkRules::Gloas => {
-            store.set_block_timeliness(anchor_root, [true, true]);
+            store.set_gloas_block_timeliness(anchor_root, [true, true]);
             store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
             store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
         }
@@ -3165,9 +3167,9 @@ fn payload_status_tiebreaker_with(
 /// **Implementation choice, not spec text**: a candidate with no recorded
 /// [`Store::block_timeliness`](ethlambda_storage::Store::block_timeliness)
 /// entry reads as not timely by either deadline, rather than raising
-/// `Error::SpecAssert`. That scratch is in-memory only, so every entry is
-/// gone after a restart; reading a gap as "not an early equivocation"
-/// rather than aborting the whole weight computation over it is the
+/// `Error::SpecAssert`. A gloas block's entry is stored and reloaded on
+/// resume, so a gap is a block with no entry at all; reading it as "not an
+/// early equivocation" rather than aborting the whole weight computation is the
 /// conservative answer (it can only ever miss withholding a boost, never
 /// wrongly withhold one), the same shape of tolerance
 /// [`gloas_get_attestation_score`]'s own doc gives for a pruned vote.
@@ -4640,7 +4642,10 @@ pub fn on_block(
     // first, and shares the pre-import head's proposer shuffling. Both calls
     // are infallible: nothing from here to the end of this function can turn
     // into an `Err`, and the store has already been mutated above.
-    store.set_block_timeliness(block_root, timeliness);
+    match rules {
+        ForkRules::Gloas => store.set_gloas_block_timeliness(block_root, timeliness),
+        ForkRules::PreGloas => store.set_block_timeliness(block_root, timeliness),
+    }
     if let Some(pre_block_head) = pre_block_head {
         update_proposer_boost_root(store, &index, pre_block_head, block_root, config);
     }
@@ -4865,9 +4870,7 @@ pub fn on_execution_payload_envelope(
 
     // Add execution payload envelope to the store. Persisted, so a restarted
     // follower keeps the full branch of this block.
-    store
-        .insert_verified_payload(signed_envelope)
-        .expect("insert");
+    store.insert_verified_payload(block.slot(), signed_envelope);
 
     Ok(())
 }
@@ -5197,9 +5200,12 @@ mod tests {
             },
             signature: Default::default(),
         };
-        store
-            .insert_verified_payload(&envelope)
-            .expect("the block is in the store");
+        let slot = store
+            .get_signed_block(&root)
+            .expect("get")
+            .expect("the block is in the store")
+            .slot();
+        store.insert_verified_payload(slot, &envelope);
     }
 
     /// A fulu signed block with an empty body and a zero signature, for the
@@ -7309,8 +7315,7 @@ mod tests {
 
         // A same-slot, same-proposer sibling of the parent that would be an
         // early equivocation if its timeliness were known, but whose
-        // `block_timeliness` entry was never recorded: the scratch is
-        // in-memory only and does not survive a restart. Deliberately no
+        // `block_timeliness` entry was never recorded. Deliberately no
         // `store.set_block_timeliness(twin_root, ...)` call.
         let twin_root = Root::repeat_byte(0xb1);
         store
@@ -7704,6 +7709,88 @@ mod tests {
             seats(store.payload_data_availability_vote(&root).unwrap()),
             vec![(2, false), (7, false)]
         );
+    }
+
+    /// A restarted follower holds a verified payload (restored from its table)
+    /// but no payload-committee votes, which are never persisted. Both the
+    /// head walk (`payload_timeliness` on the tiebreaker path) and the first
+    /// child's payload attestations (`notify_ptc_messages` ends in this same
+    /// vote update) read those vectors, so resume must reseed them empty.
+    #[test]
+    fn a_resumed_store_walks_the_head_and_takes_payload_attestations() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let anchor_root = Root::repeat_byte(0xb0);
+        let root = Root::repeat_byte(0xb1);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = store_anchored_at_on(backend.clone(), anchor_root);
+        store
+            .insert_signed_block(
+                anchor_root,
+                gloas_block(
+                    0,
+                    Root::ZERO,
+                    ExecutionBlockHash::ZERO,
+                    ExecutionBlockHash::ZERO,
+                ),
+            )
+            .unwrap();
+        store
+            .insert_signed_block(
+                root,
+                gloas_block(
+                    1,
+                    anchor_root,
+                    ExecutionBlockHash::repeat_byte(0xff),
+                    ExecutionBlockHash::repeat_byte(0x22),
+                ),
+            )
+            .unwrap();
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        store.insert_state(anchor_root, state.clone()).unwrap();
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("with_validators_at(Gloas) builds a gloas state");
+        };
+        inner.slot = 1;
+        let mut committee = vec![0; preset::PTC_SIZE];
+        committee[2] = 3;
+        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        inner.ptc_window[window_index] = committee.try_into().unwrap();
+        store.insert_state(root, state).unwrap();
+        // What `on_block` records for each gloas block, then the envelope.
+        for block_root in [anchor_root, root] {
+            store.set_gloas_block_timeliness(block_root, [true, true]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+        }
+        verify_payload(&mut store, root);
+        // Dropping the last handle lets the state writer finish its queue.
+        drop(store);
+
+        let mut store = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert!(store.has_verified_payload(&root));
+
+        // The slot after the block's own: the head walk asks whether the
+        // verified payload is timely, which reads the votes.
+        store.set_time_ms(2 * config.slot_duration_ms).unwrap();
+        let committees = CommitteeCache::default();
+        gloas_get_head(&store, &config, &committees)
+            .expect("a resumed store must walk the head over a verified payload");
+
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 3,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot: 1,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        };
+        on_payload_attestation_message(&mut store, &message, true, &config)
+            .expect("the first child's attestations must find the vote vectors");
+        assert_eq!(store.payload_timeliness_vote(&root).unwrap()[2], Some(true));
     }
 
     #[test]
