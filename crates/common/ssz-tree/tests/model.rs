@@ -546,7 +546,16 @@ where
     assert_eq!(root(&decoded), root(&reference));
 }
 
-fn run_progressive<T, U>(initial: Vec<T>, ops: Vec<Op<T>>)
+/// How `run_progressive` writes an element in place.
+#[derive(Clone, Copy)]
+enum Write {
+    /// `list[index] = value`.
+    IndexMut,
+    /// `*list.get_mut(index) = value`, the path the beacon state's balances take.
+    GetMut,
+}
+
+fn run_progressive<T, U>(initial: Vec<T>, ops: Vec<Op<T>>, write: Write)
 where
     T: Value + Debug,
     U: UpdateMap<T>,
@@ -563,7 +572,10 @@ where
             }
             Op::Set(index, value) if !model.is_empty() => {
                 let index = index % model.len();
-                list[index] = value.clone();
+                match write {
+                    Write::IndexMut => list[index] = value.clone(),
+                    Write::GetMut => *list.get_mut(index).expect("in bounds") = value.clone(),
+                }
                 model[index] = value;
             }
             Op::Set(..) => {}
@@ -577,17 +589,17 @@ proptest! {
     // Packed: 4 per chunk, so subtrees start at elements 0, 4, 20, 84, 340.
     #[test]
     fn progressive_u64(initial in vec(any::<u64>(), 0..400), ops in ops(any::<u64>())) {
-        run_progressive::<u64, VecMap<u64>>(initial, ops);
+        run_progressive::<u64, VecMap<u64>>(initial, ops, Write::IndexMut);
     }
     // Composite: one per chunk, subtrees start at 0, 1, 5, 21, 85.
     #[test]
     fn progressive_item(initial in vec(item(), 0..100), ops in ops(item())) {
-        run_progressive::<Item, BTreeMap<usize, Item>>(initial, ops);
+        run_progressive::<Item, BTreeMap<usize, Item>>(initial, ops, Write::IndexMut);
     }
     // Variable-size elements: the offset table spans every subtree.
     #[test]
     fn progressive_blob(initial in vec(blob(), 0..30), ops in ops(blob())) {
-        run_progressive::<Blob, VecMap<Blob>>(initial, ops);
+        run_progressive::<Blob, VecMap<Blob>>(initial, ops, Write::IndexMut);
     }
 }
 
@@ -603,6 +615,101 @@ fn progressive_boundaries_hash_like_libssz() {
         check_progressive_matches(&ProgressiveList::<u64>::from(values.clone()), &values);
         let items: Vec<[u8; 32]> = (0..len).map(|i| [i as u8; 32]).collect();
         check_progressive_matches(&ProgressiveList::<[u8; 32]>::from(items.clone()), &items);
+    }
+}
+
+// ── ProgressiveList: subtrees that span leaves ──
+//
+// The tests above stop at 342 elements, where every packed `u64` subtree still
+// fits in one leaf of the paged tree (a leaf holds 512 `u64`s). Subtree `k` of
+// a progressive list holds `4^k` chunks of four `u64`s, so packed `u64`
+// subtrees start at element 0, 4, 20, 84, 340, 1364 and 5460, and each is
+// paged from its own start. The subtree that starts at 340 holds 1024
+// elements, so its second leaf starts at element 852 (340 + 512). The one
+// that starts at 1364 holds 4096, so its leaves start at 1364, 1876, 2388, and
+// so on in steps of 512. The cases below run from element 1364 to 5461, which
+// covers the whole of the subtree that starts at 1364 and the start of the
+// next.
+
+proptest! {
+    // Each case hashes thousands of elements after every operation, so far
+    // fewer cases than the default keep the run short.
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// The whole subtree that starts at element 1364 (which spans eight
+    /// leaves), and the start of the one at 5460.
+    #[test]
+    fn progressive_u64_spanning_leaves(
+        initial in vec(any::<u64>(), 1364..=5461),
+        ops in ops(any::<u64>()),
+    ) {
+        run_progressive::<u64, VecMap<u64>>(initial, ops, Write::GetMut);
+    }
+
+    /// Starts just short of element 1364, so pushes open that subtree.
+    #[test]
+    fn progressive_u64_pushes_open_a_spanning_subtree(
+        initial in vec(any::<u64>(), 1350..=1364),
+        ops in ops(any::<u64>()),
+    ) {
+        run_progressive::<u64, VecMap<u64>>(initial, ops, Write::GetMut);
+    }
+
+    /// Starts just short of element 5460, so pushes open that subtree.
+    #[test]
+    fn progressive_u64_pushes_open_the_next_spanning_subtree(
+        initial in vec(any::<u64>(), 5440..=5460),
+        ops in ops(any::<u64>()),
+    ) {
+        run_progressive::<u64, VecMap<u64>>(initial, ops, Write::GetMut);
+    }
+}
+
+#[test]
+fn progressive_spanning_boundaries_hash_like_libssz() {
+    // Around the second leaf of the subtree that starts at 340 (852), around the
+    // start of the subtree that starts at 1364 and its second and third leaves
+    // (1876, 2388), and around the start of the next subtree (5460).
+    for len in [
+        851usize, 852, 853, 1363, 1364, 1365, 1875, 1876, 1877, 2387, 2388, 2389, 5459, 5460, 5461,
+    ] {
+        let values: Vec<u64> = (0..len as u64).collect();
+        check_progressive_matches(&ProgressiveList::<u64>::from(values.clone()), &values);
+    }
+}
+
+#[test]
+fn progressive_writes_and_pushes_across_the_first_spanning_boundary() {
+    let mut model: Vec<u64> = (0..1363).collect();
+    let mut list = ProgressiveList::<u64>::from(model.clone());
+    check_progressive_matches(&list, &model);
+
+    // Writes on both sides of the boundary and at leaf edges, pending until
+    // the push below opens the subtree that starts at element 1364.
+    for index in [0usize, 339, 340, 851, 852, 1362] {
+        *list.get_mut(index).expect("in bounds") = 0xdead_0000 + index as u64;
+        model[index] = 0xdead_0000 + index as u64;
+    }
+    check_progressive_matches(&list, &model);
+
+    for value in 0..12u64 {
+        list.push(value).expect("a progressive list has no limit");
+        model.push(value);
+        check_progressive_matches(&list, &model);
+    }
+
+    // Grow past the second leaf of the new subtree (1876), then write on both
+    // sides of each edge.
+    for value in 12..520u64 {
+        list.push(value).expect("a progressive list has no limit");
+        model.push(value);
+    }
+    check_progressive_matches(&list, &model);
+    for index in [1363usize, 1364, 1365, 1374, 1875, 1876] {
+        *list.get_mut(index).expect("in bounds") = !(index as u64);
+        model[index] = !(index as u64);
+        list.apply_updates();
+        check_progressive_matches(&list, &model);
     }
 }
 
