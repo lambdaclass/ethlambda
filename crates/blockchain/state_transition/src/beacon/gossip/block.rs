@@ -8,7 +8,7 @@ use super::{
     finalized_start_slot, is_future_slot,
 };
 use crate::beacon::containers::SignedBeaconBlock;
-use crate::beacon::fork_choice::{ForkRules, Store};
+use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::misc::compute_epoch_at_slot;
 use crate::beacon::precheck::{self, PrecheckError, Reference, precheck_block};
 use crate::beacon::primitives::Root;
@@ -35,9 +35,8 @@ pub fn cheap_checks(
     // builder's bid) but whose verdict would misdescribe it. `Ignore`, not
     // `Reject`: the sender did nothing wrong, and every honest peer sends
     // exactly this once this node's own clock reaches gloas.
-    match ForkRules::of(block.fork_name()) {
-        ForkRules::Gloas => return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork)),
-        ForkRules::PreGloas => {}
+    if !block.fork_name().is_followed() {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
     }
     // [IGNORE] The block is not from a future slot.
     if is_future_slot(&config, slot, now_ms) {

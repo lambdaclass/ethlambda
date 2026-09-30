@@ -418,9 +418,10 @@ choice exist, but the live follower refuses gloas blocks
 (`process_or_pend_block`) and a gloas anchor (`refuse_unfollowable_fork` in
 `main.rs`), since nothing delivers payload envelopes or payload attestations to
 it, so a Sepolia follower stops tracking the chain at `GLOAS_FORK_EPOCH`
-regardless. `network::warn_if_gloas_scheduled` (shared by
+regardless. `network::warn_if_unfollowed_fork_scheduled` (shared by
 `BuiltInNetwork::resolve` and a loaded `NetworkDir`) warns about this
-explicitly at startup (checked against `config.gloas_fork_epoch`), separately
+explicitly at startup, once per scheduled fork for which `ForkName::is_followed`
+answers no (the one place that says which forks the node follows), separately
 from the ignored-keys warning, which now only ever names heze's keys and
 `GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
 

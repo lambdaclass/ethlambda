@@ -259,12 +259,15 @@ the chain actor writes, so no request waits on the actor.
   next; attester duties cover the head's previous, current and next epoch,
   which is as far as its shuffling is already fixed. Anything else is a `400`.
   `dependent_root` follows each endpoint's v1 definition. Attester duties walk
-  every committee of the epoch, a full shuffle per request on mainnet.
+  every committee of the epoch, a full shuffle per request on mainnet. An
+  epoch the node's schedule places at gloas is a `400` on both duty endpoints:
+  the head is a fulu state, and this node does not follow gloas.
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
   choice's cached `checkpoint_state`, and only when the head is in an earlier
-  epoch). A slot before the head, or past the wall clock, is a `400`.
+  epoch). A slot before the head, or past the wall clock, is a `400`, as is a
+  slot in a gloas epoch: the answer would be a fulu-shaped vote under gloas.
 - **`pool/attestations`** checks each attestation against the electra
   `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
   window, `data.index == 0`, target epoch, the voted block known and the target
@@ -302,10 +305,13 @@ the chain actor writes, so no request waits on the actor.
   the block through `process_block`. The answer is fulu `BlockContents`, with
   `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
   **`503`** without a configured execution client, or when the payload carries
-  blobs.
+  blobs. A slot the schedule does not place at fulu (gloas included) is a
+  `400`, checked before the execution client.
 - **`POST beacon/blocks`** takes SSZ `SignedBlockContents`, checks the block
   is after the head and its proposer signature, then gossips it on
-  `beacon_block` and hands it to the chain actor to import.
+  `beacon_block` and hands it to the chain actor to import. A slot the
+  schedule does not place at fulu (gloas included) is a `400`, checked before
+  the head state is advanced.
 
 **Blobs are not supported yet.** Publishing a blob-carrying block means
 computing and gossiping its data column sidecars, which this node does not do,

@@ -194,7 +194,7 @@ pub fn fork_at_slot(config: &Config, slot: Slot) -> ForkName {
 /// reads the live clock instead of whatever fork the topic was actually
 /// built for; see [`decode_data_column_sidecar`]'s own doc and its caller in
 /// `gossipsub::handler::triage_data_column`.
-pub fn current_fork(config: &Config) -> ForkName {
+pub(crate) fn current_fork(config: &Config) -> ForkName {
     let slot = unix_now_ms()
         .saturating_sub(config.genesis_time_ms())
         .checked_div(config.slot_duration_ms)
@@ -207,9 +207,21 @@ pub fn current_fork(config: &Config) -> ForkName {
 /// Separate from [`decode_gossip`] because the two topics worth logging in
 /// detail are dispatched by name, and a handler that already knows it is
 /// holding a block should not have to unwrap a [`BeaconGossip`] to find one.
+///
+/// A block whose slot is at a fork this node does not follow (gloas) and that
+/// fails to decode is `UnsupportedFork`, not `Ssz`: the container this build
+/// models for that fork is the one at the pinned specification release, and
+/// an honest peer's block may follow a later one. Bytes too short to name a
+/// slot, and a block at a followed fork, stay `Ssz` or `Truncated`.
 pub fn decode_block(config: &Config, bytes: &[u8]) -> Result<SignedBeaconBlock, DecodeError> {
     let fork = fork_at_slot(config, block_slot(bytes)?);
-    SignedBeaconBlock::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
+    SignedBeaconBlock::from_ssz(fork, bytes).map_err(|_| {
+        if fork.is_followed() {
+            DecodeError::Ssz
+        } else {
+            DecodeError::UnsupportedFork
+        }
+    })
 }
 
 /// Decode a data column sidecar off a subnet topic.
@@ -458,6 +470,24 @@ mod tests {
             BeaconGossip::Block(Box::new(SignedBeaconBlock::Phase0(block)))
         );
         assert_eq!(decoded.topic_kind(), topics::BEACON_BLOCK);
+    }
+
+    #[test]
+    fn an_undecodable_block_is_unsupported_only_at_a_fork_the_node_does_not_follow() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        // Phase0-shaped bytes are not a valid block at either fork.
+        let at_fulu = phase0_block(slot_of(config.fulu_fork_epoch)).to_ssz();
+        let at_gloas = phase0_block(slot_of(config.gloas_fork_epoch)).to_ssz();
+        assert_eq!(decode_block(&config, &at_fulu), Err(DecodeError::Ssz));
+        assert_eq!(
+            decode_block(&config, &at_gloas),
+            Err(DecodeError::UnsupportedFork)
+        );
+        assert_eq!(
+            decode_block(&config, &[0xff; 3]),
+            Err(DecodeError::Truncated)
+        );
     }
 
     #[test]

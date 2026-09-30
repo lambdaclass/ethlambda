@@ -232,33 +232,38 @@ fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
     config.slot_duration_ms = config.seconds_per_slot * 1_000;
 }
 
-/// Warn at startup when `config` schedules gloas, whichever way this network
-/// was resolved.
+/// Warn at startup when `config` schedules a fork this build does not follow
+/// ([`ForkName::is_followed`](ethlambda_types::beacon::fork::ForkName::is_followed)),
+/// whichever way this network was resolved.
 ///
 /// Shared by a loaded directory and the built-in networks for the same
 /// reason [`derive_genesis_fields`] is. The ignored-keys warning
-/// (`ConfigFile::warn_about_ignored_keys`) no longer implies this the way it
-/// used to, now that `GLOAS_*` keys are claimed rather than reported as
-/// unknown, so this says it explicitly instead of leaving it to be
-/// discovered as a stall: the chain actor refuses every gloas block
-/// (`process_or_pend_block`), because nothing delivers payload envelopes or
-/// payload attestations to it yet, so a follower stops making progress there
-/// regardless of how cleanly its config parsed. A loaded
-/// network reaches this the same as a built-in one, and can even schedule
-/// gloas at epoch 0, in which case its own genesis state already decodes as
-/// gloas and startup refuses it outright (`refuse_unfollowable_fork` in
-/// `main.rs`, since fork choice itself accepts a gloas anchor); this warning
-/// fires first either way.
-fn warn_if_gloas_scheduled(network: &str, config: &Config) {
-    if config.gloas_fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
-        tracing::warn!(
-            network,
-            gloas_fork_epoch = config.gloas_fork_epoch,
-            "This build stops following this chain at its gloas fork epoch; \
-             crossing it is not a stall a restart clears, since the chain actor \
-             refuses every gloas block until a later release delivers payload \
-             envelopes and payload attestations to it"
-        );
+/// (`ConfigFile::warn_about_ignored_keys`) does not say this: it names keys
+/// the build does not claim, and the keys of a fork it does claim parse
+/// cleanly. So this says it explicitly instead of leaving it to be discovered
+/// as a stall: from that fork's epoch the chain actor refuses every block, so
+/// a follower stops making progress there regardless of how cleanly its
+/// config parsed. A loaded network reaches this the same as a built-in one,
+/// and can even schedule such a fork at epoch 0, in which case its own genesis
+/// state already decodes as that fork and startup refuses it outright
+/// (`refuse_unfollowable_fork` in `main.rs`, since fork choice itself accepts
+/// a gloas anchor); this warning fires first either way.
+fn warn_if_unfollowed_fork_scheduled(network: &str, config: &Config) {
+    let unfollowed = ethlambda_types::beacon::fork::ForkName::ALL
+        .into_iter()
+        .filter(|fork| !fork.is_followed());
+    for fork in unfollowed {
+        let fork_epoch = config.fork_epoch(fork);
+        if fork_epoch != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH {
+            tracing::warn!(
+                network,
+                fork = fork.as_str(),
+                fork_epoch,
+                "This build stops following this chain at the epoch of a fork it does \
+                 not follow; crossing it is not a stall a restart clears, since the \
+                 chain actor refuses every block of that fork"
+            );
+        }
     }
 }
 

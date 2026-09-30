@@ -110,6 +110,33 @@ impl ForkName {
         ForkName::ALL.get(index + 1).copied()
     }
 
+    /// Whether this node follows a chain that has reached this fork.
+    ///
+    /// Phase0 through fulu are followed. Gloas is not: nothing delivers the
+    /// payload envelopes or payload attestations a gloas chain needs, so the
+    /// node refuses gloas blocks and anchors, ignores gloas gossip and reports
+    /// syncing once the clock reaches the fork. This is the one place to
+    /// change when the node starts following gloas; every site whose rule is
+    /// "does this node follow the fork" calls it.
+    ///
+    /// # Panics
+    ///
+    /// On [`ForkName::Lean`], which is not a point on the beacon fork
+    /// schedule.
+    pub fn is_followed(self) -> bool {
+        match self {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => true,
+            ForkName::Gloas => false,
+            ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
+        }
+    }
+
     /// The one-byte tag this fork is stored under in a `States` value.
     ///
     /// Spelled out rather than `self as u8`. The variant order is already
@@ -270,6 +297,19 @@ mod tests {
             ForkName::Lean.snapshot_interval(),
             ForkName::Electra.snapshot_interval()
         );
+    }
+
+    #[test]
+    fn every_beacon_fork_through_fulu_is_followed_and_gloas_is_not() {
+        for fork in ForkName::ALL {
+            assert_eq!(fork.is_followed(), fork != ForkName::Gloas, "{fork:?}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "ForkName::Lean reached a Beacon Chain function")]
+    fn lean_is_not_a_fork_the_node_can_follow() {
+        ForkName::Lean.is_followed();
     }
 
     #[test]

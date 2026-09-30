@@ -1651,16 +1651,10 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
 /// look for a bad peer when the real answer is "wait for this build to support
 /// the fork".
 fn refuse_unfollowable_fork(fork: ForkName) -> Result<(), checkpoint_sync::CheckpointSyncError> {
-    match fork {
-        ForkName::Gloas => Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork }),
-        ForkName::Phase0
-        | ForkName::Altair
-        | ForkName::Bellatrix
-        | ForkName::Capella
-        | ForkName::Deneb
-        | ForkName::Electra
-        | ForkName::Fulu => Ok(()),
-        ForkName::Lean => unreachable!("a beacon anchor is never ForkName::Lean"),
+    if fork.is_followed() {
+        Ok(())
+    } else {
+        Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork })
     }
 }
 

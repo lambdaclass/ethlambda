@@ -18,6 +18,7 @@ use ethlambda_types::{
         containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
         preset,
         primitives::ValidatorIndex,
+        signing::compute_epoch_at_slot,
     },
     block::SignedBlock,
     chain_config::ChainConfig,
@@ -2538,7 +2539,14 @@ impl BlockChainServer {
         // children already queued under it before this landed; logged once,
         // here, rather than once per retry, since after this there is no
         // retry.
-        if matches!(signed_block, SignedBeaconBlock::Gloas(_)) {
+        //
+        // Decided by chain first: a lean block is not a point on the beacon
+        // fork schedule, and `ForkName::is_followed` refuses to answer for it.
+        let refused = match self.store.chain() {
+            Chain::Lean => false,
+            Chain::Beacon => !signed_block.fork_name().is_followed(),
+        };
+        if refused {
             warn!(
                 %slot,
                 block_root = %ShortRoot(&block_root.0),
@@ -3616,20 +3624,51 @@ impl BlockChainServer {
     ///
     /// Reads the head through [`Self::head_slot`], which is where the
     /// per-chain part of that lives (lean's `Store::head_slot` and beacon's
-    /// `Store::beacon_head` decode different tables); everything past that
-    /// point is chain-agnostic.
+    /// `Store::beacon_head` decode different tables). The tracker itself is
+    /// chain-agnostic, but the freshest block seen is not: on a beacon
+    /// follower, once the clock is past a fork the node does not follow (see
+    /// [`Self::clock_is_past_followed_forks`]) the network is treated as fresh.
     fn update_sync_status(&mut self, current_slot: u64) {
         let head_slot = self.head_slot();
-        let max_seen_slot = self
+        let live_max_slot = self
             .store
             .max_live_chain_slot()
             .expect("max live chain slot exists")
             .unwrap_or(head_slot);
+        let max_seen_slot = match self.store.chain() {
+            Chain::Beacon
+                if Self::clock_is_past_followed_forks(
+                    &self.store.config(),
+                    current_slot,
+                    head_slot,
+                ) =>
+            {
+                current_slot
+            }
+            Chain::Beacon | Chain::Lean => live_max_slot,
+        };
         let status = self
             .sync_status
             .update(current_slot, head_slot, max_seen_slot);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
+    }
+
+    /// Whether the clock is at a fork this node does not follow while the
+    /// node's own head is still from one it does.
+    ///
+    /// Blocks past the fork never reach the live chain, so the freshest block
+    /// the store knows stays at the head and the sync tracker would read the
+    /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
+    /// report `Synced` for good on a node that follows nothing. Nothing else
+    /// tells the node the network is ahead: gossip blocks past the fork are
+    /// ignored in p2p, and a node that runs across the fork keeps the fork
+    /// digest it computed at startup, so peers' Status messages are dropped
+    /// and no range session starts. The clock is the one signal that is always
+    /// there, and treating the network as fresh lets head lag decide.
+    fn clock_is_past_followed_forks(config: &Config, current_slot: u64, head_slot: u64) -> bool {
+        let fork_at = |slot: u64| config.fork_at_epoch(compute_epoch_at_slot(slot));
+        !fork_at(current_slot).is_followed() && fork_at(head_slot).is_followed()
     }
 
     /// Milliseconds until this actor's next tick, dispatched by chain: lean's
@@ -5164,6 +5203,109 @@ mod tests {
         // ordering) — so this holds whether or not that attempt itself
         // succeeds, and it does not hang either way.
         assert!(!server.blocks_awaiting_columns.contains_key(&parent_root));
+    }
+
+    /// A beacon server scheduling gloas at `gloas_epoch` (never, for `None`),
+    /// holding nothing past its anchor: no block of any fork arrives in these
+    /// tests.
+    fn syncing_server(gloas_epoch: Option<u64>) -> BlockChainServer {
+        let config = match gloas_epoch {
+            Some(epoch) => Config::mainnet().with_fork_epoch(ForkName::Gloas, epoch),
+            None => Config::mainnet(),
+        };
+        beacon_server(beacon_store_with_config(GENESIS_TIME, 0, config))
+    }
+
+    #[test]
+    fn the_node_reports_syncing_once_the_clock_passes_the_fork_it_does_not_follow() {
+        // No block arrives at all: gossip blocks past the fork are ignored in
+        // p2p and peers' Status messages are dropped, so the store's freshest
+        // block stays at the head. The clock alone must keep the node from
+        // reading the network as stalled.
+        let mut server = syncing_server(Some(1));
+        let past_the_fork = preset::SLOTS_PER_EPOCH + 8;
+        server.update_sync_status(past_the_fork);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn a_stalled_network_with_no_fork_ahead_still_reads_as_synced() {
+        // The same silence with no gloas scheduled is a stalled network, which
+        // the tracker deliberately reports as synced.
+        let mut server = syncing_server(None);
+        server.update_sync_status(preset::SLOTS_PER_EPOCH + 8);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Synced
+        );
+    }
+
+    /// Gloas at epoch 1, so slot `SLOTS_PER_EPOCH` is the first gloas slot.
+    fn gloas_at_epoch_one() -> Config {
+        Config::mainnet().with_fork_epoch(ForkName::Gloas, 1)
+    }
+
+    #[test]
+    fn the_clock_rule_holds_for_a_followed_head_once_the_clock_is_at_gloas() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot + 8,
+            0
+        ));
+    }
+
+    #[test]
+    fn the_clock_rule_does_not_hold_before_the_clock_reaches_gloas() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(!BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot - 1,
+            0
+        ));
+    }
+
+    #[test]
+    fn the_clock_rule_does_not_hold_for_a_head_already_past_the_fork() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(!BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot + 8,
+            first_gloas_slot
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lean_block_is_not_refused_as_an_unfollowed_fork() {
+        // The import path serves both chains, so a lean block reaches the
+        // fork check, and `ForkName::Lean` has no answer to "is it followed".
+        // With an unknown parent the block is parked, which is all that has to
+        // happen: the point is that it gets that far without a panic.
+        let backend = Arc::new(InMemoryBackend::default());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let mut server = beacon_server(store);
+        let block = SignedBeaconBlock::Lean(ethlambda_types::block::SignedBlock {
+            message: ethlambda_types::block::Block {
+                slot: 5,
+                proposer_index: 0,
+                parent_root: H256::repeat_byte(9),
+                state_root: H256::ZERO,
+                body: ethlambda_types::block::BlockBody::default(),
+            },
+            proof: ethlambda_types::block::MultiMessageAggregate::default(),
+        });
+        let mut queue = VecDeque::new();
+        let outcome = server
+            .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+            .await;
+        assert_eq!(outcome, None);
     }
 
     #[tokio::test]

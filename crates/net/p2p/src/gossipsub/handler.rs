@@ -13,7 +13,6 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
-    beacon::fork::ForkName,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -261,6 +260,12 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
     const KIND: &str = beacon_topics::BEACON_BLOCK;
     let block = match beacon_decode::decode_block(&wire.config, payload) {
         Ok(block) => block,
+        // A block at a fork this build has no rules for, as on the aggregate
+        // topic: an honest peer must not be scored as a bad decoder.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -317,7 +322,7 @@ fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dis
         Ok(sidecar) => sidecar,
         Err(err) => {
             let config = server.store.config();
-            if beacon_decode::current_fork(&config) == ForkName::Gloas {
+            if !beacon_decode::current_fork(&config).is_followed() {
                 metrics::inc_beacon_gossip(KIND, "unsupported_fork");
                 return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
             }
@@ -774,6 +779,7 @@ mod tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{AttestationData, electra, phase0, shared};
     use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
@@ -853,6 +859,65 @@ mod tests {
 
         assert!(matches!(
             triage_block(&server, wire, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    /// Phase0-shaped bytes at `slot`: not a valid block at any later fork, so
+    /// what `triage_block` answers depends on the fork `slot` names.
+    fn mismatched_block_bytes(slot: Slot) -> Vec<u8> {
+        phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Default::default(),
+                state_root: Default::default(),
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        }
+        .to_ssz()
+    }
+
+    async fn triage_block_under(config: Config, payload: &[u8]) -> Dispatch {
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        triage_block(&server, wire, payload)
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_gloas_slot_is_ignored() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.gloas_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbage_bytes_are_still_rejected_once_gloas_is_active() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+
+        assert!(matches!(
+            triage_block_under(config, &[0xff; 3]).await,
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_fulu_slot_is_still_rejected_after_the_fork() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
