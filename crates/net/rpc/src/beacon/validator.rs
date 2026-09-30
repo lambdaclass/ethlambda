@@ -390,11 +390,12 @@ fn attester_duties(
 #[derive(Debug, Deserialize)]
 struct AttestationDataQuery {
     slot: Slot,
-    /// Required by the endpoint, and ignored: from electra on the committee
-    /// travels outside `AttestationData`, whose `index` is always zero, so
-    /// every committee of a slot attests to the same data.
+    /// Optional and deprecated in the Beacon API, and ignored: from electra on
+    /// the committee travels outside `AttestationData`, whose `index` is always
+    /// zero, so every committee of a slot attests to the same data. Parsed
+    /// rather than dropped so a malformed value is still a `400`.
     #[allow(dead_code)]
-    committee_index: CommitteeIndex,
+    committee_index: Option<CommitteeIndex>,
 }
 
 /// `GET /eth/v1/validator/attestation_data?slot&committee_index`.
@@ -797,6 +798,28 @@ mod tests {
         let (status, json) = fetch_attestation_data(store, slot, None).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(json["code"], 503);
+    }
+
+    /// `committee_index` is deprecated and optional, and gloas clients are
+    /// told to omit it, so a request without one is answered. A malformed one
+    /// is still refused.
+    #[tokio::test]
+    async fn committee_index_may_be_omitted() {
+        let state = fulu_state_at(0);
+        let slot = state.slot();
+        let (store, _root) = beacon_store_at(state);
+        let fetch = |uri: String| {
+            let app = routes()
+                .with_state(store.clone())
+                .layer(Extension(idle_engine()));
+            app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
+        };
+
+        let response = fetch(format!("/eth/v1/validator/attestation_data?slot={slot}"));
+        assert_eq!(response.await.unwrap().status(), StatusCode::OK);
+        let malformed = format!("/eth/v1/validator/attestation_data?slot={slot}&committee_index=x");
+        let response = fetch(malformed);
+        assert_eq!(response.await.unwrap().status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
