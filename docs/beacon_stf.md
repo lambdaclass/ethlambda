@@ -251,6 +251,48 @@ pre-fork, which is exactly what a fork transition consists of. Checking first
 would reject every legitimate fork-boundary block and make crossing a fork
 impossible.
 
+## Registry and balances
+
+`validators` and `balances` hold one entry per validator, about 2.4M on
+mainnet, so they dominate both the cost of a state root and the memory of every
+cached state. They are `ethlambda_ssz_tree::List`s rather than `SszList`s:
+persistent Merkle trees in the shape of the SSZ one, modeled on the `milhouse`
+lists lighthouse keeps its state in.
+
+- **Nodes cache their hash, and states share nodes.** A state derived from
+  another shares every subtree the block did not touch through `Arc`, and its
+  root rehashes only the touched paths. A state decoded from storage is rebased
+  onto a cached relative, so it shares memory with it too.
+- **Leaves and inner nodes are page-sized.** A leaf holds a contiguous run of
+  elements (32 validators, 512 balances), and an inner node up to 512 child
+  pointers standing for nine binary levels at once. A lookup therefore crosses
+  a handful of nodes rather than one per level of the registry's depth, and
+  iteration walks each leaf as a slice. A composite leaf also keeps each
+  element's root once hashed, and a rebuilt leaf carries over the roots of the
+  elements it did not change, so one changed validator costs one validator
+  hash plus a fold of the cached roots.
+- **Writes are buffered.** `get_mut`, `IndexMut` and `push` record the new
+  value; `BeaconState::apply_pending_mutations` folds everything buffered into
+  the trees in one pass. The state transition calls it at the top of
+  `process_slot`, after `process_block`, and at the end of `process_slots` (epoch
+  processing runs after the loop's last `process_slot`). A root taken with
+  writes pending is still correct but computed on a throwaway copy, and the
+  store flushes a state before caching it, since a shared `Arc` cannot be
+  flushed later.
+
+The access pattern matters. `state.validator(i)` and `balances()[i]` are tree
+descents, cheap next to a hash but far from an array index, and they add up
+when a helper calls them once per validator:
+`get_total_active_balance` builds the active-index `Vec` and then reads every
+index back, and runs several times per block (once per attestation through
+`get_base_reward_per_increment`, once per execution request through the churn
+limits). In the 2026-09-28 import profile, those per-index reads and the
+repeated whole-registry scans were the largest cost left after hashing. A loop
+over the registry should walk `validators().iter()`, zipped with
+`balances().iter()` where it needs both. The total active balance is the obvious
+candidate for computing once per epoch rather than per call, once it is shown
+that no block operation changes it mid-epoch.
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that

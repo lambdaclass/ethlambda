@@ -14,13 +14,17 @@ axum = "0.8.1"
 tokio.workspace = true
 tokio-util.workspace = true
 ethlambda-blockchain.workspace = true
+ethlambda-engine.workspace = true
 ethlambda-fork-choice.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-network-api.workspace = true
 ethlambda-state-transition.workspace = true
 ethlambda-storage.workspace = true
 ethlambda-test-fixtures.workspace = true
 ethlambda-types.workspace = true
 libssz.workspace = true
+libssz-derive.workspace = true
+libssz-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 hex.workspace = true
@@ -29,6 +33,9 @@ jemalloc_pprof.workspace = true
 futures-util = "0.3"
 
 [dev-dependencies]
+ethlambda-validator.workspace = true
+spawned-concurrency.workspace = true
+ethlambda-state-transition = { workspace = true, features = ["test-utils"] }
 ethlambda-types.workspace = true
 libssz-types.workspace = true
 tower = { version = "0.5", features = ["util"] }

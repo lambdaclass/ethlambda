@@ -25,7 +25,7 @@ crates/
   └─ state_transition/          # Process slots, blocks, attestations
   common/
   ├─ types/                     # Core types
-  ├─ crypto/                    # XMSS aggregation (leansig wrapper)
+  ├─ crypto/                    # XMSS sign/verify + aggregation (leanVM wrapper)
   └─ metrics/                   # Prometheus metrics
   net/
   ├─ p2p/                       # libp2p: gossipsub + req-resp

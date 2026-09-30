@@ -23,5 +23,5 @@ pub mod misc;
 pub mod mutators;
 pub mod predicates;
 pub mod shuffling;
-#[cfg(test)]
-pub(crate) mod test_state;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_state;

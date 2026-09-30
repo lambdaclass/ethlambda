@@ -12,13 +12,13 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, Re
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::SignedBeaconBlock,
+    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
 use libp2p::PeerId;
-use libp2p::gossipsub::{Message, MessageId};
+use libp2p::gossipsub::{IdentTopic, Message, MessageId};
 use libssz::{SszDecode, SszEncode};
 use spawned_concurrency::tasks::Context;
 use tracing::{debug, error, info, trace, warn};
@@ -30,6 +30,7 @@ use super::{
         attestation_subnet_topic, topic_kind,
     },
 };
+use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
 use crate::beacon::verdict::{self, Dispatch, GossipId, Validated};
 use crate::beacon::{BeaconWire, decode as beacon_decode, topics as beacon_topics};
 use crate::{P2PServer, metrics};
@@ -555,6 +556,188 @@ pub async fn publish_aggregated_attestation(
         source_root = %ShortRoot(&attestation.data.source.root.0),
         "Published aggregated attestation to gossipsub"
     );
+}
+
+/// Gossip one of a validator client's attestations, handed over by the Beacon
+/// API, on its `beacon_attestation_{subnet_id}` topic.
+///
+/// The API has already validated the attestation and computed `subnet_id`; this
+/// only refuses what would be a programming error on its side (a lean node, or
+/// a subnet id past the last subnet) rather than publish to a topic no peer
+/// listens on.
+pub async fn publish_beacon_attestation(
+    server: &mut P2PServer,
+    subnet_id: u64,
+    attestation: SingleAttestation,
+) {
+    let slot = attestation.data.slot;
+    let validator = attestation.attester_index;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(%slot, validator, "A beacon attestation reached a lean node; dropping it");
+        return;
+    };
+    if subnet_id >= ATTESTATION_SUBNET_COUNT {
+        error!(%slot, validator, subnet_id, "Attestation subnet out of range; dropping it");
+        return;
+    }
+    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
+        beacon.fork_digest,
+        subnet_id,
+    ));
+    let compressed = compress_message(&attestation.to_ssz());
+    server.swarm_handle.publish(topic, compressed);
+    debug!(
+        %slot,
+        validator,
+        subnet_id,
+        target_epoch = attestation.data.target.epoch,
+        target_root = %ShortRoot(&attestation.data.target.root.0),
+        "Published attestation to gossipsub"
+    );
+}
+
+/// Gossip one of a validator client's signed aggregates, handed over by the
+/// Beacon API after validation, on `beacon_aggregate_and_proof`. This node is
+/// subscribed to that topic, so it reaches the mesh rather than relying on
+/// fanout.
+pub async fn publish_beacon_aggregate(
+    server: &mut P2PServer,
+    aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
+) {
+    let slot = aggregate.slot();
+    let aggregator = aggregate.aggregator_index();
+    let Some(beacon) = server.wire.beacon() else {
+        error!(%slot, aggregator, "A beacon aggregate reached a lean node; dropping it");
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        beacon.fork_digest,
+        beacon_topics::BEACON_AGGREGATE_AND_PROOF,
+    ));
+    // Each fork's container encodes as itself on the wire; the enum is only
+    // this node's way of holding either.
+    let ssz = match &aggregate {
+        ethlambda_types::beacon::containers::SignedAggregateAndProof::Phase0(signed) => {
+            signed.to_ssz()
+        }
+        ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(signed) => {
+            signed.to_ssz()
+        }
+    };
+    server.swarm_handle.publish(topic, compress_message(&ssz));
+    debug!(%slot, aggregator, "Published aggregate to gossipsub");
+}
+
+/// Gossip a block a validator client signed, handed over by the Beacon API,
+/// on `beacon_block`, and pass it to the chain actor as a gossiped block would
+/// be: gossipsub never delivers a node its own messages, so this is the only
+/// way this node imports its own proposal.
+pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlock) {
+    let slot = block.slot();
+    let Some(beacon) = server.wire.beacon() else {
+        error!(slot, "A beacon block reached a lean node; dropping it");
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        beacon.fork_digest,
+        beacon_topics::BEACON_BLOCK,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&block.to_ssz()));
+    info!(
+        slot,
+        proposer = block.proposer_index(),
+        block_root = %ShortRoot(&block.message_hash_tree_root().0),
+        "Published block to gossipsub"
+    );
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_block(block, BlockSource::Gossip, BlockArrival::now())
+            .inspect_err(|err| error!(%err, "Failed to hand the published block to the chain"));
+    }
+}
+
+/// The beacon wall-clock slot, from the wire's genesis and slot duration.
+fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
+    let genesis_ms = wire.genesis_time.saturating_mul(1000);
+    unix_now_ms().saturating_sub(genesis_ms) / wire.config.slot_duration_ms.max(1)
+}
+
+/// Join the attestation subnets a validator client's aggregators need, per
+/// phase0's `validator.md` ("Attestation subnet subscription": an aggregator
+/// joins its committee's subnet for the slot), and remember until when.
+///
+/// A backbone subnet is already joined for good and is left alone. A subnet
+/// named twice keeps the later slot.
+pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let mut joined = Vec::new();
+    for (subnet_id, slot) in subnets {
+        if subnet_id >= ATTESTATION_SUBNET_COUNT
+            || wire.topics.attestation_topics.contains_key(&subnet_id)
+        {
+            continue;
+        }
+        let until = server
+            .aggregator_subnets
+            .entry(subnet_id)
+            .or_insert_with(|| {
+                joined.push(subnet_id);
+                slot
+            });
+        *until = (*until).max(slot);
+    }
+    for &subnet_id in &joined {
+        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, subnet_id);
+        server.swarm_handle.subscribe(IdentTopic::new(topic));
+    }
+    if !joined.is_empty() {
+        info!(?joined, "Joined attestation subnets for aggregation");
+    }
+}
+
+/// Drop attestation pool entries more than an epoch old.
+///
+/// Inserts prune as they go; this also runs on the aggregator-subnet sweep, so
+/// a pool nothing is inserted into does not keep stale entries.
+pub fn prune_attestation_pool(server: &P2PServer) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let now = beacon_wall_slot(wire);
+    server
+        .attestation_pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .prune_before(now);
+}
+
+/// Leave every aggregator subnet whose last slot has passed.
+pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let now = beacon_wall_slot(wire);
+    let expired: Vec<u64> = server
+        .aggregator_subnets
+        .iter()
+        .filter(|&(_, &until)| until < now)
+        .map(|(&subnet_id, _)| subnet_id)
+        .collect();
+    for subnet_id in &expired {
+        server.aggregator_subnets.remove(subnet_id);
+        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, *subnet_id);
+        server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+    }
+    if !expired.is_empty() {
+        debug!(
+            ?expired,
+            "Left attestation subnets whose aggregation slot has passed"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,8 @@ use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
-use ethlambda_storage::Store;
+use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
+use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::electra::SingleAttestation;
 use ethlambda_types::beacon::containers::{
     SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
@@ -147,7 +148,28 @@ impl Validated {
     /// chain actor consumes one, matching a lighthouse follower with no
     /// validators, which verifies and relays its own backbone subnets but
     /// never calls `apply_attestation_to_fork_choice` for them either.
+    ///
+    /// What an accepted subnet attestation does feed is the attestation pool,
+    /// when its subnet is one a validator client's aggregator had this node
+    /// join: that aggregator will ask for exactly these votes. See
+    /// [`pool_aggregator_attestation`]. An accepted aggregate goes into the
+    /// pool too, whatever else happens to it, so block production can pack
+    /// other nodes' votes; see [`pool_gossip_aggregate`].
     fn forward(self, server: &P2PServer, received_at: Instant, outcome: Outcome) {
+        if let Self::Aggregate { aggregate, .. } = &self
+            && outcome == Outcome::Accept
+        {
+            pool_gossip_aggregate(server, aggregate);
+        }
+        if let Self::Attestation {
+            attestation,
+            subnet_id,
+        } = &self
+            && outcome == Outcome::Accept
+            && server.aggregator_subnets.contains_key(subnet_id)
+        {
+            pool_aggregator_attestation(server, attestation);
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -185,6 +207,61 @@ impl Validated {
             Self::Block { .. } | Self::Aggregate { .. } | Self::Attestation { .. } => {}
         }
     }
+}
+
+/// Pool an accepted gossip aggregate for block production to pack.
+///
+/// Pooled here, on `Accept`, because this is where all three of its
+/// signatures have just been verified, and one unverified attestation in a
+/// block fails the whole block. Pooling on arrival also means a slot's
+/// aggregates, published two thirds of the way through it, are in the pool
+/// when the next slot's block is asked for at its start, rather than
+/// waiting for the chain actor's next tick. Only electra's shape is pooled,
+/// since the pool holds electra attestations and electra is the earliest fork
+/// this node produces blocks for.
+fn pool_gossip_aggregate(server: &P2PServer, aggregate: &SignedAggregateAndProof) {
+    let SignedAggregateAndProof::Electra(signed) = aggregate else {
+        return;
+    };
+    server
+        .attestation_pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .insert_aggregate(signed.message.aggregate.clone());
+}
+
+/// Pool an accepted subnet attestation for a validator client's aggregator.
+///
+/// The pool keys a vote by its position in its committee, which the gossip
+/// checks resolved but do not return; it is read back from the same place
+/// they read it, the voted block's cached post-state and the shared committee
+/// cache, so nothing is derived twice.
+fn pool_aggregator_attestation(server: &P2PServer, attestation: &SingleAttestation) {
+    let data = &attestation.data;
+    let Some(state) = server
+        .store
+        .cached_state(CacheKey::BlockState(data.beacon_block_root))
+    else {
+        return;
+    };
+    let committees = server
+        .store
+        .committee_cache()
+        .committees(&state, data.target.epoch);
+    let Ok(committee) = committees.committee(data.slot, attestation.committee_index) else {
+        return;
+    };
+    let Some(position) = committee
+        .iter()
+        .position(|&member| member == attestation.attester_index)
+    else {
+        return;
+    };
+    server
+        .attestation_pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .insert(attestation, position, committee.len());
 }
 
 /// What to do with a beacon gossip message once the checks that read only the
@@ -411,6 +488,38 @@ mod tests {
                         },
                     },
                     signature: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// A one-member electra aggregate at `(slot, aggregator)`, from committee
+    /// 0. Same reasoning as [`phase0_aggregate`]: `forward` runs after the
+    /// stateful checks, so nothing here needs to be signature-valid.
+    fn electra_aggregate(slot: u64, aggregator: u64) -> SignedAggregateAndProof {
+        let mut aggregation_bits = electra::AggregationBits::with_length(1).unwrap();
+        aggregation_bits.set(0, true).unwrap();
+        let mut committee_bits = electra::CommitteeBits::default();
+        committee_bits.set(0, true).unwrap();
+        SignedAggregateAndProof::Electra(electra::SignedAggregateAndProof {
+            message: electra::AggregateAndProof {
+                aggregator_index: aggregator,
+                aggregate: electra::Attestation {
+                    aggregation_bits,
+                    data: AttestationData {
+                        slot,
+                        index: 0,
+                        beacon_block_root: Root::ZERO,
+                        source: Checkpoint::default(),
+                        target: Checkpoint {
+                            epoch: slot / 32,
+                            root: Root::ZERO,
+                        },
+                    },
+                    signature: Default::default(),
+                    committee_bits,
                 },
                 selection_proof: Default::default(),
             },
@@ -651,6 +760,59 @@ mod tests {
             &mut server,
             Outcome::Reject(RejectReason::BadSignature)
         ));
+    }
+
+    /// An accepted electra aggregate is what block production packs other
+    /// nodes' votes from, so `forward` has to put it in the pool; a phase0 one
+    /// has no place there, since the pool holds electra attestations.
+    #[tokio::test]
+    async fn an_accepted_electra_aggregate_is_pooled_and_a_phase0_one_is_not() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forward_accepted = |aggregate| {
+            Validated::Aggregate {
+                aggregate: Box::new(aggregate),
+                attesting_indices: Vec::new(),
+            }
+            .forward(&server, Instant::now(), Outcome::Accept)
+        };
+
+        forward_accepted(phase0_aggregate(5, 1));
+        let pool = server.attestation_pool.clone();
+        assert!(pool.lock().unwrap().block_candidates().is_empty());
+
+        forward_accepted(electra_aggregate(5, 1));
+        let SignedAggregateAndProof::Electra(expected) = electra_aggregate(5, 1) else {
+            unreachable!("built as electra")
+        };
+        assert_eq!(
+            pool.lock().unwrap().block_candidates(),
+            vec![expected.message.aggregate]
+        );
+    }
+
+    /// Only `Accept` means the signatures were verified; anything else must
+    /// stay out of the pool, since one unverified attestation fails the
+    /// whole block it is packed into.
+    #[tokio::test]
+    async fn an_aggregate_that_was_not_accepted_is_not_pooled() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        Validated::Aggregate {
+            aggregate: Box::new(electra_aggregate(5, 1)),
+            attesting_indices: Vec::new(),
+        }
+        .forward(
+            &server,
+            Instant::now(),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+        );
+        assert!(
+            server
+                .attestation_pool
+                .lock()
+                .unwrap()
+                .block_candidates()
+                .is_empty()
+        );
     }
 
     /// A subnet attestation is never forwarded, on any outcome, `Accept`

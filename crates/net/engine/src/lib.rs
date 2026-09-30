@@ -15,13 +15,15 @@
 //! `engine_newPayloadV4`, and the Osaka-current fork choice notification is
 //! Cancun's `engine_forkchoiceUpdatedV3`.
 //!
-//! Three method families a full client would have are deliberately absent:
-//! `engine_getPayload*` and `PayloadAttributesV3`, because this node is a
-//! follower and never proposes; `engine_getBlobs*`, because there is no
-//! blob-pool fetch path and data columns come from peers; and
+//! Payload building (`PayloadAttributesV3` on `forkchoiceUpdated`, and
+//! Osaka's `engine_getPayloadV5`) is in [`building`], for the Beacon API's
+//! block production. Two method families a full client would have are
+//! deliberately absent: `engine_getBlobs*`, because there is no blob-pool
+//! fetch path and data columns come from peers; and
 //! `engine_getPayloadBodies*`, because nothing consumes them.
 
 pub mod auth;
+pub mod building;
 pub mod client;
 pub mod error;
 pub mod types;
@@ -39,5 +41,6 @@ pub use types::{ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_newPayloadV4",
     "engine_forkchoiceUpdatedV3",
+    "engine_getPayloadV5",
     "engine_getClientVersionV1",
 ];

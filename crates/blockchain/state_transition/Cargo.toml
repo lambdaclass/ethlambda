@@ -29,6 +29,12 @@ preset-minimal = ["ethlambda-types/preset-minimal"]
 # after downloading the fixtures.
 beacon-spec-tests = []
 
+# Exposes `beacon::helpers::test_state`, the state builder this crate's own
+# tests use, to other crates' tests (the Beacon API's duty endpoints need a
+# state with a real validator registry). Never enabled outside
+# `[dev-dependencies]`.
+test-utils = []
+
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
@@ -109,6 +115,10 @@ libtest-mimic = "0.8.2"
 name = "stf_spectests"
 path = "tests/stf_spectests.rs"
 harness = false
+# Skipped by `cargo test`: the released leanSpec fixtures still carry the old
+# leanVM key format and fail to decode. Run on demand with
+# `cargo test --profile release-fast --test <name>`.
+test = false
 
 [[test]]
 name = "beacon_spec_tests"

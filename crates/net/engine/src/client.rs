@@ -217,6 +217,35 @@ impl EngineClient {
         Ok(response.payload_status)
     }
 
+    /// `engine_forkchoiceUpdatedV3` with `payloadAttributes`: the same fork
+    /// choice notification, plus a request to start building a payload on the
+    /// head for the slot the attributes describe.
+    ///
+    /// Returns the head's status and the build process's id; the id is `None`
+    /// when the execution client declined to build.
+    pub async fn forkchoice_updated_with_attributes(
+        &self,
+        state: &ForkchoiceStateV1,
+        attributes: &crate::building::PayloadAttributesV3,
+    ) -> Result<(PayloadStatusV1, Option<crate::building::PayloadId>), EngineError> {
+        let params = json!([state, attributes]);
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV3", params).await?;
+        Ok((response.payload_status, response.payload_id))
+    }
+
+    /// `engine_getPayloadV5`: the payload a build process has assembled so
+    /// far, with its blobs bundle and execution requests.
+    pub async fn get_payload(
+        &self,
+        payload_id: crate::building::PayloadId,
+    ) -> Result<crate::building::BuiltPayload, EngineError> {
+        let response: crate::building::GetPayloadV5Response = self
+            .call("engine_getPayloadV5", json!([payload_id]))
+            .await?;
+        response.try_into()
+    }
+
     /// `engine_exchangeCapabilities`. Returns what the execution client says it
     /// supports.
     pub async fn exchange_capabilities(&self, ours: &[&str]) -> Result<Vec<String>, EngineError> {
