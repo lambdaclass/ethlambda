@@ -267,7 +267,9 @@ the chain actor writes, so no request waits on the actor.
   epoch). A slot before the head, or past the wall clock, is a `400`. An
   optimistic head is a `503`: the Beacon API requires one whenever the
   answer's `beacon_block_root` has not been validated by the execution client,
-  and the head is always that root here.
+  and the head is always that root here. So is every request on a node run
+  without an execution client, whose blocks are never marked optimistic
+  because nothing validates them.
 - **`pool/attestations`** checks each attestation against the electra
   `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
   window, `data.index == 0`, target epoch, the voted block known and the target

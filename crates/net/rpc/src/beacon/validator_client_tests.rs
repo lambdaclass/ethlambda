@@ -42,12 +42,13 @@ use ethlambda_validator::{
     },
 };
 
-use crate::test_utils::{RecordingNetwork, beacon_store_at};
+use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
 
 const COUNT: usize = 64;
 
 /// A fulu head state at the first slot of the wall clock's current epoch, with
-/// its proposer lookahead filled in, served over HTTP on an ephemeral port.
+/// its proposer lookahead filled in, served over HTTP on an ephemeral port,
+/// by a node with no execution client.
 async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
     serve_with_engine(None).await
 }
@@ -113,9 +114,12 @@ async fn serve_with_store(
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
+///
+/// The node has an execution client, since it refuses attestation data
+/// without one. None of these calls reach it.
 #[tokio::test]
 async fn the_validator_client_can_attest_through_this_node() {
-    let (client, state, network) = serve().await;
+    let (client, state, network) = serve_with_engine(idle_engine()).await;
     let slot = state.slot();
     let epoch = compute_epoch_at_slot(slot);
 
@@ -259,7 +263,7 @@ fn signed_aggregate(
 /// of noticing agree, the per-request 503 and `/node/syncing`.
 #[tokio::test]
 async fn an_optimistic_head_is_one_the_client_will_not_attest_through() {
-    let (client, state, _, mut store) = serve_with_store(None).await;
+    let (client, state, _, mut store) = serve_with_store(idle_engine()).await;
     let (_slot, head_root) = store.beacon_head().expect("the anchor is the head");
     store.insert_beacon_optimistic_root(head_root, state.slot());
 
