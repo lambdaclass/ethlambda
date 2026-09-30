@@ -1,5 +1,7 @@
 //! `data_column_sidecar_{subnet_id}` gossip validation: fulu's
-//! `validate_data_column_sidecar_gossip` (`specs/fulu/p2p-interface.md`).
+//! `validate_data_column_sidecar_gossip` (`specs/fulu/p2p-interface.md`), and
+//! gloas's modified one (`specs/gloas/p2p-interface.md`) in the `_gloas`
+//! functions beside it.
 //!
 //! Also every check the chain relies on before it keeps a sidecar gossip did
 //! not accept ([`chain_checks`]): one fetched over req/resp, one gossip queued
@@ -309,57 +311,70 @@ pub fn validate(
     stateful_checks(store, sidecar)
 }
 
-/// Gloas's `validate_data_column_sidecar_gossip` (`specs/gloas/p2p-interface.md`,
-/// "Modified `data_column_sidecar_{subnet_id}`"), beside fulu's [`validate`].
+/// The gloas rules that read only the sidecar, the clock and the store's
+/// metadata: the half [`validate_gloas`] runs first, beside fulu's
+/// [`cheap_checks`].
 ///
-/// One function rather than a cheap/stateful pair: a gloas sidecar carries no
-/// header, so there is no signature, proposer or parent-state rule left to
-/// put on a blocking thread. What remains is a block lookup and the KZG
-/// batch, in the spec's own order. The caller records the sidecar in `seen`
-/// once this answers [`Outcome::Accept`].
-///
-/// A block the store has not seen is [`Outcome::Queue`], the specification's
-/// "MAY be queued until block is retrieved". A block seen without a post-state
-/// is queued too where the specification rejects it, the same deviation
-/// fulu's parent rule makes until a bad-block cache exists.
-pub fn validate_gloas(
+/// Split from [`stateful_checks_gloas`] for the reason fulu's is: a duplicate
+/// or a misrouted sidecar is dropped without taking a blocking-pool permit,
+/// and the KZG batch stays off the swarm loop. `Err` carries the verdict; `Ok`
+/// sends the sidecar on to [`stateful_checks_gloas`]. The caller records the
+/// sidecar in `seen` once the whole rule answers [`Outcome::Accept`].
+pub fn cheap_checks_gloas(
     seen: &SeenBlockColumns,
     store: &Store,
     sidecar: &gloas::DataColumnSidecar,
     subnet_id: u64,
     now_ms: u64,
-) -> Outcome {
+) -> Result<(), Outcome> {
     let config = store.config();
     // [IGNORE] The first sidecar seen for this block root and column index.
     if seen.contains(sidecar.beacon_block_root, sidecar.index) {
-        return Outcome::Ignore(IgnoreReason::AlreadySeen);
+        return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
     }
     // [REJECT] The sidecar is for the correct subnet.
     if sidecar.index % DATA_COLUMN_SIDECAR_SUBNET_COUNT != subnet_id {
-        return Outcome::Reject(RejectReason::WrongSubnet);
+        return Err(Outcome::Reject(RejectReason::WrongSubnet));
     }
     // [IGNORE] The sidecar is not from a future slot.
     if is_future_slot(&config, sidecar.slot, now_ms) {
-        return Outcome::Ignore(IgnoreReason::FutureSlot);
+        return Err(Outcome::Ignore(IgnoreReason::FutureSlot));
     }
     // [IGNORE] Already stored, fetched over req/resp before gossip delivered
-    // it. Not a rule of the specification: it saves the KZG batch below.
+    // it. Not a rule of the specification: it saves the KZG batch.
     if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
-        return Outcome::Ignore(IgnoreReason::AlreadyStored);
+        return Err(Outcome::Ignore(IgnoreReason::AlreadyStored));
     }
+    Ok(())
+}
+
+/// The gloas rules that need the named block and its post-state, then the KZG
+/// batch. Runs on a blocking thread, beside fulu's [`stateful_checks`].
+///
+/// A block the store has not seen is [`Outcome::Queue`], the specification's
+/// "MAY be queued until block is retrieved". A block seen without a post-state
+/// is queued too where the specification rejects it, the same deviation
+/// fulu's parent rule makes until a bad-block cache exists.
+pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) -> Outcome {
+    let root = sidecar.beacon_block_root;
     // [IGNORE] A block for the sidecar has been seen (MAY queue).
-    let block = match store.get_signed_block(&sidecar.beacon_block_root) {
-        Ok(Some(block)) => block,
-        Ok(None) => return Outcome::Queue(QueueReason::BlockUnknown),
-        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
-    };
+    if !store.has_block(&root) {
+        return Outcome::Queue(QueueReason::BlockUnknown);
+    }
     // [REJECT] The block for the sidecar passes validation. A block seen
-    // without a post-state is queued rather than rejected, see above.
-    match store.has_state(&sidecar.beacon_block_root) {
+    // without a post-state is queued rather than rejected, see above. Checked
+    // before the block is decoded, so one without a state costs no read of it.
+    match store.has_state(&root) {
         Ok(true) => {}
         Ok(false) => return Outcome::Queue(QueueReason::BlockNotReady),
         Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
     }
+    let block = match store.get_signed_block(&root) {
+        Ok(Some(block)) => block,
+        // Stored a moment ago and gone now (pruned): nothing to judge against.
+        Ok(None) => return Outcome::Queue(QueueReason::BlockUnknown),
+        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
+    };
     // [REJECT] The sidecar's slot matches the slot of the block.
     if sidecar.slot != block.slot() {
         return Outcome::Reject(RejectReason::SlotMismatch);
@@ -381,8 +396,8 @@ pub fn validate_gloas(
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::Malformed),
-        SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::validate_gloas"),
+        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::stateful_checks_gloas"),
     };
     // [REJECT] The sidecar passes structural validation.
     if !fork_choice::gloas_verify_data_column_sidecar(sidecar, kzg_commitments) {
@@ -397,6 +412,23 @@ pub fn validate_gloas(
         return Outcome::Reject(RejectReason::Kzg);
     }
     Outcome::Accept
+}
+
+/// [`cheap_checks_gloas`] then [`stateful_checks_gloas`], for callers with no
+/// reason to split them, such as the spec vectors: gloas's
+/// `validate_data_column_sidecar_gossip` (`specs/gloas/p2p-interface.md`,
+/// "Modified `data_column_sidecar_{subnet_id}`"), beside fulu's [`validate`].
+pub fn validate_gloas(
+    seen: &SeenBlockColumns,
+    store: &Store,
+    sidecar: &gloas::DataColumnSidecar,
+    subnet_id: u64,
+    now_ms: u64,
+) -> Outcome {
+    if let Err(outcome) = cheap_checks_gloas(seen, store, sidecar, subnet_id, now_ms) {
+        return outcome;
+    }
+    stateful_checks_gloas(store, sidecar)
 }
 
 /// Whether `parent_state`'s proposer lookahead covers `slot` at all.
@@ -1081,6 +1113,48 @@ mod tests {
         assert_eq!(
             validate_gloas(&seen, &store, &sidecar, 0, now),
             Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+    }
+
+    #[test]
+    fn a_gloas_sidecar_whose_block_has_no_post_state_is_queued() {
+        let mut store = store(0);
+        let card = gloas_sidecar(5, 0);
+        store
+            .insert_pending_block(card.beacon_block_root, parent_block(5))
+            .expect("insert pending block");
+        assert_eq!(
+            stateful_checks_gloas(&store, &card),
+            Outcome::Queue(QueueReason::BlockNotReady)
+        );
+    }
+
+    #[test]
+    fn an_already_stored_gloas_sidecar_is_ignored() {
+        let store = store(0);
+        let card = gloas_sidecar(5, 0);
+        store
+            .put_data_column_sidecar(card.slot, &card.beacon_block_root, card.index, Vec::new())
+            .expect("store the column");
+        assert_eq!(
+            cheap_checks_gloas(&block_columns(), &store, &card, 0, slot_start_ms(&store, 5)),
+            Err(Outcome::Ignore(IgnoreReason::AlreadyStored))
+        );
+    }
+
+    #[test]
+    fn a_gloas_sidecar_naming_a_non_gloas_block_is_rejected() {
+        let mut store = store(0);
+        let card = gloas_sidecar(5, 0);
+        store
+            .insert_pending_block(card.beacon_block_root, parent_block(5))
+            .expect("insert the block");
+        store
+            .insert_state(card.beacon_block_root, fulu_parent(3))
+            .expect("insert the state");
+        assert_eq!(
+            stateful_checks_gloas(&store, &card),
+            Outcome::Reject(RejectReason::BlockNotGloas)
         );
     }
 }

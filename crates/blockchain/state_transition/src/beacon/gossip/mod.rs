@@ -166,6 +166,9 @@ pub enum RejectReason {
     Kzg,
     /// A gloas sidecar's slot is not the slot of the block it names.
     SlotMismatch,
+    /// A gloas sidecar names a block of an earlier fork, which has no bid to
+    /// take commitments from.
+    BlockNotGloas,
     /// An attestation's target epoch is not its slot's epoch.
     EpochMismatch,
     /// An aggregate with no aggregation bit set.
@@ -211,6 +214,7 @@ impl RejectReason {
             Self::InclusionProof => "inclusion_proof",
             Self::Kzg => "kzg",
             Self::SlotMismatch => "slot_mismatch",
+            Self::BlockNotGloas => "block_not_gloas",
             Self::EpochMismatch => "epoch_mismatch",
             Self::NoParticipants => "no_participants",
             Self::NonZeroDataIndex => "non_zero_data_index",

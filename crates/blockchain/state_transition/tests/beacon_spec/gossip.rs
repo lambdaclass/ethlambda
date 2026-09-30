@@ -150,8 +150,9 @@ struct FinalizedOverride {
 
 #[derive(serde::Deserialize)]
 struct GossipMessage {
-    /// Missing from gloas's column vectors, which name the message's clock
-    /// reading in `current_time_ms` instead; see [`GossipMessage::arrival_ms`].
+    /// The format's offset from `meta.current_time_ms`. Some of gloas's
+    /// column vectors carry `current_time_ms` instead; see
+    /// [`GossipMessage::arrival_ms`].
     offset_ms: Option<u64>,
     current_time_ms: Option<u64>,
     subnet_id: Option<u64>,
@@ -162,15 +163,21 @@ struct GossipMessage {
 
 impl GossipMessage {
     /// The clock reading, in milliseconds since genesis, the message arrives
-    /// at: the format's `meta.current_time_ms + offset_ms`. Gloas's column
-    /// vectors instead carry a per-message `current_time_ms`, which is read as
-    /// the absolute reading (every such vector states a time later than the
-    /// meta's own base and inside the slot its sidecar is for).
-    fn arrival_ms(&self, base_ms: u64) -> u64 {
+    /// at: the format's `meta.current_time_ms + offset_ms`.
+    ///
+    /// Some of gloas's column vectors carry a per-message `current_time_ms`
+    /// instead: the generator (`test/gloas/networking/
+    /// test_gossip_data_column_sidecar.py`) writes `compute_time_at_slot_ms`
+    /// plus 500 there, the same basis as `meta.current_time_ms`, so it is the
+    /// absolute reading.
+    fn arrival_ms(&self, base_ms: u64) -> Result<u64, String> {
         match (self.offset_ms, self.current_time_ms) {
-            (Some(offset), _) => base_ms + offset,
-            (None, Some(absolute)) => absolute,
-            (None, None) => base_ms,
+            (Some(offset), _) => Ok(base_ms + offset),
+            (None, Some(absolute)) => Ok(absolute),
+            (None, None) => Err(format!(
+                "{}: names neither offset_ms nor current_time_ms",
+                self.message
+            )),
         }
     }
 }
@@ -345,7 +352,10 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_attestations = SeenAttestations::new(capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
-        let now_ms = config.genesis_time_ms() + message.arrival_ms(meta.current_time_ms);
+        let now_ms = config.genesis_time_ms()
+            + message
+                .arrival_ms(meta.current_time_ms)
+                .map_err(|err| format!("message {index}: {err}"))?;
         let outcome = match meta.topic.as_str() {
             "beacon_block" => {
                 let block = decode_block(case, &message.message)?;
