@@ -3741,6 +3741,44 @@ impl BlockChainServer {
         !fork_at(current_slot).is_followed() && fork_at(head_slot).is_followed()
     }
 
+    /// Advances a beacon store's clock to `event_ms` (Unix milliseconds), for
+    /// an event whose handler reads the clock to judge a sub-slot deadline.
+    ///
+    /// The beacon tick fires once per slot, so between ticks the store sits at
+    /// the slot's start and [`fork_choice::on_block`] would find every
+    /// current-slot block inside both the attestation and the payload
+    /// timeliness deadlines. The specification has no such gap: its `on_tick`
+    /// is called "whenever `time > store.time`", so the clock is wherever the
+    /// last event put it. The follower's tick was per slot only because it has
+    /// no sub-slot duties of its own, which nothing here changes.
+    ///
+    /// Never backwards (a re-delivered block brings an old arrival), and never
+    /// across a slot boundary: crossing one is the tick's job, since it also
+    /// drains deferred aggregates and recomputes the head, which this does
+    /// not. An event from a later slot than the store reads is clamped to the
+    /// last instant of the current one. The specification's clock is whole
+    /// seconds, so the deadlines are judged on the second the event fell in.
+    fn advance_beacon_clock_to(&mut self, event_ms: u64) {
+        if self.store.chain() != Chain::Beacon {
+            return;
+        }
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
+        let slot_end_ms = config
+            .genesis_time_ms()
+            .saturating_add(
+                current_slot
+                    .saturating_add(1)
+                    .saturating_mul(config.slot_duration_ms),
+            )
+            .saturating_sub(1);
+        let time = event_ms.min(slot_end_ms) / 1000;
+        let store_time_ms = self.store.time_ms().expect("store time exists");
+        if fork_choice::seconds_to_milliseconds(time) > store_time_ms {
+            fork_choice::on_tick(&mut self.store, time, &config);
+        }
+    }
+
     /// Milliseconds until this actor's next tick, dispatched by chain: lean's
     /// interval grid via [`ms_until_next_interval`], beacon's once-per-slot
     /// cadence via [`ms_until_next_beacon_slot`].
@@ -3965,6 +4003,15 @@ impl Handler<NewBlock> for BlockChainServer {
         // the import, the catch-up tick included, so it is its own section
         // rather than the head of the first pass's guards.
         timings.admit_end = Some(Instant::now());
+        // Time the import at the block's arrival on this node, not at the
+        // slot's start where the tick left the clock: `on_block` reads it for
+        // the attestation and payload timeliness deadlines. The arrival is the
+        // wire receipt (`decode_start`), which predates validation and the
+        // mailbox wait; `arrival_ms` was sampled at pickup.
+        let received = msg.arrival.decode_start.unwrap_or(msg.arrival.handed_off);
+        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
+            .unwrap_or(u64::MAX);
+        self.advance_beacon_clock_to(arrival_ms.saturating_sub(in_flight_ms));
         self.on_block(msg.block, timings).await;
     }
 }
@@ -4701,6 +4748,72 @@ mod tests {
             ))
             .unwrap();
         store
+    }
+
+    /// How far into its slot the store clock reads, in milliseconds.
+    fn ms_into_slot(server: &BlockChainServer) -> u64 {
+        server.store.ms_since_genesis() % server.store.config().slot_duration_ms
+    }
+
+    /// A fulu-era block arriving after the attestation deadline used to be
+    /// judged against the slot-start clock the once-per-slot tick leaves the
+    /// store on, so `block_timeliness` saw zero milliseconds into the slot and
+    /// called every current-slot block timely. Advancing the clock to the
+    /// arrival puts the store past the deadline that verdict is read against.
+    #[test]
+    fn a_late_arrival_moves_the_store_clock_past_the_attestation_deadline() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let config = server.store.config();
+        let slot_start_ms = config.genesis_time_ms() + 10 * config.slot_duration_ms;
+        let deadline_ms = fork_choice::get_attestation_due_ms(10 / 32, &config);
+        assert_eq!(
+            ms_into_slot(&server),
+            0,
+            "the tick leaves the clock at slot start"
+        );
+
+        server.advance_beacon_clock_to(slot_start_ms + deadline_ms + 500);
+
+        assert!(ms_into_slot(&server) >= deadline_ms);
+    }
+
+    #[test]
+    fn an_early_arrival_keeps_the_store_clock_inside_the_attestation_window() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let config = server.store.config();
+        let slot_start_ms = config.genesis_time_ms() + 10 * config.slot_duration_ms;
+        let deadline_ms = fork_choice::get_attestation_due_ms(10 / 32, &config);
+
+        server.advance_beacon_clock_to(slot_start_ms + 1_000);
+
+        assert!(ms_into_slot(&server) < deadline_ms);
+    }
+
+    #[test]
+    fn the_store_clock_never_moves_backwards_on_an_arrival() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let config = server.store.config();
+        let slot_start_ms = config.genesis_time_ms() + 10 * config.slot_duration_ms;
+        server.advance_beacon_clock_to(slot_start_ms + 6_000);
+        let before = server.store.time_ms().unwrap();
+
+        // A held block re-delivered with its original, earlier arrival.
+        server.advance_beacon_clock_to(slot_start_ms + 2_000);
+
+        assert_eq!(server.store.time_ms().unwrap(), before);
+    }
+
+    #[test]
+    fn an_arrival_past_the_slot_does_not_cross_the_boundary_ahead_of_the_tick() {
+        // Crossing it is the tick's job: it also drains deferred aggregates
+        // and recomputes the head, which this advance does not.
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let config = server.store.config();
+        let slot_start_ms = config.genesis_time_ms() + 10 * config.slot_duration_ms;
+
+        server.advance_beacon_clock_to(slot_start_ms + 3 * config.slot_duration_ms);
+
+        assert_eq!(fork_choice::get_current_slot(&server.store, &config), 10);
     }
 
     #[tokio::test]
