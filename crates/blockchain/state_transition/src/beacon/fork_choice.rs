@@ -7775,8 +7775,14 @@ mod tests {
         // verified payload is timely, which reads the votes.
         store.set_time_ms(2 * config.slot_duration_ms).unwrap();
         let committees = CommitteeCache::default();
-        gloas_get_head(&store, &config, &committees)
+        let walked = gloas_get_head(&store, &config, &committees)
             .expect("a resumed store must walk the head over a verified payload");
+        // The actor's own path: `walk_head` with the payload links re-derived
+        // (none survive a restart) and the boost and weight helpers.
+        let head = get_head_node(&store, &config)
+            .expect("the live head walk must succeed on a resumed store");
+        assert_eq!(head.root, walked.root);
+        assert_eq!(get_head(&mut store, &config).unwrap(), walked.root);
 
         let message = gloas::PayloadAttestationMessage {
             validator_index: 3,
