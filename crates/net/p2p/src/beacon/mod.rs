@@ -16,12 +16,14 @@
 pub mod column_checks;
 pub mod decode;
 pub mod encoding;
+pub mod fork_schedule;
 pub mod handler;
 pub mod messages;
 pub mod protocols;
 pub mod subnets;
 pub mod swarm;
 pub mod topics;
+pub mod transition;
 pub mod verdict;
 
 use ethlambda_types::beacon::config::Config;
@@ -34,15 +36,23 @@ use ethlambda_types::beacon::primitives::{ForkDigest, Root};
 /// fork a gossip payload decodes under is derived from its slot, and that
 /// derivation must use the same schedule the fork digest was computed from.
 pub struct BeaconWire {
+    /// The digest this node publishes under and advertises in `Status`. Moves
+    /// at each boundary of [`Self::schedule`]; see [`transition`].
     pub fork_digest: ForkDigest,
-    /// The fork `fork_digest` was computed at, so the fork of everything
-    /// that arrives on a subscribed topic.
+    /// The fork `fork_digest` was computed at.
     ///
-    /// Only `beacon_attestation_{subnet_id}` reads it. Every other
-    /// fork-dependent topic finds its fork from the slot inside the payload,
-    /// which this one cannot do; see [`decode::decode_attestation`].
+    /// What a message published now is in. A received message's fork comes from
+    /// its own topic's digest through [`Self::schedule`] instead, since while a
+    /// boundary's window is open this node is subscribed under two digests.
     pub fork: ForkName,
+    /// Every digest the chain will use, and when to join and leave each.
+    pub schedule: fork_schedule::ForkSchedule,
+    /// The topics under `fork_digest`.
     pub topics: topics::BeaconTopics,
+    /// The topics of every other digest the subscription window holds: the
+    /// next one from an epoch ahead of its boundary, the previous one until two
+    /// epochs after. Empty outside a window.
+    pub window_topics: Vec<topics::BeaconTopics>,
     pub config: Config,
     pub genesis_time: u64,
     /// The chain every fork digest is bound to.
@@ -52,8 +62,8 @@ pub struct BeaconWire {
     /// epoch, so serving history means computing digests this node never runs
     /// on. See [`encoding`]'s module docs for the rule.
     pub genesis_validators_root: Root,
-    /// Advertised in `Ping` responses and in `MetaData`. Never bumped today:
-    /// nothing this node advertises changes at runtime.
+    /// Advertised in `Ping` responses and in `MetaData`. Bumped when the
+    /// digest switches, the one advertised value that changes at runtime.
     pub metadata_seq_number: u64,
     /// The columns this node custodies, carried alongside `topics` so the
     /// gossip handler and the request handlers can check what this node
@@ -67,6 +77,19 @@ pub struct BeaconWire {
 }
 
 impl BeaconWire {
+    /// Every topic set this node is subscribed to: the current digest's, then
+    /// the window's.
+    pub fn held_topics(&self) -> impl Iterator<Item = &topics::BeaconTopics> {
+        std::iter::once(&self.topics).chain(self.window_topics.iter())
+    }
+
+    /// Whether this node is subscribed under `digest`, so whether a peer on it
+    /// is on a digest this node still speaks.
+    pub fn holds_digest(&self, digest: ForkDigest) -> bool {
+        self.held_topics()
+            .any(|topics| topics.fork_digest == digest)
+    }
+
     /// The two values the codec needs to put a block chunk on or off the wire.
     pub fn codec_context(&self) -> BeaconContext {
         BeaconContext {

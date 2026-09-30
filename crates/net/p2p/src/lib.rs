@@ -960,14 +960,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             // `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed rather than
             // assumed so a network that ever separates the two counts still
             // subscribes to the right topic.
-            let column_subnets: Vec<u64> = beacon
-                .custody_columns
-                .iter()
-                .map(|column| {
-                    column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
-                })
-                .collect();
-            let topics = beacon::topics::BeaconTopics::new(
+            let column_subnets = beacon::topics::column_subnets(&beacon.custody_columns);
+            let topics = beacon::topics::BeaconTopics::for_fork(
+                beacon.fork,
                 beacon.fork_digest,
                 &column_subnets,
                 &beacon.attestation_subnets,
@@ -986,10 +981,21 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 "Beacon P2P node started"
             );
 
+            // Only the current digest is joined here. The rest of the window
+            // around a boundary (the next digest's topics, or the previous
+            // one's if the node started just after one) is joined by the first
+            // `AdvanceForkSchedule`, which `P2P::spawn` sends at once, so that
+            // startup and a live crossing run one code path.
+            let schedule = beacon::fork_schedule::ForkSchedule::new(
+                &beacon.config,
+                beacon.genesis_validators_root,
+            );
             Wire::Beacon(Box::new(beacon::BeaconWire {
                 fork_digest: beacon.fork_digest,
                 fork: beacon.fork,
+                schedule,
                 topics,
+                window_topics: Vec::new(),
                 config: beacon.config,
                 genesis_time: beacon.genesis_time,
                 genesis_validators_root: beacon.genesis_validators_root,
@@ -1097,6 +1103,12 @@ impl P2P {
             handle.context(),
             p2p_protocol::DiscoverPeers,
         );
+        // Immediate on a beacon wire: joins the rest of a window the node
+        // started inside, then keeps itself scheduled. A no-op on lean.
+        let _ = handle
+            .context()
+            .send(p2p_protocol::AdvanceForkSchedule)
+            .inspect_err(|err| warn!(%err, "Could not schedule the fork schedule"));
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
     }
@@ -1282,6 +1294,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
+    /// Apply the fork schedule at the wall-clock epoch. Sent once at startup and
+    /// then by its own timer for the next join, switch or leave.
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn advance_fork_schedule(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1364,6 +1380,17 @@ impl P2PServer {
         );
         gossipsub::leave_expired_aggregator_subnets(self);
         gossipsub::prune_attestation_pool(self);
+    }
+
+    #[send_handler]
+    async fn handle_advance_fork_schedule(
+        &mut self,
+        _msg: p2p_protocol::AdvanceForkSchedule,
+        ctx: &Context<Self>,
+    ) {
+        if let Some(delay) = beacon::transition::advance(self) {
+            send_after(delay, ctx.clone(), p2p_protocol::AdvanceForkSchedule);
+        }
     }
 
     #[send_handler]

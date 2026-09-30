@@ -1576,7 +1576,7 @@ async fn handle_status_request(
     // `refuse` above (which needs `&mut server`) is behind us.
     let wire = server.wire.beacon().expect("checked above");
 
-    if peer_status.fork_digest() != wire.fork_digest {
+    if !wire.holds_digest(peer_status.fork_digest()) {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
         // becomes visible.
@@ -1688,7 +1688,7 @@ async fn handle_status_response(
     let Some(wire) = server.wire.beacon() else {
         return;
     };
-    if status.fork_digest() != wire.fork_digest {
+    if !wire.holds_digest(status.fork_digest()) {
         warn!(
             %peer,
             peer_digest = %hex::encode(status.fork_digest()),
