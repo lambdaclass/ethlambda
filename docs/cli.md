@@ -139,7 +139,7 @@ something specific here.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia` or `hoodi`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
+| `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys
 every gossip topic, the ENR `eth2` entry and discv5 admission is computed from,
@@ -147,7 +147,7 @@ come from the resolved network:
 
 | `--network` | genesis values | config | bootnodes |
 |---|---|---|---|
-| `mainnet` (default), `sepolia`, `hoodi` | two constants in `network::built_in`; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB) | `bin/ethlambda/assets/<name>/config.yaml`, `eth-clients/<name>`'s file byte for byte | `bin/ethlambda/assets/<name>/bootstrap_nodes.yaml`, from the same repo |
+| `mainnet` (default), `sepolia`, `hoodi`, `plataberget` | two constants in `network::built_in`; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB) | `bin/ethlambda/assets/<name>/config.yaml`, byte for byte from `eth-clients/<name>` (Platåberget: `ethpandaops/glamsterdam-devnets`' `network-configs/devnet-8`) | `bin/ethlambda/assets/<name>/bootstrap_nodes.yaml`, from the same repo |
 | a directory | read off the directory's own `genesis.ssz` | the directory's `config.yaml` | the directory's `bootstrap_nodes.yaml`/`.txt` |
 
 The genesis constants are checked twice at runtime: checkpoint sync verifies the
@@ -191,7 +191,7 @@ for a loaded network only, that directory's own `genesis.ssz`, then abort. The
 URL is therefore **required** on a fresh data directory only for a built-in
 network: this follower imports nothing past its anchor, so anchoring a built-in
 network at genesis would leave it parked at slot 0 while claiming to follow a
-chain that has been live for years. A loaded network's own genesis
+live chain. A loaded network's own genesis
 state is a legitimate anchor instead, since a freshly started devnet has no
 checkpoint provider at slot 0 and this is the only way to join one. A
 directory already anchored from a previous run resumes without the flag
