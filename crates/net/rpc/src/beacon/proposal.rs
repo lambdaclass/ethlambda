@@ -318,9 +318,9 @@ async fn produce(
     let attestation_count = attestations.len();
     let block = match assemble_block(&state, inputs(attestations), &config) {
         Ok(block) => block,
-        // Every packed attestation passed validation on its way into the pool,
-        // so this should not happen; but a block without them still earns the
-        // proposal, and one that fails to build earns nothing.
+        // `pack_attestations` checks every attestation's signature against this
+        // state, so this should not happen; but a block without them still
+        // earns the proposal, and one that fails to build earns nothing.
         Err(err) if attestation_count > 0 => {
             warn!(%slot, %err, "Block with attestations failed to build; retrying without");
             assemble_block(&state, inputs(Vec::new()), &config)

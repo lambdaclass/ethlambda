@@ -749,6 +749,22 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     }
 }
 
+/// Drop attestation pool entries more than an epoch old.
+///
+/// Inserts prune as they go; this also runs on the aggregator-subnet sweep, so
+/// a pool nothing is inserted into does not keep stale entries.
+pub fn prune_attestation_pool(server: &P2PServer) {
+    let Some(wire) = server.wire.beacon() else {
+        return;
+    };
+    let now = beacon_wall_slot(wire);
+    server
+        .attestation_pool
+        .lock()
+        .expect("attestation pool lock poisoned")
+        .prune_before(now);
+}
+
 /// Leave every aggregator subnet whose last slot has passed.
 pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
     let Some(wire) = server.wire.beacon() else {

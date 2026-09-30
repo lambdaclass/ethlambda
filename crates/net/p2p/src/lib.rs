@@ -1363,6 +1363,7 @@ impl P2PServer {
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
         gossipsub::leave_expired_aggregator_subnets(self);
+        gossipsub::prune_attestation_pool(self);
     }
 
     #[send_handler]

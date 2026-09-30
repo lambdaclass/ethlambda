@@ -879,8 +879,8 @@ mod tests {
 
     fn create_test_validator() -> Validator {
         Validator {
-            attestation_pubkey: [1u8; 52],
-            proposal_pubkey: [11u8; 52],
+            attestation_pubkey: [1u8; 32],
+            proposal_pubkey: [11u8; 32],
             index: 0,
         }
     }

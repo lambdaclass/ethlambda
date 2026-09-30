@@ -29,8 +29,11 @@ use ethlambda_types::{
 
 use super::bls;
 
-/// The pool, shared between whatever fills it (the Beacon API's pool endpoint,
-/// the attestation subnet handler) and the aggregate endpoint that reads it.
+/// The pool, shared between whatever fills it (the Beacon API's pool
+/// endpoints, the attestation subnet handler, accepted gossip aggregates)
+/// and what reads it (the aggregate endpoint, block
+/// production). There must be exactly one per node: a second instance hides
+/// its writers' entries from the other's readers.
 pub type SharedAttestationPool = Arc<Mutex<AttestationPool>>;
 
 /// One committee's votes on one `AttestationData`.
@@ -46,10 +49,11 @@ pub struct AttestationPool {
     /// Keyed by the data's root and the committee, which is exactly what an
     /// aggregate request names.
     votes: HashMap<(Root, CommitteeIndex), Votes>,
-    /// Single-committee aggregates this node has validated (the ones its
-    /// validator clients published through it), the best-covered per data
-    /// and committee. Block production packs from these as well as from
-    /// `votes`.
+    /// Single-committee aggregates this node has validated, the best-covered
+    /// per data and committee: the ones its validator clients published
+    /// through it, and gossip aggregates from other nodes once P2P has
+    /// verified all three of their signatures. Block production packs from
+    /// these as well as from `votes`.
     aggregates: HashMap<(Root, CommitteeIndex), Attestation>,
 }
 
@@ -126,7 +130,10 @@ impl AttestationPool {
     }
 
     /// Drop everything more than an epoch older than `slot`.
-    fn prune_before(&mut self, slot: Slot) {
+    ///
+    /// Inserts call this themselves; P2P also calls it once per slot, so a
+    /// pool nothing is inserted into does not keep stale entries.
+    pub fn prune_before(&mut self, slot: Slot) {
         self.votes
             .retain(|_, votes| votes.data.slot + preset::SLOTS_PER_EPOCH > slot);
         self.aggregates

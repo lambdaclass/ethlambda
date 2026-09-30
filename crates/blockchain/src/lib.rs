@@ -86,6 +86,14 @@ pub struct BlockChainConfig {
     pub gate_duties: bool,
     /// Attestation subnets this node subscribes to.
     pub subscribed_subnets: HashSet<u64>,
+    /// The subnet this aggregator is responsible for when scoring recursive
+    /// aggregation. Aggregators on different duty subnets merge different
+    /// children, which is what stops them all producing the same proof.
+    pub aggregation_duty_subnet: u64,
+    /// Whether the aggregator sits out candidates whose level another duty
+    /// subnet owns in the slot, trading window overlap for less duplicated prover
+    /// work.
+    pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -249,21 +257,15 @@ impl BlockChain {
             attestation_committee_count,
             gate_duties,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
         } = config;
 
         metrics::set_is_aggregator(aggregator.is_enabled());
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = store.config().time_grid();
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
-
-        // Catch XMSS keys up to the current slot before the first tick
-        // The store clock doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap we need to catch up through
-        let now_ms = unix_now_ms();
-        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot) as u32;
-        key_manager.advance_keys_to(current_slot);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
         let lean = LeanDuties {
             key_manager,
@@ -271,9 +273,39 @@ impl BlockChain {
             current_aggregation: None,
             attestation_committee_count,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
         };
+
+        // Warm the XMSS signing caches for the next duties before the first
+        // tick, which fires right away and runs the current interval's duty.
+        // The store clock doesn't work here: after an offline gap it lags
+        // wall-clock by exactly the gap the first duty will be at.
+        let ms_since_genesis = unix_now_ms().saturating_sub(time_config.genesis_time_ms());
+        let current_slot = ms_since_genesis / time_config.milliseconds_per_slot;
+        match SlotInterval::from_ms_since_genesis(ms_since_genesis, &time_config) {
+            // The first tick still attests at the current slot. No proposal
+            // key: the current slot's block was due at the previous slot's
+            // interval 4, before we started, and the interval-1 tick warms the
+            // next slot's.
+            SlotInterval::BlockPublication | SlotInterval::AttestationProduction => {
+                lean.key_manager.prepare_keys_for(current_slot as u32, None);
+            }
+            // This slot's attestations are behind us, so the next signatures
+            // are the next slot's block, built at this slot's interval 4, and
+            // that slot's attestations.
+            SlotInterval::Aggregation
+            | SlotInterval::SafeTargetUpdate
+            | SlotInterval::EndOfSlot => {
+                let num_validators = store.head_state().validators.len() as u64;
+                let next_slot = current_slot + 1;
+                let proposer = lean.our_proposer(next_slot, num_validators);
+                lean.key_manager
+                    .prepare_keys_for(next_slot as u32, proposer);
+            }
+        }
 
         Self::start_actor(
             store,
@@ -614,6 +646,16 @@ struct LeanDuties {
     /// Used to scale the early-aggregation threshold.
     subscribed_subnets: HashSet<u64>,
 
+    /// The subnet this aggregator is responsible for. Scores which children
+    /// recursive aggregation merges, so aggregators on different duty subnets
+    /// build different proofs.
+    aggregation_duty_subnet: u64,
+
+    /// Whether to sit out aggregation candidates whose level another duty
+    /// subnet owns this slot, trading window overlap for less duplicated
+    /// prover work. See [`aggregation::owns_width`] for the rotation.
+    skip_redundant_aggregation: bool,
+
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
 
@@ -623,6 +665,17 @@ struct LeanDuties {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+}
+
+impl LeanDuties {
+    /// Returns the validator ID if any of our validators is the proposer for
+    /// this slot.
+    fn our_proposer(&self, slot: u64, num_validators: u64) -> Option<u64> {
+        self.key_manager
+            .validator_ids()
+            .into_iter()
+            .find(|&vid| is_proposer(vid, slot, num_validators))
+    }
 }
 
 /// Error from importing a block, whichever chain it belongs to.
@@ -898,8 +951,14 @@ impl BlockChainServer {
         // Fail fast: a state with zero validators is invalid and would cause
         // panics in proposer selection and attestation processing. Lean-only:
         // `head_state` peels a lean `State` and panics on a beacon store, which
-        // has no validator set of its own to check.
-        if self.store.chain() == Chain::Lean && self.store.head_state().validators.is_empty() {
+        // has no validator set of its own to check. Read once per tick, since
+        // `head_state` clones the whole state. Zero on a beacon follower, where
+        // nothing reads it: `get_our_proposer` answers `None` there first.
+        let num_validators = match self.store.chain() {
+            Chain::Lean => self.store.head_state().validators.len() as u64,
+            Chain::Beacon => 0,
+        };
+        if self.store.chain() == Chain::Lean && num_validators == 0 {
             error!("Head state has no validators, skipping tick");
             return;
         }
@@ -940,7 +999,7 @@ impl BlockChainServer {
         // interval-0 attestation acceptance. `get_our_proposer` answers `None`
         // on a beacon follower, which carries no validator keys.
         let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
-            .then(|| self.get_our_proposer(slot))
+            .then(|| self.get_our_proposer(slot, num_validators))
             .flatten()
             .is_some();
 
@@ -986,7 +1045,7 @@ impl BlockChainServer {
         // beacon follower's tick ends: it has no validator duties (see
         // [`ChainDuties::Beacon`]), and everything a tick owes it happened
         // above.
-        self.run_interval_duties(interval, slot, is_aggregator, ctx)
+        self.run_interval_duties(interval, slot, num_validators, is_aggregator, ctx)
             .await;
 
         // Update safe target slot metric (updated by store.on_tick at interval 3).
@@ -1033,11 +1092,13 @@ impl BlockChainServer {
     ///
     /// `is_aggregator` is passed in rather than read here so every duty in the
     /// tick acts on the one value the tick started with, even if the admin API
-    /// toggles the role underneath it.
+    /// toggles the role underneath it. `num_validators` is the head state's,
+    /// read once by `on_tick` since `head_state` clones the whole state.
     async fn run_interval_duties(
         &mut self,
         interval: SlotInterval,
         slot: u64,
+        num_validators: u64,
         is_aggregator: bool,
         ctx: &Context<Self>,
     ) {
@@ -1096,6 +1157,21 @@ impl BlockChainServer {
                         EarlyAggregationCheck,
                     );
                 }
+
+                // Warm the XMSS signing caches for the next slot so the signing
+                // paths don't have to, now that this slot's attestations are
+                // signed: a key caches one bottom subtree, so warming any earlier
+                // evicts the subtree this slot's attestation signs with whenever
+                // the two slots straddle a subtree boundary. This lands before
+                // interval 4 signs the next slot's block. A skipped interval-1
+                // tick costs only latency, since `sign` rebuilds the subtree
+                // itself on a miss. Runs off the actor so a subtree boundary
+                // doesn't stall the tick.
+                let next_slot = slot + 1;
+                let proposer = self.get_our_proposer(next_slot, num_validators);
+                self.lean_mut()
+                    .key_manager
+                    .prepare_keys_in_background(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====
@@ -1134,7 +1210,7 @@ impl BlockChainServer {
             SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
-                    .get_our_proposer(next_slot)
+                    .get_our_proposer(next_slot, num_validators)
                     .filter(|_| self.sync_status.duties_allowed());
 
                 if let Some(validator_id) = next_proposer {
@@ -1142,14 +1218,6 @@ impl BlockChainServer {
                 }
             }
         }
-
-        // Advance XMSS keys for next slot so the signing paths don't have to.
-        // Here rather than back in `on_tick` because it is a validator duty
-        // like the rest of this function: a beacon follower holds no keys, and
-        // the early return above is what keeps it from asking for them.
-        self.lean_mut()
-            .key_manager
-            .advance_keys_to((slot + 1) as u32);
     }
 
     /// This chain's head slot: `Store::head_slot` on lean,
@@ -1233,8 +1301,9 @@ impl BlockChainServer {
 
         // Limit ourselves to a single round of aggregation if we propose next round.
         // This buys us time to build the block before the next slot's interval-0 tick.
+        let num_validators = self.store.head_state().validators.len() as u64;
         let next_proposer = self
-            .get_our_proposer(slot + 1)
+            .get_our_proposer(slot + 1, num_validators)
             .filter(|_| self.sync_status.duties_allowed());
         let max_jobs = if next_proposer.is_some() {
             1
@@ -1242,7 +1311,14 @@ impl BlockChainServer {
             MAX_AGGREGATION_JOBS
         };
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        let lean = self.lean();
+        let window_config = aggregation::AggregationWindowConfig {
+            duty_subnet: lean.aggregation_duty_subnet,
+            committee_count: attestation_committee_count,
+            skip_redundant: lean.skip_redundant_aggregation,
+        };
+        let Some(snapshot) =
+            aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs, window_config)
         else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
@@ -1386,17 +1462,11 @@ impl BlockChainServer {
     /// [`Self::lean`], and that is load-bearing: `on_tick` is chain-generic
     /// and asks this on every [`SlotInterval::BlockPublication`], which is the
     /// one interval a beacon follower's once-per-slot tick lands on.
-    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
+    fn get_our_proposer(&self, slot: u64, num_validators: u64) -> Option<u64> {
         let ChainDuties::Lean(lean) = &self.duties else {
             return None;
         };
-        let head_state = self.store.head_state();
-        let num_validators = head_state.validators.len() as u64;
-
-        lean.key_manager
-            .validator_ids()
-            .into_iter()
-            .find(|&vid| is_proposer(vid, slot, num_validators))
+        lean.our_proposer(slot, num_validators)
     }
 
     /// Lean-only.
@@ -4343,6 +4413,8 @@ mod tests {
             attestation_committee_count: 0,
             gate_duties: true,
             subscribed_subnets: HashSet::new(),
+            aggregation_duty_subnet: 0,
+            skip_redundant_aggregation: false,
             proposer_config: ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: 0,
