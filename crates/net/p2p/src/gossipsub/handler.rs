@@ -634,10 +634,11 @@ pub async fn publish_beacon_attestation(
         error!(%slot, validator, subnet_id, "Attestation subnet out of range; dropping it");
         return;
     }
-    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
-        beacon.digest_for_slot(slot),
-        subnet_id,
-    ));
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, validator, "No held fork digest covers this attestation's slot; not publishing");
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(digest, subnet_id));
     let compressed = compress_message(&attestation.to_ssz());
     server.swarm_handle.publish(topic, compressed);
     debug!(
@@ -664,8 +665,12 @@ pub async fn publish_beacon_aggregate(
         error!(%slot, aggregator, "A beacon aggregate reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, aggregator, "No held fork digest covers this aggregate's slot; not publishing");
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.digest_for_slot(slot),
+        digest,
         beacon_topics::BEACON_AGGREGATE_AND_PROOF,
     ));
     // Each fork's container encodes as itself on the wire; the enum is only
@@ -692,8 +697,15 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         error!(slot, "A beacon block reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this block's slot; not publishing"
+        );
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.digest_for_slot(slot),
+        digest,
         beacon_topics::BEACON_BLOCK,
     ));
     server

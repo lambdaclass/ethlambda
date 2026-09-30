@@ -484,8 +484,13 @@ pub fn inc_beacon_status_digest_mismatch() {
 /// Resets the vector first: the digest changes at runtime, and a label left
 /// behind at 1 would read as two current digests.
 pub fn set_beacon_fork_digest(digest: &str) {
-    LEAN_BEACON_FORK_DIGEST.reset();
-    LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
+    set_only_label(&LEAN_BEACON_FORK_DIGEST, digest);
+}
+
+/// Make `label` the one series of `gauge` that reads 1.
+fn set_only_label(gauge: &IntGaugeVec, label: &str) {
+    gauge.reset();
+    gauge.with_label_values(&[label]).set(1);
 }
 
 static LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -625,20 +630,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_current_fork_digest_reads_one() {
-        set_beacon_fork_digest("aaaaaaaa");
-        set_beacon_fork_digest("bbbbbbbb");
-        assert_eq!(
-            LEAN_BEACON_FORK_DIGEST
-                .with_label_values(&["bbbbbbbb"])
-                .get(),
-            1
-        );
-        assert_eq!(
-            LEAN_BEACON_FORK_DIGEST
-                .with_label_values(&["aaaaaaaa"])
-                .get(),
-            0
-        );
+    fn only_the_newest_label_reads_one() {
+        // A local vector: the global gauge is also written by every transition
+        // test running in parallel in this binary.
+        let gauge = register_int_gauge_vec!("lean_test_only_label_gauge", "test", &["digest"])
+            .expect("a unique name");
+        set_only_label(&gauge, "aaaaaaaa");
+        set_only_label(&gauge, "bbbbbbbb");
+        assert_eq!(gauge.with_label_values(&["bbbbbbbb"]).get(), 1);
+        assert_eq!(gauge.with_label_values(&["aaaaaaaa"]).get(), 0);
     }
 }
