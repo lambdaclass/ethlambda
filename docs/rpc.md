@@ -232,8 +232,8 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
-| `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
-| `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
+| `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, whether the head is optimistic |
+| `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing or on an optimistic head |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
@@ -264,7 +264,10 @@ the chain actor writes, so no request waits on the actor.
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
   choice's cached `checkpoint_state`, and only when the head is in an earlier
-  epoch). A slot before the head, or past the wall clock, is a `400`.
+  epoch). A slot before the head, or past the wall clock, is a `400`. An
+  optimistic head is a `503`: the Beacon API requires one whenever the
+  answer's `beacon_block_root` has not been validated by the execution client,
+  and the head is always that root here.
 - **`pool/attestations`** checks each attestation against the electra
   `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
   window, `data.index == 0`, target epoch, the voted block known and the target
@@ -282,7 +285,8 @@ the chain actor writes, so no request waits on the actor.
   subnets are left once their slot has passed, and never appear in `attnets`.
 - **`aggregate_attestation`** answers from the pool: every vote held for the
   data root and committee, as electra's `Attestation` with the BLS aggregate of
-  their signatures. `404` when nothing is held.
+  their signatures. `404` when nothing is held, and `503` when the block the
+  votes name is optimistic, whether or not it is the head.
 - **`aggregate_and_proofs`** checks each aggregate with the same
   `beacon_aggregate_and_proof` gossip conditions this node applies to its
   peers' aggregates (`gossip::aggregate`), signatures included, against a

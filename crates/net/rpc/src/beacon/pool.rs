@@ -49,7 +49,10 @@ use ethlambda_types::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::beacon::{ApiError, validator::head};
+use crate::beacon::{
+    ApiError,
+    validator::{head, require_validated},
+};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -338,6 +341,10 @@ struct AggregateQuery {
 /// for `attestation_data_root` from `committee_index`'s committee at `slot`,
 /// aggregated. A 404 when it holds none, which is what the endpoint specifies
 /// and what an aggregator reads as "nothing to publish".
+///
+/// A 503 when the aggregate votes for a block whose execution payload is still
+/// unvalidated (see [`require_validated`]). That block is the one the votes
+/// name, which need not be this node's head.
 async fn get_aggregate_attestation(
     State(store): State<Store>,
     Extension(pool): Extension<SharedAttestationPool>,
@@ -354,6 +361,9 @@ async fn get_aggregate_attestation(
     let Some(aggregate) = aggregate else {
         return ApiError::NotFound("no matching attestations to aggregate").into_response();
     };
+    if let Err(err) = require_validated(&store, aggregate.data.beacon_block_root) {
+        return err.into_response();
+    }
     let fork = store
         .config()
         .fork_at_epoch(compute_epoch_at_slot(query.slot));
@@ -613,6 +623,29 @@ mod tests {
                 &signature
             )
         );
+    }
+
+    /// Pooled votes for an unvalidated block stay pooled, but are not handed
+    /// to an aggregator to sign over until the execution client vouches for
+    /// the block.
+    #[tokio::test]
+    async fn an_aggregate_voting_for_an_optimistic_block_is_a_503() {
+        let fixture = fixture();
+        let votes = [attestation(&fixture, 0, 0), attestation(&fixture, 0, 1)];
+        let (status, _) = submit(&fixture, &votes).await;
+        assert_eq!(status, StatusCode::OK);
+        let data = votes[0].data;
+
+        // The store is a handle: this clone shares the fixture's optimistic set.
+        let mut store = fixture.store.clone();
+        store.insert_beacon_optimistic_root(data.beacon_block_root, data.slot);
+        let (status, json) = get_aggregate(&fixture, data.hash_tree_root(), data.slot, 0).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json["code"], 503);
+
+        store.remove_beacon_optimistic_root(data.beacon_block_root);
+        let (status, _) = get_aggregate(&fixture, data.hash_tree_root(), data.slot, 0).await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     #[tokio::test]
