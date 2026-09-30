@@ -279,7 +279,7 @@ const fn g2_point_at_infinity() -> [u8; BLS_SIGNATURE_SIZE] {
 
 /// `specs/altair/bls.md`'s `G2_POINT_AT_INFINITY`, the compressed encoding of
 /// the identity element of G2.
-const G2_POINT_AT_INFINITY: [u8; BLS_SIGNATURE_SIZE] = g2_point_at_infinity();
+pub const G2_POINT_AT_INFINITY: [u8; BLS_SIGNATURE_SIZE] = g2_point_at_infinity();
 
 /// The specification's `bls.Verify(pubkey, message, signature) -> bool`.
 ///

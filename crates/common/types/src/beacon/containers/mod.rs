@@ -537,6 +537,53 @@ impl BeaconState {
             .ok_or(Error::UnknownValidator(index))
     }
 
+    /// Folds every buffered write into the tree-backed fields (`validators`,
+    /// `balances`), so the next `hash_tree_root` rehashes only the touched
+    /// paths and keeps the hashes it computes.
+    ///
+    /// Hashing with writes still pending gives the right root but caches
+    /// nothing for those paths, so the state transition calls this before
+    /// every state-root computation. A no-op on a lean state, which has no
+    /// tree-backed fields.
+    pub fn apply_pending_mutations(&mut self) {
+        if matches!(self, BeaconState::Lean(_)) {
+            return;
+        }
+        self.validators_mut().apply_updates();
+        self.balances_mut().apply_updates();
+    }
+
+    /// Whether `validators` or `balances` has a write [`apply_pending_mutations`]
+    /// has not folded into its tree yet.
+    ///
+    /// Always `false` on a lean state, which has no tree-backed fields. Meant
+    /// for callers that cache an `Arc<BeaconState>`: once shared, a state
+    /// cannot be flushed later, so every root taken through the `Arc` would
+    /// pay the slow, uncached hashing path if a write were still pending.
+    ///
+    /// [`apply_pending_mutations`]: BeaconState::apply_pending_mutations
+    pub fn has_pending_mutations(&self) -> bool {
+        if matches!(self, BeaconState::Lean(_)) {
+            return false;
+        }
+        self.validators().has_pending_updates() || self.balances().has_pending_updates()
+    }
+
+    /// Makes this state's tree-backed fields share every unchanged subtree
+    /// with `base`'s, so two nearly equal states do not each hold a full copy
+    /// of the registry. The state's contents do not change, only which
+    /// allocations back them.
+    ///
+    /// Works across forks, since `validators` and `balances` have one type in
+    /// every fork. A no-op if either state is lean.
+    pub fn rebase_on(&mut self, base: &BeaconState) {
+        if matches!(self, BeaconState::Lean(_)) || matches!(base, BeaconState::Lean(_)) {
+            return;
+        }
+        self.validators_mut().rebase_on(base.validators());
+        self.balances_mut().rebase_on(base.balances());
+    }
+
     /// The balance of the validator at `index`.
     pub fn balance(&self, index: ValidatorIndex) -> Result<Gwei> {
         self.balances()
@@ -1133,8 +1180,8 @@ mod tests {
         crate::state::State::from_genesis(
             genesis_time,
             vec![crate::state::Validator {
-                attestation_pubkey: [attestation_pubkey; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [attestation_pubkey; crate::state::PUBLIC_KEY_SIZE],
+                proposal_pubkey: [2u8; crate::state::PUBLIC_KEY_SIZE],
                 index: 0,
             }],
         )

@@ -43,8 +43,13 @@ use ethlambda_network_api::{
         CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
         PublishBlock,
     },
+    rpc_to_p2p::{
+        PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
+        SubscribeAttestationSubnets,
+    },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
 };
@@ -81,12 +86,14 @@ use crate::{
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_block,
+        publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
+        publish_beacon_block, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
-        fetch_block_from_peer, fetch_data_columns_from_peer, handlers::columns_custodied_by,
+        fetch_block_from_peer, fetch_data_columns_from_peer,
+        handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
 };
@@ -158,6 +165,28 @@ const STALE_COLUMN_LOOKUP: Duration = Duration::from_secs(8);
 /// us what they keep, and do not keep this column, are not. Two rather than
 /// all of them, because a range answer is megabytes when it lands.
 const UNKNOWN_CUSTODY_RANGE_PEERS: usize = 2;
+
+/// How long a beacon range batch may be held back waiting for every one of
+/// this node's custody columns to have a known custodian among the connected
+/// peers.
+///
+/// A batch sends its blocks and its `DataColumnsByRange` together, and the
+/// column request can only be aimed at peers whose custody is already known.
+/// Right after startup that is almost nobody: a peer's custody arrives with its
+/// `metadata/3` answer, after it connects. A batch sent then aims its column
+/// request at peers that may not keep the columns, a short or empty answer is
+/// not retried, and every block it leaves uncovered is held and chased by root
+/// one at a time. The wait is what gives the one range request a custodian to
+/// go to.
+///
+/// Bounded rather than open-ended, unlike lighthouse's range sync, which waits
+/// for custody peers as long as it takes. Nothing here goes looking for a
+/// custodian of a specific column, so a column no connected peer keeps may stay
+/// uncovered for a long time; past this deadline the batch goes anyway, and the
+/// uncovered columns get the unknown-custody fallback and the by-root path, as
+/// they did before the wait existed.
+const RANGE_BATCH_CUSTODY_WAIT: Duration = Duration::from_secs(30);
+
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
 
 /// How many of one peer's addresses a dial attempt starts at once.
@@ -211,6 +240,11 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
 
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
+/// How often to leave aggregator subnets whose slot has passed. One slot's
+/// worth: a subnet outlives its need by at most this, which costs a little
+/// relayed traffic and nothing else.
+const AGGREGATOR_SUBNET_SWEEP_INTERVAL: Duration = Duration::from_secs(12);
+
 const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
 
 /// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
@@ -374,6 +408,22 @@ pub(crate) struct RangeSyncState {
     /// Latest advertised head slot for each peer.
     pub(crate) peer_set: HashMap<PeerId, u64>,
     pub(crate) in_flight: bool,
+    /// When the next batch was first held back for custody, while it still is.
+    /// Beacon-only; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    pub(crate) custody_wait_since: Option<Instant>,
+}
+
+/// Where a beacon range batch held back for custody stands, as
+/// [`RangeSyncState::wait_for_custody`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustodyWait {
+    /// The batch has only now started waiting, so its deadline still needs
+    /// scheduling.
+    Started,
+    /// Still inside [`RANGE_BATCH_CUSTODY_WAIT`].
+    Waiting,
+    /// The deadline has passed: the batch goes with whatever custody is known.
+    Expired,
 }
 
 impl RangeSyncState {
@@ -382,7 +432,41 @@ impl RangeSyncState {
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
+            custody_wait_since: None,
         }
+    }
+
+    /// Hold the next batch back for custody, starting its wait on the first
+    /// call, and say whether it may keep waiting at `now`.
+    ///
+    /// The wait belongs to the batch rather than the session: sending clears
+    /// it (see [`Self::end_custody_wait`]), so a batch that finds custody
+    /// uncovered later on, after a custodian disconnected, gets a wait of its
+    /// own rather than inheriting an expired one.
+    pub(crate) fn wait_for_custody(&mut self, now: Instant) -> CustodyWait {
+        match self.custody_wait_since {
+            None => {
+                self.custody_wait_since = Some(now);
+                CustodyWait::Started
+            }
+            Some(since) if now.duration_since(since) < RANGE_BATCH_CUSTODY_WAIT => {
+                CustodyWait::Waiting
+            }
+            Some(_) => CustodyWait::Expired,
+        }
+    }
+
+    /// End the custody wait of the batch being sent, returning how long it
+    /// waited, or `None` if it never did.
+    pub(crate) fn end_custody_wait(&mut self, now: Instant) -> Option<Duration> {
+        self.custody_wait_since
+            .take()
+            .map(|since| now.duration_since(since))
+    }
+
+    /// Whether the next batch is currently held back for custody.
+    pub(crate) fn is_waiting_for_custody(&self) -> bool {
+        self.custody_wait_since.is_some()
     }
 
     pub(crate) fn merge_peer(&mut self, peer: PeerId, peer_head: u64, end_exclusive: u64) {
@@ -949,6 +1033,7 @@ impl P2P {
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: DiscoverySpawnConfig,
+        attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = spawn_discovery(discovery).await?;
         let (swarm_stream, swarm_handle) =
@@ -998,8 +1083,15 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            attestation_pool,
+            aggregator_subnets: HashMap::new(),
         };
         let handle = server.start();
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            handle.context(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
         send_after(
             DIAL_INTERVAL_AT_ZERO_PEERS,
             handle.context(),
@@ -1093,6 +1185,18 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+
+    /// Unaggregated attestations for this node's validator clients'
+    /// aggregators, shared with the Beacon API that aggregates from it. Filled
+    /// by `verdict::forward` from the aggregator subnets below; lean never
+    /// touches it.
+    pub(crate) attestation_pool: SharedAttestationPool,
+
+    /// The attestation subnets joined for a validator client's aggregators,
+    /// each with the last slot it is needed for. Short-lived by design: never
+    /// advertised in `attnets`, and left once the slot has passed. The
+    /// backbone subnets are separate and never left.
+    pub(crate) aggregator_subnets: HashMap<u64, u64>,
 }
 
 impl P2PServer {
@@ -1174,6 +1278,10 @@ pub(crate) trait P2PProtocol: Send + Sync {
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1244,6 +1352,21 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_leave_expired_aggregator_subnets(
+        &mut self,
+        _msg: p2p_protocol::LeaveExpiredAggregatorSubnets,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        gossipsub::leave_expired_aggregator_subnets(self);
+        gossipsub::prune_attestation_pool(self);
+    }
+
+    #[send_handler]
     async fn handle_discover_peers(
         &mut self,
         _msg: p2p_protocol::DiscoverPeers,
@@ -1267,6 +1390,17 @@ impl P2PServer {
             DIAL_INTERVAL_AT_TARGET
         };
         send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
+    }
+
+    /// The deadline of a range batch held back for custody. Scheduled once,
+    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    #[send_handler]
+    async fn handle_retry_beacon_range_batch(
+        &mut self,
+        _msg: p2p_protocol::RetryBeaconRangeBatch,
+        ctx: &Context<Self>,
+    ) {
+        resume_range_batch_held_for_custody(self, ctx).await;
     }
 }
 
@@ -1294,6 +1428,30 @@ impl Handler<PublishAttestation> for P2PServer {
 impl Handler<PublishAggregatedAttestation> for P2PServer {
     async fn handle(&mut self, msg: PublishAggregatedAttestation, _ctx: &Context<Self>) {
         publish_aggregated_attestation(self, msg.attestation).await;
+    }
+}
+
+impl Handler<PublishBeaconAggregate> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
+        publish_beacon_aggregate(self, msg.aggregate).await;
+    }
+}
+
+impl Handler<PublishBeaconBlock> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
+        publish_beacon_block(self, msg.block).await;
+    }
+}
+
+impl Handler<SubscribeAttestationSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
+        gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<PublishBeaconAttestation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAttestation, _ctx: &Context<Self>) {
+        publish_beacon_attestation(self, msg.subnet_id, msg.attestation).await;
     }
 }
 
@@ -2358,6 +2516,8 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            attestation_pool: Default::default(),
+            aggregator_subnets: HashMap::new(),
         }
     }
 
@@ -3089,6 +3249,42 @@ mod tests {
         assert!(!state.in_flight);
         assert!(!state.peer_set.contains_key(&stale_peer));
         assert_eq!(state.peer_set.get(&current_peer), Some(&2999));
+    }
+
+    #[test]
+    fn a_batch_held_for_custody_waits_until_its_deadline_and_no_longer() {
+        let mut state = RangeSyncState::new(10..3000, random_peer(), 500);
+        let start = Instant::now();
+
+        // Only the first hold starts the wait, which is what schedules the
+        // deadline once rather than on every re-check.
+        assert_eq!(state.wait_for_custody(start), CustodyWait::Started);
+        assert!(state.is_waiting_for_custody());
+        let halfway = start + RANGE_BATCH_CUSTODY_WAIT / 2;
+        assert_eq!(state.wait_for_custody(halfway), CustodyWait::Waiting);
+        let deadline = start + RANGE_BATCH_CUSTODY_WAIT;
+        assert_eq!(state.wait_for_custody(deadline), CustodyWait::Expired);
+
+        assert_eq!(
+            state.end_custody_wait(deadline),
+            Some(RANGE_BATCH_CUSTODY_WAIT)
+        );
+        assert!(!state.is_waiting_for_custody());
+        assert_eq!(state.end_custody_wait(deadline), None);
+    }
+
+    #[test]
+    fn each_batch_gets_a_custody_wait_of_its_own() {
+        let mut state = RangeSyncState::new(10..3000, random_peer(), 500);
+        let start = Instant::now();
+        state.wait_for_custody(start);
+        let sent_at = start + 2 * RANGE_BATCH_CUSTODY_WAIT;
+        assert_eq!(state.wait_for_custody(sent_at), CustodyWait::Expired);
+        state.end_custody_wait(sent_at);
+
+        // A later batch that finds custody uncovered again waits in full,
+        // rather than inheriting the expired wait of the batch before it.
+        assert_eq!(state.wait_for_custody(sent_at), CustodyWait::Started);
     }
 
     #[test]

@@ -7,6 +7,9 @@
 //!
 //! This module grows as forks land. It currently covers what phase0 needs.
 
+use std::collections::BTreeMap;
+
+use ethlambda_ssz_tree::List;
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
@@ -42,14 +45,24 @@ pub type Eth1DataVotes = SszList<Eth1Data, { preset::SLOTS_PER_ETH1_VOTING_PERIO
 
 /// The validator registry. Append-only: a validator is never removed, only
 /// exited, since indices are referenced by attestations and must stay stable.
-pub type Validators = SszList<Validator, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+///
+/// Kept in a persistent Merkle tree ([`List`]) rather than a `Vec`: a state
+/// derived from another shares the unchanged part of the registry with it, and
+/// re-hashing after a block only rehashes the records the block touched.
+/// Writes are buffered in a `BTreeMap`, since they are rare and scattered,
+/// until `BeaconState::apply_pending_mutations`.
+pub type Validators =
+    List<Validator, { preset::VALIDATOR_REGISTRY_LIMIT }, BTreeMap<usize, Validator>>;
 
 /// Balances, positionally parallel to [`Validators`].
 ///
 /// Kept separate from the registry rather than as a `Validator` field because it
 /// changes every epoch while the rest of a validator's record rarely does, and a
 /// separate list means rewards do not redirty the registry's merkle tree.
-pub type Balances = SszList<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+///
+/// Tree-backed like [`Validators`], with writes buffered densely (the default
+/// `VecMap`), since epoch processing writes every balance.
+pub type Balances = List<Gwei, { preset::VALIDATOR_REGISTRY_LIMIT }>;
 
 /// Past randao mixes, indexed by epoch modulo the vector length, so the state
 /// retains a bounded history of the beacon chain's randomness.
@@ -125,7 +138,17 @@ pub struct ForkData {
 /// An epoch and the block root at its start: what attestations vote on and what
 /// justification and finalization track.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct Checkpoint {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -173,7 +196,17 @@ pub struct Validator {
 
 /// What an attestation actually attests to.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct AttestationData {
     /// The slot being attested for.

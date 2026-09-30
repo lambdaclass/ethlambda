@@ -16,6 +16,15 @@
 # That exclusivity is not optional. The ethlambda validator client keeps no
 # slashing-protection record, so a key held by it and by any other client would
 # be signed twice every slot.
+#
+# # Which beacon node it talks to
+#
+# By default, the first participant's. With `ethlambda_beacon.enabled`, the
+# package also runs `ethlambda beacon`, paired with a geth of its own over the
+# Engine API, and hands the validator client both nodes, ethlambda's first: the
+# client fails over per call, so everything ethlambda beacon serves goes through
+# it. With `ethlambda_beacon.fallback: false` the participant's node is left
+# out of the list entirely, and ethlambda beacon serves every duty alone.
 
 ethereum_package = import_module("github.com/ethpandaops/ethereum-package/main.star")
 
@@ -27,10 +36,25 @@ KEYS_ARTIFACT = "ethlambda-validator-keys"
 KEYS_MOUNT = "/keys"
 METRICS_PORT = 5064
 
+# What ethereum-package names the genesis files and the Engine API secret, and
+# where its own clients mount them.
+GENESIS_ARTIFACT = "el_cl_genesis_data"
+GENESIS_MOUNT = "/network-configs"
+JWT_ARTIFACT = "jwt_file"
+JWT_MOUNT = "/jwt"
+
+BEACON_API_PORT = 5052
+BEACON_METRICS_PORT = 5054
+BEACON_P2P_PORT = 9001
+BEACON_DISCOVERY_PORT = 9000
+ENGINE_PORT = 8551
+
 
 def run(plan, args={}):
     vc = args.get("ethlambda_validator", {})
-    devnet_args = {k: v for k, v in args.items() if k != "ethlambda_validator"}
+    devnet_args = {
+        k: v for k, v in args.items() if k not in ("ethlambda_validator", "ethlambda_beacon")
+    }
 
     network_params = devnet_args.get("network_params", {})
     # One entry per participant ethereum-package will start, in its order:
@@ -64,8 +88,22 @@ def run(plan, args={}):
         )
 
     output = ethereum_package.run(plan, devnet_args)
-    beacon_url = output.all_participants[0].cl_context.beacon_http_url
+    beacon_nodes = [output.all_participants[0].cl_context.beacon_http_url]
 
+    beacon = args.get("ethlambda_beacon", {})
+    if beacon.get("enabled", False):
+        ethlambda_url = launch_ethlambda_beacon(
+            plan,
+            beacon,
+            output.all_participants[0].cl_context.enr,
+            vc.get("image", "ghcr.io/lambdaclass/ethlambda:validator-local"),
+        )
+        # With `fallback: false` the client talks to ethlambda beacon alone, so
+        # every duty, proposals included, has to go through it.
+        if beacon.get("fallback", True):
+            beacon_nodes = [ethlambda_url] + beacon_nodes
+        else:
+            beacon_nodes = [ethlambda_url]
     name = vc.get("name", "ethlambda-vc")
     if "dora" in devnet_args.get("additional_services", []):
         label_in_dora(plan, first, last, name)
@@ -76,7 +114,7 @@ def run(plan, args={}):
     cmd = [
         "validator",
         "--beacon-nodes",
-        beacon_url,
+        ",".join(beacon_nodes),
         "--validators-dir",
         KEYS_MOUNT + "/validators",
         "--secrets-dir",
@@ -107,7 +145,9 @@ def run(plan, args={}):
     )
 
     plan.print(
-        "ethlambda validator signs for validators [{}, {}) via {}".format(first, last, beacon_url)
+        "ethlambda validator signs for validators [{}, {}) via {}".format(
+            first, last, ", ".join(beacon_nodes)
+        )
     )
     return output
 
@@ -176,3 +216,94 @@ def label_in_dora(plan, first, last, name):
     )
     plan.stop_service(name="dora", description="Restarting Dora to load the new name")
     plan.start_service(name="dora", description="Restarting Dora to load the new name")
+
+
+def launch_ethlambda_beacon(plan, beacon, bootnode_enr, default_image):
+    """Run `ethlambda beacon` with a geth of its own, and return its API URL.
+
+    The geth starts from the same genesis as the devnet's and needs no
+    execution-layer peers: ethlambda beacon syncs the chain from genesis and
+    hands geth every payload in order over the Engine API, so each one extends
+    a parent geth already has. That also makes geth answer VALID rather than
+    SYNCING, which keeps the node out of optimistic mode, and the validator
+    client refuses to sign against an optimistic node.
+
+    geth is started first because the Engine API client does not retry a block
+    once its attempts are spent.
+    """
+    geth = plan.add_service(
+        name="el-ethlambda",
+        config=ServiceConfig(
+            image=beacon.get("geth_image", "ethereum/client-go:latest"),
+            entrypoint=["sh", "-c"],
+            cmd=[
+                " ".join(
+                    [
+                        "geth",
+                        "--override.genesis={}/genesis.json".format(GENESIS_MOUNT),
+                        "--datadir=/data/geth",
+                        "--syncmode=full",
+                        "--authrpc.addr=0.0.0.0",
+                        "--authrpc.port={}".format(ENGINE_PORT),
+                        "--authrpc.vhosts=*",
+                        "--authrpc.jwtsecret={}/jwtsecret".format(JWT_MOUNT),
+                        "--nodiscover",
+                        "--maxpeers=0",
+                    ]
+                )
+            ],
+            files={GENESIS_MOUNT: GENESIS_ARTIFACT, JWT_MOUNT: JWT_ARTIFACT},
+            ports={
+                "engine": PortSpec(number=ENGINE_PORT, transport_protocol="TCP"),
+            },
+        ),
+    )
+
+    bootnodes = plan.render_templates(
+        name="ethlambda-beacon-bootnodes",
+        config={"bootnodes.txt": struct(template="{{.enr}}\n", data={"enr": bootnode_enr})},
+    )
+
+    service = plan.add_service(
+        name="cl-ethlambda",
+        config=ServiceConfig(
+            image=beacon.get("image", default_image),
+            cmd=[
+                "beacon",
+                "--network",
+                GENESIS_MOUNT,
+                "--execution-endpoint",
+                "http://{}:{}".format(geth.ip_address, ENGINE_PORT),
+                "--execution-jwt-secret",
+                "{}/jwtsecret".format(JWT_MOUNT),
+                "--bootnodes",
+                "/bootnodes/bootnodes.txt",
+                "--data-dir",
+                "/data",
+                "--http-address",
+                "0.0.0.0",
+                "--api-port",
+                str(BEACON_API_PORT),
+                "--metrics-port",
+                str(BEACON_METRICS_PORT),
+                "--gossipsub-port",
+                str(BEACON_P2P_PORT),
+                "--discovery.port",
+                str(BEACON_DISCOVERY_PORT),
+            ],
+            files={
+                GENESIS_MOUNT: GENESIS_ARTIFACT,
+                JWT_MOUNT: JWT_ARTIFACT,
+                "/bootnodes": bootnodes,
+            },
+            ports={
+                "http": PortSpec(
+                    number=BEACON_API_PORT, transport_protocol="TCP", application_protocol="http"
+                ),
+                "metrics": PortSpec(
+                    number=BEACON_METRICS_PORT, transport_protocol="TCP", application_protocol="http"
+                ),
+            },
+        ),
+    )
+    return "http://{}:{}".format(service.ip_address, BEACON_API_PORT)

@@ -9,7 +9,7 @@ Not to be confused with Ethereum consensus clients AKA Beacon Chain clients AKA 
 **Rust version:** 1.97.1 (edition 2024)
 **Test fixtures release:** Download latest production fixtures from leanSpec releases
 
-## Codebase Structure (12 workspace crates)
+## Codebase Structure (13 workspace crates)
 
 ```
 bin/ethlambda/              # Entry point, CLI, orchestration
@@ -39,7 +39,8 @@ crates/
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
-    ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
+    ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
   net/
@@ -278,9 +279,39 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
+- Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
+  (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
+  constants in `common/crypto/src/signature.rs`
 - Epoch-based to prevent reuse
-- Aggregation via leanVM (previously leanMultisig) for efficiency
+- Signing, verification, and aggregation all come from leanVM, which internalized
+  XMSS in its own `xmss` crate; there is no external leanSig dependency
+- BLAKE2s over binary fields, not Poseidon over KoalaBear: a leanVM `main` bump
+  across that rewrite invalidates every genesis key and every stored proof, even
+  when the wire sizes happen to match
+- `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
+  proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
+  which recycles the prover's large buffers across proofs instead of re-faulting
+  them, so its pages stay resident for the node's lifetime
+- `ethlambda keygen` generates genesis validator keys through the same
+  `ValidatorSecretKey` the node loads them with, so a key set cannot be built
+  against a different leanVM than the client reading it. Keys are only usable by
+  a client on the matching revision, and no file size changes when the scheme
+  does, so the manifest records `leanvm_rev`. See [`docs/keygen.md`](docs/keygen.md)
+
+**Aggregation shape (one leanVM `AggregateSignature`, grouped by `(epoch, message)`):**
+- Type-1 and Type-2 are the same object: one `XmssGroup` per `(epoch, message)`
+  pair, carrying that group's sorted, deduplicated keys
+- **A slot can carry several messages.** Validators attesting moments apart
+  disagree within a slot, so two distinct `AttestationData` at one slot is
+  ordinary rather than equivocation and a block routinely carries both. The
+  groups are sorted on the whole pair: with two of them at one slot, sorting on
+  the epoch alone rebuilds a different signer set and fails a valid proof
+- **The binding is off the wire.** `to_bytes_without_pubkeys()` carries neither
+  the keys nor the `(slot, message)` pairs, so every decode rebuilds the whole
+  signer set from a `SignerSet` per claim. A wrong set, message or slot decodes
+  fine and fails inside the SNARK verifier, so there is no cheap binding check
+- Narrowing replaces splitting: re-aggregate the parent with a `declare` naming
+  the group to keep (`split_type_2_by_message`)
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM
@@ -471,7 +502,10 @@ disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
 handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
 same `SyncStatusController` the chain actor writes to. The beacon arm takes no
 `AggregatorController` and no `EventBus`, because a follower has no aggregator duty to
-toggle and the chain-events stream is part of the lean surface.
+toggle and the chain-events stream is part of the lean surface. It does take the P2P
+actor's `RpcToP2PRef` (`crates/net/api`), the one path by which this node gossips on the
+beacon wire: `POST /eth/v2/beacon/pool/attestations` validates a validator client's
+attestations and publishes them through it.
 
 The two API routers are alternatives, never merged. A `/lean/v0` path on a `beacon` run is
 a 404: those handlers read lean state variants and metadata keys a beacon directory never
@@ -547,6 +581,21 @@ existing once per chain.
   it lives on `feat/beacon-chain-stf`, where these types are verified against
   consensus-specs v1.6.1 (5705 mainnet / 40009 minimal cases). What runs here
   is the containers' own round-trip and shape tests.
+- **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s**, persistent
+  Merkle trees that cache node hashes and share unchanged subtrees between
+  states through `Arc`; they have no slices and no `iter_mut`. A leaf holds a
+  page-sized run of elements rather than one chunk, and an inner node a page of
+  child pointers spanning several binary levels, so a lookup crosses a handful
+  of nodes and a rebuilt leaf or node copies one page. Writes are
+  buffered until `BeaconState::apply_pending_mutations`, which the state
+  transition calls before every state-root computation. A state decoded from
+  storage is rebased onto a cached one (`Store::get_state`).
+  - **`state.validator(i)` and `balances()[i]` are tree descents, not array
+    indexing.** A loop over the registry should walk `validators().iter()`
+    (zipped with `balances().iter()` where it needs both), not index per
+    validator: helpers that build the active-index `Vec` and then read each
+    index back were the largest cost left in the import profile
+    (`docs/beacon_stf.md`, "Registry and balances").
 
 ## Beacon Chain STF (`crates/blockchain/state_transition/src/beacon/`)
 
@@ -655,7 +704,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
 GENESIS_TIME: 1770407233
 MILLISECONDS_PER_SLOT: 4000  # optional, defaults to DEFAULT_MILLISECONDS_PER_SLOT
 GENESIS_VALIDATORS:
-  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # XMSS pubkeys, hex, PUBLIC_KEY_SIZE bytes
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
@@ -771,7 +820,9 @@ behavior.
 ## External Dependencies
 
 **Critical:**
-- `leansig`: XMSS signatures (leanEthereum project)
+- `leanvm`: XMSS signatures and recursive aggregation, taken from leanVM's facade
+  crate (which re-exports `xmss`, `rec_aggregation` and its `rand`) and pinned to
+  one `main` revision (leanEthereum project)
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model

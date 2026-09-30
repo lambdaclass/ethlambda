@@ -21,6 +21,10 @@
 //! size worth of columns rather than the whole matrix, and two attestation
 //! subnets rather than all sixty-four, since widening either is what turns this
 //! node into a supernode.
+//!
+//! Publishing is wider than subscribing: the Beacon API gossips a validator
+//! client's attestations on whichever subnet each belongs to, through gossipsub
+//! fanout, which needs only peers subscribed to that subnet, not this node.
 
 use std::collections::BTreeMap;
 

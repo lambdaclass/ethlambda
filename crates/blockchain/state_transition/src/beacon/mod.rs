@@ -69,6 +69,8 @@
 //! [specs]: https://github.com/ethereum/consensus-specs
 
 pub mod aggregate;
+pub mod attestation_pool;
+pub mod block_production;
 pub mod bls;
 pub mod das;
 pub mod fork_choice;

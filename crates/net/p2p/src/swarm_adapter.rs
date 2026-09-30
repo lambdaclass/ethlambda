@@ -8,7 +8,7 @@ use libp2p::{
     swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::{
     Behaviour, BehaviourEvent, ReqRespProtocol, ReqRespRequestId, metrics, req_resp::Request,
@@ -23,6 +23,10 @@ pub enum SwarmCommand {
         topic: libp2p::gossipsub::IdentTopic,
         data: Vec<u8>,
     },
+    /// Join a topic after startup: the aggregator subnets, which a validator
+    /// client names slot by slot.
+    Subscribe(libp2p::gossipsub::IdentTopic),
+    Unsubscribe(libp2p::gossipsub::IdentTopic),
     Dial {
         /// Carries the full set of addresses worth trying for one dial attempt
         /// (a peer's QUIC and TCP ports both, say): libp2p races every address
@@ -109,6 +113,20 @@ impl SwarmHandle {
             .cmd_tx
             .send(SwarmCommand::Publish { topic, data })
             .inspect_err(|_| debug!("Swarm adapter closed, cannot publish"));
+    }
+
+    pub fn subscribe(&self, topic: libp2p::gossipsub::IdentTopic) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::Subscribe(topic))
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot subscribe"));
+    }
+
+    pub fn unsubscribe(&self, topic: libp2p::gossipsub::IdentTopic) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::Unsubscribe(topic))
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot unsubscribe"));
     }
 
     pub fn dial(&self, opts: DialOpts) {
@@ -274,6 +292,16 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .publish(topic, data)
                 .inspect_err(|err| debug!(%err, "Swarm adapter: publish failed"))
                 .ok();
+        }
+        SwarmCommand::Subscribe(topic) => {
+            let _ = swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&topic)
+                .inspect_err(|err| warn!(%topic, %err, "Swarm adapter: subscribe failed"));
+        }
+        SwarmCommand::Unsubscribe(topic) => {
+            swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
         }
         SwarmCommand::Dial { opts, outcome_tx } => {
             let outcome = match swarm.dial(opts) {

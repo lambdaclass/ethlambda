@@ -154,6 +154,9 @@ pub fn state_transition(
     }
 
     block::process_block(state, signed_block, config, engine, committees)?;
+    // As in `process_slot`: the post-state's root, checked below and needed
+    // again in the next slot, is then computed on the state's own nodes.
+    state.apply_pending_mutations();
 
     if validate_result {
         verify(
@@ -196,6 +199,14 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
         *state.slot_mut() += 1;
         upgrade_at_fork_boundary(state, config)?;
     }
+
+    // Epoch processing above can leave writes buffered past the last
+    // `process_slot`'s own flush (it runs before, not after, that step). A
+    // state returned here without a block on top, such as a checkpoint state
+    // built for attestation targets or an empty-slot pre-state, would
+    // otherwise be cloned and cached with the whole epoch's writes still
+    // pending.
+    state.apply_pending_mutations();
 
     Ok(())
 }
@@ -254,6 +265,10 @@ fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<
 /// import. The value is the one this would have computed, so the state comes
 /// out the same either way.
 pub fn process_slot(state: &mut BeaconState) -> Result<()> {
+    // Fold buffered registry writes into their trees first, so the root below
+    // is computed on, and cached in, the state's own nodes rather than on a
+    // throwaway copy.
+    state.apply_pending_mutations();
     let previous_state_root = state.compute_state_root();
     let position = state.slot() as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
     state.state_roots_mut()[position] = previous_state_root;
@@ -296,5 +311,43 @@ pub(crate) fn phase0_state_ref<'a>(
             function,
             fork: other.fork_name(),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon::helpers::test_state;
+
+    #[test]
+    fn process_slot_leaves_no_buffered_registry_writes() {
+        let mut state = test_state::with_validators(4);
+        state.balances_mut()[0] += 1;
+        state.validator_mut(1).unwrap().effective_balance -= 1;
+        assert!(state.balances().has_pending_updates());
+        assert!(state.validators().has_pending_updates());
+
+        process_slot(&mut state).unwrap();
+
+        assert!(!state.balances().has_pending_updates());
+        assert!(!state.validators().has_pending_updates());
+    }
+
+    /// Epoch processing (`process_rewards_and_penalties` here) writes every
+    /// validator's balance through `increase_balance`/`decrease_balance`
+    /// after the last `process_slot`'s own flush has already run, so without
+    /// `process_slots`' own flush at the end, a state handed back after
+    /// crossing an epoch boundary carries the whole epoch's balance writes
+    /// still buffered.
+    #[test]
+    fn process_slots_across_an_epoch_boundary_leaves_no_buffered_writes() {
+        let mut state = test_state::with_validators(4);
+        let config = Config::mainnet();
+        let target_slot = state.slot() + preset::SLOTS_PER_EPOCH;
+
+        process_slots(&mut state, target_slot, &config).unwrap();
+
+        assert!(!state.balances().has_pending_updates());
+        assert!(!state.validators().has_pending_updates());
     }
 }
