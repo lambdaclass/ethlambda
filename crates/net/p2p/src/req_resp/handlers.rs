@@ -23,10 +23,8 @@ use tracing::{debug, error, info, trace, warn};
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants;
-use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::{
-    ColumnIndices, DataColumnSidecar, DataColumnsByRootIdentifier,
-};
+use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRootIdentifier};
+use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
@@ -38,7 +36,7 @@ use super::{
 };
 use crate::beacon::BeaconWire;
 use crate::beacon::column_checks;
-use crate::beacon::decode::{decode_data_column_sidecar, fork_at_slot};
+use crate::beacon::decode::fork_at_slot;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
@@ -224,9 +222,9 @@ pub async fn handle_req_resp_message(
                             // event: this response is the terminal outcome for
                             // the id either way.
                             match server.outbound_requests.remove(&request_id) {
-                                Some(PendingRequestKind::Columns(block_root)) => {
+                                Some(PendingRequestKind::Columns(block_root, requested)) => {
                                     handle_data_column_sidecars_response(
-                                        server, peer, block_root, sidecars, ctx,
+                                        server, peer, block_root, &requested, sidecars, ctx,
                                     )
                                     .await;
                                 }
@@ -307,7 +305,7 @@ pub async fn handle_req_resp_message(
                                 // data column protocol, which answers with
                                 // `DataColumnSidecars`, never with `Blocks`.
                                 Some(
-                                    PendingRequestKind::Columns(_)
+                                    PendingRequestKind::Columns(..)
                                     | PendingRequestKind::ColumnRange { .. },
                                 ) => {
                                     error!(
@@ -336,7 +334,7 @@ pub async fn handle_req_resp_message(
                                 // forever and deduplicates every later fetch.
                                 handle_fetch_failure(server, root, peer, ctx).await;
                             }
-                            Some(PendingRequestKind::Columns(block_root)) => {
+                            Some(PendingRequestKind::Columns(block_root, _)) => {
                                 // Same reasoning as the `Root` arm above: an
                                 // error response is the whole exchange, so
                                 // this is the only place that can retire it.
@@ -385,7 +383,7 @@ pub async fn handle_req_resp_message(
                         "BlocksByRange request failed; retry is disabled"
                     );
                 }
-                Some(PendingRequestKind::Columns(block_root)) => {
+                Some(PendingRequestKind::Columns(block_root, _)) => {
                     handle_column_fetch_failure(server, block_root, peer, ctx).await;
                 }
                 // Nothing waits on a range prefetch, so a failure is only
@@ -1052,6 +1050,7 @@ pub async fn fetch_data_columns_from_peer(
     let mut sent_count = 0usize;
     for (peer, columns) in by_peer {
         let count = columns.len();
+        let requested = columns.clone();
         let column_indices = match ColumnIndices::try_from(columns) {
             Ok(indices) => indices,
             Err(err) => {
@@ -1080,9 +1079,10 @@ pub async fn fetch_data_columns_from_peer(
             debug!(%block_root, %peer, "Failed to send DataColumnsByRoot request (swarm adapter closed)");
             continue;
         };
-        server
-            .outbound_requests
-            .insert(request_id, PendingRequestKind::Columns(block_root));
+        server.outbound_requests.insert(
+            request_id,
+            PendingRequestKind::Columns(block_root, requested),
+        );
         sent_count += 1;
     }
 
@@ -1321,13 +1321,11 @@ fn range_batch_needs_columns(server: &P2PServer, batch: &std::ops::Range<u64>) -
 /// range sync skips its custody-peer check before PeerDAS for the same reason:
 /// a batch with no columns to fetch has no custodian to wait for.
 ///
-/// Gloas answers yes as fulu does, though its columns have a different shape.
-/// A batch ending in gloas can begin in fulu, whose blocks need their columns.
-/// A batch lying entirely in gloas also reaches this, since
-/// `beacon_fetched_through` advances past the gloas blocks the chain actor
-/// refuses. It is then held for custody for nothing, and its column prefetch
-/// fails to decode against fulu's shape; that failure logs at debug and
-/// penalizes no peer. No gloas column is ever consumed from here.
+/// Gloas answers yes as fulu does, though its columns have a different shape
+/// and decode as gloas sidecars by the chunk's context bytes. A batch ending in
+/// gloas can begin in fulu, whose blocks need their columns; a batch lying
+/// entirely in gloas still needs them too, since a later change makes the chain
+/// actor gate a block's payload envelope on its columns.
 fn range_needs_columns(
     config: &Config,
     custody_columns: &[u64],
@@ -1941,21 +1939,18 @@ async fn handle_data_column_sidecars_by_root_request(
             continue;
         };
         for &column in identifier.columns.iter() {
-            let Ok(Some(encoded)) =
-                server
-                    .store
-                    .get_data_column_sidecar(slot, &identifier.block_root, column)
-            else {
-                continue;
-            };
-            match decode_data_column_sidecar(&encoded) {
-                Ok(sidecar) => sidecars.push(sidecar),
+            match server
+                .store
+                .get_data_column(slot, &identifier.block_root, column)
+            {
+                Ok(Some(sidecar)) => sidecars.push(sidecar),
+                Ok(None) => {}
                 Err(err) => error!(
                     %peer,
                     slot,
                     column,
                     %err,
-                    "Stored data column sidecar failed to decode"
+                    "Stored data column sidecar failed to read"
                 ),
             }
         }
@@ -2039,7 +2034,7 @@ async fn handle_data_column_sidecars_by_range_request(
     let columns = request.columns.to_vec();
     let sidecars: Vec<_> = server
         .store
-        .data_column_sidecars_in_range(request.start_slot, end_slot, &columns)
+        .data_column_rows_in_range(request.start_slot, end_slot, &columns)
         .inspect_err(|err| {
             warn!(
                 start_slot = request.start_slot,
@@ -2050,8 +2045,10 @@ async fn handle_data_column_sidecars_by_range_request(
         })
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|encoded| {
-            decode_data_column_sidecar(&encoded)
+        .filter_map(|(slot, encoded)| {
+            server
+                .store
+                .decode_data_column_sidecar(slot, &encoded)
                 .inspect_err(
                     |err| error!(%peer, %err, "Stored data column sidecar failed to decode"),
                 )
@@ -2328,7 +2325,7 @@ async fn handle_data_column_sidecars_range_response(
     let in_range: Vec<DataColumnSidecar> = sidecars
         .into_iter()
         .filter(|sidecar| {
-            let slot = sidecar.signed_block_header.message.slot;
+            let slot = sidecar.slot();
             let keep = slot >= start_slot && slot <= end_slot;
             if !keep {
                 debug!(%peer, slot, start_slot, end_slot, "Dropping an out-of-range data column sidecar");
@@ -2348,15 +2345,48 @@ async fn handle_data_column_sidecars_range_response(
     column_checks::check_and_forward(server, in_range);
 }
 
+/// Keep the sidecars of `sidecars` that answer the request: the requested
+/// block's, at a requested column. Returns them with how many were dropped.
+///
+/// Mirrors [`handle_blocks_by_root_response`], which keeps only the block the
+/// request named. Nothing downstream re-asks whether a sidecar was wanted, and
+/// an unsolicited one would otherwise be parked or stored on a peer's say-so.
+fn retain_requested_columns(
+    sidecars: Vec<DataColumnSidecar>,
+    block_root: H256,
+    requested: &[u64],
+) -> (Vec<DataColumnSidecar>, usize) {
+    let received = sidecars.len();
+    let kept: Vec<_> = sidecars
+        .into_iter()
+        .filter(|sidecar| {
+            sidecar.block_root() == block_root && requested.contains(&sidecar.index())
+        })
+        .collect();
+    let dropped = received - kept.len();
+    (kept, dropped)
+}
+
 async fn handle_data_column_sidecars_response(
     server: &mut P2PServer,
     peer: PeerId,
     block_root: H256,
+    requested: &[u64],
     sidecars: Vec<DataColumnSidecar>,
     ctx: &Context<P2PServer>,
 ) {
     let received = sidecars.len();
     trace!(%peer, %block_root, received, "Received DataColumnsByRoot response");
+
+    let (sidecars, unrequested) = retain_requested_columns(sidecars, block_root, requested);
+    if unrequested > 0 {
+        debug!(
+            %peer,
+            %block_root,
+            unrequested,
+            "Dropping data column sidecars the DataColumnsByRoot request did not ask for"
+        );
+    }
 
     if sidecars.is_empty() {
         debug!(%peer, %block_root, "DataColumnsByRoot response carried no sidecars");
@@ -2463,6 +2493,7 @@ mod tests {
     use super::*;
     use crate::ConnectionDirection;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::enr::EnrForkId;
     use ethlambda_types::{
@@ -2552,6 +2583,9 @@ mod tests {
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
             seen_aggregates:
@@ -2934,5 +2968,32 @@ mod tests {
         let mut peer_gone = RangeSyncState::new(10..20, lone_peer, 15);
         peer_gone.fail_peer(&lone_peer);
         assert!(range_session_exhausted(&peer_gone));
+    }
+
+    fn gloas_column(block_root: H256, index: u64) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index,
+            slot: 5,
+            beacon_block_root: block_root,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_by_root_answer_keeps_only_the_requested_block_and_columns() {
+        let asked = H256::repeat_byte(1);
+        let other = H256::repeat_byte(2);
+        let answer = vec![
+            gloas_column(asked, 3),
+            // A column of the right block that was not asked for.
+            gloas_column(asked, 4),
+            // A column of a block that was not asked for.
+            gloas_column(other, 3),
+        ];
+
+        let (kept, dropped) = retain_requested_columns(answer, asked, &[3]);
+
+        assert_eq!(kept, vec![gloas_column(asked, 3)]);
+        assert_eq!(dropped, 2);
     }
 }

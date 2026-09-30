@@ -18,7 +18,10 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
-        containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock, gloas},
+        containers::{
+            BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
+            gloas,
+        },
         fork::ForkName,
         fork_choice::{BlockPayloadLink, LatestMessage, PayloadStatusV1, PowBlock},
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
@@ -3797,6 +3800,66 @@ impl Store {
         Ok(())
     }
 
+    /// Decode a stored sidecar row, as the fork its slot's epoch names.
+    ///
+    /// The rows carry no fork tag (and gaining one would need a `DB_VERSION`
+    /// bump), but a fork is a function of the slot and the config, both known
+    /// here, so the schedule tells a fulu row from a gloas one.
+    pub fn decode_data_column_sidecar(
+        &self,
+        slot: u64,
+        encoded: &[u8],
+    ) -> Result<DataColumnSidecar, Error> {
+        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        DataColumnSidecar::from_ssz(fork, encoded)
+            .map_err(|_| Error::UndecodableDataColumn { slot, fork })
+    }
+
+    /// [`Self::put_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::put_pending_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_pending_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_pending_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::take_pending_data_column_sidecar`], decoded. A row that does not
+    /// decode is still taken, so it cannot be replayed into the same failure.
+    pub fn take_pending_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.take_pending_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
+    /// [`Self::get_data_column_sidecar`], decoded.
+    pub fn get_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.get_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
     /// Drop every parked row this directory holds.
     ///
     /// Called once at startup. The only index into `PendingDataColumns` is the
@@ -3963,6 +4026,22 @@ impl Store {
         end_slot: u64,
         columns: &[u64],
     ) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self
+            .data_column_rows_in_range(start_slot, end_slot, columns)?
+            .into_iter()
+            .map(|(_, encoded)| encoded)
+            .collect())
+    }
+
+    /// [`Self::data_column_sidecars_in_range`] with each row's slot beside its
+    /// bytes, which is what [`Self::decode_data_column_sidecar`] needs to pick
+    /// the fork a range spanning one boundary decodes each row as.
+    pub fn data_column_rows_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        columns: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>, Error> {
         let view = self.backend.begin_read().expect("read view");
         let mut found = Vec::new();
         for slot in start_slot..end_slot {
@@ -3983,7 +4062,7 @@ impl Store {
                     .try_into()
                     .expect("a column key ends in an eight-byte index");
                 if columns.contains(&u64::from_be_bytes(index_bytes)) {
-                    found.push(value.to_vec());
+                    found.push((slot, value.to_vec()));
                 }
             }
         }
@@ -7558,6 +7637,101 @@ mod tests {
 
     fn sidecar_bytes(marker: u8) -> Vec<u8> {
         vec![marker; 16]
+    }
+
+    /// A beacon store whose config puts gloas at epoch 2, so slots below
+    /// `2 * SLOTS_PER_EPOCH` are fulu and the rest gloas.
+    fn gloas_scheduled_store() -> Store {
+        let config = Config {
+            fulu_fork_epoch: 0,
+            gloas_fork_epoch: 2,
+            ..Config::mainnet()
+        };
+        Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            config,
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        )
+    }
+
+    fn fulu_sidecar_at(slot: u64, index: u64) -> DataColumnSidecar {
+        let mut sidecar = ethlambda_types::beacon::containers::fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                ethlambda_types::beacon::preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        };
+        sidecar.signed_block_header.message.slot = slot;
+        DataColumnSidecar::Fulu(sidecar)
+    }
+
+    fn gloas_sidecar_at(slot: u64, index: u64, root: H256) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(
+            ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+                index,
+                slot,
+                beacon_block_root: root,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_gloas_sidecar_round_trips_through_both_column_tables() {
+        let store = gloas_scheduled_store();
+        let root = H256::repeat_byte(7);
+        let slot = 2 * SLOTS_PER_EPOCH + 3;
+        let sidecar = gloas_sidecar_at(slot, 4, root);
+
+        store.put_data_column(&sidecar).unwrap();
+        assert!(store.has_data_column(slot, &root, 4));
+        assert_eq!(
+            store.get_data_column(slot, &root, 4).unwrap(),
+            Some(sidecar.clone())
+        );
+
+        let parked = gloas_sidecar_at(slot, 5, root);
+        store.put_pending_data_column(&parked).unwrap();
+        // Parked rows are not custodied ones.
+        assert!(!store.has_data_column(slot, &root, 5));
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            Some(parked)
+        );
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_row_decodes_as_the_fork_its_slot_names() {
+        let store = gloas_scheduled_store();
+        let fulu = fulu_sidecar_at(SLOTS_PER_EPOCH, 1);
+        let root = fulu.block_root();
+        store.put_data_column(&fulu).unwrap();
+        assert_eq!(
+            store.get_data_column(SLOTS_PER_EPOCH, &root, 1).unwrap(),
+            Some(fulu)
+        );
+
+        // The same bytes filed under a gloas slot are not a gloas sidecar.
+        let gloas_slot = 2 * SLOTS_PER_EPOCH;
+        let encoded = fulu_sidecar_at(gloas_slot, 1).to_ssz();
+        assert!(matches!(
+            store.decode_data_column_sidecar(gloas_slot, &encoded),
+            Err(Error::UndecodableDataColumn { .. })
+        ));
     }
 
     #[test]

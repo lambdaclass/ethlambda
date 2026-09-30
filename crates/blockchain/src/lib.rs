@@ -15,7 +15,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
+        containers::{DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock},
         preset,
         primitives::ValidatorIndex,
         signing::compute_epoch_at_slot,
@@ -25,7 +25,6 @@ use ethlambda_types::{
     primitives::{H256, HashTreeRoot as _},
     time::unix_now_ms,
 };
-use libssz::{SszDecode as _, SszEncode as _};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -45,6 +44,7 @@ use spawned_concurrency::tasks::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::beacon_columns::{ColumnParking, ParkedColumn};
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEventSnapshot;
 use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
@@ -54,6 +54,7 @@ pub use events::{ChainEvent, EventBus, Topic, UnknownTopic};
 
 pub mod aggregation;
 mod beacon_aggregates;
+mod beacon_columns;
 pub mod beacon_engine;
 pub mod block_builder;
 pub(crate) mod coverage;
@@ -134,18 +135,6 @@ pub const GOSSIP_DISPARITY_INTERVALS: u64 = 1;
 /// converts one to the other anyway.
 pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: Duration =
     Duration::from_millis(ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY);
-
-/// Where a parked data column sidecar was put.
-///
-/// The three fields are exactly `Table::PendingDataColumns`'s key, so reading
-/// the sidecar back needs nothing else. `slot` is also what the finality sweep
-/// compares against.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct ParkedColumn {
-    slot: u64,
-    block_root: H256,
-    index: u64,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SlotInterval {
@@ -414,6 +403,7 @@ impl BlockChain {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             beacon_aggregates: Default::default(),
             custody_columns,
             engine,
@@ -508,11 +498,18 @@ pub struct BlockChainServer {
     /// never have can therefore grow it until finality reclaims the slots;
     /// see [`Self::queue_sidecar_awaiting_parent`]. Always empty on lean.
     ///
-    /// A set per parent, so "the same column is never parked twice" is the
+    /// Keyed by the root whose post-state the sidecar is judged against: its
+    /// parent for a fulu sidecar, its own block for a gloas one, whose
+    /// commitments are in that block's bid ([`awaited_root`]).
+    ///
+    /// A set per root, so "the same column is never parked twice" is the
     /// container's own rule rather than a scan every arrival pays for. Order
     /// is not one: a replay checks and stores each sidecar on its own, and a
     /// held block is released by its last column arriving, whichever that is.
     sidecars_awaiting_parent: HashMap<H256, HashSet<ParkedColumn>>,
+    /// What bounds [`Self::sidecars_awaiting_parent`]: its running size, and
+    /// which gloas roots are parked at each slot.
+    column_parking: ColumnParking,
 
     /// The columns this node samples, computed once at startup from its node
     /// id (see `das::custody_columns`). Empty on lean.
@@ -826,12 +823,18 @@ fn data_availability_for(
             let sidecars = custody_columns
                 .iter()
                 .map(|&index| {
-                    let encoded = store
-                        .get_data_column_sidecar(slot, &block_root, index)
-                        .expect("DB read should succeed")
-                        .expect("presence just confirmed above");
-                    fulu::DataColumnSidecar::from_ssz_bytes(&encoded)
+                    let sidecar = store
+                        .get_data_column(slot, &block_root, index)
                         .expect("a sidecar this node verified before storing decodes")
+                        .expect("presence just confirmed above");
+                    match sidecar {
+                        DataColumnSidecar::Fulu(sidecar) => sidecar,
+                        // The row decodes by its slot's fork, and this arm is
+                        // the fulu block at that slot.
+                        DataColumnSidecar::Gloas(_) => {
+                            unreachable!("a fulu block's slot decodes its rows as fulu")
+                        }
+                    }
                 })
                 .collect();
 
@@ -1958,6 +1961,7 @@ impl BlockChainServer {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             custody_columns: Vec::new(),
             engine,
             safe_slots_to_import_optimistically,
@@ -3261,15 +3265,15 @@ impl BlockChainServer {
     ///
     /// Beacon-only: a lean node subscribes to no column subnet, so nothing
     /// ever delivers this message there.
-    async fn on_checked_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
+    async fn on_checked_data_columns(&mut self, sidecars: Vec<DataColumnSidecar>) {
         for sidecar in sidecars {
             #[cfg(debug_assertions)]
             {
                 use ethlambda_state_transition::beacon::gossip::{
                     Outcome,
-                    column::{ChainVerdict, chain_checks},
+                    column::{ChainVerdict, chain_checks_for},
                 };
-                let verdict = chain_checks(&self.store, &sidecar, unix_now_ms());
+                let verdict = chain_checks_for(&self.store, &sidecar, unix_now_ms());
                 assert!(
                     matches!(
                         verdict,
@@ -3283,10 +3287,10 @@ impl BlockChainServer {
     }
 
     /// Store a checked sidecar and release the held block it may complete.
-    async fn keep_data_column(&mut self, sidecar: fulu::DataColumnSidecar) {
-        let header = &sidecar.signed_block_header.message;
-        let slot = header.slot;
-        let block_root = header.hash_tree_root();
+    async fn keep_data_column(&mut self, sidecar: DataColumnSidecar) {
+        let slot = sidecar.slot();
+        let block_root = sidecar.block_root();
+        let index = sidecar.index();
 
         // Two copies of one column can pass the checks at once (from gossip
         // and from a fetch, say). The second write would store the same row
@@ -3295,14 +3299,11 @@ impl BlockChainServer {
             .store
             .data_column_indices_for(slot, &block_root)
             .expect("DB read should succeed");
-        if stored.contains(&sidecar.index) {
+        if stored.contains(&index) {
             return;
         }
 
-        if let Err(err) =
-            self.store
-                .put_data_column_sidecar(slot, &block_root, sidecar.index, sidecar.to_ssz())
-        {
+        if let Err(err) = self.store.put_data_column(&sidecar) {
             error!(%err, "Failed to store a data column sidecar");
             return;
         }
@@ -3310,246 +3311,6 @@ impl BlockChainServer {
 
         // A held block may now be complete.
         self.release_block_if_columns_complete(block_root).await;
-    }
-
-    /// Park sidecars the chain checks found no parent post-state for, or send
-    /// them straight back to be checked if the parent has one by now.
-    ///
-    /// The second case is a race this actor has to close, because the checks
-    /// run elsewhere: the p2p layer looked for the parent's post-state, found
-    /// none and sent these, and if the parent imported in between, its
-    /// [`Self::drain_sidecars_awaiting_parent`] has already run and will not
-    /// run again, so a sidecar parked now would wait for nothing until
-    /// finality evicts it. Asked with the same `get_state` the checks use, so
-    /// a sidecar sent back is one they will find a parent state for.
-    fn park_data_columns(&mut self, sidecars: Vec<fulu::DataColumnSidecar>) {
-        let mut ready = Vec::new();
-        for sidecar in sidecars {
-            let parent_root = sidecar.signed_block_header.message.parent_root;
-            if matches!(self.store.get_state(&parent_root), Ok(Some(_))) {
-                ready.push(sidecar);
-                continue;
-            }
-            let block_root = sidecar.signed_block_header.message.hash_tree_root();
-            self.queue_sidecar_awaiting_parent(block_root, sidecar);
-        }
-        self.send_data_columns_for_checks(ready);
-    }
-
-    /// Hand sidecars to the p2p layer's chain checks, which send back the
-    /// ones that pass through `new_data_column_sidecars`.
-    fn send_data_columns_for_checks(&self, sidecars: Vec<fulu::DataColumnSidecar>) {
-        if sidecars.is_empty() {
-            return;
-        }
-        let Some(ref p2p) = self.p2p else {
-            return;
-        };
-        let _ = p2p.check_data_column_sidecars(sidecars).inspect_err(
-            |err| error!(%err, "Failed to send data column sidecars to the p2p layer for checks"),
-        );
-    }
-
-    /// Park `sidecar` against the parent root it could not be checked against.
-    ///
-    /// Counted as `queued_for_parent` rather than as a rejection: nothing about
-    /// the sidecar has been judged yet, and conflating the two is what made the
-    /// deadlock invisible in the metrics (every column read as
-    /// `rejected{reason="unknown_parent"}` while the real fault was upstream).
-    ///
-    /// Nothing is refused here. The queue used to hold whole sidecars and so
-    /// carried a count cap, which a follower behind the tip hit constantly:
-    /// it receives gossip for the tip continuously, so the queue filled with
-    /// sidecars for blocks it would not reach for minutes and then refused
-    /// the ones for the block it was about to import. Measured on the eth-4
-    /// follower a hundred slots behind, the queue sat pinned at its cap and
-    /// dropped 2,561 sidecars in ten minutes while the chain ground through
-    /// by-root lookups for slots whose columns gossip had already delivered
-    /// and this function had thrown away. Evicting the furthest-ahead entry
-    /// instead of the newest fixed which sidecar was lost, not that one was.
-    ///
-    /// The cap is gone now that the sidecars live in
-    /// `Table::PendingDataColumns` and only their keys are held here, so what
-    /// grows is disk rather than this actor's memory.
-    /// [`Self::evict_sidecars_awaiting_parent_at_or_below_finality`] is what
-    /// bounds it, which bounds how *long* an entry lives but not how fast
-    /// they arrive: the chain checks do not require `parent_root` to name a
-    /// block this node knows. Every sidecar reaching here, gossiped or
-    /// fetched, has had its header's signature checked against the head state
-    /// by those checks (`queue_unless_forged`, in
-    /// `ethlambda_state_transition::beacon::gossip::column`), but only when a
-    /// head state is already cached *and* the header's `proposer_index` names
-    /// a validator in it: with no cached head state, or a proposer index that
-    /// names none (`u64::MAX`, say), that check is skipped and a made-up
-    /// header still reaches here and parks a row. A peer exploiting either
-    /// gap can still park rows as fast as it can invent a slot, proposer and
-    /// index, until finality catches up.
-    fn queue_sidecar_awaiting_parent(
-        &mut self,
-        block_root: H256,
-        sidecar: fulu::DataColumnSidecar,
-    ) {
-        let header = &sidecar.signed_block_header.message;
-        let parent_root = header.parent_root;
-        let parked = ParkedColumn {
-            slot: header.slot,
-            block_root,
-            index: sidecar.index,
-        };
-
-        // A re-delivery of something already parked. The by-root and by-range
-        // fetch paths skip gossip's seen cache entirely, so they never touch
-        // the p2p actor's `SeenColumns` (which in any case only records an
-        // Accept, never a park); a re-delivery reaching here is ordinary, and
-        // without this check the same column would take a second slot in the
-        // queue and leave a stale key behind after the first replay took its
-        // row. Asked before the write rather than left to the set below,
-        // because the write is what costs.
-        if self
-            .sidecars_awaiting_parent
-            .get(&parent_root)
-            .is_some_and(|parked_columns| parked_columns.contains(&parked))
-        {
-            return;
-        }
-
-        // The bytes go to disk before the key goes in the map, so a failed
-        // write leaves no key pointing at a row that is not there.
-        if let Err(err) = self.store.put_pending_data_column_sidecar(
-            parked.slot,
-            &parked.block_root,
-            parked.index,
-            sidecar.to_ssz(),
-        ) {
-            error!(%err, "Failed to park a data column sidecar");
-            return;
-        }
-
-        trace!(
-            slot = parked.slot,
-            column = parked.index,
-            parent_root = %ShortRoot(&parent_root.0),
-            "Queueing a data column sidecar until its parent has a post-state"
-        );
-        self.sidecars_awaiting_parent
-            .entry(parent_root)
-            .or_default()
-            .insert(parked);
-        self.publish_sidecars_awaiting_parent();
-    }
-
-    /// Republish how many sidecars are parked, from the map that decides it.
-    fn publish_sidecars_awaiting_parent(&self) {
-        let total: usize = self
-            .sidecars_awaiting_parent
-            .values()
-            .map(HashSet::len)
-            .sum();
-        metrics::set_sidecars_awaiting_parent(total as u64);
-    }
-
-    /// Send every sidecar parked against `block_root` back to the p2p layer's
-    /// chain checks, now that it has a post-state to be checked against.
-    ///
-    /// Called from the one arm that means "this root now has a post-state".
-    /// The ones that pass come back through `new_data_column_sidecars` as a
-    /// new message, so nothing here re-enters the import path.
-    fn drain_sidecars_awaiting_parent(&mut self, block_root: H256) {
-        let Some(parked_columns) = self.sidecars_awaiting_parent.remove(&block_root) else {
-            return;
-        };
-        debug!(
-            parent_root = %ShortRoot(&block_root.0),
-            count = parked_columns.len(),
-            "Replaying data column sidecars whose parent just imported"
-        );
-        self.publish_sidecars_awaiting_parent();
-
-        let mut sidecars = Vec::with_capacity(parked_columns.len());
-        for parked in parked_columns {
-            // Taken, not read: the row has served its purpose either way. A
-            // replay that passes is written to `DataColumns`, and one that
-            // fails a check has been judged, so neither leaves anything worth
-            // keeping here.
-            let encoded = match self.store.take_pending_data_column_sidecar(
-                parked.slot,
-                &parked.block_root,
-                parked.index,
-            ) {
-                Ok(Some(encoded)) => encoded,
-                Ok(None) => {
-                    error!(
-                        slot = parked.slot,
-                        column = parked.index,
-                        block_root = %ShortRoot(&parked.block_root.0),
-                        "A parked data column sidecar has no row to replay from"
-                    );
-                    continue;
-                }
-                Err(err) => {
-                    error!(%err, "Failed to read back a parked data column sidecar");
-                    continue;
-                }
-            };
-            let Ok(sidecar) = fulu::DataColumnSidecar::from_ssz_bytes(&encoded) else {
-                error!(
-                    slot = parked.slot,
-                    column = parked.index,
-                    "A parked data column sidecar did not decode"
-                );
-                continue;
-            };
-            sidecars.push(sidecar);
-        }
-        self.send_data_columns_for_checks(sidecars);
-    }
-
-    /// Drop parked sidecars whose block finality has superseded.
-    ///
-    /// The counterpart of [`Self::evict_held_blocks_at_or_below_finality`] and
-    /// run beside it, for the same reason: a parent root that never arrives
-    /// would otherwise pin its children's sidecars for this node's whole
-    /// uptime. A sidecar at or below the finalized slot can never be needed
-    /// again, since the chain checks would drop it outright now.
-    fn evict_sidecars_awaiting_parent_at_or_below_finality(&mut self) {
-        if self.sidecars_awaiting_parent.is_empty() {
-            return;
-        }
-        let finalized_slot = self
-            .store
-            .latest_finalized()
-            .expect("finalized checkpoint exists")
-            .slot;
-
-        let mut dropped: Vec<ParkedColumn> = Vec::new();
-        self.sidecars_awaiting_parent.retain(|_, parked_columns| {
-            parked_columns.retain(|parked| {
-                let keep = parked.slot > finalized_slot;
-                if !keep {
-                    dropped.push(*parked);
-                }
-                keep
-            });
-            !parked_columns.is_empty()
-        });
-
-        if !dropped.is_empty() {
-            info!(
-                finalized_slot,
-                count = dropped.len(),
-                "Evicting parked data column sidecars that finality has superseded"
-            );
-            // The rows go with the keys, so a key dropped from the map never
-            // leaves its bytes on disk with nothing left to read them.
-            let keys = dropped
-                .iter()
-                .map(|parked| (parked.slot, parked.block_root, parked.index));
-            let _ = self
-                .store
-                .delete_pending_data_column_sidecars(keys)
-                .inspect_err(|err| error!(%err, "Failed to drop parked data column sidecars"));
-            self.publish_sidecars_awaiting_parent();
-        }
     }
 
     /// Once a slot, revisit every held block: release the ones whose columns
@@ -4214,13 +3975,16 @@ mod tests {
     use ethlambda_state_transition::beacon::fork_choice::seconds_to_milliseconds;
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{BeaconState, deneb, electra, phase0, shared};
+    use ethlambda_types::beacon::containers::{
+        BeaconState, deneb, electra, fulu, gloas, phase0, shared,
+    };
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::checkpoint::Checkpoint;
     use ethlambda_types::state::State;
+    use libssz::SszEncode as _;
 
-    const GENESIS_TIME: u64 = 1_000;
+    pub(crate) const GENESIS_TIME: u64 = 1_000;
 
     fn config(milliseconds_per_slot: u64) -> ChainConfig {
         ChainConfig::new(GENESIS_TIME, milliseconds_per_slot)
@@ -4402,7 +4166,7 @@ mod tests {
     ///
     /// No anchor state is written: its only caller asserts on the chain tag
     /// `Store::init_beacon` sets, which is seeded before any state is.
-    fn beacon_store(genesis_time: u64, finalized_slot: u64) -> Store {
+    pub(crate) fn beacon_store(genesis_time: u64, finalized_slot: u64) -> Store {
         beacon_store_with_config(genesis_time, finalized_slot, Config::mainnet())
     }
 
@@ -4502,7 +4266,7 @@ mod tests {
     // with `beacon::gossip::column`.
     // -----------------------------------------------------------------
 
-    fn beacon_server(store: Store) -> BlockChainServer {
+    pub(crate) fn beacon_server(store: Store) -> BlockChainServer {
         BlockChainServer {
             store,
             p2p: None,
@@ -4511,6 +4275,7 @@ mod tests {
             blocks_awaiting_columns: HashMap::new(),
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
+            column_parking: ColumnParking::default(),
             beacon_aggregates: Default::default(),
             custody_columns: Vec::new(),
             engine: None,
@@ -4528,7 +4293,7 @@ mod tests {
     /// column cell, all the same length), so the chain checks judge it on its
     /// parent rather than its shape; every other field is its type's default,
     /// since nothing under test reads past the header.
-    fn sidecar_at(slot: u64, parent_root: H256) -> fulu::DataColumnSidecar {
+    pub(crate) fn sidecar_at(slot: u64, parent_root: H256) -> fulu::DataColumnSidecar {
         let cell: fulu::Cell = libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL])
             .expect("exact cell size");
         fulu::DataColumnSidecar {
@@ -4563,7 +4328,7 @@ mod tests {
     /// what `Store::insert_signed_block` writes into `LiveChain`, which is
     /// all `get_checkpoint_block`'s ancestry walk ever reads. The fork is
     /// irrelevant to that walk, so the cheapest shape to build stands in.
-    fn bare_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+    pub(crate) fn bare_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
         SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot,
@@ -4595,7 +4360,7 @@ mod tests {
     /// `insert_state` takes that as "first state on record" and stores a
     /// plain snapshot, rather than trying to diff against a parent state
     /// this helper never creates.
-    fn bare_state() -> BeaconState {
+    pub(crate) fn bare_state() -> BeaconState {
         let block_roots = vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT]
             .try_into()
             .expect("exactly the preset length");
@@ -4690,8 +4455,8 @@ mod tests {
     /// to read back. Only `check_data_column_sidecars` and `fetch_block` are
     /// recorded: nothing under test here sends the others.
     #[derive(Default)]
-    struct RecordingP2P {
-        checks: std::sync::Mutex<Vec<Vec<fulu::DataColumnSidecar>>>,
+    pub(crate) struct RecordingP2P {
+        pub(crate) checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
         fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
@@ -4723,7 +4488,7 @@ mod tests {
         }
         fn check_data_column_sidecars(
             &self,
-            sidecars: Vec<fulu::DataColumnSidecar>,
+            sidecars: Vec<DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.checks.lock().unwrap().push(sidecars);
             Ok(())
@@ -4731,7 +4496,7 @@ mod tests {
     }
 
     /// `beacon_server(store)` with a [`RecordingP2P`] wired in as its p2p ref.
-    fn beacon_server_recording(store: Store) -> (BlockChainServer, Arc<RecordingP2P>) {
+    pub(crate) fn beacon_server_recording(store: Store) -> (BlockChainServer, Arc<RecordingP2P>) {
         let p2p = Arc::new(RecordingP2P::default());
         let mut server = beacon_server(store);
         server.p2p = Some(p2p.clone());
@@ -4739,9 +4504,10 @@ mod tests {
     }
 
     /// A beacon store whose clock reads slot 10, so a sidecar at slot 10 is
-    /// neither future nor finalized.
-    fn beacon_store_at_slot_10() -> Store {
-        let mut store = beacon_store(GENESIS_TIME, 0);
+    /// neither future nor finalized. Fulu is active from genesis, since a
+    /// stored sidecar is decoded as the fork its slot names.
+    pub(crate) fn beacon_store_at_slot_10() -> Store {
+        let mut store = beacon_store_fulu_at_genesis(GENESIS_TIME, 0);
         store
             .set_time_ms(seconds_to_milliseconds(
                 GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
@@ -4826,7 +4592,9 @@ mod tests {
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
         let block_root = sidecar.signed_block_header.message.hash_tree_root();
 
-        server.keep_data_column(sidecar).await;
+        server
+            .keep_data_column(DataColumnSidecar::Fulu(sidecar))
+            .await;
 
         assert_eq!(
             server
@@ -4850,195 +4618,62 @@ mod tests {
         // keep it.
         let sidecar = sidecar_at(10, H256::repeat_byte(9));
 
-        server.on_checked_data_columns(vec![sidecar]).await;
-    }
-
-    #[test]
-    fn a_data_column_sidecar_naming_a_parent_with_no_state_is_parked_not_stored() {
-        // `beacon_store` writes no anchor state (see its own doc comment), so
-        // any parent root at all is unknown here, including the anchor's own.
-        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
-        let parent_root = H256::repeat_byte(9);
-        let sidecar = sidecar_at(10, parent_root);
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.park_data_columns(vec![sidecar]);
-
-        // Not stored: it has not been checked, so it has not been accepted.
-        assert_eq!(
-            server
-                .store
-                .data_column_indices_for(10, &block_root)
-                .unwrap(),
-            Vec::<u64>::new()
-        );
-        // But kept, under the parent it is waiting on. Dropping it here is
-        // what deadlocks a follower running the availability gate: a held
-        // block writes no post-state, so every sidecar of every child of it
-        // lands in exactly this branch.
-        assert_eq!(
-            server
-                .sidecars_awaiting_parent
-                .get(&parent_root)
-                .map(HashSet::len),
-            Some(1)
-        );
-        assert!(p2p.checks.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn a_sidecar_whose_parent_imported_meanwhile_goes_back_for_checks_not_into_the_queue() {
-        // The race the p2p layer's checks open: they found no parent state,
-        // then the parent imported and drained its (still empty) queue before
-        // this message arrived. Parking it now would strand it until
-        // finality, since that parent never drains again.
-        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
-        let parent_root = H256::repeat_byte(9);
         server
-            .store
-            .insert_state(parent_root, bare_state())
-            .expect("insert");
-        let sidecar = sidecar_at(10, parent_root);
-
-        server.park_data_columns(vec![sidecar.clone()]);
-
-        assert!(server.sidecars_awaiting_parent.is_empty());
-        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+            .on_checked_data_columns(vec![DataColumnSidecar::Fulu(sidecar)])
+            .await;
     }
 
-    #[test]
-    fn a_parked_sidecar_goes_back_for_checks_once_its_parent_gains_a_post_state() {
-        // The deadlock this closes, in miniature: while the parent has no
-        // post-state every sidecar under it parks, and if parking were the end
-        // of the story the queue would only ever grow. What breaks the cycle
-        // is that gaining a post-state releases them, to the p2p layer's
-        // checks, since this actor no longer judges a sidecar itself.
-        let (mut server, p2p) = beacon_server_recording(beacon_store_at_slot_10());
-        let parent_root = H256::repeat_byte(9);
-        let sidecar = sidecar_at(10, parent_root);
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.park_data_columns(vec![sidecar.clone()]);
-        assert!(server.sidecars_awaiting_parent.contains_key(&parent_root));
-
-        server.drain_sidecars_awaiting_parent(parent_root);
-
-        // Gone from the queue and from `PendingDataColumns`, and handed to
-        // the checks exactly as it was parked.
-        assert!(!server.sidecars_awaiting_parent.contains_key(&parent_root));
-        assert!(
-            server
-                .store
-                .take_pending_data_column_sidecar(10, &block_root, 0)
-                .expect("DB read should succeed")
-                .is_none()
+    /// [`beacon_store_at_slot_10`] with gloas active from genesis too, so a
+    /// slot-10 sidecar decodes as gloas's shape.
+    pub(crate) fn gloas_store_at_slot_10() -> Store {
+        let mut store = beacon_store_with_config(
+            GENESIS_TIME,
+            0,
+            Config::mainnet()
+                .with_fork_epoch(ForkName::Fulu, 0)
+                .with_fork_epoch(ForkName::Gloas, 0),
         );
-        assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
+        store
+            .set_time_ms(seconds_to_milliseconds(
+                GENESIS_TIME + 10 * Config::mainnet().seconds_per_slot,
+            ))
+            .unwrap();
+        store
     }
 
-    #[test]
-    fn a_parked_sidecar_holds_its_bytes_on_disk_and_not_in_the_queue() {
-        // The queue's size is chosen by whoever is gossiping, so what it holds
-        // per entry is the thing that has to stay small: a key, not a cell per
-        // blob.
-        let mut server = beacon_server(beacon_store_at_slot_10());
-        let parent_root = H256::repeat_byte(9);
-        let sidecar = sidecar_at(10, parent_root);
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
-
-        server.park_data_columns(vec![sidecar]);
-
-        assert_eq!(
-            server.sidecars_awaiting_parent.get(&parent_root),
-            Some(&HashSet::from([ParkedColumn {
-                slot: 10,
-                block_root,
-                index: 0,
-            }]))
-        );
-        assert!(
-            server
-                .store
-                .take_pending_data_column_sidecar(10, &block_root, 0)
-                .expect("DB read should succeed")
-                .is_some(),
-            "the sidecar's bytes belong in PendingDataColumns"
-        );
+    /// One blob's worth of column and proof, the smallest shape the parking
+    /// lot accepts.
+    pub(crate) fn gloas_sidecar_at(slot: u64, block_root: H256, index: u64) -> DataColumnSidecar {
+        let cell: fulu::Cell = libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL])
+            .expect("exact cell size");
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index,
+            slot,
+            beacon_block_root: block_root,
+            column: vec![cell].try_into().expect("one cell"),
+            kzg_proofs: vec![Default::default()].try_into().expect("one proof"),
+        })
     }
 
-    #[test]
-    fn a_parked_sidecar_does_not_satisfy_the_availability_gate() {
-        // Why the parked rows get a table of their own. Nothing has judged a
-        // parked sidecar's inclusion proof, its KZG batch or its proposer
-        // signature, so a peer that could get one counted as custodied would
-        // be able to release a held block with a column it invented.
-        let mut server = beacon_server(beacon_store_at_slot_10());
-        let sidecar = sidecar_at(10, H256::repeat_byte(9));
-        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+    #[tokio::test]
+    async fn a_checked_gloas_sidecar_is_stored_as_it_is() {
+        let mut server = beacon_server(gloas_store_at_slot_10());
+        let block_root = H256::repeat_byte(5);
+        let sidecar = gloas_sidecar_at(10, block_root, 3);
 
-        server.park_data_columns(vec![sidecar]);
+        server.keep_data_column(sidecar.clone()).await;
 
         assert_eq!(
             server
                 .store
                 .data_column_indices_for(10, &block_root)
                 .expect("DB read should succeed"),
-            Vec::<u64>::new(),
-            "an unverified sidecar must be invisible to data_column_indices_for"
+            vec![3]
         );
-    }
-
-    #[test]
-    fn a_sidecar_parked_twice_takes_one_slot_in_the_queue() {
-        // The by-root and by-range fetch paths skip gossip's seen cache
-        // entirely, so nothing between them and this actor dedups a
-        // re-delivery while the parent is still stateless; it is ordinary. A
-        // second entry would leave a key with no row behind it once the
-        // first replay took it.
-        let mut server = beacon_server(beacon_store_at_slot_10());
-        let parent_root = H256::repeat_byte(9);
-
-        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
-        server.park_data_columns(vec![sidecar_at(10, parent_root)]);
-
         assert_eq!(
-            server
-                .sidecars_awaiting_parent
-                .get(&parent_root)
-                .map(HashSet::len),
-            Some(1)
+            server.store.get_data_column(10, &block_root, 3).unwrap(),
+            Some(sidecar)
         );
-    }
-
-    #[test]
-    fn parked_sidecars_are_dropped_once_finality_passes_their_slot() {
-        // Populated directly rather than through `park_data_columns`: the
-        // chain checks refuse a sidecar at or below the finalized slot before
-        // it could ever be parked, so the only way to observe the sweep is to
-        // park one behind their back. The finalized slot is fixed at init, so
-        // the store carries it rather than the test moving it.
-        let mut server = beacon_server(beacon_store(GENESIS_TIME, 10));
-        let superseded = H256::repeat_byte(1);
-        let still_wanted = H256::repeat_byte(2);
-        let parked_at = |slot: u64| ParkedColumn {
-            slot,
-            block_root: H256::repeat_byte(9),
-            index: 0,
-        };
-        server
-            .sidecars_awaiting_parent
-            .insert(superseded, HashSet::from([parked_at(10)]));
-        server
-            .sidecars_awaiting_parent
-            .insert(still_wanted, HashSet::from([parked_at(20)]));
-
-        server.evict_sidecars_awaiting_parent_at_or_below_finality();
-
-        // A parent root that never arrives would otherwise pin its children's
-        // sidecars for this node's whole uptime; one still above finality is
-        // a parent that may yet show up.
-        assert!(!server.sidecars_awaiting_parent.contains_key(&superseded));
-        assert!(server.sidecars_awaiting_parent.contains_key(&still_wanted));
     }
 
     // -----------------------------------------------------------------
@@ -5183,7 +4818,8 @@ mod tests {
 
     #[test]
     fn a_block_with_every_custody_column_is_available() {
-        let store = beacon_store(0, 0);
+        // Fulu at genesis: stored rows decode by the fork their slot names.
+        let store = beacon_store_fulu_at_genesis(0, 0);
         let block = fulu_block_with_commitments(&store, 2);
         let root = block.message_hash_tree_root();
         for index in CUSTODY {

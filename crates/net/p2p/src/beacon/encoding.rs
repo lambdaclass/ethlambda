@@ -34,8 +34,8 @@
 use std::io;
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::DataColumnSidecar;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::Root;
@@ -44,6 +44,7 @@ use libssz::{SszDecode, SszEncode};
 use tracing::warn;
 
 use super::decode;
+use super::fork_schedule::ForkSchedule;
 use super::messages::{
     BeaconBlocksByRangeRequest, BeaconMetaData, BeaconStatus, MetaDataV1, MetaDataV2, MetaDataV3,
     StatusV1, StatusV2,
@@ -253,16 +254,15 @@ where
         let encoded = sidecar.to_ssz();
         if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
             warn!(
-                index = sidecar.index,
+                index = sidecar.index(),
                 size = encoded.len(),
                 "Skipping oversized data column sidecar in response"
             );
             continue;
         }
-        // The sidecar's own epoch, taken from the header it carries rather
-        // than the one this node runs on, so a backfill labels each chunk
-        // with its own fork.
-        let epoch = sidecar.signed_block_header.message.slot / preset::SLOTS_PER_EPOCH;
+        // The sidecar's own epoch rather than the one this node runs on, so a
+        // backfill labels each chunk with its own fork.
+        let epoch = sidecar.slot() / preset::SLOTS_PER_EPOCH;
         let digest = compute_fork_digest(config, genesis_validators_root, epoch);
         write_success_chunk(io, label, &digest, encoded).await?;
     }
@@ -272,14 +272,16 @@ where
 /// Read a data column sidecar response: one `DataColumnSidecar` per chunk,
 /// until the peer closes.
 ///
-/// The counterpart of [`decode_blocks_response`]. Only fulu defines this
-/// container, so there is no fork ladder to select a decoder from the way a
-/// block chunk's slot selects one; [`super::decode::decode_data_column_sidecar`]
-/// decodes unconditionally. The context bytes are still checked against the
-/// digest the sidecar's own slot implies, for the same reason a block chunk's
-/// are: it catches a peer whose `genesis_validators_root` or fork schedule
-/// differs from ours, which a signature failure would otherwise be the only
-/// way to notice.
+/// The counterpart of [`decode_blocks_response`]. A gloas sidecar carries no
+/// header to read a slot from ahead of decoding, so the fork comes from the
+/// chunk's context bytes instead ([`ForkSchedule::fork_for_digest`]), and
+/// [`super::decode::decode_data_column_sidecar`] decodes by it. A digest no
+/// scheduled fork uses ends the stream like any other mismatch. The context
+/// bytes are then checked against the digest the sidecar's own slot implies,
+/// for the same reason a block chunk's are: it catches a peer whose
+/// `genesis_validators_root` or fork schedule differs from ours, which a
+/// signature failure would otherwise be the only way to notice. It also
+/// catches a sidecar of one fork's shape sent under another's context.
 ///
 /// A mismatch ends the stream rather than skipping the chunk, matching
 /// [`decode_blocks_response`]: a peer that disagrees about a historical digest
@@ -300,16 +302,25 @@ where
         // column protocol; see `protocols::max_request_data_column_sidecars`.
         max_chunks: protocols::max_request_data_column_sidecars() as usize,
     };
+    let schedule = ForkSchedule::new(config, genesis_validators_root);
     read_chunked_response(io, protocol_label, limits, |context, payload| {
-        let sidecar = decode::decode_data_column_sidecar(payload)
+        let Some(fork) = <[u8; 4]>::try_from(context)
+            .ok()
+            .and_then(|digest| schedule.fork_for_digest(digest))
+        else {
+            return Err(invalid(format!(
+                "data column sidecar chunk context {} is no scheduled fork digest",
+                hex::encode(context),
+            )));
+        };
+        let sidecar = decode::decode_data_column_sidecar(fork, payload)
             .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
-        let slot = sidecar.signed_block_header.message.slot;
-        let epoch = slot / preset::SLOTS_PER_EPOCH;
-        let expected = compute_fork_digest(config, genesis_validators_root, epoch);
+        let slot = sidecar.slot();
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
         if context != expected {
             warn!(
                 slot,
-                index = sidecar.index,
+                index = sidecar.index(),
                 peer_context = %hex::encode(context),
                 our_context = %hex::encode(expected),
                 "Data column sidecar chunk names another fork digest"

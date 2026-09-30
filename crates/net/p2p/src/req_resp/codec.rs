@@ -470,6 +470,8 @@ mod tests {
         self, ColumnIndices, DataColumnsByRootIdentifier,
     };
     use ethlambda_types::beacon::containers::shared;
+    use ethlambda_types::beacon::containers::{DataColumnSidecar, gloas};
+    use ethlambda_types::beacon::fork_digest::compute_fork_digest;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Root;
     use futures::io::Cursor;
@@ -724,34 +726,75 @@ mod tests {
         }
     }
 
+    /// A config scheduling gloas shortly after mainnet's fulu, so fulu and gloas
+    /// sidecars get different digests.
+    fn gloas_config() -> Config {
+        let base = Config::mainnet();
+        Config {
+            gloas_fork_epoch: base.fulu_fork_epoch + 64,
+            ..base
+        }
+    }
+
+    fn codec_for(config: Config) -> Codec {
+        Codec::beacon(BeaconContext {
+            config,
+            genesis_validators_root: mainnet_gvr(),
+        })
+    }
+
+    fn fulu_slot() -> u64 {
+        Config::mainnet().fulu_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+    }
+
+    fn gloas_slot() -> u64 {
+        gloas_config().gloas_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+    }
+
+    fn gloas_data_column_sidecar(slot: u64, index: u64) -> gloas::DataColumnSidecar {
+        gloas::DataColumnSidecar {
+            index,
+            slot,
+            ..Default::default()
+        }
+    }
+
     /// Exercises `write_data_column_sidecars_response` into
     /// `decode_data_column_sidecars_response` directly, unlike
     /// [`a_by_range_column_request_round_trips`] and
     /// [`a_by_root_column_request_round_trips`] above, which only round-trip
     /// the thin SSZ-derive request wrappers and never touch this pair.
     ///
-    /// The two sidecars straddle mainnet's altair fork boundary on purpose,
-    /// so their digests actually differ: each chunk's `<context-bytes>` is
-    /// derived from *that sidecar's own* slot
-    /// (`write_data_column_sidecars_response`'s doc explains why — a
-    /// backfill answer labels each chunk with its own fork), so an
-    /// implementation that computed one digest for the whole response
-    /// (from, say, the first sidecar's epoch) would still round-trip a
-    /// batch that never crosses a fork boundary but fail this one.
+    /// The two sidecars straddle the fulu and gloas boundary on purpose, so
+    /// their digests actually differ and so do their shapes: each chunk's
+    /// `<context-bytes>` is derived from *that sidecar's own* slot
+    /// (`write_data_column_sidecars_response`'s doc explains why: a backfill
+    /// answer labels each chunk with its own fork), and the context is what
+    /// selects the decoder. An implementation that computed one digest for the
+    /// whole response would fail this batch.
     #[tokio::test]
     async fn a_data_column_sidecars_response_round_trips_with_a_per_item_context() {
-        let sidecar_a = data_column_sidecar(3, 0);
-        let post_altair_slot = Config::mainnet().altair_fork_epoch * preset::SLOTS_PER_EPOCH + 1;
-        let sidecar_b = data_column_sidecar(post_altair_slot, 7);
+        let sidecar_a = DataColumnSidecar::Fulu(data_column_sidecar(fulu_slot(), 0));
+        let sidecar_b = DataColumnSidecar::Gloas(gloas_data_column_sidecar(gloas_slot(), 7));
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
 
-        let decoded = response_round_trip(
-            protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1,
-            Response::success(ResponsePayload::DataColumnSidecars(vec![
-                sidecar_a.clone(),
-                sidecar_b.clone(),
-            ])),
-        )
-        .await;
+        let mut buffer = Cursor::new(Vec::new());
+        codec_for(gloas_config())
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::DataColumnSidecars(vec![
+                    sidecar_a.clone(),
+                    sidecar_b.clone(),
+                ])),
+            )
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let decoded = codec_for(gloas_config())
+            .read_response(&stream_protocol, &mut buffer)
+            .await
+            .expect("reads");
 
         match decoded {
             Response::Success {
@@ -763,17 +806,78 @@ mod tests {
         }
     }
 
+    /// A gloas sidecar under a fulu chunk's context bytes is a shape the
+    /// context does not name, so the stream aborts rather than handing back a
+    /// sidecar decoded as the wrong fork.
+    #[tokio::test]
+    async fn a_gloas_sidecar_under_a_fulu_context_aborts_the_stream() {
+        let config = gloas_config();
+        let root = mainnet_gvr();
+        let fulu_digest = compute_fork_digest(&config, root, config.fulu_fork_epoch);
+        let payload = gloas_data_column_sidecar(gloas_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// A chunk's context must also be the digest of its sidecar's own slot: a
+    /// fulu-shaped sidecar carrying a gloas slot, sent under the fulu digest,
+    /// decodes cleanly as fulu and is still refused.
+    #[tokio::test]
+    async fn a_fulu_shaped_sidecar_at_a_gloas_slot_under_the_fulu_digest_aborts_the_stream() {
+        let config = gloas_config();
+        let root = mainnet_gvr();
+        let fulu_digest = compute_fork_digest(&config, root, config.fulu_fork_epoch);
+        let payload = data_column_sidecar(gloas_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    /// A digest no scheduled fork uses names no shape at all.
+    #[tokio::test]
+    async fn a_data_column_chunk_under_an_unscheduled_digest_aborts_the_stream() {
+        let payload = data_column_sidecar(fulu_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &[0xde, 0xad, 0xbe, 0xef], payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec().read_response(&stream_protocol, &mut buffer).await;
+
+        assert!(result.is_err());
+    }
+
     /// A peer's `genesis_validators_root` differing from ours means every
     /// digest it labels a chunk with is for the wrong chain, even though the
-    /// chunk decodes cleanly on its own. `decode_data_column_sidecars_response`
-    /// checks the digest against what *this* node's own root implies, so
-    /// reading the same bytes back through a codec built with a different
-    /// root must abort the stream rather than hand back a sidecar under the
-    /// wrong context — mirroring the block response's own fork-mismatch
-    /// check, which nothing here exercised before.
+    /// chunk decodes cleanly on its own. The digest matches no scheduled one
+    /// under our root, so reading the same bytes back through a codec built
+    /// with a different root must abort the stream rather than hand back a
+    /// sidecar under the wrong context, mirroring the block response's own
+    /// fork-mismatch check.
     #[tokio::test]
     async fn a_data_column_sidecars_response_aborts_on_a_fork_digest_mismatch() {
-        let sidecar = data_column_sidecar(3, 0);
+        let sidecar = DataColumnSidecar::Fulu(data_column_sidecar(fulu_slot(), 0));
         let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
 
         let mut buffer = Cursor::new(Vec::new());

@@ -3,8 +3,7 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
-        SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
-        fulu::DataColumnSidecar,
+        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
     },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
@@ -27,7 +26,8 @@ pub trait BlockChainToP2P: Send + Sync {
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
     /// Run the chain checks on sidecars the chain actor had parked, now that
-    /// their parent has a post-state.
+    /// the block they are checked against has a post-state: their parent for a
+    /// fulu sidecar, their own block for a gloas one.
     ///
     /// The chain actor keeps a sidecar without checking it, so it hands these
     /// back rather than judging them itself: the p2p layer runs every column
@@ -214,9 +214,10 @@ pub trait P2PToBlockChain: Send + Sync {
     /// again.
     fn new_data_column_sidecars(&self, sidecars: Vec<DataColumnSidecar>) -> Result<(), ActorError>;
     /// Data column sidecars the chain checks could not judge yet, because
-    /// their parent has no post-state: the chain actor parks them and sends
-    /// them back through [`BlockChainToP2P::check_data_column_sidecars`] once
-    /// the parent imports.
+    /// the block they are judged against has no post-state (a fulu sidecar's
+    /// parent, a gloas sidecar's own block): the chain actor parks them and
+    /// sends them back through [`BlockChainToP2P::check_data_column_sidecars`]
+    /// once that block imports.
     fn data_column_sidecars_awaiting_parent(
         &self,
         sidecars: Vec<DataColumnSidecar>,

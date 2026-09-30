@@ -51,7 +51,8 @@ use ethlambda_network_api::{
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
 use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
-    SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
+    SeenBlockColumns, SeenBlocks, SeenColumns, aggregate::SeenAggregates,
+    attestation::SeenAttestations,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -335,10 +336,12 @@ pub(crate) enum PendingRequestKind {
         end_slot: u64,
     },
     /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
-    /// only the root: the columns, attempts and failed-peer set live in
-    /// `pending_column_requests`, keyed the same way, so this is enough to
-    /// route the response and nothing this map needs to duplicate.
-    Columns(H256),
+    /// the root and the columns this one request asked its peer for: the
+    /// attempts and failed-peer set live in `pending_column_requests`, keyed
+    /// by the root, but one lookup fans out across peers with a subset each and
+    /// retires its entry on the first answer, so what a later answer may
+    /// contain has to travel with the request itself.
+    Columns(H256, Vec<u64>),
     /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
     /// slots the matching `BlocksByRange` asked for.
     ///
@@ -1075,6 +1078,7 @@ impl P2P {
             discovery: DiscoveryState::new(discovery, built.local_peer_id),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_aggregates: SeenAggregates::new(
                 SEEN_AGGREGATES_CAPACITY,
                 SEEN_AGGREGATES_CAPACITY,
@@ -1181,6 +1185,9 @@ pub struct P2PServer {
     /// The first valid sidecar per `(slot, proposer, index)` accepted from
     /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
     pub(crate) seen_columns: SeenColumns,
+    /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
+    /// per `(block root, index)`, since a gloas sidecar names no proposer.
+    pub(crate) seen_block_columns: SeenBlockColumns,
     /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
     /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
     pub(crate) seen_aggregates: SeenAggregates,
@@ -2523,6 +2530,9 @@ pub(crate) mod test_support {
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
             seen_aggregates:

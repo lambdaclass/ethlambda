@@ -5,8 +5,9 @@
 //!
 //! Also every check the chain relies on before it keeps a sidecar gossip did
 //! not accept ([`chain_checks`]): one fetched over req/resp, one gossip queued
-//! or had no free permit for, or a parked one whose parent has since
-//! imported. The chain actor stores whatever reaches it without checking it
+//! or had no free permit for, or a parked one whose block has since imported
+//! (its parent, for a fulu sidecar; its own block, for a gloas one). The chain
+//! actor stores whatever reaches it without checking it
 //! again, so these are the only checks such a sidecar gets.
 
 use ethlambda_storage::CacheKey;
@@ -19,16 +20,19 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{DATA_COLUMN_SIDECAR_SUBNET_COUNT, DOMAIN_BEACON_PROPOSER};
 use crate::beacon::containers::BeaconState;
+use crate::beacon::containers::DataColumnSidecar as AnyDataColumnSidecar;
 use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
+use crate::beacon::fork::ForkName;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::precheck;
+use crate::beacon::preset;
 use crate::beacon::primitives::HashTreeRoot as _;
-use crate::beacon::primitives::{Slot, ValidatorIndex};
+use crate::beacon::primitives::{Root, Slot, ValidatorIndex};
 use crate::beacon::stf;
 use crate::metrics;
 
@@ -105,8 +109,10 @@ pub fn stateful_checks(store: &Store, sidecar: &DataColumnSidecar) -> Outcome {
 pub enum ChainVerdict {
     /// Passed every rule: the chain stores it as it is.
     Keep,
-    /// Its parent has no post-state yet. The chain parks it and sends it back
-    /// through [`chain_checks`] once the parent imports.
+    /// The block it is judged against has no post-state yet: its parent for a
+    /// fulu sidecar, its own block for a gloas one (whose commitments are in
+    /// that block's bid). The chain parks it and sends it back through
+    /// [`chain_checks_for`] once that block imports.
     AwaitParent,
     /// Not kept. The outcome says why: an `Ignore` or a `Reject`, or
     /// `Queue(ParentNotReady)` when the parent has a post-state but its
@@ -166,6 +172,55 @@ pub fn chain_checks(store: &Store, sidecar: &DataColumnSidecar, now_ms: u64) -> 
     };
     match judge_against_parent(store, sidecar, &parent_state, PastLookahead::Advance) {
         Outcome::Accept => ChainVerdict::Keep,
+        outcome => ChainVerdict::Drop(outcome),
+    }
+}
+
+/// [`chain_checks`] or [`chain_checks_gloas`], by the sidecar's shape.
+pub fn chain_checks_for(
+    store: &Store,
+    sidecar: &AnyDataColumnSidecar,
+    now_ms: u64,
+) -> ChainVerdict {
+    match sidecar {
+        AnyDataColumnSidecar::Fulu(sidecar) => chain_checks(store, sidecar, now_ms),
+        AnyDataColumnSidecar::Gloas(sidecar) => chain_checks_gloas(store, sidecar, now_ms),
+    }
+}
+
+/// [`chain_checks`] for a gloas sidecar: the gloas gossip rules minus the two
+/// that only mean something on a gossip topic (the subnet match and the seen
+/// cache).
+///
+/// What the stateful half cannot yet judge is [`ChainVerdict::AwaitParent`]:
+/// a block not seen, or seen without a post-state. Unlike a fulu header, a
+/// gloas sidecar carries no signature, so nothing here can refuse a forged one
+/// before it is parked; the future-slot and finalized rules bound how long a
+/// made-up key can sit there.
+pub fn chain_checks_gloas(
+    store: &Store,
+    sidecar: &gloas::DataColumnSidecar,
+    now_ms: u64,
+) -> ChainVerdict {
+    let config = store.config();
+    // [IGNORE] Not from a future slot. Also what bounds how far ahead a
+    // parked row can name.
+    if is_future_slot(&config, sidecar.slot, now_ms) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::FutureSlot));
+    }
+    // [IGNORE] From a slot greater than the latest finalized slot.
+    if sidecar.slot <= finalized_start_slot(store) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized));
+    }
+    // [IGNORE] Already stored, as in [`chain_checks`].
+    if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
+        return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::AlreadyStored));
+    }
+    match stateful_checks_gloas(store, sidecar) {
+        Outcome::Accept => ChainVerdict::Keep,
+        Outcome::Queue(QueueReason::BlockUnknown | QueueReason::BlockNotReady) => {
+            ChainVerdict::AwaitParent
+        }
         outcome => ChainVerdict::Drop(outcome),
     }
 }
@@ -356,24 +411,9 @@ pub fn cheap_checks_gloas(
 /// is queued too where the specification rejects it, the same deviation
 /// fulu's parent rule makes until a bad-block cache exists.
 pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) -> Outcome {
-    let root = sidecar.beacon_block_root;
-    // [IGNORE] A block for the sidecar has been seen (MAY queue).
-    if !store.has_block(&root) {
-        return Outcome::Queue(QueueReason::BlockUnknown);
-    }
-    // [REJECT] The block for the sidecar passes validation. A block seen
-    // without a post-state is queued rather than rejected, see above. Checked
-    // before the block is decoded, so one without a state costs no read of it.
-    match store.has_state(&root) {
-        Ok(true) => {}
-        Ok(false) => return Outcome::Queue(QueueReason::BlockNotReady),
-        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
-    }
-    let block = match store.get_signed_block(&root) {
-        Ok(Some(block)) => block,
-        // Stored a moment ago and gone now (pruned): nothing to judge against.
-        Ok(None) => return Outcome::Queue(QueueReason::BlockUnknown),
-        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
+    let block = match judgeable_block_gloas(store, &sidecar.beacon_block_root) {
+        Ok(block) => block,
+        Err(outcome) => return outcome,
     };
     // [REJECT] The sidecar's slot matches the slot of the block.
     if sidecar.slot != block.slot() {
@@ -412,6 +452,58 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
         return Outcome::Reject(RejectReason::Kzg);
     }
     Outcome::Accept
+}
+
+/// The block a gloas sidecar is judged against, or the verdict that says why
+/// there is none yet.
+///
+/// The one predicate behind "this sidecar can be judged now": the chain actor
+/// asks it before sending a parked sidecar back for checks, and
+/// [`stateful_checks_gloas`] asks it first thing. Two predicates that differed
+/// (a post-state without the block, say) would bounce a sidecar between the two
+/// for ever, each side sure the other had what it needed.
+pub fn judgeable_block_gloas(store: &Store, root: &Root) -> Result<SignedBeaconBlock, Outcome> {
+    // [IGNORE] A block for the sidecar has been seen (MAY queue).
+    if !store.has_block(root) {
+        return Err(Outcome::Queue(QueueReason::BlockUnknown));
+    }
+    // [REJECT] The block for the sidecar passes validation. A block seen
+    // without a post-state is queued rather than rejected, see above. Checked
+    // before the block is decoded, so one without a state costs no read of it.
+    match store.has_state(root) {
+        Ok(true) => {}
+        Ok(false) => return Err(Outcome::Queue(QueueReason::BlockNotReady)),
+        Err(_) => return Err(Outcome::Ignore(IgnoreReason::Internal)),
+    }
+    match store.get_signed_block(root) {
+        Ok(Some(block)) => Ok(block),
+        // Stored a moment ago and gone now (pruned): nothing to judge against.
+        Ok(None) => Err(Outcome::Queue(QueueReason::BlockUnknown)),
+        Err(_) => Err(Outcome::Ignore(IgnoreReason::Internal)),
+    }
+}
+
+/// Whether a gloas sidecar is shaped well enough to be worth parking for its
+/// block: the structural rules that need no block, checked before anything is
+/// written to disk on its behalf.
+///
+/// A gloas sidecar carries no signature, so nothing ties a parked one to a
+/// real block; these are the only bounds on what a peer can make the node keep.
+/// The slot must fall in gloas's epochs, the column index and the blob count
+/// must be in range, the column and proof lists must agree, and the index must
+/// be one this node custodies, since no other is ever stored.
+pub fn is_parkable_gloas(
+    config: &Config,
+    custody_columns: &[u64],
+    sidecar: &gloas::DataColumnSidecar,
+) -> bool {
+    let epoch = compute_epoch_at_slot(sidecar.slot);
+    config.fork_at_epoch(epoch) == ForkName::Gloas
+        && (sidecar.index as usize) < preset::NUMBER_OF_COLUMNS
+        && !sidecar.column.is_empty()
+        && sidecar.column.len() == sidecar.kzg_proofs.len()
+        && sidecar.column.len() as u64 <= config.max_blobs_per_block(epoch)
+        && custody_columns.contains(&sidecar.index)
 }
 
 /// [`cheap_checks_gloas`] then [`stateful_checks_gloas`], for callers with no
@@ -1156,5 +1248,81 @@ mod tests {
             stateful_checks_gloas(&store, &card),
             Outcome::Reject(RejectReason::BlockNotGloas)
         );
+    }
+
+    fn parkable_config() -> Config {
+        Config::mainnet()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Gloas, 1)
+    }
+
+    /// One blob's worth of column and proof, at `slot` and `index`.
+    fn shaped_gloas_sidecar(slot: Slot, index: u64) -> gloas::DataColumnSidecar {
+        let cell: fulu::Cell =
+            libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL]).expect("cell");
+        gloas::DataColumnSidecar {
+            column: vec![cell].try_into().expect("one cell"),
+            kzg_proofs: vec![Default::default()].try_into().expect("one proof"),
+            ..gloas_sidecar(slot, index)
+        }
+    }
+
+    #[test]
+    fn a_well_shaped_custodied_gloas_sidecar_is_parkable() {
+        let config = parkable_config();
+        let slot = preset::SLOTS_PER_EPOCH;
+        assert!(is_parkable_gloas(
+            &config,
+            &[3],
+            &shaped_gloas_sidecar(slot, 3)
+        ));
+    }
+
+    #[test]
+    fn a_gloas_sidecar_is_not_parkable_outside_gloas_or_off_the_custody_set_or_misshapen() {
+        let config = parkable_config();
+        let slot = preset::SLOTS_PER_EPOCH;
+        let custody = [3u64];
+        // A slot before gloas names another fork's shape.
+        assert!(!is_parkable_gloas(
+            &config,
+            &custody,
+            &shaped_gloas_sidecar(1, 3)
+        ));
+        // Not a column this node custodies.
+        assert!(!is_parkable_gloas(
+            &config,
+            &custody,
+            &shaped_gloas_sidecar(slot, 4)
+        ));
+        // Out of range, even if a custody set were to name it.
+        let beyond = preset::NUMBER_OF_COLUMNS as u64;
+        assert!(!is_parkable_gloas(
+            &config,
+            &[beyond],
+            &shaped_gloas_sidecar(slot, beyond)
+        ));
+        // No blobs.
+        assert!(!is_parkable_gloas(
+            &config,
+            &custody,
+            &gloas_sidecar(slot, 3)
+        ));
+        // Column and proofs disagree.
+        let mut uneven = shaped_gloas_sidecar(slot, 3);
+        uneven.kzg_proofs = Default::default();
+        assert!(!is_parkable_gloas(&config, &custody, &uneven));
+        // More blobs than the schedule allows at that epoch.
+        let limit = config.max_blobs_per_block(1) as usize;
+        let cell: fulu::Cell =
+            libssz_types::SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL]).expect("cell");
+        let mut crowded = shaped_gloas_sidecar(slot, 3);
+        crowded.column = vec![cell; limit + 1]
+            .try_into()
+            .expect("within the list bound");
+        crowded.kzg_proofs = vec![Default::default(); limit + 1]
+            .try_into()
+            .expect("within the list bound");
+        assert!(!is_parkable_gloas(&config, &custody, &crowded));
     }
 }
