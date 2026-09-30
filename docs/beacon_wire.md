@@ -44,8 +44,9 @@ bootnodes are largely seed-only, so a crawl is how a peer is reached.
 
 ## The fork digest
 
-Computed once at startup from the resolved network's genesis state, never
-hardcoded as a digest:
+Computed from the resolved network's genesis state and fork schedule, never
+hardcoded as a digest. Startup derives the first one and a running node follows
+the schedule from there (see below):
 
 ```
 epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
@@ -61,9 +62,23 @@ digest       = base[..4]                                    if epoch <  FULU_FOR
 EIP-7892's, which is why mainnet's digest is `8c9f62fe` rather than fulu's bare
 `82fae541`.
 
-Startup logs the next boundary's epoch and wall-clock time. The digest is
-computed once, so crossing one strands the node on topic names nobody publishes
-to; restart it to pick up the new digest.
+Startup logs the next boundary's epoch, wall-clock time, fork and digest. A
+running node crosses it without a restart (`beacon::transition` in
+`ethlambda-p2p`, driven by `beacon::fork_schedule`). Both fork activations and
+blob-parameter-only forks move the digest, so both are boundaries. Following the
+spec's "Transitioning the gossip" rules, the next digest's topics are joined
+`SUBSCRIBE_LEAD_EPOCHS` before its boundary and the previous digest's topics
+are left `UNSUBSCRIBE_LAG_EPOCHS` after it. At the boundary the node
+publishes and advertises the new digest, bumps its metadata sequence number
+and moves its discv5 admission filter. While the window is open a gossip
+message's fork comes from its own topic's digest, and a `Status` on either
+digest is answered, but range sync starts only from a peer on the current
+digest (or the next one, within clock skew of the boundary).
+
+One gap: the ENR this node serves over discv5 keeps the `eth2` entry it started
+with, because ethrex's `DiscoveryServer` offers no way to replace its record at
+runtime. Peers already connected are unaffected; peers discovering the node
+after a boundary read the stale digest and reject the record.
 
 ## Gossip
 

@@ -13,6 +13,7 @@ use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
+    beacon::fork::ForkName,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -98,7 +99,9 @@ pub async fn handle_gossip_message(
             handle_lean_attestation(server, &payload, compressed_len).await
         }
         _ => match beacon_id {
-            Some(id) => handle_beacon_gossip(server, ctx, id, kind, &payload),
+            Some(id) => {
+                handle_beacon_gossip(server, ctx, id, message.topic.as_str(), kind, &payload)
+            }
             None => trace!(topic = %message.topic, "Gossip on an unhandled topic"),
         },
     }
@@ -222,6 +225,7 @@ fn handle_beacon_gossip(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
     id: GossipId,
+    topic: &str,
     kind: &str,
     payload: &[u8],
 ) {
@@ -231,14 +235,20 @@ fn handle_beacon_gossip(
         debug!(kind, "Beacon gossip arrived on a lean node");
         return;
     };
+    // The fork comes from the topic's own digest: while a boundary's window is
+    // open the node is subscribed under two, and `wire.fork` is only the one it
+    // publishes under.
+    let topic_fork = beacon_topics::topic_digest(topic)
+        .and_then(|digest| wire.schedule.fork_for_digest(digest))
+        .unwrap_or(wire.fork);
     let dispatch = if kind == beacon_topics::BEACON_BLOCK {
         triage_block(server, wire, payload)
     } else if let Some(subnet_id) = beacon_topics::data_column_subnet(kind) {
-        triage_data_column(server, payload, subnet_id)
+        triage_data_column(server, topic_fork, payload, subnet_id)
     } else if kind == beacon_topics::BEACON_AGGREGATE_AND_PROOF {
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
-        triage_attestation(server, wire, payload, subnet_id)
+        triage_attestation(server, topic_fork, payload, subnet_id)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -297,32 +307,26 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 /// Decode a data column sidecar and run its cheap gossip checks. Same shape as
 /// [`triage_block`].
 ///
-/// Decodes first, unlike the clock-based gate this used to be: gossipsub
-/// topic subscriptions are frozen at startup (`build_swarm` does not
-/// resubscribe as a fork boundary is crossed), so a node running across the
-/// gloas boundary stays on its fulu-digest topic the whole time, where a
-/// late but perfectly legitimate fulu sidecar can still legally arrive. A
-/// clock check ahead of the decode would drop that one too, mistaking it for
-/// gloas-shaped just because the clock has moved on. Only on a decode
-/// failure does the clock matter, and only as an approximation: this node's
-/// *topic* fork (whichever one gossip actually subscribed under at startup)
-/// is not threaded down to this handler today, so [`beacon_decode::current_fork`]
-/// (the wall clock) stands in for it. That is exactly backwards for a node
-/// stuck on stale fulu topics past the boundary, the same case this doc
-/// opens with: a genuinely malformed fulu sidecar arriving there reads as
-/// `Ignore` instead of `Reject`, since the clock alone cannot tell "stale
-/// topic, bad bytes" apart from "current topic, gloas-shaped bytes". Safe
-/// either way, since `Ignore` never down-scores a peer; a future change that
-/// carries the topic's own fork into `BeaconWire` (or wherever else carries
-/// the fork digest to this handler) can make this exact instead of merely
-/// safe.
-fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
+/// Decodes first rather than gating on the clock: around a fork boundary the
+/// node holds topics under two digests (see `beacon::transition`), so a late
+/// but perfectly legitimate sidecar can still arrive on the old digest's
+/// topic, and a clock check ahead of the decode would drop it, mistaking it for
+/// the new fork's shape just because the clock has moved on. Only on a decode
+/// failure does the fork matter, and `fork` is the one the message's own topic
+/// digest names: a failure under a fork this build does not follow is its own
+/// gap, so `Ignore`; under a followed fork it is the sender's fault, so
+/// `Reject`.
+fn triage_data_column(
+    server: &P2PServer,
+    fork: ForkName,
+    payload: &[u8],
+    subnet_id: u64,
+) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
     let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
-            let config = server.store.config();
-            if !beacon_decode::current_fork(&config).is_followed() {
+            if !fork.is_followed() {
                 metrics::inc_beacon_gossip(KIND, "unsupported_fork");
                 return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
             }
@@ -427,12 +431,12 @@ fn triage_aggregate(
 /// already carries in full.
 fn triage_attestation(
     server: &P2PServer,
-    wire: &BeaconWire,
+    fork: ForkName,
     payload: &[u8],
     subnet_id: u64,
 ) -> Dispatch {
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
-    let attestation = match beacon_decode::decode_attestation(wire.fork, payload) {
+    let attestation = match beacon_decode::decode_attestation(fork, payload) {
         Ok(attestation) => attestation,
         // As on the aggregate topic: an honest peer on a fork this node has no
         // attestation rules for must not be scored as a bad decoder.
@@ -630,10 +634,11 @@ pub async fn publish_beacon_attestation(
         error!(%slot, validator, subnet_id, "Attestation subnet out of range; dropping it");
         return;
     }
-    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
-        beacon.fork_digest,
-        subnet_id,
-    ));
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, validator, "No held fork digest covers this attestation's slot; not publishing");
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(digest, subnet_id));
     let compressed = compress_message(&attestation.to_ssz());
     server.swarm_handle.publish(topic, compressed);
     debug!(
@@ -660,8 +665,12 @@ pub async fn publish_beacon_aggregate(
         error!(%slot, aggregator, "A beacon aggregate reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, aggregator, "No held fork digest covers this aggregate's slot; not publishing");
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        digest,
         beacon_topics::BEACON_AGGREGATE_AND_PROOF,
     ));
     // Each fork's container encodes as itself on the wire; the enum is only
@@ -688,8 +697,15 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         error!(slot, "A beacon block reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this block's slot; not publishing"
+        );
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        digest,
         beacon_topics::BEACON_BLOCK,
     ));
     server
@@ -740,9 +756,13 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
             });
         *until = (*until).max(slot);
     }
+    // Under every digest the node holds: while a boundary's window is open,
+    // attestations are published on either side of it.
     for &subnet_id in &joined {
-        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, subnet_id);
-        server.swarm_handle.subscribe(IdentTopic::new(topic));
+        for held in wire.held_topics() {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
+            server.swarm_handle.subscribe(IdentTopic::new(topic));
+        }
     }
     if !joined.is_empty() {
         info!(?joined, "Joined attestation subnets for aggregation");
@@ -779,8 +799,10 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
         .collect();
     for subnet_id in &expired {
         server.aggregator_subnets.remove(subnet_id);
-        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, *subnet_id);
-        server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        for held in wire.held_topics() {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
+            server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        }
     }
     if !expired.is_empty() {
         debug!(
@@ -943,7 +965,7 @@ mod tests {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
 
         assert!(matches!(
-            triage_data_column(&server, &[0xff; 3], 0),
+            triage_data_column(&server, ForkName::Fulu, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -958,7 +980,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::FutureSlot))
         ));
     }
@@ -979,7 +1001,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Validate(Validated::Column(_))
         ));
     }
@@ -997,7 +1019,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 1),
+            triage_data_column(&server, ForkName::Fulu, &payload, 1),
             Dispatch::Report(Outcome::Reject(RejectReason::WrongSubnet))
         ));
     }
@@ -1062,7 +1084,7 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         assert!(matches!(
-            triage_attestation(&server, wire, &[0xff; 3], 0),
+            triage_attestation(&server, wire.fork, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -1083,7 +1105,7 @@ mod tests {
         let payload = phase0_attestation(4).to_ssz();
 
         assert!(matches!(
-            triage_attestation(&server, wire, &payload, 0),
+            triage_attestation(&server, wire.fork, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
         ));
     }
@@ -1100,7 +1122,7 @@ mod tests {
         let payload = electra_single_attestation(4, 1).to_ssz();
 
         assert!(matches!(
-            triage_attestation(&server, wire, &payload, 0),
+            triage_attestation(&server, wire.fork, &payload, 0),
             Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
         ));
     }
@@ -1119,7 +1141,7 @@ mod tests {
         let payload = electra_single_attestation(4, 1).to_ssz();
 
         assert!(matches!(
-            triage_attestation(&server, wire, &payload, 0),
+            triage_attestation(&server, wire.fork, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
         ));
     }

@@ -28,6 +28,7 @@
 
 use std::collections::BTreeMap;
 
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::ForkDigest;
 use libp2p::gossipsub::IdentTopic;
 
@@ -97,6 +98,29 @@ pub fn topic_name(fork_digest: ForkDigest, kind: &str) -> String {
 /// the same index lean's `/leanconsensus/…` names put it at.
 pub fn topic_kind(topic: &str) -> Option<&str> {
     crate::gossipsub::topic_kind(topic)
+}
+
+/// The fork digest embedded in a full topic name, or `None` if the name is not
+/// shaped like a beacon topic or carries something other than four hex bytes.
+///
+/// A message's fork is the fork its topic's digest names, which is not the
+/// digest this node currently advertises while a fork boundary's subscription
+/// window is open.
+pub fn topic_digest(topic: &str) -> Option<ForkDigest> {
+    let digest = topic.split('/').nth(2)?;
+    hex::decode(digest).ok()?.try_into().ok()
+}
+
+/// The column subnets a custody set maps onto, in custody order.
+///
+/// A column's subnet is `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed
+/// rather than assumed so a network that ever separates the two counts still
+/// subscribes to the right topic. `BeaconTopics::new` deduplicates.
+pub fn column_subnets(custody_columns: &[u64]) -> Vec<u64> {
+    custody_columns
+        .iter()
+        .map(|column| column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+        .collect()
 }
 
 /// Topic family for unaggregated attestations, one topic per subnet.
@@ -184,6 +208,36 @@ pub struct BeaconTopics {
 }
 
 impl BeaconTopics {
+    /// The topics to hold under `fork_digest`, for the fork that digest names.
+    ///
+    /// The one place a fork may change which topic kinds exist: a fork that adds
+    /// a kind extends its own arm, and the transition then joins those topics
+    /// ahead of the boundary as the spec asks. Every arm is named so a new fork
+    /// forces a decision here.
+    pub fn for_fork(
+        fork: ForkName,
+        fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
+            // Gloas adds topics of its own (payload envelopes, payload
+            // attestations) that the follower does not yet consume, so for now
+            // it holds the same set.
+            ForkName::Gloas => Self::new(fork_digest, column_subnets, attestation_subnets),
+            ForkName::Lean => {
+                unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
+            }
+        }
+    }
+
     pub fn new(
         fork_digest: ForkDigest,
         column_subnets: &[u64],
@@ -285,6 +339,21 @@ mod tests {
                 assert!(!is_subnet, "{name} is a {prefix} subnet topic");
             }
         }
+    }
+
+    #[test]
+    fn the_digest_reads_back_from_a_topic_name() {
+        assert_eq!(
+            topic_digest(&topic_name(MAINNET, BEACON_BLOCK)),
+            Some(MAINNET)
+        );
+        assert_eq!(
+            topic_digest(&attestation_topic_name([0x0a, 0xbc, 0xde, 0xf0], 3)),
+            Some([0x0a, 0xbc, 0xde, 0xf0])
+        );
+        assert_eq!(topic_digest("/eth2/zz/beacon_block/ssz_snappy"), None);
+        assert_eq!(topic_digest("/eth2/8c9f62/beacon_block/ssz_snappy"), None);
+        assert_eq!(topic_digest("garbage"), None);
     }
 
     #[test]
