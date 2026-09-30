@@ -164,15 +164,16 @@ reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.
 
-The rules above are fulu's, except that blocks and data columns also have
-gloas rules. An aggregate, attester slashing or attestation from a fork this
-build has no rules for, gloas today, is IGNOREd with the reason `unsupported_fork` and is never scored
-against the peer: the decoders answer `DecodeError::UnsupportedFork`, not `Ssz`,
-for a gloas aggregate, attester slashing or subnet attestation, or for a block
-at a gloas slot that fails to decode, since an honest
-gloas peer sends exactly those once this node's clock reaches the fork. A gloas
-subnet attestation has the bytes of an electra one, but its `data.index` is the
-payload flag, so decoding it under electra's rules would reject honest votes.
+The rules above are fulu's, except that blocks, data columns, aggregates and
+subnet attestations also have gloas rules. A gloas aggregate has electra's bytes
+but its own progressive `Attestation`, so it decodes to its own
+`SignedAggregateAndProof::Gloas` (the signed root differs); a gloas subnet
+attestation is electra's `SingleAttestation` unchanged. In both, `data.index` is
+the payload flag (0 or 1), and a vote for the full payload (1) is IGNOREd until
+the block's envelope has been seen and its payload validated
+(`verify_attestation_payload_status`). A block at a gloas slot that fails to
+decode is IGNOREd as `unsupported_fork` rather than scored against the peer,
+since the container this build models may trail the network's.
 
 The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
 since nothing consumes them; an undecodable payload on any topic is REJECTed.

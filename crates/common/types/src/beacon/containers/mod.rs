@@ -1061,13 +1061,26 @@ impl BeaconState {
     }
 }
 
+/// The one committee `bits` names, or `None` for none or several.
+fn named_committee(bits: &electra::CommitteeBits) -> Option<CommitteeIndex> {
+    let mut named = (0..bits.len()).filter(|&index| bits.get(index).unwrap_or(false));
+    let first = named.next()?;
+    // A second named committee disqualifies the aggregate outright.
+    match named.next() {
+        None => Some(first as CommitteeIndex),
+        Some(_) => None,
+    }
+}
+
 /// An aggregate attestation with the proof its aggregator was selected, in
 /// whichever fork's shape it currently has.
 ///
-/// Two variants, not one per fork, for the reason
+/// Three variants, not one per fork, for the reason
 /// [`SignedBeaconBlock::Fulu`] wraps electra's block: every fork through deneb
 /// shares [`phase0::SignedAggregateAndProof`] outright, and fulu shares
-/// electra's the same way.
+/// electra's the same way. Gloas has its own: same bytes on the wire, but its
+/// `Attestation` is a progressive container (EIP-7688), so the
+/// `hash_tree_root` the aggregator's signature covers differs.
 ///
 /// Here rather than beside the gossip decode in `ethlambda-p2p`, where it was
 /// first declared, because the gossip path no longer ends at that decode: an
@@ -1083,6 +1096,7 @@ impl BeaconState {
 pub enum SignedAggregateAndProof {
     Phase0(phase0::SignedAggregateAndProof),
     Electra(electra::SignedAggregateAndProof),
+    Gloas(gloas::SignedAggregateAndProof),
 }
 
 impl SignedAggregateAndProof {
@@ -1091,6 +1105,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregator_index,
             Self::Electra(signed) => signed.message.aggregator_index,
+            Self::Gloas(signed) => signed.message.aggregator_index,
         }
     }
 
@@ -1099,6 +1114,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.data.slot,
             Self::Electra(signed) => signed.message.aggregate.data.slot,
+            Self::Gloas(signed) => signed.message.aggregate.data.slot,
         }
     }
 
@@ -1107,6 +1123,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.data,
             Self::Electra(signed) => signed.message.aggregate.data,
+            Self::Gloas(signed) => signed.message.aggregate.data,
         }
     }
 
@@ -1122,6 +1139,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.selection_proof,
             Self::Electra(signed) => signed.message.selection_proof,
+            Self::Gloas(signed) => signed.message.selection_proof,
         }
     }
 
@@ -1130,6 +1148,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.signature,
             Self::Electra(signed) => signed.signature,
+            Self::Gloas(signed) => signed.signature,
         }
     }
 
@@ -1152,16 +1171,9 @@ impl SignedAggregateAndProof {
     pub fn committee_index(&self) -> Option<CommitteeIndex> {
         match self {
             Self::Phase0(signed) => Some(signed.message.aggregate.data.index),
-            Self::Electra(signed) => {
-                let bits = &signed.message.aggregate.committee_bits;
-                let mut named = (0..bits.len()).filter(|&index| bits.get(index).unwrap_or(false));
-                let first = named.next()?;
-                // A second named committee disqualifies the aggregate outright.
-                match named.next() {
-                    None => Some(first as CommitteeIndex),
-                    Some(_) => None,
-                }
-            }
+            // Gloas reuses electra's `CommitteeBits` outright.
+            Self::Electra(signed) => named_committee(&signed.message.aggregate.committee_bits),
+            Self::Gloas(signed) => named_committee(&signed.message.aggregate.committee_bits),
         }
     }
 
@@ -1175,6 +1187,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
             Self::Electra(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
+            Self::Gloas(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
         }
     }
 
@@ -1193,6 +1206,12 @@ impl SignedAggregateAndProof {
                     .collect()
             }
             Self::Electra(signed) => {
+                let bits = &signed.message.aggregate.aggregation_bits;
+                (0..bits.len())
+                    .map(|i| bits.get(i).unwrap_or(false))
+                    .collect()
+            }
+            Self::Gloas(signed) => {
                 let bits = &signed.message.aggregate.aggregation_bits;
                 (0..bits.len())
                     .map(|i| bits.get(i).unwrap_or(false))

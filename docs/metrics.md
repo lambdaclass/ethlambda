@@ -373,21 +373,20 @@ cache.
 The two topics add reasons the others do not, all `reason` label values on
 `lean_beacon_gossip_validation_total`: `outside_epoch_window`, `covered_bits`
 (aggregate only), `unknown_block`, `state_unavailable`,
-`finalized_not_ancestor`, `ancestry_unknown` on the ignore side;
+`finalized_not_ancestor`, `ancestry_unknown`, `payload_envelope_unseen` and
+`payload_optimistic` (gloas only) on the ignore side;
 `epoch_mismatch`, `no_participants` (aggregate only), `non_zero_data_index`,
 `committee_bits` (aggregate only), `committee_index`, `bits_length` (aggregate
 only), `not_aggregator` (aggregate only), `not_in_committee`,
 `unknown_validator`, `selection_proof` (aggregate only),
 `aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
-only), `target_not_ancestor`, `wrong_subnet` (attestation only) on the reject
-side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+only), `target_not_ancestor`, `wrong_subnet` (attestation only), and gloas's
+`data_index_out_of_range`, `same_slot_payload_flag` and `payload_invalid` on the
+reject side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
 other topics: `unsupported_fork` is an ignore reason for a message of a fork this
-build has no gossip rules for (gloas today), on the block, data column,
-aggregate, attestation and attester-slashing topics, so an honest peer past the
-fork epoch is not scored as a bad decoder. The same label value appears as
-`result` on `lean_beacon_gossip_messages_total` for the topics without gloas
-rules. Gloas blocks and data columns are validated, so they carry their own
-verdict reasons instead.
+build has no gossip rules for, so an honest peer past the fork epoch is not
+scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
+are validated, so they carry their own verdict reasons instead.
 
 Two permit pools bound the blocking-thread half of validation:
 `gossip_validation_permits` for blocks and columns,

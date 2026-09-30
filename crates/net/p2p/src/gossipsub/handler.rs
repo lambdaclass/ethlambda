@@ -682,6 +682,9 @@ pub async fn publish_beacon_aggregate(
         ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(signed) => {
             signed.to_ssz()
         }
+        ethlambda_types::beacon::containers::SignedAggregateAndProof::Gloas(signed) => {
+            signed.to_ssz()
+        }
     };
     server.swarm_handle.publish(topic, compress_message(&ssz));
     debug!(%slot, aggregator, "Published aggregate to gossipsub");
@@ -1056,11 +1059,11 @@ mod tests {
         ));
     }
 
-    /// Gloas's aggregate has no modeled container here, and an honest gloas
-    /// peer sends exactly this once the clock reaches the fork, so the decode
-    /// error must not become a `Reject`, which would penalize it.
+    /// Gloas repurposes `data.index` as the payload flag, so an honest `1`
+    /// passes the index rule electra would reject it on; it is turned away
+    /// later, here by the empty `committee_bits` of the test message.
     #[tokio::test]
-    async fn a_gloas_aggregate_is_ignored_as_an_unsupported_fork() {
+    async fn a_gloas_aggregate_with_a_payload_flag_passes_the_index_rule() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
         let server = unconnected_beacon_server(config, 0).await;
         let wire = server
@@ -1071,7 +1074,23 @@ mod tests {
 
         assert!(matches!(
             triage_aggregate(&server, wire, &payload, Instant::now()),
-            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+            Dispatch::Report(Outcome::Reject(RejectReason::CommitteeBits))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gloas_aggregate_with_a_data_index_above_one_is_rejected() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 2).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Reject(RejectReason::DataIndexOutOfRange))
         ));
     }
 
@@ -1128,21 +1147,28 @@ mod tests {
     }
 
     /// A gloas `SingleAttestation` has electra's bytes, but its `data.index`
-    /// is the payload flag, so an honest `1` must not reach electra's rules
-    /// and be rejected as a nonzero index.
+    /// is the payload flag: an honest `1` must not be rejected as a nonzero
+    /// index, while a value past the flag's range is.
     #[tokio::test]
-    async fn a_gloas_attestation_is_ignored_as_an_unsupported_fork() {
+    async fn a_gloas_attestation_is_judged_on_the_payload_flag_range() {
         let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
         let server = unconnected_beacon_server(config, 0).await;
         let wire = server
             .wire
             .beacon()
             .expect("a beacon server has a beacon wire");
-        let payload = electra_single_attestation(4, 1).to_ssz();
 
+        let flagged = electra_single_attestation(4, 1).to_ssz();
+        assert!(!matches!(
+            triage_attestation(&server, wire.fork, &flagged, 0),
+            Dispatch::Report(Outcome::Reject(
+                RejectReason::NonZeroDataIndex | RejectReason::DataIndexOutOfRange
+            ))
+        ));
+        let out_of_range = electra_single_attestation(4, 2).to_ssz();
         assert!(matches!(
-            triage_attestation(&server, wire.fork, &payload, 0),
-            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+            triage_attestation(&server, wire.fork, &out_of_range, 0),
+            Dispatch::Report(Outcome::Reject(RejectReason::DataIndexOutOfRange))
         ));
     }
 

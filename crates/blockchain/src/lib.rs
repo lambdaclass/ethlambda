@@ -3181,6 +3181,8 @@ impl BlockChainServer {
         // takes one root per import and neither `mark_validated` nor
         // `invalidate_subtree` ever comes for them.
         self.store.prune_beacon_optimistic_roots(finalized_slot);
+        self.store
+            .prune_beacon_block_payload_statuses(finalized_slot);
 
         if self.blocks_awaiting_columns.is_empty() {
             return;

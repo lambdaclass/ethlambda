@@ -20,7 +20,9 @@ use ethlambda_types::{
         constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock, gloas},
         fork::ForkName,
-        fork_choice::{BlockPayloadLink, LatestMessage, PayloadStatusV1, PowBlock},
+        fork_choice::{
+            BlockPayloadLink, LatestMessage, PayloadStatusEnum, PayloadStatusV1, PowBlock,
+        },
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
     },
@@ -755,6 +757,13 @@ pub(crate) struct BeaconScratch {
     /// forkchoiceUpdated reads it once per head move for the whole life of the
     /// process.
     pub(crate) el_block_hashes: HashMap<H256, (u64, ExecutionBlockHash)>,
+    /// Gloas: the execution client's verdict on each beacon block's payload,
+    /// against the block's slot for pruning. Keyed by beacon root because a
+    /// gloas block's payload hash lives in its bid and envelope rather than in
+    /// `el_block_hashes`. Read by the attestation gossip rules as the
+    /// specification's `block_payload_statuses`; an absent root reads as
+    /// `NOT_VALIDATED`.
+    pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
 }
 
 /// Encode a LiveChain key (slot, root) to bytes.
@@ -3572,6 +3581,45 @@ impl Store {
             .payload_statuses
             .get(&block_hash)
             .cloned()
+    }
+
+    /// The execution client's verdict on a gloas block's payload, as the
+    /// specification's `block_payload_statuses.get(root,
+    /// PAYLOAD_STATUS_NOT_VALIDATED)`: a root with no recorded verdict reads as
+    /// `Syncing`, which is `NOT_VALIDATED`.
+    pub fn beacon_block_payload_status(&self, root: H256) -> PayloadStatusEnum {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .get(&root)
+            .map_or(PayloadStatusEnum::Syncing, |(_slot, status)| *status)
+    }
+
+    /// Records the execution client's verdict on `root`'s payload, against the
+    /// block's slot. A later verdict replaces an earlier one, since an
+    /// optimistic payload is resolved one way or the other.
+    pub fn insert_beacon_block_payload_status(
+        &mut self,
+        root: H256,
+        slot: u64,
+        status: PayloadStatusEnum,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .insert(root, (slot, status));
+    }
+
+    /// Drops payload verdicts strictly below `finalized_slot`, which no
+    /// attestation rule can ask about any more.
+    pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
     }
 
     /// Records an execution client's answer for a payload. The fixture format
