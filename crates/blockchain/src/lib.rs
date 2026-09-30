@@ -1,7 +1,7 @@
 use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as EnginePayloadStatus};
 use ethlambda_network_api::{
-    AggregateArrival, BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest,
-    InitP2P,
+    AggregateArrival, BlockAnnouncement, BlockArrival, BlockChainToP2PRef, BlockSource,
+    DeferredFrom, FetchRequest, InitP2P,
 };
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
@@ -45,7 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::block_builder::ProposerConfig;
-use crate::events::ChainEventSnapshot;
+use crate::events::ChainEvents;
 use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
 use crate::store::StoreError;
 
@@ -405,6 +405,7 @@ impl BlockChain {
             .clear_pending_data_column_sidecars()
             .inspect_err(|err| error!(%err, "Failed to clear parked data column sidecars"));
 
+        let events = ChainEvents::new(events, &store);
         let handle = BlockChainServer {
             store,
             p2p: None,
@@ -545,9 +546,11 @@ pub struct BlockChainServer {
     /// `update_sync_status` with the same `SyncStatus` fed to the metric.
     sync_status_controller: SyncStatusController,
 
-    /// Chain-event publication bus. The actor is the sole publisher; consumers
-    /// only subscribe, preserving the one-directional write flow.
-    events: EventBus,
+    /// Chain-event publication: the bus and what decides what goes out on
+    /// it. The actor is the sole publisher; consumers only subscribe to the
+    /// bus inside, preserving the one-directional write flow. See
+    /// [`ChainEvents`].
+    events: ChainEvents,
 
     /// The `beacon_aggregate_and_proof` seen-sets and deferral queue. Always
     /// empty on lean, which subscribes to no such topic. See
@@ -982,17 +985,24 @@ impl BlockChainServer {
             .is_some();
 
         // Tick the store first - this accepts attestations at interval 0 if we have a proposal.
-        // Snapshot/diff around the call so attestation-driven head or
-        // finalization moves surface as chain events.
         //
         // Which call that is depends on the chain. Lean's `store::on_tick`
         // carries its own fork-choice work; beacon's clock advance does not, so
         // the head recompute follows it here. It is still needed for a slot in
         // which nothing arrived, the block path having one of its own (see
         // [`Self::recompute_beacon_head`], which both share).
-        let pre_tick = ChainEventSnapshot::capture(&self.store);
+        //
+        // Both chains then diff the events' view, so attestation-driven head
+        // or finalization moves surface as chain events: lean right after its
+        // store call, beacon at the end of its head recompute.
         match self.store.chain() {
-            Chain::Lean => store::on_tick(&mut self.store, timestamp_ms, is_proposer),
+            Chain::Lean => {
+                store::on_tick(&mut self.store, timestamp_ms, is_proposer);
+                // `slot` above is already derived from `timestamp_ms` (the
+                // wall clock at tick time), so it doubles as the wall-clock
+                // slot for the gate.
+                self.events.publish_lean_changes(&self.store, slot);
+            }
             Chain::Beacon => {
                 let config = self.store.config();
                 // Loops `on_tick_per_slot` over every boundary crossed since the
@@ -1008,9 +1018,6 @@ impl BlockChainServer {
                 self.recompute_beacon_head().await;
             }
         }
-        // `slot` above is already derived from `timestamp_ms` (the wall clock
-        // at tick time), so it doubles as the wall-clock slot for the gate.
-        pre_tick.diff_and_emit(&self.store, &self.events, slot);
 
         // The other of the two places (with a genuine `process_block` import)
         // beacon finality can move; see the method's own documentation for
@@ -1534,11 +1541,9 @@ impl BlockChainServer {
         //
         // That interval-0 catch-up can move head/justified/finalized (it is the
         // same attestation-acceptance step a non-proposing node runs at its
-        // interval-0 tick). Snapshot around the build so those moves surface as
-        // chain events here, matching an observer node; otherwise they would
-        // land outside every snapshot window and be silently absorbed into the
-        // later block-import diff's baseline.
-        let pre_build = ChainEventSnapshot::capture(&self.store);
+        // interval-0 tick). Diffed right after the build so those moves surface
+        // as chain events here, matching an observer node, rather than being
+        // folded into the later block import's own diff.
         let timing = metrics::time_block_building();
         let build_result = store::produce_block_with_signatures(
             &mut self.store,
@@ -1551,11 +1556,11 @@ impl BlockChainServer {
         // `get_proposal_head` advances the store (interval-0 catch-up) inside
         // `produce_block_with_signatures` *before* the build can fail, so emit
         // the resulting head/checkpoint moves on both paths — a build failure
-        // must not strand a real finalization move outside every snapshot
-        // window. Ordered before the freshly built block's own import (which
+        // must not leave a real finalization move to be reported late, by the
+        // next diff. Ordered before the freshly built block's own import (which
         // emits its `block` + head/checkpoint events). The catch-up advanced
         // the store to `slot`'s interval 0, so the head-recency gate uses `slot`.
-        pre_build.diff_and_emit(&self.store, &self.events, slot);
+        self.events.publish_lean_changes(&self.store, slot);
 
         let Ok((block, single_message_aggregates, _post_checkpoints)) = build_result else {
             metrics::inc_block_building_failures();
@@ -1660,8 +1665,6 @@ impl BlockChainServer {
             .store
             .has_state(&block_root)
             .expect("DB read should succeed");
-        let pre_import = ChainEventSnapshot::capture(&self.store);
-
         let outcome = match signed_block {
             SignedBeaconBlock::Lean(lean_block) => {
                 match store::on_block(&mut self.store, lean_block) {
@@ -1871,14 +1874,17 @@ impl BlockChainServer {
         // `block` goes out first so subscribers see it ahead of the
         // justified/head/finalized moves its import triggers.
         if is_new {
-            self.events.emit(ChainEvent::Block {
-                slot,
-                block: block_root,
-            });
+            self.events.publish_block(&self.store, slot, block_root);
         }
-        // Block import has no ready-made "now" slot like `on_tick`'s, so
-        // read the wall-clock slot fresh for the head-recency gate.
-        pre_import.diff_and_emit(&self.store, &self.events, self.wall_clock_slot());
+        // Lean only: a beacon import moves no head of its own, and the
+        // cascade's head recompute publishes beacon's events once it runs.
+        // Block import has no ready-made "now" slot like `on_tick`'s, so read
+        // the wall-clock slot fresh for the head-recency gate.
+        if self.store.chain() == Chain::Lean {
+            let wall_clock_slot = self.wall_clock_slot();
+            self.events
+                .publish_lean_changes(&self.store, wall_clock_slot);
+        }
 
         // A genuine import is one of the two places (with `on_tick`) beacon
         // finality can move, and finality is the only thing that evicts a
@@ -1929,7 +1935,6 @@ impl BlockChainServer {
         );
 
         Self {
-            store,
             p2p: None,
             pending_blocks: HashMap::new(),
             pending_block_parents: HashMap::new(),
@@ -1942,9 +1947,10 @@ impl BlockChainServer {
             last_tick_instant: None,
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
-            events: EventBus::default(),
+            events: ChainEvents::new(EventBus::default(), &store),
             duties: ChainDuties::Beacon,
             beacon_aggregates: Default::default(),
+            store,
         }
     }
 
@@ -2120,6 +2126,8 @@ impl BlockChainServer {
                     source: timings.source.unwrap_or(BlockSource::Gossip),
                 }),
             },
+            // The first delivery already announced it, if anything did.
+            announcement: BlockAnnouncement::Silent,
         };
         send_after(delay, ctx.clone(), redelivery);
     }
@@ -2214,17 +2222,34 @@ impl BlockChainServer {
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
+    ///
+    /// Also where the beacon chain events for a head or finality move go
+    /// out, since every such move ends here: the tick's clock advance and the
+    /// import cascade both call this after moving finality, and the one head
+    /// change not made by the recompute itself (an `INVALID`
+    /// `forkchoiceUpdated` verdict's) happens inside it. After the
+    /// `forkchoiceUpdated` round trip, so `execution_optimistic` reflects the
+    /// verdict it carried.
     async fn recompute_beacon_head(&mut self) -> HeadTimings {
         let mut timings = self.update_head_from_fork_choice();
         if let Some((start, end)) = self.notify_forkchoice_updated().await {
             timings.fcu_start = Some(start);
             timings.fcu_end = Some(end);
         }
+        let wall_clock_slot = self.wall_clock_slot();
+        self.events
+            .publish_beacon_changes(&self.store, wall_clock_slot);
         timings
     }
 
-    /// Apply an aggregate `ethlambda-p2p`'s gossip validation already
-    /// accepted, or hold it until its own slot has passed.
+    /// Apply an aggregate that already passed every gossip condition, or hold
+    /// it until its own slot has passed.
+    ///
+    /// Two producers: `ethlambda-p2p`'s gossip validation on `Accept`, and
+    /// the Beacon API for one this node's validator client submitted, which
+    /// runs the same checks before publishing it. Both take this path, so an
+    /// aggregate of this node's own reaches fork choice the way anyone else's
+    /// does.
     ///
     /// The applied-bits gate runs first, before anything else: a valid
     /// aggregate whose votes are already covered is the common case on this
@@ -2243,6 +2268,11 @@ impl BlockChainServer {
         attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
     ) {
+        // Every aggregate that reaches here passed the gossip conditions, so
+        // it is announced before the covered-bits and hold checks, which
+        // decide only what fork choice does with it.
+        self.events.publish_beacon_aggregate(&aggregate);
+
         if let Some(dropped) = self.beacon_aggregates.already_covered(&aggregate) {
             metrics::inc_beacon_aggregate_outcome(dropped.label());
             return;
@@ -3098,11 +3128,15 @@ impl BlockChainServer {
         self.store
             .prune_beacon_el_block_hashes(finalized_slot, finalized.root);
 
-        // Same horizon, same reason. An execution client doing a long state
-        // sync answers `NOT_VALIDATED` to every block, so the optimistic set
-        // takes one root per import and neither `mark_validated` nor
-        // `invalidate_subtree` ever comes for them.
-        self.store.prune_beacon_optimistic_roots(finalized_slot);
+        // Same horizon, same reason, same exemption. An execution client
+        // doing a long state sync answers `NOT_VALIDATED` to every block, so
+        // the optimistic set takes one root per import and neither
+        // `mark_validated` nor `invalidate_subtree` ever comes for them. The
+        // finalized root's flag is still read afterwards: the
+        // `finalized_checkpoint` event reports it once the head recompute
+        // that follows the import cascade runs.
+        self.store
+            .prune_beacon_optimistic_roots(finalized_slot, finalized.root);
 
         if self.blocks_awaiting_columns.is_empty() {
             return;
@@ -3138,21 +3172,17 @@ impl BlockChainServer {
 
         // Surface only votes that passed data validation and signature
         // verification, so subscribers see the same attestations fork choice
-        // does. The ~3 KB XMSS signature is not carried. `emit`'s own guard
-        // drops the event on a node with no subscribers.
+        // does.
         if accepted {
-            self.events.emit(ChainEvent::Attestation {
-                validator_id: attestation.validator_id,
-                data: attestation.data.clone(),
-            });
+            self.events.publish_lean_attestation(attestation);
         }
     }
 
     fn on_gossip_aggregated_attestation(&mut self, attestation: SignedAggregatedAttestation) {
-        // The store consumes the aggregate, so snapshot the event inputs first.
+        // The store consumes the aggregate, so take the event inputs first.
         // Aggregates are low-rate (~one per subnet per slot), so building these
-        // unconditionally is cheap; `emit`'s own guard drops them on an
-        // unsubscribed node. The SNARK proof bytes are not carried.
+        // unconditionally is cheap; the bus drops them on an unsubscribed
+        // node.
         let participants: Vec<u64> = attestation.proof.participant_indices().collect();
         let data = attestation.data.clone();
         let accepted = store::on_gossip_aggregated_attestation(&mut self.store, attestation)
@@ -3161,8 +3191,7 @@ impl BlockChainServer {
 
         // Emit only for aggregates the store accepted, mirroring `attestation`.
         if accepted {
-            self.events
-                .emit(ChainEvent::Aggregate { participants, data });
+            self.events.publish_lean_aggregate(participants, data);
         }
     }
 
@@ -3229,6 +3258,7 @@ impl BlockChainServer {
             return;
         }
         metrics::inc_data_column_stored();
+        self.events.publish_data_column(block_root, &sidecar);
 
         // A held block may now be complete.
         self.release_block_if_columns_complete(block_root).await;
@@ -3788,13 +3818,11 @@ impl Handler<NewBlock> for BlockChainServer {
             admit_start: Some(picked_up),
             ..ImportTimings::default()
         };
-        // If message came from gossip, emit event and metric.
+        self.events
+            .publish_block_gossip(&self.store, &msg.block, msg.announcement);
+        // If message came from gossip, record its arrival.
         if msg.source == BlockSource::Gossip {
             let slot = msg.block.slot();
-            self.events.emit(ChainEvent::BlockGossip {
-                slot,
-                block: msg.block.message_hash_tree_root(),
-            });
             if self.is_arrival_observable(slot) {
                 metrics::observe_gossip_block_arrival(
                     arrival_ms,
@@ -3980,11 +4008,11 @@ impl Handler<AggregateProduced> for BlockChainServer {
 
         // Surface our own freshly produced aggregate, the counterpart of the
         // gossip-received path in `on_gossip_aggregated_attestation` (we never
-        // receive our own aggregate back over gossip). Low-rate; proof omitted.
-        self.events.emit(ChainEvent::Aggregate {
-            participants: msg.output.participants.clone(),
-            data: msg.output.hashed.data().clone(),
-        });
+        // receive our own aggregate back over gossip). Low-rate.
+        self.events.publish_lean_aggregate(
+            msg.output.participants.clone(),
+            msg.output.hashed.data().clone(),
+        );
 
         if let Some(ref p2p) = self.p2p {
             let aggregate = SignedAggregatedAttestation {
@@ -4348,6 +4376,7 @@ mod tests {
 
     fn beacon_server(store: Store) -> BlockChainServer {
         BlockChainServer {
+            events: ChainEvents::new(EventBus::default(), &store),
             store,
             p2p: None,
             pending_blocks: HashMap::new(),
@@ -4362,7 +4391,6 @@ mod tests {
             last_tick_instant: None,
             sync_status: SyncStatusTracker::new(false),
             sync_status_controller: SyncStatusController::default(),
-            events: EventBus::default(),
             duties: ChainDuties::Beacon,
         }
     }
@@ -5551,5 +5579,421 @@ mod tests {
             CUSTODY.to_vec(),
             "neither custody column has arrived yet"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Beacon chain events
+    //
+    // The view diff runs against a real store with hand-built blocks and
+    // post-states: each block's post-state records its ancestors in
+    // `block_roots`, which is all the reorg check and the dependent roots
+    // read. Fork choice never runs, so the head is moved by hand with the
+    // same writer `get_head` uses.
+    // -----------------------------------------------------------------
+
+    use crate::events::{
+        BeaconAttestationEvent, BeaconChainReorgEvent, BeaconFinalizedCheckpointEvent,
+        BeaconHeadEvent, DataColumnSidecarEvent, HEAD_EVENT_RECENCY_SLOTS,
+    };
+    use ethlambda_storage::ForkCheckpoints;
+    use tokio::sync::broadcast;
+
+    const G: H256 = H256::repeat_byte(0x10);
+    const A: H256 = H256::repeat_byte(0x11);
+    const B: H256 = H256::repeat_byte(0x12);
+    const C: H256 = H256::repeat_byte(0x13);
+
+    /// The post-state root a test block names, derived so each block's is
+    /// distinct from every root in play.
+    fn post_state_root(root: H256) -> H256 {
+        H256::repeat_byte(!root.0[0])
+    }
+
+    /// A beacon store anchored at `G`, a real block at slot zero, so the
+    /// head can move off it: the canonical-index diff walks from the old head
+    /// to the new one and needs a block at both ends.
+    fn event_store(genesis_time: u64) -> Store {
+        let anchor = Checkpoint { root: G, slot: 0 };
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            genesis_time,
+            Config::mainnet(),
+            G,
+            anchor,
+            0,
+        );
+        insert_event_block(&mut store, G, 0, H256::repeat_byte(0xee), &[]);
+        store
+    }
+
+    /// Insert `root` at `slot` under `parent`, with a post-state whose
+    /// `block_roots` names, for every slot below `slot`, the latest of
+    /// `ancestors` at or before it, as a state transition would have left it.
+    fn insert_event_block(
+        store: &mut Store,
+        root: H256,
+        slot: u64,
+        parent: H256,
+        ancestors: &[(u64, H256)],
+    ) {
+        let SignedBeaconBlock::Phase0(mut block) = bare_block(slot, parent) else {
+            unreachable!("bare_block builds a phase0 block");
+        };
+        block.message.state_root = post_state_root(root);
+        store
+            .insert_signed_block(root, SignedBeaconBlock::Phase0(block))
+            .expect("insert");
+
+        let mut state = bare_state();
+        let BeaconState::Phase0(inner) = &mut state else {
+            unreachable!("bare_state builds a phase0 state");
+        };
+        inner.slot = slot;
+        for below in 0..slot {
+            let latest = ancestors
+                .iter()
+                .filter(|(ancestor_slot, _)| *ancestor_slot <= below)
+                .max_by_key(|(ancestor_slot, _)| *ancestor_slot)
+                .map_or(H256::ZERO, |(_, root)| *root);
+            inner.block_roots[below as usize % preset::SLOTS_PER_HISTORICAL_ROOT] = latest;
+        }
+        store.insert_state(root, state).expect("insert");
+    }
+
+    fn set_head(store: &mut Store, root: H256) {
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("update head");
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<ChainEvent>) -> Vec<ChainEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn as_head(event: &ChainEvent) -> &BeaconHeadEvent {
+        match event {
+            ChainEvent::BeaconHead(head) => head,
+            other => panic!("expected a beacon head event, got {other:?}"),
+        }
+    }
+
+    fn as_reorg(event: &ChainEvent) -> &BeaconChainReorgEvent {
+        match event {
+            ChainEvent::BeaconChainReorg(reorg) => reorg,
+            other => panic!("expected a chain_reorg event, got {other:?}"),
+        }
+    }
+
+    /// G(0) <- A(1) <- B(2), and C(3) a second child of A: the store, the
+    /// actor's events started with the head at `head`, and a subscriber.
+    fn fork_fixture(head: H256) -> (Store, ChainEvents, broadcast::Receiver<ChainEvent>) {
+        let mut store = event_store(GENESIS_TIME);
+        insert_event_block(&mut store, A, 1, G, &[(0, G)]);
+        insert_event_block(&mut store, B, 2, A, &[(0, G), (1, A)]);
+        insert_event_block(&mut store, C, 3, A, &[(0, G), (1, A)]);
+        set_head(&mut store, head);
+        let events = ChainEvents::new(EventBus::new(16), &store);
+        let rx = events.subscribe();
+        (store, events, rx)
+    }
+
+    #[test]
+    fn an_unchanged_view_emits_nothing() {
+        let (store, mut events, mut rx) = fork_fixture(B);
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_head_moving_to_a_descendant_emits_head_alone() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        assert_eq!(
+            as_head(&emitted[0]),
+            &BeaconHeadEvent {
+                slot: 2,
+                block: B,
+                state: post_state_root(B),
+                epoch_transition: false,
+                // Epoch 0: both dependent roots underflow to genesis.
+                previous_duty_dependent_root: G,
+                current_duty_dependent_root: G,
+                execution_optimistic: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_head_moving_to_another_branch_emits_chain_reorg_then_head() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        set_head(&mut store, C);
+        events.publish_beacon_changes(&store, 3);
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        assert_eq!(
+            as_reorg(&emitted[0]),
+            &BeaconChainReorgEvent {
+                slot: 3,
+                // B at slot 2, the common ancestor A at slot 1.
+                depth: 1,
+                old_head_block: B,
+                new_head_block: C,
+                old_head_state: post_state_root(B),
+                new_head_state: post_state_root(C),
+                epoch: 0,
+                execution_optimistic: false,
+            }
+        );
+        assert_eq!(as_head(&emitted[1]).block, C);
+    }
+
+    /// What an `INVALID` `forkchoiceUpdated` verdict leaves: the head moves
+    /// back to an ancestor, so the previous head is not on the new chain.
+    #[test]
+    fn a_head_moving_back_to_an_ancestor_is_a_reorg() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        set_head(&mut store, A);
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 2, "{emitted:?}");
+        let reorg = as_reorg(&emitted[0]);
+        assert_eq!((reorg.slot, reorg.depth), (1, 1));
+        assert_eq!(as_head(&emitted[1]).block, A);
+    }
+
+    #[test]
+    fn crossing_an_epoch_sets_epoch_transition_and_the_dependent_roots() {
+        let x = H256::repeat_byte(0x21);
+        let y = H256::repeat_byte(0x22);
+        let z = H256::repeat_byte(0x23);
+        let mut store = event_store(GENESIS_TIME);
+        insert_event_block(&mut store, x, 31, G, &[(0, G)]);
+        insert_event_block(&mut store, y, 32, x, &[(0, G), (31, x)]);
+        insert_event_block(&mut store, z, 65, y, &[(0, G), (31, x), (32, y)]);
+        set_head(&mut store, x);
+        let mut events = ChainEvents::new(EventBus::new(16), &store);
+        let mut rx = events.subscribe();
+
+        set_head(&mut store, y);
+        events.publish_beacon_changes(&store, 32);
+        let emitted = drain(&mut rx);
+        let head = as_head(&emitted[0]);
+        assert!(head.epoch_transition);
+        // Epoch 1: current is the last root of epoch 0, previous underflows.
+        assert_eq!(head.current_duty_dependent_root, x);
+        assert_eq!(head.previous_duty_dependent_root, G);
+
+        set_head(&mut store, z);
+        events.publish_beacon_changes(&store, 65);
+        let emitted = drain(&mut rx);
+        let head = as_head(&emitted[0]);
+        assert!(head.epoch_transition);
+        // Epoch 2: the last roots of epochs 1 and 0.
+        assert_eq!(head.current_duty_dependent_root, y);
+        assert_eq!(head.previous_duty_dependent_root, x);
+    }
+
+    #[test]
+    fn a_stale_head_is_gated_but_the_view_still_moves() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2 + HEAD_EVENT_RECENCY_SLOTS + 1);
+        assert!(drain(&mut rx).is_empty());
+
+        // The move was recorded: a recent diff now has nothing to report.
+        events.publish_beacon_changes(&store, 2);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_stale_reorg_is_still_reported() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        set_head(&mut store, C);
+        events.publish_beacon_changes(&store, 3 + HEAD_EVENT_RECENCY_SLOTS + 1);
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        assert_eq!(as_reorg(&emitted[0]).new_head_block, C);
+    }
+
+    #[test]
+    fn a_head_with_an_optimistic_payload_says_so() {
+        let (mut store, mut events, mut rx) = fork_fixture(A);
+        store.insert_beacon_optimistic_root(B, 2);
+        set_head(&mut store, B);
+        events.publish_beacon_changes(&store, 2);
+
+        assert!(as_head(&drain(&mut rx)[0]).execution_optimistic);
+    }
+
+    /// Two finality steps between diffs coalesce into one event naming the
+    /// latest, with the epoch recovered from the stored start slot.
+    #[test]
+    fn finality_emits_one_event_in_epochs() {
+        let (mut store, mut events, mut rx) = fork_fixture(B);
+        store.insert_beacon_optimistic_root(A, 1);
+        for finalized in [
+            Checkpoint { root: G, slot: 32 },
+            Checkpoint { root: A, slot: 64 },
+        ] {
+            let checkpoints = ForkCheckpoints::new(B, Some(finalized), Some(finalized));
+            store.update_checkpoints(checkpoints).expect("update");
+        }
+        events.publish_beacon_changes(&store, 2);
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let ChainEvent::BeaconFinalizedCheckpoint(finalized) = &emitted[0] else {
+            panic!("expected finalized_checkpoint, got {:?}", emitted[0]);
+        };
+        assert_eq!(
+            finalized,
+            &BeaconFinalizedCheckpointEvent {
+                block: A,
+                state: post_state_root(A),
+                epoch: 2,
+                execution_optimistic: true,
+            }
+        );
+    }
+
+    /// With nobody listening the diff reads nothing but the two roots, and
+    /// still moves the view, so a client connecting later is not handed a
+    /// stale move.
+    #[test]
+    fn without_a_subscriber_the_view_still_moves() {
+        let mut store = event_store(GENESIS_TIME);
+        insert_event_block(&mut store, A, 1, G, &[(0, G)]);
+        let mut events = ChainEvents::new(EventBus::new(16), &store);
+
+        set_head(&mut store, A);
+        events.publish_beacon_changes(&store, 1);
+
+        let mut rx = events.subscribe();
+        events.publish_beacon_changes(&store, 1);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    /// The bug this view replaces: a head move made outside any snapshot
+    /// window (a beacon import cascade moves the head in its head recompute,
+    /// after the import's own diff has run) was never announced. The
+    /// recompute now publishes whatever moved since the last diff.
+    #[tokio::test]
+    async fn the_head_recompute_announces_a_head_move() {
+        // A recent genesis, so slot 1 is within the recency window of the
+        // real wall clock the recompute reads.
+        let genesis_time = unix_now_ms() / 1000 - Config::mainnet().seconds_per_slot;
+        let mut store = event_store(genesis_time);
+        insert_event_block(&mut store, A, 1, G, &[(0, G)]);
+        let mut server = beacon_server(store);
+        let mut rx = server.events.subscribe();
+
+        set_head(&mut server.store, A);
+        // Fork choice finds no head in this hand-built store (no justified
+        // state to weigh from), so the head stays where it was put.
+        server.recompute_beacon_head().await;
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        assert_eq!(as_head(&emitted[0]).block, A);
+    }
+
+    #[tokio::test]
+    async fn a_newly_stored_column_is_announced_once() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        let mut rx = server.events.subscribe();
+        let sidecar = sidecar_at(10, H256::repeat_byte(9));
+        let block_root = sidecar.signed_block_header.message.hash_tree_root();
+
+        server.keep_data_column(sidecar.clone()).await;
+        server.keep_data_column(sidecar).await;
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let ChainEvent::DataColumnSidecar(column) = &emitted[0] else {
+            panic!("expected data_column_sidecar, got {:?}", emitted[0]);
+        };
+        assert_eq!(
+            column,
+            &DataColumnSidecarEvent {
+                block_root,
+                index: 0,
+                slot: 10,
+            }
+        );
+    }
+
+    /// Announced on arrival, before the hold decides it is too early for fork
+    /// choice: every aggregate that reaches the actor passed the gossip
+    /// conditions, whatever fork choice then does with it.
+    #[test]
+    fn an_aggregate_is_announced_and_then_held() {
+        let mut server = beacon_server(beacon_store(GENESIS_TIME, 0));
+        let mut rx = server.events.subscribe();
+        let aggregate = electra::SignedAggregateAndProof {
+            message: electra::AggregateAndProof {
+                aggregator_index: 0,
+                aggregate: electra::Attestation {
+                    aggregation_bits: Default::default(),
+                    data: shared::AttestationData {
+                        slot: 10,
+                        ..Default::default()
+                    },
+                    signature: Default::default(),
+                    committee_bits: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        };
+
+        server.on_gossip_beacon_aggregate(
+            Box::new(SignedAggregateAndProof::Electra(aggregate.clone())),
+            vec![1, 2],
+            AggregateArrival::now(),
+        );
+
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let ChainEvent::BeaconAttestation(attestation) = &emitted[0] else {
+            panic!("expected attestation, got {:?}", emitted[0]);
+        };
+        assert_eq!(
+            attestation.as_ref(),
+            &BeaconAttestationEvent::Electra(aggregate.message.aggregate)
+        );
+        // The store clock is at slot 0, so a slot-10 aggregate waits.
+        assert_eq!(server.beacon_aggregates.deferred_len(), 1);
+    }
+
+    #[test]
+    fn block_gossip_follows_the_senders_announcement() {
+        let server = beacon_server(beacon_store(GENESIS_TIME, 0));
+        let mut rx = server.events.subscribe();
+        let block = bare_block(4, H256::repeat_byte(3));
+        let root = block.message_hash_tree_root();
+
+        let silent = BlockAnnouncement::Silent;
+        server
+            .events
+            .publish_block_gossip(&server.store, &block, silent);
+        assert!(drain(&mut rx).is_empty());
+
+        let announce = BlockAnnouncement::Announce;
+        server
+            .events
+            .publish_block_gossip(&server.store, &block, announce);
+        let emitted = drain(&mut rx);
+        assert_eq!(emitted.len(), 1, "{emitted:?}");
+        let ChainEvent::BeaconBlockGossip(gossip) = &emitted[0] else {
+            panic!("expected block_gossip, got {:?}", emitted[0]);
+        };
+        assert_eq!((gossip.slot, gossip.block), (4, root));
     }
 }

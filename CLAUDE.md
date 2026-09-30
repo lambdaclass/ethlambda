@@ -331,8 +331,9 @@ actual_slot = finalized_slot + 1 + relative_index
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
     columns and backbone attestation subnets. `beacon_aggregate_and_proof` and
     `beacon_attestation_{subnet_id}` validate in p2p like blocks/columns, with their own
-    permit pool. The actor applies only accepted aggregates, attesting indices already
-    gossip-verified, held one slot per `validate_on_attestation`'s `current_slot >= data.slot
+    permit pool. The actor applies only accepted aggregates (gossip's, plus the Beacon API's
+    own validated `aggregate_and_proofs` submissions), attesting indices already
+    verified, held one slot per `validate_on_attestation`'s `current_slot >= data.slot
     + 1`; subnet attestations are verified and relayed but never applied. See
     [`docs/beacon_wire.md`](docs/beacon_wire.md)
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
@@ -501,8 +502,8 @@ disagree. `node` calls `start_rpc_server` and gets `/lean/v0`; `beacon` calls
 (`crates/net/rpc/src/beacon/`, one file per endpoint group). Both reach it with real
 handles: the DB-backed anchored `Store` the `P2PServer` already holds, plus a clone of the
 same `SyncStatusController` the chain actor writes to. The beacon arm takes no
-`AggregatorController` and no `EventBus`, because a follower has no aggregator duty to
-toggle and the chain-events stream is part of the lean surface. It does take the P2P
+`AggregatorController`, because a follower has no aggregator duty to toggle, but it does
+take the same `EventBus` lean does, for `GET /eth/v1/events`. It also takes the P2P
 actor's `RpcToP2PRef` (`crates/net/api`), the one path by which this node gossips on the
 beacon wire: `POST /eth/v2/beacon/pool/attestations` validates a validator client's
 attestations and publishes them through it.

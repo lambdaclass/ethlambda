@@ -17,6 +17,7 @@ use crate::shared::block_id::IdError;
 
 pub(crate) mod blocks;
 pub(crate) mod config;
+pub(crate) mod events;
 pub(crate) mod genesis;
 pub(crate) mod headers;
 pub(crate) mod node;
@@ -52,6 +53,9 @@ pub(crate) struct Envelope<T> {
 #[derive(Debug)]
 pub(crate) enum ApiError {
     BadRequest(&'static str),
+    /// A 400 whose message names the offending input, which a fixed string
+    /// cannot (`Invalid topic: weather_forecast`).
+    BadRequestDetail(String),
     NotFound(&'static str),
     Internal(&'static str),
     /// A request this node cannot answer right now, typically because its
@@ -70,11 +74,12 @@ impl From<IdError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
-            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
-            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+        let (status, message): (_, std::borrow::Cow<'static, str>) = match self {
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m.into()),
+            ApiError::BadRequestDetail(m) => (StatusCode::BAD_REQUEST, m.into()),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m.into()),
+            ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m.into()),
+            ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m.into()),
         };
         let body = serde_json::json!({ "code": status.as_u16(), "message": message });
         let mut response = crate::json_response(body);
@@ -92,6 +97,7 @@ impl IntoResponse for ApiError {
 pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .merge(blocks::routes())
+        .merge(events::routes())
         .merge(headers::routes())
         .merge(states::routes())
         .merge(genesis::routes())

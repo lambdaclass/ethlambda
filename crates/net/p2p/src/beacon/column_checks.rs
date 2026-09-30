@@ -108,7 +108,9 @@ fn count_drop(outcome: Outcome) {
 mod tests {
     use std::sync::Arc;
 
-    use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource, P2PToBlockChain};
+    use ethlambda_network_api::{
+        AggregateArrival, BlockAnnouncement, BlockArrival, BlockSource, P2PToBlockChain,
+    };
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock};
@@ -135,6 +137,7 @@ mod tests {
             _block: SignedBeaconBlock,
             _source: BlockSource,
             _arrival: BlockArrival,
+            _announcement: BlockAnnouncement,
         ) -> Result<(), ActorError> {
             Ok(())
         }
