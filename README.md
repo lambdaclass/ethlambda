@@ -8,7 +8,75 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 
 🌐 Visit our website at [**ethlambda.xyz**](https://ethlambda.xyz) to learn more about the project.
 
-## Getting started
+## Quickstart
+
+### Beacon Chain follower
+
+Follows Ethereum mainnet from a checkpoint-synced anchor and serves the
+standard Beacon API on port 5052. It runs from the pre-built
+`ghcr.io/lambdaclass/ethlambda:beacon` image, so only
+[Docker](https://www.docker.com/get-started) is needed.
+
+This runs the consensus layer only, with no execution client: blocks are
+imported without validating their execution payloads.
+
+```sh
+docker pull ghcr.io/lambdaclass/ethlambda:beacon
+
+mkdir -p beacon-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# This host's public address, published in the node's ENR (see below)
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+
+# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
+docker run -d --name ethlambda-beacon --stop-signal SIGINT \
+  -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
+  -p 127.0.0.1:5052:5052 \
+  -v "$PWD/beacon-data:/data" \
+  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               /data/node-key \
+  --data-dir               /data/db \
+  --http-address           0.0.0.0 \
+  --discovery.advertise-ip "$PUBLIC_IP"
+```
+
+`--discovery.advertise-ip` is the address published in the node's ENR. Behind
+Docker's port mapping the node cannot see its own public address, so without
+the flag it advertises `0.0.0.0` and logs a warning. It still dials out and
+follows the chain, but peers cannot reach it until discovery learns the address
+from their replies.
+
+Follow the logs with `docker logs -f ethlambda-beacon`. The first start
+downloads the finalized state (several hundred MB) and logs
+`Beacon checkpoint sync complete`, then a few minutes of
+`Block parent missing, storing as pending` before `Block imported successfully`
+lines start. Later starts resume from `beacon-data/db`.
+
+Check progress from another terminal:
+
+```sh
+curl -s localhost:5052/eth/v1/node/syncing
+```
+
+The node has caught up once `sync_distance` (the chain's current slot minus
+`head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
+`false` during catch-up as well.
+
+For Sepolia or Hoodi, add
+`--network sepolia` or `--network hoodi` and point `--checkpoint-sync-url` at
+that network's provider. To validate payloads, pair the node with an execution
+client through `--execution-endpoint` and `--execution-jwt-secret`; see
+[`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
+those and the remaining flags.
+
+### Lean consensus devnet
+
+To run a local lean devnet with ethlambda, follow the instructions on the
+[`devnet5-ethlambda-keygen` branch of lambdaclass/lean-quickstart](https://github.com/lambdaclass/lean-quickstart/tree/devnet5-ethlambda-keygen).
+
+## Building from source
 
 ### Prerequisites
 
