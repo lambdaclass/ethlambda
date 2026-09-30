@@ -207,10 +207,9 @@ pub enum CheckpointSyncError {
     #[error("peer served no block at the anchor slot {slot}")]
     AnchorBlockMissing { slot: u64 },
     // Only a built-in network reaches this: a `--network <dir>` network
-    // anchors at the directory's own `genesis.ssz`. Every built-in network has
-    // been live for years and this follower imports nothing at startup, so
-    // anchoring there would park it at slot 0 while claiming to follow a live
-    // chain.
+    // anchors at the directory's own `genesis.ssz`. Every built-in network is
+    // a live chain and this follower imports nothing at startup, so anchoring
+    // there would park it at slot 0 while claiming to follow it.
     #[error(
         "a built-in network has no genesis-sync path, so a fresh data directory needs \
          --checkpoint-sync-url; a network loaded with --network <dir> anchors at its own \
