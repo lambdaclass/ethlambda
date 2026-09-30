@@ -4979,10 +4979,10 @@ pub fn on_block_attestation(
 /// records it against `attesting_indices`, resolved by the caller's gossip
 /// validation rather than recomputed here.
 ///
-/// The rules are [`ForkRules::PreGloas`]: an aggregate reaches this function
-/// only as a pre-gloas (phase0- or electra-shaped) one, since gloas's own
-/// aggregate is refused when the gossip payload is decoded and never gets as
-/// far as gossip validation.
+/// The rules are those of the vote's own fork, read off `data.slot`: gloas
+/// keeps electra's aggregate container, so the container cannot say, and under
+/// gloas `data.index` is the payload flag that [`update_latest_messages`]
+/// records.
 ///
 /// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
 /// this topic: an aggregate here is by definition not carried in a block, so
@@ -4999,8 +4999,9 @@ pub fn apply_verified_aggregate(
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
 ) -> Result<()> {
-    validate_on_attestation_indexed(store, data, ForkRules::PreGloas, false, config, index)?;
-    update_latest_messages(store, attesting_indices, data, ForkRules::PreGloas);
+    let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(data.slot)));
+    validate_on_attestation_indexed(store, data, rules, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data, rules);
     Ok(())
 }
 

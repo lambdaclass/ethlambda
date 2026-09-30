@@ -1,6 +1,9 @@
 //! `beacon_aggregate_and_proof` gossip validation: electra's
 //! `validate_beacon_aggregate_and_proof_gossip` (`specs/electra/p2p-interface.md`),
-//! which fulu (what mainnet runs) inherits unchanged.
+//! which fulu inherits unchanged, and gloas's modification of it
+//! (`specs/gloas/p2p-interface.md`). The aggregate's variant picks the
+//! `data.index` rule and whether the payload-status check runs; it runs last,
+//! as in the specification.
 //!
 //! # Deviations from the specification
 //!
@@ -54,6 +57,7 @@ use lru::LruCache;
 
 use super::{
     IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
+    verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::constants::{
@@ -240,6 +244,7 @@ fn aggregate_and_proof_root(aggregate: &SignedAggregateAndProof) -> Root {
     match aggregate {
         SignedAggregateAndProof::Phase0(signed) => signed.message.hash_tree_root(),
         SignedAggregateAndProof::Electra(signed) => signed.message.hash_tree_root(),
+        SignedAggregateAndProof::Gloas(signed) => signed.message.hash_tree_root(),
     }
 }
 
@@ -256,12 +261,24 @@ pub fn cheap_checks(
     let config = store.config();
     let data = aggregate.data();
 
-    // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
-    // now lives in `committee_bits` instead. Phase0 has no `committee_bits`
-    // and carries the real committee in `data.index`, so this only applies
-    // to the electra shape.
-    if matches!(aggregate, SignedAggregateAndProof::Electra(_)) && data.index != 0 {
-        return Err(Outcome::Reject(RejectReason::NonZeroDataIndex));
+    match aggregate {
+        // Phase0 has no `committee_bits` and carries the real committee in
+        // `data.index`, so there is nothing to require of it.
+        SignedAggregateAndProof::Phase0(_) => {}
+        // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
+        // now lives in `committee_bits` instead.
+        SignedAggregateAndProof::Electra(_) => {
+            if data.index != 0 {
+                return Err(Outcome::Reject(RejectReason::NonZeroDataIndex));
+            }
+        }
+        // [New in Gloas:EIP7732] [REJECT] `data.index` is 0 or 1: it is the
+        // payload-present flag now.
+        SignedAggregateAndProof::Gloas(_) => {
+            if data.index > 1 {
+                return Err(Outcome::Reject(RejectReason::DataIndexOutOfRange));
+            }
+        }
     }
     // [New in Electra:EIP7549] [REJECT] Exactly one committee is named.
     // Always `Some` for phase0, whose `data.index` alone names the committee.
@@ -426,6 +443,19 @@ pub fn stateful_checks(
             }
             indexed.attesting_indices.to_vec()
         }
+        SignedAggregateAndProof::Gloas(signed) => {
+            let gloas_attestation = &signed.message.aggregate;
+            let indexed = crate::beacon::helpers::gloas::get_indexed_attestation(
+                &state,
+                gloas_attestation,
+                &committees,
+            )
+            .map_err(|_| Outcome::Ignore(IgnoreReason::Internal))?;
+            if !crate::beacon::helpers::gloas::is_valid_indexed_attestation(&state, &indexed) {
+                return Err(Outcome::Reject(RejectReason::AggregateSignature));
+            }
+            indexed.attesting_indices.to_vec()
+        }
     };
 
     // Ancestry, via the vote state's own history; see this function's
@@ -447,6 +477,12 @@ pub fn stateful_checks(
     };
     if finalized_block != finalized.root {
         return Err(Outcome::Ignore(IgnoreReason::FinalizedNotAncestor));
+    }
+
+    // [New in Gloas:EIP7732] The attested payload status is consistent with the
+    // block's execution payload.
+    if matches!(aggregate, SignedAggregateAndProof::Gloas(_)) {
+        verify_attestation_payload_status(store, &data)?;
     }
 
     Ok(attesting_indices)
