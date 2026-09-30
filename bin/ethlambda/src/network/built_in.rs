@@ -66,7 +66,7 @@ impl BuiltInNetwork {
         // but whose state transition it does not implement yet (gloas), or
         // one whose keys it does not even claim (heze). The ignored-keys
         // warning below only ever said the second half of that; it used to
-        // say both, back when GLOAS_* were unclaimed too. `warn_if_gloas_scheduled`
+        // say both, back when GLOAS_* were unclaimed too. `warn_if_unfollowed_fork_scheduled`
         // says the first half explicitly instead of leaving it to be
         // discovered as a stall.
         parsed.warn_about_ignored_keys();
@@ -74,7 +74,7 @@ impl BuiltInNetwork {
         let genesis = chain.genesis();
         let mut config = parsed.config;
         super::derive_genesis_fields(&mut config, genesis.genesis_time);
-        super::warn_if_gloas_scheduled(self.name(), &config);
+        super::warn_if_unfollowed_fork_scheduled(self.name(), &config);
 
         Ok(BuiltIn {
             config,

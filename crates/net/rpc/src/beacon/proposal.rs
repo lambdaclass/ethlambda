@@ -37,6 +37,7 @@ use ethlambda_state_transition::beacon::{
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
+        config::Config,
         containers::{
             self, BeaconState,
             deneb::Blob,
@@ -45,6 +46,7 @@ use ethlambda_types::{
         fork::ForkName,
         preset,
         primitives::{BlsSignature, Bytes32, ExecutionAddress, KzgProof, Slot},
+        signing::compute_epoch_at_slot,
     },
     primitives::H256,
 };
@@ -149,6 +151,13 @@ async fn post_block(
     if block.slot() <= head_state.slot() {
         return ApiError::BadRequest("the block is not after this node's head").into_response();
     }
+    if let Err(err) = require_fulu_slot(
+        &store.config(),
+        block.slot(),
+        "blocks are accepted for fulu slots only",
+    ) {
+        return err.into_response();
+    }
     let Ok(state) = advance_to_slot(&head_state, block.slot(), &store.config()) else {
         return ApiError::Internal("advancing the head state failed").into_response();
     };
@@ -168,6 +177,24 @@ struct ProduceQuery {
     graffiti: Option<H256>,
 }
 
+/// Refuses a slot the schedule does not place at fulu, before anything
+/// advances a state to it: advancing a fulu head into a gloas slot would run
+/// `upgrade_to_gloas` only to refuse the result. Every other fork is refused
+/// too, since the containers here are fulu's.
+fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Result<(), ApiError> {
+    match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
+        ForkName::Fulu => Ok(()),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Gloas
+        | ForkName::Lean => Err(ApiError::BadRequest(message)),
+    }
+}
+
 async fn get_block(
     Path(slot): Path<String>,
     Query(query): Query<ProduceQuery>,
@@ -180,6 +207,15 @@ async fn get_block(
     let Ok(slot) = slot.parse::<Slot>() else {
         return ApiError::BadRequest("invalid slot").into_response();
     };
+    // Ahead of the engine check: a slot this node cannot build is a 400 on
+    // any node, not a 503 on one with no execution client.
+    if let Err(err) = require_fulu_slot(
+        &store.config(),
+        slot,
+        "block production is served for fulu only",
+    ) {
+        return err.into_response();
+    }
     let Some(engine) = engine else {
         return ApiError::ServiceUnavailable(
             "no execution client configured to build a payload with",
@@ -251,11 +287,6 @@ async fn produce(
     let state = advance_to_slot(&head_state, slot, &config)
         .map_err(|_| ApiError::Internal("advancing the head state failed"))?;
     let fork = state.fork_name();
-    if fork != ForkName::Fulu {
-        return Err(ApiError::BadRequest(
-            "block production is served for fulu only",
-        ));
-    }
     let proposer =
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
             .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
@@ -376,4 +407,80 @@ fn decimal(value: &ethlambda_types::beacon::primitives::Uint256) -> String {
     u128::from_str_radix(hex.trim_start_matches("0x"), 16)
         .map(|value| value.to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{RecordingNetwork, beacon_store_with_config};
+    use axum::{body::Body, http::Request};
+    use ethlambda_state_transition::beacon::helpers::test_state::with_signing_validators_at;
+    use ethlambda_types::beacon::config::Config;
+    use http_body_util::BodyExt as _;
+    use std::sync::Arc;
+    use tower::ServiceExt as _;
+
+    /// A store holding a fulu head, under a schedule that puts every slot at
+    /// gloas: the head is behind the fork, as on a node running across it.
+    fn gloas_scheduled_store() -> (Store, Slot) {
+        let state = with_signing_validators_at(ForkName::Fulu, 64);
+        let head_slot = state.slot();
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, _root) = beacon_store_with_config(state, config);
+        (store, head_slot)
+    }
+
+    async fn respond(app: Router, request: Request<Body>) -> (StatusCode, serde_json::Value) {
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn producing_a_gloas_slot_is_a_400_even_with_no_execution_client() {
+        let (store, head_slot) = gloas_scheduled_store();
+        let app = routes()
+            .with_state(store)
+            .layer(Extension(None::<EngineClient>))
+            .layer(Extension(SharedAttestationPool::default()))
+            .layer(Extension(FeeRecipients::default()));
+        let uri = format!(
+            "/eth/v3/validator/blocks/{}?randao_reveal=0x{}",
+            head_slot + 1,
+            "00".repeat(96)
+        );
+        let (status, json) = respond(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "block production is served for fulu only");
+    }
+
+    #[tokio::test]
+    async fn publishing_a_fulu_body_at_a_gloas_slot_is_refused_before_advancing() {
+        let (store, head_slot) = gloas_scheduled_store();
+        let contents = FuluSignedBlockContents {
+            signed_block: SignedBeaconBlock {
+                message: BeaconBlock {
+                    slot: head_slot + 1,
+                    proposer_index: 0,
+                    parent_root: H256::ZERO,
+                    state_root: H256::ZERO,
+                    body: containers::electra::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            },
+            kzg_proofs: Default::default(),
+            blobs: Default::default(),
+        };
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let app = routes().with_state(store).layer(Extension(network));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("eth-consensus-version", "fulu")
+            .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+            .body(Body::from(contents.to_ssz()))
+            .unwrap();
+        let (status, json) = respond(app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "blocks are accepted for fulu slots only");
+    }
 }

@@ -152,7 +152,8 @@ chain actor to do with one.
 The rules above are fulu's. A message from a fork this build has no rules for,
 gloas today, is IGNOREd with the reason `unsupported_fork` and is never scored
 against the peer: the decoders answer `DecodeError::UnsupportedFork`, not `Ssz`,
-for a gloas aggregate, attester slashing or subnet attestation, since an honest
+for a gloas aggregate, attester slashing or subnet attestation, or for a block
+at a gloas slot that fails to decode, since an honest
 gloas peer sends exactly those once this node's clock reaches the fork. A gloas
 subnet attestation has the bytes of an electra one, but its `data.index` is the
 payload flag, so decoding it under electra's rules would reject honest votes.
