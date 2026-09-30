@@ -1515,6 +1515,90 @@ signed_beacon_block_accessors!(
     ],
 );
 
+/// A data column sidecar in either shape: fulu's carries a signed header and
+/// an inclusion proof, gloas's names its block by root and reads its
+/// commitments from that block's bid.
+///
+/// Two variants rather than one per fork, since the shape changes only at
+/// gloas; [`DataColumnSidecar::fork`] answers which fork's rules apply.
+// Fulu's carries a header and an inclusion proof inline, so the variants differ
+// in size; a sidecar is held and passed by value, and boxing one would only make
+// every reader dereference it.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataColumnSidecar {
+    Fulu(fulu::DataColumnSidecar),
+    Gloas(gloas::DataColumnSidecar),
+}
+
+impl DataColumnSidecar {
+    /// The column this sidecar carries.
+    pub fn index(&self) -> u64 {
+        match self {
+            Self::Fulu(sidecar) => sidecar.index,
+            Self::Gloas(sidecar) => sidecar.index,
+        }
+    }
+
+    /// The slot of the block this sidecar belongs to.
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Fulu(sidecar) => sidecar.signed_block_header.message.slot,
+            Self::Gloas(sidecar) => sidecar.slot,
+        }
+    }
+
+    /// The root of the block this sidecar belongs to: fulu's is the header's
+    /// hash tree root, gloas's is named outright.
+    pub fn block_root(&self) -> Root {
+        match self {
+            Self::Fulu(sidecar) => sidecar.signed_block_header.message.hash_tree_root(),
+            Self::Gloas(sidecar) => sidecar.beacon_block_root,
+        }
+    }
+
+    /// The fork whose rules apply to this sidecar.
+    pub fn fork(&self) -> ForkName {
+        match self {
+            Self::Fulu(_) => ForkName::Fulu,
+            Self::Gloas(_) => ForkName::Gloas,
+        }
+    }
+
+    /// Decodes a sidecar of a known fork; the bytes carry no tag, so the fork
+    /// comes from context (the gossip topic's digest, a request's fork digest).
+    ///
+    /// Forks before fulu have no data columns and lean has none at all, so
+    /// they answer with an error rather than a panic: the fork comes off the
+    /// wire.
+    pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
+        match fork {
+            ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
+            ForkName::Gloas => Ok(Self::Gloas(gloas::DataColumnSidecar::from_ssz_bytes(
+                bytes,
+            )?)),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Lean => Err(Error::UnsupportedForFork {
+                function: "DataColumnSidecar",
+                fork,
+            }),
+        }
+    }
+
+    /// Encodes the sidecar.
+    pub fn to_ssz(&self) -> Vec<u8> {
+        match self {
+            Self::Fulu(sidecar) => sidecar.to_ssz(),
+            Self::Gloas(sidecar) => sidecar.to_ssz(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2203,5 +2287,73 @@ mod tests {
 
         assert_eq!(block.blob_kzg_commitment_count(), 0);
         assert_eq!(block.execution_payload_timestamp(), None);
+    }
+
+    fn fulu_sidecar(index: u64, header: BeaconBlockHeader) -> fulu::DataColumnSidecar {
+        fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: SignedBeaconBlockHeader {
+                message: header,
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                Root::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_data_column_sidecar_round_trips_per_fork() {
+        let header = BeaconBlockHeader {
+            slot: 9,
+            ..Default::default()
+        };
+        let fulu = DataColumnSidecar::Fulu(fulu_sidecar(7, header));
+        let gloas = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 3,
+            slot: 11,
+            beacon_block_root: Root::from([5; 32]),
+            ..Default::default()
+        });
+        for sidecar in [fulu, gloas] {
+            let decoded = DataColumnSidecar::from_ssz(sidecar.fork(), &sidecar.to_ssz()).unwrap();
+            assert_eq!(decoded, sidecar);
+        }
+    }
+
+    #[test]
+    fn a_data_column_sidecar_reports_its_block_root_per_variant() {
+        let header = BeaconBlockHeader {
+            slot: 9,
+            proposer_index: 2,
+            ..Default::default()
+        };
+        let fulu = DataColumnSidecar::Fulu(fulu_sidecar(7, header.clone()));
+        assert_eq!(fulu.block_root(), header.hash_tree_root());
+        assert_eq!((fulu.index(), fulu.slot()), (7, 9));
+        assert_eq!(fulu.fork(), ForkName::Fulu);
+
+        let root = Root::from([5; 32]);
+        let gloas = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 3,
+            slot: 11,
+            beacon_block_root: root,
+            ..Default::default()
+        });
+        assert_eq!(gloas.block_root(), root);
+        assert_eq!((gloas.index(), gloas.slot()), (3, 11));
+        assert_eq!(gloas.fork(), ForkName::Gloas);
+    }
+
+    #[test]
+    fn a_data_column_sidecar_does_not_decode_before_fulu_or_as_lean() {
+        assert!(DataColumnSidecar::from_ssz(ForkName::Electra, &[]).is_err());
+        assert!(DataColumnSidecar::from_ssz(ForkName::Lean, &[]).is_err());
     }
 }
