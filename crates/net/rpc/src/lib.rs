@@ -193,8 +193,8 @@ pub struct BeaconApiHandles {
     /// read by the aggregate endpoint and block production.
     pub attestation_pool: SharedAttestationPool,
     /// The execution client block production builds payloads with. `None`
-    /// makes both block production and attestation data answer 503: with
-    /// nothing validating payloads, neither has a head it may vouch for.
+    /// makes block production, attestation data and aggregation answer 503:
+    /// with nothing validating payloads, none has a block it may vouch for.
     pub engine: Option<ethlambda_engine::EngineClient>,
 }
 
