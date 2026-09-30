@@ -20,18 +20,15 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::error::{Error, Result};
-use crate::beacon::helpers::accessors::{
-    get_current_epoch, get_previous_epoch, get_total_active_balance, get_total_balance,
-};
-use crate::beacon::helpers::altair::{
-    get_flag_index_deltas, get_inactivity_penalty_deltas, get_next_sync_committee,
-    get_unslashed_participating_indices,
-};
-use crate::beacon::helpers::finality::{get_eligible_validator_indices, is_in_inactivity_leak};
+use crate::beacon::helpers::accessors::get_current_epoch;
+use crate::beacon::helpers::altair::get_next_sync_committee;
+use crate::beacon::helpers::finality::is_in_inactivity_leak;
 use crate::beacon::helpers::math::saturating_sub;
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::participation::{
+    EpochFlags, EpochSummary, ParticipationTotals, RewardContext,
+};
 use crate::beacon::preset;
-use crate::beacon::primitives::ValidatorIndex;
+use crate::beacon::primitives::{Gwei, ValidatorIndex};
 
 use super::justification::weigh_justification_and_finalization;
 
@@ -42,9 +39,7 @@ use super::justification::weigh_justification_and_finalization;
 /// update) to the fork-shared functions in [`super`], and substitutes
 /// altair's own version of the rest.
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    process_justification_and_finalization(state)?;
-    process_inactivity_updates(state, config)?;
-    process_rewards_and_penalties(state, config)?;
+    process_participation_steps(state, config)?;
     super::registry::process_registry_updates(state, config)?;
     super::registry::process_slashings(state, config)?;
     super::process_eth1_data_reset(state)?;
@@ -74,24 +69,20 @@ pub fn process_justification_and_finalization(state: &mut BeaconState) -> Result
         return Ok(());
     }
 
-    let previous_indices = get_unslashed_participating_indices(
-        state,
-        constants::TIMELY_TARGET_FLAG_INDEX,
-        get_previous_epoch(state),
-    )?;
-    let current_indices = get_unslashed_participating_indices(
-        state,
-        constants::TIMELY_TARGET_FLAG_INDEX,
-        get_current_epoch(state),
-    )?;
-    let total_active_balance = get_total_active_balance(state)?;
-    let previous_target_balance = get_total_balance(state, &previous_indices)?;
-    let current_target_balance = get_total_balance(state, &current_indices)?;
+    let totals = ParticipationTotals::compute(state)?;
+    weigh_with_totals(state, &totals)
+}
+
+/// Feeds `totals` to [`weigh_justification_and_finalization`].
+pub(super) fn weigh_with_totals(
+    state: &mut BeaconState,
+    totals: &ParticipationTotals,
+) -> Result<()> {
     weigh_justification_and_finalization(
         state,
-        total_active_balance,
-        previous_target_balance,
-        current_target_balance,
+        totals.total_active_balance,
+        totals.previous_epoch_flags[constants::TIMELY_TARGET_FLAG_INDEX],
+        totals.current_epoch_target,
     )
 }
 
@@ -116,55 +107,74 @@ pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> R
         return Ok(());
     }
 
-    // Every read below needs `&BeaconState`, so they all run before this takes
-    // the mutable borrow `inactivity_scores` requires: `altair_validator_lists_mut`
-    // borrows the whole state, and there is no way to hold that mutably while
-    // also calling `get_eligible_validator_indices`, `get_unslashed_participating_indices`,
-    // or `is_in_inactivity_leak`, each of which needs its own `&BeaconState`.
-    // `process_effective_balance_updates` in the parent module resolves the
-    // identical conflict the same way: decide everything in one pass over
-    // immutable state, then apply it in a second pass over a mutable borrow.
-    let eligible_indices = get_eligible_validator_indices(state);
-    let previous_epoch = get_previous_epoch(state);
-    let participating_indices = get_unslashed_participating_indices(
-        state,
-        constants::TIMELY_TARGET_FLAG_INDEX,
-        previous_epoch,
-    )?;
-    let leaking = is_in_inactivity_leak(state);
+    let summary = EpochSummary::build(state, false)?;
+    update_inactivity_scores(state, config, &summary)
+}
+
+/// Step 2 over an already-built summary.
+///
+/// The leak flag is read here, so a driver must call this after step 1.
+fn update_inactivity_scores(
+    state: &mut BeaconState,
+    config: &Config,
+    summary: &EpochSummary,
+) -> Result<()> {
+    let leaking = is_in_inactivity_leak(state)?;
 
     let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
     let score_count = inactivity_scores.len();
-    for index in eligible_indices {
+    for (index, (flags, _)) in summary.iter().enumerate() {
+        if !flags.is_eligible() {
+            continue;
+        }
         let score = inactivity_scores
-            .get_mut(index as usize)
+            .get_mut(index)
             .ok_or(Error::IndexOutOfBounds {
-                index: index as usize,
+                index,
                 len: score_count,
             })?;
 
-        // `participating_indices` is ascending and duplicate-free (see
-        // `get_unslashed_participating_indices`), so membership is a binary
-        // search rather than a linear scan.
-        if participating_indices.binary_search(&index).is_ok() {
-            // `x -= min(1, x)`, written with `saturating_sub` so a
-            // already-zero score cannot underflow.
-            *score = saturating_sub(*score, 1);
-        } else {
-            // The specification treats a `uint64` overflow here as an invalid
-            // state rather than a wrapped one, so this is checked rather than
-            // left to release-mode wrapping.
-            *score = score.checked_add(config.inactivity_score_bias).ok_or(
-                Error::ArithmeticOverflow("inactivity_scores[index] + INACTIVITY_SCORE_BIAS"),
-            )?;
-        }
+        let updated = next_inactivity_score(*score, flags, leaking, config)?;
 
-        if !leaking {
-            *score = saturating_sub(*score, config.inactivity_score_recovery_rate);
+        if updated != *score {
+            *score = updated;
         }
     }
 
     Ok(())
+}
+
+/// One eligible validator's post-step-2 inactivity score.
+///
+/// Shared by the standalone step and the electra single pass, so both apply
+/// the same rule and raise the same overflow error. `leaking` must be read
+/// after justification.
+pub(super) fn next_inactivity_score(
+    score: u64,
+    flags: EpochFlags,
+    leaking: bool,
+    config: &Config,
+) -> Result<u64> {
+    let mut updated = score;
+    if flags.participated(constants::TIMELY_TARGET_FLAG_INDEX) {
+        // `x -= min(1, x)`, written with `saturating_sub` so a
+        // already-zero score cannot underflow.
+        updated = saturating_sub(updated, 1);
+    } else {
+        // The specification treats a `uint64` overflow here as an invalid
+        // state rather than a wrapped one, so this is checked rather than
+        // left to release-mode wrapping.
+        updated =
+            updated
+                .checked_add(config.inactivity_score_bias)
+                .ok_or(Error::ArithmeticOverflow(
+                    "inactivity_scores[index] + INACTIVITY_SCORE_BIAS",
+                ))?;
+    }
+    if !leaking {
+        updated = saturating_sub(updated, config.inactivity_score_recovery_rate);
+    }
+    Ok(updated)
 }
 
 /// Applies the epoch's flag-index and inactivity deltas to every validator's
@@ -189,20 +199,153 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
         return Ok(());
     }
 
-    let mut deltas = Vec::with_capacity(constants::PARTICIPATION_FLAG_WEIGHTS.len() + 1);
-    for flag_index in 0..constants::PARTICIPATION_FLAG_WEIGHTS.len() {
-        deltas.push(get_flag_index_deltas(state, flag_index)?);
-    }
-    deltas.push(get_inactivity_penalty_deltas(state, config)?);
+    let summary = EpochSummary::build(state, false)?;
+    let context = RewardContext::new(state, summary.totals())?;
+    apply_rewards_and_penalties(state, config, &summary, &context)
+}
 
-    let validator_count = state.validators().len() as ValidatorIndex;
-    for (rewards, penalties) in deltas {
-        for index in 0..validator_count {
-            increase_balance(state, index, rewards[index as usize])?;
-            decrease_balance(state, index, penalties[index as usize])?;
+/// Step 3 over an already-built summary and reward context.
+///
+/// Reads the scores step 2 wrote, so a driver must call this after it. The new
+/// balances are decided over flat slices and only the ones that changed are
+/// written back, so an ineligible validator's leaf in the balances tree stays
+/// shared with the parent state.
+fn apply_rewards_and_penalties(
+    state: &mut BeaconState,
+    config: &Config,
+    summary: &EpochSummary,
+    context: &RewardContext,
+) -> Result<()> {
+    let (_, _, inactivity_scores) = state.altair_validator_lists()?;
+    let balances = state.balances();
+
+    let mut balance_iter = balances.iter();
+    let mut changes: Vec<(usize, Gwei)> = Vec::new();
+    for (index, (flags, effective_balance)) in summary.iter().enumerate() {
+        let balance = balance_iter.next().copied();
+        if !flags.is_eligible() {
+            continue;
+        }
+        let deltas = context.deltas(
+            flags,
+            effective_balance,
+            || {
+                inactivity_scores
+                    .get(index)
+                    .copied()
+                    .ok_or(Error::IndexOutOfBounds {
+                        index,
+                        len: inactivity_scores.len(),
+                    })
+            },
+            config,
+        )?;
+        // A validator without a balance is only reported once every delta has
+        // been computed, the order the specification's two phases fail in.
+        if let Some(balance) = balance {
+            let updated = deltas.apply(balance);
+            if updated != balance {
+                changes.push((index, updated));
+            }
         }
     }
+    if balances.len() < summary.len() {
+        // The specification touches every validator's balance, so a short list
+        // fails at its first missing entry.
+        return Err(Error::UnknownValidator(balances.len() as ValidatorIndex));
+    }
+
+    let balances = state.balances_mut();
+    for (index, updated) in changes {
+        *balances
+            .get_mut(index)
+            .ok_or(Error::UnknownValidator(index as ValidatorIndex))? = updated;
+    }
     Ok(())
+}
+
+/// Steps 1-3 of every altair-through-fulu epoch, over one registry scan.
+///
+/// The three steps are separate public functions for the fixtures, each
+/// paying its own scan; the drivers call this instead so the scan, and the
+/// summary it builds, is paid once. Same order and skip rules as running them
+/// one after another: justification is skipped through the first two epochs,
+/// the other two only at genesis, and the reward context is built after
+/// justification because the leak flag reads the finalized checkpoint it may
+/// have moved.
+///
+/// In debug builds, with a registry small enough to afford it, the
+/// specification-shaped steps run on a clone and the outcomes are asserted
+/// equal (`release-fast` keeps debug assertions, so every fixture checks it).
+pub(super) fn process_participation_steps(state: &mut BeaconState, config: &Config) -> Result<()> {
+    #[cfg(debug_assertions)]
+    {
+        /// Registries above this size skip the check: the reference is the
+        /// slow path this replaces.
+        const CHECK_LIMIT: usize = 4096;
+        if state.validators().len() <= CHECK_LIMIT {
+            let mut expected = state.clone();
+            let expected_result =
+                super::altair_reference::process_participation_steps(&mut expected, config);
+            let result = run_participation_steps(state, config);
+            assert_eq!(
+                result.is_ok(),
+                expected_result.is_ok(),
+                "participation steps disagree with the reference: {result:?} vs {expected_result:?}"
+            );
+            if result.is_ok() {
+                assert_participation_outcome_matches(state, &expected);
+            }
+            return result;
+        }
+    }
+    run_participation_steps(state, config)
+}
+
+fn run_participation_steps(state: &mut BeaconState, config: &Config) -> Result<()> {
+    let current_epoch = get_current_epoch(state);
+    if current_epoch == constants::GENESIS_EPOCH {
+        return Ok(());
+    }
+
+    let justifies = current_epoch > constants::GENESIS_EPOCH + 1;
+    let summary = EpochSummary::build(state, justifies)?;
+    if justifies {
+        weigh_with_totals(state, summary.totals())?;
+    }
+    update_inactivity_scores(state, config, &summary)?;
+    let context = RewardContext::new(state, summary.totals())?;
+    apply_rewards_and_penalties(state, config, &summary, &context)
+}
+
+/// Asserts everything steps 1-3 write is identical between `state` and the
+/// reference's `expected`.
+#[cfg(debug_assertions)]
+fn assert_participation_outcome_matches(state: &BeaconState, expected: &BeaconState) {
+    assert_eq!(state.balances(), expected.balances(), "balances");
+    let (_, _, scores) = state.altair_validator_lists().expect("altair lists");
+    let (_, _, expected_scores) = expected.altair_validator_lists().expect("altair lists");
+    assert_eq!(scores, expected_scores, "inactivity scores");
+    assert_eq!(
+        state.justification_bits(),
+        expected.justification_bits(),
+        "justification bits"
+    );
+    assert_eq!(
+        state.previous_justified_checkpoint(),
+        expected.previous_justified_checkpoint(),
+        "previous justified checkpoint"
+    );
+    assert_eq!(
+        state.current_justified_checkpoint(),
+        expected.current_justified_checkpoint(),
+        "current justified checkpoint"
+    );
+    assert_eq!(
+        state.finalized_checkpoint(),
+        expected.finalized_checkpoint(),
+        "finalized checkpoint"
+    );
 }
 
 /// Rotates the current epoch's participation flags into the previous slot and
