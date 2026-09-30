@@ -90,7 +90,7 @@ use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::shared::AttestationData;
-use crate::beacon::containers::{BeaconState, electra, gloas};
+use crate::beacon::containers::{BeaconState, gloas};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::hash::hash;
 use crate::beacon::preset;
@@ -164,8 +164,9 @@ pub fn is_valid_indexed_attestation(
 /// abstracts over (see its own doc), so this is a thin wrapper over that
 /// shared walk, the same shape electra's own `get_attesting_indices` is.
 /// `committee_bits` is untouched by the EIP-7688 change ([`gloas::Attestation`]
-/// reuses [`electra::CommitteeBits`] outright, see `containers::gloas`'s own
-/// module doc), which is what lets both forks share one walk over one type.
+/// reuses [`crate::beacon::containers::electra::CommitteeBits`] outright, see
+/// `containers::gloas`'s own module doc), which is what lets both forks share
+/// one walk over one type.
 pub fn get_attesting_indices(
     state: &BeaconState,
     attestation: &gloas::Attestation,
@@ -290,34 +291,6 @@ pub fn is_valid_indexed_payload_attestation(
     );
     let signing_root = compute_signing_root(attestation.data.hash_tree_root(), domain);
     bls::fast_aggregate_verify(&pubkeys, signing_root, &attestation.signature)
-}
-
-/// Whether a pending deposit with a valid signature is already queued for
-/// `pubkey`.
-///
-/// *Note (from the specification):* this naively reverifies a deposit
-/// signature on every call; a caller iterating many pubkeys should cache the
-/// verification instead of calling this in a loop.
-pub fn is_pending_validator(
-    pending_deposits: &[electra::PendingDeposit],
-    pubkey: BlsPubkey,
-    config: &Config,
-) -> bool {
-    for pending_deposit in pending_deposits {
-        if pending_deposit.pubkey != pubkey {
-            continue;
-        }
-        if crate::beacon::stf::electra::is_valid_deposit_signature(
-            pending_deposit.pubkey,
-            pending_deposit.withdrawal_credentials,
-            pending_deposit.amount,
-            &pending_deposit.signature,
-            config,
-        ) {
-            return true;
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------

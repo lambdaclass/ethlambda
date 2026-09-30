@@ -957,13 +957,13 @@ impl<'a> PendingQueueFields<'a> {
     /// The execution-layer deposit request index at which the state switched
     /// from crediting deposits off `Eth1Data` votes to crediting them off
     /// `DepositRequest`s directly, read by
-    /// `crate::beacon::stf::epoch::electra::process_pending_deposits` to know
+    /// `crate::beacon::stf::epoch::electra::drain_pending_deposits` to know
     /// whether any eth1-bridge deposit is still outstanding.
     ///
     /// `pub(crate)`: fulu's own tests read this to assert a test state starts
     /// with it at [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`].
-    /// Fulu's and gloas's own `process_pending_deposits` never read this
-    /// field at all.
+    /// Fulu's and gloas's `process_pending_deposits` retire the gate that
+    /// uses it, so the drain reads it only for electra.
     pub(crate) fn deposit_requests_start_index(&self) -> u64 {
         match self {
             PendingQueueFields::Electra(state) => state.deposit_requests_start_index,
@@ -1008,31 +1008,26 @@ impl<'a> PendingQueueFields<'a> {
     /// back. `Vec`-level, the same shape
     /// [`Self::take_pending_consolidations`]/[`Self::set_pending_consolidations`]
     /// already use, for the same reason:
-    /// `crate::beacon::stf::epoch::electra::process_pending_deposits` needs
+    /// `crate::beacon::stf::epoch::electra::drain_pending_deposits` needs
     /// to drain the whole queue into a `Vec` it can freely mutate `state`
     /// around, not a reference still borrowing it.
-    ///
-    /// Refuses gloas: gloas modifies `process_pending_deposits` and drains
-    /// the queue through its own state, so a gloas state reaching electra's
-    /// or fulu's copy is a dispatch mistake, not a caller to serve.
-    pub(crate) fn take_pending_deposits(&mut self) -> Result<Vec<electra::PendingDeposit>> {
+    pub(crate) fn take_pending_deposits(&mut self) -> Vec<electra::PendingDeposit> {
         match self {
             PendingQueueFields::Electra(state) => {
-                Ok(core::mem::take(&mut state.pending_deposits).into_inner())
+                core::mem::take(&mut state.pending_deposits).into_inner()
             }
             PendingQueueFields::Fulu(state) => {
-                Ok(core::mem::take(&mut state.pending_deposits).into_inner())
+                core::mem::take(&mut state.pending_deposits).into_inner()
             }
-            PendingQueueFields::Gloas(_) => Err(Error::UnsupportedForFork {
-                function: "process_pending_deposits",
-                fork: ForkName::Gloas,
-            }),
+            PendingQueueFields::Gloas(state) => {
+                core::mem::take(&mut state.pending_deposits).into_inner()
+            }
         }
     }
 
-    /// See [`Self::take_pending_deposits`], including why gloas is refused.
-    /// Also fails when the queue outgrows electra's and fulu's bounded
-    /// `SszList`.
+    /// See [`Self::take_pending_deposits`]. Fallible only for electra's and
+    /// fulu's bounded `SszList`; gloas's progressive one never rejects a
+    /// length.
     pub(crate) fn set_pending_deposits(
         &mut self,
         deposits: Vec<electra::PendingDeposit>,
@@ -1044,11 +1039,8 @@ impl<'a> PendingQueueFields<'a> {
             PendingQueueFields::Fulu(state) => {
                 state.pending_deposits = electra::PendingDeposits::try_from(deposits)?;
             }
-            PendingQueueFields::Gloas(_) => {
-                return Err(Error::UnsupportedForFork {
-                    function: "process_pending_deposits",
-                    fork: ForkName::Gloas,
-                });
+            PendingQueueFields::Gloas(state) => {
+                state.pending_deposits = gloas::PendingDeposits::from(deposits);
             }
         }
         Ok(())

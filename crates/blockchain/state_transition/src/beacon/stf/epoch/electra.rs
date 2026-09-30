@@ -39,8 +39,8 @@ use crate::beacon::containers::{BeaconState, electra};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_total_active_balance};
 use crate::beacon::helpers::electra::{
-    get_activation_exit_churn_limit, get_max_effective_balance, initiate_validator_exit,
-    is_eligible_for_activation_queue, pending_queue_fields,
+    PendingQueueFields, get_activation_exit_churn_limit, get_max_effective_balance,
+    initiate_validator_exit, is_eligible_for_activation_queue, pending_queue_fields,
 };
 use crate::beacon::helpers::misc::{
     compute_activation_exit_epoch, compute_deposit_domain, compute_signing_root,
@@ -305,16 +305,33 @@ pub fn process_slashings(state: &mut BeaconState, _config: &Config) -> Result<()
 ///   described above.
 ///
 /// Electra's own version, in effect only through this fork. Fulu retires the
-/// eth1-bridge-ahead-of-requests gate outright (`beacon-chain.md`'s "Modified
-/// `process_pending_deposits`"), so [`super::fulu::process_pending_deposits`]
-/// keeps its own copy of this loop rather than sharing this one; see that
-/// function's own doc for why running this version under fulu would be
-/// wrong, not merely redundant.
+/// eth1-bridge-ahead-of-requests gate and gloas swaps the churn budget
+/// (`beacon-chain.md`'s "Modified `process_pending_deposits`" in each); both
+/// drain through `drain_pending_deposits`, which this calls with electra's
+/// combined activation and exit budget.
 pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Result<()> {
-    let next_epoch = get_current_epoch(state) + 1;
     let churn_limit = get_activation_exit_churn_limit(state, config)?;
+    drain_pending_deposits(state, config, churn_limit)
+}
+
+/// The drain loop of `process_pending_deposits`, shared by every fork that
+/// has the queue. The churn budget, `churn_limit`, is the one thing a caller
+/// chooses (electra and fulu: `get_activation_exit_churn_limit`; gloas:
+/// `get_activation_churn_limit`). The eth1-bridge gate is a fact about the
+/// state's fork, so it is derived from the state here rather than passed:
+/// electra holds every deposit request back while `eth1_deposit_index` is
+/// below `deposit_requests_start_index`, and fulu and gloas retire the gate
+/// (fulu never writes that index, so keeping it would stall the queue for
+/// good rather than merely once). The rest of the function is unmodified by
+/// fulu and gloas, so it lives here once. See [`process_pending_deposits`]'s
+/// doc for the drain itself.
+pub(crate) fn drain_pending_deposits(
+    state: &mut BeaconState,
+    config: &Config,
+    churn_limit: Gwei,
+) -> Result<()> {
+    let next_epoch = get_current_epoch(state) + 1;
     let finalized_slot = compute_start_slot_at_epoch(state.finalized_checkpoint().epoch);
-    let eth1_deposit_index = state.eth1_deposit_index();
 
     // `pending_queue_fields` borrows the whole state, so everything read
     // through it below has to finish before the loop's own, ordinary
@@ -323,21 +340,25 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
     // those: once the queue is a plain `Vec` of its own, reading
     // `state.iter_validators()` and crediting balances through `state` cannot
     // conflict with walking the deposits that drive those reads and writes.
-    let (deposit_requests_start_index, available_for_processing, deposits) = {
+    let (eth1_bridge_gate, available_for_processing, deposits) = {
         let mut fields = pending_queue_fields(state, "process_pending_deposits")?;
-        let deposit_requests_start_index = fields.deposit_requests_start_index();
+        // `Some((eth1_deposit_index, deposit_requests_start_index))` only
+        // where the gate is in force; fulu and gloas read neither field.
+        let eth1_bridge_gate = match &fields {
+            PendingQueueFields::Electra(electra_state) => Some((
+                electra_state.eth1_deposit_index,
+                fields.deposit_requests_start_index(),
+            )),
+            PendingQueueFields::Fulu(_) | PendingQueueFields::Gloas(_) => None,
+        };
         let available_for_processing = fields
             .deposit_balance_to_consume()
             .checked_add(churn_limit)
             .ok_or(Error::ArithmeticOverflow(
-                "deposit_balance_to_consume + get_activation_exit_churn_limit",
+                "deposit_balance_to_consume + churn limit",
             ))?;
-        let deposits: Vec<electra::PendingDeposit> = fields.take_pending_deposits()?;
-        (
-            deposit_requests_start_index,
-            available_for_processing,
-            deposits,
-        )
+        let deposits: Vec<electra::PendingDeposit> = fields.take_pending_deposits();
+        (eth1_bridge_gate, available_for_processing, deposits)
     };
 
     let mut processed_amount: Gwei = 0;
@@ -350,7 +371,8 @@ pub fn process_pending_deposits(state: &mut BeaconState, config: &Config) -> Res
         // before the first deposit *request* is: the two sources are ordered
         // relative to each other only by this check, since a request's own
         // slot says nothing about where it falls in the bridge's queue.
-        if deposit.slot > constants::GENESIS_SLOT
+        if let Some((eth1_deposit_index, deposit_requests_start_index)) = eth1_bridge_gate
+            && deposit.slot > constants::GENESIS_SLOT
             && eth1_deposit_index < deposit_requests_start_index
         {
             break;
@@ -707,6 +729,41 @@ mod tests {
     // -----------------------------------------------------------------------
     // process_pending_deposits
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_deposit_request_waits_behind_the_eth1_bridge_while_the_start_index_is_unset() {
+        let config = Config::mainnet();
+        let mut state = electra_state_with_validators(2);
+        // Past the deposit's own slot, so only the eth1-bridge gate, not the
+        // unrelated finality gate, is under test.
+        state.finalized_checkpoint_mut().epoch = 1;
+        let validator = state.validator(0).unwrap();
+        let deposit = electra::PendingDeposit {
+            pubkey: validator.pubkey,
+            withdrawal_credentials: validator.withdrawal_credentials,
+            amount: preset::EFFECTIVE_BALANCE_INCREMENT,
+            signature: BlsSignature::default(),
+            slot: constants::GENESIS_SLOT + 1,
+        };
+        let mut fields = pending_queue_fields(&mut state, "test setup").unwrap();
+        assert_eq!(
+            fields.deposit_requests_start_index(),
+            constants::UNSET_DEPOSIT_REQUESTS_START_INDEX
+        );
+        fields.push_pending_deposit(deposit.clone()).unwrap();
+
+        let balance_before = state.balance(0).unwrap();
+        process_pending_deposits(&mut state, &config).unwrap();
+
+        // Blocked: `eth1_deposit_index < deposit_requests_start_index`, so the
+        // whole pass breaks before reaching this request-sourced entry.
+        assert_eq!(state.balance(0).unwrap(), balance_before);
+        let BeaconState::Electra(inner) = &state else {
+            unreachable!("built as Electra");
+        };
+        assert_eq!(inner.pending_deposits.len(), 1);
+        assert_eq!(inner.pending_deposits[0], deposit);
+    }
 
     #[test]
     fn a_pending_deposit_for_an_already_withdrawn_validator_bypasses_churn() {
