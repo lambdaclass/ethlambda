@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the ten tables holds, and which data is in-memory only.
+what each of the twelve tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -105,8 +105,10 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
    │   │ LiveChain           │         │  (raw XMSS sigs      │    │
    │   │ DataColumns         │         │   awaiting           │    │
    │   │ PendingDataColumns  │         │   aggregation)       │    │
-   │   └─────────────────────┘         │ state_cache (LRU)    │    │
-   │                                   └──────────────────────┘    │
+   │   │ ExecutionPayload-   │         │ state_cache (LRU)    │    │
+   │   │   Envelopes         │         └──────────────────────┘    │
+   │   │ BlockTimeliness     │                                     │
+   │   └─────────────────────┘                                     │
    │   Survives restarts, except                                   │
    │   PendingDataColumns, which       Lost on restart.            │
    │   is cleared at startup.                                      │
@@ -115,7 +117,7 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
 
 ## The Tables
 
-The ten variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The twelve variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 | Table              | Key                        | Value                                     | Pruned?                          |
 | ------------------ | --------------------------- | ----------------------------------------- | --------------------------------- |
@@ -129,6 +131,8 @@ The ten variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | `LiveChain`        | slot ‖ root                 | `parent_root`                             | yes: below finalized             |
 | `DataColumns`      | slot ‖ root ‖ column_index  | `DataColumnSidecar` (SSZ-encoded)         | no (see [DataColumns](#datacolumns) below) |
 | `PendingDataColumns` | slot ‖ root ‖ column_index | `DataColumnSidecar` (SSZ-encoded), unverified | yes: on replay, below finalized, and wholly at startup |
+| `ExecutionPayloadEnvelopes` | slot ‖ root          | gloas `SignedExecutionPayloadEnvelope` (SSZ), verified only | no: beacon block rows are kept too |
+| `BlockTimeliness`  | root                        | one byte per timeliness deadline (0 or 1), gloas blocks only | no |
 
 ### Key encoding
 
@@ -437,6 +441,23 @@ counts. `lean_table_bytes{table="data_columns"}` (see [metrics.md](./metrics.md)
 is that growth made visible; watch it, and size the disk against however long
 the node runs unattended before a pruner exists.
 
+### ExecutionPayloadEnvelopes and BlockTimeliness
+
+Gloas only. A row in `ExecutionPayloadEnvelopes` exists for an envelope that
+passed verification, keyed by the slot of the block it fulfills (the envelope
+has no slot of its own) so a by-range handler can scan a slot window. The
+table is the durable form of the store's `verified_payloads` set. Losing that
+set on restart would silently drop every full payload branch from fork choice.
+`BlockTimeliness` is the durable form of the gloas part of `block_timeliness`.
+Pre-gloas blocks write no row, since nothing reads their timeliness after a
+restart.
+
+`Store::from_db_state` reloads both for every `LiveChain` block at or above the
+finalized block's slot, and reseeds the in-memory payload-committee vote
+vectors empty for each gloas block in that window. The votes themselves are not
+persisted: the next block's payload attestations refill them. Neither table is
+pruned; rows outside the window are simply not read.
+
 ### PendingDataColumns
 
 Same key and same encoding as `DataColumns`, holding sidecars that have **not
@@ -654,7 +675,8 @@ where a future pruner is meant to land
 
 ## In-Memory Only (Lost on Restart)
 
-Five `Store` fields never touch the backend. All are bounded buffers (or, for
+Five `Store` fields never touch the backend (the gloas parts of `beacon`
+excepted, see above). All are bounded buffers (or, for
 `beacon`, bounded in practice by the validator set and the unfinalized window)
 shared across `Store` clones:
 
@@ -664,7 +686,7 @@ shared across `Store` clones:
 | `known_payloads`    | 512 messages    | Fork-choice-active aggregated proofs                                                     |
 | `gossip_signatures` | 2048 signatures | Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case) |
 | `state_cache`       | 32 states       | LRU memoization of block *and* checkpoint post-states (either chain), each held behind an `Arc` so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error |
-| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. None of it is persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, PoW blocks stand in for an execution-client call a restarted node would simply make again, and unrealized justifications are refilled as a node re-imports the unfinalized window from its anchor |
+| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Apart from a gloas block's timeliness and verified payload (see [ExecutionPayloadEnvelopes and BlockTimeliness](#executionpayloadenvelopes-and-blocktimeliness)), none of it is persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, PoW blocks stand in for an execution-client call a restarted node would simply make again, and unrealized justifications are refilled as a node re-imports the unfinalized window from its anchor |
 
 The payload buffers evict FIFO when full, and redundant proofs (whose
 participants are a subset of an existing proof for the same attestation data)
@@ -678,7 +700,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the ten tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
+network. Everything persisted in the twelve tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
 
 ## Startup and Restore
 
