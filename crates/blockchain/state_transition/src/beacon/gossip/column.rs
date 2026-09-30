@@ -10,17 +10,20 @@
 use ethlambda_storage::CacheKey;
 
 use super::{
-    IgnoreReason, Outcome, QueueReason, RejectReason, SeenColumns, finalized_ancestry,
-    finalized_start_slot, is_future_slot,
+    IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlockColumns, SeenColumns,
+    finalized_ancestry, finalized_start_slot, is_future_slot,
 };
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants::{DATA_COLUMN_SIDECAR_SUBNET_COUNT, DOMAIN_BEACON_PROPOSER};
 use crate::beacon::containers::BeaconState;
+use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
+use crate::beacon::containers::gloas;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
+use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::precheck;
 use crate::beacon::primitives::HashTreeRoot as _;
 use crate::beacon::primitives::{Slot, ValidatorIndex};
@@ -304,6 +307,96 @@ pub fn validate(
         return outcome;
     }
     stateful_checks(store, sidecar)
+}
+
+/// Gloas's `validate_data_column_sidecar_gossip` (`specs/gloas/p2p-interface.md`,
+/// "Modified `data_column_sidecar_{subnet_id}`"), beside fulu's [`validate`].
+///
+/// One function rather than a cheap/stateful pair: a gloas sidecar carries no
+/// header, so there is no signature, proposer or parent-state rule left to
+/// put on a blocking thread. What remains is a block lookup and the KZG
+/// batch, in the spec's own order. The caller records the sidecar in `seen`
+/// once this answers [`Outcome::Accept`].
+///
+/// A block the store has not seen is [`Outcome::Queue`], the specification's
+/// "MAY be queued until block is retrieved". A block seen without a post-state
+/// is queued too where the specification rejects it, the same deviation
+/// fulu's parent rule makes until a bad-block cache exists.
+pub fn validate_gloas(
+    seen: &SeenBlockColumns,
+    store: &Store,
+    sidecar: &gloas::DataColumnSidecar,
+    subnet_id: u64,
+    now_ms: u64,
+) -> Outcome {
+    let config = store.config();
+    // [IGNORE] The first sidecar seen for this block root and column index.
+    if seen.contains(sidecar.beacon_block_root, sidecar.index) {
+        return Outcome::Ignore(IgnoreReason::AlreadySeen);
+    }
+    // [REJECT] The sidecar is for the correct subnet.
+    if sidecar.index % DATA_COLUMN_SIDECAR_SUBNET_COUNT != subnet_id {
+        return Outcome::Reject(RejectReason::WrongSubnet);
+    }
+    // [IGNORE] The sidecar is not from a future slot.
+    if is_future_slot(&config, sidecar.slot, now_ms) {
+        return Outcome::Ignore(IgnoreReason::FutureSlot);
+    }
+    // [IGNORE] Already stored, fetched over req/resp before gossip delivered
+    // it. Not a rule of the specification: it saves the KZG batch below.
+    if store.has_data_column(sidecar.slot, &sidecar.beacon_block_root, sidecar.index) {
+        return Outcome::Ignore(IgnoreReason::AlreadyStored);
+    }
+    // [IGNORE] A block for the sidecar has been seen (MAY queue).
+    let block = match store.get_signed_block(&sidecar.beacon_block_root) {
+        Ok(Some(block)) => block,
+        Ok(None) => return Outcome::Queue(QueueReason::BlockUnknown),
+        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
+    };
+    // [REJECT] The block for the sidecar passes validation. A block seen
+    // without a post-state is queued rather than rejected, see above.
+    match store.has_state(&sidecar.beacon_block_root) {
+        Ok(true) => {}
+        Ok(false) => return Outcome::Queue(QueueReason::BlockNotReady),
+        Err(_) => return Outcome::Ignore(IgnoreReason::Internal),
+    }
+    // [REJECT] The sidecar's slot matches the slot of the block.
+    if sidecar.slot != block.slot() {
+        return Outcome::Reject(RejectReason::SlotMismatch);
+    }
+    let kzg_commitments = match &block {
+        SignedBeaconBlock::Gloas(block) => {
+            &block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .blob_kzg_commitments
+        }
+        // A block of any other fork has no bid to read commitments from, so
+        // no sidecar of this shape can be valid for it.
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::Malformed),
+        SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::validate_gloas"),
+    };
+    // [REJECT] The sidecar passes structural validation.
+    if !fork_choice::gloas_verify_data_column_sidecar(sidecar, kzg_commitments) {
+        return Outcome::Reject(RejectReason::Malformed);
+    }
+    // [REJECT] The sidecar's column data passes KZG verification.
+    let kzg = {
+        let _timing = metrics::time_data_column_kzg_verify();
+        fork_choice::gloas_verify_data_column_sidecar_kzg_proofs(sidecar, kzg_commitments)
+    };
+    if !matches!(kzg, Ok(true)) {
+        return Outcome::Reject(RejectReason::Kzg);
+    }
+    Outcome::Accept
 }
 
 /// Whether `parent_state`'s proposer lookahead covers `slot` at all.
@@ -931,6 +1024,63 @@ mod tests {
         assert_eq!(
             chain_checks(&store, &from_other, now),
             ChainVerdict::Drop(Outcome::Reject(RejectReason::WrongProposer))
+        );
+    }
+
+    /// Empty column, so only the rules before the block lookup can be reached.
+    fn gloas_sidecar(slot: Slot, index: u64) -> gloas::DataColumnSidecar {
+        gloas::DataColumnSidecar {
+            index,
+            slot,
+            beacon_block_root: Root::from([7; 32]),
+            ..Default::default()
+        }
+    }
+
+    fn block_columns() -> SeenBlockColumns {
+        SeenBlockColumns::new(std::num::NonZeroUsize::new(8).expect("non-zero"))
+    }
+
+    #[test]
+    fn a_gloas_sidecar_for_another_subnet_is_rejected() {
+        let store = store(0);
+        let now = slot_start_ms(&store, 5);
+        assert_eq!(
+            validate_gloas(&block_columns(), &store, &gloas_sidecar(5, 1), 0, now),
+            Outcome::Reject(RejectReason::WrongSubnet)
+        );
+    }
+
+    #[test]
+    fn a_gloas_sidecar_from_a_future_slot_is_ignored() {
+        let store = store(0);
+        let now = slot_start_ms(&store, 5) - DISPARITY - 1;
+        assert_eq!(
+            validate_gloas(&block_columns(), &store, &gloas_sidecar(5, 0), 0, now),
+            Outcome::Ignore(IgnoreReason::FutureSlot)
+        );
+    }
+
+    #[test]
+    fn a_gloas_sidecar_for_an_unseen_block_is_queued() {
+        let store = store(0);
+        let now = slot_start_ms(&store, 5);
+        assert_eq!(
+            validate_gloas(&block_columns(), &store, &gloas_sidecar(5, 0), 0, now),
+            Outcome::Queue(QueueReason::BlockUnknown)
+        );
+    }
+
+    #[test]
+    fn a_gloas_sidecar_seen_for_its_block_root_and_index_is_ignored() {
+        let store = store(0);
+        let now = slot_start_ms(&store, 5);
+        let sidecar = gloas_sidecar(5, 0);
+        let mut seen = block_columns();
+        seen.record(sidecar.beacon_block_root, sidecar.index);
+        assert_eq!(
+            validate_gloas(&seen, &store, &sidecar, 0, now),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
         );
     }
 }

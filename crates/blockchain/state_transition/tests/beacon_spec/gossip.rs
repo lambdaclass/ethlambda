@@ -16,13 +16,15 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, Checkpoint, SignedAggregateAndProof, SignedBeaconBlock, electra, fulu, phase0,
+    BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+    electra, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, PayloadValidity, Store,
 };
 use ethlambda_state_transition::beacon::gossip::{
-    self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlocks, SeenColumns,
+    self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
+    SeenColumns,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
@@ -39,6 +41,26 @@ const HANDLERS: &[&str] = &[
     "gossip_beacon_aggregate_and_proof",
     "gossip_beacon_attestation",
 ];
+
+/// The forks each of [`HANDLERS`] validates. A case from any other fork is
+/// reported as ignored rather than run, the same "known gap, not a silent one"
+/// treatment `case.in_scope()` gives a fork past `HIGHEST_IMPLEMENTED_FORK`.
+///
+/// `case.in_scope()` alone would pass every fork up to gloas, since the state
+/// transition handles them all; the gossip rules do not. The block rules
+/// (`beacon::gossip::block`) are fulu's `validate_beacon_block_gossip`, and the
+/// aggregate and attestation rules (`beacon::gossip::{aggregate, attestation}`)
+/// are electra's, which fulu keeps. The column rules have both fulu's and
+/// gloas's (`beacon::gossip::column`).
+fn validated_forks(handler: &str) -> &'static [ForkName] {
+    match handler {
+        "gossip_data_column_sidecar" => &[ForkName::Fulu, ForkName::Gloas],
+        "gossip_beacon_block"
+        | "gossip_beacon_aggregate_and_proof"
+        | "gossip_beacon_attestation" => &[ForkName::Fulu],
+        other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
+    }
+}
 
 /// Every other `gossip_*` handler the fixture tree ships, none of which this
 /// node validates yet: the topics it neither subscribes to nor has a
@@ -83,6 +105,10 @@ const SKIPPED: &[(&str, &str)] = &[
         "a parent seen without a post-state is queued, not rejected, until a bad-block cache exists",
     ),
     (
+        "gossip_data_column_sidecar__reject_block_failed_validation",
+        "a block seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
         "gossip_beacon_aggregate_and_proof__reject_block_failed_validation",
         "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
     ),
@@ -124,11 +150,29 @@ struct FinalizedOverride {
 
 #[derive(serde::Deserialize)]
 struct GossipMessage {
-    offset_ms: u64,
+    /// Missing from gloas's column vectors, which name the message's clock
+    /// reading in `current_time_ms` instead; see [`GossipMessage::arrival_ms`].
+    offset_ms: Option<u64>,
+    current_time_ms: Option<u64>,
     subnet_id: Option<u64>,
     message: String,
     expected: String,
     reason: Option<String>,
+}
+
+impl GossipMessage {
+    /// The clock reading, in milliseconds since genesis, the message arrives
+    /// at: the format's `meta.current_time_ms + offset_ms`. Gloas's column
+    /// vectors instead carry a per-message `current_time_ms`, which is read as
+    /// the absolute reading (every such vector states a time later than the
+    /// meta's own base and inside the slot its sidecar is for).
+    fn arrival_ms(&self, base_ms: u64) -> u64 {
+        match (self.offset_ms, self.current_time_ms) {
+            (Some(offset), _) => base_ms + offset,
+            (None, Some(absolute)) => absolute,
+            (None, None) => base_ms,
+        }
+    }
 }
 
 fn parse_root(hex_root: &str) -> Root {
@@ -205,13 +249,21 @@ fn build_store(
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
 
     // The store's clock at the case's base time, so `on_block` accepts every
-    // listed block.
-    let now_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
-    fork_choice::on_tick(&mut store, now_s, config);
+    // listed block; a block from a slot past that time advances it to that
+    // slot's start, since a vector may place its base time just before the
+    // slot a clock-disparity case sends its sidecar for.
+    let mut clock_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
+    fork_choice::on_tick(&mut store, clock_s, config);
 
     for entry in rest {
         let block = decode_block(case, &entry.block)?;
         let root = block.message_hash_tree_root();
+        let block_start_s =
+            (config.genesis_time_ms() + block.slot() * config.slot_duration_ms) / 1000;
+        if block_start_s > clock_s {
+            clock_s = block_start_s;
+            fork_choice::on_tick(&mut store, clock_s, config);
+        }
         // Seen without a post-state. An `INVALIDATED` payload lands here too:
         // this store never keeps a post-state for one, since `on_block` fails
         // it and invalidates the branch.
@@ -288,11 +340,12 @@ fn run_case(case: &Case) -> Result<(), String> {
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
     let mut seen_columns = SeenColumns::new(capacity);
+    let mut seen_block_columns = SeenBlockColumns::new(capacity);
     let mut seen_aggregates = SeenAggregates::new(capacity, capacity);
     let mut seen_attestations = SeenAttestations::new(capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
-        let now_ms = config.genesis_time_ms() + meta.current_time_ms + message.offset_ms;
+        let now_ms = config.genesis_time_ms() + message.arrival_ms(meta.current_time_ms);
         let outcome = match meta.topic.as_str() {
             "beacon_block" => {
                 let block = decode_block(case, &message.message)?;
@@ -305,18 +358,40 @@ fn run_case(case: &Case) -> Result<(), String> {
             }
             "data_column_sidecar" => {
                 let sidecar =
-                    fulu::DataColumnSidecar::from_ssz_bytes(&case.ssz_bytes(&message.message))
+                    DataColumnSidecar::from_ssz(case.fork, &case.ssz_bytes(&message.message))
                         .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
                 let subnet_id = message
                     .subnet_id
                     .ok_or("a data_column_sidecar message names its subnet")?;
-                let outcome =
-                    rules::column::validate(&seen_columns, &store, &sidecar, subnet_id, now_ms);
-                if outcome == Outcome::Accept {
-                    let header = &sidecar.signed_block_header.message;
-                    seen_columns.record(header.slot, header.proposer_index, sidecar.index);
+                match sidecar {
+                    DataColumnSidecar::Fulu(sidecar) => {
+                        let outcome = rules::column::validate(
+                            &seen_columns,
+                            &store,
+                            &sidecar,
+                            subnet_id,
+                            now_ms,
+                        );
+                        if outcome == Outcome::Accept {
+                            let header = &sidecar.signed_block_header.message;
+                            seen_columns.record(header.slot, header.proposer_index, sidecar.index);
+                        }
+                        outcome
+                    }
+                    DataColumnSidecar::Gloas(sidecar) => {
+                        let outcome = rules::column::validate_gloas(
+                            &seen_block_columns,
+                            &store,
+                            &sidecar,
+                            subnet_id,
+                            now_ms,
+                        );
+                        if outcome == Outcome::Accept {
+                            seen_block_columns.record(sidecar.beacon_block_root, sidecar.index);
+                        }
+                        outcome
+                    }
                 }
-                outcome
             }
             "beacon_aggregate_and_proof" => {
                 let aggregate = decode_signed_aggregate(case, &message.message)?;
@@ -369,21 +444,10 @@ pub fn trials() -> Vec<Trial> {
             cases.len(),
         ));
         for case in cases {
-            // The block and column rules (`beacon::gossip::{block, column}`)
-            // are fulu's own `validate_beacon_block_gossip` and
-            // `validate_data_column_sidecar_gossip`. The aggregate and
-            // attestation rules (`beacon::gossip::{aggregate, attestation}`)
-            // are electra's (`p2p-interface.md`), which fulu keeps. Either
-            // way a case from any other fork is ignored rather than run, the
-            // same "known gap, not a silent one" treatment `case.in_scope()`
-            // already gives a fork
-            // past `HIGHEST_IMPLEMENTED_FORK`. `case.in_scope()` alone would
-            // pass every fork up to gloas, since the state transition handles
-            // them all; the gossip rules do not. In particular the node does
-            // not validate gloas gossip yet, so a gloas case stays ignored
-            // here even though its state transition runs.
+            // A fork the handler's rules do not cover is ignored rather than
+            // run; see [`validated_forks`].
             let ignored = !case.in_scope()
-                || case.fork != ForkName::Fulu
+                || !validated_forks(handler).contains(&case.fork)
                 || SKIPPED.iter().any(|(name, _)| *name == case.name);
             trials.push(super::case_trial("gossip", case, run_case).with_ignored_flag(ignored));
         }

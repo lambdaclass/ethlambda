@@ -73,6 +73,10 @@ pub enum QueueReason {
     ParentNotReady,
     /// Its slot is outside the parent state's proposer lookahead.
     ShufflingUnavailable,
+    /// A gloas sidecar names a block that has never been seen.
+    BlockUnknown,
+    /// A gloas sidecar names a block that is stored but has no post-state yet.
+    BlockNotReady,
 }
 
 impl QueueReason {
@@ -81,6 +85,8 @@ impl QueueReason {
             Self::ParentUnknown => "parent_unknown",
             Self::ParentNotReady => "parent_not_ready",
             Self::ShufflingUnavailable => "shuffling_unavailable",
+            Self::BlockUnknown => "block_unknown",
+            Self::BlockNotReady => "block_not_ready",
         }
     }
 }
@@ -158,6 +164,8 @@ pub enum RejectReason {
     PayloadTimestamp,
     InclusionProof,
     Kzg,
+    /// A gloas sidecar's slot is not the slot of the block it names.
+    SlotMismatch,
     /// An attestation's target epoch is not its slot's epoch.
     EpochMismatch,
     /// An aggregate with no aggregation bit set.
@@ -202,6 +210,7 @@ impl RejectReason {
             Self::PayloadTimestamp => "payload_timestamp",
             Self::InclusionProof => "inclusion_proof",
             Self::Kzg => "kzg",
+            Self::SlotMismatch => "slot_mismatch",
             Self::EpochMismatch => "epoch_mismatch",
             Self::NoParticipants => "no_participants",
             Self::NonZeroDataIndex => "non_zero_data_index",
@@ -278,6 +287,34 @@ impl SeenColumns {
             return false;
         }
         self.0.put((slot, proposer, index), ());
+        true
+    }
+}
+
+/// The first valid gloas sidecar per `(block root, column index)`: the
+/// specification's modified `Seen.data_column_sidecar_tuples`.
+///
+/// A separate type from [`SeenColumns`] since the key differs: fulu's names the
+/// proposer, which a gloas sidecar does not carry, and names the block by
+/// `(slot, proposer)` where gloas names it by root. Bounded the same way.
+pub struct SeenBlockColumns(LruCache<(Root, u64), ()>);
+
+impl SeenBlockColumns {
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        Self(LruCache::new(capacity))
+    }
+
+    pub fn contains(&self, block_root: Root, index: u64) -> bool {
+        self.0.contains(&(block_root, index))
+    }
+
+    /// Record the first valid sidecar for its key. Returns `false`, changing
+    /// nothing, when one is already recorded.
+    pub fn record(&mut self, block_root: Root, index: u64) -> bool {
+        if self.0.contains(&(block_root, index)) {
+            return false;
+        }
+        self.0.put((block_root, index), ());
         true
     }
 }
@@ -444,6 +481,16 @@ mod tests {
         assert!(seen.record(10, 3, 0));
         assert!(!seen.record(10, 3, 0));
         assert!(seen.record(10, 3, 1));
+    }
+
+    #[test]
+    fn a_block_column_key_records_once_per_root_and_index() {
+        let mut seen = SeenBlockColumns::new(capacity(4));
+        let root = Root::from([1; 32]);
+        assert!(seen.record(root, 0));
+        assert!(!seen.record(root, 0));
+        assert!(seen.record(root, 1));
+        assert!(seen.record(Root::from([2; 32]), 0));
     }
 
     #[test]
