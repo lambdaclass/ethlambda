@@ -3284,6 +3284,11 @@ impl Store {
         envelope: &gloas::SignedExecutionPayloadEnvelope,
     ) {
         let root = envelope.message.beacon_block_root;
+        debug_assert_eq!(
+            beacon_block_slot(self.backend.as_ref(), &root),
+            Some(slot),
+            "the slot must be the envelope's block's own"
+        );
         let entries = vec![(encode_slot_root_key(slot, &root), envelope.to_ssz())];
         let mut batch = self.backend.begin_write().expect("write batch");
         batch
@@ -3319,8 +3324,10 @@ impl Store {
     ///
     /// Walks `LiveChain` from the finalized block's slot up: the finalized
     /// block is included because its payload status decides which branch its
-    /// children build on. Older rows stay on disk unread, so a restart costs
-    /// the unfinalized window rather than the chain's history.
+    /// children build on. Older rows stay on disk unread, but the walk still
+    /// iterates every `LiveChain` key to find the window (the index is not
+    /// pruned on a beacon directory), so the scan grows with chain length;
+    /// only the point reads are limited to the window.
     ///
     /// Also seeds both payload-committee vote vectors, empty, for every gloas
     /// block in the window. Nothing persists the votes, and the head walk and
@@ -3359,12 +3366,27 @@ impl Store {
                     .expect("a stored timeliness has one byte per deadline");
                 timeliness.insert(root, bytes.map(|byte| byte != 0));
             }
-            let is_gloas = view
+            let fork = view
                 .get(Table::BlockHeaders, &root.to_ssz())
                 .expect("get")
                 .and_then(|bytes| bytes.first().copied())
-                .and_then(ForkName::from_selector)
-                == Some(ForkName::Gloas);
+                .and_then(ForkName::from_selector);
+            let is_gloas = match fork {
+                Some(ForkName::Gloas) => true,
+                Some(
+                    ForkName::Phase0
+                    | ForkName::Altair
+                    | ForkName::Bellatrix
+                    | ForkName::Capella
+                    | ForkName::Deneb
+                    | ForkName::Electra
+                    | ForkName::Fulu,
+                ) => false,
+                // A beacon directory never holds a lean block row.
+                Some(ForkName::Lean) => unreachable!("lean block row in a beacon directory"),
+                // A LiveChain row with no block: nothing to seed.
+                None => false,
+            };
             if is_gloas {
                 gloas_roots.push(root);
             }
