@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use ethlambda_ssz_tree::{List, ProgressiveList};
+use ethlambda_ssz_tree::{List, ProgressiveList as TreeProgressiveList};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList, SszVector};
 
@@ -102,12 +102,12 @@ pub type HistoricalSummaries = SszList<HistoricalSummary, { preset::HISTORICAL_R
 /// derived state shares the unchanged part of the registry, and re-hashing
 /// after a block only rehashes the records the block touched). Writes are
 /// buffered sparsely in a `BTreeMap`, the same as [`Validators`].
-pub type ProgressiveValidators = ProgressiveList<Validator, BTreeMap<usize, Validator>>;
+pub type ProgressiveValidators = TreeProgressiveList<Validator, BTreeMap<usize, Validator>>;
 
 /// The gloas balances, positionally parallel to [`ProgressiveValidators`].
 /// Tree-backed like [`Balances`], with writes buffered densely (the default
 /// `VecMap`), since epoch processing writes every balance.
-pub type ProgressiveBalances = ProgressiveList<Gwei>;
+pub type ProgressiveBalances = TreeProgressiveList<Gwei>;
 
 // ---------------------------------------------------------------------------
 // Misc

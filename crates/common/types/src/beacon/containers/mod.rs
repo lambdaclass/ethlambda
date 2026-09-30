@@ -1291,8 +1291,12 @@ impl SignedBeaconBlock {
     /// (`signed_execution_payload_bid`), not the payload itself. The block's
     /// own EL hash depends on whether that payload is later revealed and
     /// attested available, which this accessor, reading only the block,
-    /// cannot answer. Part B replaces this once the payload envelope and
-    /// availability tracking exist.
+    /// cannot answer. The hash a gloas block commits to is the bid's
+    /// `block_hash` (`signed_execution_payload_bid.message.block_hash`), and it
+    /// names an executed payload only once `on_execution_payload_envelope` has
+    /// verified a matching envelope, which is store state, so a caller that
+    /// needs it reads the store's payload verification for that block's root
+    /// (`is_payload_verified(store, root)`) rather than this accessor.
     pub fn execution_block_hash(&self) -> Option<ExecutionBlockHash> {
         match self {
             Self::Phase0(_) | Self::Altair(_) | Self::Gloas(_) | Self::Lean(_) => None,
