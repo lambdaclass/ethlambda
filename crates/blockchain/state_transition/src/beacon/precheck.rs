@@ -133,8 +133,8 @@ pub fn precheck_block(
 
 /// The proposer `parent_state` has already fixed for `slot`, if it has.
 ///
-/// Fulu's `proposer_lookahead` (EIP-7917) holds the proposers of the state's
-/// current epoch and of the `MIN_SEED_LOOKAHEAD` epochs after it. Each entry
+/// Fulu's (and gloas's) `proposer_lookahead` (EIP-7917) holds the proposers of
+/// the state's current epoch and of the `MIN_SEED_LOOKAHEAD` epochs after it. Each entry
 /// is fixed when it enters the window: epoch processing only shifts the
 /// window along and appends a new last epoch. A slot inside the window is
 /// therefore answered exactly as the state advanced to that slot would answer
@@ -142,24 +142,21 @@ pub fn precheck_block(
 /// state, which is the import's job; the specification lets such a block
 /// through rather than rejecting it, and so does this.
 pub(crate) fn fixed_proposer(parent_state: &BeaconState, slot: Slot) -> Option<ValidatorIndex> {
-    let state = match parent_state {
-        BeaconState::Fulu(state) => state,
-        // Gloas keeps the lookahead, but its gossip rules are not applied
-        // here yet (block and column gossip refuse it before this is asked),
-        // so no window is read from a gloas parent and the caller lets the
-        // block through as it does before fulu.
+    // Gloas keeps fulu's lookahead unchanged, so both answer the same way.
+    let (state_slot, lookahead) = match parent_state {
+        BeaconState::Fulu(state) => (state.slot, &state.proposer_lookahead),
+        BeaconState::Gloas(state) => (state.slot, &state.proposer_lookahead),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
         | BeaconState::Capella(_)
         | BeaconState::Deneb(_)
         | BeaconState::Electra(_)
-        | BeaconState::Gloas(_)
         | BeaconState::Lean(_) => return None,
     };
-    let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(state.slot));
+    let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(state_slot));
     let offset = usize::try_from(slot.checked_sub(window_start)?).ok()?;
-    state.proposer_lookahead.get(offset).copied()
+    lookahead.get(offset).copied()
 }
 
 #[cfg(test)]
@@ -259,6 +256,22 @@ mod tests {
         config: &Config,
     ) -> Result<(), PrecheckError> {
         precheck_block(block, block.message_hash_tree_root(), reference, config)
+    }
+
+    #[test]
+    fn a_gloas_parents_lookahead_fixes_the_proposer_like_a_fulu_one() {
+        let mut parent = with_validators_at(ForkName::Gloas, 8);
+        let BeaconState::Gloas(inner) = &mut parent else {
+            unreachable!("with_validators_at(Gloas) builds a gloas state");
+        };
+        for entry in inner.proposer_lookahead.iter_mut() {
+            *entry = 6;
+        }
+        let slot = parent.slot() + 1;
+        assert_eq!(fixed_proposer(&parent, slot), Some(6));
+        let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(parent.slot()));
+        let beyond = window_start + preset::PROPOSER_LOOKAHEAD_LENGTH as Slot;
+        assert_eq!(fixed_proposer(&parent, beyond), None);
     }
 
     #[test]

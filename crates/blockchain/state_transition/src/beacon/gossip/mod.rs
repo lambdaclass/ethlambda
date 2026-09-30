@@ -125,6 +125,10 @@ pub enum IgnoreReason {
     FinalizedNotAncestor,
     /// An ancestor lies outside what the state's `block_roots` can answer.
     AncestryUnknown,
+    /// A gloas block builds on its parent's full payload branch, but the
+    /// parent's envelope has not been seen and verified (the specification
+    /// lets it be queued until it is).
+    ParentPayloadUnverified,
 }
 
 impl IgnoreReason {
@@ -144,6 +148,7 @@ impl IgnoreReason {
             Self::StateUnavailable => "state_unavailable",
             Self::FinalizedNotAncestor => "finalized_not_ancestor",
             Self::AncestryUnknown => "ancestry_unknown",
+            Self::ParentPayloadUnverified => "parent_payload_unverified",
         }
     }
 }
@@ -195,6 +200,14 @@ pub enum RejectReason {
     AggregateSignature,
     /// The target is not the voted block's ancestor at the target epoch.
     TargetNotAncestor,
+    /// A gloas block body (or its parent execution requests) carries more of
+    /// an operation than its limit, or any deposit.
+    OperationLimit,
+    /// A gloas bid's `parent_block_root` is not the block's `parent_root`.
+    BidParentMismatch,
+    /// A gloas block builds on its parent's empty branch, but its bid's
+    /// `parent_block_hash` is not the parent state's `latest_block_hash`.
+    BidNotOnParentHead,
 }
 
 impl RejectReason {
@@ -228,6 +241,9 @@ impl RejectReason {
             Self::AggregatorSignature => "aggregator_signature",
             Self::AggregateSignature => "aggregate_signature",
             Self::TargetNotAncestor => "target_not_ancestor",
+            Self::OperationLimit => "operation_limit",
+            Self::BidParentMismatch => "bid_parent_mismatch",
+            Self::BidNotOnParentHead => "bid_not_on_parent_head",
         }
     }
 }
