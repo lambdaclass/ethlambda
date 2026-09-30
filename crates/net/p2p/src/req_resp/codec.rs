@@ -829,6 +829,29 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A chunk's context must also be the digest of its sidecar's own slot: a
+    /// fulu-shaped sidecar carrying a gloas slot, sent under the fulu digest,
+    /// decodes cleanly as fulu and is still refused.
+    #[tokio::test]
+    async fn a_fulu_shaped_sidecar_at_a_gloas_slot_under_the_fulu_digest_aborts_the_stream() {
+        let config = gloas_config();
+        let root = mainnet_gvr();
+        let fulu_digest = compute_fork_digest(&config, root, config.fulu_fork_epoch);
+        let payload = data_column_sidecar(gloas_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::DATA_COLUMN_SIDECARS_BY_RANGE_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &fulu_digest, payload)
+            .await
+            .expect("writes");
+        let mut buffer = Cursor::new(buffer.into_inner());
+        let result = codec_for(config)
+            .read_response(&stream_protocol, &mut buffer)
+            .await;
+
+        assert!(result.is_err());
+    }
+
     /// A digest no scheduled fork uses names no shape at all.
     #[tokio::test]
     async fn a_data_column_chunk_under_an_unscheduled_digest_aborts_the_stream() {

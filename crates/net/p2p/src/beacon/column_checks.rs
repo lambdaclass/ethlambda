@@ -9,8 +9,9 @@
 //! - a gossiped sidecar reported `Queue` or `Ignore(Overloaded)`, whose
 //!   stateful checks stopped early or never ran;
 //! - every `DataColumnsByRoot` and `DataColumnsByRange` answer;
-//! - sidecars the chain actor had parked, handed back once their parent
-//!   imported (`BlockChainToP2P::check_data_column_sidecars`).
+//! - sidecars the chain actor had parked, handed back once the block they
+//!   wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
+//!   sidecar's parent, a gloas sidecar's own block.
 //!
 //! Each sidecar is checked on a blocking thread, bounded by
 //! [`P2PServer::column_check_permits`]. Unlike a gossip verdict, nothing here
@@ -26,7 +27,7 @@ use tracing::{error, warn};
 use crate::{P2PServer, metrics};
 
 /// Run the chain checks on `sidecars`, then send the chain actor the ones that
-/// passed as one batch and the ones waiting on a parent as another.
+/// passed as one batch and the ones waiting on a block as another.
 ///
 /// Returns at once: the checks run on a task of their own, so the p2p actor
 /// goes on handling swarm events while a range batch's KZG proofs are

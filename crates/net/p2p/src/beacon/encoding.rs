@@ -278,9 +278,10 @@ where
 /// [`super::decode::decode_data_column_sidecar`] decodes by it. A digest no
 /// scheduled fork uses ends the stream like any other mismatch. The context
 /// bytes are then checked against the digest the sidecar's own slot implies,
-/// for the same reason a block chunk's are: it catches a peer whose `genesis_validators_root` or fork schedule
-/// differs from ours, which a signature failure would otherwise be the only
-/// way to notice.
+/// for the same reason a block chunk's are: it catches a peer whose
+/// `genesis_validators_root` or fork schedule differs from ours, which a
+/// signature failure would otherwise be the only way to notice. It also
+/// catches a sidecar of one fork's shape sent under another's context.
 ///
 /// A mismatch ends the stream rather than skipping the chunk, matching
 /// [`decode_blocks_response`]: a peer that disagrees about a historical digest
@@ -315,8 +316,7 @@ where
         let sidecar = decode::decode_data_column_sidecar(fork, payload)
             .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
         let slot = sidecar.slot();
-        let epoch = slot / preset::SLOTS_PER_EPOCH;
-        let expected = compute_fork_digest(config, genesis_validators_root, epoch);
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
         if context != expected {
             warn!(
                 slot,
