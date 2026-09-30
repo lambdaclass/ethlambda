@@ -319,7 +319,8 @@ impl NetworkSource {
     }
 
     /// The resolved network's `CONFIG_NAME`, for logging. A built-in
-    /// network's is its own name, which `every_built_in_network_resolves`
+    /// network's is its own name, whatever its file says (see
+    /// [`BuiltInNetwork::resolve`]), which `every_built_in_network_resolves`
     /// checks.
     pub(crate) fn name(&self) -> &str {
         self.config().config_name.as_str()
@@ -356,6 +357,7 @@ mod tests {
             ("mainnet", BuiltInNetwork::Mainnet),
             ("sepolia", BuiltInNetwork::Sepolia),
             ("hoodi", BuiltInNetwork::Hoodi),
+            ("plataberget", BuiltInNetwork::Plataberget),
         ] {
             assert!(
                 matches!(
