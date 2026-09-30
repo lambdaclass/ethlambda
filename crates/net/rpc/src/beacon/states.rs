@@ -219,14 +219,26 @@ impl ValidatorId {
     }
 }
 
-/// The body of `POST .../validators`. Both fields are optional, and an absent
-/// or empty one does not filter.
+/// The body of `POST .../validators`. Both fields are optional, and an absent,
+/// `null` or empty one does not filter.
+///
+/// `null` is spelled out in the Beacon API ("Either or both may be `null` to
+/// signal that no filtering on that attribute is desired"), and `default`
+/// alone covers only an absent field: serde reads an explicit `null` as the
+/// wrong type for a `Vec` and fails the whole body.
 #[derive(Debug, Default, Deserialize)]
 struct ValidatorsRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     ids: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_empty")]
     statuses: Vec<String>,
+}
+
+fn null_as_empty<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Serialize)]
@@ -478,6 +490,23 @@ mod tests {
             assert_eq!(data[0]["status"], "active_ongoing");
             assert_eq!(data[0]["validator"]["pubkey"], pubkey_hex(&state, 5));
             assert!(data[0]["balance"].is_string(), "integers are quoted");
+        }
+
+        /// A `null` filter is the Beacon API's "no filtering on that
+        /// attribute", not a malformed body.
+        #[tokio::test]
+        async fn a_null_filter_does_not_filter() {
+            let (_, state) = app();
+            let body = serde_json::json!({ "ids": [pubkey_hex(&state, 5)], "statuses": null });
+            let response = post(body).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            assert_eq!(json["data"].as_array().unwrap().len(), 1);
+
+            let response = post(serde_json::json!({ "ids": null, "statuses": null })).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json = body_json(response).await;
+            assert_eq!(json["data"].as_array().unwrap().len(), COUNT);
         }
 
         #[tokio::test]
