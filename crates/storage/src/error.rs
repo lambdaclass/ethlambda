@@ -4,6 +4,8 @@ use ethlambda_types::{genesis::GenesisMismatch, primitives::H256};
 pub enum Error {
     #[error("storage error: {0}")]
     Storage(#[from] crate::api::Error),
+    #[error("missing metadata key: {0}")]
+    MissingMetadata(String),
     #[error("unexpected missing block header for root {0}")]
     UnexpectedMissingBlockHeader(H256),
     #[error("unexpected missing state for root {0}")]

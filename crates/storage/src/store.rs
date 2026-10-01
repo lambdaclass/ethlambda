@@ -854,20 +854,21 @@ impl Store {
     // ============ Metadata Helpers ============
 
     fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::Metadata, key)
-            .expect("get")
-            .expect("metadata key exists");
+        let view = self.backend.begin_read()?;
+        let bytes = view.get(Table::Metadata, key)?.ok_or_else(|| {
+            let key_str = std::str::from_utf8(key)
+                .expect("keys are valid UTF-8 string")
+                .to_string();
+
+            Error::MissingMetadata(key_str)
+        })?;
         Ok(T::from_ssz_bytes(&bytes).expect("valid encoding"))
     }
 
     fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
-            .expect("put metadata");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])?;
+        batch.commit()?;
         Ok(())
     }
 
