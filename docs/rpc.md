@@ -241,6 +241,10 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
+| `GET`, `POST` | `/eth/v1/beacon/pool/proposer_slashings` | JSON | The operation pool's `ProposerSlashing`s; validate, pool and gossip one |
+| `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`); validate, pool and gossip one |
+| `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
+| `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
@@ -306,25 +310,47 @@ the chain actor writes, so no request waits on the actor.
   is packed only if its target root is the advanced state's own block root for
   that epoch and its aggregate signature verifies against that state, so an
   aggregate made on another branch cannot fail the whole block. The body also
-  votes the state's own `eth1_data`, and carries an empty sync aggregate and no
-  slashings, exits or credential changes. The state root comes from running
-  the block through `process_block`. The answer is fulu `BlockContents`, with
+  votes the state's own `eth1_data`, and carries the operation pool's
+  slashings, exits and BLS changes, packed by `pack_operations` (each kept only
+  if its `process_*` succeeds on a scratch copy of the state with everything
+  packed before it applied, up to the preset's maximums), and an empty sync
+  aggregate. The payload bundle's KZG commitments go in the body. The state
+  root comes from running the block through `process_block`. The answer is
+  fulu `BlockContents`: the block, the bundle's cell proofs and its blobs, with
   `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
-  **`503`** without a configured execution client, or when the payload carries
-  blobs.
-- **`POST beacon/blocks`** takes SSZ `SignedBlockContents`, checks the block
-  is after the head and its proposer signature, then gossips it on
-  `beacon_block` and hands it to the chain actor to import.
-
-**Blobs are not supported yet.** Publishing a blob-carrying block means
-computing and gossiping its data column sidecars, which this node does not do,
-and peers will not import a block they cannot sample. Such payloads are refused
-at production (`503`, which a validator client fails over on) and such blocks
-at publication (`400`).
+  **`503`** without a configured execution client, or when the bundle is
+  malformed (its commitments, proofs and blobs disagree in count).
+- **`POST beacon/blocks`** takes SSZ `SignedBlockContents`. The block is
+  checked against its **parent's** state advanced to its slot: an unknown
+  parent, a slot not after the parent's, the wrong proposer or a bad proposer
+  signature is a `400`. Then every blob's cells are computed and all cell
+  proofs batch-verified on a blocking thread (`400` on any failure, nothing
+  gossiped); the time that takes is `lean_beacon_publish_data_columns_seconds`.
+  Then the block is gossiped on `beacon_block`, then, if it carries blobs, all 128 data column
+  sidecars, each on `data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}`,
+  and last the chain actor gets this node's custody columns, then the block, to
+  import.
+- **The operation pool** holds, beside the attestation pool and in memory in
+  the same `Store` (`Store::operation_pool`): proposer slashings (one per
+  proposer), attester slashings (one per `hash_tree_root`), voluntary exits and
+  BLS changes (one per validator), first one wins. Entries come from the four
+  `pool/*` POST routes and from gossip P2P accepts, so each has passed the
+  topic's gossip rules; the pool never checks a signature. Entries the head
+  state has made pointless are pruned.
+- **`pool/proposer_slashings`, `pool/attester_slashings`, `pool/voluntary_exits`
+  and `pool/bls_to_execution_changes`**: `GET` lists the pool. `POST` runs the
+  specification's `validate_*_gossip` rule for the topic against the head's
+  post-state as it is (consensus-specs v1.7.0-beta.1; no `process_*` and no
+  state advance, and an attester slashing's range and slashability checks run
+  before its BLS checks), pools the operation and gossips it on the topic. A
+  rejected operation is a `400`. `bls_to_execution_changes` takes an array: on
+  partial failure the response is a `400` listing the failures by index, and
+  the valid entries are still pooled and published.
 
 `tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml` points the
 validator client at this node alone, so every block on that devnet is one this
-node built.
+node built; it also runs spamoor, whose blob traffic makes those blocks carry
+blobs.
 
 ### Encoding
 
