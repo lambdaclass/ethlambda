@@ -1019,23 +1019,31 @@ impl P2P {
     /// Start discovery, start the I/O adapter, spawn the actor, and wire the
     /// swarm event stream.
     ///
-    /// The discv5 server is started here, and its handle seeds the dial loop's
-    /// state and schedules its first tick. It is started before the swarm
-    /// adapter so a fatal discovery failure (a busy UDP port, say) surfaces
-    /// before any actor is running.
+    /// `discovery` is `Some` when discv5 runs: the server is started here, and
+    /// its handle seeds the dial loop's state and schedules its first tick. It
+    /// is started before the swarm adapter so a fatal discovery failure (a busy
+    /// UDP port, say) surfaces before any actor is running. `None` leaves the
+    /// dial loop unscheduled, so peering relies solely on the static bootnode
+    /// list `build_swarm` dialed.
     ///
-    /// Discovery is not optional. It used to be, behind `--discovery.enable`,
-    /// but neither chain has another way to reach a peer it was not handed
-    /// statically, and mainnet never had the choice at all: published bootnode
-    /// ENRs carry no `quic` entry, so none of them is statically dialable.
+    /// Always `Some` on beacon, which has no other way to find a peer:
+    /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
+    /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
+    /// and co-located devnet nodes would otherwise all claim one UDP port.
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: DiscoverySpawnConfig,
+        discovery: Option<DiscoverySpawnConfig>,
         attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
-        let discovery = spawn_discovery(discovery).await?;
+        let discovery = match discovery {
+            Some(config) => Some(spawn_discovery(config).await?),
+            None => {
+                info!("discv5 discovery disabled; peering from the static bootnode list only");
+                None
+            }
+        };
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
@@ -1066,7 +1074,7 @@ impl P2P {
             beacon_fetched_through,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
-            discovery: DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_aggregates: SeenAggregates::new(
@@ -1086,17 +1094,22 @@ impl P2P {
             attestation_pool,
             aggregator_subnets: HashMap::new(),
         };
+        let discovery_enabled = server.discovery.is_some();
         let handle = server.start();
         send_after(
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
-        send_after(
-            DIAL_INTERVAL_AT_ZERO_PEERS,
-            handle.context(),
-            p2p_protocol::DiscoverPeers,
-        );
+        // The dial loop's first tick. Nothing else schedules one, so without
+        // discovery the loop never runs.
+        if discovery_enabled {
+            send_after(
+                DIAL_INTERVAL_AT_ZERO_PEERS,
+                handle.context(),
+                p2p_protocol::DiscoverPeers,
+            );
+        }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
     }
@@ -1162,7 +1175,9 @@ pub struct P2PServer {
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
-    pub(crate) discovery: DiscoveryState,
+    /// The dial loop's state. `None` when discv5 is off, which only a lean
+    /// node started without `--discovery.enable` is.
+    pub(crate) discovery: Option<DiscoveryState>,
 
     /// The first valid block per `(slot, proposer)` accepted from gossip.
     pub(crate) seen_blocks: SeenBlocks,
@@ -1372,7 +1387,12 @@ impl P2PServer {
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        let dialed = dial_tick(self).await;
+        // `P2P::spawn` schedules the first tick only with discovery on, so this
+        // never returns. If it did, not rescheduling is what "off" means.
+        let Some(target_peers) = self.discovery.as_ref().map(DiscoveryState::target_peers) else {
+            return;
+        };
+        let dialed = dial_tick(self, target_peers).await;
         // Rescheduled on every path out of the tick, so nothing above can stop
         // the loop. The gap is a function of how full the peer table is rather
         // than a flat heartbeat: near `MAX_DIAL_RATE_PER_SECOND` while short of
@@ -1385,7 +1405,7 @@ impl P2PServer {
         // the process, re-drawing a candidate pool of peers it is already
         // connected to. One dial opened puts it straight back on the curve.
         let interval = if dialed {
-            dial_interval(dial_progress(self))
+            dial_interval(dial_progress(self, target_peers))
         } else {
             DIAL_INTERVAL_AT_TARGET
         };
@@ -2491,7 +2511,10 @@ pub(crate) mod test_support {
             beacon_fetched_through: 0,
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
-            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: Some(crate::discovery::dial::DiscoveryState::new(
+                discovery,
+                built.local_peer_id,
+            )),
             seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
                 crate::SEEN_BLOCKS_CAPACITY,
             ),

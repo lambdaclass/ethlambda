@@ -321,7 +321,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise, then yamux or mplex) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP. Both addresses go into one dial, `quic` first, and `DIAL_ADDRESS_CONCURRENCY` pins `dial_concurrency_factor` to one, so the order is a real preference and TCP is tried only after the QUIC attempt fails. Mainnet beacon peers answer `na` to a yamux-only proposal, so TCP connections negotiate mplex (see the `muxers` module doc), which is expensive: preferring QUIC is how that cost is avoided where the peer allows it
-  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `CommonOptions::validate_ports` rejects every clash before anything binds
+  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `Options::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -347,7 +347,8 @@ actual_slot = finalized_slot + 1 + relative_index
     `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
 
 ### Peer Discovery (discv5)
-- Always on, on both chains, on `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `CommonOptions::validate_ports`). There is no `--discovery.enable`: mainnet bootnode ENRs are not statically dialable so a crawl is its only way to find a peer, and a lean node with no `--bootnodes` is in the same position. Co-located nodes on one host must each pass `--discovery.port`
+- Always on for `beacon` (mainnet bootnode ENRs are not statically dialable, so a crawl is its only way to find a peer); opt-in for `node` behind the lean-only `--discovery.enable`, off by default, so a lean node peers from `--bootnodes` alone and binds no discovery socket. `Network::discovery_enabled` is the one answer; `P2P::spawn` takes `Option<DiscoverySpawnConfig>` and `P2PServer.discovery` is an `Option`, `None` leaving the dial loop unscheduled
+- Where it runs: `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `Options::validate_ports`, which skips the discovery rules when it is off). Co-located nodes that run discovery must each pass `--discovery.port`
 - Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
