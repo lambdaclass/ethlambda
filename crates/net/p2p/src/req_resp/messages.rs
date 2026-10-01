@@ -2,10 +2,13 @@ use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::containers::fulu::DataColumnsByRootIdentifier;
+use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::primitives::Root;
 use libssz_types::SszList;
 
 use crate::beacon::messages::{
-    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
+    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest,
+    ExecutionPayloadEnvelopesByRangeRequest, Goodbye, Ping,
 };
 use crate::lean::messages::{BlocksByRootRequest, Status};
 
@@ -90,6 +93,13 @@ pub enum Request {
     /// codec already enforces on encode.
     DataColumnsByRoot(Vec<DataColumnsByRootIdentifier>),
     DataColumnsByRange(DataColumnsByRangeRequest),
+    /// Gloas envelopes in a slot window. Beacon-only.
+    ExecutionPayloadEnvelopesByRange(ExecutionPayloadEnvelopesByRangeRequest),
+    /// The beacon block roots of the envelopes asked for. A plain `Vec` for the
+    /// same reason as [`Self::DataColumnsByRoot`]: the wire type
+    /// ([`crate::beacon::messages::ExecutionPayloadEnvelopeRoots`]) carries the
+    /// bound on decode and the codec re-applies it on encode.
+    ExecutionPayloadEnvelopesByRoot(Vec<Root>),
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +197,13 @@ impl std::fmt::Display for Response {
                 // `Debug` alone runs to tens of kilobytes of cell bytes.
                 write!(f, "Success(DataColumnSidecars count={})", sidecars.len())
             }
+            Self::Success {
+                payload: ResponsePayload::ExecutionPayloadEnvelopes(envelopes),
+            } => write!(
+                f,
+                "Success(ExecutionPayloadEnvelopes count={})",
+                envelopes.len()
+            ),
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
                 write!(f, "Error({code:?}: {message})")
@@ -273,6 +290,8 @@ pub enum ResponsePayload {
     /// protocols: which one produced the answer is known from the outbound
     /// request id, and the chunk framing is the same either way.
     DataColumnSidecars(Vec<DataColumnSidecar>),
+    /// The envelopes answering either gloas envelope protocol.
+    ExecutionPayloadEnvelopes(Vec<SignedExecutionPayloadEnvelope>),
 }
 
 /// Error message type for non-success responses.
