@@ -392,6 +392,18 @@ instead. Neither pool has a metric of its own yet; a permit exhausted on
 either shows up as `outcome="ignore",reason="overloaded"` on
 `lean_beacon_gossip_validation_total`, for the topics that draw from it.
 
+### Beacon Block Publication
+
+`POST /eth/v2/beacon/blocks` computes every blob's cells and batch-verifies all
+its cell proofs on a blocking thread before it gossips anything, then builds the
+block's data column sidecars; at the blob cap that is thousands of cells on the
+proposal's critical path. See [rpc.md](./rpc.md#validator-endpoints). This is
+ethlambda-specific, not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_publish_data_columns_seconds` | Histogram | Time to compute and verify a published block's cells and build its data column sidecars | On every published block that carries blobs and whose cells verify | | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5 |
+
 ### Beacon Committee Cache
 
 `ethlambda beacon` derives an epoch's attester committees with one whole-epoch

@@ -335,6 +335,10 @@ actual_slot = finalized_slot + 1 + relative_index
     gossip-verified, held one slot per `validate_on_attestation`'s `current_slot >= data.slot
     + 1`; subnet attestations are verified and relayed but never applied. See
     [`docs/beacon_wire.md`](docs/beacon_wire.md)
+  - `voluntary_exit`, `proposer_slashing`, `attester_slashing` and `bls_to_execution_change`
+    validate in p2p like aggregates (`gossip::operations`, against the unadvanced head state) and
+    feed `Store::operation_pool`; the attestation pool is in `Store` too. Both are in memory, and
+    block production packs the operation pool through `pack_operations`
 - **Req/Resp**: Status, BlocksByRoot, BlocksByRange (snappy frame compression + varint length)
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
@@ -611,6 +615,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `ethlambda-blockchain`, `ethlambda-rpc` and `ethlambda-test-fixtures` all
   depend on this crate. That is the cost of one crate holding both chains'
   rules; the module is not feature-gated.
+- The BLS wrapper lives in `ethlambda_crypto::bls` and is re-exported as
+  `beacon::bls`, so p2p's operation validation and `ethlambda-rpc` can verify
+  signatures without depending on this crate: `ethlambda-storage`'s attestation
+  pool (now owned by `Store`) aggregates signatures, and storage cannot depend
+  on `ethlambda-state-transition`.
 - The `beacon_aggregate_and_proof`/`beacon_attestation_{subnet_id}` gossip rules
   (committees, `is_aggregator`, all the signatures) live in
   `gossip::{aggregate,attestation}`, validated in `ethlambda-p2p` off the vote
