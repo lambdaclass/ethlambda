@@ -20,7 +20,7 @@ use ethlambda_state_transition::beacon::containers::{
     electra, gloas, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
-    self, DataAvailability, PayloadValidity, Store,
+    self, DataAvailability, PayloadStatusEnum, PayloadValidity, Store,
 };
 use ethlambda_state_transition::beacon::gossip::{
     self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
@@ -50,13 +50,15 @@ const HANDLERS: &[&str] = &[
 /// `case.in_scope()` alone would pass every fork up to gloas, since the state
 /// transition handles them all; the gossip rules do not. The block rules
 /// (`beacon::gossip::block`) and the column rules (`beacon::gossip::column`)
-/// have both fulu's and gloas's, and the aggregate and attestation rules
-/// (`beacon::gossip::{aggregate, attestation}`) are electra's, which fulu
-/// keeps.
+/// have both fulu's and gloas's, and so do the aggregate and attestation
+/// rules (`beacon::gossip::{aggregate, attestation}`): electra's, which fulu
+/// keeps, and gloas's payload-flag modification of them.
 fn validated_forks(handler: &str) -> &'static [ForkName] {
     match handler {
         "gossip_data_column_sidecar" | "gossip_beacon_block" => &[ForkName::Fulu, ForkName::Gloas],
-        "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => &[ForkName::Fulu],
+        "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => {
+            &[ForkName::Fulu, ForkName::Gloas]
+        }
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
 }
@@ -204,9 +206,7 @@ fn decode_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
 /// needed one yet): every fork through deneb shares phase0's shape, and
 /// electra and fulu share electra's, exactly the split
 /// [`SignedAggregateAndProof`]'s own doc describes for
-/// [`SignedBeaconBlock::Fulu`]. Gloas's own aggregate has no modeled variant,
-/// and this runner does not run its cases (see [`trials`]), so it is refused
-/// by name.
+/// [`SignedBeaconBlock::Fulu`]. Gloas has its own, progressive one.
 fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAndProof, String> {
     let bytes = case.ssz_bytes(name);
     match case.fork {
@@ -222,9 +222,11 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Gloas | ForkName::Lean => {
-            Err(format!("no aggregate shape for fork {:?}", case.fork))
-        }
+        ForkName::Gloas => Ok(SignedAggregateAndProof::Gloas(
+            gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
+                .map_err(|err| format!("decoding {name}: {err:?}"))?,
+        )),
+        ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
     }
 }
 
@@ -297,22 +299,31 @@ fn build_store(
     for entry in rest {
         let block = decode_block(case, &entry.block)?;
         let root = block.message_hash_tree_root();
+        let block_slot = block.slot();
         let block_start_s =
             (config.genesis_time_ms() + block.slot() * config.slot_duration_ms) / 1000;
         if block_start_s > clock_s {
             clock_s = block_start_s;
             fork_choice::on_tick(&mut store, clock_s, config);
         }
-        // Seen without a post-state. An `INVALIDATED` payload lands here too:
-        // this store never keeps a post-state for one, since `on_block` fails
-        // it and invalidates the branch.
-        if entry.failed || entry.pending || entry.payload_status.as_deref() == Some("INVALIDATED") {
+        // Gloas's `payload_status` is the verdict on the block's envelope, not
+        // on the block, which is imported regardless; it feeds the attestation
+        // rules' `block_payload_statuses` instead.
+        let gloas = case.fork == ForkName::Gloas;
+        // Seen without a post-state. A pre-gloas `INVALIDATED` payload lands
+        // here too: this store never keeps a post-state for one, since
+        // `on_block` fails it and invalidates the branch.
+        if entry.failed
+            || entry.pending
+            || (!gloas && entry.payload_status.as_deref() == Some("INVALIDATED"))
+        {
             store
                 .insert_pending_block(root, block)
                 .map_err(|err| format!("storing {}: {err}", entry.block))?;
             continue;
         }
         let validity = match entry.payload_status.as_deref() {
+            _ if gloas => PayloadValidity::NotRequired,
             None => PayloadValidity::NotRequired,
             Some("VALID") => PayloadValidity::Validated,
             Some("NOT_VALIDATED") => PayloadValidity::Optimistic,
@@ -328,6 +339,15 @@ fn build_store(
         )
         .map_err(|err| format!("importing {}: {err:?}", entry.block))?;
         deliver_payload(&mut store, case, entry, config)?;
+        if gloas && let Some(status) = entry.payload_status.as_deref() {
+            let status = match status {
+                "VALID" => PayloadStatusEnum::Valid,
+                "NOT_VALIDATED" => PayloadStatusEnum::Syncing,
+                "INVALIDATED" => PayloadStatusEnum::Invalid,
+                other => return Err(format!("unknown payload_status {other}")),
+            };
+            store.insert_beacon_block_payload_status(root, block_slot, status);
+        }
     }
 
     if let Some(finalized) = &meta.finalized_checkpoint {

@@ -2748,6 +2748,27 @@ pub fn is_payload_verified(store: &Store, root: Root) -> bool {
     store.has_verified_payload(&root) || is_known_pre_gloas_block(store, root)
 }
 
+/// The execution verdict gloas's attestation gossip rules read for `root`'s
+/// payload, as the specification's `block_payload_statuses`.
+///
+/// A pre-gloas block's payload ran inside the block, so its verdict is the
+/// block's own: `NOT_VALIDATED` while it sits in the optimistic set, `VALID`
+/// otherwise (an invalidated block is dropped from the store, so is never
+/// asked about). This keeps an honest gloas-slot vote for the last pre-gloas
+/// block, which this node's boundary rule treats as FULL, from being ignored as
+/// optimistic. A gloas root reads [`Store::beacon_block_payload_status`].
+pub fn block_payload_status(store: &Store, root: Root) -> PayloadStatusEnum {
+    if is_known_pre_gloas_block(store, root) {
+        if store.is_beacon_optimistic(root) {
+            PayloadStatusEnum::Syncing
+        } else {
+            PayloadStatusEnum::Valid
+        }
+    } else {
+        store.beacon_block_payload_status(root)
+    }
+}
+
 /// `payload_timeliness` (gloas `fork-choice.md`): whether `root`'s payload is
 /// considered `timely` (or not, when `timely` is `false`), taking into
 /// account both local availability and the payload timeliness committee's
@@ -4979,10 +5000,11 @@ pub fn on_block_attestation(
 /// records it against `attesting_indices`, resolved by the caller's gossip
 /// validation rather than recomputed here.
 ///
-/// The rules are [`ForkRules::PreGloas`]: an aggregate reaches this function
-/// only as a pre-gloas (phase0- or electra-shaped) one, since gloas's own
-/// aggregate is refused when the gossip payload is decoded and never gets as
-/// far as gossip validation.
+/// The rules are those of the vote's own fork, read off `data.slot`: under
+/// gloas `data.index` is the payload flag that [`update_latest_messages`]
+/// records, and the electra-shaped callers that reach here (a gloas aggregate
+/// has its own container but yields the same `AttestationData`) do not say
+/// which fork they came from.
 ///
 /// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
 /// this topic: an aggregate here is by definition not carried in a block, so
@@ -4999,8 +5021,9 @@ pub fn apply_verified_aggregate(
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
 ) -> Result<()> {
-    validate_on_attestation_indexed(store, data, ForkRules::PreGloas, false, config, index)?;
-    update_latest_messages(store, attesting_indices, data, ForkRules::PreGloas);
+    let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(data.slot)));
+    validate_on_attestation_indexed(store, data, rules, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data, rules);
     Ok(())
 }
 
@@ -7182,6 +7205,31 @@ mod tests {
             is_payload_verified(&store, a_root),
             "a pre-gloas block's payload ran inside the block itself, with \
              no separate envelope left to verify"
+        );
+    }
+
+    #[test]
+    fn a_pre_gloas_root_reads_its_own_validity_as_a_payload_status() {
+        let mut store = empty_store();
+        let root = Root::repeat_byte(0xa1);
+        store
+            .insert_signed_block(root, fulu_block(1, Root::ZERO))
+            .unwrap();
+        assert_eq!(block_payload_status(&store, root), PayloadStatusEnum::Valid);
+
+        store.insert_beacon_optimistic_root(root, 1);
+        assert_eq!(
+            block_payload_status(&store, root),
+            PayloadStatusEnum::Syncing
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_recorded_verdict_is_not_validated() {
+        let store = empty_store();
+        assert!(
+            block_payload_status(&store, Root::repeat_byte(0xee)).is_not_validated(),
+            "the specification's default for a root absent from the map"
         );
     }
 

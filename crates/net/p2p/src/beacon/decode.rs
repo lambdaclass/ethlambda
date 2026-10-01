@@ -26,7 +26,7 @@
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -46,11 +46,12 @@ use super::topics;
 pub use ethlambda_types::beacon::containers::SignedAggregateAndProof;
 
 /// Slashing evidence, in whichever shape the slot's fork gives it. Electra
-/// widened `IndexedAttestation`'s committee bound.
+/// widened `IndexedAttestation`'s committee bound; gloas made it progressive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttesterSlashing {
     Phase0(phase0::AttesterSlashing),
     Electra(electra::AttesterSlashing),
+    Gloas(gloas::AttesterSlashing),
 }
 
 /// A decoded gossip payload, one variant per subscribed topic.
@@ -230,17 +231,16 @@ pub fn decode_aggregate_and_proof(
             electra::SignedAggregateAndProof::from_ssz_bytes(bytes)
                 .map(SignedAggregateAndProof::Electra)
         }
+        // Electra's bytes, but a progressive `Attestation` (EIP-7688), so the
+        // root the aggregator signs differs; `data.index` is the payload flag.
+        ForkName::Gloas => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
+            .map(SignedAggregateAndProof::Gloas),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => phase0::SignedAggregateAndProof::from_ssz_bytes(bytes)
             .map(SignedAggregateAndProof::Phase0),
-        // Gloas's own `AggregateAndProof` has no modeled variant here yet
-        // (its attestation is progressive-list-shaped, EIP-7549 continued),
-        // so this is refused rather than mis-decoded as electra's.
-        // `UnsupportedFork`, not `Ssz`: the sender did nothing wrong.
-        ForkName::Gloas => return Err(DecodeError::UnsupportedFork),
         ForkName::Lean => {
             unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
         }
@@ -284,7 +284,9 @@ impl Attestation {
 /// subscribed digest was computed at.
 pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, DecodeError> {
     match fork {
-        ForkName::Electra | ForkName::Fulu => {
+        // Gloas's `SingleAttestation` has electra's bytes; its `data.index`
+        // carries the payload flag, which the gossip rules read.
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
         ForkName::Phase0
@@ -292,11 +294,6 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb => phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0),
-        // Gloas's `SingleAttestation` has the same bytes as electra's, but its
-        // `data.index` carries the payload-availability signal instead of
-        // being zero, so electra's gossip rules would reject an honest vote.
-        // `UnsupportedFork`, not `Ssz`: the sender did nothing wrong.
-        ForkName::Gloas => return Err(DecodeError::UnsupportedFork),
         ForkName::Lean => {
             unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
         }
@@ -326,6 +323,9 @@ pub fn decode_gossip(
                 ForkName::Electra | ForkName::Fulu => {
                     electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
                 }
+                ForkName::Gloas => {
+                    gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
+                }
                 ForkName::Phase0
                 | ForkName::Altair
                 | ForkName::Bellatrix
@@ -333,9 +333,6 @@ pub fn decode_gossip(
                 | ForkName::Deneb => {
                     phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
                 }
-                // Gloas's own `AttesterSlashing` has no modeled variant here
-                // yet; see `decode_aggregate_and_proof`'s matching arm.
-                ForkName::Gloas => return Err(DecodeError::UnsupportedFork),
                 ForkName::Lean => {
                     unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
                 }
@@ -605,14 +602,13 @@ mod tests {
     }
 
     #[test]
-    fn a_subnet_attestation_at_gloas_is_unsupported_rather_than_malformed() {
-        // Gloas reads `data.index` as the payload-availability signal, so
-        // decoding these bytes with electra's rules would reject honest
-        // votes. The bytes are valid, so the refusal must not be `Ssz`.
-        let single = single_attestation(slot_of(10)).to_ssz();
+    fn a_subnet_attestation_at_gloas_decodes_as_electras_shape() {
+        // Gloas keeps electra's bytes and reads `data.index` as the payload
+        // flag; the gossip rules, not the decoder, interpret it.
+        let single = single_attestation(slot_of(10));
         assert_eq!(
-            decode_attestation(ForkName::Gloas, &single),
-            Err(DecodeError::UnsupportedFork)
+            decode_attestation(ForkName::Gloas, &single.to_ssz()),
+            Ok(Attestation::Electra(single))
         );
     }
 
