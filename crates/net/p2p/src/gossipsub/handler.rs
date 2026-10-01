@@ -361,13 +361,6 @@ fn triage_aggregate(
     const KIND: &str = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
     let aggregate = match beacon_decode::decode_aggregate_and_proof(&wire.config, payload) {
         Ok(aggregate) => aggregate,
-        // `UnsupportedFork` is not the sender's fault (an honest gloas peer
-        // sends exactly this once this node's own clock reaches gloas), so it
-        // must not score like every other decode failure does.
-        Err(beacon_decode::DecodeError::UnsupportedFork) => {
-            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
-            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
-        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -438,12 +431,6 @@ fn triage_attestation(
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
     let attestation = match beacon_decode::decode_attestation(fork, payload) {
         Ok(attestation) => attestation,
-        // As on the aggregate topic: an honest peer on a fork this node has no
-        // attestation rules for must not be scored as a bad decoder.
-        Err(beacon_decode::DecodeError::UnsupportedFork) => {
-            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
-            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
-        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -1159,11 +1146,11 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         let flagged = electra_single_attestation(4, 1).to_ssz();
-        assert!(!matches!(
+        // Past the index rule, and turned away by the clock instead: slot 4 is
+        // long outside the epoch window of a mainnet genesis.
+        assert!(matches!(
             triage_attestation(&server, wire.fork, &flagged, 0),
-            Dispatch::Report(Outcome::Reject(
-                RejectReason::NonZeroDataIndex | RejectReason::DataIndexOutOfRange
-            ))
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::OutsideEpochWindow))
         ));
         let out_of_range = electra_single_attestation(4, 2).to_ssz();
         assert!(matches!(

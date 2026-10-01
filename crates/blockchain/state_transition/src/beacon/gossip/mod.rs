@@ -27,7 +27,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
 use crate::beacon::containers::{AttestationData, BeaconState};
 use crate::beacon::fork::ForkName;
-use crate::beacon::fork_choice::{self, Store};
+use crate::beacon::fork_choice::{self, PayloadStatusEnum, Store};
 use crate::beacon::helpers::accessors::get_block_root_at_slot;
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::lean_boundary::lean_fork_unreachable;
@@ -405,8 +405,9 @@ pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms
 
 /// Whether `slot` falls in gloas.
 ///
-/// Gloas keeps electra's aggregate and subnet-attestation containers, so the
-/// message's shape cannot say which rules apply; its slot's fork does.
+/// A gloas subnet attestation is the same `SingleAttestation` as electra's, so
+/// the message's shape cannot say which rules apply; its slot's fork does.
+/// (A gloas aggregate has its own container, which says so itself.)
 pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
         ForkName::Gloas => true,
@@ -436,6 +437,23 @@ pub(crate) fn verify_attestation_payload_status(
         // The caller has already checked the block is known.
         return Err(Outcome::Ignore(IgnoreReason::UnknownBlock));
     };
+    payload_vote_verdict(
+        block_slot,
+        data,
+        || fork_choice::is_payload_verified(store, block_root),
+        || fork_choice::block_payload_status(store, block_root),
+    )
+}
+
+/// The branches of [`verify_attestation_payload_status`], over the facts it
+/// reads. The envelope and status lookups are lazy: only a vote for the full
+/// payload needs either.
+fn payload_vote_verdict(
+    block_slot: Slot,
+    data: &AttestationData,
+    is_payload_verified: impl FnOnce() -> bool,
+    payload_status: impl FnOnce() -> PayloadStatusEnum,
+) -> Result<(), Outcome> {
     // [REJECT] For same-slot attestations, the payload cannot yet be present.
     if block_slot == data.slot && data.index != 0 {
         return Err(Outcome::Reject(RejectReason::SameSlotPayloadFlag));
@@ -444,10 +462,10 @@ pub(crate) fn verify_attestation_payload_status(
         return Ok(());
     }
     // [IGNORE] The envelope has been seen and verified.
-    if !fork_choice::is_payload_verified(store, block_root) {
+    if !is_payload_verified() {
         return Err(Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen));
     }
-    let status = store.beacon_block_payload_status(block_root);
+    let status = payload_status();
     // [IGNORE] The attested payload is optimistic.
     if status.is_not_validated() {
         return Err(Outcome::Ignore(IgnoreReason::PayloadOptimistic));
@@ -538,6 +556,71 @@ mod tests {
 
     fn capacity(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).expect("non-zero")
+    }
+
+    fn vote(slot: Slot, index: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            index,
+            ..Default::default()
+        }
+    }
+
+    fn never() -> bool {
+        unreachable!("a vote that does not claim the full payload reads no envelope")
+    }
+
+    fn no_status() -> PayloadStatusEnum {
+        unreachable!("a vote that does not claim the full payload reads no status")
+    }
+
+    #[test]
+    fn a_same_slot_vote_for_the_payload_is_rejected() {
+        assert_eq!(
+            payload_vote_verdict(5, &vote(5, 1), never, no_status),
+            Err(Outcome::Reject(RejectReason::SameSlotPayloadFlag))
+        );
+    }
+
+    #[test]
+    fn a_vote_without_the_payload_flag_reads_no_payload_state() {
+        assert_eq!(
+            payload_vote_verdict(5, &vote(5, 0), never, no_status),
+            Ok(())
+        );
+        assert_eq!(
+            payload_vote_verdict(4, &vote(5, 0), never, no_status),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_full_payload_vote_without_a_verified_envelope_is_ignored() {
+        assert_eq!(
+            payload_vote_verdict(4, &vote(5, 1), || false, no_status),
+            Err(Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen))
+        );
+    }
+
+    #[test]
+    fn a_full_payload_vote_judges_the_execution_verdict() {
+        let verdict = |status| payload_vote_verdict(4, &vote(5, 1), || true, move || status);
+        assert_eq!(verdict(PayloadStatusEnum::Valid), Ok(()));
+        for status in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            assert_eq!(
+                verdict(status),
+                Err(Outcome::Ignore(IgnoreReason::PayloadOptimistic))
+            );
+        }
+        for status in [
+            PayloadStatusEnum::Invalid,
+            PayloadStatusEnum::InvalidBlockHash,
+        ] {
+            assert_eq!(
+                verdict(status),
+                Err(Outcome::Reject(RejectReason::PayloadInvalid))
+            );
+        }
     }
 
     #[test]

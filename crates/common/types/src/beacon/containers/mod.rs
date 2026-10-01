@@ -1177,6 +1177,18 @@ impl SignedAggregateAndProof {
         }
     }
 
+    /// The length of the aggregation bitfield, read without expanding it.
+    ///
+    /// For callers that must bound the bitfield before anything iterates it:
+    /// gloas's is unbounded by its type.
+    pub fn aggregation_bits_len(&self) -> usize {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.len(),
+            Self::Electra(signed) => signed.message.aggregate.aggregation_bits.len(),
+            Self::Gloas(signed) => signed.message.aggregate.aggregation_bits.len(),
+        }
+    }
+
     /// How many attesters the aggregate covers.
     ///
     /// Counts set bits rather than reporting the bitfield's length: from

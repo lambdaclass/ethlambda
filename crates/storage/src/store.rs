@@ -3587,6 +3587,13 @@ impl Store {
     /// specification's `block_payload_statuses.get(root,
     /// PAYLOAD_STATUS_NOT_VALIDATED)`: a root with no recorded verdict reads as
     /// `Syncing`, which is `NOT_VALIDATED`.
+    ///
+    /// Gloas roots only: a pre-gloas root's verdict is its block's own, which
+    /// `fork_choice::block_payload_status` derives. Envelope import is what
+    /// records a gloas root's verdict; nothing else writes it. The map is
+    /// scratch, so after a restart the verdicts of gloas blocks imported before
+    /// it are absent and votes for their full payload are ignored until those
+    /// blocks age out of the attestation window. A known, bounded gap.
     pub fn beacon_block_payload_status(&self, root: H256) -> PayloadStatusEnum {
         self.beacon
             .lock()
@@ -7325,6 +7332,32 @@ mod tests {
         assert!(!store.is_beacon_optimistic(below));
         assert!(store.is_beacon_optimistic(at));
         assert!(store.is_beacon_optimistic(above));
+    }
+
+    #[test]
+    fn block_payload_statuses_default_to_not_validated_and_prune_below_finality() {
+        let mut store = Store::test_store();
+        let below = H256::repeat_byte(1);
+        let at = H256::repeat_byte(2);
+        assert!(
+            store.beacon_block_payload_status(below).is_not_validated(),
+            "an absent root reads as the specification's default"
+        );
+
+        store.insert_beacon_block_payload_status(below, 4, PayloadStatusEnum::Valid);
+        store.insert_beacon_block_payload_status(at, 5, PayloadStatusEnum::Invalid);
+        assert_eq!(
+            store.beacon_block_payload_status(below),
+            PayloadStatusEnum::Valid
+        );
+
+        store.prune_beacon_block_payload_statuses(5);
+
+        assert!(store.beacon_block_payload_status(below).is_not_validated());
+        assert_eq!(
+            store.beacon_block_payload_status(at),
+            PayloadStatusEnum::Invalid
+        );
     }
 
     #[test]
