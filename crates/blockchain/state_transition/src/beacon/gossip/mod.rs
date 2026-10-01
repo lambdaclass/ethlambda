@@ -10,6 +10,7 @@ pub mod aggregate;
 pub mod attestation;
 pub mod block;
 pub mod column;
+pub mod operations;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -28,7 +29,7 @@ use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_block_root_at_slot;
-use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
+use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::precheck::PrecheckError;
 use crate::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 
@@ -89,6 +90,8 @@ impl QueueReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IgnoreReason {
     FutureSlot,
+    /// An operation's epoch has not begun yet on the wall clock.
+    FutureEpoch,
     Finalized,
     AlreadySeen,
     AlreadyStored,
@@ -112,12 +115,17 @@ pub enum IgnoreReason {
     FinalizedNotAncestor,
     /// An ancestor lies outside what the state's `block_roots` can answer.
     AncestryUnknown,
+    /// The wall clock is before the fork that introduced the topic's message.
+    BeforeFork,
+    /// A voluntary exit for a validator that has already initiated its exit.
+    AlreadyExiting,
 }
 
 impl IgnoreReason {
     pub fn label(&self) -> &'static str {
         match self {
             Self::FutureSlot => "future_slot",
+            Self::FutureEpoch => "future_epoch",
             Self::Finalized => "finalized",
             Self::AlreadySeen => "already_seen",
             Self::AlreadyStored => "already_stored",
@@ -130,6 +138,8 @@ impl IgnoreReason {
             Self::StateUnavailable => "state_unavailable",
             Self::FinalizedNotAncestor => "finalized_not_ancestor",
             Self::AncestryUnknown => "ancestry_unknown",
+            Self::BeforeFork => "before_fork",
+            Self::AlreadyExiting => "already_exiting",
         }
     }
 }
@@ -176,6 +186,9 @@ pub enum RejectReason {
     AggregateSignature,
     /// The target is not the voted block's ancestor at the target epoch.
     TargetNotAncestor,
+    /// A voluntary exit, slashing or credentials change that fails its gossip
+    /// rule against the head state.
+    InvalidOperation,
 }
 
 impl RejectReason {
@@ -207,6 +220,7 @@ impl RejectReason {
             Self::AggregatorSignature => "aggregator_signature",
             Self::AggregateSignature => "aggregate_signature",
             Self::TargetNotAncestor => "target_not_ancestor",
+            Self::InvalidOperation => "invalid_operation",
         }
     }
 }
@@ -286,6 +300,16 @@ pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
 /// plus the gossip clock disparity allowance.
 pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
     slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+}
+
+/// The specification's `is_future_epoch`: the wall clock, with the gossip
+/// clock disparity allowance, has not yet reached `epoch`.
+pub(crate) fn is_future_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
+    let since_genesis_ms = now_ms
+        .saturating_sub(config.genesis_time_ms())
+        .saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY);
+    let current_slot = since_genesis_ms / config.slot_duration_ms;
+    compute_epoch_at_slot(current_slot) < epoch
 }
 
 /// The specification's `is_within_epoch`: the clock, with the gossip clock

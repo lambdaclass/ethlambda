@@ -87,7 +87,17 @@ pub struct Withdrawal {
 /// it is what makes a validator eligible for the withdrawal sweep at all: the
 /// sweep only considers credentials already in the eth1 form this operation
 /// produces.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct BLSToExecutionChange {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub validator_index: ValidatorIndex,
@@ -97,7 +107,17 @@ pub struct BLSToExecutionChange {
     pub to_execution_address: ExecutionAddress,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedBLSToExecutionChange {
     pub message: BLSToExecutionChange,
     pub signature: BlsSignature,
