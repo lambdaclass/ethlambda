@@ -3,8 +3,9 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
-        SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
-        fulu::DataColumnSidecar,
+        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        electra::SingleAttestation,
+        gloas::{PayloadAttestationMessage, SignedExecutionPayloadEnvelope},
     },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
@@ -27,7 +28,8 @@ pub trait BlockChainToP2P: Send + Sync {
     /// Ask peers for whatever of one block this node is missing.
     fn fetch_block(&self, request: FetchRequest) -> Result<(), ActorError>;
     /// Run the chain checks on sidecars the chain actor had parked, now that
-    /// their parent has a post-state.
+    /// the block they are checked against has a post-state: their parent for a
+    /// fulu sidecar, their own block for a gloas one.
     ///
     /// The chain actor keeps a sidecar without checking it, so it hands these
     /// back rather than judging them itself: the p2p layer runs every column
@@ -62,6 +64,10 @@ pub struct FetchRequest {
     /// reading its own store to find out would pay a DB read per request to
     /// re-derive what the caller already knew.
     pub needs_block: bool,
+    /// Whether the block's execution payload envelope is missing (gloas): the
+    /// block is known, and it names a payload this node has no envelope for.
+    /// Fetched by root, like the block.
+    pub needs_envelope: bool,
     /// Columns of this block that this node custodies and does not have.
     ///
     /// Empty when nothing is missing, or when the block itself is, since a
@@ -178,6 +184,21 @@ pub struct DeferredFrom {
 }
 
 impl BlockArrival {
+    /// The Unix millisecond this delivery came off the wire, given that the
+    /// actor picked it up at `picked_up` (an [`Instant`]) at `picked_up_ms`
+    /// (Unix milliseconds).
+    ///
+    /// The wire receipt predates validation and the mailbox wait, and it is
+    /// what a sub-slot deadline should be judged against. Meant for every
+    /// delivery carrying a [`BlockArrival`], blocks, envelopes and payload
+    /// attestations alike.
+    pub fn wire_ms(&self, picked_up: Instant, picked_up_ms: u64) -> u64 {
+        let received = self.decode_start.unwrap_or(self.handed_off);
+        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
+            .unwrap_or(u64::MAX);
+        picked_up_ms.saturating_sub(in_flight_ms)
+    }
+
     /// An arrival whose earliest knowable moment is now.
     ///
     /// For producers that did not decode the block themselves, so have no
@@ -237,9 +258,10 @@ pub trait P2PToBlockChain: Send + Sync {
     /// again.
     fn new_data_column_sidecars(&self, sidecars: Vec<DataColumnSidecar>) -> Result<(), ActorError>;
     /// Data column sidecars the chain checks could not judge yet, because
-    /// their parent has no post-state: the chain actor parks them and sends
-    /// them back through [`BlockChainToP2P::check_data_column_sidecars`] once
-    /// the parent imports.
+    /// the block they are judged against has no post-state (a fulu sidecar's
+    /// parent, a gloas sidecar's own block): the chain actor parks them and
+    /// sends them back through [`BlockChainToP2P::check_data_column_sidecars`]
+    /// once that block imports.
     fn data_column_sidecars_awaiting_parent(
         &self,
         sidecars: Vec<DataColumnSidecar>,
@@ -278,6 +300,27 @@ pub trait P2PToBlockChain: Send + Sync {
         aggregate: Box<SignedAggregateAndProof>,
         attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+    /// A gloas execution payload envelope that passed gossip validation (or
+    /// was fetched), for the chain actor to verify against its block's
+    /// post-state and apply to fork choice.
+    ///
+    /// Boxed for the reason [`Self::new_beacon_aggregate`] is: the envelope
+    /// carries a whole execution payload. `arrival` is the same shape a block
+    /// brings, since the actor reads the clock the envelope arrived at to
+    /// judge its payload timeliness.
+    fn new_execution_payload_envelope(
+        &self,
+        envelope: Box<SignedExecutionPayloadEnvelope>,
+        arrival: BlockArrival,
+    ) -> Result<(), ActorError>;
+    /// A gloas payload attestation message that passed gossip validation, for
+    /// the chain actor to apply to fork choice. Not queued when its block is
+    /// not imported yet: a vote is only valid within its own slot.
+    fn new_payload_attestation_message(
+        &self,
+        message: PayloadAttestationMessage,
+        arrival: BlockArrival,
     ) -> Result<(), ActorError>;
 }
 

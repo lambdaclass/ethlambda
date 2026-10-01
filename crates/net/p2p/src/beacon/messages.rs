@@ -14,7 +14,7 @@ use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::{SszBitvector, SszList};
 
 use super::constants::{ATTESTATION_SUBNET_COUNT, SYNC_COMMITTEE_SUBNET_COUNT};
-use super::protocols::MAX_REQUEST_BLOCKS_DENEB;
+use super::protocols::{MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_PAYLOADS};
 
 /// `attnets`: which attestation subnets a node serves.
 pub type AttnetsBits = SszBitvector<{ ATTESTATION_SUBNET_COUNT as usize }>;
@@ -204,6 +204,20 @@ pub struct DataColumnsByRangeRequest {
     pub start_slot: Slot,
     pub count: u64,
     pub columns: ColumnIndices,
+}
+
+/// `ExecutionPayloadEnvelopeRoots`: `ExecutionPayloadEnvelopesByRoot` v1's
+/// request body, the beacon block roots of the envelopes asked for, bare as an
+/// SSZ field.
+pub type ExecutionPayloadEnvelopeRoots = SszList<Root, { MAX_REQUEST_PAYLOADS as usize }>;
+
+/// `ExecutionPayloadEnvelopesByRange` v1's request body.
+///
+/// Fixed-size like the block range body, minus the deprecated `step`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
+pub struct ExecutionPayloadEnvelopesByRangeRequest {
+    pub start_slot: Slot,
+    pub count: u64,
 }
 
 #[cfg(test)]

@@ -12,10 +12,12 @@
 //! grepped out of the test harness's output.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use ethlambda_ssz_tree::ProgressiveList;
 use ethlambda_types::beacon::containers::{Balances, Validator, Validators};
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::BlsPubkey;
@@ -312,4 +314,84 @@ fn tree_bench() {
                     .wrapping_add(validator.effective_balance)
             })
     });
+}
+
+/// Gloas turns the validator registry into a `ProgressiveList` (EIP-7916).
+/// Same scale as [`tree_bench`], but a validators-only
+/// [`Validators`](ethlambda_types::beacon::containers::Validators) baseline
+/// is built in *this* test rather than reusing [`tree_bench`]'s
+/// `memory_one_tree_state`, which holds `Validators` **and** `Balances`
+/// together and so is not a like-for-like figure. `#[ignore]`d tests in this
+/// file share one process-wide byte counter (see the module doc), so this
+/// file must run with `--test-threads=1` for either figure to be trustworthy.
+type ProgressiveValidators = ProgressiveList<Validator, BTreeMap<usize, Validator>>;
+
+/// 1000 scattered registry indices, spread across the whole registry the way
+/// [`block_validator_indices`] spreads its handful. At this sample size the
+/// writes mostly land in the handful of large subtrees near the end of the
+/// chain: a mainnet-sized registry's first six subtrees together hold only
+/// 1365 of its elements (EIP-7916 boundaries at 0, 1, 5, 21, 85, 341, 1365,
+/// ...), under one expected hit out of 1000 uniform-ish samples, so the small
+/// subtrees near the start are rarely touched by this write set.
+fn scattered_indices() -> impl Iterator<Item = usize> {
+    (0..1000).map(|i| (i * 2_654_435_761) % VALIDATOR_COUNT)
+}
+
+#[test]
+#[ignore = "mainnet-scale benchmark: several GB and seconds to run"]
+fn progressive_list_bench() {
+    let validators: Vec<Validator> = (0..VALIDATOR_COUNT).map(validator).collect();
+
+    // The `List` baseline this compares against, same elements, same
+    // process, measured before the progressive list exists so the two
+    // memory deltas do not overlap.
+    let before = live_mib();
+    let list_validators: Validators = time("list_build", || validators.clone().try_into().unwrap());
+    println!(
+        "tree_bench memory_one_list_validators_state {:.0} MiB",
+        live_mib() - before
+    );
+    time("list_cold_hash", || root(&list_validators));
+    drop(list_validators);
+
+    let before = live_mib();
+    let progressive: ProgressiveValidators =
+        time("progressive_build", || validators.clone().into());
+    println!(
+        "tree_bench memory_one_progressive_state {:.0} MiB",
+        live_mib() - before
+    );
+
+    // First root: nothing cached yet.
+    let first_root = time("progressive_cold_hash", || root(&progressive));
+
+    // 1000 scattered writes, applied, then rehashed.
+    let mut written = progressive.clone();
+    let written_root = time("progressive_scattered_writes_apply_rehash", || {
+        for index in scattered_indices() {
+            written[index].exit_epoch = 1;
+        }
+        written.apply_updates();
+        root(&written)
+    });
+    assert_ne!(
+        first_root, written_root,
+        "the scattered writes must change the root"
+    );
+    drop(validators);
+
+    // An independent copy of the source data, built from scratch (sharing no
+    // `Arc` with `written`), then rebased onto it to reclaim every subtree
+    // the scattered writes did not touch. `rebase_on` only shares
+    // allocations; it does not adopt `written`'s content, so `independent`
+    // must still hash like the untouched registry.
+    let source: Vec<Validator> = (0..VALIDATOR_COUNT).map(validator).collect();
+    let mut independent: ProgressiveValidators =
+        time("progressive_independent_build", || source.into());
+    time("progressive_rebase", || independent.rebase_on(&written));
+    assert_eq!(
+        root(&independent),
+        first_root,
+        "a rebase must not change the contents"
+    );
 }

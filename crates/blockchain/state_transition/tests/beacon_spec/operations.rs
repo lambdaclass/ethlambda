@@ -25,9 +25,11 @@
 //! given fork keeps calling whichever earlier fork's function last introduced
 //! or changed it.
 //!
-//! - `proposer_slashing` needs no routing at all: no fork's specification ever
-//!   lists a modified `process_proposer_slashing`, so phase0's function serves
-//!   every fork this crate implements.
+//! - `proposer_slashing` needs no routing through fulu: no fork's specification
+//!   before gloas ever lists a modified `process_proposer_slashing`, so
+//!   phase0's function serves every earlier fork. Gloas's own specification
+//!   does modify it (EIP-7732: clearing the `BuilderPendingPayment` tied to a
+//!   slashed proposal), so it gets its own routed arm and its own function.
 //! - `attester_slashing` and `deposit` need no *function* routing through
 //!   deneb (neither fork's specification lists either as modified before
 //!   electra), but `attester_slashing`'s container does change shape at
@@ -35,7 +37,9 @@
 //!   `process_attester_slashing` (transcribed against the new container, not
 //!   behaviorally different) and `process_deposit` (behaviorally different:
 //!   a deposit is queued rather than credited) as its own functions from
-//!   there on.
+//!   there on. `attester_slashing`'s container changes shape again at gloas
+//!   (EIP-7688's unbounded `AttestingIndices`), so gloas gets its own
+//!   transcription too, not behaviorally different either.
 //! - `attestation` needs both. The container
 //!   ([`phase0::Attestation`]) is the one phase0, altair, bellatrix, capella,
 //!   and deneb all share, and [`electra::Attestation`] (EIP-7549's committee
@@ -50,21 +54,33 @@
 //!   on a later case would not even fail loudly in every instance, since it
 //!   would return [`ethlambda_state_transition::beacon::Error::UnsupportedForFork`] only where
 //!   the two forks' state shapes actually differ, which is still a rejection,
-//!   just not the one the fixture is testing for.
+//!   just not the one the fixture is testing for. Gloas reshapes the
+//!   container a third time (EIP-7688) and modifies the function again
+//!   (EIP-7732's `parent_slot` argument, read from the case's own `meta.yaml`
+//!   since it is not part of the operation file itself, and the
+//!   builder-payment weight accounting), so it gets its own arm and its own
+//!   function too, called [`gloas_stf::process_attestation`] rather than
+//!   [`electra_stf::process_attestation`].
 //! - `voluntary_exit` changes twice after phase0: deneb pins the signature to
 //!   a fixed fork version for EIP-7044, and electra adds a
 //!   pending-partial-withdrawal check and swaps in electra's own
-//!   exit-queue accounting for EIP-7251.
+//!   exit-queue accounting for EIP-7251. Neither fulu's nor gloas's own
+//!   specification lists a further change, so electra's function serves both;
+//!   `voluntary_exit_churn` is a second fixture handler gloas ships with the
+//!   same operation file and the same processing call, exercising exit-queue
+//!   churn scenarios specifically, so it routes identically.
 //! - `block_header`'s file is a whole `BeaconBlock`, and that type is
 //!   different per fork (altair's carries a `sync_aggregate` its body root
-//!   folds in, bellatrix's an execution payload on top of that, and so on).
+//!   folds in, bellatrix's an execution payload on top of that, and so on;
+//!   gloas's drops the payload entirely in favor of a builder's bid).
 //!   [`block::process_block_header`] itself takes only the four
 //!   fork-invariant fields a header needs, not a block, precisely so this
 //!   runner (and every per-fork `process_block_*` driver) can decode with the
 //!   fork's own concrete type and still call one shared function.
 //! - `sync_aggregate` is new in altair, with no phase0 case, and no later
-//!   fork's specification ever lists a modified version of it, so it needs
-//!   no fork match beyond that.
+//!   fork's specification, gloas included, ever lists a modified version of
+//!   it, so it needs no fork match at all: `sync_aggregate` is byte-for-byte
+//!   the same field on every state and body from altair on.
 //! - `execution_payload` is new in bellatrix and its specification lists a
 //!   modified version at every fork from capella on: capella and later drop
 //!   the still-mid-merge-transition check, deneb folds in the blob
@@ -73,32 +89,57 @@
 //!   Five forks, five distinct functions, none reusable for another fork's
 //!   case.
 //! - `bls_to_execution_change` and `withdrawals` are both new in capella.
-//!   `bls_to_execution_change` is never listed as modified again: its
-//!   function reads and writes only fork-invariant fields, so capella's own
-//!   serves every later fork too. `withdrawals` is listed as modified once
-//!   more, at electra (EIP-7251's partial-withdrawal queue); deneb's own
-//!   specification lists no change to it at all, so deneb's copy exists only
-//!   to hold a differently-typed `payload` parameter, not different logic.
+//!   `bls_to_execution_change` is never listed as modified again, gloas
+//!   included: its function reads and writes only fork-invariant fields
+//!   (the validator registry, genesis validators root), so capella's own
+//!   serves every later fork too, with no fork match needed. `withdrawals` is
+//!   listed as modified once more, at electra (EIP-7251's partial-withdrawal
+//!   queue); deneb's own specification lists no change to it at all, so
+//!   deneb's copy exists only to hold a differently-typed `payload` parameter,
+//!   not different logic.
 //! - `consolidation_request`, `deposit_request`, and `withdrawal_request` are
 //!   all new in electra, alongside `withdrawals`, `process_attestation`,
-//!   `process_deposit`, and `process_voluntary_exit`; fulu's specification
-//!   lists none of the seven as modified again, so electra's functions serve
-//!   fulu's cases too.
-use std::sync::Arc;
-
+//!   `process_deposit`, and `process_voluntary_exit`. Fulu's specification
+//!   lists `consolidation_request`, `withdrawal_request`, `withdrawals`,
+//!   `process_attestation`, and `process_voluntary_exit` as unmodified, so
+//!   electra's functions serve fulu's cases for those five too, and it lists
+//!   `process_deposit` as removed outright rather than modified (beta.2 ships
+//!   no fulu `operations/deposit` fixtures, so that arm is untested either
+//!   way). `deposit_request` is the one exception with a genuine fulu-only
+//!   function: it drops the statement that sets
+//!   `deposit_requests_start_index`, since fulu retires the eth1-bridge
+//!   deposit mechanism outright (`fulu_stf::process_deposit_request`'s own
+//!   doc).
+//! - `execution_payload_bid` and `parent_execution_payload` are new in gloas,
+//!   the block's binding commitment to a builder's payload and the next
+//!   block's processing of the previous one (EIP-7732); neither exists on any
+//!   earlier fork. `withdrawals` is modified again at gloas, and this time the
+//!   fixture's own operation file changes too: gloas's own
+//!   `process_withdrawals(state)` takes no payload at all (withdrawals are now
+//!   deterministic from the state alone), so unlike every earlier fork's arm
+//!   this one reads no `<input-name>` file and calls `gloas_stf::process_withdrawals`
+//!   with only the state.
+//! - `payload_attestation` is new in gloas too, the payload timeliness
+//!   committee's vote on whether the *previous* slot's payload showed up on
+//!   time; no earlier fork has anything to route away from. `execution_payload`
+//!   must not appear for gloas at all: a block no longer carries an embedded
+//!   payload for this handler's own `process_execution_payload` family to
+//!   check, so its Gloas arm returns an error naming the handler rather than
+//!   silently falling through to `unhandled operation`.
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, altair, bellatrix, capella, deneb, electra, phase0, shared,
+    BeaconState, altair, bellatrix, capella, deneb, electra, gloas, phase0, shared,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
-use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
+use ethlambda_state_transition::beacon::primitives::{HashTreeRoot as _, Slot};
 use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
 use ethlambda_state_transition::beacon::stf::capella as capella_stf;
 use ethlambda_state_transition::beacon::stf::deneb as deneb_stf;
 use ethlambda_state_transition::beacon::stf::electra as electra_stf;
 use ethlambda_state_transition::beacon::stf::fulu as fulu_stf;
+use ethlambda_state_transition::beacon::stf::gloas as gloas_stf;
 use ethlambda_state_transition::beacon::stf::{ExecutionEngine, block, operations};
 use libtest_mimic::{Failed, Trial};
 
@@ -111,6 +152,15 @@ use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
 #[derive(serde::Deserialize)]
 struct ExecutionYaml {
     execution_valid: bool,
+}
+
+/// The `{parent_slot: int}` a gloas `attestation` case's own `meta.yaml`
+/// carries: the parent block's slot, an extra input
+/// [`gloas_stf::process_attestation`] needs that no earlier fork's version
+/// does (EIP-7732's payload-availability bit).
+#[derive(serde::Deserialize)]
+struct AttestationMeta {
+    parent_slot: Slot,
 }
 
 /// Applies one operation to the case's pre-state.
@@ -199,6 +249,20 @@ fn apply(
                     block.body.hash_tree_root(),
                 )
             }
+            // Gloas drops the embedded execution payload (EIP-7732) but keeps
+            // `process_block_header` unmodified: a `BeaconBlockHeader` never
+            // carried a payload to begin with, so the four fields this shared
+            // function reads are unaffected.
+            ForkName::Gloas => {
+                let block: gloas::BeaconBlock = case.ssz("block");
+                block::process_block_header(
+                    state,
+                    block.slot,
+                    block.proposer_index,
+                    block.parent_root,
+                    block.body.hash_tree_root(),
+                )
+            }
             // No `other` arm: the patterns above already cover every `ForkName`
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
@@ -231,6 +295,17 @@ fn apply(
                 let attestation: electra::Attestation = case.ssz("attestation");
                 electra_stf::process_attestation(state, &attestation, &committees)
             }
+            // Gloas reshapes the container a third time (EIP-7688's unbounded
+            // `AttestingIndices`) and modifies the function again (the new
+            // `parent_slot` argument and the builder-payment weight
+            // accounting, EIP-7732), so this reads the case's own `meta.yaml`
+            // for `parent_slot` rather than only the operation file every
+            // other fork's arm reads.
+            ForkName::Gloas => {
+                let attestation: gloas::Attestation = case.ssz("attestation");
+                let meta: AttestationMeta = case.yaml("meta");
+                gloas_stf::process_attestation(state, &attestation, meta.parent_slot, &committees)
+            }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
         },
         "attester_slashing" => match case.fork {
@@ -251,14 +326,34 @@ fn apply(
                 let slashing: electra::AttesterSlashing = case.ssz("attester_slashing");
                 electra_stf::process_attester_slashing(state, &slashing, config)
             }
+            // Gloas's container widens again (EIP-7688's unbounded
+            // `AttestingIndices`); the function is still not behaviorally
+            // modified, only transcribed against gloas's own type.
+            ForkName::Gloas => {
+                let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
+                gloas_stf::process_attester_slashing(state, &slashing, config)
+            }
             ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
         },
-        // `ProposerSlashing` never changes shape, and no fork's specification
-        // ever lists a modified `process_proposer_slashing`, so this needs no
-        // per-fork routing at all.
+        // `ProposerSlashing` never changes shape, container included, gloas's
+        // own not excepted. What changes at gloas is the function: it clears
+        // the `BuilderPendingPayment` tied to a slashed proposal (EIP-7732),
+        // which every earlier fork's `process_proposer_slashing` has no
+        // notion of, so this alone needs the routing every other fork's
+        // `proposer_slashing` handler above already has.
         "proposer_slashing" => {
             let slashing: shared::ProposerSlashing = case.ssz("proposer_slashing");
-            operations::process_proposer_slashing(state, &slashing, config)
+            match case.fork {
+                ForkName::Phase0
+                | ForkName::Altair
+                | ForkName::Bellatrix
+                | ForkName::Capella
+                | ForkName::Deneb
+                | ForkName::Electra
+                | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
+                ForkName::Gloas => gloas_stf::process_proposer_slashing(state, &slashing, config),
+                ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
+            }
         }
         "deposit" => match case.fork {
             // The `Deposit` container never changes shape; through deneb a
@@ -273,15 +368,33 @@ fn apply(
             }
             // Electra queues a deposit's amount instead of crediting it
             // directly (EIP-7251), so the epoch boundary can rate-limit
-            // activation by balance rather than by validator count; fulu's
-            // specification makes no further change.
+            // activation by balance rather than by validator count. Fulu's
+            // specification removes `process_deposit` outright rather than
+            // modifying it (`beacon-chain.md`'s "Modified `process_operations`":
+            // `assert len(body.deposits) == 0`, no call at all), so this
+            // fulu arm is dead in practice: beta.2 ships no fulu
+            // `operations/deposit` fixtures. Kept rather than dropped so a
+            // future fixture release that does ship one fails loudly through
+            // whatever electra's function rejects it for, not silently
+            // through `unhandled operation`.
             ForkName::Electra | ForkName::Fulu => {
                 let deposit: shared::Deposit = case.ssz("deposit");
                 electra_stf::process_deposit(state, &deposit, config)
             }
+            ForkName::Gloas => Err(
+                ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                    function: "deposit",
+                    fork: ForkName::Gloas,
+                },
+            ),
             ForkName::Lean => lean_is_not_a_fixture_fork("deposit"),
         },
-        "voluntary_exit" => match case.fork {
+        // `voluntary_exit_churn` is a second gloas-only fixture handler
+        // exercising exit-queue churn scenarios specifically; its own
+        // operation file is still named `voluntary_exit.ssz_snappy`, and it
+        // routes through the identical processing call, so it shares this
+        // whole arm rather than getting one of its own.
+        "voluntary_exit" | "voluntary_exit_churn" => match case.fork {
             // Unchanged through capella.
             ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
@@ -295,9 +408,12 @@ fn apply(
                 deneb_stf::process_voluntary_exit(state, &exit, config)
             }
             // Electra adds a pending-partial-withdrawal check and its own
-            // balance-churn exit-queue accounting (EIP-7251); fulu's
-            // specification changes neither.
-            ForkName::Electra | ForkName::Fulu => {
+            // balance-churn exit-queue accounting (EIP-7251); neither fulu's
+            // nor gloas's specification changes it further (gloas's own churn
+            // limits are read by `crate::beacon::helpers::electra::compute_exit_epoch_and_update_churn`
+            // dispatching on the state's own fork, not by a gloas copy of
+            // `process_voluntary_exit`; see that function's own doc).
+            ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
@@ -371,11 +487,18 @@ fn apply(
                     let body: electra::BeaconBlockBody = case.ssz("body");
                     fulu_stf::process_execution_payload(state, &body, config, &engine)
                 }
-                other => {
+                fork @ (ForkName::Phase0 | ForkName::Altair) => {
                     return Err(format!(
-                        "execution_payload has no handler for fork `{other}`"
+                        "execution_payload has no handler for fork `{fork}`"
                     ));
                 }
+                ForkName::Gloas => Err(
+                    ethlambda_state_transition::beacon::Error::UnsupportedForFork {
+                        function: "execution_payload",
+                        fork: ForkName::Gloas,
+                    },
+                ),
+                ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
             }
         }
         // New in capella, named `address_change` in the fixture tree even
@@ -412,22 +535,92 @@ fn apply(
                 let payload: deneb::ExecutionPayload = case.ssz("execution_payload");
                 electra_stf::process_withdrawals(state, &payload)
             }
-            other => return Err(format!("withdrawals has no handler for fork `{other}`")),
+            fork @ (ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix) => {
+                return Err(format!("withdrawals has no handler for fork `{fork}`"));
+            }
+            // Modified again at gloas (EIP-7732): `process_withdrawals` drops
+            // its `payload` parameter entirely, since withdrawals are now
+            // deterministic from the state alone. This is the one fork whose
+            // arm reads no operation file at all.
+            ForkName::Gloas => gloas_stf::process_withdrawals(state),
+            ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
         },
-        // All three are new in electra, alongside `withdrawals`; fulu's
-        // specification lists none of them as modified, so electra's own
-        // functions serve fulu's cases too.
+        // New in gloas (EIP-7732): the block's binding commitment to a
+        // builder's payload.
+        "execution_payload_bid" => {
+            let signed_bid: gloas::SignedExecutionPayloadBid = case.ssz("execution_payload_bid");
+            gloas_stf::process_execution_payload_bid(state, &signed_bid, config)
+        }
+        // New in gloas (EIP-7732): the *next* block's processing of the
+        // previous slot's payload, so the fixture's operation file is a whole
+        // `BeaconBlock`, named `block` like `block_header`'s.
+        "parent_execution_payload" => {
+            let block: gloas::BeaconBlock = case.ssz("block");
+            gloas_stf::process_parent_execution_payload(state, &block, config)
+        }
+        // `consolidation_request` and `withdrawal_request` are new in
+        // electra, alongside `withdrawals`; neither fulu's nor gloas's own
+        // specification lists either as modified (gloas's own
+        // `apply_parent_execution_payload` is the only caller left once
+        // `process_operations` drops the call, but the function itself is
+        // unchanged), so electra's own functions serve every later fork's
+        // cases too. `ConsolidationRequest` and `WithdrawalRequest` are
+        // likewise electra's own containers, reused unchanged, so no fork
+        // match is needed for either the type or the call.
         "consolidation_request" => {
             let request: electra::ConsolidationRequest = case.ssz("consolidation_request");
             electra_stf::process_consolidation_request(state, &request, config)
         }
-        "deposit_request" => {
-            let request: electra::DepositRequest = case.ssz("deposit_request");
-            electra_stf::process_deposit_request(state, &request)
-        }
+        // `deposit_request` is new in electra too, but fulu's specification
+        // does list a modified version (`beacon-chain.md`'s "Modified
+        // `process_deposit_request`"): it drops the statement that sets
+        // `deposit_requests_start_index` the first time a request is seen,
+        // since fulu retires the eth1-bridge deposit mechanism outright (see
+        // `fulu_stf::process_deposit_request`'s own doc). Gloas's own
+        // specification does not redefine the function again, so it inherits
+        // fulu's version rather than electra's, the same way gloas's own
+        // `apply_parent_execution_payload` calls straight into
+        // `fulu_stf::process_deposit_request`. Routing a fulu or gloas case to
+        // electra's version regardless would still pass every fixture shipped
+        // so far, since pyspec's own genesis for both already sets that
+        // field, but it is not the function either fork's specification names.
+        "deposit_request" => match case.fork {
+            ForkName::Fulu | ForkName::Gloas => {
+                let request: electra::DepositRequest = case.ssz("deposit_request");
+                fulu_stf::process_deposit_request(state, &request)
+            }
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra => {
+                let request: electra::DepositRequest = case.ssz("deposit_request");
+                electra_stf::process_deposit_request(state, &request)
+            }
+            ForkName::Lean => lean_is_not_a_fixture_fork("deposit_request"),
+        },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");
             electra_stf::process_withdrawal_request(state, &request, config)
+        }
+        // New in gloas (EIP-8282): the builder registry's own onboarding and
+        // exit requests, applied by `apply_parent_execution_payload` the same
+        // way the validator registry's own deposit/withdrawal/consolidation
+        // requests are.
+        "builder_deposit_request" => {
+            let request: gloas::BuilderDepositRequest = case.ssz("builder_deposit_request");
+            gloas_stf::process_builder_deposit_request(state, &request, config)
+        }
+        "builder_exit_request" => {
+            let request: gloas::BuilderExitRequest = case.ssz("builder_exit_request");
+            gloas_stf::process_builder_exit_request(state, &request, config)
+        }
+        // New in gloas (EIP-7732): the payload timeliness committee's vote on
+        // whether the *previous* slot's payload showed up on time.
+        "payload_attestation" => {
+            let payload_attestation: gloas::PayloadAttestation = case.ssz("payload_attestation");
+            gloas_stf::process_payload_attestation(state, &payload_attestation, config)
         }
         other => return Err(format!("unhandled operation `{other}`")),
     };
@@ -436,16 +629,15 @@ fn apply(
 }
 
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "operations");
     let mut trials = vec![super::discovery_trial("operations", cases.len())];
 
     for (handler, case) in cases {
-        let config = Arc::clone(&config);
         trials.push(super::case_trial("operations", case, move |case| {
             let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
 
+            let config = super::case_config(case);
             let outcome = apply(&handler, case, &mut state, &config);
             super::check_transition(case, outcome, &state)
         }));
@@ -475,13 +667,19 @@ fn every_shipped_handler_is_dispatched() -> Result<(), Failed> {
         "attester_slashing",
         "block_header",
         "bls_to_execution_change",
+        "builder_deposit_request",
+        "builder_exit_request",
         "consolidation_request",
         "deposit",
         "deposit_request",
         "execution_payload",
+        "execution_payload_bid",
+        "parent_execution_payload",
+        "payload_attestation",
         "proposer_slashing",
         "sync_aggregate",
         "voluntary_exit",
+        "voluntary_exit_churn",
         "withdrawal_request",
         "withdrawals",
     ];

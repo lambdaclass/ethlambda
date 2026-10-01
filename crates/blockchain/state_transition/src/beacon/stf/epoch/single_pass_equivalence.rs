@@ -28,7 +28,9 @@ use crate::beacon::helpers::electra::ExitChurnCursor;
 use crate::beacon::helpers::misc::{
     compute_deposit_domain, compute_signing_root, compute_start_slot_at_epoch,
 };
-use crate::beacon::helpers::test_state::{secret_key_for, sign_for, with_signing_validators_at};
+use crate::beacon::helpers::test_state::{
+    replace_balances, secret_key_for, sign_for, with_signing_validators_at,
+};
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, Epoch, Gwei, HashTreeRoot as _, Root, ValidatorIndex,
@@ -105,7 +107,7 @@ fn deposit_for_key(
 /// A random state derived from `base` (a registry of signing validators).
 fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> BeaconState {
     let mut state = base.clone();
-    let count = state.validators().len();
+    let count = state.validator_count();
 
     let epoch: Epoch = match rng.below(10) {
         // Genesis: the fused pass declines and the steps run one by one.
@@ -215,7 +217,7 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
             _ => effective,
         });
     }
-    *state.balances_mut() = balances.try_into().unwrap();
+    replace_balances(&mut state, balances);
 
     // Participation lists and scores, all bit patterns.
     let lists: Vec<Vec<u8>> = (0..2)
@@ -250,9 +252,9 @@ fn random_state(rng: &mut SplitMix64, base: &BeaconState, config: &Config) -> Be
     // A few states the fused pass declines: a short list.
     if rng.chance(3) {
         let keep = rng.below(count as u64) as usize;
-        let mut balances = state.balances().to_vec();
+        let mut balances: Vec<Gwei> = state.iter_balances().collect();
         balances.truncate(keep);
-        *state.balances_mut() = balances.try_into().unwrap();
+        replace_balances(&mut state, balances);
     }
 
     // The slashings vector.
@@ -490,8 +492,8 @@ fn fused_pass_matches_the_unfused_steps() {
                 );
             }
 
-            let before: Vec<_> = state.validators().iter().collect();
-            let after: Vec<_> = fused.validators().iter().collect();
+            let before: Vec<_> = state.iter_validators().collect();
+            let after: Vec<_> = fused.iter_validators().collect();
             for (old, new) in before.iter().zip(after.iter()) {
                 coverage.ejected += (old.exit_epoch == FAR_FUTURE_EPOCH
                     && new.exit_epoch != FAR_FUTURE_EPOCH)
@@ -508,10 +510,12 @@ fn fused_pass_matches_the_unfused_steps() {
             coverage.validators_created += (after.len() > before.len()) as u32;
             let queue_len = |state: &mut BeaconState| {
                 let mut state = state.clone();
-                let mut fields = super::electra::pending_queue_fields(&mut state, "test").unwrap();
+                let fields =
+                    crate::beacon::helpers::electra::pending_queue_fields(&mut state, "test")
+                        .unwrap();
                 (
-                    fields.pending_deposits_mut().len(),
-                    fields.pending_consolidations_mut().len(),
+                    fields.pending_deposits().len(),
+                    fields.pending_consolidations().len(),
                 )
             };
             let (deposits_before, consolidations_before) = queue_len(&mut state.clone());

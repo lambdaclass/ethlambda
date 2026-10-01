@@ -6,9 +6,9 @@
 //! other four topics carry containers whose shape has not changed since the
 //! fork that introduced them, so they decode with no fork lookup at all.
 //! `data_column_sidecar_{subnet_id}`, the one family among the subscribed
-//! topics rather than a fixed name, decodes with no lookup either, for a
-//! different reason: fulu is the only fork that defines the container, so
-//! there is no ladder to begin with (see [`decode_data_column_sidecar`]).
+//! topics rather than a fixed name, decodes by the fork its topic's digest
+//! names, since fulu and gloas define different containers under the one name
+//! (see [`decode_data_column_sidecar`]).
 //! `beacon_attestation_{subnet_id}` is the exception to reading the fork off
 //! the payload: electra moved its slot, so its fork comes from the topic's
 //! digest instead (see [`decode_attestation`]).
@@ -22,11 +22,12 @@
 //! | `voluntary_exit`, `proposer_slashing` | No |
 //! | `bls_to_execution_change` | No, capella onward |
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
-//! | `data_column_sidecar_{subnet_id}` | No, fulu only |
+//! | `data_column_sidecar_{subnet_id}` | Yes, at gloas, by topic digest |
+//! | `execution_payload`, `payload_attestation_message` | No, gloas onward |
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    SignedBeaconBlock, altair, capella, electra, fulu, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -46,11 +47,12 @@ use super::topics;
 pub use ethlambda_types::beacon::containers::SignedAggregateAndProof;
 
 /// Slashing evidence, in whichever shape the slot's fork gives it. Electra
-/// widened `IndexedAttestation`'s committee bound.
+/// widened `IndexedAttestation`'s committee bound; gloas made it progressive.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttesterSlashing {
     Phase0(phase0::AttesterSlashing),
     Electra(electra::AttesterSlashing),
+    Gloas(gloas::AttesterSlashing),
 }
 
 /// A decoded gossip payload, one variant per subscribed topic.
@@ -93,6 +95,12 @@ pub enum DecodeError {
     Truncated,
     /// SSZ rejected the payload for the fork the slot selected.
     Ssz,
+    /// The message's own fork (gloas, today) has no container modeled here
+    /// yet. Distinct from [`Self::Ssz`] on purpose: an honest peer on a fork
+    /// this build cannot decode is not sending malformed bytes, so a caller
+    /// mapping this to a gossipsub verdict must not score it as `Reject` the
+    /// way [`Self::Ssz`] is; see `gossipsub::handler`'s callers.
+    UnsupportedFork,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -101,6 +109,7 @@ impl std::fmt::Display for DecodeError {
             Self::UnknownTopic => write!(f, "unsubscribed topic"),
             Self::Truncated => write!(f, "payload truncated before the slot"),
             Self::Ssz => write!(f, "ssz decode failed"),
+            Self::UnsupportedFork => write!(f, "message's fork has no container modeled yet"),
         }
     }
 }
@@ -180,18 +189,52 @@ pub fn fork_at_slot(config: &Config, slot: Slot) -> ForkName {
 /// Separate from [`decode_gossip`] because the two topics worth logging in
 /// detail are dispatched by name, and a handler that already knows it is
 /// holding a block should not have to unwrap a [`BeaconGossip`] to find one.
+///
+/// A block whose slot is at a fork this node does not follow (none today) and
+/// that fails to decode is `UnsupportedFork`, not `Ssz`: the container this build
+/// models for that fork is the one at the pinned specification release, and
+/// an honest peer's block may follow a later one. Bytes too short to name a
+/// slot, and a block at a followed fork, stay `Ssz` or `Truncated`.
 pub fn decode_block(config: &Config, bytes: &[u8]) -> Result<SignedBeaconBlock, DecodeError> {
     let fork = fork_at_slot(config, block_slot(bytes)?);
-    SignedBeaconBlock::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
+    SignedBeaconBlock::from_ssz(fork, bytes).map_err(|_| {
+        if fork.is_followed() {
+            DecodeError::Ssz
+        } else {
+            DecodeError::UnsupportedFork
+        }
+    })
 }
 
-/// Decode a data column sidecar off a subnet topic.
+/// Decode a data column sidecar at `fork`.
 ///
-/// Takes no `Config` and no fork, unlike [`decode_block`]: only fulu defines
-/// this container, so there is no fork ladder to choose from. A sidecar whose
-/// slot predates fulu is rejected later, by the checks that know the schedule.
-pub fn decode_data_column_sidecar(bytes: &[u8]) -> Result<fulu::DataColumnSidecar, DecodeError> {
-    fulu::DataColumnSidecar::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+/// Fulu and gloas define different containers under this name (gloas drops the
+/// header and inclusion proof for a `slot` and a block root; see
+/// `containers::gloas::DataColumnSidecar`'s doc), and the bytes alone do not say
+/// which one they are. The fork therefore comes from context: a gossip topic's
+/// digest, or a req/resp chunk's context bytes. A fork with no data columns
+/// fails like a malformed payload.
+pub fn decode_data_column_sidecar(
+    fork: ForkName,
+    bytes: &[u8],
+) -> Result<DataColumnSidecar, DecodeError> {
+    DataColumnSidecar::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode an `execution_payload` payload. The topic exists from gloas on, so
+/// the container needs no fork lookup.
+pub fn decode_execution_payload_envelope(
+    bytes: &[u8],
+) -> Result<gloas::SignedExecutionPayloadEnvelope, DecodeError> {
+    gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode a `payload_attestation_message` payload. Gloas on, like
+/// [`decode_execution_payload_envelope`].
+pub fn decode_payload_attestation_message(
+    bytes: &[u8],
+) -> Result<gloas::PayloadAttestationMessage, DecodeError> {
+    gloas::PayloadAttestationMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
@@ -200,11 +243,24 @@ pub fn decode_aggregate_and_proof(
     bytes: &[u8],
 ) -> Result<SignedAggregateAndProof, DecodeError> {
     let fork = fork_at_slot(config, aggregate_slot(bytes)?);
-    if fork >= ForkName::Electra {
-        electra::SignedAggregateAndProof::from_ssz_bytes(bytes)
-            .map(SignedAggregateAndProof::Electra)
-    } else {
-        phase0::SignedAggregateAndProof::from_ssz_bytes(bytes).map(SignedAggregateAndProof::Phase0)
+    match fork {
+        ForkName::Electra | ForkName::Fulu => {
+            electra::SignedAggregateAndProof::from_ssz_bytes(bytes)
+                .map(SignedAggregateAndProof::Electra)
+        }
+        // Electra's bytes, but a progressive `Attestation` (EIP-7688), so the
+        // root the aggregator signs differs; `data.index` is the payload flag.
+        ForkName::Gloas => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
+            .map(SignedAggregateAndProof::Gloas),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => phase0::SignedAggregateAndProof::from_ssz_bytes(bytes)
+            .map(SignedAggregateAndProof::Phase0),
+        ForkName::Lean => {
+            unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
+        }
     }
     .map_err(|_| DecodeError::Ssz)
 }
@@ -244,10 +300,20 @@ impl Attestation {
 /// lighthouse decodes this one on that digest too. `fork` is the fork the
 /// subscribed digest was computed at.
 pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, DecodeError> {
-    if fork >= ForkName::Electra {
-        electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
-    } else {
-        phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0)
+    match fork {
+        // Gloas's `SingleAttestation` has electra's bytes; its `data.index`
+        // carries the payload flag, which the gossip rules read.
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+            electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => phase0::Attestation::from_ssz_bytes(bytes).map(Attestation::Phase0),
+        ForkName::Lean => {
+            unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
+        }
     }
     .map_err(|_| DecodeError::Ssz)
 }
@@ -270,10 +336,23 @@ pub fn decode_gossip(
             .map(|value| BeaconGossip::AggregateAndProof(Box::new(value))),
         topics::ATTESTER_SLASHING => {
             let fork = fork_at_slot(config, attester_slashing_slot(bytes)?);
-            let decoded = if fork >= ForkName::Electra {
-                electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
-            } else {
-                phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
+            let decoded = match fork {
+                ForkName::Electra | ForkName::Fulu => {
+                    electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
+                }
+                ForkName::Gloas => {
+                    gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
+                }
+                ForkName::Phase0
+                | ForkName::Altair
+                | ForkName::Bellatrix
+                | ForkName::Capella
+                | ForkName::Deneb => {
+                    phase0::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Phase0)
+                }
+                ForkName::Lean => {
+                    unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
+                }
             };
             decoded
                 .map(|value| BeaconGossip::AttesterSlashing(Box::new(value)))
@@ -302,6 +381,7 @@ pub fn decode_gossip(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ethlambda_types::beacon::containers::fulu;
     use ethlambda_types::beacon::primitives::{BlsSignature, Bytes32, Root};
     use libssz::SszEncode as _;
 
@@ -385,6 +465,21 @@ mod tests {
     }
 
     #[test]
+    fn an_undecodable_block_is_an_ssz_failure_at_gloas_as_at_any_followed_fork() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        // Phase0-shaped bytes are not a valid block at either fork.
+        let at_fulu = phase0_block(slot_of(config.fulu_fork_epoch)).to_ssz();
+        let at_gloas = phase0_block(slot_of(config.gloas_fork_epoch)).to_ssz();
+        assert_eq!(decode_block(&config, &at_fulu), Err(DecodeError::Ssz));
+        assert_eq!(decode_block(&config, &at_gloas), Err(DecodeError::Ssz));
+        assert_eq!(
+            decode_block(&config, &[0xff; 3]),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
     fn the_slot_actually_drives_which_shape_is_decoded() {
         // A phase0-shaped payload whose slot lands in fulu must be refused, not
         // decoded as phase0. Without this, `decode_gossip` could ignore the
@@ -434,8 +529,28 @@ mod tests {
             .expect("exactly the required depth"),
         };
         let bytes = sidecar.to_ssz();
-        assert_eq!(decode_data_column_sidecar(&bytes).unwrap().index, 3);
-        assert!(decode_data_column_sidecar(&bytes[..bytes.len() - 1]).is_err());
+        assert_eq!(
+            decode_data_column_sidecar(ForkName::Fulu, &bytes)
+                .unwrap()
+                .index(),
+            3
+        );
+        assert!(decode_data_column_sidecar(ForkName::Fulu, &bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_gloas_sidecar_decodes_by_the_topics_fork_and_not_as_fulu() {
+        let sidecar = ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+            index: 5,
+            slot: 77,
+            ..Default::default()
+        };
+        let bytes = sidecar.to_ssz();
+        let decoded = decode_data_column_sidecar(ForkName::Gloas, &bytes).unwrap();
+        assert_eq!((decoded.index(), decoded.slot()), (5, 77));
+        assert_eq!(decoded, DataColumnSidecar::Gloas(sidecar));
+        assert!(decode_data_column_sidecar(ForkName::Fulu, &bytes).is_err());
+        assert!(decode_data_column_sidecar(ForkName::Electra, &bytes).is_err());
     }
 
     /// One attester's vote at `slot`, in the shape electra puts on a subnet.
@@ -501,11 +616,50 @@ mod tests {
     }
 
     #[test]
+    fn a_subnet_attestation_at_gloas_decodes_as_electras_shape() {
+        // Gloas keeps electra's bytes and reads `data.index` as the payload
+        // flag; the gossip rules, not the decoder, interpret it.
+        let single = single_attestation(slot_of(10));
+        assert_eq!(
+            decode_attestation(ForkName::Gloas, &single.to_ssz()),
+            Ok(Attestation::Electra(single))
+        );
+    }
+
+    #[test]
     fn a_truncated_subnet_attestation_is_refused() {
         let bytes = single_attestation(slot_of(10)).to_ssz();
         for length in 0..bytes.len() {
             assert!(decode_attestation(ForkName::Fulu, &bytes[..length]).is_err());
         }
+    }
+
+    #[test]
+    fn a_payload_attestation_message_round_trips() {
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 17,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: Root::repeat_byte(3),
+                slot: slot_of(10),
+                payload_present: true,
+                blob_data_available: false,
+            },
+            signature: Default::default(),
+        };
+        let bytes = message.to_ssz();
+        assert_eq!(decode_payload_attestation_message(&bytes), Ok(message));
+        for length in 0..bytes.len() {
+            assert!(decode_payload_attestation_message(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn an_execution_payload_envelope_round_trips() {
+        let envelope = crate::test_support::envelope(5, 9);
+        let bytes = envelope.to_ssz();
+        assert_eq!(decode_execution_payload_envelope(&bytes), Ok(envelope));
+        assert!(decode_execution_payload_envelope(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode_execution_payload_envelope(&[0xff; 3]).is_err());
     }
 
     #[test]

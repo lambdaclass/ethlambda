@@ -46,7 +46,8 @@ use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
-    InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef, ToRpcToP2PRef,
+    BlockArrival, InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
+    ToRpcToP2PRef,
 };
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
@@ -58,7 +59,7 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
     },
     beacon::fork::ForkName,
     genesis::{GenesisConfig, verify_state_genesis},
@@ -203,6 +204,9 @@ enum ChainActor {
         /// `--execution-endpoint` was not given.
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        /// The checkpoint-sync URLs to ask for a gloas anchor's execution
+        /// payload envelope; empty when there is nothing to ask.
+        anchor_envelope_urls: Vec<String>,
     },
 }
 
@@ -606,8 +610,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
+                    let gloas_scheduled = store.config().gloas_fork_epoch
+                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
                     let _ = client
-                        .handshake(&version::engine_client_version())
+                        .handshake(&version::engine_client_version(), gloas_scheduled)
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -639,6 +645,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine,
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
+                    anchor_envelope_urls: clean_checkpoint_urls.clone(),
                 },
             }
         }
@@ -748,6 +755,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
+    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
     let blockchain = match setup.chain {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
@@ -756,8 +764,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            anchor_envelope_urls,
         } => {
             check_custody_set(&custody_columns)?;
+            anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
+                .filter(|_| !anchor_envelope_urls.is_empty())
+                .map(|root| (anchor_envelope_urls, root));
             BlockChain::spawn_beacon(
                 setup.store,
                 sync_status,
@@ -788,6 +800,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
+    // After both `Init*` sends, so the actor has its p2p handle when an
+    // envelope parks waiting for columns. Off the startup path: the fetch is best-effort and a slow peer must not
+    // delay the node. The envelope goes through the same chain-actor entry a
+    // gossiped one does, so the bid check, the column check and the
+    // verification all apply to it.
+    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+        let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
+        tokio::spawn(async move {
+            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
+            {
+                let _ = chain
+                    .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
+                    .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));
+            }
+        });
+    }
+
     wait_for_shutdown(RunningNode {
         p2p,
         blockchain,
@@ -796,6 +825,25 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// The root of the anchor block when it is a gloas block whose execution
+/// payload envelope the store does not hold.
+///
+/// The anchor is the finalized block. A node that checkpoint-synced onto a
+/// gloas block has the block and state but not the payload its children may
+/// build on; asking the checkpoint source for it saves waiting for a FULL
+/// child to make the by-root request fetch it.
+fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
+    let root = store.latest_finalized().ok()?.root;
+    let block = store.get_signed_block(&root).ok()??;
+    // Gloas or any later fork (lean sorts last, and is not a beacon fork).
+    let fork = block.fork_name();
+    if fork < ForkName::Gloas || fork == ForkName::Lean {
+        return None;
+    }
+    let held = store.get_execution_payload_envelope(&root).ok()?.is_some();
+    (!held).then_some(root)
 }
 
 /// Reject a beacon node with no custody set before it spawns.
@@ -1505,6 +1553,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch: _,
         fulu_fork_version: _,
         fulu_fork_epoch: _,
+        gloas_fork_version: _,
+        gloas_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1524,6 +1574,15 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         proposer_reorg_cutoff_bps: _,
         sync_message_due_bps: _,
         contribution_due_bps: _,
+        attestation_due_bps_gloas: _,
+        aggregate_due_bps_gloas: _,
+        sync_message_due_bps_gloas: _,
+        contribution_due_bps_gloas: _,
+        payload_due_bps: _,
+        payload_attestation_due_bps: _,
+        // Compared below, alongside `min_validator_withdrawability_delay`:
+        // the builder-registry counterpart, also a state-transition rule.
+        min_builder_withdrawability_delay: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -1536,6 +1595,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         max_per_epoch_activation_churn_limit: _,
         min_per_epoch_churn_limit_electra: _,
         max_per_epoch_activation_exit_churn_limit: _,
+        churn_limit_quotient_gloas: _,
+        max_per_epoch_activation_churn_limit_gloas: _,
 
         // Fork choice: weighting/timing knobs a node applies to its own view
         // of the chain. They change which head a node *prefers*, not which
@@ -1625,9 +1686,12 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch,
         fulu_fork_version,
         fulu_fork_epoch,
+        gloas_fork_version,
+        gloas_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
+        min_builder_withdrawability_delay,
         shard_committee_period,
         inactivity_score_bias,
         inactivity_score_recovery_rate,
@@ -1637,6 +1701,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         max_per_epoch_activation_churn_limit,
         min_per_epoch_churn_limit_electra,
         max_per_epoch_activation_exit_churn_limit,
+        churn_limit_quotient_gloas,
+        max_per_epoch_activation_churn_limit_gloas,
         consolidation_churn_limit_quotient,
         max_blobs_per_block_deneb,
         max_blobs_per_block_electra,
@@ -1646,6 +1712,29 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         deposit_contract_address,
     );
     None
+}
+
+/// Refuses an anchor state in `fork` if this node cannot follow that fork.
+///
+/// Every fork is followed today, gloas included, so this lets every anchor
+/// through. A gloas anchor starts with no payload known (`payloads` is empty
+/// in `fork_choice::get_forkchoice_store`), so its head is EMPTY and the
+/// first FULL child is held until the actor fetches the parent's envelope.
+/// The guard stays for the next fork the node cannot follow: checked ahead of
+/// any store construction, on both anchor sources (a loaded network's genesis
+/// state and a checkpoint provider's finalized state), so a rejected anchor
+/// writes nothing to the data directory.
+///
+/// Keeps the refusal distinguishable from a peer serving a mismatched anchor
+/// pair: reporting both as `AnchorPairingMismatch` would tell an operator to
+/// look for a bad peer when the real answer is "wait for this build to support
+/// the fork".
+fn refuse_unfollowable_fork(fork: ForkName) -> Result<(), checkpoint_sync::CheckpointSyncError> {
+    if fork.is_followed() {
+        Ok(())
+    } else {
+        Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork { fork })
+    }
 }
 
 /// Fetch the initial state for a beacon node.
@@ -1797,14 +1886,16 @@ async fn fetch_initial_beacon_state(
     // A loaded network carries its own genesis state, which is a legitimate
     // anchor: a fresh devnet has no checkpoint provider at slot 0, so this is
     // the only way to join one. A built-in network still refuses, because
-    // every one has been live for years and this follower would sit at slot 0
-    // claiming to follow a live chain.
+    // every one is a live chain and this follower would sit at slot 0
+    // claiming to follow it.
     if checkpoint_urls.is_empty() {
         let network::NetworkSource::Loaded(loaded) = source else {
             return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
         };
 
         let state = loaded.genesis_state.as_ref().clone();
+        refuse_unfollowable_fork(state.fork_name())
+            .inspect_err(|err| error!(%err, "Cannot anchor at this network's genesis state"))?;
         let block = genesis_anchor_block(&state);
         info!(
             genesis_time = genesis.genesis_time,
@@ -1829,12 +1920,14 @@ async fn fetch_initial_beacon_state(
     info!(
         slot = state.slot(),
         fork = %state.fork_name(),
-        validators = state.validators().len(),
+        validators = state.validator_count(),
         finalized_epoch = state.finalized_checkpoint().epoch,
         anchor_block_slot = block.slot(),
         "Beacon checkpoint sync complete"
     );
 
+    refuse_unfollowable_fork(state.fork_name())
+        .inspect_err(|err| error!(%err, "Cannot anchor at the checkpoint provider's state"))?;
     fork_choice::get_forkchoice_store(backend, state, block, &config)
         .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
         .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)
@@ -1935,6 +2028,16 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Gloas => SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: gloas::BeaconBlockBody::empty(),
             },
             signature: Default::default(),
         }),
@@ -2077,6 +2180,18 @@ mod tests {
     fn an_unset_or_empty_assignment_passes_validation() {
         assert!(validate_aggregate_subnet_ids(None, 4).is_ok());
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
+    }
+
+    /// Gloas is followed: the envelopes and payload attestations a gloas chain
+    /// needs are delivered, so no fork is refused as an anchor.
+    #[test]
+    fn startup_accepts_an_anchor_at_every_beacon_fork() {
+        for fork in ForkName::ALL {
+            assert!(
+                refuse_unfollowable_fork(fork).is_ok(),
+                "{fork} must be followable"
+            );
+        }
     }
 
     /// Validator-config snippet matching `lean-quickstart`'s ansible-devnet
@@ -2590,6 +2705,72 @@ validators:
         assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
     }
 
+    /// A loaded network can schedule gloas at epoch 0, which makes its own
+    /// genesis state a gloas one. That is a legitimate anchor now that gloas
+    /// is followed: the store is built, at the genesis slot.
+    #[tokio::test]
+    async fn a_gloas_genesis_becomes_an_anchor() {
+        use ethlambda_state_transition::beacon::config::Config;
+        use ethlambda_state_transition::beacon::upgrade::upgrade_state;
+
+        // Every fork from altair on scheduled at epoch 0, in the file and in
+        // the config the genesis state is upgraded with.
+        let scheduled = [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+            ForkName::Gloas,
+        ];
+        let fixture = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/networks/devnet/config.yaml"),
+        )
+        .unwrap();
+        let config_text: String = fixture
+            .lines()
+            .map(|line| {
+                match scheduled.iter().find(|fork| {
+                    let key = format!("{}_FORK_EPOCH:", fork.as_str().to_uppercase());
+                    line.starts_with(&key)
+                }) {
+                    Some(fork) => format!("{}_FORK_EPOCH: 0", fork.as_str().to_uppercase()),
+                    None => line.to_string(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in scheduled {
+            config = config.with_fork_epoch(fork, 0);
+            state = upgrade_state(&state, fork, &config).unwrap();
+        }
+        assert_eq!(state.fork_name(), ForkName::Gloas);
+        // A real gloas genesis commits to gloas's empty body; the upgrade
+        // chain above leaves phase0's in the header.
+        state.latest_block_header_mut().body_root =
+            gloas::BeaconBlockBody::empty().hash_tree_root();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.yaml"), config_text).unwrap();
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        let loaded = network::dir::NetworkDir::load(dir.path()).unwrap();
+        let source = network::NetworkSource::Loaded(Box::new(loaded));
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+
+        let store = fetch_initial_beacon_state(&[], backend, &source)
+            .await
+            .expect("a gloas genesis anchors");
+        let (head_slot, _) = store
+            .beacon_head()
+            .expect("an anchored directory has a head");
+        assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
+    }
+
     /// A changed fork epoch leaves genesis time and the validators root
     /// untouched, so `verify_state_genesis` cannot see it, while putting this
     /// node on a different chain from its peers from that epoch on. Resuming
@@ -2681,9 +2862,9 @@ validators:
         );
     }
 
-    /// Every built-in network has been live for years, and this follower
-    /// imports nothing at startup, so anchoring at genesis would park it at
-    /// slot 0 while claiming to follow a live chain. That refusal is
+    /// Every built-in network is a live chain, and this follower imports
+    /// nothing at startup, so anchoring at genesis would park it at slot 0
+    /// while claiming to follow it. That refusal is
     /// deliberate and must survive; no built-in network carries a genesis
     /// state to anchor at in the first place.
     #[tokio::test]
@@ -2734,6 +2915,10 @@ validators:
     /// from genesis still names phase0's empty-body root; it is re-stamped
     /// to each new fork's own empty body below, exactly as a genesis
     /// generator targeting that fork directly would have to.
+    ///
+    /// Chains all the way through gloas: `upgrade_state` handles every fork
+    /// from altair to gloas, so this loop exercises `genesis_anchor_block`'s
+    /// gloas arm the same way it does every earlier fork's.
     #[test]
     fn a_genesis_anchor_block_hashes_to_the_states_own_header_at_every_fork() {
         let config = Config::mainnet();
@@ -2756,6 +2941,7 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
+                ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;
@@ -2919,5 +3105,109 @@ validators:
         let fallback = default_bootnodes(Some(&mainnet_source));
         assert!(!fallback.is_empty());
         assert_eq!(fallback, mainnet_source.bootnodes());
+    }
+}
+
+#[cfg(test)]
+mod anchor_envelope_root_tests {
+    use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::checkpoint::Checkpoint;
+
+    fn anchored_at(block: SignedBeaconBlock) -> (Store, H256, u64) {
+        let slot = block.slot();
+        let root = block.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store.insert_signed_block(root, block).expect("insert");
+        (store, root, slot)
+    }
+
+    fn gloas_block(slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_gloas_anchor_without_its_envelope_is_asked_about() {
+        let (store, root, _) = anchored_at(gloas_block(64));
+        assert_eq!(missing_anchor_envelope_root(&store), Some(root));
+    }
+
+    #[test]
+    fn a_gloas_anchor_that_holds_its_envelope_is_not() {
+        let (mut store, root, slot) = anchored_at(gloas_block(64));
+        let mut envelope = test_envelope();
+        envelope.message.beacon_block_root = root;
+        store.insert_verified_payload(slot, &envelope);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    #[test]
+    fn a_pre_gloas_anchor_has_no_envelope_to_ask_for() {
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 64,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        });
+        let (store, _, _) = anchored_at(block);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    fn test_envelope() -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; ethlambda_types::beacon::preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: H256::ZERO,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
     }
 }

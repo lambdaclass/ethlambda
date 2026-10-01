@@ -16,7 +16,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libtest_mimic::Trial;
 
-use super::{Case, PRESET, collect, fixture_root};
+use super::{Case, PRESET, collect, crypto_root, fixture_root};
 
 #[derive(serde::Deserialize)]
 struct RootFile {
@@ -45,11 +45,10 @@ pub fn trials() -> Vec<Trial> {
                 "no {PRESET} fixtures under {}",
                 root.display()
             );
-            assert!(
-                root.join("general").is_dir(),
-                "no general fixtures under {}",
-                root.display()
-            );
+            // `crypto_root` panics on its own if the BLS/KZG vectors are
+            // missing, which is the assertion this trial wants; calling it is
+            // enough.
+            crypto_root();
             Ok(())
         }),
         Trial::test("harness/discovery_finds_a_known_suite", || {

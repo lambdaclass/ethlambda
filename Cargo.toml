@@ -130,17 +130,21 @@ postcard = { version = "1.1.3", features = ["alloc"] }
 # hand out `&mut` into an `SszList` (the validator registry, through
 # `altair_validator_lists_mut`), which published libssz-types 0.3.0 cannot do:
 # it exposes only `Deref` and `Index`. `DerefMut` and `IndexMut` landed after
-# that release, in lambdaclass/libssz#33.
+# that release, in lambdaclass/libssz#33. Gloas's progressive state lists need
+# the same in-place access on `ProgressiveList`, which lambdaclass/libssz#37
+# adds.
 #
 # Pinned by `rev` rather than tracking `main`: the requirement is a commit that
-# carries #33, not whatever `main` holds today, and `main` here is the SSZ encoder
-# and merkleizer that decides every `hash_tree_root`, so a routine `cargo update`
-# must not be able to move it. Return these to a crates.io version once a release
-# carrying #33 exists.
-libssz = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
-libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
-libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
-libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+# carries #33 and #37, not whatever `main` holds today, and `main` here is the
+# SSZ encoder and merkleizer that decides every `hash_tree_root`, so a routine
+# `cargo update` must not be able to move it. This rev is #37's PR branch head,
+# not yet merged: it must move to #37's merge commit before this branch merges,
+# since a PR branch ref stops being fetchable once the branch is deleted. Return
+# these to a crates.io version once a release carrying #33 and #37 exists.
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "5cb14378ffdadcb51b387c003567e2630d0c7073" }
 
 # VCDIFF delta compression for beacon state diffs.
 #

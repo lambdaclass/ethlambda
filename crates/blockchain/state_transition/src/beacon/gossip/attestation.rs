@@ -1,6 +1,8 @@
 //! `beacon_attestation_{subnet_id}` gossip validation: electra's modified
 //! `validate_beacon_attestation_gossip` (`specs/electra/p2p-interface.md`),
-//! which fulu (what mainnet runs) inherits unchanged.
+//! which fulu inherits unchanged, and gloas's modification of it
+//! (`specs/gloas/p2p-interface.md`), picked by the attestation's slot since
+//! gloas keeps [`SingleAttestation`].
 //!
 //! EIP-7549 replaced the wire type for this topic with [`SingleAttestation`]:
 //! one attester's vote, with its committee named explicitly
@@ -43,6 +45,7 @@ use lru::LruCache;
 
 use super::{
     IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
+    is_gloas_slot, verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::config::Config;
@@ -134,9 +137,15 @@ pub fn cheap_checks(
     if seen.contains(target_epoch, attestation.attester_index) {
         return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
     }
-    // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
-    // now travels in `committee_index` instead.
-    if data.index != 0 {
+    if is_gloas_slot(&config, data.slot) {
+        // [New in Gloas:EIP7732] [REJECT] `data.index` is 0 or 1: it is the
+        // payload-present flag now.
+        if data.index > 1 {
+            return Err(Outcome::Reject(RejectReason::DataIndexOutOfRange));
+        }
+    } else if data.index != 0 {
+        // [New in Electra:EIP7549] [REJECT] `data.index` is zero: the committee
+        // now travels in `committee_index` instead.
         return Err(Outcome::Reject(RejectReason::NonZeroDataIndex));
     }
     // [IGNORE] Not from a future slot.
@@ -229,6 +238,14 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
     };
     if finalized_block != finalized.root {
         return Outcome::Ignore(IgnoreReason::FinalizedNotAncestor);
+    }
+
+    // [New in Gloas:EIP7732] The attested payload status is consistent with the
+    // block's execution payload.
+    if is_gloas_slot(&store.config(), data.slot)
+        && let Err(outcome) = verify_attestation_payload_status(store, data)
+    {
+        return outcome;
     }
 
     Outcome::Accept

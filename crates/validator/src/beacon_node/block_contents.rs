@@ -230,11 +230,16 @@ impl ProducedBlock {
                     },
                 })
             }
+            // ePBS (EIP-7732) replaces the embedded payload this client
+            // decodes here with a builder's bid, a shape neither
+            // `Contents` variant models yet, so this is refused the same
+            // way a pre-electra fork is rather than mis-decoded.
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb
+            | ForkName::Gloas
             | ForkName::Lean => Err(Error::InconsistentResponse(format!(
                 "beacon node produced a block for fork {}, which this client does not propose \
                  under; electra is the earliest supported",

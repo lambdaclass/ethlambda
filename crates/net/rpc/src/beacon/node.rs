@@ -46,7 +46,7 @@ pub(crate) fn wall_slot(store: &Store) -> u64 {
 fn head_is_optimistic(store: &Store) -> bool {
     store
         .beacon_head()
-        .is_some_and(|(_slot, root)| store.is_beacon_optimistic(root))
+        .is_some_and(|(_slot, root)| crate::shared::optimistic::block_is_optimistic(store, root))
 }
 
 async fn get_syncing(

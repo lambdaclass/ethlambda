@@ -19,8 +19,11 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::electra::SingleAttestation;
+use ethlambda_types::beacon::containers::gloas::{
+    PayloadAttestationMessage, SignedExecutionPayloadEnvelope,
+};
 use ethlambda_types::beacon::containers::{
-    SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
+    DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
 };
 use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
@@ -72,6 +75,11 @@ pub(crate) enum Validated {
         attestation: Box<SingleAttestation>,
         subnet_id: u64,
     },
+    /// A gloas `execution_payload`. Boxed for the reason `Block` is: it
+    /// carries a whole execution payload.
+    Envelope(Box<SignedExecutionPayloadEnvelope>),
+    /// A gloas `payload_attestation_message`.
+    PayloadAttestation(PayloadAttestationMessage),
 }
 
 impl Validated {
@@ -86,7 +94,12 @@ impl Validated {
             Self::Block { block, block_root } => {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
-            Self::Column(sidecar) => gossip::column::stateful_checks(store, sidecar),
+            Self::Column(sidecar) => match &**sidecar {
+                DataColumnSidecar::Fulu(sidecar) => gossip::column::stateful_checks(store, sidecar),
+                DataColumnSidecar::Gloas(sidecar) => {
+                    gossip::column::stateful_checks_gloas(store, sidecar)
+                }
+            },
             Self::Aggregate {
                 aggregate,
                 attesting_indices,
@@ -101,6 +114,10 @@ impl Validated {
                 attestation,
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
+            Self::Envelope(envelope) => gossip::envelope::stateful_checks(store, envelope),
+            Self::PayloadAttestation(message) => {
+                gossip::payload_attestation::stateful_checks(store, message)
+            }
         }
     }
 
@@ -113,14 +130,26 @@ impl Validated {
                     .seen_blocks
                     .record(block.slot(), block.proposer_index(), *block_root)
             }
-            Self::Column(sidecar) => {
-                let header = &sidecar.signed_block_header.message;
-                server
-                    .seen_columns
-                    .record(header.slot, header.proposer_index, sidecar.index)
-            }
+            Self::Column(sidecar) => match &**sidecar {
+                DataColumnSidecar::Fulu(sidecar) => {
+                    let header = &sidecar.signed_block_header.message;
+                    server
+                        .seen_columns
+                        .record(header.slot, header.proposer_index, sidecar.index)
+                }
+                DataColumnSidecar::Gloas(sidecar) => server
+                    .seen_block_columns
+                    .record(sidecar.beacon_block_root, sidecar.index),
+            },
             Self::Aggregate { aggregate, .. } => server.seen_aggregates.record(aggregate),
             Self::Attestation { attestation, .. } => server.seen_attestations.record(attestation),
+            Self::Envelope(envelope) => server.seen_envelopes.record(
+                envelope.message.beacon_block_root,
+                envelope.message.builder_index,
+            ),
+            Self::PayloadAttestation(message) => server
+                .seen_payload_attestations
+                .record(message.data.slot, message.validator_index),
         }
     }
 
@@ -140,6 +169,14 @@ impl Validated {
     /// chain actor consumes one, matching a lighthouse follower with no
     /// validators, which verifies and relays its own backbone subnets but
     /// never calls `apply_attestation_to_fork_choice` for them either.
+    ///
+    /// An envelope goes on when accepted, and also when queued: the chain
+    /// actor holds an envelope whose block it has not imported yet, which is
+    /// exactly what `Queue` means, and its own checks judge it again once the
+    /// block is there; a queued one has not had its signature checked, so the
+    /// actor checks it before it parks one. Any other outcome keeps it away. A
+    /// payload attestation goes on only when accepted: it is only valid within
+    /// its own slot, and the specification makes queueing one optional.
     ///
     /// What an accepted subnet attestation does feed is the attestation pool,
     /// when its subnet is one a validator client's aggregator had this node
@@ -212,7 +249,30 @@ impl Validated {
                     .new_beacon_aggregate(aggregate, attesting_indices, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip aggregate"));
             }
-            Self::Aggregate { .. } | Self::Attestation { .. } => {}
+            Self::Envelope(envelope) if matches!(outcome, Outcome::Accept | Outcome::Queue(_)) => {
+                let arrival = BlockArrival {
+                    decode_start: Some(received_at),
+                    handed_off: Instant::now(),
+                    deferred_from: None,
+                };
+                let _ = blockchain
+                    .new_execution_payload_envelope(envelope, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a gossip envelope"));
+            }
+            Self::PayloadAttestation(message) if outcome == Outcome::Accept => {
+                let arrival = BlockArrival {
+                    decode_start: Some(received_at),
+                    handed_off: Instant::now(),
+                    deferred_from: None,
+                };
+                let _ = blockchain
+                    .new_payload_attestation_message(message, arrival)
+                    .inspect_err(|err| warn!(%err, "Failed to forward a payload attestation"));
+            }
+            Self::Aggregate { .. }
+            | Self::Attestation { .. }
+            | Self::Envelope(_)
+            | Self::PayloadAttestation(_) => {}
         }
     }
 }
@@ -240,7 +300,10 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         Validated::Attestation { attestation, .. } => {
             observed.record(attestation.data.target.epoch, attestation.attester_index);
         }
-        Validated::Block { .. } | Validated::Column(_) => {}
+        Validated::Block { .. }
+        | Validated::Column(_)
+        | Validated::Envelope(_)
+        | Validated::PayloadAttestation(_) => {}
     }
 }
 
@@ -395,6 +458,23 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
     forward
 }
 
+/// The permit pool `object`'s stateful checks draw from: blocks, columns and
+/// envelopes from the gossip pool, everything the attesters send from the
+/// attestation pool, so neither burst starves the other.
+fn permits_for<'a>(
+    server: &'a P2PServer,
+    object: &Validated,
+) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
+    match object {
+        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
+            &server.gossip_validation_permits
+        }
+        Validated::Aggregate { .. }
+        | Validated::Attestation { .. }
+        | Validated::PayloadAttestation(_) => &server.attestation_validation_permits,
+    }
+}
+
 /// Run `object`'s stateful checks on a blocking thread. The verdict comes back
 /// to the actor as a [`GossipVerdict`].
 ///
@@ -420,13 +500,7 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
-    let permits = match &object {
-        Validated::Block { .. } | Validated::Column(_) => &server.gossip_validation_permits,
-        Validated::Aggregate { .. } | Validated::Attestation { .. } => {
-            &server.attestation_validation_permits
-        }
-    };
-    let Ok(permit) = permits.clone().try_acquire_owned() else {
+    let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -474,12 +548,17 @@ pub(crate) fn guarded(checks: impl FnOnce() -> Outcome) -> Outcome {
 mod tests {
     use std::sync::Arc;
 
+    use ethlambda_network_api::P2PToBlockChain;
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
+    use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{AttestationData, Checkpoint, electra, phase0};
+    use spawned_concurrency::error::ActorError;
 
     use super::*;
-    use crate::test_support::{RecordingChain, unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{
+        RecordingChain, envelope, unconnected_beacon_server, valid_shaped_sidecar,
+    };
 
     /// A minimal fulu block for a given `(slot, proposer)`: `settle` and
     /// `record_seen` only ever read those two fields plus the root passed
@@ -630,7 +709,9 @@ mod tests {
     #[tokio::test]
     async fn the_first_accept_for_a_column_key_stands_and_the_second_is_marked_seen() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
-        let object = Validated::Column(Box::new(valid_shaped_sidecar(5, 0)));
+        let object = Validated::Column(Box::new(DataColumnSidecar::Fulu(valid_shaped_sidecar(
+            5, 0,
+        ))));
 
         assert_eq!(
             settle(&mut server, Outcome::Accept, &object),
@@ -856,14 +937,195 @@ mod tests {
         assert!(chain.aggregates.lock().unwrap().is_empty());
     }
 
+    /// What `forward` handed the chain actor, by method.
+    #[derive(Debug, PartialEq)]
+    enum Sent {
+        Envelope,
+        PayloadAttestation,
+    }
+
+    /// A chain actor stand-in that reports only the two gloas deliveries.
+    struct GloasRecorder(tokio::sync::mpsc::UnboundedSender<Sent>);
+
+    impl P2PToBlockChain for GloasRecorder {
+        fn new_block(
+            &self,
+            _block: SignedBeaconBlock,
+            _source: BlockSource,
+            _arrival: BlockArrival,
+            _announcement: BlockAnnouncement,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_attestation(&self, _attestation: SignedAttestation) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_aggregated_attestation(
+            &self,
+            _attestation: SignedAggregatedAttestation,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_data_column_sidecars(
+            &self,
+            _sidecars: Vec<DataColumnSidecar>,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn data_column_sidecars_awaiting_parent(
+            &self,
+            _sidecars: Vec<DataColumnSidecar>,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_beacon_aggregate(
+            &self,
+            _aggregate: Box<SignedAggregateAndProof>,
+            _attesting_indices: Vec<ValidatorIndex>,
+            _arrival: AggregateArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_execution_payload_envelope(
+            &self,
+            _envelope: Box<SignedExecutionPayloadEnvelope>,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            let _ = self.0.send(Sent::Envelope);
+            Ok(())
+        }
+        fn new_payload_attestation_message(
+            &self,
+            _message: PayloadAttestationMessage,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            let _ = self.0.send(Sent::PayloadAttestation);
+            Ok(())
+        }
+    }
+
+    pub(crate) fn payload_attestation(slot: u64, validator: u64) -> PayloadAttestationMessage {
+        let mut message = PayloadAttestationMessage {
+            validator_index: validator,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        message.data.slot = slot;
+        message
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_an_envelope_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::Envelope(Box::new(envelope(1, 3)));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        // A queued envelope records nothing, so a later accept still stands.
+        let other = Validated::Envelope(Box::new(envelope(2, 3)));
+        assert_eq!(
+            settle(
+                &mut server,
+                Outcome::Queue(QueueReason::BlockUnknown),
+                &other
+            ),
+            Outcome::Queue(QueueReason::BlockUnknown)
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &other),
+            Outcome::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_a_payload_attestation_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::PayloadAttestation(payload_attestation(5, 1));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+    }
+
+    /// An envelope reaches the chain actor on `Accept` and on `Queue` (the
+    /// actor holds it for its block), and on nothing else.
+    #[tokio::test]
+    async fn an_envelope_is_forwarded_on_accept_and_queue_only() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+
+        let forward = |outcome| {
+            Validated::Envelope(Box::new(envelope(1, 3))).forward(&server, Instant::now(), outcome)
+        };
+        forward(Outcome::Accept);
+        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
+        forward(Outcome::Queue(QueueReason::BlockUnknown));
+        assert_eq!(received.try_recv(), Ok(Sent::Envelope));
+        forward(Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(Outcome::Reject(RejectReason::BadSignature));
+        assert!(received.try_recv().is_err());
+    }
+
+    /// A payload attestation reaches the chain actor on `Accept` alone.
+    #[tokio::test]
+    async fn a_payload_attestation_is_forwarded_on_accept_only() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+
+        let forward = |outcome| {
+            Validated::PayloadAttestation(payload_attestation(5, 1)).forward(
+                &server,
+                Instant::now(),
+                outcome,
+            )
+        };
+        forward(Outcome::Ignore(IgnoreReason::UnknownBlock));
+        forward(Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(Outcome::Reject(RejectReason::NotInPtc));
+        assert!(received.try_recv().is_err());
+        forward(Outcome::Accept);
+        assert_eq!(received.try_recv(), Ok(Sent::PayloadAttestation));
+    }
+
     /// The pool an aggregate or a subnet attestation draws its stateful-check
     /// permit from is not the pool a block or a column draws from: exhausting
     /// one must leave the other untouched, or a burst on this topic could
     /// make a block or a column answer `Ignore(Overloaded)` too.
+    ///
+    /// An envelope shares the block pool and a payload attestation the
+    /// attestation pool, for the same reason: a slot's committee votes arrive
+    /// in a burst that must not starve block validation.
     #[tokio::test]
     async fn the_block_column_and_attestation_permit_pools_are_independent() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let attestation_permits_before = server.attestation_validation_permits.available_permits();
+
+        let same_pool = |a: &std::sync::Arc<tokio::sync::Semaphore>, b: &std::sync::Arc<_>| {
+            std::sync::Arc::ptr_eq(a, b)
+        };
+        let envelope = Validated::Envelope(Box::new(envelope(1, 3)));
+        let vote = Validated::PayloadAttestation(payload_attestation(5, 1));
+        assert!(same_pool(
+            permits_for(&server, &envelope),
+            &server.gossip_validation_permits
+        ));
+        assert!(same_pool(
+            permits_for(&server, &vote),
+            &server.attestation_validation_permits
+        ));
 
         let mut held = Vec::new();
         while let Ok(permit) = server.gossip_validation_permits.clone().try_acquire_owned() {

@@ -1,4 +1,4 @@
-//! Electra's epoch steps 1-9 over one walk of the validator registry.
+//! Electra's and fulu's epoch steps 1-9 over one walk of the validator registry.
 //!
 //! Run step by step, the specification reads the registry once per step:
 //! inactivity updates, rewards, registry updates, slashings, pending deposits
@@ -56,7 +56,9 @@ use crate::beacon::containers::shared::Validator;
 use crate::beacon::containers::{BeaconState, electra};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::helpers::accessors::get_current_epoch;
-use crate::beacon::helpers::electra::{ExitChurnCursor, activation_exit_churn_limit_for};
+use crate::beacon::helpers::electra::{
+    ExitChurnCursor, PendingQueueFields, activation_exit_churn_limit_for, pending_queue_fields,
+};
 use crate::beacon::helpers::misc::{compute_activation_exit_epoch, compute_start_slot_at_epoch};
 use crate::beacon::helpers::participation::{EpochSummary, RewardContext};
 use crate::beacon::preset;
@@ -64,9 +66,8 @@ use crate::beacon::primitives::{BlsPubkey, Epoch, Gwei, ValidatorIndex};
 
 use super::altair::{next_inactivity_score, weigh_with_totals};
 use super::electra::{
-    RegistryAction, SlashingsContext, apply_pending_deposit, pending_queue_fields,
-    process_pending_consolidations, process_unfused_steps, registry_action,
-    updated_effective_balance,
+    RegistryAction, SlashingsContext, apply_pending_deposit, process_pending_consolidations,
+    process_unfused_steps, registry_action, updated_effective_balance,
 };
 
 /// Registries above this size skip the debug oracle: it is the slow path this
@@ -83,7 +84,7 @@ pub(super) fn process_steps_through_effective_balances(
 ) -> Result<()> {
     #[cfg(debug_assertions)]
     {
-        if state.validators().len() <= ORACLE_LIMIT {
+        if state.validator_count() <= ORACLE_LIMIT {
             let mut expected = state.clone();
             let expected_result = process_unfused_steps(&mut expected, config, true);
             let result = dispatch(state, config);
@@ -121,11 +122,11 @@ pub(super) fn can_fuse(state: &BeaconState) -> bool {
     if get_current_epoch(state) == constants::GENESIS_EPOCH {
         return false;
     }
-    let count = state.validators().len();
+    let count = state.validator_count();
     let Ok((previous, current, scores)) = state.altair_validator_lists() else {
         return false;
     };
-    state.balances().len() == count
+    state.iter_balances().len() == count
         && previous.len() == count
         && current.len() == count
         && scores.len() == count
@@ -165,15 +166,13 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
     let mut validator_changes: Vec<(usize, Validator)> = Vec::new();
     let mut balance_changes: Vec<(usize, Gwei)> = Vec::new();
     {
-        let validators = state.validators();
-        let balances = state.balances();
         let (_, _, scores) = state.altair_validator_lists()?;
         let mut top_ups = plan.top_ups.iter().peekable();
         let mut deferred_cursor = deferred.iter().peekable();
 
-        for (index, (((validator, &balance), &score), (flags, _))) in validators
-            .iter()
-            .zip(balances.iter())
+        for (index, (((validator, balance), &score), (flags, _))) in state
+            .iter_validators()
+            .zip(state.iter_balances())
             .zip(scores.iter())
             .zip(summary.iter())
             .enumerate()
@@ -271,13 +270,13 @@ fn fused(state: &mut BeaconState, config: &Config) -> Result<()> {
     super::process_eth1_data_reset(state)?;
 
     // Step 7: the queue itself, then the deposits that create validators.
-    let registry_len = state.validators().len();
+    let registry_len = state.validator_count();
     plan.finish(state, config)?;
 
     // Step 8, then step 9 for what was deferred, and for the validators the
     // deposits just created.
     process_pending_consolidations(state, config)?;
-    let new_registry_len = state.validators().len();
+    let new_registry_len = state.validator_count();
     let mut effective_updates = Vec::new();
     let patched = deferred
         .iter()
@@ -308,17 +307,11 @@ fn write_back(
     exit_cursor: ExitChurnCursor,
     exit_cursor_before: ExitChurnCursor,
 ) -> Result<()> {
-    let validators = state.validators_mut();
     for (index, validator) in validator_changes {
-        *validators
-            .get_mut(index)
-            .ok_or(Error::UnknownValidator(index as ValidatorIndex))? = validator;
+        *state.validator_mut(index as ValidatorIndex)? = validator;
     }
-    let balances = state.balances_mut();
     for (index, balance) in balance_changes {
-        *balances
-            .get_mut(index)
-            .ok_or(Error::UnknownValidator(index as ValidatorIndex))? = balance;
+        *state.balance_mut(index as ValidatorIndex)? = balance;
     }
     let (_, _, scores) = state.altair_validator_lists_mut()?;
     let score_count = scores.len();
@@ -342,9 +335,9 @@ fn write_back(
 /// then doing it on its final balance is the same as doing it in the loop for
 /// a validator nothing touched.
 fn consolidation_participants(state: &mut BeaconState) -> Result<Vec<usize>> {
-    let mut fields = pending_queue_fields(state, "single-pass epoch processing")?;
+    let fields = pending_queue_fields(state, "single-pass epoch processing")?;
     let mut participants: Vec<usize> = fields
-        .pending_consolidations_mut()
+        .pending_consolidations()
         .iter()
         .flat_map(|consolidation| {
             [
@@ -405,23 +398,26 @@ impl DepositPlan {
     ) -> Result<Self> {
         let next_epoch = current_epoch + 1;
         let finalized_slot = compute_start_slot_at_epoch(finalized_epoch);
-        let eth1_deposit_index = state.eth1_deposit_index();
 
-        let (deposit_requests_start_index, available_for_processing, mut deposits) = {
+        let (eth1_bridge_gate, available_for_processing, mut deposits) = {
             let mut fields = pending_queue_fields(state, "single-pass epoch processing")?;
+            // Electra holds deposit requests behind the eth1 bridge; fulu
+            // retires the gate, exactly as `drain_pending_deposits` decides.
+            let eth1_bridge_gate = match &fields {
+                PendingQueueFields::Electra(electra_state) => Some((
+                    electra_state.eth1_deposit_index,
+                    fields.deposit_requests_start_index(),
+                )),
+                PendingQueueFields::Fulu(_) | PendingQueueFields::Gloas(_) => None,
+            };
             let available_for_processing = fields
                 .deposit_balance_to_consume()
                 .checked_add(per_epoch_churn)
                 .ok_or(Error::ArithmeticOverflow(
-                    "deposit_balance_to_consume + get_activation_exit_churn_limit",
+                    "deposit_balance_to_consume + churn limit",
                 ))?;
-            let deposits: Vec<electra::PendingDeposit> =
-                core::mem::take(fields.pending_deposits_mut()).into_inner();
-            (
-                fields.deposit_requests_start_index(),
-                available_for_processing,
-                deposits,
-            )
+            let deposits: Vec<electra::PendingDeposit> = fields.take_pending_deposits();
+            (eth1_bridge_gate, available_for_processing, deposits)
         };
 
         // The ordering gates and the per-epoch cap read nothing from the
@@ -430,9 +426,13 @@ impl DepositPlan {
             .iter()
             .take(preset::MAX_PENDING_DEPOSITS_PER_EPOCH as usize)
             .take_while(|deposit| {
-                !(deposit.slot > constants::GENESIS_SLOT
-                    && eth1_deposit_index < deposit_requests_start_index)
-                    && deposit.slot <= finalized_slot
+                let held_behind_bridge = eth1_bridge_gate.is_some_and(
+                    |(eth1_deposit_index, deposit_requests_start_index)| {
+                        deposit.slot > constants::GENESIS_SLOT
+                            && eth1_deposit_index < deposit_requests_start_index
+                    },
+                );
+                !held_behind_bridge && deposit.slot <= finalized_slot
             })
             .count();
         let found = first_indices_of(
@@ -532,7 +532,7 @@ impl DepositPlan {
     fn finish(&mut self, state: &mut BeaconState, config: &Config) -> Result<()> {
         let remaining = core::mem::take(&mut self.remaining);
         let mut fields = pending_queue_fields(state, "single-pass epoch processing")?;
-        *fields.pending_deposits_mut() = electra::PendingDeposits::try_from(remaining)?;
+        fields.set_pending_deposits(remaining)?;
         *fields.deposit_balance_to_consume_mut() = self.deposit_balance_to_consume;
 
         for deposit in core::mem::take(&mut self.new_pubkey_deposits) {
@@ -562,7 +562,7 @@ fn first_indices_of(
         |pubkey: &BlsPubkey| u64::from_le_bytes(pubkey.0[..8].try_into().expect("8 <= 48"));
     let prefixes: Vec<u64> = wanted.iter().map(prefix).collect();
     let mut missing = wanted.len();
-    for (index, validator) in state.validators().iter().enumerate() {
+    for (index, validator) in state.iter_validators().enumerate() {
         let validator_prefix = prefix(&validator.pubkey);
         for (slot, wanted_prefix) in prefixes.iter().enumerate() {
             if found[slot].is_none()
@@ -616,14 +616,14 @@ pub(super) fn differing_fields(state: &mut BeaconState, expected: &mut BeaconSta
     };
     let debug_all = |items: &mut dyn Iterator<Item = String>| items.collect::<Vec<_>>();
 
-    let left = debug_all(&mut state.validators().iter().map(|v| format!("{v:?}")));
-    let right = debug_all(&mut expected.validators().iter().map(|v| format!("{v:?}")));
+    let left = debug_all(&mut state.iter_validators().map(|v| format!("{v:?}")));
+    let right = debug_all(&mut expected.iter_validators().map(|v| format!("{v:?}")));
     if let Some(text) = describe_at("validators", left, right) {
         note(&text, true);
     }
 
-    let left = debug_all(&mut state.balances().iter().map(|v| v.to_string()));
-    let right = debug_all(&mut expected.balances().iter().map(|v| v.to_string()));
+    let left = debug_all(&mut state.iter_balances().map(|v| v.to_string()));
+    let right = debug_all(&mut expected.iter_balances().map(|v| v.to_string()));
     if let Some(text) = describe_at("balances", left, right) {
         note(&text, true);
     }
@@ -654,13 +654,13 @@ pub(super) fn differing_fields(state: &mut BeaconState, expected: &mut BeaconSta
         "exit_churn_cursor",
         ExitChurnCursor::read(state).ok() != ExitChurnCursor::read(expected).ok(),
     );
-    if let (Ok(mut left), Ok(mut right)) = (
+    if let (Ok(left), Ok(right)) = (
         pending_queue_fields(state, "oracle"),
         pending_queue_fields(expected, "oracle"),
     ) {
         note(
             "pending_deposits",
-            left.pending_deposits_mut() != right.pending_deposits_mut(),
+            left.pending_deposits() != right.pending_deposits(),
         );
         note(
             "deposit_balance_to_consume",
@@ -668,7 +668,7 @@ pub(super) fn differing_fields(state: &mut BeaconState, expected: &mut BeaconSta
         );
         note(
             "pending_consolidations",
-            left.pending_consolidations_mut() != right.pending_consolidations_mut(),
+            left.pending_consolidations() != right.pending_consolidations(),
         );
     }
     if differences.is_empty() {

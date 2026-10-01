@@ -18,10 +18,17 @@ use ethlambda_types::{
     },
     beacon::{
         config::Config,
-        containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
+        constants::NUM_BLOCK_TIMELINESS_DEADLINES,
+        containers::{
+            BeaconState, Checkpoint as BeaconCheckpoint, DataColumnSidecar, SignedBeaconBlock,
+            gloas,
+        },
         fork::ForkName,
-        fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
-        preset::{Preset, SLOTS_PER_EPOCH},
+        fork_choice::{
+            BlockPayloadLink, LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1,
+            PowBlock,
+        },
+        preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
     },
     block::{
@@ -173,7 +180,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 ///
 /// 4 added `PRESET_BASE` and `CONFIG_NAME` to `Config`, at the front of its
 /// encoding, for the same reason and with the same consequence as 3.
-pub const DB_VERSION: u64 = 4;
+///
+/// 5 widened `Config` with the gloas schedule, timing and churn keys
+/// (`max_request_payloads` was already claimed before this version bump), so a
+/// directory written by version 4 decodes into the wrong fields.
+pub const DB_VERSION: u64 = 5;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -638,38 +649,107 @@ impl GossipSignatureBuffer {
 }
 
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
-/// chain history: nothing here survives a restart, and nothing here is worth
-/// the write amplification of persisting.
+/// chain history: apart from the gloas entries named below, nothing here
+/// survives a restart, and nothing here is worth the write amplification of
+/// persisting.
 ///
-/// `proposer_boost_root` resets every slot, `block_timeliness` is read only by
-/// the same-slot reorg helpers, `equivocating_indices` is rebuilt by replaying
-/// attester slashings on sync, `latest_messages` is rebuilt by the first epoch
-/// of attestations, `pow_blocks` stands in for a call to an execution client
-/// that a restarted node would simply make again, and
+/// `proposer_boost_root` resets every slot, pre-gloas `block_timeliness` is
+/// read only by the same-slot reorg helpers, `equivocating_indices` is rebuilt
+/// by replaying attester slashings on sync, `latest_messages` is rebuilt by
+/// the first epoch of attestations, `pow_blocks` stands in for a call to an
+/// execution client that a restarted node would simply make again, and
 /// `unrealized_justifications` is recomputed by replaying epoch processing on a
 /// copy of a block's post-state, which a node resuming from an anchor does
 /// anyway as it re-imports the unfinalized window. `optimistic_roots` and
 /// `payload_statuses` are likewise answers an execution client can be asked
-/// for again, and `el_block_hashes` is a cache over data already decodable
-/// from the block itself.
+/// for again, and `el_block_hashes` and `payload_links` are caches over data
+/// already decodable from the block itself.
+///
+/// Gloas's `verified_payloads` and `block_timeliness` are the exceptions: they
+/// live in this scratch for reading, but a gloas block's entries are written
+/// through to `Table::ExecutionPayloadEnvelopes` and `Table::BlockTimeliness`,
+/// and [`Store::from_db_state`] rebuilds both for every block at or above the
+/// finalized one. Losing `verified_payloads` would not error, it would
+/// silently drop every full payload branch from fork choice. Losing a
+/// `block_timeliness` entry does not error either: a missing entry reads as
+/// not timely by either deadline, which quietly changes what
+/// `should_apply_proposer_boost` withholds. Pre-gloas timeliness is never
+/// persisted: nothing reads it after a restart.
+///
+/// `payload_timeliness_vote` and `payload_data_availability_vote` stay in
+/// memory on purpose. They are the payload timeliness committee's per-slot
+/// ballot, read only while the slot they were cast for is being decided. A
+/// resumed store reseeds them empty (every member `None`) for each restored
+/// gloas block, which is what a block just imported holds, and the next
+/// block's payload attestations refill them: the loss lasts about a slot.
 ///
 /// Most of this is uncapped: the per-validator maps are bounded by the
 /// validator set, and the per-block ones (`block_timeliness`,
-/// `unrealized_justifications`) grow with the blocks this process has
-/// imported. Two are the exception, `el_block_hashes` and `optimistic_roots`,
-/// each pruned to the unfinalized window by its own `prune_*` method. Both
-/// fill on a path that runs for the whole life of the process and has no other
-/// way of emptying them: `forkchoiceUpdated` reads the first once per head
-/// move, and an execution client doing a long state sync answers
-/// `NOT_VALIDATED` to every block, which writes the second once per import.
+/// `unrealized_justifications`, and gloas's own three) grow with the blocks
+/// this process has imported. Three are the exception, `el_block_hashes`,
+/// `payload_links` and `optimistic_roots`, each pruned to the unfinalized
+/// window by its own `prune_*` method. All three fill on a path that runs for
+/// the whole life of the process and has no other way of emptying them:
+/// `forkchoiceUpdated` reads the first once per head move, the head walk
+/// reads the second for every block it visits, and an execution client doing a
+/// long state sync answers `NOT_VALIDATED` to every block, which writes the
+/// third once per import.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
-    pub(crate) block_timeliness: HashMap<H256, bool>,
+    /// Gloas widens this from one bool to two, `[ATTESTATION_TIMELINESS_INDEX,
+    /// PTC_TIMELINESS_INDEX]`: a block is now timed against both the
+    /// attestation deadline and the (later) payload-attestation-committee
+    /// deadline. Pre-gloas code reads `ATTESTATION_TIMELINESS_INDEX` only,
+    /// the same deadline it always checked.
+    pub(crate) block_timeliness: HashMap<H256, [bool; NUM_BLOCK_TIMELINESS_DEADLINES]>,
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
+    /// Gloas: beacon block roots whose execution payload envelope has been
+    /// locally delivered and verified (`on_execution_payload_envelope`'s own
+    /// `store.payloads[root] = envelope`), the in-memory index of
+    /// `Table::ExecutionPayloadEnvelopes` for `is_payload_verified`'s
+    /// membership test. The envelopes themselves are read from the table.
+    pub(crate) verified_payloads: HashSet<H256>,
+    /// Each imported block's payload link (which rules it is handled under,
+    /// and which of its parent's payload branches it builds on), so the head
+    /// computation reads both without decoding a block. Written by `on_block`,
+    /// and by the head computation itself for a block it finds missing (a block
+    /// imported before a restart), the one decode that block ever costs.
+    ///
+    /// A cache over data already decodable from the block, like
+    /// `el_block_hashes`, and bounded the same way: each entry carries its
+    /// block's slot, and `prune_beacon_payload_links` drops the ones below
+    /// finality. A pruned link is derived again by decoding if anything asks
+    /// for it.
+    pub(crate) payload_links: HashMap<H256, (u64, BlockPayloadLink)>,
+    /// The head node fork choice last picked, as its block root and payload
+    /// branch: `Full` when the node is the block with the payload revealed,
+    /// `Empty` when it is the block alone. A pre-gloas head is `Full` (see
+    /// `fork_choice::get_head_node`).
+    ///
+    /// The root is stored with the status so a reader can tell whether the
+    /// status belongs to the head it sees: the head root lives in the backend
+    /// and this does not, so the two cannot be written atomically, and a
+    /// status alone could be paired with the wrong root. Readers compare roots
+    /// and treat a mismatch as unknown.
+    ///
+    /// `None` until the first head computation of this process: nothing
+    /// persists it, and a resumed directory recomputes it on the first tick
+    /// rather than storing a second source of truth for what the head walk
+    /// derives. Readers treat `None` as "not known to be `Full`".
+    pub(crate) head_node_payload_status: Option<(H256, PayloadStatus)>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
+    /// `None` until that member votes. Keyed by beacon block root, like
+    /// `block_timeliness`.
+    pub(crate) payload_timeliness_vote: HashMap<H256, Vec<Option<bool>>>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's blob data was available, the sibling of
+    /// `payload_timeliness_vote`.
+    pub(crate) payload_data_availability_vote: HashMap<H256, Vec<Option<bool>>>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
     /// against the slot the unfinalized-window bound prunes them by.
     ///
@@ -698,6 +778,13 @@ pub(crate) struct BeaconScratch {
     /// forkchoiceUpdated reads it once per head move for the whole life of the
     /// process.
     pub(crate) el_block_hashes: HashMap<H256, (u64, ExecutionBlockHash)>,
+    /// Gloas: the execution client's verdict on each beacon block's payload,
+    /// against the block's slot for pruning. Keyed by beacon root because a
+    /// gloas block's payload hash lives in its bid and envelope rather than in
+    /// `el_block_hashes`. Read by the attestation gossip rules as the
+    /// specification's `block_payload_statuses`; an absent root reads as
+    /// `NOT_VALIDATED`.
+    pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
 }
 
 /// Encode a LiveChain key (slot, root) to bytes.
@@ -765,6 +852,31 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
     SignedBeaconBlock::from_ssz(fork, ssz).expect("valid signed block")
 }
 
+/// Whether `block` builds on the payload whose hash is `payload_block_hash`:
+/// gloas's bid `parent_block_hash` rule for a payload being part of the chain.
+fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
+    match block {
+        SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        // A pre-gloas block cannot follow a gloas one.
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => false,
+        SignedBeaconBlock::Lean(_) => Store::lean_only("builds_on_payload"),
+    }
+}
+
 /// `root`'s slot on a beacon chain, read without a `Store`, for the writer
 /// thread's anchor decision.
 ///
@@ -775,9 +887,10 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 /// Beacon directories only: it decodes the row as a tagged
 /// [`SignedBeaconBlock`], which is the wrong shape for a lean directory's bare
 /// [`BlockHeader`] (unlike [`block_fields`](Store::block_fields), which
-/// dispatches on `self.chain`). Nothing does today: [`StateWriter::write`](crate::state_writer)'s
-/// non-`Lean` match arm is this function's only caller, so that invariant is
-/// enforced by having exactly one caller rather than by a runtime check.
+/// dispatches on `self.chain`). Its callers are [`StateWriter::write`](crate::state_writer)'s
+/// non-`Lean` match arm and the beacon-only envelope and resume methods on
+/// [`Store`], so that invariant is enforced by every caller being a beacon
+/// path rather than by a runtime check.
 pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Option<u64> {
     let view = backend.begin_read().expect("read view");
     let bytes = view
@@ -1046,12 +1159,12 @@ impl Store {
         };
 
         info!(?chain, anchor_slot, "Loaded store from persisted DB state");
-        Ok(Some(Self::from_parts(
-            backend,
-            Arc::new(config),
-            chain,
-            anchor_slot,
-        )))
+        let store = Self::from_parts(backend, Arc::new(config), chain, anchor_slot);
+        match chain {
+            Chain::Lean => {}
+            Chain::Beacon => store.restore_beacon_scratch(),
+        }
+        Ok(Some(store))
     }
 
     /// Checks that both the justified and finalized checkpoints have a
@@ -2005,8 +2118,8 @@ impl Store {
     ///
     /// Dropping the row is the whole of "remove this block from fork choice":
     /// [`block_index`](Self::block_index) is the only source
-    /// `filter_block_tree`, `compute_weights` and `get_head` read, so a root
-    /// with no row contributes no weight to any ancestor and can never be
+    /// `filter_block_tree`, `compute_node_weights` and `walk_head` read, so a
+    /// root with no row contributes no weight to any ancestor and can never be
     /// walked to.
     ///
     /// The block and its state stay in their own tables. Nothing reads them
@@ -2334,6 +2447,34 @@ impl Store {
     }
 
     // ============ Beacon Head ============
+
+    /// The payload status of the head node fork choice last picked, for the
+    /// store's *current* head root only: `None` before this process has
+    /// computed a head, and also while the recorded node is not the current
+    /// head (a head move whose status is not recorded yet). Never a status
+    /// belonging to another root.
+    pub fn head_payload_status(&self) -> Option<PayloadStatus> {
+        let head = self.head().ok()?;
+        self.payload_status_of_head_node(head)
+    }
+
+    /// The recorded status, if it was recorded for `head`.
+    fn payload_status_of_head_node(&self, head: H256) -> Option<PayloadStatus> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .head_node_payload_status
+            .filter(|(root, _)| *root == head)
+            .map(|(_, status)| status)
+    }
+
+    /// Records the head node fork choice just picked: its block `root` and
+    /// payload `status`. Order against [`Store::update_checkpoints`] does not
+    /// matter, since readers only use the status for a head whose root equals
+    /// the recorded one.
+    pub fn set_head_payload_status(&self, root: H256, status: PayloadStatus) {
+        self.beacon.lock().unwrap().head_node_payload_status = Some((root, status));
+    }
 
     /// The beacon fork-choice head as `(slot, root)`, or `None` if the head
     /// row names a block this store has no header for.
@@ -3135,9 +3276,11 @@ impl Store {
 
     // ============ Beacon Fork-Choice Scratch ============
     //
-    // None of these carry a `Result`: the beacon fork choice's error type
-    // lives in `ethlambda-types` and cannot name a storage error, so these
-    // accessors take and return plain values like the rest of this scratch.
+    // The accessors on in-memory scratch carry no `Result`: the beacon fork
+    // choice's error type lives in `ethlambda-types` and cannot name a storage
+    // error, so they take and return plain values. The gloas write-through
+    // ones (`set_gloas_block_timeliness`, `insert_verified_payload`) write a
+    // row and so `expect` on the backend like the other infallible writers.
 
     /// The block root proposer boost currently applies to. Resets every slot.
     pub fn proposer_boost_root(&self) -> H256 {
@@ -3149,9 +3292,17 @@ impl Store {
         self.beacon.lock().unwrap().proposer_boost_root = root;
     }
 
-    /// Whether `root` arrived within the same-slot reorg window. `None` when
-    /// no timeliness has been recorded for the block yet.
-    pub fn block_timeliness(&self, root: &H256) -> Option<bool> {
+    /// `root`'s two timeliness deadlines,
+    /// `[ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX]`. `None` when no
+    /// timeliness has been recorded for the block yet.
+    ///
+    /// A pre-gloas caller wants `ATTESTATION_TIMELINESS_INDEX`, the same-slot
+    /// reorg deadline this answered alone before gloas added the second;
+    /// `is_head_late` reads exactly that index rather than a narrower
+    /// accessor existing beside this one, since gloas and pre-gloas share
+    /// one record per block and pre-gloas code writes both entries of it
+    /// (see [`Store::set_block_timeliness`]).
+    pub fn block_timeliness(&self, root: &H256) -> Option<[bool; NUM_BLOCK_TIMELINESS_DEADLINES]> {
         self.beacon
             .lock()
             .unwrap()
@@ -3160,13 +3311,36 @@ impl Store {
             .copied()
     }
 
-    /// Records whether `root` arrived within the same-slot reorg window.
-    pub fn set_block_timeliness(&mut self, root: H256, timely: bool) {
+    /// Records `root`'s two timeliness deadlines in memory only. See
+    /// [`Store::block_timeliness`]. A gloas block uses
+    /// [`Store::set_gloas_block_timeliness`] instead, since only gloas reads
+    /// the entry back after a restart.
+    pub fn set_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
         self.beacon
             .lock()
             .unwrap()
             .block_timeliness
             .insert(root, timely);
+    }
+
+    /// Records a gloas block's timeliness in memory and in
+    /// `Table::BlockTimeliness`, so a resumed store still has it.
+    pub fn set_gloas_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
+        let entries = vec![(root.to_ssz(), timely.map(u8::from).to_vec())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::BlockTimeliness, entries)
+            .expect("put block timeliness");
+        batch.commit().expect("commit");
+        self.set_block_timeliness(root, timely);
     }
 
     /// Whether `index` has been observed equivocating (via a processed
@@ -3188,6 +3362,344 @@ impl Store {
             .insert(index);
     }
 
+    /// Gloas: whether `root`'s execution payload envelope has been locally
+    /// delivered and verified, the specification's `is_payload_verified`.
+    pub fn has_verified_payload(&self, root: &H256) -> bool {
+        self.beacon.lock().unwrap().verified_payloads.contains(root)
+    }
+
+    /// Gloas: stores a verified execution payload envelope and records that
+    /// its block's payload is verified.
+    ///
+    /// `slot` is the slot of the block the envelope fulfills, which the
+    /// caller has already read while verifying the envelope against it; the
+    /// envelope carries none and the row is keyed by it.
+    pub fn insert_verified_payload(
+        &mut self,
+        slot: u64,
+        envelope: &gloas::SignedExecutionPayloadEnvelope,
+    ) {
+        let root = envelope.message.beacon_block_root;
+        debug_assert_eq!(
+            beacon_block_slot(self.backend.as_ref(), &root),
+            Some(slot),
+            "the slot must be the envelope's block's own"
+        );
+        let entries = vec![(encode_slot_root_key(slot, &root), envelope.to_ssz())];
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(Table::ExecutionPayloadEnvelopes, entries)
+            .expect("put execution payload envelope");
+        batch.commit().expect("commit");
+        self.beacon.lock().unwrap().verified_payloads.insert(root);
+    }
+
+    /// Gloas: forgets that `root`'s payload is verified and deletes its stored
+    /// envelope, for a payload the execution layer later found invalid.
+    ///
+    /// The FULL node of the block stops existing for fork choice (it is
+    /// derived from [`Self::has_verified_payload`]) and the envelope is no
+    /// longer served to peers. Returns whether `root` was verified.
+    pub fn remove_verified_payload(&mut self, root: &H256) -> bool {
+        let was_verified = {
+            let mut scratch = self.beacon.lock().unwrap();
+            // The cached hash goes too: nothing may resolve a payload this
+            // store no longer holds as a FULL node.
+            scratch.el_block_hashes.remove(root);
+            scratch.verified_payloads.remove(root)
+        };
+        if let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) {
+            let keys = vec![encode_slot_root_key(slot, root)];
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::ExecutionPayloadEnvelopes, keys)
+                .expect("delete execution payload envelope");
+            batch.commit().expect("commit");
+        }
+        was_verified
+    }
+
+    /// Gloas: the roots whose payload is verified, in no particular order.
+    pub fn verified_payload_roots(&self) -> Vec<H256> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .verified_payloads
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Gloas: the verified envelope stored for `root`, if any.
+    pub fn get_execution_payload_envelope(
+        &self,
+        root: &H256,
+    ) -> Result<Option<gloas::SignedExecutionPayloadEnvelope>, Error> {
+        let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) else {
+            return Ok(None);
+        };
+        let view = self.backend.begin_read().expect("read view");
+        let bytes = view
+            .get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get");
+        Ok(bytes.map(|bytes| {
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+                .expect("a stored envelope decodes")
+        }))
+    }
+
+    /// Gloas: the stored envelopes of payloads on the canonical chain, for the
+    /// slots `start_slot..=end_slot`, in ascending slot order.
+    ///
+    /// Serves `ExecutionPayloadEnvelopesByRange`. A payload is part of the
+    /// chain when the next canonical block builds on it: that block's bid
+    /// `parent_block_hash` equals the payload's `block_hash`. A block whose
+    /// successor builds on its empty branch has its envelope left out, even
+    /// when this node holds one. The head has no successor, so its envelope is
+    /// served only when the head node fork choice picked is `Full`
+    /// ([`Self::head_payload_status`]); before this process has computed a head
+    /// the status is unknown and the head's envelope is withheld.
+    ///
+    /// Canonical blocks come from `BlockRoots` and the whole answer is read
+    /// from one view, like [`get_signed_blocks_by_slot_range`](Self::get_signed_blocks_by_slot_range).
+    /// The successor of the last block in the window may lie past `end_slot`,
+    /// so the index is read on beyond it, up to the head, until one is found;
+    /// that search is skipped when the last block holds no envelope to judge.
+    pub fn canonical_execution_payload_envelopes(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, Error> {
+        if self.chain != Chain::Beacon {
+            Self::lean_only("canonical_execution_payload_envelopes");
+        }
+        let recorded_head = self.beacon.lock().unwrap().head_node_payload_status;
+        let view = self.backend.begin_read().expect("read view");
+        let canonical_root = |slot: u64| -> Option<H256> {
+            view.get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+                .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+        };
+
+        let envelope_row = |slot: u64, root: &H256| {
+            view.get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get")
+        };
+
+        let mut window: Vec<(u64, H256)> = (start_slot..=end_slot)
+            .filter_map(|slot| canonical_root(slot).map(|root| (slot, root)))
+            .collect();
+        // Head and its slot come out of the same view as the rest, so a head
+        // move partway through cannot pair one branch's index with another's.
+        let head_root = view
+            .get(Table::Metadata, KEY_HEAD)
+            .expect("get head")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"));
+        // The head's envelope is served only when the recorded node is this
+        // view's head and FULL; a status recorded for another root says
+        // nothing about this one.
+        let head_is_full = head_root.is_some()
+            && recorded_head == head_root.map(|root| (root, PayloadStatus::Full));
+        let head_slot = head_root
+            .and_then(|head| view.get(Table::BlockHeaders, &head.to_ssz()).expect("get"))
+            .map(|bytes| decode_beacon_block_value(&bytes).slot());
+        if let Some(&(last_slot, last_root)) = window.last()
+            && envelope_row(last_slot, &last_root).is_some()
+            && let Some(head_slot) = head_slot
+        {
+            let successor = (end_slot.saturating_add(1)..=head_slot)
+                .find_map(|slot| canonical_root(slot).map(|root| (slot, root)));
+            window.extend(successor);
+        }
+
+        let mut envelopes = Vec::new();
+        for (index, &(slot, root)) in window.iter().enumerate() {
+            if slot > end_slot {
+                break;
+            }
+            let Some(bytes) = envelope_row(slot, &root) else {
+                continue;
+            };
+            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+                .expect("a stored envelope decodes");
+            let builds_on_it = match window.get(index + 1) {
+                // No successor: this is the head, whose envelope is part of
+                // the chain only on the FULL node.
+                None => head_is_full,
+                Some((_, next_root)) => {
+                    let next = view
+                        .get(Table::BlockHeaders, &next_root.to_ssz())
+                        .expect("get")
+                        .map(|bytes| decode_beacon_block_value(&bytes));
+                    match next {
+                        Some(next) => {
+                            builds_on_payload(&next, &envelope.message.payload.block_hash)
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if builds_on_it {
+                envelopes.push(envelope);
+            }
+        }
+        Ok(envelopes)
+    }
+
+    /// Rebuilds the in-memory `verified_payloads` and `block_timeliness` from
+    /// their tables, for every block fork choice can still reach.
+    ///
+    /// Walks `LiveChain` from the finalized block's slot up: the finalized
+    /// block is included because its payload status decides which branch its
+    /// children build on. Older rows stay on disk unread, but the walk still
+    /// iterates every `LiveChain` key to find the window (the index is not
+    /// pruned on a beacon directory), so the scan grows with chain length;
+    /// only the point reads are limited to the window.
+    ///
+    /// Also seeds both payload-committee vote vectors, empty, for every gloas
+    /// block in the window. Nothing persists the votes, and the head walk and
+    /// `notify_ptc_messages` read a gloas block's vectors, so an absent entry
+    /// would fail them with a `SpecAssert`. Empty is what `on_block` gives a
+    /// block it just imported, and is true here: this process has seen no
+    /// votes for it.
+    fn restore_beacon_scratch(&self) {
+        let finalized = self.beacon_finalized_checkpoint();
+        // Without the finalized block the epoch start would be wrong, since a
+        // finalized block can sit below its checkpoint's epoch start; the
+        // anchor is the lowest slot this directory holds.
+        let floor =
+            beacon_block_slot(self.backend.as_ref(), &finalized.root).unwrap_or(self.anchor_slot);
+
+        let view = self.backend.begin_read().expect("read view");
+        let mut timeliness = HashMap::new();
+        let mut payloads = HashSet::new();
+        let mut gloas_roots = Vec::new();
+        for (key, _) in view
+            .prefix_iterator(Table::LiveChain, &[])
+            .expect("iterator")
+            .filter_map(Result::ok)
+        {
+            let (slot, root) = decode_slot_root_key(&key);
+            if slot < floor {
+                continue;
+            }
+            if let Some(bytes) = view
+                .get(Table::BlockTimeliness, &root.to_ssz())
+                .expect("get")
+            {
+                let bytes: [u8; NUM_BLOCK_TIMELINESS_DEADLINES] = bytes
+                    .as_slice()
+                    .try_into()
+                    .expect("a stored timeliness has one byte per deadline");
+                timeliness.insert(root, bytes.map(|byte| byte != 0));
+            }
+            let fork = view
+                .get(Table::BlockHeaders, &root.to_ssz())
+                .expect("get")
+                .and_then(|bytes| bytes.first().copied())
+                .and_then(ForkName::from_selector);
+            let is_gloas = match fork {
+                Some(ForkName::Gloas) => true,
+                Some(
+                    ForkName::Phase0
+                    | ForkName::Altair
+                    | ForkName::Bellatrix
+                    | ForkName::Capella
+                    | ForkName::Deneb
+                    | ForkName::Electra
+                    | ForkName::Fulu,
+                ) => false,
+                // A beacon directory never holds a lean block row.
+                Some(ForkName::Lean) => unreachable!("lean block row in a beacon directory"),
+                // A LiveChain row with no block: nothing to seed.
+                None => false,
+            };
+            if is_gloas {
+                gloas_roots.push(root);
+            }
+            if view
+                .get(Table::ExecutionPayloadEnvelopes, &key)
+                .expect("get")
+                .is_some()
+            {
+                payloads.insert(root);
+            }
+        }
+        drop(view);
+
+        let mut scratch = self.beacon.lock().unwrap();
+        scratch.block_timeliness.extend(timeliness);
+        scratch.verified_payloads.extend(payloads);
+        for root in gloas_roots {
+            scratch
+                .payload_timeliness_vote
+                .insert(root, vec![None; PTC_SIZE]);
+            scratch
+                .payload_data_availability_vote
+                .insert(root, vec![None; PTC_SIZE]);
+        }
+    }
+
+    /// `root`'s payload link, if one has been recorded. See
+    /// [`BlockPayloadLink`] for what it holds and why a missing entry is not
+    /// an error.
+    pub fn payload_link(&self, root: &H256) -> Option<BlockPayloadLink> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .get(root)
+            .map(|(_slot, link)| *link)
+    }
+
+    /// Records `root`'s payload link, against the block's `slot` that the
+    /// unfinalized-window bound prunes it by.
+    ///
+    /// `&self`, unlike the other setters here: the head computation records the
+    /// link of a block it had to decode and only has a shared reference to the
+    /// store, and the scratch is behind its own lock either way.
+    pub fn set_payload_link(&self, root: H256, slot: u64, link: BlockPayloadLink) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .insert(root, (slot, link));
+    }
+
+    /// Drops payload links strictly below `finalized_slot`, always keeping
+    /// `keep`.
+    ///
+    /// The same bound and exemption as
+    /// [`Store::prune_beacon_el_block_hashes`], with one refinement. The head
+    /// walk weighs only blocks at or above the finalized block, so nothing
+    /// below that block's own slot is read again, and a link asked for after
+    /// all is derived again. That slot can be below `finalized_slot` (the
+    /// checkpoint's stored slot is its epoch's start, and a skipped boundary
+    /// leaves the block earlier), so the bound is the lower of the two, read
+    /// from `keep`'s own recorded link.
+    ///
+    /// Prunes nothing when `keep` has no recorded link, since the block's own
+    /// slot is then unknown and a bound taken from the checkpoint could drop
+    /// links the walk still reads. A caller records that link first (see
+    /// `fork_choice::ensure_payload_link`); it is missing after this method
+    /// only when the block is not stored at all.
+    pub fn prune_beacon_payload_links(&mut self, finalized_slot: u64, keep: H256) {
+        let mut beacon = self.beacon.lock().unwrap();
+        let Some(&(keep_slot, _link)) = beacon.payload_links.get(&keep) else {
+            return;
+        };
+        let bound = keep_slot.min(finalized_slot);
+        beacon
+            .payload_links
+            .retain(|root, (slot, _link)| *slot >= bound || *root == keep);
+    }
+
     /// The latest attestation recorded for validator `index`, if any.
     pub fn latest_message(&self, index: u64) -> Option<LatestMessage> {
         self.beacon
@@ -3205,6 +3717,49 @@ impl Store {
             .unwrap()
             .latest_messages
             .insert(index, message);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s payload was timely, one entry per PTC member and `None` for a
+    /// member that has not voted yet. `None` when `root` has no vote vector at
+    /// all yet (`get_forkchoice_store`/`on_block` seed one per block).
+    pub fn payload_timeliness_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-timeliness vote vector.
+    pub fn set_payload_timeliness_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .insert(root, votes);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s blob data was available. The sibling of
+    /// [`Store::payload_timeliness_vote`].
+    pub fn payload_data_availability_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-data-availability vote vector.
+    pub fn set_payload_data_availability_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .insert(root, votes);
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
@@ -3250,6 +3805,66 @@ impl Store {
             .payload_statuses
             .get(&block_hash)
             .cloned()
+    }
+
+    /// The execution client's verdict on a gloas block's payload, as the
+    /// specification's `block_payload_statuses.get(root,
+    /// PAYLOAD_STATUS_NOT_VALIDATED)`: a root with no recorded verdict reads as
+    /// `Syncing`, which is `NOT_VALIDATED`.
+    ///
+    /// Gloas roots only: a pre-gloas root's verdict is its block's own, which
+    /// `fork_choice::block_payload_status` derives. Envelope import is what
+    /// records a gloas root's verdict; nothing else writes it. The map is
+    /// scratch, so after a restart the verdicts of gloas blocks imported before
+    /// it are absent and votes for their full payload are ignored until those
+    /// blocks age out of the attestation window. A known, bounded gap.
+    pub fn beacon_block_payload_status(&self, root: H256) -> PayloadStatusEnum {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .get(&root)
+            .map_or(PayloadStatusEnum::Syncing, |(_slot, status)| *status)
+    }
+
+    /// Whether any recorded gloas payload verdict is still `NOT_VALIDATED`.
+    ///
+    /// The cheap half of resolving optimistic payloads, like
+    /// [`Self::has_beacon_optimistic_roots`]: with a healthy execution client
+    /// it is always `false`, so callers can skip a `block_index` scan.
+    pub fn has_unvalidated_block_payloads(&self) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .values()
+            .any(|(_slot, status)| status.is_not_validated())
+    }
+
+    /// Records the execution client's verdict on `root`'s payload, against the
+    /// block's slot. A later verdict replaces an earlier one, since an
+    /// optimistic payload is resolved one way or the other.
+    pub fn insert_beacon_block_payload_status(
+        &mut self,
+        root: H256,
+        slot: u64,
+        status: PayloadStatusEnum,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .insert(root, (slot, status));
+    }
+
+    /// Drops payload verdicts strictly below `finalized_slot`, which no
+    /// attestation rule can ask about any more.
+    pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
     }
 
     /// Records an execution client's answer for a payload. The fixture format
@@ -3479,6 +4094,66 @@ impl Store {
         Ok(())
     }
 
+    /// Decode a stored sidecar row, as the fork its slot's epoch names.
+    ///
+    /// The rows carry no fork tag (and gaining one would need a `DB_VERSION`
+    /// bump), but a fork is a function of the slot and the config, both known
+    /// here, so the schedule tells a fulu row from a gloas one.
+    pub fn decode_data_column_sidecar(
+        &self,
+        slot: u64,
+        encoded: &[u8],
+    ) -> Result<DataColumnSidecar, Error> {
+        let fork = self.config.fork_at_epoch(slot / SLOTS_PER_EPOCH);
+        DataColumnSidecar::from_ssz(fork, encoded)
+            .map_err(|_| Error::UndecodableDataColumn { slot, fork })
+    }
+
+    /// [`Self::put_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::put_pending_data_column_sidecar`], for a sidecar in hand.
+    pub fn put_pending_data_column(&self, sidecar: &DataColumnSidecar) -> Result<(), Error> {
+        self.put_pending_data_column_sidecar(
+            sidecar.slot(),
+            &sidecar.block_root(),
+            sidecar.index(),
+            sidecar.to_ssz(),
+        )
+    }
+
+    /// [`Self::take_pending_data_column_sidecar`], decoded. A row that does not
+    /// decode is still taken, so it cannot be replayed into the same failure.
+    pub fn take_pending_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.take_pending_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
+    /// [`Self::get_data_column_sidecar`], decoded.
+    pub fn get_data_column(
+        &self,
+        slot: u64,
+        block_root: &H256,
+        column_index: u64,
+    ) -> Result<Option<DataColumnSidecar>, Error> {
+        self.get_data_column_sidecar(slot, block_root, column_index)?
+            .map(|encoded| self.decode_data_column_sidecar(slot, &encoded))
+            .transpose()
+    }
+
     /// Drop every parked row this directory holds.
     ///
     /// Called once at startup. The only index into `PendingDataColumns` is the
@@ -3645,6 +4320,22 @@ impl Store {
         end_slot: u64,
         columns: &[u64],
     ) -> Result<Vec<Vec<u8>>, Error> {
+        Ok(self
+            .data_column_rows_in_range(start_slot, end_slot, columns)?
+            .into_iter()
+            .map(|(_, encoded)| encoded)
+            .collect())
+    }
+
+    /// [`Self::data_column_sidecars_in_range`] with each row's slot beside its
+    /// bytes, which is what [`Self::decode_data_column_sidecar`] needs to pick
+    /// the fork a range spanning one boundary decodes each row as.
+    pub fn data_column_rows_in_range(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+        columns: &[u64],
+    ) -> Result<Vec<(u64, Vec<u8>)>, Error> {
         let view = self.backend.begin_read().expect("read view");
         let mut found = Vec::new();
         for slot in start_slot..end_slot {
@@ -3665,7 +4356,7 @@ impl Store {
                     .try_into()
                     .expect("a column key ends in an eight-byte index");
                 if columns.contains(&u64::from_be_bytes(index_bytes)) {
-                    found.push(value.to_vec());
+                    found.push((slot, value.to_vec()));
                 }
             }
         }
@@ -5612,8 +6303,7 @@ mod tests {
                 effective_balance: i,
                 ..Default::default()
             };
-            parent.validators_mut().push(validator).unwrap();
-            parent.balances_mut().push(i).unwrap();
+            parent.push_validator(validator, i).unwrap();
         }
         parent.apply_pending_mutations();
         store
@@ -5626,7 +6316,7 @@ mod tests {
         let mut child = parent;
         *child.slot_mut() = 11;
         child.latest_block_header_mut().parent_root = parent_root;
-        child.balances_mut()[0] += 1;
+        *child.balance_mut(0).unwrap() += 1;
         child.apply_pending_mutations();
         store
             .insert_signed_block(child_root, beacon_test_block(11, parent_root))
@@ -5643,7 +6333,7 @@ mod tests {
         let resident_parent = cold.get_state(&parent_root).expect("get").expect("present");
         let decoded = cold.get_state(&child_root).expect("get").expect("present");
 
-        assert!(decoded.validators().ptr_eq(resident_parent.validators()));
+        assert!(decoded.validators_ptr_eq(&resident_parent));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
@@ -6646,9 +7336,311 @@ mod tests {
         assert!(store.is_equivocating(42));
         assert!(!store.is_equivocating(43));
 
-        clone.set_block_timeliness(H256::from([1u8; 32]), true);
-        assert_eq!(store.block_timeliness(&H256::from([1u8; 32])), Some(true));
+        clone.set_block_timeliness(H256::from([1u8; 32]), [true, false]);
+        assert_eq!(
+            store.block_timeliness(&H256::from([1u8; 32])),
+            Some([true, false])
+        );
         assert_eq!(store.block_timeliness(&H256::from([2u8; 32])), None);
+    }
+
+    /// An envelope for `root` with every field at its zero value.
+    fn test_envelope(root: H256) -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; ethlambda_types::beacon::preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: root,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A beacon directory whose finalized checkpoint is the epoch-1 boundary
+    /// checkpoint naming `finalized_root`, so the finalized slot is the first
+    /// slot of that epoch.
+    fn beacon_backend_finalized_at(finalized_root: H256) -> Arc<InMemoryBackend> {
+        let backend = Arc::new(InMemoryBackend::new());
+        let finalized = BeaconCheckpoint {
+            epoch: 1,
+            root: finalized_root,
+        };
+        Store::init_beacon(
+            backend.clone(),
+            0,
+            Config::mainnet(),
+            finalized_root,
+            Store::beacon_checkpoint_as_stored(finalized),
+            0,
+        );
+        backend
+    }
+
+    fn reopen(backend: Arc<InMemoryBackend>) -> Store {
+        Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory")
+    }
+
+    /// A gloas signed block with an empty body and a zero signature.
+    fn gloas_test_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// The head's envelope belongs to the served chain only on the FULL node:
+    /// an EMPTY head, or a head whose status this process has not computed,
+    /// withholds it.
+    #[test]
+    fn the_heads_envelope_is_served_only_when_the_head_node_is_full() {
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            H256::ZERO,
+            Store::beacon_checkpoint_as_stored(BeaconCheckpoint::default()),
+            0,
+        );
+        store
+            .insert_signed_block(H256::ZERO, gloas_test_block(0, H256::ZERO))
+            .expect("insert anchor");
+        let block = gloas_test_block(1, H256::ZERO);
+        let root = block.message_hash_tree_root();
+        store.insert_signed_block(root, block).expect("insert head");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("advance head");
+        let envelope = test_envelope(root);
+        store.insert_verified_payload(1, &envelope);
+
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(root, PayloadStatus::Empty);
+        assert_eq!(store.head_payload_status(), Some(PayloadStatus::Empty));
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        // A FULL status recorded for another root (the previous head, say)
+        // must not release this head's envelope.
+        store.set_head_payload_status(H256::repeat_byte(0xee), PayloadStatus::Full);
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(root, PayloadStatus::Full);
+        assert_eq!(
+            store.canonical_execution_payload_envelopes(1, 1).unwrap(),
+            vec![envelope]
+        );
+    }
+
+    #[test]
+    fn an_unverified_payload_is_forgotten_across_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
+        store.insert_beacon_el_block_hash(root, SLOTS_PER_EPOCH, H256::from([9u8; 32]));
+
+        assert!(store.remove_verified_payload(&root));
+        assert_eq!(store.beacon_el_block_hash(root), None);
+        assert!(!store.remove_verified_payload(&root));
+
+        assert!(!store.has_verified_payload(&root));
+        assert_eq!(store.get_execution_payload_envelope(&root).unwrap(), None);
+        assert!(!reopen(backend).has_verified_payload(&root));
+    }
+
+    #[test]
+    fn a_verified_payload_survives_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        let envelope = test_envelope(root);
+        store.insert_verified_payload(SLOTS_PER_EPOCH, &envelope);
+        assert!(store.has_verified_payload(&root));
+
+        let reopened = reopen(backend);
+
+        assert!(reopened.has_verified_payload(&root));
+        assert_eq!(
+            reopened
+                .get_execution_payload_envelope(&root)
+                .expect("read"),
+            Some(envelope)
+        );
+    }
+
+    #[test]
+    fn block_timeliness_survives_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.set_gloas_block_timeliness(root, [true, false]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&root), Some([true, false]));
+    }
+
+    #[test]
+    fn pre_gloas_timeliness_is_not_persisted() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, beacon_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.set_block_timeliness(root, [true, true]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&root), None);
+    }
+
+    #[test]
+    fn resume_reseeds_empty_vote_vectors_for_gloas_blocks_only() {
+        let gloas_root = H256::from([1u8; 32]);
+        let phase0_root = H256::from([2u8; 32]);
+        let backend = beacon_backend_finalized_at(gloas_root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(gloas_root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store
+            .insert_signed_block(
+                phase0_root,
+                beacon_test_block(SLOTS_PER_EPOCH + 1, gloas_root),
+            )
+            .expect("insert block");
+
+        let reopened = reopen(backend);
+
+        let empty = vec![None; PTC_SIZE];
+        assert_eq!(
+            reopened.payload_timeliness_vote(&gloas_root),
+            Some(empty.clone())
+        );
+        assert_eq!(
+            reopened.payload_data_availability_vote(&gloas_root),
+            Some(empty)
+        );
+        assert_eq!(reopened.payload_timeliness_vote(&phase0_root), None);
+    }
+
+    #[test]
+    fn resume_skips_payloads_below_finality() {
+        // The finalized block sits below its checkpoint's epoch start, and its
+        // child sits between the two: a floor at the epoch start would skip
+        // both, so the child loading shows the floor is the block's own slot.
+        let old = H256::from([1u8; 32]);
+        let finalized = H256::from([2u8; 32]);
+        let child = H256::from([3u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        let slots = [
+            (old, SLOTS_PER_EPOCH - 3, H256::ZERO),
+            (finalized, SLOTS_PER_EPOCH - 2, old),
+            (child, SLOTS_PER_EPOCH - 1, finalized),
+        ];
+        for (root, slot, parent) in slots {
+            store
+                .insert_signed_block(root, gloas_test_block(slot, parent))
+                .expect("insert block");
+            store.insert_verified_payload(slot, &test_envelope(root));
+            store.set_gloas_block_timeliness(root, [true, true]);
+        }
+
+        let reopened = reopen(backend);
+
+        assert!(!reopened.has_verified_payload(&old));
+        assert_eq!(reopened.block_timeliness(&old), None);
+        assert_eq!(reopened.payload_timeliness_vote(&old), None);
+        for root in [finalized, child] {
+            assert!(reopened.has_verified_payload(&root));
+            assert_eq!(reopened.block_timeliness(&root), Some([true, true]));
+        }
+        // Skipped in memory only: the row stays on disk.
+        assert!(
+            reopened
+                .get_execution_payload_envelope(&old)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn resume_without_the_finalized_block_floors_at_the_anchor_slot() {
+        // The finalized block has no row, so the floor falls back; a block
+        // below the checkpoint's epoch start must still load.
+        let finalized = H256::from([2u8; 32]);
+        let block = H256::from([3u8; 32]);
+        let backend = beacon_backend_finalized_at(finalized);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(block, gloas_test_block(5, H256::ZERO))
+            .expect("insert block");
+        store.set_gloas_block_timeliness(block, [true, true]);
+
+        let reopened = reopen(backend);
+
+        assert_eq!(reopened.block_timeliness(&block), Some([true, true]));
     }
 
     #[test]
@@ -6656,7 +7648,9 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 3,
+            slot: 24,
             root: H256::from([7u8; 32]),
+            payload_present: false,
         };
 
         store.set_latest_message(1, message);
@@ -6765,6 +7759,32 @@ mod tests {
     }
 
     #[test]
+    fn block_payload_statuses_default_to_not_validated_and_prune_below_finality() {
+        let mut store = Store::test_store();
+        let below = H256::repeat_byte(1);
+        let at = H256::repeat_byte(2);
+        assert!(
+            store.beacon_block_payload_status(below).is_not_validated(),
+            "an absent root reads as the specification's default"
+        );
+
+        store.insert_beacon_block_payload_status(below, 4, PayloadStatusEnum::Valid);
+        store.insert_beacon_block_payload_status(at, 5, PayloadStatusEnum::Invalid);
+        assert_eq!(
+            store.beacon_block_payload_status(below),
+            PayloadStatusEnum::Valid
+        );
+
+        store.prune_beacon_block_payload_statuses(5);
+
+        assert!(store.beacon_block_payload_status(below).is_not_validated());
+        assert_eq!(
+            store.beacon_block_payload_status(at),
+            PayloadStatusEnum::Invalid
+        );
+    }
+
+    #[test]
     fn el_block_hashes_prune_strictly_below_the_finalized_slot() {
         let mut store = Store::test_store();
         let below = H256::repeat_byte(1);
@@ -6817,6 +7837,50 @@ mod tests {
             store.beacon_el_block_hash(head),
             Some(ExecutionBlockHash::repeat_byte(0xb3))
         );
+    }
+
+    /// Payload links are pruned like the execution hashes: strictly below the
+    /// finalized slot, keeping the finalized root even when its block sits
+    /// below that slot.
+    #[test]
+    fn payload_links_prune_strictly_below_the_finalized_slot_and_keep_its_root() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let at = H256::repeat_byte(3);
+        let above = H256::repeat_byte(4);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(finalized, 30, link);
+        let between = H256::repeat_byte(5);
+        store.set_payload_link(stale, 29, link);
+        // Between the finalized block (30) and the checkpoint's slot (32): a
+        // fork block the head walk still reads.
+        store.set_payload_link(between, 31, link);
+        store.set_payload_link(at, 32, link);
+        store.set_payload_link(above, 33, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&finalized), Some(link));
+        assert_eq!(store.payload_link(&stale), None);
+        assert_eq!(store.payload_link(&between), Some(link));
+        assert_eq!(store.payload_link(&at), Some(link));
+        assert_eq!(store.payload_link(&above), Some(link));
+    }
+
+    /// Without a link for the finalized root its own slot is unknown, so the
+    /// prune leaves every link alone rather than bounding on the checkpoint.
+    #[test]
+    fn payload_links_are_not_pruned_when_the_finalized_root_has_none() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(stale, 29, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&stale), Some(link));
     }
 
     #[test]
@@ -6999,6 +8063,101 @@ mod tests {
 
     fn sidecar_bytes(marker: u8) -> Vec<u8> {
         vec![marker; 16]
+    }
+
+    /// A beacon store whose config puts gloas at epoch 2, so slots below
+    /// `2 * SLOTS_PER_EPOCH` are fulu and the rest gloas.
+    fn gloas_scheduled_store() -> Store {
+        let config = Config {
+            fulu_fork_epoch: 0,
+            gloas_fork_epoch: 2,
+            ..Config::mainnet()
+        };
+        Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            config,
+            H256::ZERO,
+            Checkpoint::default(),
+            0,
+        )
+    }
+
+    fn fulu_sidecar_at(slot: u64, index: u64) -> DataColumnSidecar {
+        let mut sidecar = ethlambda_types::beacon::containers::fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: Default::default(),
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                ethlambda_types::beacon::preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        };
+        sidecar.signed_block_header.message.slot = slot;
+        DataColumnSidecar::Fulu(sidecar)
+    }
+
+    fn gloas_sidecar_at(slot: u64, index: u64, root: H256) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(
+            ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+                index,
+                slot,
+                beacon_block_root: root,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn a_gloas_sidecar_round_trips_through_both_column_tables() {
+        let store = gloas_scheduled_store();
+        let root = H256::repeat_byte(7);
+        let slot = 2 * SLOTS_PER_EPOCH + 3;
+        let sidecar = gloas_sidecar_at(slot, 4, root);
+
+        store.put_data_column(&sidecar).unwrap();
+        assert!(store.has_data_column(slot, &root, 4));
+        assert_eq!(
+            store.get_data_column(slot, &root, 4).unwrap(),
+            Some(sidecar.clone())
+        );
+
+        let parked = gloas_sidecar_at(slot, 5, root);
+        store.put_pending_data_column(&parked).unwrap();
+        // Parked rows are not custodied ones.
+        assert!(!store.has_data_column(slot, &root, 5));
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            Some(parked)
+        );
+        assert_eq!(
+            store.take_pending_data_column(slot, &root, 5).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_row_decodes_as_the_fork_its_slot_names() {
+        let store = gloas_scheduled_store();
+        let fulu = fulu_sidecar_at(SLOTS_PER_EPOCH, 1);
+        let root = fulu.block_root();
+        store.put_data_column(&fulu).unwrap();
+        assert_eq!(
+            store.get_data_column(SLOTS_PER_EPOCH, &root, 1).unwrap(),
+            Some(fulu)
+        );
+
+        // The same bytes filed under a gloas slot are not a gloas sidecar.
+        let gloas_slot = 2 * SLOTS_PER_EPOCH;
+        let encoded = fulu_sidecar_at(gloas_slot, 1).to_ssz();
+        assert!(matches!(
+            store.decode_data_column_sidecar(gloas_slot, &encoded),
+            Err(Error::UndecodableDataColumn { .. })
+        ));
     }
 
     #[test]

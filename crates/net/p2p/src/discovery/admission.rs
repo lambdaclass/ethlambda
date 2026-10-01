@@ -18,6 +18,7 @@
 //! ([`rank_candidates`]).
 
 use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 
 use ethrex_p2p::peer_filter::PeerFilter;
 use ethrex_p2p::types::NodeRecord;
@@ -27,6 +28,7 @@ use tracing::debug;
 
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::beacon::constants;
+use ethlambda_types::beacon::primitives::ForkDigest;
 
 use super::enr::{
     ATTNETS_ENR_KEY, CGC_ENR_KEY, ETH2_ENR_KEY, EnrForkId, node_id_from_peer_id, read_ip,
@@ -80,21 +82,49 @@ pub(crate) enum RejectReason {
 /// Holds what [`admit`] needs to judge a record, so the dial loop no longer
 /// carries the local fork id and committee count around: the value handed to
 /// [`PeerTableServer::spawn_with_filter`](ethrex_p2p::peer_table::PeerTableServer::spawn_with_filter)
-/// judges by the same rules the dial loop later asks for dial targets. It is
+/// judges by the same rules the dial loop later asks for dial targets.
+///
 /// [`Clone`] because the peer table takes ownership of the filter it runs, and
-/// both fields are plain data.
+/// every clone shares one [`Policy`], so [`Self::set_fork_id`] at a fork
+/// boundary changes what the table's copy admits as well as the dial loop's.
 #[derive(Clone)]
 pub struct LeanFilter {
-    fork_id: EnrForkId,
+    policy: Arc<RwLock<Policy>>,
     attestation_committee_count: u64,
+}
+
+/// The part of admission that moves at a fork boundary.
+#[derive(Debug, Clone)]
+struct Policy {
+    /// This node's own `eth2` entry; its digest is always admitted.
+    fork_id: EnrForkId,
+    /// Further digests admitted alongside it: while a boundary's subscription
+    /// window is open, peers are still legitimately on the other side of it.
+    also_admitted: Vec<ForkDigest>,
 }
 
 impl LeanFilter {
     pub(crate) fn new(fork_id: EnrForkId, attestation_committee_count: u64) -> Self {
         Self {
-            fork_id,
+            policy: Arc::new(RwLock::new(Policy {
+                fork_id,
+                also_admitted: Vec::new(),
+            })),
             attestation_committee_count,
         }
+    }
+
+    /// Replace the local `eth2` entry and the further digests admitted beside
+    /// it.
+    ///
+    /// The peer table re-judges a record only when its `seq` rises, so a peer
+    /// rejected under the old policy stays rejected until it republishes;
+    /// peers cross a boundary by doing exactly that.
+    pub(crate) fn set_fork_id(&self, fork_id: EnrForkId, also_admitted: Vec<ForkDigest>) {
+        *self.policy.write().expect("admission policy lock poisoned") = Policy {
+            fork_id,
+            also_admitted,
+        };
     }
 
     /// What to dial for a record that has already been admitted, or `None` if it
@@ -106,13 +136,23 @@ impl LeanFilter {
     /// unchanged, and the peer table hands out clones: a caller that reaches
     /// this with an arbitrary record should get nothing to dial, not a panic.
     pub(crate) fn dial_target(&self, record: &NodeRecord) -> Option<DiscoveredPeer> {
-        admit(record, &self.fork_id, self.attestation_committee_count).ok()
+        self.judge(record).ok()
+    }
+
+    fn judge(&self, record: &NodeRecord) -> Result<DiscoveredPeer, RejectReason> {
+        let policy = self.policy.read().expect("admission policy lock poisoned");
+        admit(
+            record,
+            &policy.fork_id,
+            &policy.also_admitted,
+            self.attestation_committee_count,
+        )
     }
 }
 
 impl PeerFilter for LeanFilter {
     fn accepts(&self, record: &NodeRecord) -> bool {
-        admit(record, &self.fork_id, self.attestation_committee_count)
+        self.judge(record)
             // The only place a rejection is visible: the peer table records
             // that the record failed the filter but says nothing about why.
             .inspect_err(|reason| {
@@ -136,6 +176,7 @@ impl PeerFilter for LeanFilter {
 fn admit(
     record: &NodeRecord,
     local: &EnrForkId,
+    also_admitted: &[ForkDigest],
     attestation_committee_count: u64,
 ) -> Result<DiscoveredPeer, RejectReason> {
     let pairs = record.pairs();
@@ -144,7 +185,7 @@ fn admit(
         .ok_or(RejectReason::MissingForkId)?;
     let remote = EnrForkId::from_ssz_bytes(&raw).map_err(|_| RejectReason::MissingForkId)?;
 
-    if remote.fork_digest != local.fork_digest {
+    if remote.fork_digest != local.fork_digest && !also_admitted.contains(&remote.fork_digest) {
         return Err(RejectReason::ForkDigestMismatch);
     }
     if remote.next_fork_version != local.next_fork_version
@@ -333,7 +374,7 @@ mod tests {
     }
 
     fn admit_record(record: &NodeRecord) -> Result<DiscoveredPeer, RejectReason> {
-        admit(record, &EnrForkId::local(), TEST_COMMITTEE_COUNT)
+        admit(record, &EnrForkId::local(), &[], TEST_COMMITTEE_COUNT)
     }
 
     /// Build a record whose pairs are fully controlled, bypassing
@@ -573,6 +614,36 @@ mod tests {
 
         assert!(!filter().accepts(&record));
         assert!(filter().dial_target(&record).is_none());
+    }
+
+    #[test]
+    fn a_fork_boundary_moves_what_every_clone_admits() {
+        // The peer table owns a clone of the filter, so a boundary has to reach
+        // it through the shared policy rather than through the dial loop's copy.
+        let table_copy = filter();
+        let dial_copy = table_copy.clone();
+
+        let mut next = EnrForkId::local();
+        next.fork_digest = [0xde, 0xad, 0xbe, 0xef];
+        let on_next = record_with(|pairs| {
+            set_eth2(pairs, next);
+            set_quic(pairs, 9001);
+        });
+        let on_local = record_with(|pairs| {
+            set_eth2(pairs, EnrForkId::local());
+            set_quic(pairs, 9001);
+        });
+        assert!(!table_copy.accepts(&on_next));
+
+        // Window open: both sides of the boundary are admitted.
+        dial_copy.set_fork_id(EnrForkId::local(), vec![next.fork_digest]);
+        assert!(table_copy.accepts(&on_next));
+        assert!(table_copy.accepts(&on_local));
+
+        // Switched and window closed: only the new digest.
+        dial_copy.set_fork_id(next, Vec::new());
+        assert!(table_copy.accepts(&on_next));
+        assert!(!table_copy.accepts(&on_local));
     }
 
     #[test]

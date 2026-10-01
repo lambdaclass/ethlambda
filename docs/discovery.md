@@ -89,8 +89,11 @@ A discovered peer is admitted only if:
 - it advertises a `quic` port, a `tcp` port, or both.
 
 The digest compared against is the caller's, not a constant: lean passes its
-hardcoded dummy and `beacon` passes the digest it derived at startup, so one
-admission policy serves both chains.
+hardcoded dummy and `beacon` passes the digest it derived at startup and moves
+it at each fork-digest boundary, so one admission policy serves both chains. The
+record this node serves is not refreshed at a boundary (ethrex's
+`DiscoveryServer` cannot replace it at runtime), so its `eth2` entry keeps the
+startup digest until a restart; see [beacon_wire.md](./beacon_wire.md#the-fork-digest).
 
 A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an

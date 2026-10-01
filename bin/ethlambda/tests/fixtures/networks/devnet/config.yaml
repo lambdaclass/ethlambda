@@ -203,9 +203,11 @@ BLOB_SCHEDULE:
   - EPOCH: 419072  # January 7, 2026, 01:01:11am UTC
     MAX_BLOBS_PER_BLOCK: 21
 
-# Keys a kurtosis-generated config carries that mainnet's does not. The gloas
-# and heze entries are deliberately present: this build cannot process either
-# fork, so they must land in the ignored-key warning rather than in Config.
+# Keys a kurtosis-generated config carries that mainnet's does not. GLOAS_* and
+# PAYLOAD_DUE_BPS are claimed by `Config` now; GAS_LIMIT_SCHEDULE,
+# HEZE_FORK_VERSION, HEZE_FORK_EPOCH, and INCLUSION_LIST_DUE_BPS are still
+# deliberately present: this build cannot process heze, so they must land in
+# the ignored-key warning rather than in Config.
 MAX_REQUEST_PAYLOADS: 128
 CONSOLIDATION_CHURN_LIMIT_QUOTIENT: 65536
 GAS_LIMIT_SCHEDULE: []

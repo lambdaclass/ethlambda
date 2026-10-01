@@ -39,7 +39,7 @@ use ethlambda_state_transition::beacon::{
     helpers::altair::compute_sync_committee_period,
 };
 
-use crate::beacon::ApiError;
+use crate::beacon::{ApiError, refuse_validator_duties_from_gloas};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -160,7 +160,7 @@ fn sync_duties(
     }
 
     Ok(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(head_root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, head_root),
         "data": duties,
     }))
 }
@@ -359,7 +359,7 @@ pub(crate) fn head(store: &Store) -> Result<(H256, Arc<BeaconState>), ApiError> 
 /// Not a lasting refusal: a `VALID` from the execution client clears the root,
 /// and the actor asks through `forkchoiceUpdated` at least once a slot.
 pub(crate) fn require_validated(store: &Store, root: H256) -> Result<(), ApiError> {
-    if store.is_beacon_optimistic(root) {
+    if crate::shared::optimistic::block_is_optimistic(store, root) {
         return Err(ApiError::ServiceUnavailable(
             "the block's execution payload has not been validated yet",
         ));
@@ -433,6 +433,11 @@ async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Stor
 
 fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
+    refuse_validator_duties_from_gloas(
+        &store.config(),
+        epoch,
+        "gloas proposer duties are not supported",
+    )?;
     let (head_root, state) = head(store)?;
 
     let BeaconState::Fulu(fulu) = state.as_ref() else {
@@ -530,6 +535,11 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+    refuse_validator_duties_from_gloas(
+        &store.config(),
+        epoch,
+        "gloas attester duties are not supported",
+    )?;
     let (head_root, state) = head(store)?;
 
     let state_epoch = compute_epoch_at_slot(state.slot());
@@ -627,6 +637,11 @@ async fn get_attestation_data(
 }
 
 fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiError> {
+    refuse_validator_duties_from_gloas(
+        &store.config(),
+        compute_epoch_at_slot(slot),
+        "gloas attestation data is not supported",
+    )?;
     let (head_root, state) = head(store)?;
     if slot < state.slot() {
         return Err(ApiError::BadRequest("slot is before the head block"));
@@ -1104,6 +1119,89 @@ mod tests {
         // Slot 34 is offset 2 in its epoch: committee 3 of 4 per slot is the
         // epoch's committee 11.
         assert_eq!(*network.subscriptions.lock().unwrap(), vec![(11, 34)]);
+    }
+
+    /// Sends the request `request` builds to a store holding a fulu head under
+    /// a schedule that puts gloas one epoch past the head's: the head's epoch
+    /// is the last fulu one, and the next is the first gloas one. `request`
+    /// gets the head's epoch and slot.
+    async fn with_gloas_next_epoch(
+        request: impl Fn(Epoch, Slot) -> Request<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let state = fulu_state();
+        let head_slot = state.slot();
+        let head_epoch = compute_epoch_at_slot(head_slot);
+        let config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, head_epoch + 1);
+        let (store, _root) = crate::test_utils::beacon_store_with_config(state, config);
+        let response = routes()
+            .with_state(store)
+            .layer(Extension(crate::test_utils::idle_engine()))
+            .oneshot(request(head_epoch, head_slot))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn get_request(uri: String) -> Request<Body> {
+        Request::get(uri).body(Body::empty()).unwrap()
+    }
+
+    fn attestation_data_request(slot: Slot) -> Request<Body> {
+        get_request(format!(
+            "/eth/v1/validator/attestation_data?slot={slot}&committee_index=0"
+        ))
+    }
+
+    #[tokio::test]
+    async fn attestation_data_is_answered_up_to_the_last_fulu_slot_and_refused_after() {
+        let (status, _) =
+            with_gloas_next_epoch(|_, head_slot| attestation_data_request(head_slot)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
+            attestation_data_request(compute_start_slot_at_epoch(head_epoch + 1))
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "gloas attestation data is not supported");
+    }
+
+    #[tokio::test]
+    async fn proposer_duties_are_answered_for_the_last_fulu_epoch_and_refused_after() {
+        let (status, _) = with_gloas_next_epoch(|head_epoch, _| {
+            get_request(format!("/eth/v1/validator/duties/proposer/{head_epoch}"))
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
+            get_request(format!(
+                "/eth/v1/validator/duties/proposer/{}",
+                head_epoch + 1
+            ))
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "gloas proposer duties are not supported");
+    }
+
+    #[tokio::test]
+    async fn attester_duties_are_answered_for_the_last_fulu_epoch_and_refused_after() {
+        let attester = |epoch: Epoch| {
+            Request::post(format!("/eth/v1/validator/duties/attester/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from("[\"0\"]"))
+                .unwrap()
+        };
+        let (status, _) = with_gloas_next_epoch(|head_epoch, _| attester(head_epoch)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, json) = with_gloas_next_epoch(|head_epoch, _| attester(head_epoch + 1)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "gloas attester duties are not supported");
     }
 
     #[tokio::test]

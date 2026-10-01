@@ -12,7 +12,8 @@ use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, Re
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
+    beacon::containers::{DataColumnSidecar, SignedBeaconBlock, electra::SingleAttestation},
+    beacon::fork::ForkName,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::HashTreeRoot as _,
@@ -99,7 +100,9 @@ pub async fn handle_gossip_message(
             handle_lean_attestation(server, &payload, compressed_len).await
         }
         _ => match beacon_id {
-            Some(id) => handle_beacon_gossip(server, ctx, id, kind, &payload),
+            Some(id) => {
+                handle_beacon_gossip(server, ctx, id, message.topic.as_str(), kind, &payload)
+            }
             None => trace!(topic = %message.topic, "Gossip on an unhandled topic"),
         },
     }
@@ -224,6 +227,7 @@ fn handle_beacon_gossip(
     server: &P2PServer,
     ctx: &Context<P2PServer>,
     id: GossipId,
+    topic: &str,
     kind: &str,
     payload: &[u8],
 ) {
@@ -233,14 +237,24 @@ fn handle_beacon_gossip(
         debug!(kind, "Beacon gossip arrived on a lean node");
         return;
     };
+    // The fork comes from the topic's own digest: while a boundary's window is
+    // open the node is subscribed under two, and `wire.fork` is only the one it
+    // publishes under.
+    let topic_fork = beacon_topics::topic_digest(topic)
+        .and_then(|digest| wire.schedule.fork_for_digest(digest))
+        .unwrap_or(wire.fork);
     let dispatch = if kind == beacon_topics::BEACON_BLOCK {
         triage_block(server, wire, payload)
     } else if let Some(subnet_id) = beacon_topics::data_column_subnet(kind) {
-        triage_data_column(server, payload, subnet_id)
+        triage_data_column(server, topic_fork, payload, subnet_id)
     } else if kind == beacon_topics::BEACON_AGGREGATE_AND_PROOF {
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
-        triage_attestation(server, wire, payload, subnet_id)
+        triage_attestation(server, topic_fork, payload, subnet_id)
+    } else if kind == beacon_topics::EXECUTION_PAYLOAD {
+        triage_envelope(server, payload)
+    } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
+        triage_payload_attestation(server, payload)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -262,6 +276,12 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
     const KIND: &str = beacon_topics::BEACON_BLOCK;
     let block = match beacon_decode::decode_block(&wire.config, payload) {
         Ok(block) => block,
+        // A block at a fork this build has no rules for, as on the aggregate
+        // topic: an honest peer must not be scored as a bad decoder.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -292,11 +312,31 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 
 /// Decode a data column sidecar and run its cheap gossip checks. Same shape as
 /// [`triage_block`].
-fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
+///
+/// Decodes first rather than gating on the clock: around a fork boundary the
+/// node holds topics under two digests (see `beacon::transition`), so a late
+/// but perfectly legitimate sidecar can still arrive on the old digest's
+/// topic, and a clock check ahead of the decode would drop it, mistaking it for
+/// the new fork's shape just because the clock has moved on. `fork` is the one
+/// the message's own topic digest names, and it picks the container to decode
+/// (fulu's and gloas's differ) and the cheap rules to run. On a decode failure
+/// it also decides the verdict: a failure under a fork this build does not
+/// follow is its own gap, so `Ignore`; under a followed fork it is the
+/// sender's fault, so `Reject`.
+fn triage_data_column(
+    server: &P2PServer,
+    fork: ForkName,
+    payload: &[u8],
+    subnet_id: u64,
+) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
-    let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
+    let sidecar = match beacon_decode::decode_data_column_sidecar(fork, payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
+            if !fork.is_followed() {
+                metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+                return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+            }
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(?err, "Dropping an undecodable data column sidecar");
             return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
@@ -304,13 +344,23 @@ fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dis
     };
     metrics::inc_beacon_gossip(KIND, "decoded");
     let now_ms = unix_now_ms();
-    if let Err(outcome) = gossip::column::cheap_checks(
-        &server.seen_columns,
-        &server.store,
-        &sidecar,
-        subnet_id,
-        now_ms,
-    ) {
+    let cheap = match &sidecar {
+        DataColumnSidecar::Fulu(sidecar) => gossip::column::cheap_checks(
+            &server.seen_columns,
+            &server.store,
+            sidecar,
+            subnet_id,
+            now_ms,
+        ),
+        DataColumnSidecar::Gloas(sidecar) => gossip::column::cheap_checks_gloas(
+            &server.seen_block_columns,
+            &server.store,
+            sidecar,
+            subnet_id,
+            now_ms,
+        ),
+    };
+    if let Err(outcome) = cheap {
         return Dispatch::Report(outcome);
     }
     Dispatch::Validate(Validated::Column(Box::new(sidecar)))
@@ -391,12 +441,12 @@ fn triage_aggregate(
 /// already carries in full.
 fn triage_attestation(
     server: &P2PServer,
-    wire: &BeaconWire,
+    fork: ForkName,
     payload: &[u8],
     subnet_id: u64,
 ) -> Dispatch {
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
-    let attestation = match beacon_decode::decode_attestation(wire.fork, payload) {
+    let attestation = match beacon_decode::decode_attestation(fork, payload) {
         Ok(attestation) => attestation,
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
@@ -435,6 +485,65 @@ fn triage_attestation(
     })
 }
 
+/// Decode a gloas execution payload envelope and run its cheap gossip checks.
+/// Same shape as [`triage_block`].
+fn triage_envelope(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::EXECUTION_PAYLOAD;
+    let envelope = match beacon_decode::decode_execution_payload_envelope(payload) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    debug!(
+        slot = envelope.message.payload.slot_number,
+        builder_index = envelope.message.builder_index,
+        block_root = %ShortRoot(&envelope.message.beacon_block_root.0),
+        bytes = payload.len(),
+        "Beacon execution payload envelope decoded"
+    );
+    if let Err(outcome) =
+        gossip::envelope::cheap_checks(&server.seen_envelopes, &server.store, &envelope)
+    {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::Envelope(Box::new(envelope)))
+}
+
+/// Decode a gloas payload attestation message and run its cheap gossip
+/// checks. Same shape as [`triage_block`].
+fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::PAYLOAD_ATTESTATION_MESSAGE;
+    let message = match beacon_decode::decode_payload_attestation_message(payload) {
+        Ok(message) => message,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    // `trace` rather than `debug`: the committee votes in one burst per slot.
+    trace!(
+        slot = message.data.slot,
+        validator = message.validator_index,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        "Beacon payload attestation message decoded"
+    );
+    if let Err(outcome) = gossip::payload_attestation::cheap_checks(
+        &server.seen_payload_attestations,
+        &server.store,
+        &message,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::PayloadAttestation(message))
+}
+
 /// Decode one of the five beacon topics with nothing particular to report,
 /// and count it. Ignored rather than validated: none of the five has a
 /// consumer, so this always answers `Dispatch::Report`.
@@ -448,6 +557,12 @@ fn triage_other(wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
                 "Beacon gossip decoded"
             );
             Outcome::Ignore(IgnoreReason::NoConsumer)
+        }
+        // See `triage_aggregate`'s matching arm for why this scores as
+        // `Ignore` rather than `Reject`.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(kind, "unsupported_fork");
+            Outcome::Ignore(IgnoreReason::UnsupportedFork)
         }
         Err(err) => {
             metrics::inc_beacon_gossip(kind, "decode_failed");
@@ -582,10 +697,11 @@ pub async fn publish_beacon_attestation(
         error!(%slot, validator, subnet_id, "Attestation subnet out of range; dropping it");
         return;
     }
-    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(
-        beacon.fork_digest,
-        subnet_id,
-    ));
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, validator, "No held fork digest covers this attestation's slot; not publishing");
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::attestation_topic_name(digest, subnet_id));
     let compressed = compress_message(&attestation.to_ssz());
     server.swarm_handle.publish(topic, compressed);
     debug!(
@@ -616,8 +732,12 @@ pub async fn publish_beacon_aggregate(
         error!(%slot, aggregator, "A beacon aggregate reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(%slot, aggregator, "No held fork digest covers this aggregate's slot; not publishing");
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        digest,
         beacon_topics::BEACON_AGGREGATE_AND_PROOF,
     ));
     // Each fork's container encodes as itself on the wire; the enum is only
@@ -627,6 +747,9 @@ pub async fn publish_beacon_aggregate(
             signed.to_ssz()
         }
         ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(signed) => {
+            signed.to_ssz()
+        }
+        ethlambda_types::beacon::containers::SignedAggregateAndProof::Gloas(signed) => {
             signed.to_ssz()
         }
     };
@@ -653,8 +776,15 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         error!(slot, "A beacon block reached a lean node; dropping it");
         return;
     };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this block's slot; not publishing"
+        );
+        return;
+    };
     let topic = IdentTopic::new(beacon_topics::topic_name(
-        beacon.fork_digest,
+        digest,
         beacon_topics::BEACON_BLOCK,
     ));
     server
@@ -710,9 +840,13 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
             });
         *until = (*until).max(slot);
     }
+    // Under every digest the node holds: while a boundary's window is open,
+    // attestations are published on either side of it.
     for &subnet_id in &joined {
-        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, subnet_id);
-        server.swarm_handle.subscribe(IdentTopic::new(topic));
+        for held in wire.held_topics() {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, subnet_id);
+            server.swarm_handle.subscribe(IdentTopic::new(topic));
+        }
     }
     if !joined.is_empty() {
         info!(?joined, "Joined attestation subnets for aggregation");
@@ -749,8 +883,10 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
         .collect();
     for subnet_id in &expired {
         server.aggregator_subnets.remove(subnet_id);
-        let topic = beacon_topics::attestation_topic_name(wire.fork_digest, *subnet_id);
-        server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        for held in wire.held_topics() {
+            let topic = beacon_topics::attestation_topic_name(held.fork_digest, *subnet_id);
+            server.swarm_handle.unsubscribe(IdentTopic::new(topic));
+        }
     }
     if !expired.is_empty() {
         debug!(
@@ -763,8 +899,9 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{AttestationData, electra, phase0, shared};
+    use ethlambda_types::beacon::containers::{AttestationData, electra, gloas, phase0, shared};
     use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
@@ -848,12 +985,71 @@ mod tests {
         ));
     }
 
+    /// Phase0-shaped bytes at `slot`: not a valid block at any later fork, so
+    /// what `triage_block` answers depends on the fork `slot` names.
+    fn mismatched_block_bytes(slot: Slot) -> Vec<u8> {
+        phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Default::default(),
+                state_root: Default::default(),
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        }
+        .to_ssz()
+    }
+
+    async fn triage_block_under(config: Config, payload: &[u8]) -> Dispatch {
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        triage_block(&server, wire, payload)
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_gloas_slot_is_rejected() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.gloas_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbage_bytes_are_still_rejected_once_gloas_is_active() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+
+        assert!(matches!(
+            triage_block_under(config, &[0xff; 3]).await,
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_fulu_slot_is_still_rejected_after_the_fork() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
     #[tokio::test]
     async fn garbage_bytes_on_a_data_column_subnet_are_rejected_as_undecodable() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
 
         assert!(matches!(
-            triage_data_column(&server, &[0xff; 3], 0),
+            triage_data_column(&server, ForkName::Fulu, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -868,7 +1064,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::FutureSlot))
         ));
     }
@@ -889,8 +1085,41 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 0),
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
             Dispatch::Validate(Validated::Column(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gloas_sidecar_decodes_by_its_topics_fork_and_is_judged_by_gloas_rules() {
+        let now_ms = unix_now_ms();
+        let config = Config {
+            genesis_time: now_ms / 1_000 - 5,
+            slot_duration_ms: 1_000,
+            ..Config::mainnet()
+        };
+        let server = unconnected_beacon_server(config, 0).await;
+        let sidecar = ethlambda_types::beacon::containers::gloas::DataColumnSidecar {
+            index: 0,
+            slot: 4,
+            ..Default::default()
+        };
+        let payload = sidecar.to_ssz();
+
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Gloas, &payload, 0),
+            Dispatch::Validate(Validated::Column(_))
+        ));
+        // Gloas's rule has no header to read a proposer from, but it does have
+        // a subnet rule.
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Gloas, &payload, 1),
+            Dispatch::Report(Outcome::Reject(RejectReason::WrongSubnet))
+        ));
+        // The same bytes under fulu's topic are not a fulu sidecar.
+        assert!(matches!(
+            triage_data_column(&server, ForkName::Fulu, &payload, 0),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
 
@@ -907,7 +1136,7 @@ mod tests {
         let payload = sidecar.to_ssz();
 
         assert!(matches!(
-            triage_data_column(&server, &payload, 1),
+            triage_data_column(&server, ForkName::Fulu, &payload, 1),
             Dispatch::Report(Outcome::Reject(RejectReason::WrongSubnet))
         ));
     }
@@ -944,6 +1173,41 @@ mod tests {
         ));
     }
 
+    /// Gloas repurposes `data.index` as the payload flag, so an honest `1`
+    /// passes the index rule electra would reject it on; it is turned away
+    /// later, here by the empty `committee_bits` of the test message.
+    #[tokio::test]
+    async fn a_gloas_aggregate_with_a_payload_flag_passes_the_index_rule() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Reject(RejectReason::CommitteeBits))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_gloas_aggregate_with_a_data_index_above_one_is_rejected() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 2).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Reject(RejectReason::DataIndexOutOfRange))
+        ));
+    }
+
     #[tokio::test]
     async fn garbage_bytes_on_an_attestation_subnet_are_rejected_as_undecodable() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -953,7 +1217,7 @@ mod tests {
             .expect("a beacon server has a beacon wire");
 
         assert!(matches!(
-            triage_attestation(&server, wire, &[0xff; 3], 0),
+            triage_attestation(&server, wire.fork, &[0xff; 3], 0),
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -974,7 +1238,7 @@ mod tests {
         let payload = phase0_attestation(4).to_ssz();
 
         assert!(matches!(
-            triage_attestation(&server, wire, &payload, 0),
+            triage_attestation(&server, wire.fork, &payload, 0),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
         ));
     }
@@ -991,8 +1255,34 @@ mod tests {
         let payload = electra_single_attestation(4, 1).to_ssz();
 
         assert!(matches!(
-            triage_attestation(&server, wire, &payload, 0),
+            triage_attestation(&server, wire.fork, &payload, 0),
             Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
+        ));
+    }
+
+    /// A gloas `SingleAttestation` has electra's bytes, but its `data.index`
+    /// is the payload flag: an honest `1` must not be rejected as a nonzero
+    /// index, while a value past the flag's range is.
+    #[tokio::test]
+    async fn a_gloas_attestation_is_judged_on_the_payload_flag_range() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+
+        let flagged = electra_single_attestation(4, 1).to_ssz();
+        // Past the index rule, and turned away by the clock instead: slot 4 is
+        // long outside the epoch window of a mainnet genesis.
+        assert!(matches!(
+            triage_attestation(&server, wire.fork, &flagged, 0),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::OutsideEpochWindow))
+        ));
+        let out_of_range = electra_single_attestation(4, 2).to_ssz();
+        assert!(matches!(
+            triage_attestation(&server, wire.fork, &out_of_range, 0),
+            Dispatch::Report(Outcome::Reject(RejectReason::DataIndexOutOfRange))
         ));
     }
 
@@ -1038,6 +1328,12 @@ mod tests {
     #[tokio::test]
     async fn a_published_aggregate_is_handed_to_the_chain_with_its_indices() {
         let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        // The test server's digest is a placeholder, and an aggregate whose
+        // slot no held digest covers is neither published nor handed on.
+        let crate::Wire::Beacon(beacon) = &mut server.wire else {
+            unreachable!("unconnected_beacon_server builds a beacon wire");
+        };
+        beacon.topics.fork_digest = beacon.digest_for_slot(5);
         let chain = std::sync::Arc::new(RecordingChain::default());
         server.blockchain = Some(chain.clone());
         let aggregate = ethlambda_types::beacon::containers::SignedAggregateAndProof::Electra(
@@ -1047,5 +1343,79 @@ mod tests {
         publish_beacon_aggregate(&mut server, aggregate.clone(), vec![3, 4]).await;
 
         assert_eq!(*chain.aggregates.lock().unwrap(), [(aggregate, vec![3, 4])]);
+    }
+
+    /// A payload that does not decode as a gloas envelope is the sender's
+    /// fault, on either gloas topic.
+    #[tokio::test]
+    async fn an_undecodable_gloas_message_is_rejected() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+
+        assert!(matches!(
+            triage_envelope(&server, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+        assert!(matches!(
+            triage_payload_attestation(&server, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    /// An envelope that clears the cheap checks goes on to the stateful ones,
+    /// and a second one for a key the seen cache holds is ignored before them.
+    #[tokio::test]
+    async fn an_envelope_passes_triage_unless_its_key_was_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let envelope = crate::test_support::envelope(1, 3);
+        let payload = envelope.to_ssz();
+
+        assert!(matches!(
+            triage_envelope(&server, &payload),
+            Dispatch::Validate(Validated::Envelope(decoded)) if *decoded == envelope
+        ));
+
+        server.seen_envelopes.record(
+            envelope.message.beacon_block_root,
+            envelope.message.builder_index,
+        );
+        assert!(matches!(
+            triage_envelope(&server, &payload),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        ));
+    }
+
+    /// A payload attestation for a slot before gloas is rejected by the cheap
+    /// checks; mainnet's gloas epoch is not zero, so slot zero is before it.
+    #[tokio::test]
+    async fn a_payload_attestation_before_gloas_is_rejected() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 1,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+
+        assert!(matches!(
+            triage_payload_attestation(&server, &message.to_ssz()),
+            Dispatch::Report(Outcome::Reject(RejectReason::PreGloasSlot))
+        ));
+    }
+
+    /// A payload attestation inside gloas but outside the current slot is
+    /// ignored, and one in the current slot goes on to the stateful checks.
+    #[tokio::test]
+    async fn a_payload_attestation_is_judged_on_the_clock() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let mut message = gloas::PayloadAttestationMessage {
+            validator_index: 1,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        message.data.slot = 1_000_000;
+        assert!(matches!(
+            triage_payload_attestation(&server, &message.to_ssz()),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NotCurrentSlot))
+        ));
     }
 }

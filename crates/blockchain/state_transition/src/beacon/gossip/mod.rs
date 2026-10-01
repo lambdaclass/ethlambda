@@ -10,6 +10,8 @@ pub mod aggregate;
 pub mod attestation;
 pub mod block;
 pub mod column;
+pub mod envelope;
+pub mod payload_attestation;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -18,6 +20,8 @@ pub(crate) mod test_support;
 // topic's submodule defines it.
 pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
+pub use envelope::SeenEnvelopes;
+pub use payload_attestation::SeenPayloadAttestations;
 
 use std::num::NonZeroUsize;
 
@@ -25,11 +29,14 @@ use lru::LruCache;
 
 use crate::beacon::config::Config;
 use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
-use crate::beacon::containers::BeaconState;
-use crate::beacon::fork_choice::{self, Store};
+use crate::beacon::containers::{AttestationData, BeaconState, gloas};
+use crate::beacon::fork::ForkName;
+use crate::beacon::fork_choice::{self, PayloadStatusEnum, Store};
 use crate::beacon::helpers::accessors::get_block_root_at_slot;
-use crate::beacon::helpers::misc::compute_start_slot_at_epoch;
+use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
+use crate::beacon::lean_boundary::lean_fork_unreachable;
 use crate::beacon::precheck::PrecheckError;
+use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 
 /// A gossip message's verdict.
@@ -73,6 +80,15 @@ pub enum QueueReason {
     ParentNotReady,
     /// Its slot is outside the parent state's proposer lookahead.
     ShufflingUnavailable,
+    /// A gloas sidecar names a block that has never been seen.
+    BlockUnknown,
+    /// A gloas sidecar names a block that is stored but has no post-state yet.
+    BlockNotReady,
+    /// A gloas envelope names a block whose post-state is stored but not in
+    /// the cache the gossip checks read, as when the block was imported
+    /// moments ago. See `envelope::stateful_checks` for why this is not an
+    /// ignore.
+    StateNotCached,
 }
 
 impl QueueReason {
@@ -81,6 +97,9 @@ impl QueueReason {
             Self::ParentUnknown => "parent_unknown",
             Self::ParentNotReady => "parent_not_ready",
             Self::ShufflingUnavailable => "shuffling_unavailable",
+            Self::BlockUnknown => "block_unknown",
+            Self::BlockNotReady => "block_not_ready",
+            Self::StateNotCached => "state_not_cached",
         }
     }
 }
@@ -98,6 +117,13 @@ pub enum IgnoreReason {
     Overloaded,
     /// Validation panicked.
     Internal,
+    /// The message's own fork is one this build does not validate or decode
+    /// (currently gloas): not the sender's fault, and not malformed, so this
+    /// is `Ignore` rather than `Reject`. A `Reject` down-scores the peer in
+    /// gossipsub, and every honest peer on the network sends these once this
+    /// node's own clock crosses that fork's activation, which would punish
+    /// the whole mesh for a gap in this build rather than in the message.
+    UnsupportedFork,
     /// An attestation's slot is in neither the current nor the previous epoch.
     OutsideEpochWindow,
     /// An aggregate adds no bit that one already accepted for the same data
@@ -112,6 +138,23 @@ pub enum IgnoreReason {
     FinalizedNotAncestor,
     /// An ancestor lies outside what the state's `block_roots` can answer.
     AncestryUnknown,
+    /// A gloas block builds on its parent's full payload branch, but the
+    /// parent's envelope has not been seen and verified (the specification
+    /// lets it be queued until it is).
+    ParentPayloadUnverified,
+    /// A gloas vote names the full payload (`data.index == 1`) of a block whose
+    /// envelope has not been seen and verified (the specification lets it be
+    /// queued until it is).
+    PayloadEnvelopeUnseen,
+    /// A gloas vote names a payload the execution client has not validated.
+    PayloadOptimistic,
+    /// A payload attestation's slot is not the current slot.
+    NotCurrentSlot,
+    /// A payload attestation names a block that is not at the attested slot.
+    BlockNotAtSlot,
+    /// The head state's payload timeliness committee window cannot answer for
+    /// the attested slot.
+    PtcUnavailable,
 }
 
 impl IgnoreReason {
@@ -124,12 +167,19 @@ impl IgnoreReason {
             Self::NoConsumer => "no_consumer",
             Self::Overloaded => "overloaded",
             Self::Internal => "internal",
+            Self::UnsupportedFork => "unsupported_fork",
             Self::OutsideEpochWindow => "outside_epoch_window",
             Self::CoveredBits => "covered_bits",
             Self::UnknownBlock => "unknown_block",
             Self::StateUnavailable => "state_unavailable",
             Self::FinalizedNotAncestor => "finalized_not_ancestor",
             Self::AncestryUnknown => "ancestry_unknown",
+            Self::ParentPayloadUnverified => "parent_payload_unverified",
+            Self::PayloadEnvelopeUnseen => "payload_envelope_unseen",
+            Self::PayloadOptimistic => "payload_optimistic",
+            Self::NotCurrentSlot => "not_current_slot",
+            Self::BlockNotAtSlot => "block_not_at_slot",
+            Self::PtcUnavailable => "ptc_unavailable",
         }
     }
 }
@@ -150,6 +200,11 @@ pub enum RejectReason {
     PayloadTimestamp,
     InclusionProof,
     Kzg,
+    /// A gloas sidecar's slot is not the slot of the block it names.
+    SlotMismatch,
+    /// A gloas sidecar names a block of an earlier fork, which has no bid to
+    /// take commitments from.
+    BlockNotGloas,
     /// An attestation's target epoch is not its slot's epoch.
     EpochMismatch,
     /// An aggregate with no aggregation bit set.
@@ -176,6 +231,33 @@ pub enum RejectReason {
     AggregateSignature,
     /// The target is not the voted block's ancestor at the target epoch.
     TargetNotAncestor,
+    /// A gloas block body (or its parent execution requests) carries more of
+    /// an operation than its limit, or any deposit.
+    OperationLimit,
+    /// A gloas bid's `parent_block_root` is not the block's `parent_root`.
+    BidParentMismatch,
+    /// A gloas block builds on its parent's empty branch, but its bid's
+    /// `parent_block_hash` is not the parent state's `latest_block_hash`.
+    BidNotOnParentHead,
+    /// A gloas vote's `data.index` is neither zero nor one.
+    DataIndexOutOfRange,
+    /// A gloas vote cast in its block's own slot claims the payload is present.
+    SameSlotPayloadFlag,
+    /// A gloas vote names a payload the execution client found invalid.
+    PayloadInvalid,
+    /// A gloas envelope's builder is not the one its block's bid committed to.
+    BuilderIndexMismatch,
+    /// A gloas envelope's payload block hash is not its bid's.
+    BlockHashMismatch,
+    /// The root of a gloas envelope's execution requests is not its bid's.
+    ExecutionRequestsRootMismatch,
+    /// A gloas envelope's payload carries more withdrawals than its limit.
+    TooManyWithdrawals,
+    /// A payload attestation's slot lies before the gloas fork.
+    PreGloasSlot,
+    /// A payload attestation's validator is not in its slot's payload
+    /// timeliness committee.
+    NotInPtc,
 }
 
 impl RejectReason {
@@ -194,6 +276,8 @@ impl RejectReason {
             Self::PayloadTimestamp => "payload_timestamp",
             Self::InclusionProof => "inclusion_proof",
             Self::Kzg => "kzg",
+            Self::SlotMismatch => "slot_mismatch",
+            Self::BlockNotGloas => "block_not_gloas",
             Self::EpochMismatch => "epoch_mismatch",
             Self::NoParticipants => "no_participants",
             Self::NonZeroDataIndex => "non_zero_data_index",
@@ -207,6 +291,18 @@ impl RejectReason {
             Self::AggregatorSignature => "aggregator_signature",
             Self::AggregateSignature => "aggregate_signature",
             Self::TargetNotAncestor => "target_not_ancestor",
+            Self::OperationLimit => "operation_limit",
+            Self::BidParentMismatch => "bid_parent_mismatch",
+            Self::BidNotOnParentHead => "bid_not_on_parent_head",
+            Self::DataIndexOutOfRange => "data_index_out_of_range",
+            Self::SameSlotPayloadFlag => "same_slot_payload_flag",
+            Self::PayloadInvalid => "payload_invalid",
+            Self::BuilderIndexMismatch => "builder_index_mismatch",
+            Self::BlockHashMismatch => "block_hash_mismatch",
+            Self::ExecutionRequestsRootMismatch => "execution_requests_root_mismatch",
+            Self::TooManyWithdrawals => "too_many_withdrawals",
+            Self::PreGloasSlot => "pre_gloas_slot",
+            Self::NotInPtc => "not_in_ptc",
         }
     }
 }
@@ -274,6 +370,51 @@ impl SeenColumns {
     }
 }
 
+/// The first valid gloas sidecar per `(block root, column index)`: the
+/// specification's modified `Seen.data_column_sidecar_tuples`.
+///
+/// A separate type from [`SeenColumns`] since the key differs: fulu's names the
+/// proposer, which a gloas sidecar does not carry, and names the block by
+/// `(slot, proposer)` where gloas names it by root. Bounded the same way.
+pub struct SeenBlockColumns(LruCache<(Root, u64), ()>);
+
+impl SeenBlockColumns {
+    pub fn new(capacity: NonZeroUsize) -> Self {
+        Self(LruCache::new(capacity))
+    }
+
+    pub fn contains(&self, block_root: Root, index: u64) -> bool {
+        self.0.contains(&(block_root, index))
+    }
+
+    /// Record the first valid sidecar for its key. Returns `false`, changing
+    /// nothing, when one is already recorded.
+    pub fn record(&mut self, block_root: Root, index: u64) -> bool {
+        if self.0.contains(&(block_root, index)) {
+            return false;
+        }
+        self.0.put((block_root, index), ());
+        true
+    }
+}
+
+/// `verify_execution_requests_limits` (`specs/gloas/p2p-interface.md`).
+///
+/// The four lists the specification names: withdrawals, consolidations,
+/// builder deposits and builder exits. Deposit requests are deliberately not
+/// checked: gloas's `DepositRequests` is progressive and neither the
+/// specification nor the state transition bounds it, so a limit here would
+/// reject a block that import accepts.
+///
+/// Shared by [`block`] (a block's parent execution requests) and [`envelope`].
+pub(crate) fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
+    requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
+        && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
+        && requests.builder_deposits.len() as u64
+            <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
+        && requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
+}
+
 /// The specification's `compute_time_at_slot_ms`: the clock reading at the
 /// start of `slot`.
 pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
@@ -286,6 +427,18 @@ pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
 /// plus the gossip clock disparity allowance.
 pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
     slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+}
+
+/// The specification's `is_current_slot` (`altair/p2p-interface.md`): the
+/// clock, with the gossip clock disparity allowance on both ends, falls within
+/// `slot`'s own span. That is `is_within_slot_range` with a range of zero, so
+/// the far edge is the *next* slot's start.
+pub(crate) fn is_current_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
+    if now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY) < slot_start_ms(config, slot) {
+        return false;
+    }
+    slot_start_ms(config, slot.saturating_add(1)).saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+        >= now_ms
 }
 
 /// The specification's `is_within_epoch`: the clock, with the gossip clock
@@ -317,6 +470,80 @@ pub(crate) fn is_within_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> boo
 /// name an epoch more than one boundary stale, which this catches instead.
 pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms: u64) -> bool {
     is_within_epoch(config, epoch, now_ms) || is_within_epoch(config, epoch + 1, now_ms)
+}
+
+/// Whether `slot` falls in gloas.
+///
+/// A gloas subnet attestation is the same `SingleAttestation` as electra's, so
+/// the message's shape cannot say which rules apply; its slot's fork does.
+/// (A gloas aggregate has its own container, which says so itself.)
+pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
+    match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
+        ForkName::Gloas => true,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu => false,
+        ForkName::Lean => lean_fork_unreachable("gossip::is_gloas_slot"),
+    }
+}
+
+/// Gloas's `verify_attestation_payload_status` (`specs/gloas/p2p-interface.md`):
+/// the payload flag a vote carries in `data.index` must agree with what this
+/// node knows of the voted block's payload.
+///
+/// The specification lets a vote on an unseen envelope be queued and asks the
+/// node to request it by root; neither is done here, so it is an `IGNORE`.
+pub(crate) fn verify_attestation_payload_status(
+    store: &Store,
+    data: &AttestationData,
+) -> Result<(), Outcome> {
+    let block_root = data.beacon_block_root;
+    let Some((block_slot, _)) = store.block_slot_and_state_root(&block_root) else {
+        // The caller has already checked the block is known.
+        return Err(Outcome::Ignore(IgnoreReason::UnknownBlock));
+    };
+    payload_vote_verdict(
+        block_slot,
+        data,
+        || fork_choice::is_payload_verified(store, block_root),
+        || fork_choice::block_payload_status(store, block_root),
+    )
+}
+
+/// The branches of [`verify_attestation_payload_status`], over the facts it
+/// reads. The envelope and status lookups are lazy: only a vote for the full
+/// payload needs either.
+fn payload_vote_verdict(
+    block_slot: Slot,
+    data: &AttestationData,
+    is_payload_verified: impl FnOnce() -> bool,
+    payload_status: impl FnOnce() -> PayloadStatusEnum,
+) -> Result<(), Outcome> {
+    // [REJECT] For same-slot attestations, the payload cannot yet be present.
+    if block_slot == data.slot && data.index != 0 {
+        return Err(Outcome::Reject(RejectReason::SameSlotPayloadFlag));
+    }
+    if data.index != 1 {
+        return Ok(());
+    }
+    // [IGNORE] The envelope has been seen and verified.
+    if !is_payload_verified() {
+        return Err(Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen));
+    }
+    let status = payload_status();
+    // [IGNORE] The attested payload is optimistic.
+    if status.is_not_validated() {
+        return Err(Outcome::Ignore(IgnoreReason::PayloadOptimistic));
+    }
+    // [REJECT] The attested payload is processed and invalid.
+    if status.is_invalidated() {
+        return Err(Outcome::Reject(RejectReason::PayloadInvalid));
+    }
+    Ok(())
 }
 
 /// Which block `state`'s own history names as the ancestor at `slot`, given
@@ -400,6 +627,71 @@ mod tests {
         NonZeroUsize::new(n).expect("non-zero")
     }
 
+    fn vote(slot: Slot, index: u64) -> AttestationData {
+        AttestationData {
+            slot,
+            index,
+            ..Default::default()
+        }
+    }
+
+    fn never() -> bool {
+        unreachable!("a vote that does not claim the full payload reads no envelope")
+    }
+
+    fn no_status() -> PayloadStatusEnum {
+        unreachable!("a vote that does not claim the full payload reads no status")
+    }
+
+    #[test]
+    fn a_same_slot_vote_for_the_payload_is_rejected() {
+        assert_eq!(
+            payload_vote_verdict(5, &vote(5, 1), never, no_status),
+            Err(Outcome::Reject(RejectReason::SameSlotPayloadFlag))
+        );
+    }
+
+    #[test]
+    fn a_vote_without_the_payload_flag_reads_no_payload_state() {
+        assert_eq!(
+            payload_vote_verdict(5, &vote(5, 0), never, no_status),
+            Ok(())
+        );
+        assert_eq!(
+            payload_vote_verdict(4, &vote(5, 0), never, no_status),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_full_payload_vote_without_a_verified_envelope_is_ignored() {
+        assert_eq!(
+            payload_vote_verdict(4, &vote(5, 1), || false, no_status),
+            Err(Outcome::Ignore(IgnoreReason::PayloadEnvelopeUnseen))
+        );
+    }
+
+    #[test]
+    fn a_full_payload_vote_judges_the_execution_verdict() {
+        let verdict = |status| payload_vote_verdict(4, &vote(5, 1), || true, move || status);
+        assert_eq!(verdict(PayloadStatusEnum::Valid), Ok(()));
+        for status in [PayloadStatusEnum::Syncing, PayloadStatusEnum::Accepted] {
+            assert_eq!(
+                verdict(status),
+                Err(Outcome::Ignore(IgnoreReason::PayloadOptimistic))
+            );
+        }
+        for status in [
+            PayloadStatusEnum::Invalid,
+            PayloadStatusEnum::InvalidBlockHash,
+        ] {
+            assert_eq!(
+                verdict(status),
+                Err(Outcome::Reject(RejectReason::PayloadInvalid))
+            );
+        }
+    }
+
     #[test]
     fn a_slot_is_future_only_past_the_clock_disparity() {
         let config = Config {
@@ -420,6 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn the_current_slot_holds_within_the_clock_disparity_at_either_edge() {
+        let config = Config {
+            genesis_time: 0,
+            ..Config::mainnet()
+        };
+        let start_ms = slot_start_ms(&config, 3);
+        let next_start_ms = slot_start_ms(&config, 4);
+        assert!(is_current_slot(
+            &config,
+            3,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_current_slot(
+            &config,
+            3,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY - 1
+        ));
+        assert!(is_current_slot(
+            &config,
+            3,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_current_slot(
+            &config,
+            3,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY + 1
+        ));
+    }
+
+    #[test]
     fn a_block_key_records_once() {
         let mut seen = SeenBlocks::new(capacity(4));
         assert!(!seen.contains(10, 3));
@@ -436,6 +758,16 @@ mod tests {
         assert!(seen.record(10, 3, 0));
         assert!(!seen.record(10, 3, 0));
         assert!(seen.record(10, 3, 1));
+    }
+
+    #[test]
+    fn a_block_column_key_records_once_per_root_and_index() {
+        let mut seen = SeenBlockColumns::new(capacity(4));
+        let root = Root::from([1; 32]);
+        assert!(seen.record(root, 0));
+        assert!(!seen.record(root, 0));
+        assert!(seen.record(root, 1));
+        assert!(seen.record(Root::from([2; 32]), 0));
     }
 
     #[test]

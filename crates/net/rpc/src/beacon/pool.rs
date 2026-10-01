@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::beacon::{
-    ApiError,
+    ApiError, refuse_validator_duties_from_gloas,
     validator::{head, require_execution_client, require_validated},
 };
 
@@ -94,7 +94,7 @@ async fn post_pool_attestations(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_electra_or_later(&headers) {
+    if let Err(err) = require_electra_or_fulu(&headers) {
         return err.into_response();
     }
     let Ok(attestations) = serde_json::from_slice::<Vec<SingleAttestation>>(&body) else {
@@ -244,19 +244,34 @@ fn validate(
     })
 }
 
-/// The endpoints here take electra's containers, which exist only from that
-/// fork on; `Eth-Consensus-Version` is required to say so.
-fn require_electra_or_later(headers: &HeaderMap) -> Result<(), ApiError> {
+/// The endpoints here take electra's containers, which exist from that fork
+/// on and which fulu keeps; `Eth-Consensus-Version` is required to say so.
+/// Gloas changed the attestation (a progressive list, and `data.index` as the
+/// payload-availability signal) and the pool rules that go with it, neither of
+/// which this node models, so it is refused by name rather than read as
+/// electra.
+fn require_electra_or_fulu(headers: &HeaderMap) -> Result<(), ApiError> {
     let fork = headers
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if fork.is_some_and(|fork| fork >= ForkName::Electra) {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "Eth-Consensus-Version must name electra or a later fork",
-        ))
+    match fork {
+        Some(ForkName::Electra | ForkName::Fulu) => Ok(()),
+        Some(ForkName::Gloas) => Err(ApiError::BadRequest(
+            "Eth-Consensus-Version gloas is not supported",
+        )),
+        // `ForkName::parse` never returns Lean: it is absent from `ALL`.
+        Some(
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Lean,
+        )
+        | None => Err(ApiError::BadRequest(
+            "Eth-Consensus-Version must name electra or fulu",
+        )),
     }
 }
 
@@ -289,7 +304,7 @@ async fn post_aggregate_and_proofs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err(err) = require_electra_or_later(&headers) {
+    if let Err(err) = require_electra_or_fulu(&headers) {
         return err.into_response();
     }
     let Ok(aggregates) = serde_json::from_slice::<Vec<electra::SignedAggregateAndProof>>(&body)
@@ -370,6 +385,19 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
     }
+    let fork = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(query.slot));
+    // The pool holds electra-shaped votes, and the response is labelled with
+    // the slot's fork, so a gloas slot would be served as gloas with a body of
+    // the wrong shape.
+    if let Err(err) = refuse_validator_duties_from_gloas(
+        &store.config(),
+        compute_epoch_at_slot(query.slot),
+        "gloas aggregates are not supported",
+    ) {
+        return err.into_response();
+    }
     let aggregate = pool
         .lock()
         .expect("attestation pool lock poisoned")
@@ -384,9 +412,6 @@ async fn get_aggregate_attestation(
     if let Err(err) = require_validated(&store, aggregate.data.beacon_block_root) {
         return err.into_response();
     }
-    let fork = store
-        .config()
-        .fork_at_epoch(compute_epoch_at_slot(query.slot));
     let response = crate::json_response(serde_json::json!({
         "version": fork.as_str(),
         "data": aggregate,
@@ -419,6 +444,7 @@ mod tests {
         accessors::get_beacon_committee,
         test_state::{sign_for, with_signing_validators_at},
     };
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -889,5 +915,43 @@ mod tests {
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_aggregate_query_at_a_gloas_slot_is_refused_by_name() {
+        let mut fixture = fixture();
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, _) = crate::test_utils::beacon_store_with_config(fixture.state.clone(), config);
+        fixture.store = store;
+        let (status, json) = get_aggregate(&fixture, Root::ZERO, fixture.state.slot(), 0).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["message"], "gloas aggregates are not supported");
+    }
+
+    #[tokio::test]
+    async fn a_gloas_fork_header_is_refused_by_name() {
+        for path in [
+            "/eth/v2/beacon/pool/attestations",
+            "/eth/v2/validator/aggregate_and_proofs",
+        ] {
+            let fixture = fixture();
+            let network: RpcToP2PRef = fixture.network.clone();
+            let app = routes()
+                .with_state(fixture.store.clone())
+                .layer(Extension(network))
+                .layer(Extension(fixture.pool.clone()));
+            let request = Request::post(path)
+                .header("eth-consensus-version", "gloas")
+                .body(Body::from("[]"))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json["message"], "Eth-Consensus-Version gloas is not supported",
+                "{path}"
+            );
+        }
     }
 }

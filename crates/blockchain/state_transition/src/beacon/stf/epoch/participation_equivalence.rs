@@ -23,7 +23,7 @@ use crate::beacon::helpers::participation::{
     EpochSummary, ParticipationTotals, RewardContext, ValidatorDeltas,
 };
 use crate::beacon::helpers::participation_reference as reference;
-use crate::beacon::helpers::test_state::with_validators_at;
+use crate::beacon::helpers::test_state::{replace_balances, with_validators_at};
 use crate::beacon::preset;
 use crate::beacon::primitives::{Gwei, Root, ValidatorIndex};
 
@@ -144,7 +144,7 @@ fn random_state(rng: &mut SplitMix64, fork: ForkName) -> BeaconState {
             }
         })
         .collect();
-    *state.balances_mut() = balances.try_into().unwrap();
+    replace_balances(&mut state, balances);
 
     let mut lists: Vec<Vec<u8>> = (0..2)
         .map(|_| {
@@ -190,9 +190,9 @@ fn random_state(rng: &mut SplitMix64, fork: ForkName) -> BeaconState {
     }
     if rng.chance(1) {
         let keep = rng.below(count as u64) as usize;
-        let mut balances = state.balances().to_vec();
+        let mut balances: Vec<Gwei> = state.iter_balances().collect();
         balances.truncate(keep);
-        *state.balances_mut() = balances.try_into().unwrap();
+        replace_balances(&mut state, balances);
     }
     let (previous, current, inactivity) = state.altair_validator_lists_mut().unwrap();
     *current = lists.pop().unwrap().try_into().unwrap();
@@ -248,8 +248,8 @@ fn assert_same_outcome<T, U>(
 
 fn assert_same_state(seed: u64, what: &str, fast: &BeaconState, slow: &BeaconState) {
     assert_eq!(
-        fast.balances(),
-        slow.balances(),
+        fast.iter_balances().collect::<Vec<_>>(),
+        slow.iter_balances().collect::<Vec<_>>(),
         "{what} balances, seed {seed}"
     );
     let (_, _, fast_scores) = fast.altair_validator_lists().unwrap();
@@ -307,7 +307,7 @@ fn drivers_match_the_reference_steps() {
         if fast_result.is_ok() {
             assert_same_state(seed, "driver", &fast, &slow);
             succeeded += 1;
-            balances_moved += (fast.balances() != state.balances()) as u32;
+            balances_moved += !fast.iter_balances().eq(state.iter_balances()) as u32;
             justified += (fast.current_justified_checkpoint()
                 != state.current_justified_checkpoint()) as u32;
             finalized += (fast.finalized_checkpoint() != state.finalized_checkpoint()) as u32;
@@ -457,7 +457,7 @@ fn summary_matches_the_reference() {
         );
         let summary = EpochSummary::build(state, true).unwrap();
         assert_eq!(summary.totals(), &totals, "summary totals, seed {seed}");
-        assert_eq!(summary.len(), state.validators().len());
+        assert_eq!(summary.len(), state.validator_count());
 
         let eligible = crate::beacon::helpers::finality::get_eligible_validator_indices(state);
         for (index, (flags, effective_balance)) in summary.iter().enumerate() {

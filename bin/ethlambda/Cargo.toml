@@ -64,7 +64,7 @@ libc.workspace = true
 # `test-util` for `#[tokio::test(start_paused = true)]`: the checkpoint-sync
 # tests would otherwise wait out the real retry backoff. Dev-only, so the
 # feature never reaches the shipped binary.
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "net", "io-util", "macros", "rt"] }
 # Keygen writes a directory of key files and the benchmark corpus writes a
 # key set, so their tests need a throwaway directory.
 tempfile = "3"
