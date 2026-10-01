@@ -2929,6 +2929,7 @@ impl BlockChainServer {
                 .fetch_block(FetchRequest {
                     block_root,
                     needs_block: true,
+                    needs_envelope: false,
                     // Nothing to name: a block this node has never seen has
                     // told it nothing about what it committed to.
                     columns: Vec::new(),
@@ -2951,6 +2952,7 @@ impl BlockChainServer {
             let request = FetchRequest {
                 block_root,
                 needs_block: false,
+                needs_envelope: false,
                 columns: missing,
             };
             let _ = p2p.fetch_block(request).inspect_err(
@@ -3485,7 +3487,7 @@ impl BlockChainServer {
     /// Whether the clock is at a fork this node does not follow while the
     /// node's own head is still from one it does.
     ///
-    /// Blocks past the fork never reach the live chain, so the freshest block
+    /// Blocks past the fork do not reach the live chain from the network, so the freshest block
     /// the store knows stays at the head and the sync tracker would read the
     /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
     /// report `Synced` for good on a node that follows nothing. Nothing else
@@ -4474,7 +4476,7 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct RecordingP2P {
         pub(crate) checks: std::sync::Mutex<Vec<Vec<DataColumnSidecar>>>,
-        fetches: std::sync::Mutex<Vec<FetchRequest>>,
+        pub(crate) fetches: std::sync::Mutex<Vec<FetchRequest>>,
     }
 
     impl ethlambda_network_api::BlockChainToP2P for RecordingP2P {

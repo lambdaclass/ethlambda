@@ -1513,8 +1513,12 @@ async fn fetch_missing(server: &mut P2PServer, request: FetchRequest) {
     let FetchRequest {
         block_root,
         needs_block,
+        needs_envelope,
         columns,
     } = request;
+    if needs_envelope {
+        debug!(%block_root, "Envelope fetch by root is not served yet; ignoring");
+    }
     if needs_block {
         fetch_missing_block(server, block_root).await;
     }

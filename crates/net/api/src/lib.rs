@@ -63,6 +63,10 @@ pub struct FetchRequest {
     /// reading its own store to find out would pay a DB read per request to
     /// re-derive what the caller already knew.
     pub needs_block: bool,
+    /// Whether the block's execution payload envelope is missing (gloas): the
+    /// block is known, and it names a payload this node has no envelope for.
+    /// Fetched by root, like the block.
+    pub needs_envelope: bool,
     /// Columns of this block that this node custodies and does not have.
     ///
     /// Empty when nothing is missing, or when the block itself is, since a
