@@ -960,15 +960,11 @@ impl Store {
             entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()));
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch.put_batch(Table::Metadata, entries).expect("put");
-        batch
-            .delete_batch(Table::BlockRoots, block_root_deletes)
-            .expect("delete old canonical block roots");
-        batch
-            .put_batch(Table::BlockRoots, block_root_entries)
-            .expect("put canonical block roots");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::Metadata, entries)?;
+        batch.delete_batch(Table::BlockRoots, block_root_deletes)?;
+        batch.put_batch(Table::BlockRoots, block_root_entries)?;
+        batch.commit()?;
 
         // Lightweight pruning that should happen immediately on finalization advance:
         // live chain index, signatures, and attestation data. These are cheap and
@@ -977,9 +973,7 @@ impl Store {
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self
-                .prune_live_chain(finalized.slot)
-                .expect("prune live chain");
+            let pruned_chain = self.prune_live_chain(finalized.slot)?;
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
 
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
@@ -1003,18 +997,14 @@ impl Store {
     /// This is separated from `update_checkpoints` so callers can defer heavy
     /// pruning until after a batch of blocks has been fully processed.
     pub fn prune_old_data(&mut self) -> Result<(), Error> {
-        let finalized_slot = self
-            .latest_finalized()
-            .expect("Failed to get latest finalized checkpoint")
-            .slot;
+        let finalized_slot = self.latest_finalized()?.slot;
+        let head = self.head()?;
         let tip_slot = self
-            .get_block_header(&self.head().expect("Failed to get head block root"))
-            .map_or(finalized_slot, |header| {
-                header.expect("Failed to get block header").slot
-            });
-        let pruned_below_slot = self
-            .prune_old_block_proofs(finalized_slot, tip_slot)
-            .expect("prune old block proofs");
+            .get_block_header(&head)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(head))?
+            .slot;
+
+        let pruned_below_slot = self.prune_old_block_proofs(finalized_slot, tip_slot)?;
         if pruned_below_slot > 0 {
             info!(pruned_below_slot, "Pruned old finalized block proofs");
         }
