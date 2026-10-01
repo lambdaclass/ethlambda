@@ -217,7 +217,7 @@ mod tests {
     fn extend_chain(store: &mut Store, block: SignedBeaconBlock) -> H256 {
         let root = block.message_hash_tree_root();
         store.insert_signed_block(root, block).expect("insert");
-        store.set_head_payload_status(PayloadStatus::Full);
+        store.set_head_payload_status(root, PayloadStatus::Full);
         store
             .update_checkpoints(ForkCheckpoints::head_only(root))
             .expect("advance head");

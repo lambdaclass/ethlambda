@@ -724,16 +724,22 @@ pub(crate) struct BeaconScratch {
     /// finality. A pruned link is derived again by decoding if anything asks
     /// for it.
     pub(crate) payload_links: HashMap<H256, (u64, BlockPayloadLink)>,
-    /// The payload branch of the head fork choice last picked: `Full` when
-    /// the head node is its block with the payload revealed, `Empty` when it
-    /// is the block alone. A pre-gloas head is `Full` (see
+    /// The head node fork choice last picked, as its block root and payload
+    /// branch: `Full` when the node is the block with the payload revealed,
+    /// `Empty` when it is the block alone. A pre-gloas head is `Full` (see
     /// `fork_choice::get_head_node`).
+    ///
+    /// The root is stored with the status so a reader can tell whether the
+    /// status belongs to the head it sees: the head root lives in the backend
+    /// and this does not, so the two cannot be written atomically, and a
+    /// status alone could be paired with the wrong root. Readers compare roots
+    /// and treat a mismatch as unknown.
     ///
     /// `None` until the first head computation of this process: nothing
     /// persists it, and a resumed directory recomputes it on the first tick
     /// rather than storing a second source of truth for what the head walk
     /// derives. Readers treat `None` as "not known to be `Full`".
-    pub(crate) head_payload_status: Option<PayloadStatus>,
+    pub(crate) head_node_payload_status: Option<(H256, PayloadStatus)>,
     /// Gloas: the payload timeliness committee's per-member vote on whether
     /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
     /// `None` until that member votes. Keyed by beacon block root, like
@@ -2434,21 +2440,32 @@ impl Store {
 
     // ============ Beacon Head ============
 
-    /// The payload status of the head node fork choice last picked, or `None`
-    /// before this process has computed a head. See
-    /// [`BeaconScratch::head_payload_status`].
+    /// The payload status of the head node fork choice last picked, for the
+    /// store's *current* head root only: `None` before this process has
+    /// computed a head, and also while the recorded node is not the current
+    /// head (a head move whose status is not recorded yet). Never a status
+    /// belonging to another root.
     pub fn head_payload_status(&self) -> Option<PayloadStatus> {
-        self.beacon.lock().unwrap().head_payload_status
+        let head = self.head().ok()?;
+        self.payload_status_of_head_node(head)
     }
 
-    /// Records the payload status of the head node fork choice just picked.
-    ///
-    /// Call it **before** [`Store::update_checkpoints`] moves the head root:
-    /// a reader that sees the new status against the old head merely withholds
-    /// an envelope for a moment, where the other order could serve the new
-    /// head's envelope while its node is still the empty one.
-    pub fn set_head_payload_status(&self, status: PayloadStatus) {
-        self.beacon.lock().unwrap().head_payload_status = Some(status);
+    /// The recorded status, if it was recorded for `head`.
+    fn payload_status_of_head_node(&self, head: H256) -> Option<PayloadStatus> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .head_node_payload_status
+            .filter(|(root, _)| *root == head)
+            .map(|(_, status)| status)
+    }
+
+    /// Records the head node fork choice just picked: its block `root` and
+    /// payload `status`. Order against [`Store::update_checkpoints`] does not
+    /// matter, since readers only use the status for a head whose root equals
+    /// the recorded one.
+    pub fn set_head_payload_status(&self, root: H256, status: PayloadStatus) {
+        self.beacon.lock().unwrap().head_node_payload_status = Some((root, status));
     }
 
     /// The beacon fork-choice head as `(slot, root)`, or `None` if the head
@@ -3409,10 +3426,7 @@ impl Store {
         if self.chain != Chain::Beacon {
             Self::lean_only("canonical_execution_payload_envelopes");
         }
-        // Read ahead of the view, and written ahead of the head by
-        // `set_head_payload_status`'s contract, so a head move partway through
-        // errs toward withholding.
-        let head_is_full = self.head_payload_status() == Some(PayloadStatus::Full);
+        let recorded_head = self.beacon.lock().unwrap().head_node_payload_status;
         let view = self.backend.begin_read().expect("read view");
         let canonical_root = |slot: u64| -> Option<H256> {
             view.get(Table::BlockRoots, &encode_block_root_key(slot))
@@ -3433,10 +3447,16 @@ impl Store {
             .collect();
         // Head and its slot come out of the same view as the rest, so a head
         // move partway through cannot pair one branch's index with another's.
-        let head_slot = view
+        let head_root = view
             .get(Table::Metadata, KEY_HEAD)
             .expect("get head")
-            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"))
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"));
+        // The head's envelope is served only when the recorded node is this
+        // view's head and FULL; a status recorded for another root says
+        // nothing about this one.
+        let head_is_full = head_root.is_some()
+            && recorded_head == head_root.map(|root| (root, PayloadStatus::Full));
+        let head_slot = head_root
             .and_then(|head| view.get(Table::BlockHeaders, &head.to_ssz()).expect("get"))
             .map(|bytes| decode_beacon_block_value(&bytes).slot());
         if let Some(&(last_slot, last_root)) = window.last()
@@ -7358,7 +7378,8 @@ mod tests {
                 .is_empty()
         );
 
-        store.set_head_payload_status(PayloadStatus::Empty);
+        store.set_head_payload_status(root, PayloadStatus::Empty);
+        assert_eq!(store.head_payload_status(), Some(PayloadStatus::Empty));
         assert!(
             store
                 .canonical_execution_payload_envelopes(1, 1)
@@ -7366,7 +7387,18 @@ mod tests {
                 .is_empty()
         );
 
-        store.set_head_payload_status(PayloadStatus::Full);
+        // A FULL status recorded for another root (the previous head, say)
+        // must not release this head's envelope.
+        store.set_head_payload_status(H256::repeat_byte(0xee), PayloadStatus::Full);
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(root, PayloadStatus::Full);
         assert_eq!(
             store.canonical_execution_payload_envelopes(1, 1).unwrap(),
             vec![envelope]
