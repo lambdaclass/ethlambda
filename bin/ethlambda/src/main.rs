@@ -1697,11 +1697,11 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
 /// currently gloas.
 ///
 /// `fork_choice::get_forkchoice_store` accepts a gloas anchor, since fork choice
-/// itself handles the fork. This node's wiring does not: nothing delivers
-/// payload envelopes or payload attestations to the chain actor, and
-/// `process_or_pend_block` refuses every gloas block, so a follower anchored
-/// here would sit at its anchor forever, looking alive while importing
-/// nothing. Refusing at startup reports the real reason instead. Checked ahead
+/// itself handles the fork. This node's wiring does not: the network side
+/// delivers neither payload envelopes nor payload attestations to the chain
+/// actor yet, and gloas gossip is ignored, so a follower anchored here would
+/// sit at its anchor, looking alive while following nothing. Refusing at
+/// startup reports the real reason instead. Checked ahead
 /// of any store construction, on both anchor sources (a loaded network's
 /// genesis state can schedule `GLOAS_FORK_EPOCH: 0`, and a checkpoint provider
 /// can serve a gloas finalized state), so a rejected anchor writes nothing to

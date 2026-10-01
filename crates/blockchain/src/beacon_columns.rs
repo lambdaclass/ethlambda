@@ -260,8 +260,9 @@ impl BlockChainServer {
     /// not already parked at another slot, and this slot has room for it.
     ///
     /// A root this actor already holds as a pending or held block is exempt
-    /// from the per-slot cap: an honest block is known, so four forged roots
-    /// at its slot cannot shut its columns out. It still has to match the slot
+    /// from the per-slot cap: an honest block is known, so
+    /// [`MAX_PARKED_GLOAS_ROOTS_PER_SLOT`] forged roots at its slot cannot shut
+    /// its columns out. It still has to match the slot
     /// it was first parked at.
     fn gloas_root_fits(&self, root: H256, slot: u64) -> bool {
         if self

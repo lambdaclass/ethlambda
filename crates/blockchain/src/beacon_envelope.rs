@@ -42,12 +42,13 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use ethlambda_network_api::FetchRequest;
 use ethlambda_state_transition::beacon::fork::ForkName;
 use ethlambda_state_transition::beacon::fork_choice::{self, PayloadStatus, PayloadStatusEnum};
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, gloas};
-use ethlambda_types::primitives::H256;
+use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::import_timing::ImportTimings;
@@ -62,6 +63,14 @@ use crate::{BlockChainServer, custody_columns_present, metrics};
 /// for.
 pub(crate) const MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT: usize = 4;
 
+/// How many distinct envelopes may be held for one block root this node has not
+/// imported.
+///
+/// Nobody has checked these against a bid yet, so a forged envelope for a real
+/// root must not be able to evict the honest one: the root keeps a few, and
+/// when the block imports each is tried until one verifies.
+pub(crate) const MAX_ENVELOPES_PER_UNMATCHED_ROOT: usize = 3;
+
 /// How many blocks may wait on one parent's payload.
 ///
 /// The children of a block that all name it as a FULL parent: one per slot the
@@ -71,6 +80,9 @@ pub(crate) const MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD: usize = 4;
 /// An envelope the actor is holding until it can be verified.
 pub(crate) struct HeldEnvelope {
     envelope: gloas::SignedExecutionPayloadEnvelope,
+    /// The envelope's own root, which tells a re-delivery from a different
+    /// envelope for the same block.
+    envelope_root: H256,
     /// The slot the hold is evicted by: the slot the envelope arrived in while
     /// its block is unknown (the envelope names no slot), the block's own once
     /// it is.
@@ -88,6 +100,7 @@ impl HeldEnvelope {
         event_ms: u64,
     ) -> Self {
         Self {
+            envelope_root: envelope.hash_tree_root(),
             envelope,
             slot,
             event_ms,
@@ -99,8 +112,9 @@ impl HeldEnvelope {
 /// ready.
 #[derive(Default)]
 pub(crate) struct EnvelopeQueues {
-    /// Envelopes whose block has no post-state yet, by the block's root.
-    pub(crate) awaiting_block: HashMap<H256, HeldEnvelope>,
+    /// Envelopes whose block has no post-state yet, by the block's root, up to
+    /// [`MAX_ENVELOPES_PER_UNMATCHED_ROOT`] distinct ones each.
+    pub(crate) awaiting_block: HashMap<H256, Vec<HeldEnvelope>>,
     /// Envelopes whose bid has commitments and whose sampled columns are not
     /// all stored, by the block's root.
     pub(crate) awaiting_columns: HashMap<H256, HeldEnvelope>,
@@ -160,6 +174,21 @@ pub(crate) fn missing_columns_for_envelope(
     (!missing.is_empty()).then_some(missing)
 }
 
+/// The checks of `verify_execution_payload_envelope` that need only the block's
+/// bid, not its post-state: the envelope is the one the bid promised.
+fn envelope_matches_bid(
+    envelope: &gloas::ExecutionPayloadEnvelope,
+    bid: &gloas::ExecutionPayloadBid,
+    block_slot: u64,
+) -> bool {
+    envelope.builder_index == bid.builder_index
+        && envelope.payload.block_hash == bid.block_hash
+        && envelope.payload.prev_randao == bid.prev_randao
+        && envelope.payload.gas_limit == bid.gas_limit
+        && envelope.execution_requests.hash_tree_root() == bid.execution_requests_root
+        && envelope.payload.slot_number == block_slot
+}
+
 impl BlockChainServer {
     /// Take an envelope that passed gossip validation: verify it now, or hold
     /// it until what it waits on arrives. The caller then settles the queues.
@@ -197,26 +226,22 @@ impl BlockChainServer {
         };
 
         let slot = block.slot();
-        let finalized_slot = self
+        let finalized = self
             .store
             .latest_finalized()
-            .expect("finalized checkpoint exists")
-            .slot;
-        // Strictly below: the finalized block's own children may still name it
-        // as their FULL parent.
-        if slot < finalized_slot {
+            .expect("finalized checkpoint exists");
+        // Strictly below, and the finalized block exempted by name: its
+        // children may still name it as their FULL parent, and the checkpoint
+        // slot is an epoch boundary the finalized block can sit before.
+        if slot < finalized.slot && root != finalized.root {
             trace!(%slot, "Dropping an envelope for a block below the finalized slot");
             return false;
         }
 
-        let commitment_count = match &block {
-            SignedBeaconBlock::Gloas(inner) => inner
-                .message
-                .body
-                .signed_execution_payload_bid
-                .message
-                .blob_kzg_commitments
-                .len(),
+        let bid = match &block {
+            SignedBeaconBlock::Gloas(inner) => {
+                &inner.message.body.signed_execution_payload_bid.message
+            }
             SignedBeaconBlock::Phase0(_)
             | SignedBeaconBlock::Altair(_)
             | SignedBeaconBlock::Bellatrix(_)
@@ -233,6 +258,20 @@ impl BlockChainServer {
                 return false;
             }
         };
+        let commitment_count = bid.blob_kzg_commitments.len();
+
+        // The cheap half of verification, before anything is held: only an
+        // envelope that matches the bid its block committed to may occupy a
+        // hold or cost a fetch. The signature is p2p's gossip check.
+        if !envelope_matches_bid(&held.envelope.message, bid, slot) {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope that does not match its block's bid"
+            );
+            self.refetch_envelope_if_children_wait(root);
+            return false;
+        }
 
         let present = self
             .store
@@ -251,9 +290,18 @@ impl BlockChainServer {
             match self.stored_gloas_columns(slot, &root) {
                 Some(sidecars) => sidecars,
                 None => {
-                    // Present a moment ago and unreadable now: not worth
-                    // guessing at, so wait for them to be stored again.
-                    self.hold_envelope_awaiting_columns(root, slot, held, Vec::new());
+                    // Every sampled column was listed as stored a moment ago,
+                    // so failing to read one back is a storage or decode
+                    // fault, not a wait. Holding would name nothing missing
+                    // and be redriven every slot for as long as the fault
+                    // lasts, so the envelope is dropped (and asked for again
+                    // if children wait on it).
+                    warn!(
+                        %slot,
+                        block_root = %ShortRoot(&root.0),
+                        "Dropping an envelope: a stored sampled column could not be read back"
+                    );
+                    self.refetch_envelope_if_children_wait(root);
                     return false;
                 }
             }
@@ -301,6 +349,7 @@ impl BlockChainServer {
                     ?err,
                     "Dropping an execution payload envelope that failed verification"
                 );
+                self.refetch_envelope_if_children_wait(root);
                 false
             }
         }
@@ -330,19 +379,28 @@ impl BlockChainServer {
 
     fn hold_envelope_awaiting_block(&mut self, root: H256, held: HeldEnvelope) {
         let queues = &mut self.envelopes;
-        if queues.awaiting_block.contains_key(&root) {
+        if let Some(held_for_root) = queues.awaiting_block.get_mut(&root) {
+            if held_for_root.len() >= MAX_ENVELOPES_PER_UNMATCHED_ROOT
+                || held_for_root
+                    .iter()
+                    .any(|other| other.envelope_root == held.envelope_root)
+            {
+                return;
+            }
+            held_for_root.push(held);
+            self.publish_envelope_queues();
             return;
         }
-        let at_slot = queues
+        let roots_at_slot = queues
             .awaiting_block
             .values()
-            .filter(|other| other.slot == held.slot)
+            .filter(|others| others.iter().any(|other| other.slot == held.slot))
             .count();
-        if at_slot >= MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT {
+        if roots_at_slot >= MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT {
             trace!(
                 slot = held.slot,
                 block_root = %ShortRoot(&root.0),
-                "Dropping an envelope: its slot already holds the most unmatched envelopes allowed"
+                "Dropping an envelope: its slot already holds the most unmatched roots allowed"
             );
             return;
         }
@@ -350,7 +408,7 @@ impl BlockChainServer {
             block_root = %ShortRoot(&root.0),
             "Holding an envelope until its block is imported"
         );
-        queues.awaiting_block.insert(root, held);
+        queues.awaiting_block.insert(root, vec![held]);
         self.publish_envelope_queues();
     }
 
@@ -369,8 +427,8 @@ impl BlockChainServer {
         info!(
             %slot,
             block_root = %ShortRoot(&root.0),
-            missing = ?missing,
-            "Holding an envelope: its custody columns have not all arrived yet"
+            ?missing,
+            "Holding an envelope: its sampled columns have not all arrived yet"
         );
         self.envelopes.awaiting_columns.insert(root, held);
         if !missing.is_empty() {
@@ -422,29 +480,54 @@ impl BlockChainServer {
         }
     }
 
-    /// The held envelope for `root` if what it waited on is now there.
-    fn take_ready_envelope(&mut self, root: H256) -> Option<HeldEnvelope> {
+    /// The held envelopes for `root` if what they waited on is now there.
+    fn take_ready_envelopes(&mut self, root: H256) -> Vec<HeldEnvelope> {
         if self.envelopes.awaiting_block.contains_key(&root)
             && self.store.has_state(&root).expect("DB read should succeed")
         {
-            return self.envelopes.awaiting_block.remove(&root);
+            return self
+                .envelopes
+                .awaiting_block
+                .remove(&root)
+                .unwrap_or_default();
         }
-        let slot = self.envelopes.awaiting_columns.get(&root)?.slot;
+        let Some(slot) = self
+            .envelopes
+            .awaiting_columns
+            .get(&root)
+            .map(|held| held.slot)
+        else {
+            return Vec::new();
+        };
         if custody_columns_present(&self.store, slot, &root, &self.custody_columns) {
-            return self.envelopes.awaiting_columns.remove(&root);
+            return self
+                .envelopes
+                .awaiting_columns
+                .remove(&root)
+                .into_iter()
+                .collect();
         }
-        None
+        Vec::new()
     }
 
     /// Drain the roots pushed since the last call: verify each ready envelope,
     /// import the blocks that were waiting on each verified payload, and
     /// recompute the head once if anything changed.
     pub(crate) async fn settle_envelopes(&mut self) {
+        // Nothing to do on most ticks, and none at all on lean: leave the
+        // gauges alone rather than rewriting them every interval.
+        if self.envelopes.work.is_empty() && self.envelopes.verified.is_empty() {
+            return;
+        }
         let mut changed = false;
         loop {
             if let Some(root) = self.envelopes.work.pop_front() {
-                if let Some(held) = self.take_ready_envelope(root) {
-                    self.apply_or_hold_envelope(held);
+                // The first that verifies wins; the rest are forgeries or
+                // duplicates of it.
+                for held in self.take_ready_envelopes(root) {
+                    if self.apply_or_hold_envelope(held) {
+                        break;
+                    }
                 }
             } else if let Some(root) = self.envelopes.verified.pop_front() {
                 changed = true;
@@ -499,6 +582,9 @@ impl BlockChainServer {
                 parent_root = %ShortRoot(&parent_root.0),
                 "Dropping a block: its parent already has the most children held for its payload"
             );
+            // Its own pending children would otherwise wait on a root that
+            // never imports, and their descendants re-queue it.
+            self.discard_pending_subtree(block_root);
             return;
         }
 
@@ -518,6 +604,35 @@ impl BlockChainServer {
             .insert(block_root, slot);
         self.held_timings.insert(block_root, timings);
         self.publish_envelope_queues();
+        self.request_missing_envelope(parent_root);
+    }
+
+    /// Ask p2p for `root`'s envelope by root. The request carries nothing but
+    /// the flag, since an envelope names its block and nothing else.
+    fn request_missing_envelope(&self, root: H256) {
+        if let Some(ref p2p) = self.p2p {
+            let _ = p2p
+                .fetch_block(FetchRequest {
+                    block_root: root,
+                    needs_block: false,
+                    needs_envelope: true,
+                    columns: Vec::new(),
+                })
+                .inspect_err(|err| {
+                    error!(block_root = %ShortRoot(&root.0), %err, "Failed to request a missing envelope")
+                });
+        }
+    }
+
+    /// After an envelope was dropped: ask again if blocks wait on exactly it.
+    fn refetch_envelope_if_children_wait(&self, root: H256) {
+        if self
+            .envelopes
+            .blocks_awaiting_parent_payload
+            .contains_key(&root)
+        {
+            self.request_missing_envelope(root);
+        }
     }
 
     /// Re-import every block that waited on `parent_root`'s payload, now that
@@ -580,18 +695,23 @@ impl BlockChainServer {
         if self.envelopes.is_empty() {
             return;
         }
-        let finalized_slot = self
+        let finalized = self
             .store
             .latest_finalized()
-            .expect("finalized checkpoint exists")
-            .slot;
+            .expect("finalized checkpoint exists");
+        let finalized_slot = finalized.slot;
 
-        self.envelopes
-            .awaiting_block
-            .retain(|_, held| held.slot >= finalized_slot);
+        // The finalized block's own envelope is exempt by name, as its
+        // execution hash is from `prune_beacon_el_block_hashes`: the
+        // checkpoint slot is an epoch boundary, and the block can sit before
+        // a skipped one.
+        self.envelopes.awaiting_block.retain(|root, held| {
+            held.retain(|other| other.slot >= finalized_slot || *root == finalized.root);
+            !held.is_empty()
+        });
         self.envelopes
             .awaiting_columns
-            .retain(|_, held| held.slot >= finalized_slot);
+            .retain(|root, held| held.slot >= finalized_slot || *root == finalized.root);
 
         let stale: Vec<H256> = self
             .envelopes
@@ -979,8 +1099,12 @@ mod tests {
         let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
         let held = |slot: u64| HeldEnvelope::new(envelope.clone(), slot, 0);
         let queues = &mut server.envelopes;
-        queues.awaiting_block.insert(H256::repeat_byte(1), held(9));
-        queues.awaiting_block.insert(H256::repeat_byte(2), held(11));
+        queues
+            .awaiting_block
+            .insert(H256::repeat_byte(1), vec![held(9)]);
+        queues
+            .awaiting_block
+            .insert(H256::repeat_byte(2), vec![held(11)]);
         queues
             .awaiting_columns
             .insert(H256::repeat_byte(3), held(9));
@@ -1013,5 +1137,146 @@ mod tests {
             HashMap::from([(H256::repeat_byte(7), 11)])
         );
         assert!(!server.held_timings.contains_key(&H256::repeat_byte(6)));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_forged_envelope_for_a_root_does_not_evict_the_honest_one() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let honest = case.envelope(PARENT_ENVELOPE);
+        let forged = |gas_limit: u64| {
+            let mut envelope = honest.clone();
+            envelope.message.payload.gas_limit = gas_limit;
+            envelope
+        };
+
+        // The forgeries arrive first and fill what the root may hold, bar one.
+        for gas_limit in 1..MAX_ENVELOPES_PER_UNMATCHED_ROOT as u64 {
+            server.receive_envelope(forged(gas_limit), 0);
+        }
+        server.receive_envelope(honest.clone(), 0);
+        // A re-delivery of the honest one and a surplus forgery add nothing.
+        server.receive_envelope(honest.clone(), 0);
+        server.receive_envelope(forged(99), 0);
+        assert_eq!(
+            server.envelopes.awaiting_block[&root(PARENT)].len(),
+            MAX_ENVELOPES_PER_UNMATCHED_ROOT
+        );
+
+        server
+            .on_block(case.block(PARENT), ImportTimings::default())
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(server.store.has_verified_payload(&root(PARENT)));
+        assert!(server.envelopes.awaiting_block.is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    fn the_finalized_blocks_own_envelope_survives_eviction() {
+        // Finalized at slot 10, so the finalized root is the zero anchor of
+        // `beacon_store`.
+        let mut server = beacon_server(beacon_store(GENESIS_TIME, 10));
+        let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
+        let finalized_root = server.store.latest_finalized().unwrap().root;
+        server.envelopes.awaiting_block.insert(
+            finalized_root,
+            vec![HeldEnvelope::new(envelope.clone(), 3, 0)],
+        );
+        server
+            .envelopes
+            .awaiting_columns
+            .insert(finalized_root, HeldEnvelope::new(envelope, 3, 0));
+
+        server.evict_envelope_queues_at_or_below_finality();
+
+        assert!(
+            server
+                .envelopes
+                .awaiting_block
+                .contains_key(&finalized_root)
+        );
+        assert!(
+            server
+                .envelopes
+                .awaiting_columns
+                .contains_key(&finalized_root)
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_block_held_for_its_parents_payload_asks_p2p_for_the_envelope() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let state_server = case.server(12);
+        let (mut server, p2p) = crate::tests::beacon_server_recording(state_server.store.clone());
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        fork_choice::on_tick(&mut server.store, 24, &fixture_config());
+
+        server
+            .on_block(case.block(FULL_CHILD), ImportTimings::default())
+            .await;
+
+        let fetches = p2p.fetches.lock().unwrap();
+        assert!(fetches.iter().any(|request| request.needs_envelope
+            && !request.needs_block
+            && request.block_root == root(FULL_PARENT)));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_dropped_block_takes_its_pending_children_with_it() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let child = case.block(CHILD);
+        let held_roots: Vec<H256> = (0..MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD as u64)
+            .map(|extra| {
+                let mut block = child.clone();
+                if let SignedBeaconBlock::Gloas(inner) = &mut block {
+                    inner.message.slot += extra;
+                }
+                let block_root = block.message_hash_tree_root();
+                server.hold_block_for_parent_payload(block, ImportTimings::default());
+                block_root
+            })
+            .collect();
+        assert_eq!(held_roots.len(), MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD);
+
+        // One more, with a child pending on it: the cap drops the block and
+        // the child goes too.
+        let mut surplus = child.clone();
+        if let SignedBeaconBlock::Gloas(inner) = &mut surplus {
+            inner.message.slot += 50;
+        }
+        let surplus_root = surplus.message_hash_tree_root();
+        let pending_child = H256::repeat_byte(0xcc);
+        server.pending_blocks.insert(
+            surplus_root,
+            std::collections::HashSet::from([pending_child]),
+        );
+        server
+            .pending_block_parents
+            .insert(pending_child, surplus_root);
+
+        server.hold_block_for_parent_payload(surplus, ImportTimings::default());
+
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
     }
 }
