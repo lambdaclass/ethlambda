@@ -66,6 +66,11 @@ pub(crate) fn seen_aggregates() -> SeenAggregates {
     SeenAggregates::new(capacity, capacity)
 }
 
+/// The [`seen_blocks`] counterpart for gloas execution payload envelopes.
+pub(crate) fn seen_envelopes() -> super::SeenEnvelopes {
+    super::SeenEnvelopes::new(NonZeroUsize::new(8).expect("non-zero"))
+}
+
 /// The [`seen_blocks`] counterpart for subnet attestations.
 pub(crate) fn seen_attestations() -> SeenAttestations {
     SeenAttestations::new(NonZeroUsize::new(8).expect("non-zero"))

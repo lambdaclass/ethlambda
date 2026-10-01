@@ -105,7 +105,9 @@ pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage
     }
 
     // The committee is read off the head state, as the specification says.
-    let Some((_, head_root)) = store.beacon_head() else {
+    // `head` is the root alone: `beacon_head` would decode the whole head block
+    // for a slot nothing here reads.
+    let Ok(head_root) = store.head() else {
         return Outcome::Ignore(IgnoreReason::Internal);
     };
     let Some(state) = store.cached_state(CacheKey::BlockState(head_root)) else {
@@ -118,7 +120,7 @@ pub fn stateful_checks(store: &Store, message: &gloas::PayloadAttestationMessage
     // [REJECT] The validator is a member of the payload timeliness committee.
     // A slot the head's committee window cannot answer is not the sender's fault.
     let Ok(ptc) = get_ptc(&state, data.slot, &store.config()) else {
-        return Outcome::Ignore(IgnoreReason::StateUnavailable);
+        return Outcome::Ignore(IgnoreReason::PtcUnavailable);
     };
     if !ptc.contains(&validator_index) {
         return Outcome::Reject(RejectReason::NotInPtc);
@@ -154,7 +156,143 @@ pub fn validate(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::checkpoint::Checkpoint;
+
     use super::*;
+    use crate::beacon::config::Config;
+    use crate::beacon::containers::{SignedBeaconBlock, electra};
+    use crate::beacon::fork::ForkName;
+    use crate::beacon::gossip::test_support::{GENESIS_TIME, store};
+    use crate::beacon::helpers::test_state::with_validators_at;
+    use crate::beacon::preset;
+    use crate::beacon::primitives::Root;
+
+    /// A fulu block at `slot`: a block of the wrong fork for either topic.
+    fn fulu_block(slot: Slot) -> SignedBeaconBlock {
+        SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    const BLOCK_ROOT: Root = Root::repeat_byte(7);
+
+    fn message(slot: Slot) -> gloas::PayloadAttestationMessage {
+        gloas::PayloadAttestationMessage {
+            validator_index: 0,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: BLOCK_ROOT,
+                slot,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A store that is gloas from genesis, so the committee lookup is reached.
+    fn gloas_store() -> Store {
+        Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            GENESIS_TIME,
+            Config::mainnet()
+                .with_fork_epoch(ForkName::Fulu, 0)
+                .with_fork_epoch(ForkName::Gloas, 0),
+            Root::ZERO,
+            Checkpoint {
+                root: Root::ZERO,
+                slot: 0,
+            },
+            0,
+        )
+    }
+
+    #[test]
+    fn a_vote_for_an_unseen_block_is_ignored() {
+        let store = store(0);
+        assert_eq!(
+            stateful_checks(&store, &message(5)),
+            Outcome::Ignore(IgnoreReason::UnknownBlock)
+        );
+    }
+
+    #[test]
+    fn a_vote_for_a_block_without_a_post_state_is_ignored_not_rejected() {
+        let mut store = store(0);
+        store
+            .insert_pending_block(BLOCK_ROOT, fulu_block(5))
+            .expect("insert pending block");
+        assert_eq!(
+            stateful_checks(&store, &message(5)),
+            Outcome::Ignore(IgnoreReason::StateUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_vote_is_ignored_when_the_head_state_is_not_cached() {
+        let mut store = store(0);
+        store
+            .insert_pending_block(BLOCK_ROOT, fulu_block(5))
+            .expect("insert the block");
+        // Only the voted block has a state; the head (the anchor root) has none.
+        store
+            .insert_state(BLOCK_ROOT, with_validators_at(ForkName::Gloas, 8))
+            .expect("insert the state");
+        assert_eq!(
+            stateful_checks(&store, &message(5)),
+            Outcome::Ignore(IgnoreReason::StateUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_vote_outside_the_head_states_committee_window_is_ignored_with_its_own_reason() {
+        let mut store = gloas_store();
+        let slot = 10 * preset::SLOTS_PER_EPOCH;
+        store
+            .insert_pending_block(BLOCK_ROOT, fulu_block(slot))
+            .expect("insert the block");
+        store
+            .insert_state(BLOCK_ROOT, with_validators_at(ForkName::Gloas, 8))
+            .expect("insert the voted block's state");
+        let head = store.head().expect("head root");
+        store
+            .insert_state(head, with_validators_at(ForkName::Gloas, 8))
+            .expect("insert the head state");
+        assert_eq!(
+            stateful_checks(&store, &message(slot)),
+            Outcome::Ignore(IgnoreReason::PtcUnavailable)
+        );
+    }
+
+    #[test]
+    fn a_validator_the_head_state_lacks_is_rejected() {
+        let mut store = gloas_store();
+        store
+            .insert_pending_block(BLOCK_ROOT, fulu_block(5))
+            .expect("insert the block");
+        store
+            .insert_state(BLOCK_ROOT, with_validators_at(ForkName::Gloas, 8))
+            .expect("insert the voted block's state");
+        let head = store.head().expect("head root");
+        store
+            .insert_state(head, with_validators_at(ForkName::Gloas, 8))
+            .expect("insert the head state");
+        let mut message = message(5);
+        message.validator_index = 8;
+        assert_eq!(
+            stateful_checks(&store, &message),
+            Outcome::Reject(RejectReason::UnknownValidator)
+        );
+    }
 
     #[test]
     fn a_payload_attestation_key_records_once_per_slot_and_validator() {

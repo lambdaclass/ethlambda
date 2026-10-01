@@ -146,6 +146,9 @@ pub enum IgnoreReason {
     NotCurrentSlot,
     /// A payload attestation names a block that is not at the attested slot.
     BlockNotAtSlot,
+    /// The head state's payload timeliness committee window cannot answer for
+    /// the attested slot.
+    PtcUnavailable,
 }
 
 impl IgnoreReason {
@@ -170,6 +173,7 @@ impl IgnoreReason {
             Self::PayloadOptimistic => "payload_optimistic",
             Self::NotCurrentSlot => "not_current_slot",
             Self::BlockNotAtSlot => "block_not_at_slot",
+            Self::PtcUnavailable => "ptc_unavailable",
         }
     }
 }
