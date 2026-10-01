@@ -17,6 +17,7 @@ use ethlambda_types::{
             electra::AttesterSlashing,
             shared::{ProposerSlashing, SignedVoluntaryExit, Validator},
         },
+        operation::BeaconOperation,
         primitives::{Epoch, Root, ValidatorIndex},
         signing::compute_epoch_at_slot,
     },
@@ -70,6 +71,16 @@ impl OperationPool {
     pub fn insert_bls_to_execution_change(&mut self, change: SignedBLSToExecutionChange) -> bool {
         let key = change.message.validator_index;
         insert_first(&mut self.bls_to_execution_changes, key, change)
+    }
+
+    /// Insert `operation` into its list. `false` if its key was already held.
+    pub fn insert(&mut self, operation: BeaconOperation) -> bool {
+        match operation {
+            BeaconOperation::ProposerSlashing(op) => self.insert_proposer_slashing(op),
+            BeaconOperation::AttesterSlashing(op) => self.insert_attester_slashing(op),
+            BeaconOperation::VoluntaryExit(op) => self.insert_voluntary_exit(op),
+            BeaconOperation::BlsToExecutionChange(op) => self.insert_bls_to_execution_change(op),
+        }
     }
 
     /// Every proposer slashing held, in proposer order.

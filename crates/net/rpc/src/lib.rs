@@ -407,6 +407,8 @@ pub(crate) mod test_utils {
         >,
         pub(crate) aggregates:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedAggregateAndProof>>,
+        pub(crate) operations:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::operation::BeaconOperation>>,
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
@@ -432,6 +434,14 @@ pub(crate) mod test_utils {
             aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.aggregates.lock().unwrap().push(aggregate);
+            Ok(())
+        }
+
+        fn publish_beacon_operation(
+            &self,
+            operation: ethlambda_types::beacon::operation::BeaconOperation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.operations.lock().unwrap().push(operation);
             Ok(())
         }
 
