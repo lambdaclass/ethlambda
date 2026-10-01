@@ -7,7 +7,7 @@
 //! pull in `reqwest`. This crate already depends on both, so the assembly that
 //! needs a helper from each lives here.
 //!
-//! # Everything a request needs comes from the block alone
+//! # Everything a pre-gloas request needs comes from the block alone
 //!
 //! `NewPayloadRequest` in the specification reads `parent_beacon_block_root`
 //! off `state.latest_block_header.parent_root`, which after
@@ -15,15 +15,19 @@
 //! fields are body fields. So the whole question is answerable before the state
 //! transition runs, which is what lets the engine round trip happen outside the
 //! state transition and the state transition stay synchronous.
+//!
+//! Gloas is the exception: its payload is revealed in an envelope, so its
+//! request ([`gloas_new_payload_request`]) needs the block and the envelope.
 
 use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_engine::{EngineClient, EngineError, PayloadStatusV1};
 use ethlambda_state_transition::beacon::containers::{self, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
+use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list;
-use ethlambda_state_transition::beacon::stf::gloas::get_execution_requests_list as get_gloas_execution_requests_list;
+use ethlambda_state_transition::beacon::stf::gloas;
 
 /// Everything `engine_newPayloadV4` takes, derived from one block.
 pub struct NewPayloadRequest<'a> {
@@ -42,8 +46,14 @@ pub struct GloasNewPayloadRequest<'a> {
     pub execution_requests: Vec<Vec<u8>>,
 }
 
-/// The question to ask about `block`'s revealed payload, or `None` if `block`
-/// is not a gloas block.
+/// The question to ask about `block`'s revealed payload.
+///
+/// `Err(EnvelopeMismatch)` when `block` is not a gloas block, when the
+/// envelope's `beacon_block_root` is not `block`'s root, or when the bid's
+/// `block_hash` is not the payload's. Unlike [`new_payload_request`]'s `None`,
+/// which means "nothing to ask, import it", none of these has an importable
+/// reading, so a caller cannot mistake one for a pass. The checks are cheap
+/// and stop an envelope being validated against a block it does not belong to.
 ///
 /// `NewPayloadRequest` as `verify_execution_payload_envelope` builds it
 /// (gloas `beacon-chain.md`): the payload and the requests come from the
@@ -59,7 +69,8 @@ pub struct GloasNewPayloadRequest<'a> {
 pub fn gloas_new_payload_request<'a>(
     block: &SignedBeaconBlock,
     envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Option<GloasNewPayloadRequest<'a>> {
+) -> Result<GloasNewPayloadRequest<'a>, EngineError> {
+    let mismatch = |reason: &str| Err(EngineError::EnvelopeMismatch(reason.to_string()));
     let inner = match block {
         SignedBeaconBlock::Gloas(inner) => inner,
         SignedBeaconBlock::Phase0(_)
@@ -69,24 +80,30 @@ pub fn gloas_new_payload_request<'a>(
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_)
-        | SignedBeaconBlock::Lean(_) => return None,
+        | SignedBeaconBlock::Lean(_) => return mismatch("the block is not a gloas block"),
     };
 
-    let versioned_hashes = inner
-        .message
-        .body
-        .signed_execution_payload_bid
-        .message
+    if envelope.message.beacon_block_root != inner.message.hash_tree_root() {
+        return mismatch("the envelope's beacon_block_root is not the block's root");
+    }
+    let bid = &inner.message.body.signed_execution_payload_bid.message;
+    if bid.block_hash != envelope.message.payload.block_hash {
+        return mismatch("the bid's block_hash is not the payload's block_hash");
+    }
+
+    let versioned_hashes = bid
         .blob_kzg_commitments
         .iter()
         .map(kzg_commitment_to_versioned_hash)
         .collect();
 
-    Some(GloasNewPayloadRequest {
+    Ok(GloasNewPayloadRequest {
         execution_payload: &envelope.message.payload,
         versioned_hashes,
         parent_beacon_block_root: envelope.message.parent_beacon_block_root,
-        execution_requests: get_gloas_execution_requests_list(&envelope.message.execution_requests),
+        execution_requests: gloas::get_execution_requests_list(
+            &envelope.message.execution_requests,
+        ),
     })
 }
 
@@ -189,15 +206,16 @@ pub async fn ask(
 /// Asks the execution client about the payload `envelope` reveals for `block`,
 /// with `engine_newPayloadV5`.
 ///
-/// `Ok(None)` when `block` is not a gloas block; otherwise as [`ask`].
+/// Never `Ok(None)`: unlike [`ask`] there is no "nothing to ask" reading, and a
+/// block/envelope pair that does not match is an
+/// [`EngineError::EnvelopeMismatch`], which the caller must treat as a refusal
+/// to import.
 pub async fn ask_envelope(
     client: &EngineClient,
     block: &SignedBeaconBlock,
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
-) -> Result<Option<PayloadValidity>, EngineError> {
-    let Some(request) = gloas_new_payload_request(block, envelope) else {
-        return Ok(None);
-    };
+) -> Result<PayloadValidity, EngineError> {
+    let request = gloas_new_payload_request(block, envelope)?;
     let status = client
         .new_payload_v5(
             request.execution_payload,
@@ -206,7 +224,7 @@ pub async fn ask_envelope(
             &request.execution_requests,
         )
         .await?;
-    Ok(Some(verdict(&status)))
+    Ok(verdict(&status))
 }
 
 #[cfg(test)]
@@ -336,6 +354,7 @@ mod tests {
 
     /// A gloas envelope whose payload is otherwise zero.
     fn gloas_envelope(
+        beacon_block_root: Root,
         parent_beacon_block_root: Root,
     ) -> containers::gloas::SignedExecutionPayloadEnvelope {
         let payload = containers::gloas::ExecutionPayload {
@@ -368,7 +387,7 @@ mod tests {
                 payload,
                 execution_requests: Default::default(),
                 builder_index: 0,
-                beacon_block_root: Root::repeat_byte(1),
+                beacon_block_root,
                 parent_beacon_block_root,
             },
             signature: BlsSignature::default(),
@@ -387,17 +406,18 @@ mod tests {
             .message
             .blob_kzg_commitments
             .push(KzgCommitment::default());
+        let block_root = block.message.hash_tree_root();
         let block = SignedBeaconBlock::Gloas(block);
 
-        let mut envelope = gloas_envelope(Root::repeat_byte(9));
+        let mut envelope = gloas_envelope(block_root, Root::repeat_byte(9));
         envelope
             .message
             .execution_requests
             .builder_exits
             .push(Default::default());
 
-        let request =
-            gloas_new_payload_request(&block, &envelope).expect("a gloas block has a request");
+        let request = gloas_new_payload_request(&block, &envelope)
+            .unwrap_or_else(|err| panic!("a matching pair has a request: {err}"));
 
         assert_eq!(request.parent_beacon_block_root, Root::repeat_byte(9));
         assert_eq!(request.execution_payload.slot_number, 5);
@@ -417,9 +437,37 @@ mod tests {
     #[test]
     fn a_pre_gloas_block_has_no_envelope_question() {
         let block = SignedBeaconBlock::Fulu(electra_block(Root::ZERO));
-        let envelope = gloas_envelope(Root::ZERO);
+        let envelope = gloas_envelope(Root::ZERO, Root::ZERO);
 
-        assert!(gloas_new_payload_request(&block, &envelope).is_none());
+        assert!(matches!(
+            gloas_new_payload_request(&block, &envelope),
+            Err(EngineError::EnvelopeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn an_envelope_for_another_block_is_refused() {
+        let block = SignedBeaconBlock::Gloas(containers::gloas::SignedBeaconBlock::default());
+        let envelope = gloas_envelope(Root::repeat_byte(0xee), Root::ZERO);
+
+        assert!(matches!(
+            gloas_new_payload_request(&block, &envelope),
+            Err(EngineError::EnvelopeMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn a_payload_other_than_the_bids_is_refused() {
+        let inner = containers::gloas::SignedBeaconBlock::default();
+        let block_root = inner.message.hash_tree_root();
+        let block = SignedBeaconBlock::Gloas(inner);
+        let mut envelope = gloas_envelope(block_root, Root::ZERO);
+        envelope.message.payload.block_hash = ExecutionBlockHash::repeat_byte(0xab);
+
+        assert!(matches!(
+            gloas_new_payload_request(&block, &envelope),
+            Err(EngineError::EnvelopeMismatch(_))
+        ));
     }
 
     #[test]

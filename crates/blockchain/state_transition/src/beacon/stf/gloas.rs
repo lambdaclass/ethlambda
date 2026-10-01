@@ -512,14 +512,14 @@ pub fn process_withdrawals(state: &mut BeaconState) -> Result<()> {
 /// built from the revealed envelope's own `execution_requests`. Not from
 /// `state.latest_execution_payload_bid`: the bid commits to that list only
 /// by its hash ([`gloas::ExecutionPayloadBid::execution_requests_root`]), it
-/// never carries the list itself. Nothing calls this: envelope verification
-/// does not build the request list, since [`ExecutionEngine`] collapses the
-/// whole `verify_and_notify_new_payload` interface to one boolean and never
-/// inspects it (see [`crate::beacon::stf::deneb::process_execution_payload`]'s
-/// own documentation). Electra's own
-/// [`crate::beacon::stf::electra::get_execution_requests_list`] is called, by
-/// the live follower's Engine API client (`ethlambda-blockchain`'s
-/// `beacon_engine`), which sends the list to a real execution client.
+/// never carries the list itself. [`verify_execution_payload_envelope`] does
+/// not call this, since [`ExecutionEngine`] collapses the whole
+/// `verify_and_notify_new_payload` interface to one boolean and never inspects
+/// it (see [`crate::beacon::stf::deneb::process_execution_payload`]'s own
+/// documentation). The live follower's Engine API client does: `ethlambda-blockchain`'s
+/// `beacon_engine` builds the `engine_newPayloadV5` request list with this,
+/// and electra's [`crate::beacon::stf::electra::get_execution_requests_list`]
+/// for the earlier forks.
 pub fn get_execution_requests_list(requests: &gloas::ExecutionRequests) -> Vec<Vec<u8>> {
     let mut list = Vec::new();
 
