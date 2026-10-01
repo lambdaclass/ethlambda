@@ -4,6 +4,7 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
+        gloas::SignedExecutionPayloadEnvelope,
     },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
@@ -251,6 +252,19 @@ pub trait P2PToBlockChain: Send + Sync {
         aggregate: Box<SignedAggregateAndProof>,
         attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+    /// A gloas execution payload envelope that passed gossip validation (or
+    /// was fetched), for the chain actor to verify against its block's
+    /// post-state and apply to fork choice.
+    ///
+    /// Boxed for the reason [`Self::new_beacon_aggregate`] is: the envelope
+    /// carries a whole execution payload. `arrival` is the same shape a block
+    /// brings, since the actor reads the clock the envelope arrived at to
+    /// judge its payload timeliness.
+    fn new_execution_payload_envelope(
+        &self,
+        envelope: Box<SignedExecutionPayloadEnvelope>,
+        arrival: BlockArrival,
     ) -> Result<(), ActorError>;
 }
 
