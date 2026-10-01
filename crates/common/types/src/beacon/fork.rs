@@ -138,6 +138,27 @@ impl ForkName {
         }
     }
 
+    /// Whether blocks of this fork reveal their execution payload in a separate
+    /// envelope (gloas, EIP-7732, and any fork after it).
+    ///
+    /// An explicit match rather than `self >= ForkName::Gloas`: the derived
+    /// order puts [`ForkName::Lean`] after every beacon fork, so that
+    /// comparison is true for lean, which has no envelopes. A fork added after
+    /// gloas must be listed here, so the compiler forces the decision.
+    pub const fn has_payload_envelopes(self) -> bool {
+        match self {
+            ForkName::Gloas => true,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Lean => false,
+        }
+    }
+
     /// The one-byte tag this fork is stored under in a `States` value.
     ///
     /// Spelled out rather than `self as u8`. The variant order is already
@@ -220,6 +241,14 @@ mod tests {
         assert!(ForkName::Phase0 < ForkName::Altair);
         assert!(ForkName::Deneb < ForkName::Electra);
         assert!(ForkName::Fulu > ForkName::Phase0);
+    }
+
+    #[test]
+    fn only_gloas_and_later_beacon_forks_have_payload_envelopes() {
+        for fork in ForkName::ALL {
+            assert_eq!(fork.has_payload_envelopes(), fork >= ForkName::Gloas);
+        }
+        assert!(!ForkName::Lean.has_payload_envelopes());
     }
 
     #[test]
