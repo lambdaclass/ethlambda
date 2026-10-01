@@ -963,7 +963,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 .custody_columns
                 .iter()
                 .map(|column| {
-                    column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
+                    ethlambda_state_transition::beacon::das::compute_subnet_for_data_column_sidecar(
+                        *column,
+                    )
                 })
                 .collect();
             let topics = beacon::topics::BeaconTopics::new(
@@ -1430,7 +1432,7 @@ impl Handler<PublishBeaconAggregate> for P2PServer {
 
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
-        publish_beacon_block(self, msg.block).await;
+        publish_beacon_block(self, msg.block, msg.sidecars).await;
     }
 }
 

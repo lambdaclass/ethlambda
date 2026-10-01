@@ -8,11 +8,12 @@
 use std::time::Instant;
 
 use ethlambda_network_api::{BlockArrival, BlockSource};
+use ethlambda_state_transition::beacon::das;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome, RejectReason};
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation},
+    beacon::containers::{SignedBeaconBlock, electra::SingleAttestation, fulu::DataColumnSidecar},
     block::SignedBlock,
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
@@ -629,10 +630,22 @@ pub async fn publish_beacon_aggregate(
 }
 
 /// Gossip a block a validator client signed, handed over by the Beacon API,
-/// on `beacon_block`, and pass it to the chain actor as a gossiped block would
-/// be: gossipsub never delivers a node its own messages, so this is the only
-/// way this node imports its own proposal.
-pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlock) {
+/// on `beacon_block`, then each of its data column sidecars on its column
+/// subnet (the proposer publishes all of them), and pass the block to the
+/// chain actor as a gossiped block would be: gossipsub never delivers a node
+/// its own messages, so this is the only way this node imports its own
+/// proposal.
+///
+/// The block goes out before the columns so peers can start its state
+/// transition while the columns arrive. The chain actor gets this node's
+/// custody columns first and the block second: its mailbox is FIFO, so the
+/// block finds its columns already stored and never waits in
+/// `blocks_awaiting_columns`.
+pub async fn publish_beacon_block(
+    server: &mut P2PServer,
+    block: SignedBeaconBlock,
+    sidecars: Vec<DataColumnSidecar>,
+) {
     let slot = block.slot();
     let Some(beacon) = server.wire.beacon() else {
         error!(slot, "A beacon block reached a lean node; dropping it");
@@ -651,7 +664,33 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
         block_root = %ShortRoot(&block.message_hash_tree_root().0),
         "Published block to gossipsub"
     );
+    for sidecar in &sidecars {
+        let subnet = das::compute_subnet_for_data_column_sidecar(sidecar.index);
+        let topic = IdentTopic::new(beacon_topics::data_column_topic_name(
+            beacon.fork_digest,
+            subnet,
+        ));
+        server
+            .swarm_handle
+            .publish(topic, compress_message(&sidecar.to_ssz()));
+    }
+    if !sidecars.is_empty() {
+        info!(
+            slot,
+            columns = sidecars.len(),
+            "Published data columns to gossipsub"
+        );
+    }
     if let Some(ref blockchain) = server.blockchain {
+        let custody: Vec<DataColumnSidecar> = sidecars
+            .into_iter()
+            .filter(|sidecar| beacon.custody_columns.contains(&sidecar.index))
+            .collect();
+        if !custody.is_empty() {
+            let _ = blockchain
+                .new_data_column_sidecars(custody)
+                .inspect_err(|err| error!(%err, "Failed to hand the custody columns to the chain"));
+        }
         let _ = blockchain
             .new_block(block, BlockSource::Gossip, BlockArrival::now())
             .inspect_err(|err| error!(%err, "Failed to hand the published block to the chain"));
