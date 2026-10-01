@@ -84,6 +84,11 @@ pub enum QueueReason {
     BlockUnknown,
     /// A gloas sidecar names a block that is stored but has no post-state yet.
     BlockNotReady,
+    /// A gloas envelope names a block whose post-state is stored but not in
+    /// the cache the gossip checks read, as when the block was imported
+    /// moments ago. See `envelope::stateful_checks` for why this is not an
+    /// ignore.
+    StateNotCached,
 }
 
 impl QueueReason {
@@ -94,6 +99,7 @@ impl QueueReason {
             Self::ShufflingUnavailable => "shuffling_unavailable",
             Self::BlockUnknown => "block_unknown",
             Self::BlockNotReady => "block_not_ready",
+            Self::StateNotCached => "state_not_cached",
         }
     }
 }
