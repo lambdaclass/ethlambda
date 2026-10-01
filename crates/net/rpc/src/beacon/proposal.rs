@@ -31,7 +31,7 @@ use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::{
         BlockInputs, Operations, advance_to_slot, assemble_block, pack_attestations,
-        parse_execution_requests, payload_inputs,
+        pack_operations, parse_execution_requests, payload_inputs,
     },
     data_columns::{self, SidecarError},
     helpers::accessors::get_beacon_proposer_index,
@@ -338,24 +338,36 @@ async fn produce(
 
     let candidates = store.attestation_pool().block_candidates();
     let attestations = pack_attestations(&state, candidates);
-    let inputs = |attestations| BlockInputs {
+    let operation_candidates = {
+        let pool = store.operation_pool();
+        Operations {
+            proposer_slashings: pool.proposer_slashings(),
+            attester_slashings: pool.attester_slashings(),
+            voluntary_exits: pool.voluntary_exits(),
+            bls_to_execution_changes: pool.bls_to_execution_changes(),
+        }
+    };
+    let operations = pack_operations(&state, operation_candidates, &config);
+    let inputs = |attestations, operations| BlockInputs {
         randao_reveal,
         graffiti,
         attestations,
-        operations: Operations::default(),
+        operations,
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: built.blobs_bundle.commitments.clone(),
         execution_requests: execution_requests.clone(),
     };
     let attestation_count = attestations.len();
-    let block = match assemble_block(&state, inputs(attestations), &config) {
+    let has_operations = !operations.is_empty();
+    let block = match assemble_block(&state, inputs(attestations, operations), &config) {
         Ok(block) => block,
-        // `pack_attestations` checks every attestation's signature against this
-        // state, so this should not happen; but a block without them still
-        // earns the proposal, and one that fails to build earns nothing.
-        Err(err) if attestation_count > 0 => {
-            warn!(%slot, %err, "Block with attestations failed to build; retrying without");
-            assemble_block(&state, inputs(Vec::new()), &config)
+        // `pack_attestations` and `pack_operations` check every candidate
+        // against this state, so this should not happen; but a block without
+        // them still earns the proposal, and one that fails to build earns
+        // nothing.
+        Err(err) if attestation_count > 0 || has_operations => {
+            warn!(%slot, %err, "Block with attestations or operations failed to build; retrying without");
+            assemble_block(&state, inputs(Vec::new(), Operations::default()), &config)
                 .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
@@ -364,6 +376,9 @@ async fn produce(
         %slot,
         proposer,
         attestations = block.body.attestations.len(),
+        slashings = block.body.proposer_slashings.len() + block.body.attester_slashings.len(),
+        exits = block.body.voluntary_exits.len(),
+        bls_changes = block.body.bls_to_execution_changes.len(),
         transactions = block.body.execution_payload.transactions.len(),
         blobs = block.body.blob_kzg_commitments.len(),
         "Produced block"

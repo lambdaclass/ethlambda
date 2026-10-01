@@ -414,6 +414,8 @@ pub(crate) mod test_utils {
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
         pub(crate) sidecars:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::fulu::DataColumnSidecar>>,
+        /// When set, `publish_beacon_operation` fails as a stopped actor would.
+        pub(crate) fail_operations: std::sync::atomic::AtomicBool,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -441,6 +443,12 @@ pub(crate) mod test_utils {
             &self,
             operation: ethlambda_types::beacon::operation::BeaconOperation,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
+            if self
+                .fail_operations
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(spawned_concurrency::error::ActorError::ActorStopped);
+            }
             self.operations.lock().unwrap().push(operation);
             Ok(())
         }
