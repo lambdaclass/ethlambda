@@ -157,6 +157,10 @@ xdelta3 = { git = "https://github.com/sigp/xdelta3-rs", rev = "fe3906605c87", de
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }
+# The commit hash `build.rs` embeds in full, which vergen only offers abbreviated
+# beside the branch. vergen-git2 already builds this crate with no default
+# features, so naming it directly adds nothing to the dependency graph.
+git2 = { version = "0.20", default-features = false }
 
 rayon = "1.11"
 rand = "0.10"
