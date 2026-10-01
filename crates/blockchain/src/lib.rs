@@ -59,6 +59,7 @@ mod beacon_columns;
 pub mod beacon_engine;
 mod beacon_envelope;
 mod beacon_payloads;
+pub use beacon_payloads::checkpoint_hash;
 pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
@@ -379,7 +380,7 @@ impl BlockChain {
     /// `safe_slots_to_import_optimistically`, which nothing on that arm reads.
     #[allow(clippy::too_many_arguments)]
     fn start_actor(
-        store: Store,
+        mut store: Store,
         sync_status: SyncStatusTracker,
         sync_status_controller: SyncStatusController,
         events: EventBus,
@@ -389,6 +390,12 @@ impl BlockChain {
         safe_slots_to_import_optimistically: u64,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
+
+        // Payloads verified before a restart have no recorded verdict, since
+        // the map is scratch; see `seed_resumed_payload_statuses`.
+        if matches!(duties, ChainDuties::Beacon) {
+            beacon_payloads::seed_resumed_payload_statuses(&mut store, engine.is_some());
+        }
 
         // `sidecars_awaiting_parent` starts empty below, and it is the only
         // index into `Table::PendingDataColumns`. Anything a previous run
@@ -1048,6 +1055,7 @@ impl BlockChainServer {
         self.evict_envelope_queues_at_or_below_finality();
         self.redrive_held_blocks().await;
         self.redrive_envelopes_awaiting_columns();
+        self.redrive_envelopes_awaiting_engine();
         self.redrive_missing_envelopes();
         self.settle_envelopes().await;
 

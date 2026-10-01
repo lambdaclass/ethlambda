@@ -4924,6 +4924,28 @@ pub fn on_execution_payload_envelope(
     sidecars: &[gloas::DataColumnSidecar],
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
+    check_execution_payload_envelope(store, signed_envelope, config, sidecars, engine)?;
+    accept_execution_payload_envelope(store, signed_envelope);
+    Ok(())
+}
+
+/// Every check of [`on_execution_payload_envelope`], without recording the
+/// payload.
+///
+/// Split out so a caller whose execution engine answers over the network can
+/// run the pure consensus checks first, ask the engine only about an envelope
+/// that passed them, and record the payload with
+/// [`accept_execution_payload_envelope`] once the answer allows it. The
+/// `engine` argument still answers the engine's part of
+/// `verify_execution_payload_envelope`; such a caller passes
+/// [`stf::ExecutionEngine::valid`] and consults the real engine itself.
+pub fn check_execution_payload_envelope(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: &[gloas::DataColumnSidecar],
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
     let envelope = &signed_envelope.message;
     let block_root = envelope.beacon_block_root;
 
@@ -4952,11 +4974,24 @@ pub fn on_execution_payload_envelope(
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
 
-    // Add execution payload envelope to the store. Persisted, so a restarted
-    // follower keeps the full branch of this block.
-    store.insert_verified_payload(block.slot(), signed_envelope);
-
     Ok(())
+}
+
+/// The recording half of [`on_execution_payload_envelope`]: adds a checked
+/// envelope to the store. Persisted, so a restarted follower keeps the full
+/// branch of this block.
+///
+/// The caller must have run [`check_execution_payload_envelope`] on the same
+/// envelope; a block the store does not hold is the only case this refuses.
+pub fn accept_execution_payload_envelope(
+    store: &mut Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+) {
+    let block_root = signed_envelope.message.beacon_block_root;
+    let Some((slot, _parent)) = store.block_entry(&block_root) else {
+        return;
+    };
+    store.insert_verified_payload(slot, signed_envelope);
 }
 
 /// Validates `attestation` and, if valid, records it as each attester's

@@ -3387,7 +3387,13 @@ impl Store {
     /// derived from [`Self::has_verified_payload`]) and the envelope is no
     /// longer served to peers. Returns whether `root` was verified.
     pub fn remove_verified_payload(&mut self, root: &H256) -> bool {
-        let was_verified = self.beacon.lock().unwrap().verified_payloads.remove(root);
+        let was_verified = {
+            let mut scratch = self.beacon.lock().unwrap();
+            // The cached hash goes too: nothing may resolve a payload this
+            // store no longer holds as a FULL node.
+            scratch.el_block_hashes.remove(root);
+            scratch.verified_payloads.remove(root)
+        };
         if let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) {
             let keys = vec![encode_slot_root_key(slot, root)];
             let mut batch = self.backend.begin_write().expect("write batch");
@@ -3397,6 +3403,17 @@ impl Store {
             batch.commit().expect("commit");
         }
         was_verified
+    }
+
+    /// Gloas: the roots whose payload is verified, in no particular order.
+    pub fn verified_payload_roots(&self) -> Vec<H256> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .verified_payloads
+            .iter()
+            .copied()
+            .collect()
     }
 
     /// Gloas: the verified envelope stored for `root`, if any.
@@ -7447,8 +7464,10 @@ mod tests {
             .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
             .expect("insert block");
         store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
+        store.insert_beacon_el_block_hash(root, SLOTS_PER_EPOCH, H256::from([9u8; 32]));
 
         assert!(store.remove_verified_payload(&root));
+        assert_eq!(store.beacon_el_block_hash(root), None);
         assert!(!store.remove_verified_payload(&root));
 
         assert!(!store.has_verified_payload(&root));
