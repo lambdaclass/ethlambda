@@ -46,7 +46,8 @@ use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_engine::types::ClientVersionV1;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
-    InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef, ToRpcToP2PRef,
+    BlockArrival, InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
+    ToRpcToP2PRef,
 };
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
@@ -211,6 +212,9 @@ enum ChainActor {
         /// `--execution-endpoint` was not given.
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        /// The checkpoint-sync URLs to ask for a gloas anchor's execution
+        /// payload envelope; empty when there is nothing to ask.
+        anchor_envelope_urls: Vec<String>,
     },
 }
 
@@ -670,6 +674,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine,
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
+                    anchor_envelope_urls: clean_checkpoint_urls.clone(),
                 },
             }
         }
@@ -777,6 +782,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
+    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
     let blockchain = match setup.chain {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
@@ -785,8 +791,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            anchor_envelope_urls,
         } => {
             check_custody_set(&custody_columns)?;
+            anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
+                .filter(|_| !anchor_envelope_urls.is_empty())
+                .map(|root| (anchor_envelope_urls, root));
             BlockChain::spawn_beacon(
                 setup.store,
                 sync_status,
@@ -797,6 +807,22 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             )
         }
     };
+
+    // Off the startup path: the fetch is best-effort and a slow peer must not
+    // delay the node. The envelope goes through the same chain-actor entry a
+    // gossiped one does, so the bid check, the column check and the
+    // verification all apply to it.
+    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+        let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
+        tokio::spawn(async move {
+            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
+            {
+                let _ = chain
+                    .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
+                    .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));
+            }
+        });
+    }
 
     let p2p_ref = p2p.actor_ref();
     let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
@@ -825,6 +851,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// The root of the anchor block when it is a gloas block whose execution
+/// payload envelope the store does not hold.
+///
+/// The anchor is the finalized block. A node that checkpoint-synced onto a
+/// gloas block has the block and state but not the payload its children may
+/// build on; asking the checkpoint source for it saves waiting for a FULL
+/// child to make the by-root request fetch it.
+fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
+    let root = store.latest_finalized().ok()?.root;
+    let block = store.get_signed_block(&root).ok()??;
+    if block.fork_name() != ForkName::Gloas {
+        return None;
+    }
+    let held = store.get_execution_payload_envelope(&root).ok()?.is_some();
+    (!held).then_some(root)
 }
 
 /// Reject a beacon node with no custody set before it spawns.
