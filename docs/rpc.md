@@ -261,7 +261,9 @@ the chain actor writes, so no request waits on the actor.
   `dependent_root` follows each endpoint's v1 definition. Attester duties walk
   every committee of the epoch, a full shuffle per request on mainnet. An
   epoch the node's schedule places at gloas is a `400` on both duty endpoints:
-  the head is a fulu state, and this node does not follow gloas.
+  the head is a fulu state, and the node serves no validator duties from gloas
+  (it follows the fork but has no builder, payload-timeliness or gloas proposer
+  support).
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork

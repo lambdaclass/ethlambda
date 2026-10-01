@@ -190,8 +190,8 @@ pub fn fork_at_slot(config: &Config, slot: Slot) -> ForkName {
 /// detail are dispatched by name, and a handler that already knows it is
 /// holding a block should not have to unwrap a [`BeaconGossip`] to find one.
 ///
-/// A block whose slot is at a fork this node does not follow (gloas) and that
-/// fails to decode is `UnsupportedFork`, not `Ssz`: the container this build
+/// A block whose slot is at a fork this node does not follow (none today) and
+/// that fails to decode is `UnsupportedFork`, not `Ssz`: the container this build
 /// models for that fork is the one at the pinned specification release, and
 /// an honest peer's block may follow a later one. Bytes too short to name a
 /// slot, and a block at a followed fork, stay `Ssz` or `Truncated`.

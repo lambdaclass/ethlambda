@@ -247,8 +247,9 @@ fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
 /// config parsed. A loaded network reaches this the same as a built-in one,
 /// and can even schedule such a fork at epoch 0, in which case its own genesis
 /// state already decodes as that fork and startup refuses it outright
-/// (`refuse_unfollowable_fork` in `main.rs`, since fork choice itself accepts
-/// a gloas anchor); this warning fires first either way.
+/// (`refuse_unfollowable_fork` in `main.rs`); this warning fires first either
+/// way. Every fork `ForkName` models is followed today, gloas included, so
+/// this is the guard for the next fork the node cannot follow.
 fn warn_if_unfollowed_fork_scheduled(network: &str, config: &Config) {
     let unfollowed = ethlambda_types::beacon::fork::ForkName::ALL
         .into_iter()

@@ -2160,6 +2160,9 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// on its first tick. That writer also keeps the canonical `BlockRoots` index
 /// in step with the branch fork choice just picked.
 ///
+/// The head node's payload status is recorded too ([`Store::head_payload_status`]):
+/// the root alone cannot say which payload branch of a gloas block was picked.
+///
 /// Written unconditionally on every call, not only when the head changes: a
 /// value written once and then left alone is a second source of truth a bug
 /// can let drift, and the write is one small metadata row plus an index diff
@@ -2167,6 +2170,9 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
     let head = get_head_node(store, config)?;
+    // Recorded with its root, so a reader can tell which head the status is
+    // for whichever of the two writes it sees first.
+    store.set_head_payload_status(head.root, head.payload_status);
     store
         .update_checkpoints(ForkCheckpoints::head_only(head.root))
         .expect("record beacon head");
@@ -7979,6 +7985,7 @@ mod tests {
             .expect("the live head walk must succeed on a resumed store");
         assert_eq!(head.root, walked.root);
         assert_eq!(get_head(&mut store, &config).unwrap(), walked.root);
+        assert_eq!(store.head_payload_status(), Some(walked.payload_status));
 
         let message = gloas::PayloadAttestationMessage {
             validator_index: 3,
