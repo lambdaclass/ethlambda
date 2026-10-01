@@ -11,7 +11,7 @@
 //!
 //! Osaka introduces no new `newPayload`: its own document adds only
 //! `engine_getPayloadV5` and `engine_getBlobsV2`/`V3`, and `engine_newPayloadV5`
-//! belongs to Amsterdam. So the Osaka-current call for a payload is Prague's
+//! belongs to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is Prague's
 //! `engine_newPayloadV4`, and the Osaka-current fork choice notification is
 //! Cancun's `engine_forkchoiceUpdatedV3`.
 //!
@@ -40,6 +40,7 @@ pub use types::{ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
 /// requires `engine_exchangeCapabilities` itself not to appear.
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_newPayloadV4",
+    "engine_newPayloadV5",
     "engine_forkchoiceUpdatedV3",
     "engine_getPayloadV5",
     "engine_getClientVersionV1",

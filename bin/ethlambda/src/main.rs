@@ -635,8 +635,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
+                    let gloas_scheduled = store.config().gloas_fork_epoch
+                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
                     let _ = client
-                        .handshake(&ours)
+                        .handshake(&ours, gloas_scheduled)
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
