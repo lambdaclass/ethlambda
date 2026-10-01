@@ -429,6 +429,10 @@ fn delete_one(
         Err(err) => return KeyStatus::error(err),
     };
     let in_memory = store.remove(pubkey);
+    // Whatever becomes of the definitions file below, this process no longer
+    // signs with the key, so its overrides have nothing left to apply to. A key
+    // imported again starts on the defaults.
+    context.settings.forget(pubkey);
 
     if !on_disk && !in_memory {
         return KeyStatus {
@@ -553,6 +557,10 @@ mod tests {
     fn context_with_dirs(store: SharedStore, dir: &std::path::Path) -> KeymanagerContext {
         KeymanagerContext {
             store,
+            settings: Arc::new(crate::proposer_settings::ProposerSettings::new(
+                ethlambda_types::beacon::primitives::Bytes32::ZERO,
+                None,
+            )),
             validators_dir: dir.to_path_buf(),
             secrets_dir: dir.to_path_buf(),
             definitions_lock: Arc::new(tokio::sync::Mutex::new(())),

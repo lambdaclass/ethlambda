@@ -281,9 +281,9 @@ implementation's, so none of the [common flags](#common-flags) apply to it.
 | `--http-address` | `127.0.0.1` | Bind address for the metrics and keymanager servers |
 | `--metrics-port` | `5064` | Prometheus metrics port |
 | `--keymanager-port` | `5062` | Keymanager API port. Only bound with `--enable-keymanager` |
-| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
-| `--graffiti` | empty | Text for the graffiti field of proposed blocks. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer |
-| `--enable-keymanager` | off | Serve the keymanager API. Off by default because it mutates key material |
+| `--suggested-fee-recipient` | none | Execution address to receive block rewards, `0x`-prefixed, for every validator the keymanager API gives no address of its own. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours |
+| `--graffiti` | empty | Text for the graffiti field of proposed blocks, for every validator the keymanager API gives no graffiti of its own. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer. An ethlambda beacon node appends both clients' versions to it (see [`rpc.md`](rpc.md#validator-endpoints)) |
+| `--enable-keymanager` | off | Serve the keymanager API: keystores, plus each validator's own fee recipient, graffiti and gas limit. Off by default because it mutates key material |
 
 ### What it does today
 
@@ -291,10 +291,10 @@ Attestations, block proposals and attestation aggregation.
 
 Each epoch it resolves its validators' indices, fetches their attester duties
 for this epoch and the next, fetches this epoch's proposer duties, subscribes
-to the committee subnets the attester duties need, and registers its fee
-recipient with the beacon node. The subscription also tells the node which
-committees this client will aggregate for, which it has to know in advance so
-it can collect the votes.
+to the committee subnets the attester duties need, and registers each
+validator's fee recipient with the beacon node. The subscription also tells the
+node which committees this client will aggregate for, which it has to know in
+advance so it can collect the votes.
 
 Each slot it wakes at the boundary. If one of its validators proposes that
 slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
@@ -362,6 +362,27 @@ Off unless `--enable-keymanager` is passed. It serves `GET`, `POST` and
 `api-token.txt` in the validators directory and generated there on first start
 if absent. The token file is written `0600` and a file too short to be a real
 token is refused rather than accepted.
+
+It also serves `GET`, `POST` and `DELETE` on
+`/eth/v1/validator/{pubkey}/feerecipient`, `/graffiti` and `/gas_limit`, which
+give one validator its own value in place of the command line's default:
+
+| Setting | Default | Takes effect |
+|---|---|---|
+| `feerecipient` | `--suggested-fee-recipient` | At the next epoch boundary, when the fee recipients are registered with the beacon node again. A block proposed before then pays the address the node was last given, and the check before signing reports the mismatch |
+| `graffiti` | `--graffiti` | The next proposal |
+| `gas_limit` | `DEFAULT_GAS_LIMIT` | Stored and served only: it matters to builder registrations, and there is no builder flow |
+
+**These are held in memory only.** A restart puts every validator back on the
+defaults, so an operator driving these endpoints must set them again after one.
+Deleting a keystore drops its values too.
+
+A few answers worth knowing: `GET feerecipient` is a `500` when the validator
+has no address and there is no `--suggested-fee-recipient` default, as
+Lighthouse answers it; `POST feerecipient` refuses the zero address, as the
+specification requires; `POST graffiti` refuses text over 32 bytes rather than
+truncating it; and every route answers `404` for a key this client does not
+hold.
 
 The specification requires TLS. This binds to `--http-address`, loopback by
 default; exposing it further means putting a TLS terminator in front.
