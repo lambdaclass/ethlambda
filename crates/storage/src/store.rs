@@ -834,6 +834,31 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
     SignedBeaconBlock::from_ssz(fork, ssz).expect("valid signed block")
 }
 
+/// Whether `block` builds on the payload whose hash is `payload_block_hash`:
+/// gloas's bid `parent_block_hash` rule for a payload being part of the chain.
+fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBlockHash) -> bool {
+    match block {
+        SignedBeaconBlock::Gloas(block) => {
+            block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .parent_block_hash
+                == *payload_block_hash
+        }
+        // A pre-gloas block cannot follow a gloas one.
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => false,
+        SignedBeaconBlock::Lean(_) => Store::lean_only("builds_on_payload"),
+    }
+}
+
 /// `root`'s slot on a beacon chain, read without a `Store`, for the writer
 /// thread's anchor decision.
 ///
@@ -3329,6 +3354,99 @@ impl Store {
             gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
                 .expect("a stored envelope decodes")
         }))
+    }
+
+    /// Gloas: the stored envelopes of payloads on the canonical chain, for the
+    /// slots `start_slot..=end_slot`, in ascending slot order.
+    ///
+    /// Serves `ExecutionPayloadEnvelopesByRange`. A payload is part of the
+    /// chain when the next canonical block builds on it: that block's bid
+    /// `parent_block_hash` equals the payload's `block_hash`. A block whose
+    /// successor builds on its empty branch has its envelope left out, even
+    /// when this node holds one. The head has no successor and fork choice does
+    /// not persist which payload branch it picked, so its envelope is served
+    /// when held: only a verified envelope is ever stored. See
+    /// `docs/spec_deviations.md`, "The head's payload envelope is served
+    /// whenever it is held".
+    ///
+    /// Canonical blocks come from `BlockRoots` and the whole answer is read
+    /// from one view, like [`get_signed_blocks_by_slot_range`](Self::get_signed_blocks_by_slot_range).
+    /// The successor of the last block in the window may lie past `end_slot`,
+    /// so the index is read on beyond it, up to the head, until one is found;
+    /// that search is skipped when the last block holds no envelope to judge.
+    pub fn canonical_execution_payload_envelopes(
+        &self,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<gloas::SignedExecutionPayloadEnvelope>, Error> {
+        if self.chain != Chain::Beacon {
+            Self::lean_only("canonical_execution_payload_envelopes");
+        }
+        let view = self.backend.begin_read().expect("read view");
+        let canonical_root = |slot: u64| -> Option<H256> {
+            view.get(Table::BlockRoots, &encode_block_root_key(slot))
+                .expect("get block root")
+                .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
+        };
+
+        let envelope_row = |slot: u64, root: &H256| {
+            view.get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get")
+        };
+
+        let mut window: Vec<(u64, H256)> = (start_slot..=end_slot)
+            .filter_map(|slot| canonical_root(slot).map(|root| (slot, root)))
+            .collect();
+        // Head and its slot come out of the same view as the rest, so a head
+        // move partway through cannot pair one branch's index with another's.
+        let head_slot = view
+            .get(Table::Metadata, KEY_HEAD)
+            .expect("get head")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"))
+            .and_then(|head| view.get(Table::BlockHeaders, &head.to_ssz()).expect("get"))
+            .map(|bytes| decode_beacon_block_value(&bytes).slot());
+        if let Some(&(last_slot, last_root)) = window.last()
+            && envelope_row(last_slot, &last_root).is_some()
+            && let Some(head_slot) = head_slot
+        {
+            let successor = (end_slot.saturating_add(1)..=head_slot)
+                .find_map(|slot| canonical_root(slot).map(|root| (slot, root)));
+            window.extend(successor);
+        }
+
+        let mut envelopes = Vec::new();
+        for (index, &(slot, root)) in window.iter().enumerate() {
+            if slot > end_slot {
+                break;
+            }
+            let Some(bytes) = envelope_row(slot, &root) else {
+                continue;
+            };
+            let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+                .expect("a stored envelope decodes");
+            let builds_on_it = match window.get(index + 1) {
+                None => true,
+                Some((_, next_root)) => {
+                    let next = view
+                        .get(Table::BlockHeaders, &next_root.to_ssz())
+                        .expect("get")
+                        .map(|bytes| decode_beacon_block_value(&bytes));
+                    match next {
+                        Some(next) => {
+                            builds_on_payload(&next, &envelope.message.payload.block_hash)
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if builds_on_it {
+                envelopes.push(envelope);
+            }
+        }
+        Ok(envelopes)
     }
 
     /// Rebuilds the in-memory `verified_payloads` and `block_timeliness` from

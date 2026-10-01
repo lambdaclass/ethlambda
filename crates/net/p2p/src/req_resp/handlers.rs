@@ -31,7 +31,7 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
 use super::{
-    Request, Response, ResponsePayload,
+    Request, Response, ResponsePayload, envelopes,
     messages::{ResponseCode, error_message},
 };
 use crate::beacon::BeaconWire;
@@ -167,6 +167,26 @@ pub async fn handle_req_resp_message(
                         )
                         .await;
                     }
+                    Request::ExecutionPayloadEnvelopesByRange(request) => {
+                        trace!(
+                            kind = "execution_payload_envelopes_by_range_request",
+                            peer_count, "P2P message received"
+                        );
+                        envelopes::handle_execution_payload_envelopes_by_range_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
+                    }
+                    Request::ExecutionPayloadEnvelopesByRoot(roots) => {
+                        trace!(
+                            kind = "execution_payload_envelopes_by_root_request",
+                            peer_count, "P2P message received"
+                        );
+                        envelopes::handle_execution_payload_envelopes_by_root_request(
+                            server, peer, roots, channel,
+                        )
+                        .await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -266,6 +286,21 @@ pub async fn handle_req_resp_message(
                                     );
                                 }
                             }
+                        }
+                        ResponsePayload::ExecutionPayloadEnvelopes(envelopes) => {
+                            trace!(
+                                kind = "execution_payload_envelopes_response",
+                                peer_count, "P2P message received"
+                            );
+                            // Nothing requests envelopes yet, so no id can
+                            // legitimately be waiting for this answer.
+                            server.outbound_requests.remove(&request_id);
+                            debug!(
+                                %peer,
+                                ?request_id,
+                                count = envelopes.len(),
+                                "Received an execution payload envelopes response nothing asked for"
+                            );
                         }
                         ResponsePayload::Blocks(blocks) => {
                             trace!(kind = "blocks_response", peer_count, "P2P message received");
@@ -462,14 +497,18 @@ fn lean_blocks(blocks: Vec<SignedBeaconBlock>) -> Vec<SignedBlock> {
 ///
 /// Every request handler on either chain ends here, which is most of what the
 /// two have in common above encoding.
-fn respond(server: &mut P2PServer, channel: ResponseChannel<Response>, payload: ResponsePayload) {
+pub(super) fn respond(
+    server: &mut P2PServer,
+    channel: ResponseChannel<Response>,
+    payload: ResponsePayload,
+) {
     server
         .swarm_handle
         .send_response(channel, Response::success(payload));
 }
 
 /// Answer a request with an error code and a reason.
-fn refuse(
+pub(super) fn refuse(
     server: &mut P2PServer,
     channel: ResponseChannel<Response>,
     code: ResponseCode,
@@ -1776,7 +1815,7 @@ fn handle_metadata_response(server: &mut P2PServer, peer: PeerId, metadata: Beac
 /// to block requests" (data column sidecar requests name the same code for
 /// the same reason), where an empty stream claims we looked and had nothing,
 /// and `INVALID_REQUEST` would blame the asker for a request that was fine.
-fn beacon_block_store_or_refuse(
+pub(super) fn beacon_block_store_or_refuse(
     server: &mut P2PServer,
     peer: PeerId,
     channel: ResponseChannel<Response>,

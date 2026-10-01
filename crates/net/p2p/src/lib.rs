@@ -392,6 +392,8 @@ pub enum ReqRespProtocol {
     BeaconBlocksByRoot,
     DataColumnSidecarsByRange,
     DataColumnSidecarsByRoot,
+    ExecutionPayloadEnvelopesByRange,
+    ExecutionPayloadEnvelopesByRoot,
 }
 
 /// An outbound request id, namespaced by the protocol it was sent on.
@@ -1877,6 +1879,12 @@ async fn handle_behaviour_event(
             ReqRespEvent::DataColumnSidecarsByRoot(e) => {
                 (ReqRespProtocol::DataColumnSidecarsByRoot, e)
             }
+            ReqRespEvent::ExecutionPayloadEnvelopesByRange(e) => {
+                (ReqRespProtocol::ExecutionPayloadEnvelopesByRange, e)
+            }
+            ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
+                (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
+            }
         },
     };
 
@@ -2886,6 +2894,12 @@ mod tests {
                 }
                 ReqRespEvent::DataColumnSidecarsByRoot(e) => {
                     (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+                }
+                ReqRespEvent::ExecutionPayloadEnvelopesByRange(e) => {
+                    (ReqRespProtocol::ExecutionPayloadEnvelopesByRange, e)
+                }
+                ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
+                    (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
                 }
             })
         }

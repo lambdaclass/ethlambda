@@ -216,6 +216,27 @@ the root of the state's latest block header.
   shapes give the same root.
 - **Equivalence:** the same check, on both kinds of state.
 
+## The head's payload envelope is served whenever it is held
+
+`ExecutionPayloadEnvelopesByRange` (gloas `p2p-interface.md`) says clients
+MUST NOT include the envelope of a block whose `ForkChoiceNode` in the
+served chain has `payload_status` equal to `PAYLOAD_STATUS_EMPTY`.
+
+- **The specification:** for the head block, the envelope is part of the chain
+  only when the head node's payload status is FULL.
+- **ethlambda:** for every block but the head, the envelope is served when the
+  next canonical block's bid `parent_block_hash` equals the payload's
+  `block_hash`, which is the specification's rule. For the head there is no
+  next block, and the head node's payload status is not yet exposed by the
+  store (`KEY_HEAD` holds a root only), so the envelope is served whenever it
+  is held. Only verified envelopes are ever stored.
+- **Effect:** when fork choice picked the head's EMPTY branch despite a
+  verified envelope being held, a peer receives an envelope fork choice
+  currently does not build on. The next block resolves it, since that block's
+  bid then decides the envelope's membership like any other.
+- **Fixed when:** the head node's payload status is stored.
+  `Store::canonical_execution_payload_envelopes` is the one place to change.
+
 ## The attestation deadline takes the epoch that picks the fork's rule
 
 - **The specification:** `get_attestation_due_ms()` takes no argument, and
