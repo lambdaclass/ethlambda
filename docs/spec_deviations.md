@@ -274,3 +274,54 @@ node, and each call walks every latest message and every ancestor step.
   `gloas_get_weight` remain, as the references the walk is compared with, at
   every `head` check of every fork-choice fixture and on randomized trees;
   `compute_head` is the pre-gloas reference.
+
+## The execution client judges a gloas payload before the envelope is applied
+
+`verify_execution_payload_envelope` asks the execution engine last, as part of
+one boolean function. The follower asks it first, with `engine_newPayloadV5`,
+and applies the envelope with the engine's part answered "valid", because the
+answer has three outcomes and the specification's `ExecutionEngine` has two.
+
+- **`VALID`:** applied; the payload is recorded `VALID`.
+- **`SYNCING` / `ACCEPTED`:** applied, since the consensus checks passed and the
+  payload is `NOT_VALIDATED` (`optimistic-sync.md`); recorded `SYNCING`, which
+  the attestation gossip rules already read as not yet validated. A later
+  `forkchoiceUpdated` `VALID` for the head, or for a descendant payload, moves
+  it and every optimistic payload on that chain to `VALID`. Unlike a pre-gloas
+  block there is no `is_optimistic_candidate_block` gate: a payload is applied
+  to a block the consensus layer already imported, so there is no
+  merge-transition poisoning to guard against.
+- **`INVALID`:** not applied, so the FULL node of the block never exists; the
+  payload is recorded `INVALID`, children held for it are dropped and later
+  blocks that name it as their FULL parent are dropped instead of held. The
+  block itself and its EMPTY branch stay. `latestValidHash` can reach further
+  back, in which case the first payload after it is condemned the same way
+  (`beacon_payloads::resolve_invalid_payload`, which skips blocks that carry no
+  payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
+  `INVALID` for a payload already applied removes it again (its FULL node, its
+  stored envelope, and every child built on it).
+- **No answer after the retry ladder:** as for a block, the payload is not
+  applied; the envelope is fetched again rather than held.
+
+The engine is asked only about an envelope whose builder signature holds: an
+unsigned copy with the honest block hash and a different body would otherwise
+earn an `INVALID` that lands on the honest payload.
+
+## `forkchoiceUpdated` for a gloas head
+
+- The head hash follows the head node: `bid.block_hash` for a FULL head,
+  `bid.parent_block_hash` for an EMPTY one. A head whose payload status has not
+  been computed yet is skipped.
+- `finalized_block_hash` is the finalized block's `bid.parent_block_hash`, as
+  the specification has it.
+- `safe_block_hash` is the justified block's `bid.parent_block_hash`. The
+  specification's `get_safe_execution_block_hash` is built on fast
+  confirmation, which the follower does not run, so this is the fallback. It
+  can only be older than the confirmed block, which keeps it safe.
+- A pre-gloas checkpoint block, including one beneath a gloas head, keeps its
+  own payload hash.
+- The call is V4 with the node's custody columns when the head block is gloas,
+  and V3 before; `engine_newPayloadV5` is for envelopes and V4 for pre-gloas
+  blocks.
+- A hash of zero is "nothing to say" on either fork, so a payload whose hash is
+  zero (the fixtures' placeholder) sends no `forkchoiceUpdated`.
