@@ -124,7 +124,7 @@ fn header_with_body_root(
             state_root: message.state_root,
             body_root,
         },
-        signature: block.signature.clone(),
+        signature: block.signature,
     }
 }
 
@@ -232,7 +232,7 @@ pub fn verified_sidecars(
         for (cell_index, cell) in cells.iter().enumerate() {
             batch_commitments.push(*commitment);
             batch_indices.push(cell_index as u64);
-            batch_cells.push(cell.clone());
+            batch_cells.push(*cell);
         }
     }
     let verified = kzg::verify_cell_kzg_proof_batch(

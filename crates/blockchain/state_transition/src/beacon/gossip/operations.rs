@@ -110,11 +110,12 @@ impl SeenOperations {
             BeaconOperation::AttesterSlashing(slashing) => {
                 // Every index is recorded, so one new index is enough to
                 // count as new.
-                slashed_indices(slashing)
-                    .into_iter()
-                    .fold(false, |any_new, index| {
-                        self.attester_slashed.insert(index) || any_new
-                    })
+                // An explicit loop rather than `any`, which would short-circuit.
+                let mut any_new = false;
+                for index in slashed_indices(slashing) {
+                    any_new |= self.attester_slashed.insert(index);
+                }
+                any_new
             }
             BeaconOperation::BlsToExecutionChange(change) => self
                 .bls_to_execution_changes
@@ -353,7 +354,8 @@ fn bls_to_execution_change(
     Ok(())
 }
 
-/// Both halves, for the fixture runner.
+/// Both halves in one call: what the fixture runner and the Beacon API's pool
+/// POSTs run, the latter with a fresh seen set.
 pub fn validate(
     seen: &SeenOperations,
     store: &Store,
