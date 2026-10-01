@@ -55,6 +55,7 @@ test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chai
 
 test-beacon-mainnet: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, mainnet preset
 	$(BEACON_TEST) --features beacon-spec-tests
+	cargo test -p ethlambda-blockchain --lib --profile release-fast --features beacon-spec-tests
 
 test-beacon-minimal: consensus-spec-tests cryptography-specs ## 🧪 Run the Beacon Chain spec tests, minimal preset
 	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal

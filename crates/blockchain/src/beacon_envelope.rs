@@ -707,6 +707,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_gloas_block_imports_without_columns_and_is_not_held() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -722,6 +726,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_ahead_of_its_block_is_held_then_applied_when_the_block_imports() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -763,6 +771,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_block_on_a_full_parent_waits_for_the_parents_envelope_then_imports() {
         let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
         let mut server = case.server(12);
@@ -791,6 +803,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_that_fails_verification_is_dropped_and_its_child_stays_held() {
         let case = Case::new(
             "on_execution_payload_envelope",
@@ -820,6 +836,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn an_envelope_for_an_already_verified_payload_is_ignored() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -854,6 +874,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn a_stored_column_queues_only_an_envelope_that_waits_for_columns() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -882,6 +906,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn unmatched_envelopes_are_capped_per_slot_and_per_root() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -911,6 +939,10 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     async fn blocks_held_for_one_parents_payload_are_capped() {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
@@ -936,6 +968,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
     fn finality_evicts_all_three_queues() {
         // The finalized slot is fixed at init, so the queues are filled
         // directly around it.
