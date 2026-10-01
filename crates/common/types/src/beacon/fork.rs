@@ -112,13 +112,13 @@ impl ForkName {
 
     /// Whether this node follows a chain that has reached this fork.
     ///
-    /// Phase0 through fulu are followed. Gloas is not yet: the chain actor
-    /// imports gloas blocks and payload envelopes, but the network side does
-    /// not deliver envelopes or payload attestations, so the node still
-    /// refuses gloas anchors, ignores gloas gossip and reports syncing once
-    /// the clock reaches the fork. This is the one place to
-    /// change when the node starts following gloas; every site whose rule is
-    /// "does this node follow the fork" calls it.
+    /// Every beacon fork is followed. Gloas needs the payload envelopes and
+    /// payload attestations that phase0 through fulu do not: the chain actor
+    /// imports the envelopes, the network side delivers them and the two
+    /// gloas gossip topics, and fork choice keeps the head's payload status.
+    /// The question stays a function so a fork this node cannot follow has
+    /// one place to say so; every site whose rule is "does this node follow
+    /// the fork" calls it.
     ///
     /// # Panics
     ///
@@ -132,8 +132,8 @@ impl ForkName {
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra
-            | ForkName::Fulu => true,
-            ForkName::Gloas => false,
+            | ForkName::Fulu
+            | ForkName::Gloas => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -301,9 +301,9 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_fulu_is_followed_and_gloas_is_not() {
+    fn every_beacon_fork_through_gloas_is_followed() {
         for fork in ForkName::ALL {
-            assert_eq!(fork.is_followed(), fork != ForkName::Gloas, "{fork:?}");
+            assert!(fork.is_followed(), "{fork:?}");
         }
     }
 

@@ -24,7 +24,8 @@ use ethlambda_types::{
         },
         fork::ForkName,
         fork_choice::{
-            BlockPayloadLink, LatestMessage, PayloadStatusEnum, PayloadStatusV1, PowBlock,
+            BlockPayloadLink, LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1,
+            PowBlock,
         },
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
@@ -723,6 +724,16 @@ pub(crate) struct BeaconScratch {
     /// finality. A pruned link is derived again by decoding if anything asks
     /// for it.
     pub(crate) payload_links: HashMap<H256, (u64, BlockPayloadLink)>,
+    /// The payload branch of the head fork choice last picked: `Full` when
+    /// the head node is its block with the payload revealed, `Empty` when it
+    /// is the block alone. A pre-gloas head is `Full` (see
+    /// `fork_choice::get_head_node`).
+    ///
+    /// `None` until the first head computation of this process: nothing
+    /// persists it, and a resumed directory recomputes it on the first tick
+    /// rather than storing a second source of truth for what the head walk
+    /// derives. Readers treat `None` as "not known to be `Full`".
+    pub(crate) head_payload_status: Option<PayloadStatus>,
     /// Gloas: the payload timeliness committee's per-member vote on whether
     /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
     /// `None` until that member votes. Keyed by beacon block root, like
@@ -2423,6 +2434,23 @@ impl Store {
 
     // ============ Beacon Head ============
 
+    /// The payload status of the head node fork choice last picked, or `None`
+    /// before this process has computed a head. See
+    /// [`BeaconScratch::head_payload_status`].
+    pub fn head_payload_status(&self) -> Option<PayloadStatus> {
+        self.beacon.lock().unwrap().head_payload_status
+    }
+
+    /// Records the payload status of the head node fork choice just picked.
+    ///
+    /// Call it **before** [`Store::update_checkpoints`] moves the head root:
+    /// a reader that sees the new status against the old head merely withholds
+    /// an envelope for a moment, where the other order could serve the new
+    /// head's envelope while its node is still the empty one.
+    pub fn set_head_payload_status(&self, status: PayloadStatus) {
+        self.beacon.lock().unwrap().head_payload_status = Some(status);
+    }
+
     /// The beacon fork-choice head as `(slot, root)`, or `None` if the head
     /// row names a block this store has no header for.
     ///
@@ -3363,11 +3391,10 @@ impl Store {
     /// chain when the next canonical block builds on it: that block's bid
     /// `parent_block_hash` equals the payload's `block_hash`. A block whose
     /// successor builds on its empty branch has its envelope left out, even
-    /// when this node holds one. The head has no successor and fork choice does
-    /// not persist which payload branch it picked, so its envelope is served
-    /// when held: only a verified envelope is ever stored. See
-    /// `docs/spec_deviations.md`, "The head's payload envelope is served
-    /// whenever it is held".
+    /// when this node holds one. The head has no successor, so its envelope is
+    /// served only when the head node fork choice picked is `Full`
+    /// ([`Self::head_payload_status`]); before this process has computed a head
+    /// the status is unknown and the head's envelope is withheld.
     ///
     /// Canonical blocks come from `BlockRoots` and the whole answer is read
     /// from one view, like [`get_signed_blocks_by_slot_range`](Self::get_signed_blocks_by_slot_range).
@@ -3382,6 +3409,10 @@ impl Store {
         if self.chain != Chain::Beacon {
             Self::lean_only("canonical_execution_payload_envelopes");
         }
+        // Read ahead of the view, and written ahead of the head by
+        // `set_head_payload_status`'s contract, so a head move partway through
+        // errs toward withholding.
+        let head_is_full = self.head_payload_status() == Some(PayloadStatus::Full);
         let view = self.backend.begin_read().expect("read view");
         let canonical_root = |slot: u64| -> Option<H256> {
             view.get(Table::BlockRoots, &encode_block_root_key(slot))
@@ -3428,7 +3459,9 @@ impl Store {
             let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
                 .expect("a stored envelope decodes");
             let builds_on_it = match window.get(index + 1) {
-                None => true,
+                // No successor: this is the head, whose envelope is part of
+                // the chain only on the FULL node.
+                None => head_is_full,
                 Some((_, next_root)) => {
                     let next = view
                         .get(Table::BlockHeaders, &next_root.to_ssz())
@@ -7290,6 +7323,54 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// The head's envelope belongs to the served chain only on the FULL node:
+    /// an EMPTY head, or a head whose status this process has not computed,
+    /// withholds it.
+    #[test]
+    fn the_heads_envelope_is_served_only_when_the_head_node_is_full() {
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            0,
+            Config::mainnet(),
+            H256::ZERO,
+            Store::beacon_checkpoint_as_stored(BeaconCheckpoint::default()),
+            0,
+        );
+        store
+            .insert_signed_block(H256::ZERO, gloas_test_block(0, H256::ZERO))
+            .expect("insert anchor");
+        let block = gloas_test_block(1, H256::ZERO);
+        let root = block.message_hash_tree_root();
+        store.insert_signed_block(root, block).expect("insert head");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("advance head");
+        let envelope = test_envelope(root);
+        store.insert_verified_payload(1, &envelope);
+
+        assert_eq!(store.head_payload_status(), None);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(PayloadStatus::Empty);
+        assert!(
+            store
+                .canonical_execution_payload_envelopes(1, 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        store.set_head_payload_status(PayloadStatus::Full);
+        assert_eq!(
+            store.canonical_execution_payload_envelopes(1, 1).unwrap(),
+            vec![envelope]
+        );
     }
 
     #[test]

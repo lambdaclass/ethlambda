@@ -181,10 +181,10 @@ pub fn wire_params(
     // happens at it, and the old topics are left after it, per
     // `SUBSCRIBE_LEAD_EPOCHS` and `UNSUBSCRIBE_LAG_EPOCHS`. Say what is coming.
     //
-    // The gloas boundary keeps its own warning: crossing its digest works like
-    // any other, but the network side delivers neither gloas blocks nor
-    // payload envelopes or payload attestations to the chain actor yet, so
-    // the node stops tracking the chain there regardless.
+    // A fork the node does not follow keeps its own warning: crossing its
+    // digest works like any other, but the node stops tracking the chain
+    // there regardless. No fork is in that state today, since gloas is
+    // followed, so the warning is the guard for the next one.
     let schedule = ForkSchedule::new(&chain, genesis.genesis_validators_root);
     match schedule.next_boundary_after(epoch) {
         Some(next) if !next.fork.is_followed() => warn!(

@@ -36,7 +36,7 @@ use ethlambda_state_transition::beacon::{
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
 };
 
-use crate::beacon::{ApiError, refuse_unfollowed_epoch};
+use crate::beacon::{ApiError, refuse_validator_duties_from_gloas};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -206,7 +206,7 @@ async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Stor
 
 fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         epoch,
         "gloas proposer duties are not supported",
@@ -308,7 +308,7 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         epoch,
         "gloas attester duties are not supported",
@@ -399,7 +399,7 @@ async fn get_attestation_data(
 }
 
 fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiError> {
-    refuse_unfollowed_epoch(
+    refuse_validator_duties_from_gloas(
         &store.config(),
         compute_epoch_at_slot(slot),
         "gloas attestation data is not supported",

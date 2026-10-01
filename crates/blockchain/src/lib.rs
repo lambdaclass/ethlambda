@@ -3488,6 +3488,9 @@ impl BlockChainServer {
     /// Whether the clock is at a fork this node does not follow while the
     /// node's own head is still from one it does.
     ///
+    /// Every fork is followed today, so this is false; it stays as the guard
+    /// for the next fork the node cannot follow.
+    ///
     /// Blocks past the fork do not reach the live chain from the network, so the freshest block
     /// the store knows stays at the head and the sync tracker would read the
     /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
@@ -5058,17 +5061,17 @@ mod tests {
     }
 
     #[test]
-    fn the_node_reports_syncing_once_the_clock_passes_the_fork_it_does_not_follow() {
-        // No block arrives at all: gossip blocks past the fork are ignored in
-        // p2p and peers' Status messages are dropped, so the store's freshest
-        // block stays at the head. The clock alone must keep the node from
-        // reading the network as stalled.
+    fn the_clock_reaching_a_followed_fork_does_not_force_syncing() {
+        // Gloas is followed, so blocks past the fork do reach the live chain
+        // and the tracker's own stall detection applies as before: with no
+        // block at all it reads a stalled network as synced, the same as when
+        // no fork is scheduled.
         let mut server = syncing_server(Some(1));
         let past_the_fork = preset::SLOTS_PER_EPOCH + 8;
         server.update_sync_status(past_the_fork);
         assert_eq!(
             server.sync_status_controller.get(),
-            crate::metrics::SyncStatus::Syncing
+            crate::metrics::SyncStatus::Synced
         );
     }
 
@@ -5090,33 +5093,24 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_rule_holds_for_a_followed_head_once_the_clock_is_at_gloas() {
+    fn the_clock_rule_never_holds_while_every_fork_is_followed() {
+        // The rule is a guard for a fork the node cannot follow; with gloas
+        // followed there is none, whatever the clock and head say.
         let first_gloas_slot = preset::SLOTS_PER_EPOCH;
-        assert!(BlockChainServer::clock_is_past_followed_forks(
-            &gloas_at_epoch_one(),
-            first_gloas_slot + 8,
-            0
-        ));
-    }
-
-    #[test]
-    fn the_clock_rule_does_not_hold_before_the_clock_reaches_gloas() {
-        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
-        assert!(!BlockChainServer::clock_is_past_followed_forks(
-            &gloas_at_epoch_one(),
-            first_gloas_slot - 1,
-            0
-        ));
-    }
-
-    #[test]
-    fn the_clock_rule_does_not_hold_for_a_head_already_past_the_fork() {
-        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
-        assert!(!BlockChainServer::clock_is_past_followed_forks(
-            &gloas_at_epoch_one(),
-            first_gloas_slot + 8,
-            first_gloas_slot
-        ));
+        for (current_slot, head_slot) in [
+            (first_gloas_slot + 8, 0),
+            (first_gloas_slot - 1, 0),
+            (first_gloas_slot + 8, first_gloas_slot),
+        ] {
+            assert!(
+                !BlockChainServer::clock_is_past_followed_forks(
+                    &gloas_at_epoch_one(),
+                    current_slot,
+                    head_slot
+                ),
+                "clock {current_slot}, head {head_slot}"
+            );
+        }
     }
 
     #[tokio::test]

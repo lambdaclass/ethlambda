@@ -1695,19 +1695,16 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
     None
 }
 
-/// Refuses an anchor state in `fork` if this node cannot follow that fork yet,
-/// currently gloas.
+/// Refuses an anchor state in `fork` if this node cannot follow that fork.
 ///
-/// `fork_choice::get_forkchoice_store` accepts a gloas anchor, since fork choice
-/// itself handles the fork. This node's wiring does not: the network side
-/// delivers neither payload envelopes nor payload attestations to the chain
-/// actor yet, and gloas gossip is ignored, so a follower anchored here would
-/// sit at its anchor, looking alive while following nothing. Refusing at
-/// startup reports the real reason instead. Checked ahead
-/// of any store construction, on both anchor sources (a loaded network's
-/// genesis state can schedule `GLOAS_FORK_EPOCH: 0`, and a checkpoint provider
-/// can serve a gloas finalized state), so a rejected anchor writes nothing to
-/// the data directory.
+/// Every fork is followed today, gloas included, so this lets every anchor
+/// through. A gloas anchor starts with no payload known (`payloads` is empty
+/// in `fork_choice::get_forkchoice_store`), so its head is EMPTY and the
+/// first FULL child is held until the actor fetches the parent's envelope.
+/// The guard stays for the next fork the node cannot follow: checked ahead of
+/// any store construction, on both anchor sources (a loaded network's genesis
+/// state and a checkpoint provider's finalized state), so a rejected anchor
+/// writes nothing to the data directory.
 ///
 /// Keeps the refusal distinguishable from a peer serving a mismatched anchor
 /// pair: reporting both as `AnchorPairingMismatch` would tell an operator to
@@ -2166,24 +2163,15 @@ mod tests {
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
-    /// Fork choice accepts a gloas anchor, so the node has to be the one to
-    /// refuse it: nothing here delivers the payload envelopes a gloas chain
-    /// needs. Every fork this node does follow must still be let through.
+    /// Gloas is followed: the envelopes and payload attestations a gloas chain
+    /// needs are delivered, so no fork is refused as an anchor.
     #[test]
-    fn startup_refuses_a_gloas_anchor_and_only_a_gloas_anchor() {
-        assert!(matches!(
-            refuse_unfollowable_fork(ForkName::Gloas),
-            Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork {
-                fork: ForkName::Gloas
-            })
-        ));
+    fn startup_accepts_an_anchor_at_every_beacon_fork() {
         for fork in ForkName::ALL {
-            if fork != ForkName::Gloas {
-                assert!(
-                    refuse_unfollowable_fork(fork).is_ok(),
-                    "{fork} must stay followable"
-                );
-            }
+            assert!(
+                refuse_unfollowable_fork(fork).is_ok(),
+                "{fork} must be followable"
+            );
         }
     }
 
@@ -2699,11 +2687,10 @@ validators:
     }
 
     /// A loaded network can schedule gloas at epoch 0, which makes its own
-    /// genesis state a gloas one. Fork choice accepts that anchor, so startup
-    /// has to be what refuses it, with the reason that names the fork, and
-    /// before anything is written to the data directory.
+    /// genesis state a gloas one. That is a legitimate anchor now that gloas
+    /// is followed: the store is built, at the genesis slot.
     #[tokio::test]
-    async fn a_gloas_genesis_is_refused_before_the_store_is_built() {
+    async fn a_gloas_genesis_becomes_an_anchor() {
         use ethlambda_state_transition::beacon::config::Config;
         use ethlambda_state_transition::beacon::upgrade::upgrade_state;
 
@@ -2744,6 +2731,10 @@ validators:
             state = upgrade_state(&state, fork, &config).unwrap();
         }
         assert_eq!(state.fork_name(), ForkName::Gloas);
+        // A real gloas genesis commits to gloas's empty body; the upgrade
+        // chain above leaves phase0's in the header.
+        state.latest_block_header_mut().body_root =
+            gloas::BeaconBlockBody::empty().hash_tree_root();
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), config_text).unwrap();
@@ -2752,23 +2743,13 @@ validators:
         let source = network::NetworkSource::Loaded(Box::new(loaded));
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
-        // `Store` is not `Debug`, so take the error by pattern.
-        let Err(err) = fetch_initial_beacon_state(&[], backend.clone(), &source).await else {
-            panic!("a gloas genesis must not become an anchor");
-        };
-        assert!(
-            matches!(
-                err,
-                checkpoint_sync::CheckpointSyncError::UnsupportedFork {
-                    fork: ForkName::Gloas
-                }
-            ),
-            "the refusal must name the fork: {err}"
-        );
-        assert!(
-            Store::from_db_state(backend).unwrap().is_none(),
-            "a refused anchor leaves the directory empty"
-        );
+        let store = fetch_initial_beacon_state(&[], backend, &source)
+            .await
+            .expect("a gloas genesis anchors");
+        let (head_slot, _) = store
+            .beacon_head()
+            .expect("an anchored directory has a head");
+        assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
     }
 
     /// A changed fork epoch leaves genesis time and the validators root

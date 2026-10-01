@@ -67,13 +67,11 @@ impl BuiltInNetwork {
             .wrap_err_with(|| format!("the built-in {} config.yaml did not parse", self.name()))?;
         super::check_preset(parsed.config.preset_base.as_str())?;
         super::check_constants(&parsed.config)?;
-        // A built-in config can carry a fork whose *keys* this build claims
-        // but whose state transition it does not implement yet (gloas), or
-        // one whose keys it does not even claim (heze). The ignored-keys
-        // warning below only ever said the second half of that; it used to
-        // say both, back when GLOAS_* were unclaimed too. `warn_if_unfollowed_fork_scheduled`
-        // says the first half explicitly instead of leaving it to be
-        // discovered as a stall.
+        // A built-in config can carry a fork whose keys this build does not
+        // even claim (heze), which the ignored-keys warning below says. A fork
+        // whose keys it claims but whose rules it does not follow is
+        // `warn_if_unfollowed_fork_scheduled`'s to say; none exists today,
+        // since gloas is followed.
         parsed.warn_about_ignored_keys();
 
         let genesis = chain.genesis();
