@@ -536,14 +536,21 @@ impl RangeSyncState {
 /// at runtime.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
-    identify: libp2p::identify::Behaviour,
-    gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: ReqResp,
     /// Refuses connections past the configured ceiling. A deny from any member
     /// behaviour denies the connection, so registering this is the whole
     /// mechanism; see [`beacon::swarm::connection_limits`] for the numbers and why the
     /// beacon network needs them while lean does not.
+    ///
+    /// First, and it has to stay first. The derive asks each field for a
+    /// handler in declaration order and stops at the first refusal, and a
+    /// refused connection never produces a `ConnectionClosed`. Every
+    /// `request_response::Behaviour` in [`ReqResp`] records a connection the
+    /// moment it is asked, so behind this field a refusal left them holding a
+    /// connection the swarm never had (libp2p/rust-libp2p#4773, #4870).
     connection_limits: libp2p::connection_limits::Behaviour,
+    identify: libp2p::identify::Behaviour,
+    gossipsub: libp2p::gossipsub::Behaviour,
+    req_resp: ReqResp,
 }
 
 /// No connection limits, which is what the lean network has always run with: a
@@ -826,10 +833,10 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     );
 
     let behavior = Behaviour {
+        connection_limits,
         identify,
         gossipsub,
         req_resp,
-        connection_limits,
     };
 
     // TODO: set peer scoring params
@@ -3533,5 +3540,108 @@ mod tests {
         assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, Some(9001));
+    }
+
+    /// A connection the limits refuse must leave no trace in any
+    /// request/response field.
+    ///
+    /// `request_response::Behaviour` records a connection when its handler is
+    /// built and forgets it only on `ConnectionClosed`. A refused connection
+    /// never gets one: the swarm reports it with a `ListenFailure` and nothing
+    /// else. So a field asked before the limits keeps a connection the swarm
+    /// never had, and once the peer's real connections close it still counts
+    /// one. With debug assertions that trips request-response's own
+    /// `debug_assert` in `on_connection_closed` and kills the P2P task; without
+    /// them, requests to that peer can be routed to the phantom and vanish
+    /// without an `OutboundFailure`.
+    ///
+    /// Drives the composed [`Behaviour`] the way the swarm does: a peer
+    /// already holding [`beacon::swarm::MAX_CONNECTIONS_PER_PEER`] connections
+    /// opens one more, then the ones it held close.
+    #[tokio::test]
+    async fn a_connection_the_limits_refuse_leaves_no_request_response_state() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::fork::ForkName;
+        use ethlambda_types::beacon::primitives::Root;
+        use libp2p::core::ConnectedPoint;
+        use libp2p::swarm::{
+            ConnectionId, ListenError,
+            behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm, ListenFailure},
+        };
+
+        let mut built = build_swarm(SwarmConfig {
+            node_key: vec![7u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
+                fork_digest: [0x11, 0x22, 0x33, 0x44],
+                fork: ForkName::Fulu,
+                config: Config::mainnet(),
+                genesis_time: 0,
+                genesis_validators_root: Root::ZERO,
+                custody_columns: Vec::new(),
+                attestation_subnets: Vec::new(),
+            })),
+        })
+        .expect("swarm builds");
+        let behaviour = built.swarm.behaviour_mut();
+
+        let peer = random_peer();
+        let local_addr: Multiaddr = "/ip4/127.0.0.1/tcp/9001".parse().expect("valid multiaddr");
+        let send_back_addr: Multiaddr = "/ip4/192.0.2.1/tcp/9001".parse().expect("valid multiaddr");
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: local_addr.clone(),
+            send_back_addr: send_back_addr.clone(),
+        };
+
+        let max_per_peer = beacon::swarm::MAX_CONNECTIONS_PER_PEER as usize;
+        let held: Vec<ConnectionId> = (0..max_per_peer).map(ConnectionId::new_unchecked).collect();
+        for (other_established, &connection_id) in held.iter().enumerate() {
+            let admitted = behaviour.handle_established_inbound_connection(
+                connection_id,
+                peer,
+                &local_addr,
+                &send_back_addr,
+            );
+            assert!(admitted.is_ok(), "within the per-peer limit");
+            behaviour.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                failed_addresses: &[],
+                other_established,
+            }));
+        }
+
+        let refused = ConnectionId::new_unchecked(max_per_peer);
+        let cause = behaviour
+            .handle_established_inbound_connection(refused, peer, &local_addr, &send_back_addr)
+            .err()
+            .expect("the per-peer limit refuses one connection too many");
+        let error = ListenError::Denied { cause };
+        behaviour.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &local_addr,
+            send_back_addr: &send_back_addr,
+            error: &error,
+            connection_id: refused,
+            peer_id: Some(peer),
+        }));
+
+        for (closed, &connection_id) in held.iter().enumerate() {
+            behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: held.len() - closed - 1,
+            }));
+        }
+
+        let blocks_by_range = &behaviour.req_resp.beacon_blocks_by_range;
+        assert!(
+            !blocks_by_range.is_connected(&peer),
+            "a request/response field still holds the connection the limits refused"
+        );
     }
 }
