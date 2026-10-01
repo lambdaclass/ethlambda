@@ -23,7 +23,7 @@ use ethlambda_types::{
         containers::BeaconState,
         fork::ForkName,
         preset,
-        primitives::BlsPubkey,
+        primitives::{BlsPubkey, BlsSignature},
         signing::{compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch},
     },
     primitives::HashTreeRoot as _,
@@ -53,6 +53,19 @@ async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
 async fn serve_with_engine(
     engine: Option<ethlambda_engine::EngineClient>,
 ) -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
+    let (client, state, network, _) = serve_at(engine).await;
+    (client, state, network)
+}
+
+/// [`serve_with_engine`], also naming the socket it listens on.
+async fn serve_at(
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (
+    HttpBeaconNode,
+    BeaconState,
+    Arc<RecordingNetwork>,
+    std::net::SocketAddr,
+) {
     let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
     let (probe, _) = beacon_store_at(state.clone());
     let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
@@ -83,6 +96,17 @@ async fn serve_with_engine(
         .unwrap()
         .as_millis() as u64;
     store.set_time_ms(now_ms).unwrap();
+    // A block built on this head names the head block's real root as its
+    // parent, which the fixture's placeholder anchor block does not have:
+    // keep the state under that root too, as a real anchor would be.
+    let advanced = ethlambda_state_transition::beacon::block_production::advance_to_slot(
+        &state,
+        state.slot() + 1,
+        &ethlambda_types::beacon::config::Config::mainnet(),
+    )
+    .unwrap();
+    let parent_root = advanced.latest_block_header().hash_tree_root();
+    store.insert_state(parent_root, state.clone()).unwrap();
     let network = Arc::new(RecordingNetwork::default());
     let p2p: RpcToP2PRef = network.clone();
     let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
@@ -96,7 +120,7 @@ async fn serve_with_engine(
     tokio::spawn(async move { axum::serve(listener, router).await });
 
     let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
-    (client, state, network)
+    (client, state, network, address)
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
@@ -257,17 +281,56 @@ async fn block_production_without_an_execution_client_is_retryable() {
     assert!(err.is_retryable());
 }
 
+/// A blob whose every field element is below the BLS modulus: the first byte
+/// of each 32-byte element is zero, the rest are `seed`-derived.
+fn valid_blob(seed: u8) -> Vec<u8> {
+    let mut bytes = vec![0u8; preset::BYTES_PER_BLOB];
+    for (i, element) in bytes.chunks_mut(32).enumerate() {
+        element[1] = seed;
+        element[2] = i as u8;
+        element[3] = (i >> 8) as u8;
+    }
+    bytes
+}
+
 /// A stand-in execution client: `forkchoiceUpdated` with attributes answers a
 /// payload id, and `getPayloadV5` a payload that extends the requested head
 /// with exactly the requested attributes, which is all a real one's payload
 /// has to agree with for the block to verify.
-async fn fake_execution_client() -> ethlambda_engine::EngineClient {
+///
+/// The bundle carries `blob_count` valid blobs with their commitments and
+/// cell proofs (flattened blob by blob, as `BlobsBundleV2` does).
+async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineClient {
     use axum::{Json, routing::post};
+    use ethlambda_state_transition::beacon::kzg;
     use std::sync::Mutex;
+
+    let hex_of = |bytes: &[u8]| format!("0x{}", hex::encode(bytes));
+    let blobs: Vec<Vec<u8>> = (0..blob_count)
+        .map(|seed| valid_blob(seed as u8 + 1))
+        .collect();
+    let commitments: Vec<String> = blobs
+        .iter()
+        .map(|blob| hex_of(kzg::blob_to_kzg_commitment(blob).unwrap().as_ref()))
+        .collect();
+    let proofs: Vec<String> = blobs
+        .iter()
+        .flat_map(|blob| {
+            let (_, proofs) = kzg::compute_cells_and_kzg_proofs(blob).unwrap();
+            proofs
+                .iter()
+                .map(|proof| hex_of(proof.as_ref()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let blobs: Vec<String> = blobs.iter().map(|blob| hex_of(blob)).collect();
+    let blob_gas_used = format!("0x{:x}", blob_count * 131072);
 
     let requested: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
     let handler = move |Json(request): Json<serde_json::Value>| {
         let requested = requested.clone();
+        let (commitments, proofs, blobs) = (commitments.clone(), proofs.clone(), blobs.clone());
+        let blob_gas_used = blob_gas_used.clone();
         async move {
             let result = match request["method"].as_str() {
                 Some("engine_forkchoiceUpdatedV3") => {
@@ -298,11 +361,11 @@ async fn fake_execution_client() -> ethlambda_engine::EngineClient {
                             "blockHash": format!("0x{}", "ee".repeat(32)),
                             "transactions": [],
                             "withdrawals": attributes["withdrawals"],
-                            "blobGasUsed": "0x0",
+                            "blobGasUsed": blob_gas_used,
                             "excessBlobGas": "0x0",
                         },
                         "blockValue": "0x2a",
-                        "blobsBundle": { "commitments": [], "proofs": [], "blobs": [] },
+                        "blobsBundle": { "commitments": commitments, "proofs": proofs, "blobs": blobs },
                         "shouldOverrideBuilder": false,
                         "executionRequests": [],
                     })
@@ -323,16 +386,17 @@ async fn fake_execution_client() -> ethlambda_engine::EngineClient {
     .unwrap()
 }
 
-/// A proposer's slot through this node: the block produced from this node's
-/// execution client, signed, and published back.
-#[tokio::test]
-async fn the_validator_client_can_propose_through_this_node() {
+/// A proposer's slot through this node up to the produced block: the block
+/// from this node's execution client (with `blob_count` blobs), and what a
+/// validator client needs to sign it.
+async fn produce_for_proposer(blob_count: usize) -> Proposal {
     use ethlambda_state_transition::beacon::{
         block_production::advance_to_slot, helpers::accessors::get_beacon_proposer_index,
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
-    let (client, state, network) = serve_with_engine(Some(fake_execution_client().await)).await;
+    let (client, state, network, address) =
+        serve_at(Some(fake_execution_client(blob_count).await)).await;
     let slot = state.slot() + 1;
     let advanced = advance_to_slot(
         &state,
@@ -363,7 +427,134 @@ async fn the_validator_client_can_propose_through_this_node() {
         proposer as usize,
         compute_signing_root(produced.block().hash_tree_root(), block_domain),
     );
-    let body = produced.into_signed_ssz(signature);
-    client.publish_block(ForkName::Fulu, &body).await.unwrap();
-    assert_eq!(network.blocks.lock().unwrap().len(), 1);
+    Proposal {
+        client,
+        network,
+        produced,
+        signature,
+        address,
+        slot,
+        randao_reveal,
+    }
+}
+
+/// What [`produce_for_proposer`] leaves a test to publish or probe with.
+struct Proposal {
+    client: HttpBeaconNode,
+    network: Arc<RecordingNetwork>,
+    produced: ethlambda_validator::beacon_node::block_contents::ProducedBlock,
+    signature: BlsSignature,
+    address: std::net::SocketAddr,
+    slot: u64,
+    randao_reveal: BlsSignature,
+}
+
+/// A proposer's slot through this node: the block produced from this node's
+/// execution client, signed, and published back.
+#[tokio::test]
+async fn the_validator_client_can_propose_through_this_node() {
+    let p = produce_for_proposer(0).await;
+    let body = p.produced.into_signed_ssz(p.signature);
+    p.client.publish_block(ForkName::Fulu, &body).await.unwrap();
+    assert_eq!(p.network.blocks.lock().unwrap().len(), 1);
+    assert!(p.network.sidecars.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_validator_client_can_propose_a_blob_block_through_this_node() {
+    use ethlambda_state_transition::beacon::fork_choice::verify_data_column_sidecar_inclusion_proof;
+
+    let p = produce_for_proposer(2).await;
+    assert_eq!(p.produced.blob_count(), 2);
+    let body = p.produced.into_signed_ssz(p.signature);
+    p.client.publish_block(ForkName::Fulu, &body).await.unwrap();
+    assert_eq!(p.network.blocks.lock().unwrap().len(), 1);
+    let sidecars = p.network.sidecars.lock().unwrap();
+    assert_eq!(sidecars.len(), preset::NUMBER_OF_COLUMNS);
+    assert!(
+        sidecars
+            .iter()
+            .all(verify_data_column_sidecar_inclusion_proof)
+    );
+}
+
+/// Publishes `body` and asserts a 400 with nothing handed to the network.
+async fn assert_publish_refused(p: &Proposal, body: &[u8]) {
+    let result = p.client.publish_block(ForkName::Fulu, body).await;
+    assert!(
+        matches!(result, Err(Error::BeaconNodeStatus { status: 400, .. })),
+        "{result:?}"
+    );
+    assert!(p.network.blocks.lock().unwrap().is_empty());
+    assert!(p.network.sidecars.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_published_block_with_a_wrong_cell_proof_is_refused() {
+    use crate::beacon::proposal::FuluSignedBlockContents;
+    use libssz::{SszDecode as _, SszEncode as _};
+
+    let p = produce_for_proposer(2).await;
+    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
+    contents.kzg_proofs.swap(0, 1);
+    assert_publish_refused(&p, &contents.to_ssz()).await;
+}
+
+#[tokio::test]
+async fn a_published_block_with_a_missing_cell_proof_is_refused() {
+    use crate::beacon::proposal::FuluSignedBlockContents;
+    use libssz::{SszDecode as _, SszEncode as _};
+
+    let p = produce_for_proposer(2).await;
+    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
+    let mut proofs: Vec<_> = contents.kzg_proofs.iter().cloned().collect();
+    proofs.pop();
+    contents.kzg_proofs = proofs.try_into().unwrap();
+    assert_publish_refused(&p, &contents.to_ssz()).await;
+}
+
+#[tokio::test]
+async fn a_published_block_on_an_unknown_parent_is_refused() {
+    use crate::beacon::proposal::FuluSignedBlockContents;
+    use libssz::{SszDecode as _, SszEncode as _};
+
+    let p = produce_for_proposer(0).await;
+    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
+    contents.signed_block.message.parent_root = ethlambda_types::primitives::H256([0xab; 32]);
+    assert_publish_refused(&p, &contents.to_ssz()).await;
+}
+
+#[tokio::test]
+async fn the_json_block_carries_its_blobs_and_cell_proofs_as_hex() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let p = produce_for_proposer(2).await;
+    let randao = format!("0x{}", hex::encode(p.randao_reveal.0));
+    let request = format!(
+        "GET /eth/v3/validator/blocks/{}?randao_reveal={randao} HTTP/1.0\r\n\
+         Accept: application/json\r\n\r\n",
+        p.slot
+    );
+    let mut stream = tokio::net::TcpStream::connect(p.address).await.unwrap();
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response = String::from_utf8(response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert!(head.starts_with("HTTP/1.0 200"), "{head}");
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    let data = &json["data"];
+    let blobs = data["blobs"].as_array().unwrap();
+    let proofs = data["kzg_proofs"].as_array().unwrap();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(proofs.len(), 2 * preset::CELLS_PER_EXT_BLOB);
+    assert!(
+        blobs
+            .iter()
+            .chain(proofs)
+            .all(|value| value.as_str().is_some_and(|text| text.starts_with("0x")))
+    );
 }
