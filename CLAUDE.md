@@ -339,9 +339,10 @@ actual_slot = finalized_slot + 1 + relative_index
   - Beacon adds `beacon_blocks_by_{range,root}/2` alongside its Status/Ping/MetaData/Goodbye set.
     Both serve from the checkpoint-anchored store, and `build_status` advertises it
     (head, finalized checkpoint, and the anchor's slot as `earliest_available_slot`), so peers
-    have a reason to ask. Asking runs too: a peer's Status starts a range session paced by
-    `P2PServer::beacon_fetched_through`, the highest slot handed to the chain actor, rather
-    than the store's head, which trails a delivered batch by the whole actor mailbox.
+    have a reason to ask. Asking runs too: a peer's Status starts a range session from the
+    higher of `P2PServer::beacon_fetched_through` (the highest slot a range answer handed to
+    the chain actor, since the store's head trails a delivered batch by the whole actor
+    mailbox) and the store's head (which gossip imports move and the watermark never sees).
     Fetched blocks reach the actor as `BlockSource::Sync`.
     Their chunks carry four `<context-bytes>` (the block's own epoch's fork digest), which is why
     `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
