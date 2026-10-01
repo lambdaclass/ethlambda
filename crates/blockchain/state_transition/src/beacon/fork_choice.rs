@@ -2170,9 +2170,9 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
     let head = get_head_node(store, config)?;
-    // Ahead of the head root, so a reader never pairs the new root with the
-    // old node's status (see `Store::set_head_payload_status`).
-    store.set_head_payload_status(head.payload_status);
+    // Recorded with its root, so a reader can tell which head the status is
+    // for whichever of the two writes it sees first.
+    store.set_head_payload_status(head.root, head.payload_status);
     store
         .update_checkpoints(ForkCheckpoints::head_only(head.root))
         .expect("record beacon head");

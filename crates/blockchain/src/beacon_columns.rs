@@ -614,10 +614,8 @@ mod tests {
     }
 
     #[test]
-    fn a_gloas_sidecar_parks_although_gloas_is_not_in_the_followed_set() {
-        // Gloas blocks import now, so a parked row has a block to drain it;
-        // `ForkName::is_followed` belongs to the anchor, RPC and gossip side
-        // and no longer decides whether the parking lot keeps a column.
+    fn a_gloas_sidecar_is_parked_and_counted_awaiting_its_parent() {
+        // Gloas blocks import, so a parked row has a block to drain it.
         let (mut server, p2p) = gloas_server();
         let block_root = H256::repeat_byte(5);
 
