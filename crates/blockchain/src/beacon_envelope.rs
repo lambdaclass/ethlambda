@@ -42,9 +42,13 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use ethlambda_engine::EngineError;
+use ethlambda_engine::types::PayloadStatusValue;
 use ethlambda_network_api::{BlockSource, FetchRequest};
 use ethlambda_state_transition::beacon::fork::ForkName;
-use ethlambda_state_transition::beacon::fork_choice::{self, PayloadStatus, PayloadStatusEnum};
+use ethlambda_state_transition::beacon::fork_choice::{
+    self, PayloadStatus, PayloadStatusEnum, PayloadValidity,
+};
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
@@ -52,6 +56,7 @@ use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, 
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use tracing::{debug, error, info, trace, warn};
 
+use crate::beacon_engine;
 use crate::import_timing::ImportTimings;
 use crate::{BlockChainServer, custody_columns_present, metrics};
 
@@ -87,6 +92,13 @@ pub(crate) const ENVELOPE_AWAITING_BLOCK_TTL_SLOTS: u64 = 2;
 /// The children of a block that all name it as a FULL parent: one per slot the
 /// chain skipped past it, plus equivocations.
 pub(crate) const MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD: usize = 4;
+
+/// How many envelope roots the execution client refused for their own
+/// contents are remembered.
+///
+/// Enough to cover the copies one slot can bring; an older one asked about
+/// again costs one engine call and is refused again.
+pub(crate) const MAX_REJECTED_ENVELOPES: usize = 64;
 
 /// An envelope the actor is holding until it can be verified.
 pub(crate) struct HeldEnvelope {
@@ -129,6 +141,17 @@ pub(crate) struct EnvelopeQueues {
     /// Envelopes whose bid has commitments and whose sampled columns are not
     /// all stored, by the block's root.
     pub(crate) awaiting_columns: HashMap<H256, HeldEnvelope>,
+    /// Consensus-valid envelopes the execution client gave no answer for, by
+    /// the block's root, asked again once a slot.
+    pub(crate) awaiting_engine: HashMap<H256, HeldEnvelope>,
+    /// Roots of envelopes the execution client refused for their own contents
+    /// (`INVALID_BLOCK_HASH`), newest last and bounded by
+    /// [`MAX_REJECTED_ENVELOPES`], so a copy that arrives again is not asked
+    /// about again.
+    rejected: VecDeque<H256>,
+    /// Set when an engine verdict changed what fork choice sees without a
+    /// payload being verified, so the head is recomputed.
+    pub(crate) head_dirty: bool,
     /// Blocks whose parent is FULL with a payload not yet verified, by the
     /// parent's root, each with its own slot. The block's bytes are in
     /// `Table::BlockHeaders`/`BlockBodies` as for any other held block.
@@ -148,9 +171,23 @@ impl EnvelopeQueues {
             .any(|children| children.contains_key(block_root))
     }
 
+    /// Whether the execution client already refused the envelope with this
+    /// root.
+    fn is_rejected(&self, envelope_root: &H256) -> bool {
+        self.rejected.contains(envelope_root)
+    }
+
+    fn reject(&mut self, envelope_root: H256) {
+        if self.rejected.len() >= MAX_REJECTED_ENVELOPES {
+            self.rejected.pop_front();
+        }
+        self.rejected.push_back(envelope_root);
+    }
+
     fn is_empty(&self) -> bool {
         self.awaiting_block.is_empty()
             && self.awaiting_columns.is_empty()
+            && self.awaiting_engine.is_empty()
             && self.blocks_awaiting_parent_payload.is_empty()
     }
 
@@ -203,26 +240,56 @@ fn envelope_matches_bid(
 impl BlockChainServer {
     /// Take an envelope: verify it now, or hold it until what it waits on
     /// arrives. Callers may hand over envelopes nothing has checked (a
-    /// checkpoint source's, for one); the actor verifies them itself. The caller then settles the queues.
-    pub(crate) fn receive_envelope(
+    /// checkpoint source's, for one); the actor verifies them itself. The
+    /// caller then settles the queues.
+    pub(crate) async fn receive_envelope(
         &mut self,
         envelope: gloas::SignedExecutionPayloadEnvelope,
         event_ms: u64,
     ) {
         let config = self.store.config();
         let arrival_slot = fork_choice::get_current_slot(&self.store, &config);
-        self.apply_or_hold_envelope(HeldEnvelope::new(envelope, arrival_slot, event_ms));
+        self.apply_or_hold_envelope(HeldEnvelope::new(envelope, arrival_slot, event_ms))
+            .await;
     }
 
     /// Verify `held` against its block, or put it back in the queue for what it
     /// is waiting on. `true` when the envelope was verified and recorded.
-    fn apply_or_hold_envelope(&mut self, held: HeldEnvelope) -> bool {
+    async fn apply_or_hold_envelope(&mut self, held: HeldEnvelope) -> bool {
         let root = held.envelope.message.beacon_block_root;
+        if self
+            .store
+            .beacon_block_payload_status(root)
+            .is_invalidated()
+        {
+            trace!(
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope whose payload the execution client found invalid"
+            );
+            return false;
+        }
         if self.store.has_verified_payload(&root) {
             trace!(
                 block_root = %ShortRoot(&root.0),
                 "Dropping an envelope whose payload is already verified"
             );
+            return false;
+        }
+        // Before any work: a copy the execution client already refused costs
+        // nothing.
+        if self.envelopes.is_rejected(&held.envelope_root) {
+            trace!(
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope the execution client already rejected"
+            );
+            return false;
+        }
+        if self
+            .envelopes
+            .awaiting_engine
+            .get(&root)
+            .is_some_and(|other| other.envelope_root == held.envelope_root)
+        {
             return false;
         }
 
@@ -250,25 +317,13 @@ impl BlockChainServer {
             return false;
         }
 
-        let bid = match &block {
-            SignedBeaconBlock::Gloas(inner) => {
-                &inner.message.body.signed_execution_payload_bid.message
-            }
-            SignedBeaconBlock::Phase0(_)
-            | SignedBeaconBlock::Altair(_)
-            | SignedBeaconBlock::Bellatrix(_)
-            | SignedBeaconBlock::Capella(_)
-            | SignedBeaconBlock::Deneb(_)
-            | SignedBeaconBlock::Electra(_)
-            | SignedBeaconBlock::Fulu(_)
-            | SignedBeaconBlock::Lean(_) => {
-                warn!(
-                    %slot,
-                    block_root = %ShortRoot(&root.0),
-                    "Dropping an envelope: its block is not a gloas block"
-                );
-                return false;
-            }
+        let Some(bid) = crate::beacon_payloads::bid_of(&block) else {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope: its block is not a gloas block"
+            );
+            return false;
         };
         let commitment_count = bid.blob_kzg_commitments.len();
 
@@ -322,52 +377,167 @@ impl BlockChainServer {
             }
         };
 
+        // The consensus checks come first, as `verify_execution_payload_envelope`
+        // orders them, so the execution client is only ever asked about an
+        // envelope this node would accept: signed by the builder, matching
+        // the bid and the state, and with its data available.
         self.advance_beacon_clock_to(held.event_ms);
         let config = self.store.config();
-        // Without an execution client the follower trusts the payload, as it
-        // already does for every pre-gloas block it imports (the engine's
-        // verdict is `NotRequired` there), so the engine's part of
-        // `verify_execution_payload_envelope` is answered "valid".
-        let verdict = fork_choice::on_execution_payload_envelope(
-            &mut self.store,
+        if let Err(err) = fork_choice::check_execution_payload_envelope(
+            &self.store,
             &held.envelope,
             &config,
             &sidecars,
             &ExecutionEngine::valid(),
-        );
-        match verdict {
-            Ok(()) => {
-                info!(
-                    %slot,
-                    block_root = %ShortRoot(&root.0),
-                    "Execution payload envelope verified"
-                );
-                // With a client configured the verdict is the client's to give
-                // (a later change asks it); recording VALID without asking
-                // would claim a validation that never happened.
-                if self.engine.is_none() {
-                    self.store.insert_beacon_block_payload_status(
-                        root,
-                        slot,
-                        PayloadStatusEnum::Valid,
-                    );
-                }
-                self.envelopes.verified.push_back(root);
-                true
-            }
-            Err(err) => {
-                // p2p judged the envelope before it got here, so no peer is
-                // penalized from this side.
-                warn!(
-                    %slot,
-                    block_root = %ShortRoot(&root.0),
-                    ?err,
-                    "Dropping an execution payload envelope that failed verification"
-                );
-                self.refetch_envelope_if_children_wait(root);
-                false
-            }
+        ) {
+            // p2p judged the envelope before it got here, so no peer is
+            // penalized from this side.
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                ?err,
+                "Dropping an execution payload envelope that failed verification"
+            );
+            self.refetch_envelope_if_children_wait(root);
+            return false;
         }
+
+        // Then the execution client, whose answer has three outcomes where the
+        // specification's engine has two (see `docs/spec_deviations.md`).
+        // Without a client the follower trusts the payload, as it already does
+        // for every pre-gloas block it imports (`NotRequired`).
+        let status = match self.engine.clone() {
+            None => PayloadStatusEnum::Valid,
+            Some(client) => {
+                let asked =
+                    beacon_engine::ask_envelope_status(&client, &block, &held.envelope).await;
+                // The client answered, so the envelopes waiting on it can be
+                // asked about in this same pass.
+                if asked.is_ok() {
+                    self.release_envelopes_awaiting_engine();
+                }
+                match asked {
+                    // The payload does not hash to the block hash it claims:
+                    // this envelope is bad, the payload the bid names may not
+                    // be. Only this envelope is refused, so the builder's real
+                    // one can still arrive.
+                    // Some execution clients have no `INVALID_BLOCK_HASH` and
+                    // answer a hash mismatch with `INVALID` and a null
+                    // `latestValidHash` (ethrex does), whereas a payload that
+                    // executed and failed names its last valid ancestor. So a
+                    // null one is read the same way.
+                    Ok(raw)
+                        if raw.status == PayloadStatusValue::InvalidBlockHash
+                            || (raw.status == PayloadStatusValue::Invalid
+                                && raw.latest_valid_hash.is_none()) =>
+                    {
+                        warn!(
+                            %slot,
+                            block_root = %ShortRoot(&root.0),
+                            "Execution client found an envelope's contents do not match its \
+                             block hash; rejecting this envelope"
+                        );
+                        self.envelopes.reject(held.envelope_root);
+                        self.refetch_envelope_if_children_wait(root);
+                        return false;
+                    }
+                    Ok(raw) => match beacon_engine::verdict(&raw) {
+                        PayloadValidity::Validated | PayloadValidity::NotRequired => {
+                            PayloadStatusEnum::Valid
+                        }
+                        PayloadValidity::Optimistic => PayloadStatusEnum::Syncing,
+                        PayloadValidity::Invalidated { latest_valid_hash } => {
+                            warn!(
+                                %slot,
+                                block_root = %ShortRoot(&root.0),
+                                "Execution client found an envelope's payload invalid; \
+                                 not applying it"
+                            );
+                            self.condemn_payload_chain(root, latest_valid_hash);
+                            // Children held for this payload are gone, and the
+                            // head may have named a branch the verdict removed.
+                            self.envelopes.head_dirty = true;
+                            return false;
+                        }
+                    },
+                    Err(EngineError::EnvelopeMismatch(reason)) => {
+                        warn!(
+                            %slot,
+                            block_root = %ShortRoot(&root.0),
+                            reason,
+                            "Dropping an envelope that does not match its block"
+                        );
+                        self.refetch_envelope_if_children_wait(root);
+                        return false;
+                    }
+                    // No answer after the whole retry ladder. The envelope is
+                    // consensus-valid, so it is kept, and the per-slot redrive
+                    // asks again; fetching it would only repeat the ladder
+                    // for every copy that arrives.
+                    Err(err) => {
+                        warn!(
+                            %slot,
+                            block_root = %ShortRoot(&root.0),
+                            %err,
+                            "No verdict from the execution client; holding the envelope"
+                        );
+                        metrics::inc_engine_no_verdict();
+                        self.hold_envelope_awaiting_engine(root, slot, held);
+                        return false;
+                    }
+                }
+            }
+        };
+
+        // `VALID` and `SYNCING` both let the payload in: the consensus layer
+        // has verified it, the execution layer may not have finished.
+        fork_choice::accept_execution_payload_envelope(&mut self.store, &held.envelope);
+        info!(
+            %slot,
+            block_root = %ShortRoot(&root.0),
+            ?status,
+            "Execution payload envelope verified"
+        );
+        self.store
+            .insert_beacon_block_payload_status(root, slot, status);
+        // Lets `latestValidHash` find this FULL node.
+        self.store.insert_beacon_el_block_hash(
+            root,
+            slot,
+            held.envelope.message.payload.block_hash,
+        );
+        self.envelopes.verified.push_back(root);
+        true
+    }
+
+    /// Keep a consensus-valid envelope until the execution client answers.
+    fn hold_envelope_awaiting_engine(&mut self, root: H256, slot: u64, mut held: HeldEnvelope) {
+        held.slot = slot;
+        self.envelopes.awaiting_engine.entry(root).or_insert(held);
+        self.publish_envelope_queues();
+    }
+
+    /// Once a slot: ask the execution client again about the oldest envelope
+    /// it has not answered for.
+    ///
+    /// One, not all: with the client down each ask spends the whole retry
+    /// ladder, and the held envelopes grow with the finality lag. The rest are
+    /// released by [`Self::release_envelopes_awaiting_engine`] once an ask gets
+    /// any answer.
+    pub(crate) fn redrive_envelopes_awaiting_engine(&mut self) {
+        let oldest = self
+            .envelopes
+            .awaiting_engine
+            .iter()
+            .min_by_key(|(root, held)| (held.slot, held.event_ms, **root))
+            .map(|(root, _)| *root);
+        self.envelopes.work.extend(oldest);
+    }
+
+    /// Queue every envelope held for the execution client.
+    fn release_envelopes_awaiting_engine(&mut self) {
+        let roots: Vec<H256> = self.envelopes.awaiting_engine.keys().copied().collect();
+        self.envelopes.work.extend(roots);
     }
 
     /// Every sampled column stored for `root`, decoded as gloas sidecars, or
@@ -503,7 +673,12 @@ impl BlockChainServer {
         for &parent_root in self.envelopes.blocks_awaiting_parent_payload.keys() {
             if !self.envelopes.awaiting_block.contains_key(&parent_root)
                 && !self.envelopes.awaiting_columns.contains_key(&parent_root)
+                && !self.envelopes.awaiting_engine.contains_key(&parent_root)
                 && !self.store.has_verified_payload(&parent_root)
+                && !self
+                    .store
+                    .beacon_block_payload_status(parent_root)
+                    .is_invalidated()
             {
                 self.request_missing_envelope(parent_root);
             }
@@ -549,6 +724,9 @@ impl BlockChainServer {
                 .remove(&root)
                 .unwrap_or_default();
         }
+        if let Some(held) = self.envelopes.awaiting_engine.remove(&root) {
+            return vec![held];
+        }
         let Some(slot) = self
             .envelopes
             .awaiting_columns
@@ -574,10 +752,13 @@ impl BlockChainServer {
     pub(crate) async fn settle_envelopes(&mut self) {
         // Nothing to do on most ticks, and none at all on lean: leave the
         // gauges alone rather than rewriting them every interval.
-        if self.envelopes.work.is_empty() && self.envelopes.verified.is_empty() {
+        if self.envelopes.work.is_empty()
+            && self.envelopes.verified.is_empty()
+            && !self.envelopes.head_dirty
+        {
             return;
         }
-        let mut changed = false;
+        let mut changed = std::mem::take(&mut self.envelopes.head_dirty);
         loop {
             if let Some(root) = self.envelopes.work.pop_front() {
                 // The first that verifies wins; the rest are forgeries or
@@ -586,7 +767,7 @@ impl BlockChainServer {
                 // payload, so a second bid-consistent candidate differs only
                 // in a signature, which a parked one has had checked.
                 for held in self.take_ready_envelopes(root) {
-                    if self.apply_or_hold_envelope(held) {
+                    if self.apply_or_hold_envelope(held).await {
                         break;
                     }
                 }
@@ -596,6 +777,7 @@ impl BlockChainServer {
             } else {
                 break;
             }
+            changed |= std::mem::take(&mut self.envelopes.head_dirty);
         }
         self.publish_envelope_queues();
         if changed {
@@ -628,6 +810,23 @@ impl BlockChainServer {
         let slot = block.slot();
         let block_root = block.message_hash_tree_root();
         let parent_root = block.parent_root();
+
+        // The parent's payload was found invalid, so this block builds on a
+        // FULL node that will never exist, and neither will its descendants.
+        if self
+            .store
+            .beacon_block_payload_status(parent_root)
+            .is_invalidated()
+        {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&block_root.0),
+                parent_root = %ShortRoot(&parent_root.0),
+                "Dropping a block: it builds on a payload the execution client found invalid"
+            );
+            self.discard_pending_subtree(block_root);
+            return;
+        }
 
         let held_for_parent = self
             .envelopes
@@ -677,7 +876,7 @@ impl BlockChainServer {
 
     /// Ask p2p for `root`'s envelope by root. The request carries nothing but
     /// the flag, since an envelope names its block and nothing else.
-    fn request_missing_envelope(&self, root: H256) {
+    pub(crate) fn request_missing_envelope(&self, root: H256) {
         if let Some(ref p2p) = self.p2p {
             let _ = p2p
                 .fetch_block(FetchRequest {
@@ -785,6 +984,9 @@ impl BlockChainServer {
         });
         self.envelopes
             .awaiting_columns
+            .retain(|root, held| held.slot >= finalized_slot || *root == finalized.root);
+        self.envelopes
+            .awaiting_engine
             .retain(|root, held| held.slot >= finalized_slot || *root == finalized.root);
 
         let stale: Vec<H256> = self
@@ -929,7 +1131,9 @@ mod tests {
         let case = Case::new("get_head", TIEBREAK);
         let mut server = case.server(12);
 
-        server.receive_envelope(case.envelope(PARENT_ENVELOPE), 0);
+        server
+            .receive_envelope(case.envelope(PARENT_ENVELOPE), 0)
+            .await;
         server.settle_envelopes().await;
         assert!(server.envelopes.awaiting_block.contains_key(&root(PARENT)));
         assert!(!server.store.has_verified_payload(&root(PARENT)));
@@ -988,7 +1192,9 @@ mod tests {
         assert!(server.held_timings.contains_key(&root(FULL_CHILD)));
         assert_eq!(head(&server).0, root(FULL_PARENT));
 
-        server.receive_envelope(valid_envelope_for_full_parent(), 0);
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
         server.settle_envelopes().await;
 
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
@@ -1020,7 +1226,9 @@ mod tests {
             .await;
         assert!(server.envelopes.is_block_held(&root(child)));
 
-        server.receive_envelope(case.envelope(bad_envelope), 0);
+        server
+            .receive_envelope(case.envelope(bad_envelope), 0)
+            .await;
         server.settle_envelopes().await;
 
         assert!(!server.store.has_verified_payload(&root(parent)));
@@ -1041,10 +1249,14 @@ mod tests {
         server
             .on_block(case.block(PARENT), ImportTimings::default())
             .await;
-        server.receive_envelope(case.envelope(PARENT_ENVELOPE), 0);
+        server
+            .receive_envelope(case.envelope(PARENT_ENVELOPE), 0)
+            .await;
         assert!(server.store.has_verified_payload(&root(PARENT)));
 
-        server.receive_envelope(case.envelope(PARENT_ENVELOPE), 0);
+        server
+            .receive_envelope(case.envelope(PARENT_ENVELOPE), 0)
+            .await;
 
         assert!(server.envelopes.awaiting_block.is_empty());
         assert!(server.envelopes.awaiting_columns.is_empty());
@@ -1156,10 +1368,10 @@ mod tests {
         };
 
         for byte in 1..=MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT as u8 + 2 {
-            server.receive_envelope(with_root(byte), 0);
+            server.receive_envelope(with_root(byte), 0).await;
         }
         // A second delivery of a held root changes nothing.
-        server.receive_envelope(with_root(1), 0);
+        server.receive_envelope(with_root(1), 0).await;
 
         assert_eq!(
             server.envelopes.awaiting_block.len(),
@@ -1271,12 +1483,12 @@ mod tests {
 
         // The forgeries arrive first and fill what the root may hold, bar one.
         for gas_limit in 1..MAX_ENVELOPES_PER_UNMATCHED_ROOT as u64 {
-            server.receive_envelope(forged(gas_limit), 0);
+            server.receive_envelope(forged(gas_limit), 0).await;
         }
-        server.receive_envelope(honest.clone(), 0);
+        server.receive_envelope(honest.clone(), 0).await;
         // A re-delivery of the honest one and a surplus forgery add nothing.
-        server.receive_envelope(honest.clone(), 0);
-        server.receive_envelope(forged(99), 0);
+        server.receive_envelope(honest.clone(), 0).await;
+        server.receive_envelope(forged(99), 0).await;
         assert_eq!(
             server.envelopes.awaiting_block[&root(PARENT)].len(),
             MAX_ENVELOPES_PER_UNMATCHED_ROOT
@@ -1574,5 +1786,920 @@ mod tests {
                 .expect("votes exist")
                 .contains(&Some(true))
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // The execution client's part: newPayloadV5 on envelope import and
+    // forkchoiceUpdated for a gloas head.
+    // ---------------------------------------------------------------------
+
+    use ethlambda_engine::{EngineClient, JwtSecret};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    /// What the mock execution client answers and has been asked.
+    #[derive(Default)]
+    struct MockState {
+        /// The `payloadStatus` object `engine_newPayloadV5` answers with.
+        new_payload: String,
+        /// The `payloadStatus` object `engine_forkchoiceUpdated*` answers with.
+        forkchoice: String,
+        /// Request bodies, in arrival order.
+        requests: Vec<String>,
+    }
+
+    fn status_json(status: &str, latest_valid_hash: Option<H256>) -> String {
+        let hash = latest_valid_hash.map_or("null".to_string(), |hash| format!("\"{hash:?}\""));
+        format!(r#"{{"status":"{status}","latestValidHash":{hash},"validationError":null}}"#)
+    }
+
+    /// A hand-rolled JSON-RPC server answering by method name, like
+    /// `ethlambda-engine`'s wire smoke tests but for many requests.
+    async fn mock_engine(
+        new_payload: String,
+        forkchoice: String,
+    ) -> (EngineClient, Arc<std::sync::Mutex<MockState>>) {
+        let state = Arc::new(std::sync::Mutex::new(MockState {
+            new_payload,
+            forkchoice,
+            requests: Vec::new(),
+        }));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let addr = listener.local_addr().expect("bound address");
+        let shared = Arc::clone(&state);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let shared = Arc::clone(&shared);
+                tokio::spawn(async move {
+                    let mut pending: Vec<u8> = Vec::new();
+                    loop {
+                        // One request: headers up to the blank line, then
+                        // `Content-Length` bytes of body.
+                        let (head_end, body_len) = loop {
+                            if let Some(end) =
+                                pending.windows(4).position(|window| window == b"\r\n\r\n")
+                            {
+                                let head = String::from_utf8_lossy(&pending[..end]).to_lowercase();
+                                let len = head
+                                    .lines()
+                                    .find_map(|line| line.strip_prefix("content-length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                                    .unwrap_or(0);
+                                break (end + 4, len);
+                            }
+                            let mut chunk = [0u8; 16 * 1024];
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                            }
+                        };
+                        while pending.len() < head_end + body_len {
+                            let mut chunk = [0u8; 16 * 1024];
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(read) => pending.extend_from_slice(&chunk[..read]),
+                            }
+                        }
+                        let body = String::from_utf8_lossy(&pending[head_end..head_end + body_len])
+                            .to_string();
+                        pending.drain(..head_end + body_len);
+
+                        let result = {
+                            let mut state = shared.lock().unwrap();
+                            state.requests.push(body.clone());
+                            if body.contains("engine_newPayloadV5") {
+                                state.new_payload.clone()
+                            } else {
+                                state.forkchoice.clone()
+                            }
+                        };
+                        let result = if body.contains("engine_newPayloadV5") {
+                            result
+                        } else {
+                            format!(r#"{{"payloadStatus":{result},"payloadId":null}}"#)
+                        };
+                        let payload = if result == "ERROR" {
+                            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"mock failure"}}"#.to_string()
+                        } else {
+                            format!(r#"{{"jsonrpc":"2.0","id":1,"result":{result}}}"#)
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        if socket.write_all(response.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = EngineClient::new(format!("http://{addr}"), JwtSecret::new([0x0f; 32]))
+            .expect("a client");
+        (client, state)
+    }
+
+    fn methods(state: &Arc<std::sync::Mutex<MockState>>) -> Vec<String> {
+        state
+            .lock()
+            .unwrap()
+            .requests
+            .iter()
+            .map(|body| {
+                let rest = body.split("\"method\":\"").nth(1).expect("a method");
+                rest.split('"').next().expect("closing quote").to_string()
+            })
+            .collect()
+    }
+
+    /// The `on_execution_payload_envelope` chain: a parent (FULL once its
+    /// envelope is applied) and a child that builds on the FULL parent, held
+    /// until the envelope verifies.
+    async fn server_with_held_child(client: EngineClient) -> BlockChainServer {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server.engine = Some(client);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        fork_choice::on_tick(&mut server.store, 24, &fixture_config());
+        server
+            .on_block(case.block(FULL_CHILD), ImportTimings::default())
+            .await;
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+        server
+    }
+
+    fn payload_hash(envelope: &gloas::SignedExecutionPayloadEnvelope) -> H256 {
+        envelope.message.payload.block_hash
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_valid_verdict_applies_the_envelope_and_records_valid() {
+        let (client, mock) =
+            mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+        let envelope = valid_envelope_for_full_parent();
+
+        server.receive_envelope(envelope.clone(), 0).await;
+        server.settle_envelopes().await;
+
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Valid
+        );
+        assert_eq!(
+            server.store.beacon_el_block_hash(root(FULL_PARENT)),
+            Some(payload_hash(&envelope))
+        );
+        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        let methods = methods(&mock);
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|m| *m == "engine_newPayloadV5")
+                .count(),
+            1
+        );
+        // The head is gloas, so forkchoiceUpdated is V4.
+        assert!(methods.iter().any(|m| m == "engine_forkchoiceUpdatedV4"));
+        assert!(!methods.iter().any(|m| m == "engine_forkchoiceUpdatedV3"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_syncing_verdict_applies_the_envelope_as_not_validated() {
+        let (client, _mock) =
+            mock_engine(status_json("SYNCING", None), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+        let status = server.store.beacon_block_payload_status(root(FULL_PARENT));
+        assert_eq!(status, PayloadStatusEnum::Syncing);
+        assert!(status.is_not_validated());
+        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_verdict_leaves_no_full_node_and_drops_the_full_child() {
+        // A non-null `latestValidHash`: the payload executed and failed.
+        let (client, mock) = mock_engine(
+            status_json("INVALID", Some(H256::repeat_byte(0x11))),
+            status_json("SYNCING", None),
+        )
+        .await;
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Invalid
+        );
+        // The child built on the FULL node, so it is gone; the parent block and
+        // its EMPTY branch stay.
+        assert!(!server.envelopes.is_block_held(&root(FULL_CHILD)));
+        assert!(!server.store.has_state(&root(FULL_CHILD)).unwrap());
+        assert!(server.store.block_index().contains_key(&root(FULL_PARENT)));
+        assert_eq!(head(&server), (root(FULL_PARENT), PayloadStatus::Empty));
+
+        // A second delivery is not asked about again, and a later block that
+        // builds on the FULL node is dropped instead of held.
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        server
+            .on_block(case.block(FULL_CHILD), ImportTimings::default())
+            .await;
+        assert!(!server.envelopes.is_block_held(&root(FULL_CHILD)));
+        let asked = methods(&mock)
+            .iter()
+            .filter(|m| *m == "engine_newPayloadV5")
+            .count();
+        assert_eq!(asked, 1);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn no_verdict_does_not_apply_the_envelope() {
+        // Port 1 has nothing listening, so every attempt is refused at once.
+        let client = EngineClient::new("http://127.0.0.1:1".to_string(), JwtSecret::new([0u8; 32]))
+            .expect("client builds");
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+    }
+
+    /// The fixture payloads all hash to zero, which `forkchoiceUpdated` rightly
+    /// treats as "nothing to say"; give `root`'s bid and cached payload a real
+    /// hash so the call can be observed.
+    fn give_payload_a_hash(server: &mut BlockChainServer, root: H256, hash: H256) {
+        let mut block = server
+            .store
+            .get_signed_block(&root)
+            .unwrap()
+            .expect("block stored");
+        let slot = block.slot();
+        match &mut block {
+            SignedBeaconBlock::Gloas(inner) => {
+                inner
+                    .message
+                    .body
+                    .signed_execution_payload_bid
+                    .message
+                    .block_hash = hash;
+            }
+            _ => panic!("a gloas block"),
+        }
+        server
+            .store
+            .insert_pending_block(root, block)
+            .expect("overwrite");
+        server.store.insert_beacon_el_block_hash(root, slot, hash);
+    }
+
+    /// A server whose only block is `FULL_PARENT`, its envelope applied with
+    /// `new_payload`'s verdict, then given a nonzero payload hash and made the
+    /// FULL head.
+    async fn full_head_server(
+        new_payload: &str,
+        forkchoice: &str,
+    ) -> (BlockChainServer, Arc<std::sync::Mutex<MockState>>, H256) {
+        let (client, mock) = mock_engine(
+            status_json(new_payload, None),
+            status_json(forkchoice, None),
+        )
+        .await;
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        server.engine = Some(client);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+
+        let hash = H256::repeat_byte(0x42);
+        give_payload_a_hash(&mut server, root(FULL_PARENT), hash);
+        fork_choice::get_head(&mut server.store, &fixture_config()).expect("head");
+        server
+            .store
+            .set_head_payload_status(root(FULL_PARENT), PayloadStatus::Full);
+        (server, mock, hash)
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn the_forkchoice_hashes_follow_the_head_node_and_the_checkpoints_bids() {
+        let (server, _mock, hash) = full_head_server("VALID", "SYNCING").await;
+        let parent = server
+            .store
+            .get_signed_block(&root(FULL_PARENT))
+            .unwrap()
+            .unwrap();
+        let bid = crate::beacon_payloads::bid_of(&parent).expect("gloas block");
+        let anchor_root = server.store.beacon_finalized_checkpoint().root;
+        let anchor = server
+            .store
+            .get_signed_block(&anchor_root)
+            .unwrap()
+            .unwrap();
+        let anchor_parent_hash = crate::beacon_payloads::bid_of(&anchor)
+            .expect("gloas anchor")
+            .parent_block_hash;
+
+        // A FULL head names the revealed payload; finalized and safe are the
+        // checkpoint blocks' bids' parent hashes.
+        let plan = crate::beacon_payloads::forkchoice_plan(&server.store, root(FULL_PARENT))
+            .expect("a plan");
+        assert!(plan.gloas);
+        assert_eq!(plan.state.head_block_hash, hash);
+        assert_eq!(plan.state.finalized_block_hash, anchor_parent_hash);
+        assert_eq!(plan.state.safe_block_hash, anchor_parent_hash);
+
+        // An EMPTY head names the payload before it.
+        server
+            .store
+            .set_head_payload_status(root(FULL_PARENT), PayloadStatus::Empty);
+        let plan = crate::beacon_payloads::forkchoice_plan(&server.store, root(FULL_PARENT))
+            .expect("a plan");
+        assert_eq!(plan.state.head_block_hash, bid.parent_block_hash);
+
+        // No status for the head yet: nothing to say.
+        server
+            .store
+            .set_head_payload_status(H256::repeat_byte(1), PayloadStatus::Full);
+        assert!(
+            crate::beacon_payloads::forkchoice_plan(&server.store, root(FULL_PARENT)).is_none()
+        );
+    }
+
+    #[test]
+    fn a_pre_gloas_head_keeps_its_own_hash_and_uses_forkchoice_v3() {
+        let mut store = beacon_store(GENESIS_TIME, 0);
+        let block = crate::tests::fulu_block(H256::ZERO, 1, 0);
+        let block_root = block.message_hash_tree_root();
+        store
+            .insert_pending_block(block_root, block)
+            .expect("insert");
+        store.insert_beacon_el_block_hash(block_root, 1, H256::repeat_byte(7));
+
+        let plan = crate::beacon_payloads::forkchoice_plan(&store, block_root).expect("a plan");
+
+        assert!(!plan.gloas);
+        assert_eq!(plan.state.head_block_hash, H256::repeat_byte(7));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_gloas_head_sends_forkchoice_v4_with_the_custody_columns() {
+        let (mut server, mock, hash) = full_head_server("VALID", "SYNCING").await;
+        server.custody_columns = vec![0, 9];
+
+        server.notify_forkchoice_updated().await;
+
+        let last = mock
+            .lock()
+            .unwrap()
+            .requests
+            .last()
+            .cloned()
+            .expect("a request");
+        assert!(last.contains("engine_forkchoiceUpdatedV4"));
+        assert!(last.contains(&format!("{hash:?}")));
+        // Columns 0 and 9 as a little-endian bitvector.
+        assert!(last.contains("0x01020000000000000000000000000000"));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_valid_forkchoice_response_promotes_optimistic_payloads() {
+        let (mut server, mock, _hash) = full_head_server("SYNCING", "SYNCING").await;
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Syncing
+        );
+
+        // Still syncing: nothing changes.
+        server.notify_forkchoice_updated().await;
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Syncing
+        );
+
+        mock.lock().unwrap().forkchoice = status_json("VALID", None);
+        server.notify_forkchoice_updated().await;
+
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Valid
+        );
+        assert!(!server.store.has_unvalidated_block_payloads());
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_forkchoice_response_unverifies_the_payload_and_keeps_the_block() {
+        let (mut server, _mock, _hash) = full_head_server("SYNCING", "INVALID").await;
+
+        server.notify_forkchoice_updated().await;
+
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert_eq!(
+            server.store.beacon_block_payload_status(root(FULL_PARENT)),
+            PayloadStatusEnum::Invalid
+        );
+        assert!(server.store.block_index().contains_key(&root(FULL_PARENT)));
+        assert_eq!(head(&server), (root(FULL_PARENT), PayloadStatus::Empty));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_forkchoice_response_removes_a_child_built_on_the_full_payload() {
+        let (mut server, _mock, hash) = full_head_server("SYNCING", "INVALID").await;
+        // A child whose bid names the parent's payload as its own parent: the
+        // fixture child, retargeted at the hash this test gave the payload.
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut child = case.block(FULL_CHILD);
+        let child_root = child.message_hash_tree_root();
+        match &mut child {
+            SignedBeaconBlock::Gloas(inner) => {
+                inner
+                    .message
+                    .body
+                    .signed_execution_payload_bid
+                    .message
+                    .parent_block_hash = hash;
+            }
+            _ => panic!("a gloas block"),
+        }
+        server
+            .store
+            .insert_pending_block(child_root, child)
+            .expect("insert");
+        let child_slot = server
+            .store
+            .get_signed_block(&child_root)
+            .unwrap()
+            .unwrap()
+            .slot();
+        server
+            .store
+            .insert_live_chain_entry(child_slot, child_root, root(FULL_PARENT));
+        assert!(server.store.block_index().contains_key(&child_root));
+
+        server.notify_forkchoice_updated().await;
+
+        assert!(!server.store.block_index().contains_key(&child_root));
+    }
+
+    fn count(mock: &Arc<std::sync::Mutex<MockState>>, method: &str) -> usize {
+        methods(mock).iter().filter(|m| *m == method).count()
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn the_engine_is_not_asked_about_an_envelope_that_fails_consensus_checks() {
+        let (client, mock) =
+            mock_engine(status_json("VALID", None), status_json("SYNCING", None)).await;
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let bad_envelope = "73c5948d041ccb171b9331c0eac4a3bb8cdcf01994916fee4c7493e63e890559";
+        let mut server = case.server(12);
+        server.engine = Some(client);
+        server
+            .on_block(case.block(FULL_PARENT), ImportTimings::default())
+            .await;
+
+        server
+            .receive_envelope(case.envelope(bad_envelope), 0)
+            .await;
+
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 0);
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_block_hash_rejects_only_that_envelope() {
+        let (client, mock) = mock_engine(
+            status_json("INVALID_BLOCK_HASH", None),
+            status_json("SYNCING", None),
+        )
+        .await;
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        // The root's payload is not condemned: another envelope may still
+        // reveal it, and the child keeps waiting for one.
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(
+            !server
+                .store
+                .beacon_block_payload_status(root(FULL_PARENT))
+                .is_invalidated()
+        );
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+
+        // The same envelope is not asked about again.
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_engine_error_holds_the_envelope_and_asks_again_once_a_slot() {
+        let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+        let p2p = Arc::new(crate::tests::RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+        let fetches_before = p2p.fetches.lock().unwrap().len();
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        assert!(
+            server
+                .envelopes
+                .awaiting_engine
+                .contains_key(&root(FULL_PARENT))
+        );
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+
+        // The same copy again, and the slot's other redrives, add no asks.
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.redrive_missing_envelopes();
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+
+        // One ask per slot while it keeps failing, and no fetch at all.
+        for asks in 2..=3 {
+            server.redrive_envelopes_awaiting_engine();
+            server.settle_envelopes().await;
+            assert_eq!(count(&mock, "engine_newPayloadV5"), asks);
+        }
+        assert_eq!(p2p.fetches.lock().unwrap().len(), fetches_before);
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+
+        // The client recovers: the next redrive applies it.
+        mock.lock().unwrap().new_payload = status_json("VALID", None);
+        server.redrive_envelopes_awaiting_engine();
+        server.settle_envelopes().await;
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(server.envelopes.awaiting_engine.is_empty());
+        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+    }
+
+    /// A chain `q <- p <- r` of gloas blocks above the anchor, each with a
+    /// verified payload and the cached hash, where `r` built on `p`'s EMPTY
+    /// node: its bid's parent hash is `q`'s payload, not `p`'s.
+    ///
+    /// Returns `(server, [q, p, r], [hq, hp, hr])`. Blocks are the fixture
+    /// parent with its slot, parent and bid hashes rewritten, stored under
+    /// made-up roots, which is all the walks read.
+    fn skipped_payload_chain() -> (BlockChainServer, [H256; 3], [H256; 3]) {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        let anchor = server.store.latest_finalized().unwrap();
+        let roots = [
+            H256::repeat_byte(0xa1),
+            H256::repeat_byte(0xa2),
+            H256::repeat_byte(0xa3),
+        ];
+        let hashes = [
+            H256::repeat_byte(0xb1),
+            H256::repeat_byte(0xb2),
+            H256::repeat_byte(0xb3),
+        ];
+        // (parent root, bid.parent_block_hash) per block.
+        let links = [
+            (anchor.root, H256::repeat_byte(0xb0)),
+            (roots[0], hashes[0]),
+            (roots[1], hashes[0]),
+        ];
+        for i in 0..3 {
+            let slot = anchor.slot + 1 + i as u64;
+            let mut block = case.block(FULL_PARENT);
+            match &mut block {
+                SignedBeaconBlock::Gloas(inner) => {
+                    inner.message.slot = slot;
+                    inner.message.parent_root = links[i].0;
+                    let bid = &mut inner.message.body.signed_execution_payload_bid.message;
+                    bid.block_hash = hashes[i];
+                    bid.parent_block_hash = links[i].1;
+                }
+                _ => panic!("a gloas block"),
+            }
+            server
+                .store
+                .insert_pending_block(roots[i], block)
+                .expect("insert");
+            server
+                .store
+                .insert_live_chain_entry(slot, roots[i], links[i].0);
+            let mut envelope = valid_envelope_for_full_parent();
+            envelope.message.beacon_block_root = roots[i];
+            server.store.insert_verified_payload(slot, &envelope);
+            server
+                .store
+                .insert_beacon_el_block_hash(roots[i], slot, hashes[i]);
+            server.store.insert_beacon_block_payload_status(
+                roots[i],
+                slot,
+                PayloadStatusEnum::Syncing,
+            );
+        }
+        (server, roots, hashes)
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_latest_valid_hash_does_not_reach_a_payload_the_block_skipped() {
+        let (mut server, [q, p, r], [hq, _hp, _hr]) = skipped_payload_chain();
+
+        // r's EL parent is q: p was skipped (r built on p's EMPTY node).
+        assert_eq!(
+            crate::beacon_payloads::resolve_invalid_payload(&server.store, r, Some(hq)),
+            r
+        );
+        assert_eq!(
+            crate::beacon_payloads::resolve_invalid_payload(&server.store, r, None),
+            r
+        );
+        // A hash that is not on the chain reads as null.
+        assert_eq!(
+            crate::beacon_payloads::resolve_invalid_payload(
+                &server.store,
+                r,
+                Some(H256::repeat_byte(0xee))
+            ),
+            r
+        );
+        // All zeroes: the earliest block on the chain, which is q, not p.
+        assert_eq!(
+            crate::beacon_payloads::resolve_invalid_payload(&server.store, r, Some(H256::ZERO)),
+            q
+        );
+
+        server.condemn_payload_chain(r, Some(hq));
+
+        assert!(!server.store.has_verified_payload(&r));
+        assert!(
+            server.store.has_verified_payload(&p),
+            "p's payload survives"
+        );
+        assert!(server.store.has_verified_payload(&q));
+        assert_eq!(
+            server.store.beacon_block_payload_status(r),
+            PayloadStatusEnum::Invalid
+        );
+        assert_eq!(
+            server.store.beacon_block_payload_status(p),
+            PayloadStatusEnum::Syncing
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn validation_does_not_promote_a_payload_the_block_skipped() {
+        let (mut server, [q, p, r], _hashes) = skipped_payload_chain();
+
+        crate::beacon_payloads::mark_payloads_validated(&mut server.store, r);
+
+        assert_eq!(
+            server.store.beacon_block_payload_status(r),
+            PayloadStatusEnum::Valid
+        );
+        assert_eq!(
+            server.store.beacon_block_payload_status(q),
+            PayloadStatusEnum::Valid
+        );
+        assert_eq!(
+            server.store.beacon_block_payload_status(p),
+            PayloadStatusEnum::Syncing,
+            "r never built on p's payload"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_payload_takes_its_full_child_and_spares_the_empty_one() {
+        let (mut server, [q, p, r], [_hq, hp, _hr]) = skipped_payload_chain();
+        // Two children of p: `full` names p's payload as its parent's, `empty`
+        // names the payload before it. Condemning p's payload takes only `full`.
+        let slot = server.store.get_signed_block(&p).unwrap().unwrap().slot() + 1;
+        let full = H256::repeat_byte(0xc1);
+        let empty = H256::repeat_byte(0xc2);
+        for (root, parent_hash) in [(full, hp), (empty, H256::repeat_byte(0xb1))] {
+            let mut block = server.store.get_signed_block(&r).unwrap().unwrap();
+            match &mut block {
+                SignedBeaconBlock::Gloas(inner) => {
+                    inner.message.slot = slot;
+                    inner.message.parent_root = p;
+                    inner
+                        .message
+                        .body
+                        .signed_execution_payload_bid
+                        .message
+                        .parent_block_hash = parent_hash;
+                }
+                _ => panic!("a gloas block"),
+            }
+            server
+                .store
+                .insert_pending_block(root, block)
+                .expect("insert");
+            server.store.insert_live_chain_entry(slot, root, p);
+        }
+
+        server.condemn_payload_chain(p, None);
+
+        let index = server.store.block_index();
+        assert!(!server.store.has_verified_payload(&p));
+        assert!(index.contains_key(&p), "the block stays");
+        assert!(!index.contains_key(&full), "the FULL child goes");
+        assert!(index.contains_key(&empty), "the EMPTY child stays");
+        assert!(server.store.has_verified_payload(&q));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_restored_payload_is_seeded_with_a_verdict_a_valid_answer_can_promote() {
+        let (mut server, [q, p, r], _hashes) = skipped_payload_chain();
+        // A restart empties the status map; the verified set is on disk.
+        for root in [q, p, r] {
+            server
+                .store
+                .insert_beacon_block_payload_status(root, 0, PayloadStatusEnum::Valid);
+        }
+        let mut restarted = server;
+
+        crate::beacon_payloads::seed_resumed_payload_statuses(&mut restarted.store, true);
+        assert_eq!(
+            restarted.store.beacon_block_payload_status(r),
+            PayloadStatusEnum::Syncing
+        );
+        assert!(restarted.store.has_unvalidated_block_payloads());
+        crate::beacon_payloads::mark_payloads_validated(&mut restarted.store, r);
+        assert_eq!(
+            restarted.store.beacon_block_payload_status(r),
+            PayloadStatusEnum::Valid
+        );
+
+        crate::beacon_payloads::seed_resumed_payload_statuses(&mut restarted.store, false);
+        assert_eq!(
+            restarted.store.beacon_block_payload_status(p),
+            PayloadStatusEnum::Valid
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_verdict_with_a_null_latest_valid_hash_rejects_only_that_envelope() {
+        // How ethrex reports a payload whose contents do not hash to its block
+        // hash: INVALID, `latestValidHash` null.
+        let (client, mock) =
+            mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(
+            !server
+                .store
+                .beacon_block_payload_status(root(FULL_PARENT))
+                .is_invalidated()
+        );
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_down_engine_is_probed_once_per_redrive_however_many_envelopes_wait() {
+        let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        // More envelopes waiting, for blocks later than the real one.
+        for byte in 1..=4u8 {
+            let mut envelope = valid_envelope_for_full_parent();
+            envelope.message.beacon_block_root = H256::repeat_byte(byte);
+            server.envelopes.awaiting_engine.insert(
+                H256::repeat_byte(byte),
+                HeldEnvelope::new(envelope, 1_000 + u64::from(byte), 0),
+            );
+        }
+        assert_eq!(server.envelopes.awaiting_engine.len(), 5);
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+
+        for asks in 2..=3 {
+            server.redrive_envelopes_awaiting_engine();
+            server.settle_envelopes().await;
+            assert_eq!(count(&mock, "engine_newPayloadV5"), asks);
+            assert_eq!(server.envelopes.awaiting_engine.len(), 5);
+        }
+
+        // The engine answers: the oldest is applied and the rest are released
+        // in the same redrive.
+        mock.lock().unwrap().new_payload = status_json("VALID", None);
+        server.redrive_envelopes_awaiting_engine();
+        server.settle_envelopes().await;
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(server.envelopes.awaiting_engine.is_empty());
     }
 }

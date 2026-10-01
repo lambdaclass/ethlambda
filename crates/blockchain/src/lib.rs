@@ -1,4 +1,4 @@
-use ethlambda_engine::{EngineClient, ForkchoiceStateV1, PayloadStatusV1 as EnginePayloadStatus};
+use ethlambda_engine::{CustodyColumns, EngineClient, PayloadStatusV1 as EnginePayloadStatus};
 use ethlambda_network_api::{
     AggregateArrival, BlockArrival, BlockChainToP2PRef, BlockSource, DeferredFrom, FetchRequest,
     InitP2P,
@@ -58,6 +58,8 @@ mod beacon_aggregates;
 mod beacon_columns;
 pub mod beacon_engine;
 mod beacon_envelope;
+mod beacon_payloads;
+pub use beacon_payloads::checkpoint_hash;
 pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
@@ -378,7 +380,7 @@ impl BlockChain {
     /// `safe_slots_to_import_optimistically`, which nothing on that arm reads.
     #[allow(clippy::too_many_arguments)]
     fn start_actor(
-        store: Store,
+        mut store: Store,
         sync_status: SyncStatusTracker,
         sync_status_controller: SyncStatusController,
         events: EventBus,
@@ -388,6 +390,12 @@ impl BlockChain {
         safe_slots_to_import_optimistically: u64,
     ) -> BlockChain {
         let genesis_time = store.config().genesis_time;
+
+        // Payloads verified before a restart have no recorded verdict, since
+        // the map is scratch; see `seed_resumed_payload_statuses`.
+        if matches!(duties, ChainDuties::Beacon) {
+            beacon_payloads::seed_resumed_payload_statuses(&mut store, engine.is_some());
+        }
 
         // `sidecars_awaiting_parent` starts empty below, and it is the only
         // index into `Table::PendingDataColumns`. Anything a previous run
@@ -1047,6 +1055,7 @@ impl BlockChainServer {
         self.evict_envelope_queues_at_or_below_finality();
         self.redrive_held_blocks().await;
         self.redrive_envelopes_awaiting_columns();
+        self.redrive_envelopes_awaiting_engine();
         self.redrive_missing_envelopes();
         self.settle_envelopes().await;
 
@@ -2418,7 +2427,7 @@ impl BlockChainServer {
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
     /// wait out, not a reason to crash a follower.
-    fn update_head_from_fork_choice(&mut self) -> HeadTimings {
+    pub(crate) fn update_head_from_fork_choice(&mut self) -> HeadTimings {
         let _timing = metrics::time_beacon_head_compute();
         let mut timings = HeadTimings {
             head_start: Some(Instant::now()),
@@ -2482,35 +2491,14 @@ impl BlockChainServer {
         let client = self.engine.clone()?;
         let (_head_slot, head_root) = self.store.beacon_head()?;
 
-        let justified_root = self.store.beacon_justified_checkpoint().root;
-        let finalized_root = self.store.beacon_finalized_checkpoint().root;
-
-        // `H256::ZERO` explicitly rather than `unwrap_or_default()`: the zero
-        // hash is a meaningful value here, not an absence. EIP-3675 requires
-        // `finalized_block_hash` to be zero before a post-transition block is
-        // finalized, and the specification's own
-        // `get_safe_execution_block_hash` returns zero when no payload is
-        // justified yet.
-        let state = ForkchoiceStateV1 {
-            head_block_hash: self
-                .store
-                .beacon_el_block_hash(head_root)
-                .unwrap_or(H256::ZERO),
-            safe_block_hash: self
-                .store
-                .beacon_el_block_hash(justified_root)
-                .unwrap_or(H256::ZERO),
-            finalized_block_hash: self
-                .store
-                .beacon_el_block_hash(finalized_root)
-                .unwrap_or(H256::ZERO),
-        };
-
-        // Nothing to say yet: a follower whose head has no cached payload hash
-        // is still on its checkpoint anchor.
-        if state.head_block_hash.is_zero() {
-            return None;
-        }
+        // A gloas head is ambiguous without its payload status (FULL names the
+        // revealed payload, EMPTY the one before), and a head whose status has
+        // not been computed yet is skipped. The plan also carries the hashes
+        // for a pre-gloas head, which keeps its own cached payload hash;
+        // `None` there means a follower still on its checkpoint anchor.
+        let plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
+        let state = plan.state;
+        let gloas = plan.gloas;
 
         // `head_root` stays valid across the await: this is a single-threaded
         // actor, so no other message is handled until this one returns. An
@@ -2521,8 +2509,18 @@ impl BlockChainServer {
         // `apply_forkchoice_verdict` recomputes the head itself rather than
         // leaving it to the next tick.
         let start = Instant::now();
-        match client.forkchoice_updated(&state).await {
-            Ok(status) => self.apply_forkchoice_verdict(head_root, &status),
+        // V4 from gloas on: it carries the custody columns the execution
+        // client must keep. The follower sends `null` attributes either way.
+        let response = if gloas {
+            let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
+            client.forkchoice_updated_v4(&state, custody).await
+        } else {
+            client.forkchoice_updated(&state).await
+        };
+        match response {
+            Ok(status) => {
+                self.apply_forkchoice_verdict(head_root, state.head_block_hash, gloas, &status)
+            }
             Err(err) => warn!(%err, "forkchoiceUpdated failed"),
         }
         Some((start, Instant::now()))
@@ -2533,7 +2531,23 @@ impl BlockChainServer {
     /// `VALID` clears the head and every optimistic ancestor; `INVALID` cuts the
     /// condemned branch out of fork choice. `SYNCING` and `ACCEPTED` say the
     /// execution client is still working and change nothing.
-    fn apply_forkchoice_verdict(&mut self, head_root: H256, status: &EnginePayloadStatus) {
+    ///
+    /// For a gloas head the verdict is about `head_hash`, which names a payload
+    /// rather than a block: the head's own (FULL) or an ancestor's (EMPTY). It
+    /// is resolved to the block carrying that payload first, and an `INVALID`
+    /// verdict then takes that payload's FULL node and what builds on it, not
+    /// the block (see `beacon_payloads`).
+    fn apply_forkchoice_verdict(
+        &mut self,
+        head_root: H256,
+        head_hash: H256,
+        gloas: bool,
+        status: &EnginePayloadStatus,
+    ) {
+        if gloas {
+            self.apply_gloas_forkchoice_verdict(head_root, head_hash, status);
+            return;
+        }
         match beacon_engine::verdict(status) {
             fork_choice::PayloadValidity::Validated => {
                 fork_choice::mark_validated(&mut self.store, head_root);
@@ -3087,7 +3101,7 @@ impl BlockChainServer {
     ///
     /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
     /// children that would otherwise remain stuck in the pending maps indefinitely.
-    fn discard_pending_subtree(&mut self, block_root: H256) {
+    pub(crate) fn discard_pending_subtree(&mut self, block_root: H256) {
         // A block held for its custody columns already had a known parent
         // when it was held (see `hold_block_for_columns`), so it carries no
         // entry of its own in `pending_blocks` and would not be reached by
@@ -3823,7 +3837,8 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
         };
         let arrival_ms = unix_now_ms();
         let picked_up = Instant::now();
-        self.receive_envelope(*msg.envelope, msg.arrival.wire_ms(picked_up, arrival_ms));
+        self.receive_envelope(*msg.envelope, msg.arrival.wire_ms(picked_up, arrival_ms))
+            .await;
         self.settle_envelopes().await;
     }
 }
@@ -4797,7 +4812,11 @@ mod tests {
     /// caller of this helper is exercising, so nothing here needs to be real:
     /// only structurally present, so `message_hash_tree_root` and `to_ssz`
     /// succeed.
-    fn fulu_block(parent_root: H256, slot: u64, commitment_count: usize) -> SignedBeaconBlock {
+    pub(crate) fn fulu_block(
+        parent_root: H256,
+        slot: u64,
+        commitment_count: usize,
+    ) -> SignedBeaconBlock {
         let payload = deneb::ExecutionPayload {
             parent_hash: Default::default(),
             fee_recipient: Default::default(),

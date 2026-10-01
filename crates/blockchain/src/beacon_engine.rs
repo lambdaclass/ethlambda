@@ -215,16 +215,29 @@ pub async fn ask_envelope(
     block: &SignedBeaconBlock,
     envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
 ) -> Result<PayloadValidity, EngineError> {
+    ask_envelope_status(client, block, envelope)
+        .await
+        .map(|status| verdict(&status))
+}
+
+/// [`ask_envelope`] with the engine's raw answer, for a caller that must tell
+/// `INVALID_BLOCK_HASH` (the envelope's contents do not hash to its claimed
+/// block hash, so only that envelope is bad) from `INVALID` (the payload the
+/// hash names is bad).
+pub async fn ask_envelope_status(
+    client: &EngineClient,
+    block: &SignedBeaconBlock,
+    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
+) -> Result<PayloadStatusV1, EngineError> {
     let request = gloas_new_payload_request(block, envelope)?;
-    let status = client
+    client
         .new_payload_v5(
             request.execution_payload,
             &request.versioned_hashes,
             request.parent_beacon_block_root,
             &request.execution_requests,
         )
-        .await?;
-    Ok(verdict(&status))
+        .await
 }
 
 #[cfg(test)]
