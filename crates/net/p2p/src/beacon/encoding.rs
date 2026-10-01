@@ -36,6 +36,8 @@ use std::io;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::Root;
@@ -335,4 +337,150 @@ where
         Ok(sidecar)
     })
     .await
+}
+
+/// Write an envelope response: one result code, one `ForkDigest` and one
+/// payload per envelope.
+///
+/// The counterpart of [`write_blocks_response`]. The spec keys the context
+/// epoch off the block the envelope fulfills; an envelope carries no slot of
+/// its own, but `verify_execution_payload_envelope` pins
+/// `payload.slot_number` to that block's slot, so a stored envelope's
+/// `slot_number` is the block's slot.
+pub async fn write_execution_payload_envelopes_response<T>(
+    io: &mut T,
+    label: &'static str,
+    config: &Config,
+    genesis_validators_root: Root,
+    envelopes: &[SignedExecutionPayloadEnvelope],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    for envelope in envelopes {
+        let encoded = envelope.to_ssz();
+        let slot = envelope.message.payload.slot_number;
+        if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+            warn!(
+                slot,
+                size = encoded.len(),
+                "Skipping oversized execution payload envelope in response"
+            );
+            continue;
+        }
+        let digest = compute_fork_digest(
+            config,
+            genesis_validators_root,
+            slot / preset::SLOTS_PER_EPOCH,
+        );
+        write_success_chunk(io, label, &digest, encoded).await?;
+    }
+    Ok(())
+}
+
+/// Read an envelope response: one `SignedExecutionPayloadEnvelope` per chunk,
+/// until the peer closes.
+///
+/// The counterpart of [`decode_data_column_sidecars_response`]: the fork comes
+/// from the context bytes, and a digest no scheduled fork uses ends the stream.
+/// Envelopes exist only from gloas, so any other fork's digest is refused too.
+/// The context is then checked against the digest the payload's own
+/// `slot_number` implies.
+pub async fn decode_execution_payload_envelopes_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+    config: &Config,
+    genesis_validators_root: Root,
+) -> io::Result<Vec<SignedExecutionPayloadEnvelope>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let limits = ChunkLimits {
+        has_context: true,
+        max_chunks: protocols::MAX_REQUEST_PAYLOADS as usize,
+    };
+    let schedule = ForkSchedule::new(config, genesis_validators_root);
+    read_chunked_response(io, protocol_label, limits, |context, payload| {
+        let fork = <[u8; 4]>::try_from(context)
+            .ok()
+            .and_then(|digest| schedule.fork_for_digest(digest));
+        if fork != Some(ForkName::Gloas) {
+            return Err(invalid(format!(
+                "execution payload envelope chunk context {} is not the gloas fork digest",
+                hex::encode(context),
+            )));
+        }
+        let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
+            .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
+        let slot = envelope.message.payload.slot_number;
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
+        if context != expected {
+            warn!(
+                slot,
+                peer_context = %hex::encode(context),
+                our_context = %hex::encode(expected),
+                "Execution payload envelope chunk names another fork digest"
+            );
+            return Err(invalid(format!(
+                "execution payload envelope chunk context {} does not match {} for slot {}",
+                hex::encode(context),
+                hex::encode(expected),
+                slot,
+            )));
+        }
+        Ok(envelope)
+    })
+    .await
+}
+
+/// Test fixtures shared by the codec and handler tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ethlambda_types::beacon::containers::gloas::{
+        ExecutionPayload, ExecutionPayloadEnvelope, SignedExecutionPayloadEnvelope,
+    };
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Root};
+
+    /// An otherwise-empty envelope for the block `beacon_block_root` at `slot`,
+    /// revealing the payload `block_hash`.
+    pub(crate) fn envelope(
+        beacon_block_root: Root,
+        slot: u64,
+        block_hash: ExecutionBlockHash,
+    ) -> SignedExecutionPayloadEnvelope {
+        let payload = ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: slot,
+        };
+        SignedExecutionPayloadEnvelope {
+            message: ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 0,
+                beacon_block_root,
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
 }
