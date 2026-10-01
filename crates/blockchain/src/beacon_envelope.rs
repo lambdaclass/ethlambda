@@ -273,6 +273,15 @@ impl BlockChainServer {
             );
             return false;
         }
+        // Before any work: a copy the execution client already refused costs
+        // nothing.
+        if self.envelopes.is_rejected(&held.envelope_root) {
+            trace!(
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope the execution client already rejected"
+            );
+            return false;
+        }
         if self
             .envelopes
             .awaiting_engine
@@ -395,22 +404,31 @@ impl BlockChainServer {
         // specification's engine has two (see `docs/spec_deviations.md`).
         // Without a client the follower trusts the payload, as it already does
         // for every pre-gloas block it imports (`NotRequired`).
-        if self.envelopes.is_rejected(&held.envelope_root) {
-            trace!(
-                block_root = %ShortRoot(&root.0),
-                "Dropping an envelope the execution client already rejected"
-            );
-            return false;
-        }
         let status = match self.engine.clone() {
             None => PayloadStatusEnum::Valid,
             Some(client) => {
-                match beacon_engine::ask_envelope_status(&client, &block, &held.envelope).await {
+                let asked =
+                    beacon_engine::ask_envelope_status(&client, &block, &held.envelope).await;
+                // The client answered, so the envelopes waiting on it can be
+                // asked about in this same pass.
+                if asked.is_ok() {
+                    self.release_envelopes_awaiting_engine();
+                }
+                match asked {
                     // The payload does not hash to the block hash it claims:
                     // this envelope is bad, the payload the bid names may not
                     // be. Only this envelope is refused, so the builder's real
                     // one can still arrive.
-                    Ok(raw) if raw.status == PayloadStatusValue::InvalidBlockHash => {
+                    // Some execution clients have no `INVALID_BLOCK_HASH` and
+                    // answer a hash mismatch with `INVALID` and a null
+                    // `latestValidHash` (ethrex does), whereas a payload that
+                    // executed and failed names its last valid ancestor. So a
+                    // null one is read the same way.
+                    Ok(raw)
+                        if raw.status == PayloadStatusValue::InvalidBlockHash
+                            || (raw.status == PayloadStatusValue::Invalid
+                                && raw.latest_valid_hash.is_none()) =>
+                    {
                         warn!(
                             %slot,
                             block_root = %ShortRoot(&root.0),
@@ -497,9 +515,25 @@ impl BlockChainServer {
         self.publish_envelope_queues();
     }
 
-    /// Once a slot: ask the execution client again about every envelope it
-    /// has not answered for.
+    /// Once a slot: ask the execution client again about the oldest envelope
+    /// it has not answered for.
+    ///
+    /// One, not all: with the client down each ask spends the whole retry
+    /// ladder, and the held envelopes grow with the finality lag. The rest are
+    /// released by [`Self::release_envelopes_awaiting_engine`] once an ask gets
+    /// any answer.
     pub(crate) fn redrive_envelopes_awaiting_engine(&mut self) {
+        let oldest = self
+            .envelopes
+            .awaiting_engine
+            .iter()
+            .min_by_key(|(root, held)| (held.slot, held.event_ms, **root))
+            .map(|(root, _)| *root);
+        self.envelopes.work.extend(oldest);
+    }
+
+    /// Queue every envelope held for the execution client.
+    fn release_envelopes_awaiting_engine(&mut self) {
         let roots: Vec<H256> = self.envelopes.awaiting_engine.keys().copied().collect();
         self.envelopes.work.extend(roots);
     }
@@ -1968,8 +2002,12 @@ mod tests {
         ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
     )]
     async fn an_invalid_verdict_leaves_no_full_node_and_drops_the_full_child() {
-        let (client, mock) =
-            mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
+        // A non-null `latestValidHash`: the payload executed and failed.
+        let (client, mock) = mock_engine(
+            status_json("INVALID", Some(H256::repeat_byte(0x11))),
+            status_json("SYNCING", None),
+        )
+        .await;
         let mut server = server_with_held_child(client).await;
 
         server
@@ -2591,5 +2629,75 @@ mod tests {
             restarted.store.beacon_block_payload_status(p),
             PayloadStatusEnum::Valid
         );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_invalid_verdict_with_a_null_latest_valid_hash_rejects_only_that_envelope() {
+        // How ethrex reports a payload whose contents do not hash to its block
+        // hash: INVALID, `latestValidHash` null.
+        let (client, mock) =
+            mock_engine(status_json("INVALID", None), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(!server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(
+            !server
+                .store
+                .beacon_block_payload_status(root(FULL_PARENT))
+                .is_invalidated()
+        );
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_down_engine_is_probed_once_per_redrive_however_many_envelopes_wait() {
+        let (client, mock) = mock_engine("ERROR".to_string(), status_json("SYNCING", None)).await;
+        let mut server = server_with_held_child(client).await;
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        // More envelopes waiting, for blocks later than the real one.
+        for byte in 1..=4u8 {
+            let mut envelope = valid_envelope_for_full_parent();
+            envelope.message.beacon_block_root = H256::repeat_byte(byte);
+            server.envelopes.awaiting_engine.insert(
+                H256::repeat_byte(byte),
+                HeldEnvelope::new(envelope, 1_000 + u64::from(byte), 0),
+            );
+        }
+        assert_eq!(server.envelopes.awaiting_engine.len(), 5);
+        assert_eq!(count(&mock, "engine_newPayloadV5"), 1);
+
+        for asks in 2..=3 {
+            server.redrive_envelopes_awaiting_engine();
+            server.settle_envelopes().await;
+            assert_eq!(count(&mock, "engine_newPayloadV5"), asks);
+            assert_eq!(server.envelopes.awaiting_engine.len(), 5);
+        }
+
+        // The engine answers: the oldest is applied and the rest are released
+        // in the same redrive.
+        mock.lock().unwrap().new_payload = status_json("VALID", None);
+        server.redrive_envelopes_awaiting_engine();
+        server.settle_envelopes().await;
+        assert!(server.store.has_verified_payload(&root(FULL_PARENT)));
+        assert!(server.envelopes.awaiting_engine.is_empty());
     }
 }

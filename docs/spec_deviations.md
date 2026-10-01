@@ -303,13 +303,21 @@ three outcomes and the specification's `ExecutionEngine` has two.
   payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
   `INVALID` for a payload already applied removes it again (its FULL node, its
   stored envelope, and every child built on it).
-- **`INVALID_BLOCK_HASH`:** the envelope's contents do not hash to the block
-  hash it claims, so only that envelope (by its own root) is refused; the
-  root's payload is not condemned, since the builder's real envelope may still
-  arrive.
+- **A hash mismatch (`INVALID_BLOCK_HASH`, or `INVALID` with a null
+  `latestValidHash`):** the envelope's contents do not hash to the block hash it
+  claims, so only that envelope (by its own root) is refused; the root's
+  payload is not condemned, since the builder's real envelope may still arrive.
+  ethrex has no `INVALID_BLOCK_HASH` status: it answers a block hash mismatch
+  with `INVALID` and a null `latestValidHash`, and an executed-and-failed
+  payload with `INVALID` and its last valid ancestor. So a null one is read as
+  a mismatch and a non-null one as the payload being invalid. A payload that
+  failed with no valid ancestor to name is read as a mismatch too, which only
+  costs a refused envelope.
 - **No answer after the retry ladder:** the payload is not applied, as for a
   block, but unlike a block the envelope is consensus-valid and already held,
-  so it is kept and the per-slot redrive asks again. It is not fetched again:
+  so it is kept and the per-slot redrive asks again, about the oldest held
+  envelope only and the rest once that ask is answered, so a down client costs
+  one retry ladder per slot however many wait. It is not fetched again:
   that would repeat the ladder for every copy that arrives.
 
 `latestValidHash` and `VALID` follow the execution-layer chain, not every
