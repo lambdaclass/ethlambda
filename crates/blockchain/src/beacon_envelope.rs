@@ -201,8 +201,9 @@ fn envelope_matches_bid(
 }
 
 impl BlockChainServer {
-    /// Take an envelope that passed gossip validation: verify it now, or hold
-    /// it until what it waits on arrives. The caller then settles the queues.
+    /// Take an envelope: verify it now, or hold it until what it waits on
+    /// arrives. Callers may hand over envelopes nothing has checked (a
+    /// checkpoint source's, for one); the actor verifies them itself. The caller then settles the queues.
     pub(crate) fn receive_envelope(
         &mut self,
         envelope: gloas::SignedExecutionPayloadEnvelope,

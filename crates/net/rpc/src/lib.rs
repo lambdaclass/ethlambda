@@ -476,7 +476,7 @@ pub(crate) mod test_utils {
     }
 
     /// A gloas block whose bid names `parent_block_hash` and `block_hash`.
-    fn gloas_beacon_block(
+    pub(crate) fn gloas_beacon_block(
         slot: u64,
         parent_root: H256,
         parent_block_hash: H256,
@@ -532,7 +532,7 @@ pub(crate) mod test_utils {
     }
 
     /// A signed envelope for `root` with every other field at its zero value.
-    pub(crate) fn gloas_envelope(root: H256) -> gloas::SignedExecutionPayloadEnvelope {
+    pub(crate) fn gloas_envelope(root: H256, slot: u64) -> gloas::SignedExecutionPayloadEnvelope {
         let payload = gloas::ExecutionPayload {
             parent_hash: Default::default(),
             fee_recipient: Default::default(),
@@ -554,7 +554,7 @@ pub(crate) mod test_utils {
             blob_gas_used: 0,
             excess_blob_gas: 0,
             block_access_list: Default::default(),
-            slot_number: 0,
+            slot_number: slot,
         };
         gloas::SignedExecutionPayloadEnvelope {
             message: gloas::ExecutionPayloadEnvelope {

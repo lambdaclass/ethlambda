@@ -12,10 +12,85 @@
 //!   The block's own payload does not count: the block itself was imported
 //!   without it, and a withheld payload must not make the chain look
 //!   unverified.
+//!
+//! Everything here only reads the store, and an answer that cannot be worked
+//! out is optimistic: this flag gates signing, so an unknown gets the cautious
+//! reading. The payload links are therefore looked up or derived here instead
+//! of through fork choice, whose `ensure_payload_link` records what it derives
+//! and panics on a failed read.
 
-use ethlambda_state_transition::beacon::fork_choice::{self, PayloadStatus, PayloadStatusEnum};
 use ethlambda_storage::Store;
-use ethlambda_types::primitives::H256;
+use ethlambda_types::{
+    beacon::{
+        containers::SignedBeaconBlock,
+        fork_choice::{BlockPayloadLink, PayloadStatus, PayloadStatusEnum},
+    },
+    primitives::H256,
+};
+
+/// `root`'s payload link: the one fork choice recorded, or one derived from the
+/// stored blocks without recording it. `None` when it cannot be worked out.
+///
+/// The derivation is `derive_payload_link`'s: a gloas block's parent status is
+/// FULL when its bid names the parent's block hash (or the parent is
+/// pre-gloas), and unknown when the parent is not stored, which is the anchor.
+fn payload_link(store: &Store, root: H256) -> Option<BlockPayloadLink> {
+    if let Some(link) = store.payload_link(&root) {
+        return Some(link);
+    }
+    match store.get_signed_block(&root).ok()?? {
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_) => Some(BlockPayloadLink::PreGloas),
+        SignedBeaconBlock::Gloas(block) => {
+            let parent_status = match store.get_signed_block(&block.message.parent_root).ok()? {
+                None => None,
+                Some(SignedBeaconBlock::Gloas(parent)) => {
+                    let wanted = block
+                        .message
+                        .body
+                        .signed_execution_payload_bid
+                        .message
+                        .parent_block_hash;
+                    let held = parent
+                        .message
+                        .body
+                        .signed_execution_payload_bid
+                        .message
+                        .block_hash;
+                    Some(if wanted == held {
+                        PayloadStatus::Full
+                    } else {
+                        PayloadStatus::Empty
+                    })
+                }
+                Some(_) => Some(PayloadStatus::Full),
+            };
+            Some(BlockPayloadLink::Gloas { parent_status })
+        }
+        // A lean block is never in a beacon store.
+        SignedBeaconBlock::Lean(_) => None,
+    }
+}
+
+/// Whether the payload of the block at `root` is not (known to be) `VALID`.
+///
+/// A pre-gloas block's payload is its own, so it reads the optimistic set; a
+/// gloas root reads its recorded verdict, where none recorded is
+/// `NOT_VALIDATED`. Unknown links are not valid.
+fn payload_is_not_valid(store: &Store, root: H256) -> bool {
+    match payload_link(store, root) {
+        Some(BlockPayloadLink::PreGloas) => store.is_beacon_optimistic(root),
+        Some(BlockPayloadLink::Gloas { .. }) => {
+            store.beacon_block_payload_status(root) != PayloadStatusEnum::Valid
+        }
+        None => true,
+    }
+}
 
 /// Whether the payload of the block at `root` is not yet vouched for by the
 /// execution layer.
@@ -23,7 +98,7 @@ use ethlambda_types::primitives::H256;
 /// An unrecorded gloas verdict reads as `NOT_VALIDATED`, so an envelope the
 /// store holds but has no verdict for is optimistic.
 pub(crate) fn envelope_is_optimistic(store: &Store, root: H256) -> bool {
-    fork_choice::block_payload_status(store, root) != PayloadStatusEnum::Valid
+    payload_is_not_valid(store, root)
 }
 
 /// Whether the block at `root` rests on a payload that is not `VALID`.
@@ -33,32 +108,23 @@ pub(crate) fn envelope_is_optimistic(store: &Store, root: H256) -> bool {
 /// builds on, then reads that payload's verdict. A pre-gloas block is its own
 /// payload, so it reads the optimistic set as before. A chain that runs out
 /// (an anchor whose parent is below the retained window) has nothing left to
-/// doubt, so it is not optimistic.
-///
-/// A link that cannot be derived is reported optimistic: this flag gates
-/// signing, so the answer for an unknown is the cautious one.
+/// doubt, so it is not optimistic. A block or link that cannot be read is
+/// optimistic.
 pub(crate) fn block_is_optimistic(store: &Store, root: H256) -> bool {
     let mut current = root;
     loop {
-        if fork_choice::ensure_payload_link(store, current).is_err() {
+        let Some(link) = payload_link(store, current) else {
             return true;
-        }
-        let Some(link) = store.payload_link(&current) else {
-            // The block is not in the store, so there is no payload to doubt.
-            return false;
         };
         if !link.is_gloas() {
             return store.is_beacon_optimistic(current);
         }
-        let Ok(Some(block)) = store.get_signed_block(&current) else {
-            return false;
+        let parent = match store.get_signed_block(&current) {
+            Ok(Some(block)) => block.parent_root(),
+            Ok(None) | Err(_) => return true,
         };
-        let parent = block.parent_root();
         match link.parent_status() {
-            Some(PayloadStatus::Full) => {
-                return fork_choice::block_payload_status(store, parent)
-                    != PayloadStatusEnum::Valid;
-            }
+            Some(PayloadStatus::Full) => return payload_is_not_valid(store, parent),
             Some(PayloadStatus::Empty) => current = parent,
             // A pending parent status never comes out of a block's own bid.
             Some(PayloadStatus::Pending) | None => return false,
@@ -117,5 +183,41 @@ mod tests {
         let head = fixture.head_root;
         fixture.store.insert_beacon_optimistic_root(head, 65);
         assert!(block_is_optimistic(&fixture.store, fixture.g1.0));
+    }
+
+    #[test]
+    fn a_block_the_store_cannot_produce_is_optimistic() {
+        let fixture = gloas_fixture();
+        let unknown = H256::from([0xee; 32]);
+        assert!(block_is_optimistic(&fixture.store, unknown));
+        assert!(envelope_is_optimistic(&fixture.store, unknown));
+    }
+
+    #[test]
+    fn a_gloas_anchor_with_an_unknown_parent_is_not_optimistic() {
+        let mut fixture = gloas_fixture();
+        let block = crate::test_utils::gloas_beacon_block(
+            500,
+            H256::from([0xab; 32]),
+            H256::ZERO,
+            H256::ZERO,
+        );
+        let root = block.message_hash_tree_root();
+        fixture
+            .store
+            .insert_signed_block(root, block)
+            .expect("insert");
+
+        assert!(!block_is_optimistic(&fixture.store, root));
+    }
+
+    #[test]
+    fn judging_a_block_records_nothing_in_the_store() {
+        let fixture = gloas_fixture();
+        let (g2, _) = fixture.g2;
+        // Drop whatever import recorded, so the helper has to derive.
+        let before = fixture.store.payload_link(&g2);
+        block_is_optimistic(&fixture.store, g2);
+        assert_eq!(fixture.store.payload_link(&g2), before);
     }
 }

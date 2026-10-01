@@ -54,11 +54,8 @@ async fn get_envelope(
         Ok(None) => return not_found.into_response(),
         Err(_) => return ApiError::Internal("store read failed").into_response(),
     };
-    let slot = match store.get_signed_block(&root) {
-        Ok(Some(block)) => block.slot(),
-        Ok(None) => return not_found.into_response(),
-        Err(_) => return ApiError::Internal("store read failed").into_response(),
-    };
+    // Verified against its block's bid, so the payload's slot is the block's.
+    let slot = envelope.message.payload.slot_number;
 
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let response = match Encoding::from_accept(accept) {
@@ -110,7 +107,7 @@ mod tests {
         let (root, slot) = fixture.g1;
         fixture
             .store
-            .insert_verified_payload(slot, &gloas_envelope(root));
+            .insert_verified_payload(slot, &gloas_envelope(root, slot));
 
         // No verdict recorded: NOT_VALIDATED, so optimistic.
         let response = get(fixture.store.clone(), &url(root), None).await;
@@ -136,7 +133,7 @@ mod tests {
     async fn a_stored_envelope_is_served_as_ssz_on_request() {
         let mut fixture = gloas_fixture();
         let (root, slot) = fixture.g1;
-        let envelope = gloas_envelope(root);
+        let envelope = gloas_envelope(root, slot);
         fixture.store.insert_verified_payload(slot, &envelope);
 
         let response = get(fixture.store, &url(root), Some("application/octet-stream")).await;

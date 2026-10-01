@@ -808,22 +808,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         }
     };
 
-    // Off the startup path: the fetch is best-effort and a slow peer must not
-    // delay the node. The envelope goes through the same chain-actor entry a
-    // gossiped one does, so the bid check, the column check and the
-    // verification all apply to it.
-    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
-        let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
-        tokio::spawn(async move {
-            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
-            {
-                let _ = chain
-                    .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
-                    .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));
-            }
-        });
-    }
-
     let p2p_ref = p2p.actor_ref();
     let p2p_to_block_chain = p2p_ref.to_block_chain_to_p2p_ref();
 
@@ -842,6 +826,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             blockchain: blockchain.actor_ref().to_p2p_to_block_chain_ref(),
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
+
+    // After both `Init*` sends, so the actor has its p2p handle when an
+    // envelope parks waiting for columns. Off the startup path: the fetch is best-effort and a slow peer must not
+    // delay the node. The envelope goes through the same chain-actor entry a
+    // gossiped one does, so the bid check, the column check and the
+    // verification all apply to it.
+    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+        let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
+        tokio::spawn(async move {
+            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
+            {
+                let _ = chain
+                    .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
+                    .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));
+            }
+        });
+    }
 
     wait_for_shutdown(RunningNode {
         p2p,
@@ -863,7 +864,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
     let root = store.latest_finalized().ok()?.root;
     let block = store.get_signed_block(&root).ok()??;
-    if block.fork_name() != ForkName::Gloas {
+    // Gloas or any later fork (lean sorts last, and is not a beacon fork).
+    let fork = block.fork_name();
+    if fork < ForkName::Gloas || fork == ForkName::Lean {
         return None;
     }
     let held = store.get_execution_payload_envelope(&root).ok()?.is_some();
@@ -3129,5 +3132,109 @@ validators:
         let fallback = default_bootnodes(Some(&mainnet_source));
         assert!(!fallback.is_empty());
         assert_eq!(fallback, mainnet_source.bootnodes());
+    }
+}
+
+#[cfg(test)]
+mod anchor_envelope_root_tests {
+    use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::checkpoint::Checkpoint;
+
+    fn anchored_at(block: SignedBeaconBlock) -> (Store, H256, u64) {
+        let slot = block.slot();
+        let root = block.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store.insert_signed_block(root, block).expect("insert");
+        (store, root, slot)
+    }
+
+    fn gloas_block(slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_gloas_anchor_without_its_envelope_is_asked_about() {
+        let (store, root, _) = anchored_at(gloas_block(64));
+        assert_eq!(missing_anchor_envelope_root(&store), Some(root));
+    }
+
+    #[test]
+    fn a_gloas_anchor_that_holds_its_envelope_is_not() {
+        let (mut store, root, slot) = anchored_at(gloas_block(64));
+        let mut envelope = test_envelope();
+        envelope.message.beacon_block_root = root;
+        store.insert_verified_payload(slot, &envelope);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    #[test]
+    fn a_pre_gloas_anchor_has_no_envelope_to_ask_for() {
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 64,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        });
+        let (store, _, _) = anchored_at(block);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    fn test_envelope() -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; ethlambda_types::beacon::preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: H256::ZERO,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
     }
 }
