@@ -3380,6 +3380,25 @@ impl Store {
         self.beacon.lock().unwrap().verified_payloads.insert(root);
     }
 
+    /// Gloas: forgets that `root`'s payload is verified and deletes its stored
+    /// envelope, for a payload the execution layer later found invalid.
+    ///
+    /// The FULL node of the block stops existing for fork choice (it is
+    /// derived from [`Self::has_verified_payload`]) and the envelope is no
+    /// longer served to peers. Returns whether `root` was verified.
+    pub fn remove_verified_payload(&mut self, root: &H256) -> bool {
+        let was_verified = self.beacon.lock().unwrap().verified_payloads.remove(root);
+        if let Some(slot) = beacon_block_slot(self.backend.as_ref(), root) {
+            let keys = vec![encode_slot_root_key(slot, root)];
+            let mut batch = self.backend.begin_write().expect("write batch");
+            batch
+                .delete_batch(Table::ExecutionPayloadEnvelopes, keys)
+                .expect("delete execution payload envelope");
+            batch.commit().expect("commit");
+        }
+        was_verified
+    }
+
     /// Gloas: the verified envelope stored for `root`, if any.
     pub fn get_execution_payload_envelope(
         &self,
@@ -3775,6 +3794,20 @@ impl Store {
             .block_payload_statuses
             .get(&root)
             .map_or(PayloadStatusEnum::Syncing, |(_slot, status)| *status)
+    }
+
+    /// Whether any recorded gloas payload verdict is still `NOT_VALIDATED`.
+    ///
+    /// The cheap half of resolving optimistic payloads, like
+    /// [`Self::has_beacon_optimistic_roots`]: with a healthy execution client
+    /// it is always `false`, so callers can skip a `block_index` scan.
+    pub fn has_unvalidated_block_payloads(&self) -> bool {
+        self.beacon
+            .lock()
+            .unwrap()
+            .block_payload_statuses
+            .values()
+            .any(|(_slot, status)| status.is_not_validated())
     }
 
     /// Records the execution client's verdict on `root`'s payload, against the
@@ -7403,6 +7436,24 @@ mod tests {
             store.canonical_execution_payload_envelopes(1, 1).unwrap(),
             vec![envelope]
         );
+    }
+
+    #[test]
+    fn an_unverified_payload_is_forgotten_across_reopen() {
+        let root = H256::from([1u8; 32]);
+        let backend = beacon_backend_finalized_at(root);
+        let mut store = reopen(backend.clone());
+        store
+            .insert_signed_block(root, gloas_test_block(SLOTS_PER_EPOCH, H256::ZERO))
+            .expect("insert block");
+        store.insert_verified_payload(SLOTS_PER_EPOCH, &test_envelope(root));
+
+        assert!(store.remove_verified_payload(&root));
+        assert!(!store.remove_verified_payload(&root));
+
+        assert!(!store.has_verified_payload(&root));
+        assert_eq!(store.get_execution_payload_envelope(&root).unwrap(), None);
+        assert!(!reopen(backend).has_verified_payload(&root));
     }
 
     #[test]
