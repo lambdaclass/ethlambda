@@ -227,6 +227,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 |--------|------|----------|-------------|
 | `GET` | `/eth/v2/beacon/blocks/{block_id}` | JSON or SSZ | `SignedBeaconBlock` at `block_id` |
 | `GET` | `/eth/v1/beacon/blocks/{block_id}/root` | JSON | That block's root |
+| `GET` | `/eth/v1/beacon/execution_payload_envelopes/{block_id}` | JSON or SSZ | Gloas `SignedExecutionPayloadEnvelope` of that block (see below) |
 | `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
@@ -353,6 +354,46 @@ Serving `/eth/v2/debug/beacon/states/finalized` as SSZ is what makes this client
 checkpoint-syncable from itself: it is the exact path
 [`checkpoint_sync.rs`](./checkpoint_sync.md) fetches from other clients.
 
+### `GET /eth/v1/beacon/execution_payload_envelopes/{block_id}`
+
+Gloas moves a block's execution payload into a separate signed envelope. This
+serves the one the node has verified, as `{version: "gloas", execution_optimistic,
+finalized, data}` JSON or as SSZ on `Accept: application/octet-stream`, with
+`Eth-Consensus-Version: gloas` either way. It is also what a checkpoint-syncing
+node asks for the payload of its anchor (see
+[`checkpoint_sync.md`](./checkpoint_sync.md)).
+
+| Status | When |
+|--------|------|
+| `400` | `block_id` is malformed |
+| `404` | the block is unknown, or the node holds no envelope for it |
+
+The second `404` is deliberately one status for several situations: the store
+keeps verified envelopes only, so a withheld payload, a payload not yet
+received and a pre-gloas block (which has no envelope; the specification's
+error list names no other status for it) are indistinguishable here. A caller
+must read `404` as "unknown to this node", not as "the payload is empty".
+
+### `execution_optimistic` under gloas
+
+Before gloas a block's payload ran inside the block, so the flag is whether the
+block is in the store's optimistic set. From gloas on the payload is a separate
+object that may arrive late or never, and two rules share the flag:
+
+- an **envelope** response is optimistic iff that payload's verdict is not
+  `VALID` (an unrecorded verdict reads as `NOT_VALIDATED`);
+- a **block, header, state or finality-checkpoints** response for a gloas block
+  is optimistic iff the latest FULL payload the block builds on is not `VALID`.
+  The walk starts at the block's parent: if the block's bid names the parent's
+  payload as its parent block hash it reads the parent's verdict, and otherwise
+  it steps back to the parent and repeats. A pre-gloas block on the way reads
+  the optimistic set. The block's own payload does not count, so a withheld
+  payload does not make the chain look unverified.
+
+Pre-gloas responses are unchanged. One helper implements both rules
+(`shared/optimistic.rs`) and every response that carries the flag goes through
+it.
+
 ### `GET /eth/v1/config/spec`
 
 One flat object holding the network's configuration, the compiled preset, and
@@ -360,15 +401,21 @@ the specification's constants, as the Beacon API asks. Validator clients depend
 on it: lighthouse's refuses a beacon node whose `PRESET_BASE` does not match
 its own, and treats an absent key as a mismatch.
 
-The key set is lighthouse's, less gloas's preset and constant keys
-(`beacon::preset` and `beacon::constants` hold them, such as
-`DOMAIN_BEACON_BUILDER` and `DOMAIN_PTC_ATTESTER`, but this list does not
-report them yet; gloas's schedule, timing and churn keys are reported, since
-they are `Config` fields) and three keys the specification does not define
-(`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`, `TTFB_TIMEOUT`). Domain types
-and withdrawal prefixes are `0x`-prefixed hex; `VERSIONED_HASH_VERSION_KZG` is
-a decimal, as lighthouse reports it. `GENESIS_TIME` is absent:
-`/eth/v1/beacon/genesis` reports it.
+The key set is lighthouse's plus gloas's preset and constant keys, read from
+`beacon::preset` and `beacon::constants` rather than typed here: `PTC_SIZE`,
+`MAX_PAYLOAD_ATTESTATIONS`, `MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD`,
+`MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD`, `MAX_BUILDERS_PER_WITHDRAWALS_SWEEP`,
+the four gloas domains (`DOMAIN_BEACON_BUILDER`, `DOMAIN_PTC_ATTESTER`,
+`DOMAIN_PROPOSER_PREFERENCES`, `DOMAIN_BUILDER_DEPOSIT`), the builder
+withdrawal prefix and request types, and the `BUILDER_INDEX_*`,
+`BUILDER_PAYMENT_THRESHOLD_*` and `PAYLOAD_BUILDER_VERSION` constants. Gloas's
+schedule, timing and churn keys are `Config` fields, so they were already
+reported. Three keys are left out because the specification does not define
+them (`GAS_LIMIT_ADJUSTMENT_FACTOR`, `RESP_TIMEOUT`, `TTFB_TIMEOUT`), and so are
+gloas's `MAX_*_SIZE` preset keys, which bound gossip message sizes the node does
+not run on. Domain types and withdrawal prefixes are `0x`-prefixed hex;
+`VERSIONED_HASH_VERSION_KZG` is a decimal, as lighthouse reports it.
+`GENESIS_TIME` is absent: `/eth/v1/beacon/genesis` reports it.
 
 The configuration keys come from the `Config` the data directory was
 initialized with. Some of them (the custody and subnet counts, the
