@@ -16,6 +16,7 @@
 pub mod column_checks;
 pub mod decode;
 pub mod encoding;
+pub mod envelope_checks;
 pub mod fork_schedule;
 pub mod handler;
 pub mod messages;
