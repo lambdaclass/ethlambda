@@ -30,6 +30,7 @@ use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
+pub(crate) use super::envelope_client::release_envelope_gate;
 use super::envelope_client::{
     handle_envelope_fetch_failure, handle_envelopes_by_range_response,
     handle_envelopes_by_root_response, request_beacon_envelopes_by_range,
@@ -272,10 +273,10 @@ pub async fn handle_req_resp_message(
                                 // exactly the way #608 fixed, since no further
                                 // event will ever name this id again.
                                 Some(
-                                    PendingRequestKind::Root(_)
+                                    kind @ (PendingRequestKind::Root(_)
                                     | PendingRequestKind::Range { .. }
                                     | PendingRequestKind::EnvelopeRoot(_)
-                                    | PendingRequestKind::EnvelopeRange { .. },
+                                    | PendingRequestKind::EnvelopeRange { .. }),
                                 ) => {
                                     error!(
                                         %peer,
@@ -283,6 +284,7 @@ pub async fn handle_req_resp_message(
                                         count = sidecars.len(),
                                         "Data column sidecars response answered a non-column request id"
                                     );
+                                    retire_unanswered(server, kind, peer, ctx).await;
                                 }
                                 None => {
                                     debug!(
@@ -313,17 +315,18 @@ pub async fn handle_req_resp_message(
                                     end_slot,
                                 }) => {
                                     handle_envelopes_by_range_response(
-                                        server, peer, start_slot, end_slot, envelopes,
-                                    );
+                                        server, peer, start_slot, end_slot, envelopes, ctx,
+                                    )
+                                    .await;
                                 }
                                 // Unreachable by construction, as for the
                                 // column payload above: only the two envelope
                                 // kinds are sent on the envelope protocols.
                                 Some(
-                                    PendingRequestKind::Root(_)
+                                    kind @ (PendingRequestKind::Root(_)
                                     | PendingRequestKind::Range { .. }
                                     | PendingRequestKind::Columns(..)
-                                    | PendingRequestKind::ColumnRange { .. },
+                                    | PendingRequestKind::ColumnRange { .. }),
                                 ) => {
                                     error!(
                                         %peer,
@@ -331,6 +334,7 @@ pub async fn handle_req_resp_message(
                                         count = envelopes.len(),
                                         "Envelopes response answered a non-envelope request id"
                                     );
+                                    retire_unanswered(server, kind, peer, ctx).await;
                                 }
                                 None => {
                                     debug!(
@@ -380,15 +384,16 @@ pub async fn handle_req_resp_message(
                                 // data column protocol, which answers with
                                 // `DataColumnSidecars`, never with `Blocks`.
                                 Some(
-                                    PendingRequestKind::Columns(..)
+                                    kind @ (PendingRequestKind::Columns(..)
                                     | PendingRequestKind::ColumnRange { .. }
                                     | PendingRequestKind::EnvelopeRoot(_)
-                                    | PendingRequestKind::EnvelopeRange { .. },
+                                    | PendingRequestKind::EnvelopeRange { .. }),
                                 ) => {
                                     error!(
                                         %peer,
                                         "Blocks response answered a non-block request id"
                                     );
+                                    retire_unanswered(server, kind, peer, ctx).await;
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -427,9 +432,12 @@ pub async fn handle_req_resp_message(
                                 // Same reasoning as the `Root` arm above.
                                 handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
                             }
-                            // As for a column range: nothing waits on it, and
-                            // the chain actor re-asks by root.
-                            Some(PendingRequestKind::EnvelopeRange { .. }) => {}
+                            // Nothing retries it, and the chain actor re-asks
+                            // by root; but range pacing waits on the answer,
+                            // so it must be released here.
+                            Some(PendingRequestKind::EnvelopeRange { .. }) => {
+                                release_envelope_gate(server, ctx).await;
+                            }
                             None => {}
                         }
                     }
@@ -498,6 +506,7 @@ pub async fn handle_req_resp_message(
                         end_slot,
                         "ExecutionPayloadEnvelopesByRange request failed; envelopes fall back to the by-root path"
                     );
+                    release_envelope_gate(server, ctx).await;
                 }
                 // The handshake is the only *tracked* request kind absent
                 // here: every other outcome for a `Root`, `Range` or `Columns`
@@ -1303,7 +1312,10 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
 /// nothing failed. The batch is re-checked when a peer's metadata arrives (see
 /// [`resume_range_batch_held_for_custody`]), on every call that would have sent
 /// it anyway, and at the deadline.
-async fn request_next_beacon_range_batch(server: &mut P2PServer, ctx: &Context<P2PServer>) -> bool {
+pub(super) async fn request_next_beacon_range_batch(
+    server: &mut P2PServer,
+    ctx: &Context<P2PServer>,
+) -> bool {
     let Some((peer, batch)) = server
         .range_sync_state
         .as_ref()
@@ -2591,8 +2603,10 @@ async fn handle_beacon_blocks_by_range_response(
     debug!(%peer, received, accepted, "Beacon blocks received");
 
     // The batch's blocks are all in the actor's mailbox now; ask for the
-    // envelopes of the same span only after that (see the function's doc).
-    request_beacon_envelopes_by_range(
+    // envelopes of the same span only after that. On a gloas span the next
+    // batch is then held back until the answer has been delivered (see
+    // `RangeSyncState::envelopes_pending`).
+    let waiting_on_envelopes = request_beacon_envelopes_by_range(
         server,
         peer,
         start_slot,
@@ -2613,7 +2627,35 @@ async fn handle_beacon_blocks_by_range_response(
             return;
         }
     }
+    if waiting_on_envelopes {
+        return;
+    }
     request_next_beacon_range_batch(server, ctx).await;
+}
+
+/// Retire a request whose id was answered on a protocol that never carries its
+/// kind. The codec cannot produce such an answer, but if one ever arrived the
+/// exchange is over all the same: leaving the entry would keep its root in the
+/// matching pending map, deduplicating every later ask for it, or leave range
+/// sync waiting on a request that already ended.
+async fn retire_unanswered(
+    server: &mut P2PServer,
+    kind: PendingRequestKind,
+    peer: PeerId,
+    ctx: &Context<P2PServer>,
+) {
+    match kind {
+        PendingRequestKind::Root(root) => handle_fetch_failure(server, root, peer, ctx).await,
+        PendingRequestKind::Range { .. } => fail_range_request(server, &peer),
+        PendingRequestKind::Columns(block_root, _) => {
+            handle_column_fetch_failure(server, block_root, peer, ctx).await;
+        }
+        PendingRequestKind::ColumnRange { .. } => {}
+        PendingRequestKind::EnvelopeRoot(block_root) => {
+            handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
+        }
+        PendingRequestKind::EnvelopeRange { .. } => release_envelope_gate(server, ctx).await,
+    }
 }
 
 #[cfg(test)]

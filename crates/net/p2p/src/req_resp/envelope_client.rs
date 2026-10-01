@@ -5,6 +5,7 @@
 //! through `beacon::envelope_checks` before the chain actor sees it.
 
 use std::collections::HashSet;
+use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
@@ -15,12 +16,48 @@ use spawned_concurrency::tasks::{Context, send_after};
 use tracing::{debug, error, trace};
 
 use super::Request;
-use super::handlers::{choose_fetch_peer, retire_root_attempt};
+use super::handlers::{choose_fetch_peer, request_next_beacon_range_batch, retire_root_attempt};
 use crate::beacon::decode::fork_at_slot;
 use crate::beacon::envelope_checks;
 use crate::beacon::messages::ExecutionPayloadEnvelopesByRangeRequest;
-use crate::beacon::protocols::MAX_REQUEST_PAYLOADS;
+use crate::beacon::protocols::{MAX_REQUEST_BLOCKS_DENEB, MAX_REQUEST_PAYLOADS};
 use crate::{P2PServer, PendingRequest, PendingRequestKind, ReqRespProtocol, p2p_protocol};
+
+// A range request is clamped to the smaller of the two ceilings, so a block
+// batch is never wider than its envelope request can answer for.
+const _: () = assert!(MAX_REQUEST_PAYLOADS >= MAX_REQUEST_BLOCKS_DENEB);
+
+/// What one failed attempt at an envelope lookup leaves to do.
+#[derive(Debug, PartialEq, Eq)]
+enum FailedAttempt {
+    /// Ask again after the backoff.
+    Retry(Duration),
+    /// The ladder is exhausted and the lookup is retired.
+    GaveUp,
+    /// Nothing is waiting on this root: a late or duplicate failure.
+    Stale,
+}
+
+/// Charge `peer` with a failed attempt at `block_root`'s envelope, retiring the
+/// lookup when the ladder runs out.
+fn fail_envelope_attempt(server: &mut P2PServer, block_root: H256, peer: PeerId) -> FailedAttempt {
+    let Some(pending) = server.pending_envelope_requests.get_mut(&block_root) else {
+        return FailedAttempt::Stale;
+    };
+    let attempts = pending.attempts;
+    match retire_root_attempt(pending, peer) {
+        Some(backoff) => {
+            debug!(%block_root, %peer, attempts, ?backoff, "Envelope fetch failed, scheduling retry");
+            FailedAttempt::Retry(backoff)
+        }
+        None => {
+            error!(%block_root, %peer, attempts,
+                   "Envelope fetch failed after max retries, giving up");
+            server.pending_envelope_requests.remove(&block_root);
+            FailedAttempt::GaveUp
+        }
+    }
+}
 
 /// Retire one failed attempt at fetching `block_root`'s envelope.
 ///
@@ -35,25 +72,25 @@ pub(super) async fn handle_envelope_fetch_failure(
     peer: PeerId,
     ctx: &Context<P2PServer>,
 ) {
-    let Some(pending) = server.pending_envelope_requests.get_mut(&block_root) else {
+    if let FailedAttempt::Retry(backoff) = fail_envelope_attempt(server, block_root, peer) {
+        send_after(
+            backoff,
+            ctx.clone(),
+            p2p_protocol::RetryEnvelopeFetch { block_root },
+        );
+    }
+}
+
+/// Let range sync go on after a gloas batch's envelopes: whether they were
+/// delivered, refused, or never came. Does nothing when no batch is waiting.
+pub(crate) async fn release_envelope_gate(server: &mut P2PServer, ctx: &Context<P2PServer>) {
+    let Some(state) = &mut server.range_sync_state else {
         return;
     };
-
-    let attempts = pending.attempts;
-    let Some(backoff) = retire_root_attempt(pending, peer) else {
-        error!(%block_root, %peer, attempts,
-               "Envelope fetch failed after max retries, giving up");
-        server.pending_envelope_requests.remove(&block_root);
+    if !std::mem::take(&mut state.envelopes_pending) {
         return;
-    };
-
-    debug!(%block_root, %peer, attempts, ?backoff, "Envelope fetch failed, scheduling retry");
-
-    send_after(
-        backoff,
-        ctx.clone(),
-        p2p_protocol::RetryEnvelopeFetch { block_root },
-    );
+    }
+    request_next_beacon_range_batch(server, ctx).await;
 }
 
 /// Fetch the envelope of `block_root` from a random connected peer.
@@ -143,6 +180,40 @@ pub(super) async fn handle_envelopes_by_root_response(
     envelopes: Vec<SignedExecutionPayloadEnvelope>,
     ctx: &Context<P2PServer>,
 ) {
+    match settle_by_root_answer(server, peer, block_root, envelopes) {
+        ByRootAnswer::Forward(envelopes) => {
+            if server.blockchain.is_none() {
+                debug!(%peer, %block_root, "No blockchain handler available");
+                return;
+            }
+            envelope_checks::check_and_forward(server, envelopes);
+        }
+        ByRootAnswer::Failed(FailedAttempt::Retry(backoff)) => {
+            send_after(
+                backoff,
+                ctx.clone(),
+                p2p_protocol::RetryEnvelopeFetch { block_root },
+            );
+        }
+        ByRootAnswer::Failed(FailedAttempt::GaveUp | FailedAttempt::Stale) => {}
+    }
+}
+
+/// What a by-root answer comes to.
+#[derive(Debug, PartialEq)]
+enum ByRootAnswer {
+    /// The envelopes that answer the request; the lookup is retired.
+    Forward(Vec<SignedExecutionPayloadEnvelope>),
+    /// Nothing answered it: an attempt is spent.
+    Failed(FailedAttempt),
+}
+
+fn settle_by_root_answer(
+    server: &mut P2PServer,
+    peer: PeerId,
+    block_root: H256,
+    envelopes: Vec<SignedExecutionPayloadEnvelope>,
+) -> ByRootAnswer {
     let received = envelopes.len();
     trace!(%peer, %block_root, received, "Received ExecutionPayloadEnvelopesByRoot response");
 
@@ -158,18 +229,11 @@ pub(super) async fn handle_envelopes_by_root_response(
 
     if envelopes.is_empty() {
         debug!(%peer, %block_root, "ExecutionPayloadEnvelopesByRoot response carried no matching envelope");
-        handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
-        return;
+        return ByRootAnswer::Failed(fail_envelope_attempt(server, block_root, peer));
     }
 
     server.pending_envelope_requests.remove(&block_root);
-
-    if server.blockchain.is_none() {
-        debug!(%peer, %block_root, "No blockchain handler available");
-        return;
-    }
-
-    envelope_checks::check_and_forward(server, envelopes);
+    ByRootAnswer::Forward(envelopes)
 }
 
 /// Whether a range sync batch over `span` can contain a gloas block, and so an
@@ -187,12 +251,19 @@ fn range_reaches_gloas(config: &Config, span: &std::ops::RangeInclusive<u64>) ->
 /// finishes first: the blocks are already in its mailbox when this request
 /// goes out, and its answer is forwarded by a task spawned later still, so
 /// the actor sees every envelope after the blocks of the batch (its mailbox is
-/// FIFO). It also never holds the batch's block delivery on this answer.
+/// FIFO). It never holds the batch's block delivery on this answer.
 ///
-/// Best effort: nothing waits on the answer, and an envelope that does not
-/// arrive is asked for by root once its block is a parent missing one. The
-/// return value says whether a request went out. Does nothing for a span that
-/// ends before gloas.
+/// The chain actor keeps an envelope whose block has not imported only
+/// briefly and in small numbers, so range delivery relies on the batches
+/// reaching it in order. A batch's envelopes must therefore land before the
+/// next batch's blocks do, and the next request is held back until the answer
+/// has been checked and forwarded: this sets
+/// `RangeSyncState::envelopes_pending`, and [`release_envelope_gate`] clears
+/// it. An envelope the answer lacks is asked for by root once its block is a
+/// parent missing one.
+///
+/// Returns whether a request went out, which is also whether range sync is now
+/// waiting on it. Does nothing for a span that ends before gloas.
 pub(crate) async fn request_beacon_envelopes_by_range(
     server: &mut P2PServer,
     peer: PeerId,
@@ -234,6 +305,9 @@ pub(crate) async fn request_beacon_envelopes_by_range(
             end_slot,
         },
     );
+    if let Some(state) = &mut server.range_sync_state {
+        state.envelopes_pending = true;
+    }
     true
 }
 
@@ -259,22 +333,25 @@ fn retain_envelopes_in_range(
 
 /// Take delivery of an `ExecutionPayloadEnvelopesByRange` answer.
 ///
-/// No failure handling, unlike the by-root path: nothing waits on this answer,
-/// so a short or empty one is not an attempt spent. The envelopes it lacks are
-/// asked for by root, since the chain actor re-asks every slot for each parent
-/// still missing one.
-pub(super) fn handle_envelopes_by_range_response(
+/// No retry, unlike the by-root path: a short or empty answer is not an
+/// attempt spent, and the envelopes it lacks are asked for by root, since the
+/// chain actor re-asks every slot for each parent still missing one. Range
+/// sync is released once the answer has been forwarded, or at once when there
+/// is nothing to forward.
+pub(super) async fn handle_envelopes_by_range_response(
     server: &mut P2PServer,
     peer: PeerId,
     start_slot: u64,
     end_slot: u64,
     envelopes: Vec<SignedExecutionPayloadEnvelope>,
+    ctx: &Context<P2PServer>,
 ) {
     let received = envelopes.len();
     trace!(%peer, start_slot, end_slot, received, "Received ExecutionPayloadEnvelopesByRange response");
 
     if server.blockchain.is_none() {
         debug!(%peer, "No blockchain handler available");
+        release_envelope_gate(server, ctx).await;
         return;
     }
 
@@ -282,7 +359,15 @@ pub(super) fn handle_envelopes_by_range_response(
     if dropped > 0 {
         debug!(%peer, start_slot, end_slot, dropped, "Dropping out-of-range envelopes");
     }
-    envelope_checks::check_and_forward(server, envelopes);
+    let resume = ctx.clone();
+    let done: envelope_checks::Done = Box::new(move || {
+        send_after(
+            Duration::ZERO,
+            resume,
+            p2p_protocol::ResumeRangeAfterEnvelopes,
+        );
+    });
+    envelope_checks::check_and_forward_then(server, envelopes, Some(done));
 }
 
 #[cfg(test)]
@@ -473,8 +558,14 @@ mod tests {
             .connected_peers
             .insert(peer, ConnectionDirection::Outbound);
 
+        server.range_sync_state = Some(crate::RangeSyncState::new(0..100_000, peer, 99_999));
+
         assert!(!request_beacon_envelopes_by_range(&mut server, peer, 0, 64).await);
         assert!(server.outbound_requests.is_empty());
+        // Pre-gloas pacing is unchanged: the next batch is not held back.
+        let state = server.range_sync_state.as_ref().unwrap();
+        assert!(!state.envelopes_pending);
+        assert!(state.next_batch().is_some());
 
         // The span is clamped to what the peer will answer for.
         assert!(
@@ -491,6 +582,109 @@ mod tests {
                 if *start_slot == first_gloas_slot
                     && *end_slot == first_gloas_slot + MAX_REQUEST_PAYLOADS - 1
         ));
+        // A gloas span holds the next batch back until its answer is delivered.
+        let state = server.range_sync_state.as_mut().unwrap();
+        assert!(state.envelopes_pending);
+        assert!(state.next_batch().is_none());
+        state.envelopes_pending = false;
+        assert!(state.next_batch().is_some());
+    }
+
+    /// The release runs the completion callback even with nothing to forward,
+    /// or no chain to forward to, so range sync cannot wait forever.
+    #[tokio::test]
+    async fn the_range_release_fires_when_there_is_nothing_to_forward() {
+        use crate::beacon::envelope_checks::tests::Recorder;
+
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        let callback = |tx: tokio::sync::mpsc::UnboundedSender<()>| -> envelope_checks::Done {
+            Box::new(move || {
+                let _ = tx.send(());
+            })
+        };
+
+        // No chain actor.
+        envelope_checks::check_and_forward_then(
+            &server,
+            vec![envelope_for(7, H256::repeat_byte(1))],
+            Some(callback(done_tx.clone())),
+        );
+        assert_eq!(done_rx.recv().await, Some(()));
+
+        // An empty answer.
+        let (sender, _received) = tokio::sync::mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(Recorder(sender)));
+        envelope_checks::check_and_forward_then(&server, Vec::new(), Some(callback(done_tx)));
+        assert_eq!(done_rx.recv().await, Some(()));
+    }
+
+    fn pending_lookup(server: &mut P2PServer, root: H256, attempts: u32) {
+        server.pending_envelope_requests.insert(
+            root,
+            PendingRequest {
+                attempts,
+                failed_peers: HashSet::new(),
+            },
+        );
+    }
+
+    /// An empty or non-matching by-root answer spends an attempt and schedules
+    /// a retry after the first rung of the backoff; a good one retires the
+    /// lookup and is forwarded.
+    #[tokio::test]
+    async fn a_by_root_answer_without_the_envelope_schedules_a_retry() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let root = H256::repeat_byte(4);
+        let peer = PeerId::random();
+        pending_lookup(&mut server, root, 1);
+
+        let empty = settle_by_root_answer(&mut server, peer, root, Vec::new());
+        assert_eq!(
+            empty,
+            ByRootAnswer::Failed(FailedAttempt::Retry(Duration::from_millis(
+                INITIAL_BACKOFF_MS
+            )))
+        );
+        assert_eq!(server.pending_envelope_requests[&root].attempts, 2);
+        assert!(
+            server.pending_envelope_requests[&root]
+                .failed_peers
+                .contains(&peer)
+        );
+
+        // An envelope for another root is as good as none.
+        let wrong = settle_by_root_answer(
+            &mut server,
+            peer,
+            root,
+            vec![envelope_for(9, H256::repeat_byte(5))],
+        );
+        assert!(matches!(
+            wrong,
+            ByRootAnswer::Failed(FailedAttempt::Retry(_))
+        ));
+
+        let good = settle_by_root_answer(&mut server, peer, root, vec![envelope_for(9, root)]);
+        assert_eq!(good, ByRootAnswer::Forward(vec![envelope_for(9, root)]));
+        assert!(server.pending_envelope_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_by_root_lookup_gives_up_when_the_ladder_is_spent() {
+        let mut server = crate::test_support::unconnected_beacon_server(Config::mainnet(), 0).await;
+        let root = H256::repeat_byte(4);
+        pending_lookup(&mut server, root, MAX_FETCH_RETRIES);
+
+        let outcome = fail_envelope_attempt(&mut server, root, PeerId::random());
+
+        assert_eq!(outcome, FailedAttempt::GaveUp);
+        assert!(server.pending_envelope_requests.is_empty());
+        // A late failure for a retired lookup is ignored.
+        assert_eq!(
+            fail_envelope_attempt(&mut server, root, PeerId::random()),
+            FailedAttempt::Stale
+        );
     }
 
     /// The range answer reaches the chain actor after the blocks the batch
@@ -515,17 +709,25 @@ mod tests {
                 BlockArrival::now(),
             );
         }
-        handle_envelopes_by_range_response(
-            &mut server,
-            PeerId::random(),
-            20,
-            21,
-            vec![envelope_for(21, root), envelope_for(20, root)],
+        // The handler's own steps, less the actor `Context` it also needs for
+        // the release message: filter to the span in slot order, then check
+        // and forward with a completion callback.
+        let (answer, _) =
+            retain_envelopes_in_range(vec![envelope_for(21, root), envelope_for(20, root)], 20, 21);
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        envelope_checks::check_and_forward_then(
+            &server,
+            answer,
+            Some(Box::new(move || {
+                let _ = done_tx.send(());
+            })),
         );
 
         assert_eq!(received.recv().await, Some(Seen::Block(20)));
         assert_eq!(received.recv().await, Some(Seen::Block(21)));
         assert_eq!(received.recv().await, Some(Seen::Envelope(root, 20)));
         assert_eq!(received.recv().await, Some(Seen::Envelope(root, 21)));
+        // The release comes only after the last envelope was sent.
+        assert_eq!(done_rx.recv().await, Some(()));
     }
 }

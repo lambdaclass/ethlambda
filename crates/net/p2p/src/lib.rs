@@ -427,6 +427,14 @@ pub(crate) struct RangeSyncState {
     /// Latest advertised head slot for each peer.
     pub(crate) peer_set: HashMap<PeerId, u64>,
     pub(crate) in_flight: bool,
+    /// Set while the envelopes of the batch just delivered are being fetched
+    /// and checked, which only gloas spans have.
+    ///
+    /// The chain actor holds an envelope whose block has not imported only
+    /// briefly and in small numbers, and imports a batch in order, so the next
+    /// batch's blocks must not reach it before this batch's envelopes have.
+    /// Holding the next request back on the answer is what guarantees that.
+    pub(crate) envelopes_pending: bool,
     /// When the next batch was first held back for custody, while it still is.
     /// Beacon-only; see [`RANGE_BATCH_CUSTODY_WAIT`].
     pub(crate) custody_wait_since: Option<Instant>,
@@ -451,6 +459,7 @@ impl RangeSyncState {
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
+            envelopes_pending: false,
             custody_wait_since: None,
         }
     }
@@ -495,7 +504,7 @@ impl RangeSyncState {
     }
 
     pub(crate) fn next_batch(&self) -> Option<(PeerId, Range<u64>)> {
-        if self.in_flight || self.current_range.is_empty() {
+        if self.in_flight || self.envelopes_pending || self.current_range.is_empty() {
             return None;
         }
 
@@ -1318,6 +1327,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn resume_range_after_envelopes(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
@@ -1352,6 +1363,15 @@ impl P2PServer {
             tracing::error!(%root, "Failed to retry block fetch, giving up");
             self.pending_root_requests.remove(&root);
         }
+    }
+
+    #[send_handler]
+    async fn handle_resume_range_after_envelopes(
+        &mut self,
+        _msg: p2p_protocol::ResumeRangeAfterEnvelopes,
+        ctx: &Context<Self>,
+    ) {
+        req_resp::handlers::release_envelope_gate(self, ctx).await;
     }
 
     #[send_handler]
