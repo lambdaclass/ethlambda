@@ -991,14 +991,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_undecodable_block_at_a_gloas_slot_is_ignored() {
+    async fn an_undecodable_block_at_a_gloas_slot_is_rejected() {
         let mut config = Config::mainnet();
         config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
         let slot = config.gloas_fork_epoch * preset::SLOTS_PER_EPOCH;
 
         assert!(matches!(
             triage_block_under(config, &mismatched_block_bytes(slot)).await,
-            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
 

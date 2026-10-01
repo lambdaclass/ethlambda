@@ -222,6 +222,13 @@ pub(crate) mod tests {
             ));
             Ok(())
         }
+        fn new_payload_attestation_message(
+            &self,
+            _: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+            _: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     pub(crate) fn envelope(slot: u64, byte: u8) -> SignedExecutionPayloadEnvelope {
