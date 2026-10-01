@@ -93,7 +93,7 @@ use crate::{
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
         Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
-        fetch_block_from_peer, fetch_data_columns_from_peer,
+        fetch_block_from_peer, fetch_data_columns_from_peer, fetch_envelope_from_peer,
         handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
@@ -351,6 +351,20 @@ pub(crate) enum PendingRequestKind {
     /// paired with arrive on their own request, and any column still missing
     /// when a block is held still gets the by-root path.
     ColumnRange {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// An `ExecutionPayloadEnvelopesByRoot` lookup for this block root's
+    /// envelope. Its attempts and failed peers live in
+    /// `pending_envelope_requests`, keyed by the same root.
+    EnvelopeRoot(H256),
+    /// An `ExecutionPayloadEnvelopesByRange` sweep for a range sync batch,
+    /// asked for the slots a `BeaconBlocksByRange` answer just delivered.
+    ///
+    /// Like [`Self::ColumnRange`] it carries no per-root bookkeeping: a short
+    /// or empty answer is not a failure to retry, since the chain actor asks
+    /// again by root for every parent still missing its envelope.
+    EnvelopeRange {
         start_slot: u64,
         end_slot: u64,
     },
@@ -1071,6 +1085,7 @@ impl P2P {
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_envelope_requests: HashMap::new(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -1166,6 +1181,11 @@ pub struct P2PServer {
     /// never as "custodies nothing".
     pub(crate) peer_custody: HashMap<PeerId, Vec<u64>>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
+    /// One entry per block root with an in-flight or backed-off
+    /// `ExecutionPayloadEnvelopesByRoot` lookup: `pending_root_requests`'s
+    /// counterpart for envelopes, deduplicating a repeated ask and carrying
+    /// the retry ladder.
+    pub(crate) pending_envelope_requests: HashMap<H256, PendingRequest>,
     /// One entry per block root with an in-flight or backed-off
     /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
     /// the block path: `fetch_missing_columns` dedupes against it, and
@@ -1296,6 +1316,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_envelope_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
@@ -1329,6 +1351,26 @@ impl P2PServer {
         if !fetch_block_from_peer(self, root).await {
             tracing::error!(%root, "Failed to retry block fetch, giving up");
             self.pending_root_requests.remove(&root);
+        }
+    }
+
+    #[send_handler]
+    async fn handle_retry_envelope_fetch(
+        &mut self,
+        msg: p2p_protocol::RetryEnvelopeFetch,
+        _ctx: &Context<Self>,
+    ) {
+        let block_root = msg.block_root;
+        // Same "might have completed during backoff" guard as
+        // `handle_retry_block_fetch`.
+        if !self.pending_envelope_requests.contains_key(&block_root) {
+            trace!(%block_root, "Envelope fetch completed during backoff, skipping retry");
+            return;
+        }
+        trace!(%block_root, "Retrying envelope fetch after backoff");
+        if !fetch_envelope_from_peer(self, block_root).await {
+            tracing::error!(%block_root, "Failed to retry envelope fetch, giving up");
+            self.pending_envelope_requests.remove(&block_root);
         }
     }
 
@@ -1519,7 +1561,7 @@ async fn fetch_missing(server: &mut P2PServer, request: FetchRequest) {
         columns,
     } = request;
     if needs_envelope {
-        debug!(%block_root, "Envelope fetch by root is not served yet; ignoring");
+        fetch_missing_envelope(server, block_root).await;
     }
     if needs_block {
         fetch_missing_block(server, block_root).await;
@@ -1537,6 +1579,17 @@ async fn fetch_missing_block(server: &mut P2PServer, root: H256) {
         return;
     }
     fetch_block_from_peer(server, root).await;
+}
+
+/// The by-root envelope half of a [`FetchRequest`].
+async fn fetch_missing_envelope(server: &mut P2PServer, block_root: H256) {
+    // The chain actor re-asks once per slot for every parent still missing its
+    // envelope, so a root already in flight is the normal case, not a fault.
+    if server.pending_envelope_requests.contains_key(&block_root) {
+        trace!(%block_root, "Envelope fetch already in progress, ignoring duplicate");
+        return;
+    }
+    fetch_envelope_from_peer(server, block_root).await;
 }
 
 /// The by-root column half of a [`FetchRequest`].
@@ -2430,6 +2483,21 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
 /// keeps its own lean-flavored copy, since that one builds a different wire.
 #[cfg(test)]
 pub(crate) mod test_support {
+    /// Keep a test swarm's event stream consumed. The swarm task exits on
+    /// its first event once nothing receives them, which takes the command
+    /// channel down with it and leaves `send_request` racing a dead task.
+    pub(crate) fn drain_swarm_events(
+        stream: impl futures::Stream<Item = libp2p::swarm::SwarmEvent<crate::BehaviourEvent>>
+        + Send
+        + 'static,
+    ) {
+        use futures::StreamExt as _;
+        tokio::spawn(async move {
+            let mut stream = Box::pin(stream);
+            while stream.next().await.is_some() {}
+        });
+    }
+
     use std::collections::{HashMap, HashSet};
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
@@ -2477,8 +2545,9 @@ pub(crate) mod test_support {
         })
         .expect("swarm builds");
 
-        let (_swarm_stream, swarm_handle) =
+        let (swarm_stream, swarm_handle) =
             crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+        drain_swarm_events(swarm_stream);
 
         let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -2531,6 +2600,7 @@ pub(crate) mod test_support {
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_envelope_requests: HashMap::new(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
