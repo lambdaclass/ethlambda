@@ -83,6 +83,26 @@ pub(crate) const MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT: usize = 4;
 /// when the block imports each is tried until one verifies.
 pub(crate) const MAX_ENVELOPES_PER_UNMATCHED_ROOT: usize = 3;
 
+/// How many envelopes one by-range envelope answer can carry, mirroring p2p's
+/// `MAX_REQUEST_PAYLOADS` (this crate does not depend on p2p).
+const SYNC_BATCH_ENVELOPES: usize = 128;
+
+/// How many sync batches of envelopes `awaiting_import` may hold.
+const SYNC_BATCHES_AWAITING_IMPORT: usize = 4;
+
+/// The most envelopes held for stored, unimported blocks, across all roots.
+///
+/// The per-root cap bounds one block, and finality bounds the stored blocks,
+/// but p2p's fetch lead over import is unbounded across sessions: with the
+/// actor stalled (a missing envelope, the engine down) range sync keeps
+/// delivering while nothing finalizes to sweep the queue. A few batches is the
+/// working set catch-up needs, since the envelopes of one batch arrive before
+/// the next is released. Past it the envelopes nearest the import frontier
+/// (lowest slots) are kept and the highest dropped: those are the furthest
+/// from import, and are asked for again by root once their child is held.
+pub(crate) const MAX_ENVELOPES_AWAITING_IMPORT: usize =
+    SYNC_BATCH_ENVELOPES * SYNC_BATCHES_AWAITING_IMPORT;
+
 /// How many slots an envelope for a block this node has not imported is kept.
 ///
 /// A builder reveals its payload after the block it bid in, so the block
@@ -197,6 +217,30 @@ impl EnvelopeQueues {
             self.rejected.pop_front();
         }
         self.rejected.push_back(envelope_root);
+    }
+
+    /// Drop envelopes from `awaiting_import`, highest slot first, until it
+    /// holds at most [`MAX_ENVELOPES_AWAITING_IMPORT`].
+    fn trim_awaiting_import(&mut self) {
+        let mut total: usize = self.awaiting_import.values().map(Vec::len).sum();
+        while total > MAX_ENVELOPES_AWAITING_IMPORT {
+            let Some(furthest) = self
+                .awaiting_import
+                .iter()
+                .filter_map(|(root, held)| held.iter().map(|h| h.slot).max().map(|s| (s, *root)))
+                .max()
+                .map(|(_, root)| root)
+            else {
+                return;
+            };
+            if let Some(held) = self.awaiting_import.get_mut(&furthest) {
+                held.pop();
+                total -= 1;
+                if held.is_empty() {
+                    self.awaiting_import.remove(&furthest);
+                }
+            }
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -595,6 +639,16 @@ impl BlockChainServer {
         root: H256,
         mut held: HeldEnvelope,
     ) -> Option<HeldEnvelope> {
+        // Repeat copies cost nothing: the per-root bound and the duplicate
+        // check come before the block is decoded.
+        if let Some(held_for_root) = self.envelopes.awaiting_import.get(&root)
+            && (held_for_root.len() >= MAX_ENVELOPES_PER_UNMATCHED_ROOT
+                || held_for_root
+                    .iter()
+                    .any(|other| other.envelope_root == held.envelope_root))
+        {
+            return None;
+        }
         if !self.store.has_block(&root) {
             return Some(held);
         }
@@ -626,19 +680,17 @@ impl BlockChainServer {
             return None;
         }
         held.slot = slot;
-        let held_for_root = self.envelopes.awaiting_import.entry(root).or_default();
-        if held_for_root.len() < MAX_ENVELOPES_PER_UNMATCHED_ROOT
-            && !held_for_root
-                .iter()
-                .any(|other| other.envelope_root == held.envelope_root)
-        {
-            debug!(
-                %slot,
-                block_root = %ShortRoot(&root.0),
-                "Holding an envelope until its stored block is imported"
-            );
-            held_for_root.push(held);
-        }
+        debug!(
+            %slot,
+            block_root = %ShortRoot(&root.0),
+            "Holding an envelope until its stored block is imported"
+        );
+        self.envelopes
+            .awaiting_import
+            .entry(root)
+            .or_default()
+            .push(held);
+        self.envelopes.trim_awaiting_import();
         self.publish_envelope_queues();
         None
     }
@@ -754,18 +806,24 @@ impl BlockChainServer {
     /// does not stall the child for good.
     pub(crate) fn redrive_missing_envelopes(&self) {
         for &parent_root in self.envelopes.blocks_awaiting_parent_payload.keys() {
-            if !self.envelopes.awaiting_block.contains_key(&parent_root)
-                && !self.envelopes.awaiting_columns.contains_key(&parent_root)
-                && !self.envelopes.awaiting_engine.contains_key(&parent_root)
-                && !self.store.has_verified_payload(&parent_root)
-                && !self
-                    .store
-                    .beacon_block_payload_status(parent_root)
-                    .is_invalidated()
-            {
+            if self.parent_envelope_is_unaccounted_for(&parent_root) {
                 self.request_missing_envelope(parent_root);
             }
         }
+    }
+
+    /// Whether `parent_root`'s envelope is neither held in any queue nor
+    /// verified (nor its payload found invalid), so asking for it can help.
+    fn parent_envelope_is_unaccounted_for(&self, parent_root: &H256) -> bool {
+        !self.envelopes.awaiting_block.contains_key(parent_root)
+            && !self.envelopes.awaiting_import.contains_key(parent_root)
+            && !self.envelopes.awaiting_columns.contains_key(parent_root)
+            && !self.envelopes.awaiting_engine.contains_key(parent_root)
+            && !self.store.has_verified_payload(parent_root)
+            && !self
+                .store
+                .beacon_block_payload_status(*parent_root)
+                .is_invalidated()
     }
 
     /// Once a slot: look at every envelope waiting for columns, and ask peers
@@ -963,7 +1021,12 @@ impl BlockChainServer {
         // follower to one block per slot. p2p dedups in-flight roots, so a
         // range batch whose envelopes are on their way costs at most one extra
         // request per block.
-        self.request_missing_envelope(parent_root);
+        // Unless a queue already holds it: a cascade of held children whose
+        // parents' envelopes arrived with their range batch would otherwise
+        // cost one by-root request and signature check per block.
+        if self.parent_envelope_is_unaccounted_for(&parent_root) {
+            self.request_missing_envelope(parent_root);
+        }
     }
 
     /// Ask p2p for `root`'s envelope by root. The request carries nothing but
@@ -1907,6 +1970,61 @@ mod tests {
         assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
         assert!(server.envelopes.blocks_awaiting_parent_payload.is_empty());
         assert_eq!(server.store.ms_since_genesis(), time_before);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_held_envelope_for_the_parent_suppresses_the_immediate_ask() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        let p2p = std::sync::Arc::new(crate::tests::RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+        let child = case.block(CHILD);
+        let envelope = case.envelope(PARENT_ENVELOPE);
+        server
+            .envelopes
+            .awaiting_import
+            .insert(child.parent_root(), vec![HeldEnvelope::new(envelope, 0, 0)]);
+
+        server.hold_block_for_parent_payload(child, ImportTimings::default());
+
+        assert!(p2p.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    fn awaiting_import_keeps_the_lowest_slots_when_over_its_cap() {
+        let mut queues = EnvelopeQueues::default();
+        let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
+        let total = MAX_ENVELOPES_AWAITING_IMPORT as u64 + 5;
+        for slot in 0..total {
+            let mut root_bytes = [0u8; 32];
+            root_bytes[..8].copy_from_slice(&slot.to_be_bytes());
+            queues.awaiting_import.insert(
+                H256(root_bytes),
+                vec![HeldEnvelope::new(envelope.clone(), slot, 0)],
+            );
+        }
+
+        queues.trim_awaiting_import();
+
+        let mut kept: Vec<u64> = queues
+            .awaiting_import
+            .values()
+            .flatten()
+            .map(|held| held.slot)
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            (0..MAX_ENVELOPES_AWAITING_IMPORT as u64).collect::<Vec<_>>()
+        );
     }
 
     #[test]
