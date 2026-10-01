@@ -91,7 +91,7 @@ async fn get_state(
         // borrow.
         Encoding::Json => crate::json_response(Envelope {
             version: fork.as_str(),
-            execution_optimistic: store.is_beacon_optimistic(root),
+            execution_optimistic: crate::shared::optimistic::block_is_optimistic(&store, root),
             finalized: is_finalized(&store, state.slot()),
             data: state.as_ref(),
         }),
@@ -114,7 +114,7 @@ async fn get_finality_checkpoints(
     // the state is the only place a *previous* justified checkpoint is kept
     // at all: the store keeps one justified row and one finalized row.
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, state.slot()),
         "data": {
             "previous_justified": state.previous_justified_checkpoint(),
@@ -324,7 +324,7 @@ fn validators_response(store: &Store, state_id: &str, request: ValidatorsRequest
         .collect();
 
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(store, root),
         "finalized": is_finalized(store, state.slot()),
         "data": entries,
     }))

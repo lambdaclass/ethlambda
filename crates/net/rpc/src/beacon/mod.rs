@@ -18,6 +18,7 @@ use crate::shared::block_id::IdError;
 
 pub(crate) mod blocks;
 pub(crate) mod config;
+pub(crate) mod envelopes;
 pub(crate) mod genesis;
 pub(crate) mod headers;
 pub(crate) mod node;
@@ -123,6 +124,7 @@ impl IntoResponse for ApiError {
 pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
     Router::new()
         .merge(blocks::routes())
+        .merge(envelopes::routes())
         .merge(headers::routes())
         .merge(states::routes())
         .merge(genesis::routes())
