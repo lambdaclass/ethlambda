@@ -169,11 +169,15 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
         DOMAIN_BUILDER_DEPOSIT,
     );
 
-    // One-byte constants, so each goes out as a one-byte array would.
-    let withdrawal_prefixes = entries!(|prefix: u8| hex_string([prefix]); constants:
+    // One-byte constants (withdrawal prefixes and execution request types), so
+    // each goes out as a one-byte array would.
+    let one_byte_constants = entries!(|prefix: u8| hex_string([prefix]); constants:
         BLS_WITHDRAWAL_PREFIX,
         ETH1_ADDRESS_WITHDRAWAL_PREFIX,
         COMPOUNDING_WITHDRAWAL_PREFIX,
+        DEPOSIT_REQUEST_TYPE,
+        WITHDRAWAL_REQUEST_TYPE,
+        CONSOLIDATION_REQUEST_TYPE,
         BUILDER_WITHDRAWAL_PREFIX,
         BUILDER_DEPOSIT_REQUEST_TYPE,
         BUILDER_EXIT_REQUEST_TYPE,
@@ -198,7 +202,7 @@ fn extra_entries() -> impl Iterator<Item = (&'static str, String)> {
     preset
         .into_iter()
         .chain(domains)
-        .chain(withdrawal_prefixes)
+        .chain(one_byte_constants)
         .chain(other_constants)
 }
 
@@ -301,6 +305,8 @@ mod tests {
         assert_eq!(data["DOMAIN_PTC_ATTESTER"], "0x0c000000");
         assert_eq!(data["DOMAIN_PROPOSER_PREFERENCES"], "0x0d000000");
         assert_eq!(data["DOMAIN_BUILDER_DEPOSIT"], "0x0e000000");
+        assert_eq!(data["DEPOSIT_REQUEST_TYPE"], "0x00");
+        assert_eq!(data["CONSOLIDATION_REQUEST_TYPE"], "0x02");
         assert_eq!(data["BUILDER_WITHDRAWAL_PREFIX"], "0xb0");
         assert_eq!(data["BUILDER_DEPOSIT_REQUEST_TYPE"], "0x03");
         assert_eq!(data["BUILDER_EXIT_REQUEST_TYPE"], "0x04");
