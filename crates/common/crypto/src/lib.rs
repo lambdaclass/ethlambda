@@ -116,13 +116,10 @@ where
     prover_queue()
         .send(task)
         .expect("the prover thread never exits");
-    match reply_rx
+    reply_rx
         .recv()
         .expect("the prover thread replies to every job")
-    {
-        Ok(value) => value,
-        Err(payload) => panic::resume_unwind(payload),
-    }
+        .unwrap_or_else(|payload| panic::resume_unwind(payload))
 }
 
 /// The prover thread's job queue, spawning the thread on first use.
