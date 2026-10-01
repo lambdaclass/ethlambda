@@ -3365,12 +3365,15 @@ impl Store {
     /// successor builds on its empty branch has its envelope left out, even
     /// when this node holds one. The head has no successor and fork choice does
     /// not persist which payload branch it picked, so its envelope is served
-    /// when held: only a verified envelope is ever stored.
+    /// when held: only a verified envelope is ever stored. See
+    /// `docs/spec_deviations.md`, "The head's payload envelope is served
+    /// whenever it is held".
     ///
     /// Canonical blocks come from `BlockRoots` and the whole answer is read
     /// from one view, like [`get_signed_blocks_by_slot_range`](Self::get_signed_blocks_by_slot_range).
     /// The successor of the last block in the window may lie past `end_slot`,
-    /// so the index is read on beyond it, up to the head, until one is found.
+    /// so the index is read on beyond it, up to the head, until one is found;
+    /// that search is skipped when the last block holds no envelope to judge.
     pub fn canonical_execution_payload_envelopes(
         &self,
         start_slot: u64,
@@ -3386,11 +3389,28 @@ impl Store {
                 .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root"))
         };
 
+        let envelope_row = |slot: u64, root: &H256| {
+            view.get(
+                Table::ExecutionPayloadEnvelopes,
+                &encode_slot_root_key(slot, root),
+            )
+            .expect("get")
+        };
+
         let mut window: Vec<(u64, H256)> = (start_slot..=end_slot)
             .filter_map(|slot| canonical_root(slot).map(|root| (slot, root)))
             .collect();
-        if !window.is_empty()
-            && let Some(head_slot) = beacon_block_slot(self.backend.as_ref(), &self.head()?)
+        // Head and its slot come out of the same view as the rest, so a head
+        // move partway through cannot pair one branch's index with another's.
+        let head_slot = view
+            .get(Table::Metadata, KEY_HEAD)
+            .expect("get head")
+            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid head root"))
+            .and_then(|head| view.get(Table::BlockHeaders, &head.to_ssz()).expect("get"))
+            .map(|bytes| decode_beacon_block_value(&bytes).slot());
+        if let Some(&(last_slot, last_root)) = window.last()
+            && envelope_row(last_slot, &last_root).is_some()
+            && let Some(head_slot) = head_slot
         {
             let successor = (end_slot.saturating_add(1)..=head_slot)
                 .find_map(|slot| canonical_root(slot).map(|root| (slot, root)));
@@ -3402,13 +3422,7 @@ impl Store {
             if slot > end_slot {
                 break;
             }
-            let Some(bytes) = view
-                .get(
-                    Table::ExecutionPayloadEnvelopes,
-                    &encode_slot_root_key(slot, &root),
-                )
-                .expect("get")
-            else {
+            let Some(bytes) = envelope_row(slot, &root) else {
                 continue;
             };
             let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)

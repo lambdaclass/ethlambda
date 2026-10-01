@@ -19,11 +19,13 @@ use crate::beacon::protocols::MAX_REQUEST_PAYLOADS;
 /// Answer `execution_payload_envelopes_by_range/1` off the canonical chain.
 ///
 /// The spec makes it equivalent to `BeaconBlocksByRange` v2 with another
-/// response type, so the window rules are the block ones: an empty window is
-/// `INVALID_REQUEST`, a `count` above `MAX_REQUEST_PAYLOADS` is truncated to it
-/// ("Clients MAY limit the number of ... in the response"), and a `start_slot`
-/// below the anchor is `RESOURCE_UNAVAILABLE`. A window before gloas simply
-/// holds no envelopes, so it is an empty answer. Which envelopes count as
+/// response type. An empty window is `INVALID_REQUEST` and a `start_slot`
+/// below the anchor is `RESOURCE_UNAVAILABLE`, as for blocks. A `count` above
+/// `MAX_REQUEST_PAYLOADS` is truncated to it rather than refused, which the
+/// specification's "Clients MAY limit the number of payload envelopes in the
+/// response" allows; the block handler refuses a `count` past its phase0
+/// ceiling instead, because a request that wide is a protocol violation there.
+/// A window before gloas simply holds no envelopes, so it is an empty answer. Which envelopes count as
 /// canonical is [`Store::canonical_execution_payload_envelopes`]'s business.
 pub(super) async fn handle_execution_payload_envelopes_by_range_request(
     server: &mut P2PServer,
@@ -299,33 +301,83 @@ mod tests {
         );
     }
 
+    /// A phase0 block, standing in for any block before gloas.
+    fn pre_gloas_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+        use ethlambda_types::beacon::containers::phase0;
+
+        SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody {
+                    randao_reveal: Default::default(),
+                    eth1_data: Default::default(),
+                    graffiti: H256::ZERO,
+                    proposer_slashings: Default::default(),
+                    attester_slashings: Default::default(),
+                    attestations: Default::default(),
+                    deposits: Default::default(),
+                    voluntary_exits: Default::default(),
+                },
+            },
+            signature: Default::default(),
+        })
+    }
+
     #[test]
     fn by_range_caps_the_window_at_max_request_payloads() {
-        let (store, envelopes) = chain_with_every_payload_built_on();
+        let mut store = beacon_store();
+        let total = MAX_REQUEST_PAYLOADS + 2;
+        let payload_hash = |slot: u64| H256::repeat_byte(slot as u8);
+        let mut parent = H256::ZERO;
+        for slot in 1..=total {
+            // Each block builds on the previous slot's payload, so every
+            // envelope is on the chain and only the cap can cut the answer.
+            let block = gloas_block(slot, parent, payload_hash(slot - 1));
+            parent = extend_chain(&mut store, block);
+            reveal(&mut store, slot, parent, payload_hash(slot));
+        }
 
-        // A window far wider than the cap still answers from the first
-        // MAX_REQUEST_PAYLOADS slots only, which here includes every envelope;
-        // the cap is observable on where the window ends.
-        assert_eq!(
-            envelopes_by_range(&store, 1, u64::MAX).expect("in window"),
-            envelopes
+        let served = envelopes_by_range(&store, 1, total).expect("in window");
+
+        assert_eq!(served.len() as u64, MAX_REQUEST_PAYLOADS);
+        let last_slot = served
+            .last()
+            .expect("non-empty")
+            .message
+            .payload
+            .slot_number;
+        assert_eq!(last_slot, MAX_REQUEST_PAYLOADS);
+        // A count past the cap is cut to it, not refused.
+        let wide = envelopes_by_range(&store, 1, u64::MAX).expect("in window");
+        assert_eq!(wide, served);
+    }
+
+    #[test]
+    fn by_range_answers_empty_for_a_pre_gloas_window_that_has_blocks() {
+        let mut store = beacon_store();
+        let root_1 = extend_chain(&mut store, pre_gloas_block(1, H256::ZERO));
+        let root_2 = extend_chain(&mut store, pre_gloas_block(2, root_1));
+        let root_3 = extend_chain(&mut store, gloas_block(3, root_2, hash(0)));
+        let envelope = reveal(&mut store, 3, root_3, hash(3));
+
+        assert!(
+            envelopes_by_range(&store, 1, 2)
+                .expect("in window")
+                .is_empty()
         );
-        let beyond_cap = 1 + MAX_REQUEST_PAYLOADS;
         assert_eq!(
-            envelopes_by_range(&store, beyond_cap, u64::MAX).expect("in window"),
-            Vec::new()
+            envelopes_by_range(&store, 1, 3).expect("in window"),
+            vec![envelope]
         );
     }
 
     #[test]
-    fn by_range_answers_empty_for_a_window_before_gloas_and_for_overflow() {
+    fn by_range_answers_empty_for_an_overflowing_window() {
         let (store, _) = chain_with_every_payload_built_on();
 
-        assert!(
-            envelopes_by_range(&store, 0, 1)
-                .expect("in window")
-                .is_empty()
-        );
         assert!(
             envelopes_by_range(&store, u64::MAX, 5)
                 .expect("in window")
