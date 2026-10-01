@@ -19,19 +19,24 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 use crate::Error;
+use crate::proposer_settings::ProposerSettings;
 use crate::secure_fs;
 
 pub mod keystores;
+pub mod proposer;
 
 pub use keystores::SharedStore;
 
-/// Everything the keymanager handlers need: the validator store, plus the
-/// directories an import or delete must write through so the change survives
-/// a restart. Held as the axum state rather than three separate `Extension`s,
-/// since every route needs all three together.
+/// Everything the keymanager handlers need: the validator store, the
+/// per-validator proposal settings, plus the directories an import or delete
+/// must write through so the change survives a restart. Held as the axum state
+/// rather than separate `Extension`s, since the routes share most of it.
 #[derive(Clone)]
 pub struct KeymanagerContext {
     pub store: SharedStore,
+    /// Each validator's fee recipient, graffiti and gas limit, which the
+    /// `proposer` routes override and a keystore delete forgets.
+    pub settings: Arc<ProposerSettings>,
     pub validators_dir: PathBuf,
     pub secrets_dir: PathBuf,
     /// Serializes the open-mutate-save cycle over the validator definitions
@@ -128,6 +133,24 @@ pub fn router(context: KeymanagerContext, token: String) -> Router {
             get(keystores::list)
                 .post(keystores::import)
                 .delete(keystores::delete),
+        )
+        .route(
+            "/eth/v1/validator/{pubkey}/feerecipient",
+            get(proposer::get_fee_recipient)
+                .post(proposer::set_fee_recipient)
+                .delete(proposer::delete_fee_recipient),
+        )
+        .route(
+            "/eth/v1/validator/{pubkey}/graffiti",
+            get(proposer::get_graffiti)
+                .post(proposer::set_graffiti)
+                .delete(proposer::delete_graffiti),
+        )
+        .route(
+            "/eth/v1/validator/{pubkey}/gas_limit",
+            get(proposer::get_gas_limit)
+                .post(proposer::set_gas_limit)
+                .delete(proposer::delete_gas_limit),
         )
         .with_state(context)
         .layer(middleware::from_fn(require_bearer))
