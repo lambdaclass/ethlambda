@@ -124,8 +124,7 @@ where
 
 /// The prover thread's job queue, spawning the thread on first use.
 ///
-/// The thread lives for the rest of the process. It keeps std's default stack,
-/// the size tokio gives its own threads.
+/// The thread lives for the rest of the process.
 fn prover_queue() -> &'static mpsc::Sender<ProverJob> {
     static QUEUE: OnceLock<mpsc::Sender<ProverJob>> = OnceLock::new();
     QUEUE.get_or_init(|| {
