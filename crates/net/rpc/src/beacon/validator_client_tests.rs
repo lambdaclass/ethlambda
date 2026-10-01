@@ -53,7 +53,7 @@ async fn serve() -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
 async fn serve_with_engine(
     engine: Option<ethlambda_engine::EngineClient>,
 ) -> (HttpBeaconNode, BeaconState, Arc<RecordingNetwork>) {
-    let (client, state, network, _) = serve_at(engine).await;
+    let (client, state, network, _, _) = serve_at(engine).await;
     (client, state, network)
 }
 
@@ -65,6 +65,7 @@ async fn serve_at(
     BeaconState,
     Arc<RecordingNetwork>,
     std::net::SocketAddr,
+    ethlambda_storage::Store,
 ) {
     let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
     let (probe, _) = beacon_store_at(state.clone());
@@ -109,7 +110,7 @@ async fn serve_at(
     store.insert_state(parent_root, state.clone()).unwrap();
     let network = Arc::new(RecordingNetwork::default());
     let p2p: RpcToP2PRef = network.clone();
-    let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
+    let router = crate::build_beacon_api_router(store.clone(), "ethlambda/test", "peer".into())
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
@@ -120,7 +121,7 @@ async fn serve_at(
     tokio::spawn(async move { axum::serve(listener, router).await });
 
     let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
-    (client, state, network, address)
+    (client, state, network, address, store)
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
@@ -390,13 +391,23 @@ async fn fake_execution_client(blob_count: usize) -> ethlambda_engine::EngineCli
 /// from this node's execution client (with `blob_count` blobs), and what a
 /// validator client needs to sign it.
 async fn produce_for_proposer(blob_count: usize) -> Proposal {
+    produce_with_pool(blob_count, |_store, _state| {}).await
+}
+
+/// [`produce_for_proposer`], after `fill_pool` has put operations into the
+/// node's pool.
+async fn produce_with_pool(
+    blob_count: usize,
+    fill_pool: impl FnOnce(&ethlambda_storage::Store, &BeaconState),
+) -> Proposal {
     use ethlambda_state_transition::beacon::{
         block_production::advance_to_slot, helpers::accessors::get_beacon_proposer_index,
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
-    let (client, state, network, address) =
+    let (client, state, network, address, store) =
         serve_at(Some(fake_execution_client(blob_count).await)).await;
+    fill_pool(&store, &state);
     let slot = state.slot() + 1;
     let advanced = advance_to_slot(
         &state,
@@ -460,6 +471,43 @@ async fn the_validator_client_can_propose_through_this_node() {
     assert!(p.network.sidecars.lock().unwrap().is_empty());
 }
 
+/// A voluntary exit in the node's pool rides in the block it produces. The
+/// state sits at the wall clock's epoch, far past `SHARD_COMMITTEE_PERIOD`
+/// since every validator is active from epoch 0, so the exit is valid.
+#[tokio::test]
+async fn a_pooled_exit_is_packed_into_the_produced_block() {
+    use ethlambda_state_transition::beacon::helpers::misc::compute_domain;
+    use ethlambda_types::beacon::{
+        constants::DOMAIN_VOLUNTARY_EXIT, containers::shared, operation::BeaconOperation,
+    };
+
+    let mut expected = None;
+    let p = produce_with_pool(0, |store, state| {
+        let exit = shared::VoluntaryExit {
+            epoch: compute_epoch_at_slot(state.slot()),
+            validator_index: 5,
+        };
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            store.config().capella_fork_version,
+            state.genesis_validators_root(),
+        );
+        let signed = shared::SignedVoluntaryExit {
+            message: exit,
+            signature: sign_for(5, compute_signing_root(exit.hash_tree_root(), domain)),
+        };
+        store
+            .operation_pool()
+            .insert(BeaconOperation::VoluntaryExit(signed.clone()));
+        expected = Some(signed);
+    })
+    .await;
+    assert_eq!(
+        p.produced.block().body.voluntary_exits.to_vec(),
+        vec![expected.unwrap()]
+    );
+}
+
 #[tokio::test]
 async fn the_validator_client_can_propose_a_blob_block_through_this_node() {
     use ethlambda_state_transition::beacon::fork_choice::verify_data_column_sidecar_inclusion_proof;
@@ -495,7 +543,7 @@ async fn a_published_block_with_a_wrong_cell_proof_is_refused() {
     use libssz::{SszDecode as _, SszEncode as _};
 
     let p = produce_for_proposer(2).await;
-    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let body = p.produced.clone().into_signed_ssz(p.signature);
     let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
     contents.kzg_proofs.swap(0, 1);
     assert_publish_refused(&p, &contents.to_ssz()).await;
@@ -507,7 +555,7 @@ async fn a_published_block_with_a_missing_cell_proof_is_refused() {
     use libssz::{SszDecode as _, SszEncode as _};
 
     let p = produce_for_proposer(2).await;
-    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let body = p.produced.clone().into_signed_ssz(p.signature);
     let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
     let mut proofs: Vec<_> = contents.kzg_proofs.iter().cloned().collect();
     proofs.pop();
@@ -521,7 +569,7 @@ async fn a_published_block_on_an_unknown_parent_is_refused() {
     use libssz::{SszDecode as _, SszEncode as _};
 
     let p = produce_for_proposer(0).await;
-    let body = p.produced.clone().into_signed_ssz(p.signature.clone());
+    let body = p.produced.clone().into_signed_ssz(p.signature);
     let mut contents = FuluSignedBlockContents::from_ssz_bytes(&body).unwrap();
     contents.signed_block.message.parent_root = ethlambda_types::primitives::H256([0xab; 32]);
     assert_publish_refused(&p, &contents.to_ssz()).await;

@@ -77,9 +77,9 @@ struct Checked {
 /// One rejected attestation, in the Beacon API's `IndexedErrorMessage` shape:
 /// its position in the submitted array, and why.
 #[derive(Debug, Serialize)]
-struct Failure {
-    index: usize,
-    message: &'static str,
+pub(crate) struct Failure {
+    pub(crate) index: usize,
+    pub(crate) message: std::borrow::Cow<'static, str>,
 }
 
 async fn post_pool_attestations(
@@ -124,7 +124,10 @@ async fn post_pool_attestations(
             Ok(()) => debug!(%slot, validator, "Accepted attestation for gossip"),
             Err(message) => {
                 warn!(%slot, validator, reason = message, "Refused a submitted attestation");
-                failures.push(Failure { index, message });
+                failures.push(Failure {
+                    index,
+                    message: message.into(),
+                });
             }
         }
     }
@@ -251,7 +254,7 @@ fn require_electra_or_later(headers: &HeaderMap) -> Result<(), ApiError> {
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
 /// naming each failed item by position; the rest were still published.
-fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
+pub(crate) fn batch_response(failures: Vec<Failure>, message: &'static str) -> Response {
     if failures.is_empty() {
         return StatusCode::OK.into_response();
     }
@@ -313,7 +316,10 @@ async fn post_aggregate_and_proofs(
             });
         match published {
             Ok(()) => debug!(%slot, aggregator, "Accepted aggregate for gossip"),
-            Err(message) => failures.push(Failure { index, message }),
+            Err(message) => failures.push(Failure {
+                index,
+                message: message.into(),
+            }),
         }
     }
     batch_response(
