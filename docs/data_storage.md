@@ -458,6 +458,15 @@ vectors empty for each gloas block in that window. The votes themselves are not
 persisted: the next block's payload attestations refill them. Neither table is
 pruned; rows outside the window are simply not read.
 
+The execution client's verdict on each reloaded payload is in-memory scratch
+too, so the chain actor seeds one at startup: `SYNCING` when an execution
+client is configured, so its first `forkchoiceUpdated` `VALID` for the head
+promotes them, and `VALID` without one, as the follower trusts every envelope it
+applies then. The head node's payload status (`Store::head_payload_status`) is
+likewise not stored; it is unknown until the first head computation after a
+restart, and the envelope by-range server withholds the head's envelope until it
+is known.
+
 ### PendingDataColumns
 
 Same key and same encoding as `DataColumns`, holding sidecars that have **not

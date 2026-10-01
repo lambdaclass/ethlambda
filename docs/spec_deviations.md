@@ -192,8 +192,9 @@ that the tests compare like with like.
   it, and its vote walks the block table and contributes nothing.
 - **Missing timeliness** (`should_apply_proposer_boost`). A candidate with no
   `block_timeliness` entry reads as not timely by either deadline, where the
-  specification indexes the entry directly. The entries are in memory only, so a
-  restart empties them. The reading can only miss withholding a boost from an
+  specification indexes the entry directly. A gloas block's entry is persisted
+  (`Table::BlockTimeliness`) and reloaded on resume; a pre-gloas block's is in
+  memory only, so a restart empties it. The reading can only miss withholding a boost from an
   early equivocation, never withhold one wrongly.
 - **Equivalence:** each is the specification's answer wherever the specification
   has one; they differ only where it would have raised.
