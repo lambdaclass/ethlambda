@@ -1,5 +1,5 @@
-mod beacon;
 mod banner;
+mod beacon;
 mod benchmark;
 mod checkpoint_sync;
 mod cli;
