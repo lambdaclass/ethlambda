@@ -21,8 +21,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .emit()?;
 
     emit_crypto_revs();
+    emit_git_commit();
 
     Ok(())
+}
+
+/// Embed HEAD's full commit hash as `ETHLAMBDA_GIT_COMMIT`, empty when the
+/// build has no git checkout to read.
+///
+/// `VERGEN_GIT_SHA` cannot stand in for it. `sha(true)` asks vergen for git's
+/// abbreviated id, seven characters unless a longer prefix is needed to be
+/// unique, and it stays abbreviated because the version string carries it. The
+/// Engine API's `commit` is four bytes, eight hex digits, so the abbreviation
+/// is one digit short. vergen's git instructions already make cargo rerun this
+/// script when `HEAD` or the branch it names moves, so this value follows the
+/// same checkouts vergen's own do.
+fn emit_git_commit() {
+    let commit = std::env::current_dir()
+        .ok()
+        .and_then(|dir| git2::Repository::discover(dir).ok())
+        .and_then(|repo| Some(repo.head().ok()?.peel_to_commit().ok()?.id()))
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    println!("cargo:rustc-env=ETHLAMBDA_GIT_COMMIT={commit}");
 }
 
 /// Embed the resolved leanVM git revision from the workspace Cargo.lock.
