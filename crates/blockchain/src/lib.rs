@@ -3116,6 +3116,8 @@ impl BlockChainServer {
         }
 
         self.forget_block_held_for_parent_payload(block_root);
+        // An envelope held for this block has nothing left to wait for.
+        self.forget_envelopes_awaiting_import(block_root);
 
         // Both eviction paths reach this function, so removing here is what
         // keeps `held_timings` from outliving the blocks it describes.
@@ -3510,10 +3512,11 @@ impl BlockChainServer {
     /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
     /// report `Synced` for good on a node that follows nothing. Nothing else
     /// tells the node the network is ahead: gossip blocks past the fork are
-    /// ignored in p2p, and a node that runs across the fork keeps the fork
-    /// digest it computed at startup, so peers' Status messages are dropped
-    /// and no range session starts. The clock is the one signal that is always
-    /// there, and treating the network as fresh lets head lag decide.
+    /// ignored in p2p. The fork digest rolls over at runtime, so a node that
+    /// runs across a fork it can follow switches topics and Status digests on
+    /// its own; for a fork it cannot follow that switch brings nothing in. The
+    /// clock is the one signal that is always there, and treating the network
+    /// as fresh lets head lag decide.
     fn clock_is_past_followed_forks(config: &Config, current_slot: u64, head_slot: u64) -> bool {
         let fork_at = |slot: u64| config.fork_at_epoch(compute_epoch_at_slot(slot));
         !fork_at(current_slot).is_followed() && fork_at(head_slot).is_followed()

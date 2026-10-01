@@ -6,8 +6,9 @@
 //! and each has a bounded queue here:
 //!
 //! ```text
-//! envelope ─► block known (with post-state)? ─no─► awaiting_block[root]
-//!               │yes
+//! envelope ─► block imported (has post-state)? ─no─► block stored? ─yes (bid-checked)─► awaiting_import[root]
+//!               │yes                                      │no
+//!               │                                         └─► awaiting_block[root]
 //!               ▼
 //!           bid has commitments and a sampled column missing? ─yes─► awaiting_columns[root]
 //!               │no
@@ -33,19 +34,24 @@
 //!
 //! # What bounds this
 //!
-//! An envelope for a block this node has not imported cannot be judged, so
+//! An envelope for a block this node has never seen cannot be judged, so
 //! nobody has vouched for it: at most [`MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT`]
-//! are kept for the slot they arrived in, and one per root. Blocks held for a
-//! parent's payload are capped per parent by
-//! [`MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD`]. All three queues are swept at
-//! finality by [`BlockChainServer::evict_envelope_queues_at_or_below_finality`].
+//! are kept for the slot they arrived in, and a few per root. An envelope for a
+//! block that is stored but not imported (pending on its parent, or held for
+//! columns or a parent's payload) is checked against that block's bid instead,
+//! and held in `awaiting_import` outside that cap, bounded by the stored blocks
+//! it names. Range catch-up depends on it: a batch's envelopes arrive when all
+//! but its first block are in that state. Blocks held for a parent's payload
+//! are capped per parent by [`MAX_BLOCKS_HELD_PER_PARENT_PAYLOAD`]. Every queue
+//! is swept at finality by
+//! [`BlockChainServer::evict_envelope_queues_at_or_below_finality`], and
+//! `awaiting_import` also when its block is discarded.
 
 use std::collections::{HashMap, VecDeque};
 
 use ethlambda_engine::EngineError;
 use ethlambda_engine::types::PayloadStatusValue;
-use ethlambda_network_api::{BlockSource, FetchRequest};
-use ethlambda_state_transition::beacon::fork::ForkName;
+use ethlambda_network_api::FetchRequest;
 use ethlambda_state_transition::beacon::fork_choice::{
     self, PayloadStatus, PayloadStatusEnum, PayloadValidity,
 };
@@ -138,6 +144,15 @@ pub(crate) struct EnvelopeQueues {
     /// Envelopes whose block has no post-state yet, by the block's root, up to
     /// [`MAX_ENVELOPES_PER_UNMATCHED_ROOT`] distinct ones each.
     pub(crate) awaiting_block: HashMap<H256, Vec<HeldEnvelope>>,
+    /// Envelopes for blocks that are stored but not imported (pending on a
+    /// missing parent, held for columns or for their parent's payload), by the
+    /// block's root. Each was checked against the stored block's bid, which
+    /// commits to the whole payload, so they sit outside the per-arrival-slot
+    /// cap and are bounded by the stored blocks instead. Up to
+    /// [`MAX_ENVELOPES_PER_UNMATCHED_ROOT`] each, since the signature is not
+    /// checked until the block imports and a forged copy must not shut the
+    /// honest one out.
+    pub(crate) awaiting_import: HashMap<H256, Vec<HeldEnvelope>>,
     /// Envelopes whose bid has commitments and whose sampled columns are not
     /// all stored, by the block's root.
     pub(crate) awaiting_columns: HashMap<H256, HeldEnvelope>,
@@ -186,6 +201,7 @@ impl EnvelopeQueues {
 
     fn is_empty(&self) -> bool {
         self.awaiting_block.is_empty()
+            && self.awaiting_import.is_empty()
             && self.awaiting_columns.is_empty()
             && self.awaiting_engine.is_empty()
             && self.blocks_awaiting_parent_payload.is_empty()
@@ -300,7 +316,9 @@ impl BlockChainServer {
             None
         };
         let Some(block) = block else {
-            self.hold_envelope_awaiting_block(root, held);
+            if let Some(held) = self.hold_envelope_for_stored_block(root, held) {
+                self.hold_envelope_awaiting_block(root, held);
+            }
             return false;
         };
 
@@ -562,6 +580,69 @@ impl BlockChainServer {
             .collect()
     }
 
+    /// Hold `held` for a block that is in the store but has no post-state yet,
+    /// after checking it against that block's bid.
+    ///
+    /// Range catch-up delivers a batch's envelopes right behind its blocks,
+    /// when all but the first block are still pending or held for a parent's
+    /// payload. Those envelopes are not strangers: the stored block names what
+    /// payload it committed to, so one that matches is held outside the
+    /// per-arrival-slot cap, which exists for roots nobody has vouched for.
+    /// `Err(held)` hands the envelope back when the block is not stored at all,
+    /// for the unverified path.
+    fn hold_envelope_for_stored_block(
+        &mut self,
+        root: H256,
+        mut held: HeldEnvelope,
+    ) -> Option<HeldEnvelope> {
+        if !self.store.has_block(&root) {
+            return Some(held);
+        }
+        let Ok(Some(block)) = self.store.get_signed_block(&root) else {
+            return Some(held);
+        };
+        let slot = block.slot();
+        let Some(bid) = crate::beacon_payloads::bid_of(&block) else {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope: its block is not a gloas block"
+            );
+            return None;
+        };
+        if !envelope_matches_bid(&held.envelope.message, bid, slot) {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope that does not match its stored block's bid"
+            );
+            return None;
+        }
+        let finalized = self
+            .store
+            .latest_finalized()
+            .expect("finalized checkpoint exists");
+        if slot < finalized.slot && root != finalized.root {
+            return None;
+        }
+        held.slot = slot;
+        let held_for_root = self.envelopes.awaiting_import.entry(root).or_default();
+        if held_for_root.len() < MAX_ENVELOPES_PER_UNMATCHED_ROOT
+            && !held_for_root
+                .iter()
+                .any(|other| other.envelope_root == held.envelope_root)
+        {
+            debug!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Holding an envelope until its stored block is imported"
+            );
+            held_for_root.push(held);
+        }
+        self.publish_envelope_queues();
+        None
+    }
+
     fn hold_envelope_awaiting_block(&mut self, root: H256, held: HeldEnvelope) {
         let queues = &mut self.envelopes;
         if let Some(held_for_root) = queues.awaiting_block.get_mut(&root) {
@@ -654,7 +735,9 @@ impl BlockChainServer {
     /// Queue `root`'s envelope for a look in [`Self::settle_envelopes`], if one
     /// is waiting for the block to import.
     pub(crate) fn note_block_imported_for_envelope(&mut self, root: H256) {
-        if self.envelopes.awaiting_block.contains_key(&root) {
+        if self.envelopes.awaiting_block.contains_key(&root)
+            || self.envelopes.awaiting_import.contains_key(&root)
+        {
             self.envelopes.work.push_back(root);
         }
     }
@@ -715,14 +798,22 @@ impl BlockChainServer {
 
     /// The held envelopes for `root` if what they waited on is now there.
     fn take_ready_envelopes(&mut self, root: H256) -> Vec<HeldEnvelope> {
-        if self.envelopes.awaiting_block.contains_key(&root)
+        if (self.envelopes.awaiting_block.contains_key(&root)
+            || self.envelopes.awaiting_import.contains_key(&root))
             && self.store.has_state(&root).expect("DB read should succeed")
         {
-            return self
+            let mut ready = self
                 .envelopes
-                .awaiting_block
+                .awaiting_import
                 .remove(&root)
                 .unwrap_or_default();
+            ready.extend(
+                self.envelopes
+                    .awaiting_block
+                    .remove(&root)
+                    .unwrap_or_default(),
+            );
+            return ready;
         }
         if let Some(held) = self.envelopes.awaiting_engine.remove(&root) {
             return vec![held];
@@ -789,7 +880,7 @@ impl BlockChainServer {
     /// parent's payload is not yet verified: `on_block` would reject it with
     /// `is_payload_verified(store, block.parent_root)`.
     pub(crate) fn parent_payload_unverified(&self, block: &SignedBeaconBlock) -> bool {
-        if block.fork_name() != ForkName::Gloas {
+        if !block.fork_name().has_payload_envelopes() {
             return false;
         }
         matches!(
@@ -862,16 +953,17 @@ impl BlockChainServer {
             .entry(parent_root)
             .or_default()
             .insert(block_root, slot);
-        let arrived_by_sync = timings.source == Some(BlockSource::Sync);
         self.held_timings.insert(block_root, timings);
         self.publish_envelope_queues();
-        // A synced block comes from a range batch, whose envelopes are already
-        // being fetched alongside it. Asking again at once would fetch each
-        // envelope twice, and each costs a post-state load and a signature
-        // check; the once-a-slot re-ask covers any the range answer lacks.
-        if !arrived_by_sync {
-            self.request_missing_envelope(parent_root);
-        }
+        // Asked at once whatever the block's source. A synced block is not
+        // covered by a range batch's envelopes: `BlockSource::Sync` also marks
+        // by-root answers and pending children a cascade released, and a range
+        // answer that fails or comes back empty falls back to this same ask.
+        // Waiting for the once-a-slot redrive instead is what held a catching-up
+        // follower to one block per slot. p2p dedups in-flight roots, so a
+        // range batch whose envelopes are on their way costs at most one extra
+        // request per block.
+        self.request_missing_envelope(parent_root);
     }
 
     /// Ask p2p for `root`'s envelope by root. The request carries nothing but
@@ -951,6 +1043,14 @@ impl BlockChainServer {
         self.publish_envelope_queues();
     }
 
+    /// Drop the envelopes held for `block_root`'s import, which is not coming.
+    /// Called from the funnel every block eviction goes through.
+    pub(crate) fn forget_envelopes_awaiting_import(&mut self, block_root: H256) {
+        if self.envelopes.awaiting_import.remove(&block_root).is_some() {
+            self.publish_envelope_queues();
+        }
+    }
+
     /// Drop every queued envelope and held block that finality has superseded.
     ///
     /// The counterpart of [`Self::evict_held_blocks_at_or_below_finality`], run
@@ -982,6 +1082,10 @@ impl BlockChainServer {
             });
             !held.is_empty()
         });
+        self.envelopes.awaiting_import.retain(|root, held| {
+            held.retain(|other| other.slot >= finalized_slot || *root == finalized.root);
+            !held.is_empty()
+        });
         self.envelopes
             .awaiting_columns
             .retain(|root, held| held.slot >= finalized_slot || *root == finalized.root);
@@ -1004,7 +1108,13 @@ impl BlockChainServer {
     }
 
     pub(crate) fn publish_envelope_queues(&self) {
-        let unmatched: usize = self.envelopes.awaiting_block.values().map(Vec::len).sum();
+        let unmatched: usize = self
+            .envelopes
+            .awaiting_block
+            .values()
+            .chain(self.envelopes.awaiting_import.values())
+            .map(Vec::len)
+            .sum();
         metrics::set_envelopes_awaiting_block(unmatched as u64);
         metrics::set_envelopes_awaiting_columns(self.envelopes.awaiting_columns.len() as u64);
         metrics::set_blocks_awaiting_parent_payload(self.envelopes.held_blocks() as u64);
@@ -1023,6 +1133,8 @@ mod tests {
 
     use super::*;
     use crate::tests::{GENESIS_TIME, beacon_server, beacon_store};
+    use ethlambda_network_api::BlockSource;
+    use ethlambda_state_transition::beacon::fork::ForkName;
 
     /// The mainnet preset with every fork active from genesis, as the fork
     /// choice fixtures that carry no `config.yaml` of their own are run.
@@ -1607,17 +1719,17 @@ mod tests {
         assert!(server.pending_block_parents.is_empty());
     }
 
-    /// A held child that came from range sync does not ask for its parent's
-    /// envelope at once, since the range answer carries it; one that came from
-    /// gossip does, as nothing else is fetching it.
+    /// A held child asks for its parent's envelope at once whatever its
+    /// source: `BlockSource::Sync` also marks by-root answers and cascade
+    /// releases, which no range batch is bringing an envelope for.
     #[tokio::test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
         ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
     )]
-    async fn only_a_synced_held_child_skips_the_immediate_envelope_request() {
+    async fn a_held_child_asks_for_the_envelope_at_once_whatever_its_source() {
         for (source, asks) in [
-            (Some(BlockSource::Sync), 0),
+            (Some(BlockSource::Sync), 1),
             (Some(BlockSource::Gossip), 1),
             (None, 1),
         ] {
@@ -1640,6 +1752,161 @@ mod tests {
                 && !request.needs_block
                 && request.block_root == parent));
         }
+    }
+
+    /// A stored, unimported gloas block at `slot_offset` past the fixture
+    /// child's slot, whose bid names the valid envelope's payload, and that
+    /// envelope rewritten to belong to it. The stand-in for one block of a
+    /// range batch.
+    fn stored_block_with_matching_envelope(
+        server: &mut BlockChainServer,
+        slot_offset: u64,
+    ) -> (H256, gloas::SignedExecutionPayloadEnvelope) {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut envelope = valid_envelope_for_full_parent();
+        let mut block = case.block(FULL_CHILD);
+        let SignedBeaconBlock::Gloas(inner) = &mut block else {
+            unreachable!("the fixture block is a gloas block");
+        };
+        inner.message.slot += slot_offset;
+        let slot = inner.message.slot;
+        let bid = &mut inner.message.body.signed_execution_payload_bid.message;
+        bid.builder_index = envelope.message.builder_index;
+        bid.block_hash = envelope.message.payload.block_hash;
+        bid.prev_randao = envelope.message.payload.prev_randao;
+        bid.gas_limit = envelope.message.payload.gas_limit;
+        bid.execution_requests_root = envelope.message.execution_requests.hash_tree_root();
+        bid.blob_kzg_commitments = Default::default();
+        envelope.message.payload.slot_number = slot;
+        let block_root = block.message_hash_tree_root();
+        envelope.message.beacon_block_root = block_root;
+        server
+            .store
+            .insert_pending_block(block_root, block)
+            .expect("pending block stores");
+        (block_root, envelope)
+    }
+
+    /// Range catch-up: a batch's later blocks are stored but unimported when
+    /// their envelopes arrive, all in one arrival slot. The per-arrival-slot
+    /// cap is for roots nobody has vouched for, so none of these may count
+    /// against it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn envelopes_for_stored_blocks_are_kept_outside_the_per_slot_cap() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        let count = MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT as u64 * 3;
+        let mut roots = Vec::new();
+        let mut envelopes = Vec::new();
+        for offset in 0..count {
+            let (block_root, envelope) = stored_block_with_matching_envelope(&mut server, offset);
+            roots.push(block_root);
+            envelopes.push(envelope);
+        }
+
+        for envelope in envelopes {
+            server.receive_envelope(envelope, 0).await;
+            server.settle_envelopes().await;
+        }
+
+        for block_root in &roots {
+            assert!(
+                server.envelopes.awaiting_import.contains_key(block_root),
+                "every stored block keeps its envelope"
+            );
+        }
+        assert!(server.envelopes.awaiting_block.is_empty());
+
+        // The cap still binds roots nothing is stored for.
+        let stranger = valid_envelope_for_full_parent();
+        for byte in 1..=MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT as u8 + 2 {
+            let mut envelope = stranger.clone();
+            envelope.message.beacon_block_root = H256::repeat_byte(byte);
+            server.receive_envelope(envelope, 0).await;
+        }
+        assert_eq!(
+            server.envelopes.awaiting_block.len(),
+            MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT
+        );
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_envelope_that_contradicts_the_stored_bid_is_dropped() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        let (block_root, mut envelope) = stored_block_with_matching_envelope(&mut server, 0);
+        envelope.message.payload.gas_limit += 1;
+
+        server.receive_envelope(envelope, 0).await;
+
+        assert!(server.envelopes.awaiting_import.is_empty());
+        assert!(!server.envelopes.awaiting_block.contains_key(&block_root));
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn an_envelope_held_for_a_stored_block_goes_with_the_block() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(12);
+        let (block_root, envelope) = stored_block_with_matching_envelope(&mut server, 0);
+        server.receive_envelope(envelope, 0).await;
+        assert!(server.envelopes.awaiting_import.contains_key(&block_root));
+
+        server.discard_pending_subtree(block_root);
+
+        assert!(server.envelopes.awaiting_import.is_empty());
+    }
+
+    /// The whole catch-up chain imports on deliveries alone: the child arrives
+    /// ahead of its parent, then the parent, then the parent's envelope, and
+    /// the clock is not ticked in between.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn catch_up_imports_the_chain_without_a_tick() {
+        let case = Case::new("on_execution_payload_envelope", FULL_CHILD_CASE);
+        let mut server = case.server(24);
+        let p2p = std::sync::Arc::new(crate::tests::RecordingP2P::default());
+        server.p2p = Some(p2p.clone());
+        let time_before = server.store.ms_since_genesis();
+
+        let timings = || ImportTimings {
+            source: Some(BlockSource::Sync),
+            ..ImportTimings::default()
+        };
+        server.on_block(case.block(FULL_CHILD), timings()).await;
+        server.on_block(case.block(FULL_PARENT), timings()).await;
+        assert!(server.envelopes.is_block_held(&root(FULL_CHILD)));
+        // Asked for at once, though the child came from sync.
+        assert!(
+            p2p.fetches
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request.needs_envelope && request.block_root == root(FULL_PARENT))
+        );
+
+        server
+            .receive_envelope(valid_envelope_for_full_parent(), 0)
+            .await;
+        server.settle_envelopes().await;
+
+        assert!(server.store.has_state(&root(FULL_CHILD)).unwrap());
+        assert!(server.envelopes.blocks_awaiting_parent_payload.is_empty());
+        assert_eq!(server.store.ms_since_genesis(), time_before);
     }
 
     #[test]

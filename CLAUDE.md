@@ -753,7 +753,11 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `on_execution_payload_envelope`; a block whose parent is FULL with an
   unverified payload is held until that envelope verifies. All queues are
   capped, aged out and swept at finality, a missing parent envelope is re-asked
-  once a slot (`FetchRequest.needs_envelope`), and `beacon_columns.rs` bounds
+  once a slot (`FetchRequest.needs_envelope`, asked at once when the block is
+  held, whatever its source, since `BlockSource::Sync` also covers by-root
+  answers), an envelope for a block that is stored but not imported is checked
+  against that block's bid and held outside the per-arrival-slot cap
+  (`awaiting_import`, which range catch-up needs), and `beacon_columns.rs` bounds
   the parking of gloas column sidecars (they carry no signature). Fork-choice
   events are timed at arrival, not at the slot tick, and the head's payload
   status is kept with its root (`Store::head_payload_status`, recomputed after

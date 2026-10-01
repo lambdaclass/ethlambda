@@ -24,7 +24,6 @@ use crate::beacon::containers::DataColumnSidecar as AnyDataColumnSidecar;
 use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
-use crate::beacon::fork::ForkName;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
@@ -498,7 +497,7 @@ pub fn is_parkable_gloas(
     sidecar: &gloas::DataColumnSidecar,
 ) -> bool {
     let epoch = compute_epoch_at_slot(sidecar.slot);
-    config.fork_at_epoch(epoch) == ForkName::Gloas
+    config.fork_at_epoch(epoch).has_payload_envelopes()
         && (sidecar.index as usize) < preset::NUMBER_OF_COLUMNS
         && !sidecar.column.is_empty()
         && sidecar.column.len() == sidecar.kzg_proofs.len()
@@ -588,6 +587,7 @@ mod tests {
     use super::*;
     use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY;
     use crate::beacon::containers::{SignedBeaconBlock, electra, fulu, shared};
+    use crate::beacon::fork::ForkName;
     use crate::beacon::gossip::test_support::{fulu_parent, seen_columns, slot_start_ms, store};
     use crate::beacon::gossip::{IgnoreReason, Outcome, QueueReason, RejectReason};
     use crate::beacon::helpers::misc::compute_start_slot_at_epoch;

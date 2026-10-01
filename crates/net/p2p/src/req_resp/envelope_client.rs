@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
-use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::primitives::H256;
 use libp2p::PeerId;
 use spawned_concurrency::tasks::{Context, send_after};
@@ -240,7 +239,7 @@ fn settle_by_root_answer(
 /// envelope worth asking for. Earlier forks have no envelopes, and the server
 /// answers such a request empty at best.
 fn range_reaches_gloas(config: &Config, span: &std::ops::RangeInclusive<u64>) -> bool {
-    fork_at_slot(config, *span.end()) >= ForkName::Gloas
+    fork_at_slot(config, *span.end()).has_payload_envelopes()
 }
 
 /// Ask `peer` for the envelopes in `[start_slot, start_slot + count)`, the span
@@ -378,6 +377,7 @@ mod tests {
 
     use ethlambda_network_api::{BlockArrival, BlockSource};
     use ethlambda_types::beacon::containers::SignedBeaconBlock;
+    use ethlambda_types::beacon::fork::ForkName;
 
     use super::*;
     use crate::req_resp::handlers::tests::unconnected_server;
