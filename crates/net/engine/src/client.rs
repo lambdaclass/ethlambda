@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
+    ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
     ForkchoiceUpdatedResponse, PayloadStatusV1, data,
 };
 
@@ -264,6 +264,24 @@ impl EngineClient {
         Ok(response.payload_status)
     }
 
+    /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
+    /// a `null` `payloadAttributes` and the consensus client's custody set.
+    ///
+    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
+    /// follower never asks for a build. `custody_columns` of `None` sends
+    /// `null`, meaning the consensus client provides no custody. The response
+    /// is V3's.
+    pub async fn forkchoice_updated_v4(
+        &self,
+        state: &ForkchoiceStateV1,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let params = forkchoice_updated_v4_params(state, custody_columns);
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV4", params).await?;
+        Ok(response.payload_status)
+    }
+
     /// `engine_forkchoiceUpdatedV3` with `payloadAttributes`: the same fork
     /// choice notification, plus a request to start building a payload on the
     /// head for the slot the attributes describe.
@@ -333,14 +351,18 @@ impl EngineClient {
                 );
             }
         }
-        // Kept out of the list above: V5 is only called from gloas on, so a
+        // Kept out of the list above: these are only called from gloas on, so a
         // network that does not schedule gloas never needs it, and an
         // execution client that predates Amsterdam is right not to offer it.
-        if gloas_scheduled && !theirs.iter().any(|method| method == "engine_newPayloadV5") {
-            warn!(
-                method = "engine_newPayloadV5",
-                "The execution client does not advertise a method this node needs from gloas on"
-            );
+        if gloas_scheduled {
+            for required in ["engine_newPayloadV5", "engine_forkchoiceUpdatedV4"] {
+                if !theirs.iter().any(|method| method == required) {
+                    warn!(
+                        method = required,
+                        "The execution client does not advertise a method this node needs from gloas on"
+                    );
+                }
+            }
         }
         match self.client_version(ours).await {
             Ok(versions) => {
@@ -358,5 +380,48 @@ impl EngineClient {
             Err(err) => debug!(%err, "The execution client did not report its version"),
         }
         Ok(())
+    }
+}
+
+/// The three positional parameters of `engine_forkchoiceUpdatedV4`: the state,
+/// a `null` `payloadAttributes`, and the custody bitmap or `null`.
+fn forkchoice_updated_v4_params(
+    state: &ForkchoiceStateV1,
+    custody_columns: Option<CustodyColumns>,
+) -> serde_json::Value {
+    json!([state, serde_json::Value::Null, custody_columns])
+}
+
+#[cfg(test)]
+mod tests {
+    use ethlambda_types::beacon::primitives::ExecutionBlockHash;
+
+    use super::*;
+
+    fn state() -> ForkchoiceStateV1 {
+        ForkchoiceStateV1 {
+            head_block_hash: ExecutionBlockHash::repeat_byte(1),
+            safe_block_hash: ExecutionBlockHash::repeat_byte(2),
+            finalized_block_hash: ExecutionBlockHash::repeat_byte(3),
+        }
+    }
+
+    #[test]
+    fn forkchoice_updated_v4_params_are_state_null_and_bitmap() {
+        let columns = CustodyColumns::from_indices([0, 9]);
+        let params = forkchoice_updated_v4_params(&state(), columns);
+        let params = params.as_array().expect("an array of params");
+        assert_eq!(params.len(), 3);
+        assert!(params[0].get("headBlockHash").is_some());
+        assert!(params[1].is_null());
+        assert_eq!(params[2], "0x01020000000000000000000000000000");
+    }
+
+    #[test]
+    fn forkchoice_updated_v4_without_custody_sends_a_third_null() {
+        let params = forkchoice_updated_v4_params(&state(), None);
+        let params = params.as_array().expect("an array of params");
+        assert_eq!(params.len(), 3);
+        assert!(params[2].is_null());
     }
 }
