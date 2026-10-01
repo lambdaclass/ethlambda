@@ -216,9 +216,8 @@ fn pool_gossip_aggregate(server: &P2PServer, aggregate: &SignedAggregateAndProof
         return;
     };
     server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
+        .store
+        .attestation_pool()
         .insert_aggregate(signed.message.aggregate.clone());
 }
 
@@ -250,9 +249,8 @@ fn pool_aggregator_attestation(server: &P2PServer, attestation: &SingleAttestati
         return;
     };
     server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
+        .store
+        .attestation_pool()
         .insert(attestation, position, committee.len());
 }
 
@@ -724,15 +722,20 @@ mod tests {
         };
 
         forward_accepted(phase0_aggregate(5, 1));
-        let pool = server.attestation_pool.clone();
-        assert!(pool.lock().unwrap().block_candidates().is_empty());
+        assert!(
+            server
+                .store
+                .attestation_pool()
+                .block_candidates()
+                .is_empty()
+        );
 
         forward_accepted(electra_aggregate(5, 1));
         let SignedAggregateAndProof::Electra(expected) = electra_aggregate(5, 1) else {
             unreachable!("built as electra")
         };
         assert_eq!(
-            pool.lock().unwrap().block_candidates(),
+            server.store.attestation_pool().block_candidates(),
             vec![expected.message.aggregate]
         );
     }
@@ -754,9 +757,8 @@ mod tests {
         );
         assert!(
             server
-                .attestation_pool
-                .lock()
-                .unwrap()
+                .store
+                .attestation_pool()
                 .block_candidates()
                 .is_empty()
         );

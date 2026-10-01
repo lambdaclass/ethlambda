@@ -2538,7 +2538,6 @@ mod tests {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

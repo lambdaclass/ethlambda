@@ -3,7 +3,6 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -189,9 +188,6 @@ pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
     /// validator client hands them.
     pub p2p: RpcToP2PRef,
-    /// Filled by the attestation pool endpoint and the aggregator subnets,
-    /// read by the aggregate endpoint and block production.
-    pub attestation_pool: SharedAttestationPool,
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
     pub engine: Option<ethlambda_engine::EngineClient>,
@@ -214,7 +210,6 @@ pub async fn start_beacon_rpc_server(
     let api_router = build_beacon_api_router(store, config.version, peer_id)
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
-        .layer(Extension(handles.attestation_pool))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine));
     start_http_servers(config, Some(api_router), shutdown).await

@@ -2161,6 +2161,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "blst",
  "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-types",
