@@ -47,7 +47,17 @@ pub const BLS_TO_EXECUTION_CHANGE: &str = "bls_to_execution_change";
 /// Topic kind for aggregated sync committee contributions.
 pub const SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF: &str = "sync_committee_contribution_and_proof";
 
-/// Every topic kind this node subscribes to, in the order they are subscribed.
+/// Topic kind for gloas execution payload envelopes.
+pub const EXECUTION_PAYLOAD: &str = "execution_payload";
+/// Topic kind for gloas payload timeliness committee votes.
+pub const PAYLOAD_ATTESTATION_MESSAGE: &str = "payload_attestation_message";
+
+/// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
+/// the gloas digest on and never under an earlier one.
+pub const GLOAS_TOPIC_KINDS: [&str; 2] = [EXECUTION_PAYLOAD, PAYLOAD_ATTESTATION_MESSAGE];
+
+/// Every topic kind this node subscribes to at every fork, in the order they
+/// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
 pub const SUBSCRIBED_TOPIC_KINDS: [&str; 7] = [
     BEACON_BLOCK,
     BEACON_AGGREGATE_AND_PROOF,
@@ -73,7 +83,11 @@ pub const BEACON_ATTESTATION_KIND: &str = "beacon_attestation";
 /// `None` for anything else, lean kinds included, which is what tells the
 /// gossip handler a message needs no verdict.
 pub fn metric_kind(kind: &str) -> Option<&'static str> {
-    if let Some(&global) = SUBSCRIBED_TOPIC_KINDS.iter().find(|&&known| known == kind) {
+    if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
+        .iter()
+        .chain(GLOAS_TOPIC_KINDS.iter())
+        .find(|&&known| known == kind)
+    {
         return Some(global);
     }
     if data_column_subnet(kind).is_some() {
@@ -228,10 +242,14 @@ impl BeaconTopics {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
-            // Gloas adds topics of its own (payload envelopes, payload
-            // attestations) that the follower does not yet consume, so for now
-            // it holds the same set.
-            ForkName::Gloas => Self::new(fork_digest, column_subnets, attestation_subnets),
+            // Gloas adds the payload envelope and the payload attestation
+            // topics, which the follower consumes.
+            ForkName::Gloas => Self::with_extra_kinds(
+                fork_digest,
+                &GLOAS_TOPIC_KINDS,
+                column_subnets,
+                attestation_subnets,
+            ),
             ForkName::Lean => {
                 unreachable!("a beacon topic's fork is never Lean: it is absent from ForkName::ALL")
             }
@@ -240,6 +258,17 @@ impl BeaconTopics {
 
     pub fn new(
         fork_digest: ForkDigest,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
+        Self::with_extra_kinds(fork_digest, &[], column_subnets, attestation_subnets)
+    }
+
+    /// [`Self::new`] plus the global topic `extra_kinds` a fork adds, placed
+    /// after [`SUBSCRIBED_TOPIC_KINDS`] and ahead of the subnet families.
+    fn with_extra_kinds(
+        fork_digest: ForkDigest,
+        extra_kinds: &[&str],
         column_subnets: &[u64],
         attestation_subnets: &[u64],
     ) -> Self {
@@ -261,6 +290,7 @@ impl BeaconTopics {
 
         let mut topics: Vec<IdentTopic> = SUBSCRIBED_TOPIC_KINDS
             .iter()
+            .chain(extra_kinds)
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
             .collect();
         topics.extend(column_topics.values().cloned());
@@ -311,6 +341,35 @@ mod tests {
     fn subscriptions_are_exactly_the_seven_global_topics() {
         let topics = BeaconTopics::new(MAINNET, &[], &[]);
         assert_eq!(topics.topics.len(), 7);
+    }
+
+    #[test]
+    fn gloas_adds_the_envelope_and_payload_attestation_topics() {
+        let fork_topics = |fork| {
+            BeaconTopics::for_fork(fork, MAINNET, &[], &[])
+                .topics
+                .iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>()
+        };
+        let gloas = fork_topics(ForkName::Gloas);
+        let fulu = fork_topics(ForkName::Fulu);
+        assert_eq!(gloas.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
+        assert_eq!(fulu.len(), SUBSCRIBED_TOPIC_KINDS.len());
+        for kind in GLOAS_TOPIC_KINDS {
+            let name = topic_name(MAINNET, kind);
+            assert!(gloas.contains(&name), "gloas lacks {name}");
+            assert!(!fulu.contains(&name), "fulu holds {name}");
+            assert_eq!(metric_kind(kind), Some(kind));
+        }
+        assert_eq!(
+            topic_name(MAINNET, EXECUTION_PAYLOAD),
+            "/eth2/8c9f62fe/execution_payload/ssz_snappy"
+        );
+        assert_eq!(
+            topic_name(MAINNET, PAYLOAD_ATTESTATION_MESSAGE),
+            "/eth2/8c9f62fe/payload_attestation_message/ssz_snappy"
+        );
     }
 
     #[test]

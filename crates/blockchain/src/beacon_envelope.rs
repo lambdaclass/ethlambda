@@ -1416,4 +1416,47 @@ mod tests {
                 * MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT
         );
     }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_gossip_payload_attestation_message_is_applied_to_its_blocks_votes() {
+        let case = Case::new(
+            "on_payload_attestation_message",
+            "on_payload_attestation_message_valid",
+        );
+        let block = "76bf14e70fc96a5a3442a46dff3bfb897d5568cdb4dc7e94419f625df2fcd9e5";
+        let message_name = "payload_attestation_message_0xeaae966a9a1931c94efc5ca0280b35bac86166ebf8d47a936156bbeb1e7179d1";
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(block), ImportTimings::default())
+            .await;
+        let message = gloas::PayloadAttestationMessage::from_ssz_bytes(&case.bytes(message_name))
+            .expect("message decodes");
+        let before = server.store.time_ms().unwrap();
+        assert!(
+            server
+                .store
+                .payload_timeliness_vote(&root(block))
+                .expect("votes exist")
+                .iter()
+                .all(Option::is_none)
+        );
+
+        server.apply_payload_attestation_message(
+            &message,
+            &ethlambda_network_api::BlockArrival::now(),
+        );
+
+        assert!(server.store.time_ms().unwrap() >= before);
+        assert!(
+            server
+                .store
+                .payload_timeliness_vote(&root(block))
+                .expect("votes exist")
+                .contains(&Some(true))
+        );
+    }
 }

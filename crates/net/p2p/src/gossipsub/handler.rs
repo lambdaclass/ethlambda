@@ -249,6 +249,10 @@ fn handle_beacon_gossip(
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
         triage_attestation(server, topic_fork, payload, subnet_id)
+    } else if kind == beacon_topics::EXECUTION_PAYLOAD {
+        triage_envelope(server, payload)
+    } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
+        triage_payload_attestation(server, payload)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -477,6 +481,65 @@ fn triage_attestation(
         attestation: Box::new(single),
         subnet_id,
     })
+}
+
+/// Decode a gloas execution payload envelope and run its cheap gossip checks.
+/// Same shape as [`triage_block`].
+fn triage_envelope(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::EXECUTION_PAYLOAD;
+    let envelope = match beacon_decode::decode_execution_payload_envelope(payload) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    debug!(
+        slot = envelope.message.payload.slot_number,
+        builder_index = envelope.message.builder_index,
+        block_root = %ShortRoot(&envelope.message.beacon_block_root.0),
+        bytes = payload.len(),
+        "Beacon execution payload envelope decoded"
+    );
+    if let Err(outcome) =
+        gossip::envelope::cheap_checks(&server.seen_envelopes, &server.store, &envelope)
+    {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::Envelope(Box::new(envelope)))
+}
+
+/// Decode a gloas payload attestation message and run its cheap gossip
+/// checks. Same shape as [`triage_block`].
+fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::PAYLOAD_ATTESTATION_MESSAGE;
+    let message = match beacon_decode::decode_payload_attestation_message(payload) {
+        Ok(message) => message,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    // `trace` rather than `debug`: the committee votes in one burst per slot.
+    trace!(
+        slot = message.data.slot,
+        validator = message.validator_index,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        "Beacon payload attestation message decoded"
+    );
+    if let Err(outcome) = gossip::payload_attestation::cheap_checks(
+        &server.seen_payload_attestations,
+        &server.store,
+        &message,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::PayloadAttestation(message))
 }
 
 /// Decode one of the five beacon topics with nothing particular to report,
@@ -816,7 +879,7 @@ pub fn leave_expired_aggregator_subnets(server: &mut P2PServer) {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{AttestationData, electra, phase0, shared};
+    use ethlambda_types::beacon::containers::{AttestationData, electra, gloas, phase0, shared};
     use ethlambda_types::beacon::fork::ForkName;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Slot;
@@ -1236,6 +1299,80 @@ mod tests {
         assert!(matches!(
             triage_other(wire, beacon_topics::VOLUNTARY_EXIT, &payload),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+        ));
+    }
+
+    /// A payload that does not decode as a gloas envelope is the sender's
+    /// fault, on either gloas topic.
+    #[tokio::test]
+    async fn an_undecodable_gloas_message_is_rejected() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+
+        assert!(matches!(
+            triage_envelope(&server, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+        assert!(matches!(
+            triage_payload_attestation(&server, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    /// An envelope that clears the cheap checks goes on to the stateful ones,
+    /// and a second one for a key the seen cache holds is ignored before them.
+    #[tokio::test]
+    async fn an_envelope_passes_triage_unless_its_key_was_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let envelope = crate::test_support::envelope(1, 3);
+        let payload = envelope.to_ssz();
+
+        assert!(matches!(
+            triage_envelope(&server, &payload),
+            Dispatch::Validate(Validated::Envelope(decoded)) if *decoded == envelope
+        ));
+
+        server.seen_envelopes.record(
+            envelope.message.beacon_block_root,
+            envelope.message.builder_index,
+        );
+        assert!(matches!(
+            triage_envelope(&server, &payload),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        ));
+    }
+
+    /// A payload attestation for a slot before gloas is rejected by the cheap
+    /// checks; mainnet's gloas epoch is not zero, so slot zero is before it.
+    #[tokio::test]
+    async fn a_payload_attestation_before_gloas_is_rejected() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 1,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+
+        assert!(matches!(
+            triage_payload_attestation(&server, &message.to_ssz()),
+            Dispatch::Report(Outcome::Reject(RejectReason::PreGloasSlot))
+        ));
+    }
+
+    /// A payload attestation inside gloas but outside the current slot is
+    /// ignored, and one in the current slot goes on to the stateful checks.
+    #[tokio::test]
+    async fn a_payload_attestation_is_judged_on_the_clock() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let mut message = gloas::PayloadAttestationMessage {
+            validator_index: 1,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        message.data.slot = 1_000_000;
+        assert!(matches!(
+            triage_payload_attestation(&server, &message.to_ssz()),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NotCurrentSlot))
         ));
     }
 }

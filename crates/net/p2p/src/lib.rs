@@ -52,7 +52,8 @@ use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
 use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlockColumns, SeenBlocks, SeenColumns, aggregate::SeenAggregates,
-    attestation::SeenAttestations,
+    attestation::SeenAttestations, envelope::SeenEnvelopes,
+    payload_attestation::SeenPayloadAttestations,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -250,6 +251,17 @@ const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-z
 
 /// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
 const SEEN_COLUMNS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the first-valid-envelope cache, keyed by `(block root,
+/// builder index)`. One block a slot carries one envelope, so this is sized
+/// like [`SEEN_BLOCKS_CAPACITY`].
+const SEEN_ENVELOPES_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
+
+/// Capacity of the first-valid-payload-attestation cache, keyed by `(slot,
+/// validator index)`. The rule only asks about the current slot, so one
+/// committee's worth of votes for a few slots is generous headroom, in the
+/// spirit of [`SEEN_COLUMNS_CAPACITY`].
+const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
 
 /// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
 /// cache remembers, and how many `(hash_tree_root(data), committee_index)`
@@ -1081,6 +1093,10 @@ impl P2P {
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_block_columns: SeenBlockColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_envelopes: SeenEnvelopes::new(SEEN_ENVELOPES_CAPACITY),
+            seen_payload_attestations: SeenPayloadAttestations::new(
+                SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+            ),
             seen_aggregates: SeenAggregates::new(
                 SEEN_AGGREGATES_CAPACITY,
                 SEEN_AGGREGATES_CAPACITY,
@@ -1190,6 +1206,12 @@ pub struct P2PServer {
     /// Gloas's counterpart of [`Self::seen_columns`]: the first valid sidecar
     /// per `(block root, index)`, since a gloas sidecar names no proposer.
     pub(crate) seen_block_columns: SeenBlockColumns,
+    /// The first valid `execution_payload` per `(block root, builder index)`
+    /// accepted from gossip.
+    pub(crate) seen_envelopes: SeenEnvelopes,
+    /// The first valid `payload_attestation_message` per `(slot, validator
+    /// index)` accepted from gossip.
+    pub(crate) seen_payload_attestations: SeenPayloadAttestations,
     /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
     /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
     pub(crate) seen_aggregates: SeenAggregates,
@@ -2448,6 +2470,51 @@ pub(crate) mod test_support {
     use crate::beacon::swarm::BeaconWireConfig;
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
 
+    /// A gloas envelope for `(root_byte, builder)` at slot `slot_number`
+    /// zero. Only what the cheap gossip checks and the seen cache read is
+    /// meaningful; nothing here is signature-valid.
+    pub(crate) fn envelope(
+        root_byte: u8,
+        builder_index: u64,
+    ) -> ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope {
+        use ethlambda_types::beacon::containers::{bellatrix, gloas};
+        use ethlambda_types::beacon::primitives::{
+            Bytes32, ExecutionAddress, ExecutionBlockHash, Uint256,
+        };
+        let payload = gloas::ExecutionPayload {
+            parent_hash: ExecutionBlockHash::ZERO,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: bellatrix::LogsBloom::try_from(vec![0u8; preset::BYTES_PER_LOGS_BLOOM])
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Bytes32::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: ExecutionBlockHash::ZERO,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index,
+                beacon_block_root: Root::repeat_byte(root_byte),
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
+
     /// A real, unconnected beacon `P2PServer`, built the same way
     /// `req_resp::handlers::tests::unconnected_server` builds a lean one:
     /// port `0` throughout, so this cannot collide with a running node or a
@@ -2547,6 +2614,13 @@ pub(crate) mod test_support {
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_envelopes: ethlambda_state_transition::beacon::gossip::envelope::SeenEnvelopes::new(
+                crate::SEEN_ENVELOPES_CAPACITY,
+            ),
+            seen_payload_attestations:
+                ethlambda_state_transition::beacon::gossip::payload_attestation::SeenPayloadAttestations::new(
+                    crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+                ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,

@@ -362,8 +362,10 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
-`beacon_attestation`. `queue` means IGNORE to gossipsub while the chain actor
-still receives the object and parks it; neither the aggregate nor the
+`beacon_attestation`. The gloas topics `execution_payload` and
+`payload_attestation_message` are labelled by their own name. `queue` means
+IGNORE to gossipsub while the chain actor still receives the object and parks
+it (an `execution_payload` whose block is unknown answers it); neither the aggregate nor the
 attestation topic ever answers `queue`, since the vote block's post-state is
 either cached or it is not (`IgnoreReason::UnknownBlock`/`StateUnavailable`),
 with nothing to hold the message for. **`verdict_expired_total` should stay at

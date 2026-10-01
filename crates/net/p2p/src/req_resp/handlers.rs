@@ -2627,6 +2627,13 @@ mod tests {
             seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_envelopes: ethlambda_state_transition::beacon::gossip::SeenEnvelopes::new(
+                crate::SEEN_ENVELOPES_CAPACITY,
+            ),
+            seen_payload_attestations:
+                ethlambda_state_transition::beacon::gossip::SeenPayloadAttestations::new(
+                    crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+                ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,
