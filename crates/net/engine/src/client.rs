@@ -311,10 +311,17 @@ impl EngineClient {
     /// Runs the startup handshake, logging what the execution client is and
     /// warning about any method this client needs that it does not advertise.
     ///
+    /// `gloas_scheduled` says whether the network's fork schedule includes
+    /// gloas, which is what makes `engine_newPayloadV5` a needed method.
+    ///
     /// Warns rather than refuses: an execution client that under-reports its
     /// capabilities still works, and refusing to start over a handshake would
     /// turn a cosmetic mismatch into an outage.
-    pub async fn handshake(&self, ours: &ClientVersionV1) -> Result<(), EngineError> {
+    pub async fn handshake(
+        &self,
+        ours: &ClientVersionV1,
+        gloas_scheduled: bool,
+    ) -> Result<(), EngineError> {
         let theirs = self
             .exchange_capabilities(crate::ETHLAMBDA_ENGINE_CAPABILITIES)
             .await?;
@@ -326,9 +333,10 @@ impl EngineClient {
                 );
             }
         }
-        // Kept out of the list above: V5 is only called from gloas on, and a
-        // node on an earlier fork never needs it.
-        if !theirs.iter().any(|method| method == "engine_newPayloadV5") {
+        // Kept out of the list above: V5 is only called from gloas on, so a
+        // network that does not schedule gloas never needs it, and an
+        // execution client that predates Amsterdam is right not to offer it.
+        if gloas_scheduled && !theirs.iter().any(|method| method == "engine_newPayloadV5") {
             warn!(
                 method = "engine_newPayloadV5",
                 "The execution client does not advertise a method this node needs from gloas on"

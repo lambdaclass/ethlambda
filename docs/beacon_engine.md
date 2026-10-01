@@ -14,18 +14,19 @@ The wire is
 
 ## Which methods, and why so few
 
-Four:
+Five:
 
 | Method | Introduced | Why |
 |---|---|---|
 | `engine_newPayloadV4` | prague | Validate one block's payload |
+| `engine_newPayloadV5` | amsterdam | Validate the payload a gloas envelope reveals |
 | `engine_forkchoiceUpdatedV3` | cancun | Say where the head, safe and finalized blocks are |
 | `engine_exchangeCapabilities` | common | Startup handshake |
 | `engine_getClientVersionV1` | identification | Log what the execution client is |
 
 Osaka introduces **no new `newPayload`**. Its own document adds only
 `engine_getPayloadV5` and `engine_getBlobsV2`/`V3`; `engine_newPayloadV5` belongs
-to Amsterdam. So the Osaka-current call for a payload is prague's V4, and the
+to Amsterdam, where gloas's envelope import uses it. So the Osaka-current call for a payload is prague's V4, and the
 Osaka-current fork choice notification is cancun's V3.
 
 Three method families a full client would have are deliberately absent:

@@ -165,7 +165,9 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
         withdrawals: Default::default(),
         blob_gas_used: 0,
         excess_blob_gas: 0,
-        block_access_list: Default::default(),
+        // 0xc0 is the RLP of an empty list, the smallest BAL an execution
+        // client accepts as well-formed.
+        block_access_list: vec![0xc0u8].try_into().expect("fits"),
         slot_number: 77,
     };
     let status = client(endpoint)
@@ -187,7 +189,7 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
     let params = body["params"].as_array().expect("an array of params");
     assert_eq!(params.len(), 4);
     assert_eq!(params[0]["slotNumber"], "0x4d");
-    assert_eq!(params[0]["blockAccessList"], "0x");
+    assert_eq!(params[0]["blockAccessList"], "0xc0");
     assert_eq!(params[1][0], format!("0x{}", "01".repeat(32)));
     assert_eq!(params[2], format!("0x{}", "02".repeat(32)));
     assert_eq!(params[3][0], "0x00aa");
