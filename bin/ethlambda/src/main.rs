@@ -44,7 +44,6 @@ use command::Command;
 use ethlambda_blockchain::block_builder::ProposerConfig;
 use ethlambda_blockchain::key_manager::{KeyRole, ValidatorKeyPair};
 use ethlambda_crypto::signature::ValidatorSecretKey;
-use ethlambda_engine::types::ClientVersionV1;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
     InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef, ToRpcToP2PRef,
@@ -606,32 +605,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                         .map_err(|err| eyre::eyre!("building the engine client: {err}"))?;
                     info!(endpoint = %options.endpoint, "Execution client configured");
 
-                    let ours = ClientVersionV1 {
-                        // `identification.md` reserves two-letter codes per
-                        // client; none is assigned to ethlambda, and `XX` is
-                        // what the document names for a client without one.
-                        code: "XX".to_string(),
-                        name: "ethlambda".to_string(),
-                        version: version::CLIENT_VERSION.to_string(),
-                        // `identification.md` types `commit` as DATA, 4 bytes,
-                        // and geth decodes it into `hexutil.Bytes`, which
-                        // rejects a bare hex string with "hex string without
-                        // 0x prefix". So the prefix is not cosmetic: without
-                        // it `engine_getClientVersionV1` comes back an RPC
-                        // error and the handshake below never identifies
-                        // anything. `get` rather than a slice or `take(8)`,
-                        // since `VERGEN_GIT_SHA` is not guaranteed to be eight
-                        // or more characters in every build configuration.
-                        commit: format!(
-                            "0x{}",
-                            env!("VERGEN_GIT_SHA").get(..8).unwrap_or("00000000")
-                        ),
-                    };
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
                     let _ = client
-                        .handshake(&ours)
+                        .handshake(&version::engine_client_version())
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -752,6 +730,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
                     engine: rpc_engine,
+                    client_version: version::engine_client_version(),
                 },
                 local_peer_id,
                 rpc_shutdown,
