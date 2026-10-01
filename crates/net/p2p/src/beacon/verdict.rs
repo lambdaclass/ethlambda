@@ -22,14 +22,16 @@ use ethlambda_types::beacon::containers::electra::SingleAttestation;
 use ethlambda_types::beacon::containers::{
     SignedAggregateAndProof, SignedBeaconBlock, fulu::DataColumnSidecar,
 };
+use ethlambda_types::beacon::operation::BeaconOperation;
 use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
 use libp2p::PeerId;
 use libp2p::gossipsub::{MessageAcceptance, MessageId};
 use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::beacon::column_checks;
+use crate::gossipsub::operation_kind;
 use crate::{P2PServer, metrics};
 
 /// Which gossip message a verdict is for.
@@ -72,6 +74,8 @@ pub(crate) enum Validated {
         attestation: Box<SingleAttestation>,
         subnet_id: u64,
     },
+    /// One of the four operation topics. Boxed like the other wide payloads.
+    Operation(Box<BeaconOperation>),
 }
 
 impl Validated {
@@ -101,6 +105,7 @@ impl Validated {
                 attestation,
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
+            Self::Operation(operation) => gossip::operations::stateful_checks(store, operation),
         }
     }
 
@@ -121,6 +126,7 @@ impl Validated {
             }
             Self::Aggregate { aggregate, .. } => server.seen_aggregates.record(aggregate),
             Self::Attestation { attestation, .. } => server.seen_attestations.record(attestation),
+            Self::Operation(operation) => server.seen_operations.record(operation),
         }
     }
 
@@ -162,6 +168,16 @@ impl Validated {
         {
             pool_aggregator_attestation(server, attestation);
         }
+        if let Self::Operation(operation) = &self {
+            // Only an accepted operation is pooled; the chain actor consumes
+            // nothing on these topics, so nothing is forwarded to it.
+            if outcome == Outcome::Accept {
+                let kind = operation_kind(operation);
+                let inserted = server.store.operation_pool().insert((**operation).clone());
+                debug!(kind, inserted, "Pooled a gossip operation");
+            }
+            return;
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -196,7 +212,7 @@ impl Validated {
                     .new_beacon_aggregate(aggregate, attesting_indices, arrival)
                     .inspect_err(|err| warn!(%err, "Failed to forward a gossip aggregate"));
             }
-            Self::Aggregate { .. } | Self::Attestation { .. } => {}
+            Self::Aggregate { .. } | Self::Attestation { .. } | Self::Operation(_) => {}
         }
     }
 }
@@ -377,7 +393,7 @@ pub(crate) fn spawn_stateful_checks(
 ) {
     let permits = match &object {
         Validated::Block { .. } | Validated::Column(_) => &server.gossip_validation_permits,
-        Validated::Aggregate { .. } | Validated::Attestation { .. } => {
+        Validated::Aggregate { .. } | Validated::Attestation { .. } | Validated::Operation(_) => {
             &server.attestation_validation_permits
         }
     };

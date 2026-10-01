@@ -45,12 +45,13 @@ use ethlambda_network_api::{
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
-        SubscribeAttestationSubnets,
+        PublishBeaconOperation, SubscribeAttestationSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
+    operations::SeenOperations,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -86,7 +87,7 @@ use crate::{
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
         publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
-        publish_beacon_block, publish_block,
+        publish_beacon_block, publish_beacon_operation, publish_block,
     },
     lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
@@ -1076,6 +1077,7 @@ impl P2P {
             seen_attestations: SeenAttestations::new(seen_attestations_capacity(
                 backbone_attestation_subnets,
             )),
+            seen_operations: SeenOperations::default(),
             gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 GOSSIP_VALIDATION_PERMITS,
             )),
@@ -1174,6 +1176,12 @@ pub struct P2PServer {
     /// Accepted `beacon_attestation_{subnet_id}`s, by `(target_epoch,
     /// attester_index)`.
     pub(crate) seen_attestations: SeenAttestations,
+    /// The first valid operation per validator (or per attesting index, for
+    /// attester slashings) accepted from gossip on the four operation topics.
+    /// Recorded only after the stateful check passes and never pruned: an
+    /// entry needs a validator to really exit, be slashed or change
+    /// credentials, so it is bounded by the registry.
+    pub(crate) seen_operations: SeenOperations,
     /// Permits for block and column stateful gossip checks in flight on
     /// blocking threads.
     pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
@@ -1357,6 +1365,7 @@ impl P2PServer {
         );
         gossipsub::leave_expired_aggregator_subnets(self);
         gossipsub::prune_attestation_pool(self);
+        gossipsub::prune_operation_pool(self);
     }
 
     #[send_handler]
@@ -1427,6 +1436,12 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
 impl Handler<PublishBeaconAggregate> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
         publish_beacon_aggregate(self, msg.aggregate).await;
+    }
+}
+
+impl Handler<PublishBeaconOperation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconOperation, _ctx: &Context<Self>) {
+        publish_beacon_operation(self, msg.operation).await;
     }
 }
 
@@ -2500,6 +2515,7 @@ pub(crate) mod test_support {
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
                     crate::seen_attestations_capacity(backbone_attestation_subnets),
                 ),
+            seen_operations: Default::default(),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),

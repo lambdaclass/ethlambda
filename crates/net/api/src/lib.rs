@@ -6,6 +6,7 @@ use ethlambda_types::{
         SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
         fulu::DataColumnSidecar,
     },
+    beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
@@ -303,6 +304,8 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         aggregate: SignedAggregateAndProof,
     ) -> Result<(), ActorError>;
+    /// Gossip one operation on its topic, already validated by the caller.
+    fn publish_beacon_operation(&self, operation: BeaconOperation) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
