@@ -76,6 +76,7 @@ pub use ethlambda_crypto::bls;
 #[cfg(test)]
 mod bls_fixtures;
 pub mod das;
+pub mod data_columns;
 pub mod fork_choice;
 pub mod genesis;
 pub mod gossip;
