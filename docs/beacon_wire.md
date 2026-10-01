@@ -85,7 +85,14 @@ after a boundary read the stale digest and reject the record.
 Seven global topics, `/eth2/{digest}/{name}/ssz_snappy`, plus two subnet
 families this node's own node id selects a narrow slice of: the data column
 subnets it custodies and the attestation subnets it backbones, both described
-below.
+below. A gloas digest adds two more, `execution_payload` and
+`payload_attestation_message`, which `BeaconTopics::for_fork` subscribes under
+gloas digests and not under earlier ones. An envelope is validated like a block
+(its stateful half on the blocking pool) and goes to the chain actor on `Accept`
+and on `Queue`, since the actor holds an envelope whose block is not imported
+yet. A payload attestation is validated on the attestation permit pool and goes
+to the actor on `Accept` only: a vote for a block not imported here is dropped,
+since it is valid only within its own slot.
 
 | Topic | Decoded as |
 | --- | --- |
@@ -97,6 +104,8 @@ below.
 | `bls_to_execution_change` | `SignedBLSToExecutionChange` |
 | `sync_committee_contribution_and_proof` | `SignedContributionAndProof` |
 | `beacon_attestation_{subnet_id}` | `Attestation`, phase0 or electra |
+| `execution_payload` | `SignedExecutionPayloadEnvelope`, gloas digests only |
+| `payload_attestation_message` | `PayloadAttestationMessage`, gloas digests only |
 
 `beacon_attestation_{0..63}` is no longer wholly unsubscribed. This node holds
 `SUBNETS_PER_NODE` (2 on mainnet) long-lived subscriptions from that family,

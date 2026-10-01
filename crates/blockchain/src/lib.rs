@@ -15,7 +15,7 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         constants,
-        containers::{DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock},
+        containers::{DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, gloas},
         preset,
         primitives::ValidatorIndex,
         signing::compute_epoch_at_slot,
@@ -3540,6 +3540,46 @@ impl BlockChainServer {
         }
     }
 
+    /// Applies a gossip payload attestation message to fork choice, with the
+    /// clock first advanced to the instant it arrived: the specification's
+    /// `on_payload_attestation_message` rejects a vote outside its own slot,
+    /// and only the arrival says which slot that is.
+    ///
+    /// An error is logged at `debug` and the vote dropped. The common cause
+    /// is a vote for a block not imported here yet, which per the
+    /// specification is only valid within its slot, so holding it would
+    /// serve nothing.
+    fn apply_payload_attestation_message(
+        &mut self,
+        message: &gloas::PayloadAttestationMessage,
+        arrival: &BlockArrival,
+    ) {
+        let arrival_ms = unix_now_ms();
+        let received = arrival.decode_start.unwrap_or(arrival.handed_off);
+        let in_flight_ms = u64::try_from(
+            Instant::now()
+                .saturating_duration_since(received)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        self.advance_beacon_clock_to(arrival_ms.saturating_sub(in_flight_ms));
+        let config = self.store.config();
+        let slot = message.data.slot;
+        let validator = message.validator_index;
+        let block_root = message.data.beacon_block_root;
+        let _ =
+            fork_choice::on_payload_attestation_message(&mut self.store, message, false, &config)
+                .inspect_err(|err| {
+                    debug!(
+                        slot,
+                        validator,
+                        block_root = %ShortRoot(&block_root.0),
+                        %err,
+                        "Dropping a payload attestation message"
+                    )
+                });
+    }
+
     /// Milliseconds until this actor's next tick, dispatched by chain: lean's
     /// interval grid via [`ms_until_next_interval`], beacon's once-per-slot
     /// cadence via [`ms_until_next_beacon_slot`].
@@ -3657,7 +3697,7 @@ impl BlockChainServer {
 
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
-    NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope,
+    NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope, NewPayloadAttestationMessage,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3792,6 +3832,16 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
             .unwrap_or(u64::MAX);
         self.receive_envelope(*msg.envelope, arrival_ms.saturating_sub(in_flight_ms));
         self.settle_envelopes().await;
+    }
+}
+
+impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
+    async fn handle(&mut self, msg: NewPayloadAttestationMessage, _ctx: &Context<Self>) {
+        // Beacon-only: lean has no payload timeliness committee.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        self.apply_payload_attestation_message(&msg.message, &msg.arrival);
     }
 }
 
@@ -4539,6 +4589,34 @@ mod tests {
     /// How far into its slot the store clock reads, in milliseconds.
     fn ms_into_slot(server: &BlockChainServer) -> u64 {
         server.store.ms_since_genesis() % server.store.config().slot_duration_ms
+    }
+
+    /// A payload attestation message advances the clock to its arrival before
+    /// it is judged, and one naming a block that is not imported here is
+    /// dropped without touching the store.
+    #[tokio::test]
+    async fn a_payload_attestation_for_an_unknown_block_advances_the_clock_and_is_dropped() {
+        let mut server = beacon_server(beacon_store_at_slot_10());
+        assert_eq!(ms_into_slot(&server), 0);
+        let mut message = gloas::PayloadAttestationMessage {
+            validator_index: 0,
+            data: Default::default(),
+            signature: Default::default(),
+        };
+        message.data.slot = 10;
+        message.data.beacon_block_root = H256::repeat_byte(9);
+
+        server.apply_payload_attestation_message(&message, &BlockArrival::now());
+
+        // The wall clock is long past the store's slot, so the clock is
+        // clamped to that slot's last second.
+        assert!(ms_into_slot(&server) > 0);
+        assert!(
+            server
+                .store
+                .payload_timeliness_vote(&message.data.beacon_block_root)
+                .is_none()
+        );
     }
 
     /// A fulu-era block arriving after the attestation deadline used to be

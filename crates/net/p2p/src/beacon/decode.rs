@@ -23,6 +23,7 @@
 //! | `bls_to_execution_change` | No, capella onward |
 //! | `sync_committee_contribution_and_proof` | No, altair onward |
 //! | `data_column_sidecar_{subnet_id}` | Yes, at gloas, by topic digest |
+//! | `execution_payload`, `payload_attestation_message` | No, gloas onward |
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
@@ -218,6 +219,22 @@ pub fn decode_data_column_sidecar(
     bytes: &[u8],
 ) -> Result<DataColumnSidecar, DecodeError> {
     DataColumnSidecar::from_ssz(fork, bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode an `execution_payload` payload. The topic exists from gloas on, so
+/// the container needs no fork lookup.
+pub fn decode_execution_payload_envelope(
+    bytes: &[u8],
+) -> Result<gloas::SignedExecutionPayloadEnvelope, DecodeError> {
+    gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode a `payload_attestation_message` payload. Gloas on, like
+/// [`decode_execution_payload_envelope`].
+pub fn decode_payload_attestation_message(
+    bytes: &[u8],
+) -> Result<gloas::PayloadAttestationMessage, DecodeError> {
+    gloas::PayloadAttestationMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
@@ -618,6 +635,34 @@ mod tests {
         for length in 0..bytes.len() {
             assert!(decode_attestation(ForkName::Fulu, &bytes[..length]).is_err());
         }
+    }
+
+    #[test]
+    fn a_payload_attestation_message_round_trips() {
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 17,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: Root::repeat_byte(3),
+                slot: slot_of(10),
+                payload_present: true,
+                blob_data_available: false,
+            },
+            signature: Default::default(),
+        };
+        let bytes = message.to_ssz();
+        assert_eq!(decode_payload_attestation_message(&bytes), Ok(message));
+        for length in 0..bytes.len() {
+            assert!(decode_payload_attestation_message(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn an_execution_payload_envelope_round_trips() {
+        let envelope = crate::test_support::envelope(5, 9);
+        let bytes = envelope.to_ssz();
+        assert_eq!(decode_execution_payload_envelope(&bytes), Ok(envelope));
+        assert!(decode_execution_payload_envelope(&bytes[..bytes.len() - 1]).is_err());
+        assert!(decode_execution_payload_envelope(&[0xff; 3]).is_err());
     }
 
     #[test]

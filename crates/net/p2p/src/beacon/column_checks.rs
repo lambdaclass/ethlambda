@@ -179,6 +179,13 @@ mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_payload_attestation_message(
+            &self,
+            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to

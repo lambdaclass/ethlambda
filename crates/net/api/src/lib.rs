@@ -3,8 +3,9 @@ use std::time::Instant;
 use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
-        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
-        gloas::SignedExecutionPayloadEnvelope,
+        DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        electra::SingleAttestation,
+        gloas::{PayloadAttestationMessage, SignedExecutionPayloadEnvelope},
     },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
@@ -268,6 +269,14 @@ pub trait P2PToBlockChain: Send + Sync {
     fn new_execution_payload_envelope(
         &self,
         envelope: Box<SignedExecutionPayloadEnvelope>,
+        arrival: BlockArrival,
+    ) -> Result<(), ActorError>;
+    /// A gloas payload attestation message that passed gossip validation, for
+    /// the chain actor to apply to fork choice. Not queued when its block is
+    /// not imported yet: a vote is only valid within its own slot.
+    fn new_payload_attestation_message(
+        &self,
+        message: PayloadAttestationMessage,
         arrival: BlockArrival,
     ) -> Result<(), ActorError>;
 }
