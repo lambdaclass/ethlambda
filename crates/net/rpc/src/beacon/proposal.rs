@@ -28,8 +28,8 @@ use ethlambda_engine::{
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::{
-        BlockInputs, advance_to_slot, assemble_block, pack_attestations, parse_execution_requests,
-        payload_inputs,
+        BlockInputs, Operations, advance_to_slot, assemble_block, pack_attestations,
+        parse_execution_requests, payload_inputs,
     },
     stf::verify_block_signature,
 };
@@ -273,6 +273,7 @@ async fn produce(
         randao_reveal,
         graffiti,
         attestations,
+        operations: Operations::default(),
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: Vec::new(),
         execution_requests: execution_requests.clone(),
