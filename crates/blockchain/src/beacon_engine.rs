@@ -23,6 +23,7 @@ use ethlambda_state_transition::beacon::fork_choice::PayloadValidity;
 use ethlambda_state_transition::beacon::primitives::{Bytes32, Root};
 use ethlambda_state_transition::beacon::stf::deneb::kzg_commitment_to_versioned_hash;
 use ethlambda_state_transition::beacon::stf::electra::get_execution_requests_list;
+use ethlambda_state_transition::beacon::stf::gloas::get_execution_requests_list as get_gloas_execution_requests_list;
 
 /// Everything `engine_newPayloadV4` takes, derived from one block.
 pub struct NewPayloadRequest<'a> {
@@ -30,6 +31,63 @@ pub struct NewPayloadRequest<'a> {
     pub versioned_hashes: Vec<Bytes32>,
     pub parent_beacon_block_root: Root,
     pub execution_requests: Vec<Vec<u8>>,
+}
+
+/// Everything `engine_newPayloadV5` takes, derived from a gloas block and the
+/// envelope that reveals its payload.
+pub struct GloasNewPayloadRequest<'a> {
+    pub execution_payload: &'a containers::gloas::ExecutionPayload,
+    pub versioned_hashes: Vec<Bytes32>,
+    pub parent_beacon_block_root: Root,
+    pub execution_requests: Vec<Vec<u8>>,
+}
+
+/// The question to ask about `block`'s revealed payload, or `None` if `block`
+/// is not a gloas block.
+///
+/// `NewPayloadRequest` as `verify_execution_payload_envelope` builds it
+/// (gloas `beacon-chain.md`): the payload and the requests come from the
+/// envelope, the parent root is the envelope's own `parent_beacon_block_root`,
+/// and the versioned hashes come from the BLOCK, off its bid's
+/// `blob_kzg_commitments`, since the envelope does not carry commitments.
+/// Requests go through gloas's own list builder, which also encodes the
+/// builder deposit and exit request types.
+///
+/// The fork is chosen by an explicit match: a fork before gloas carries its
+/// payload in the block and is asked about with [`new_payload_request`] and
+/// `engine_newPayloadV4`, and no fork after gloas exists yet to need a V6.
+pub fn gloas_new_payload_request<'a>(
+    block: &SignedBeaconBlock,
+    envelope: &'a containers::gloas::SignedExecutionPayloadEnvelope,
+) -> Option<GloasNewPayloadRequest<'a>> {
+    let inner = match block {
+        SignedBeaconBlock::Gloas(inner) => inner,
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_)
+        | SignedBeaconBlock::Deneb(_)
+        | SignedBeaconBlock::Electra(_)
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Lean(_) => return None,
+    };
+
+    let versioned_hashes = inner
+        .message
+        .body
+        .signed_execution_payload_bid
+        .message
+        .blob_kzg_commitments
+        .iter()
+        .map(kzg_commitment_to_versioned_hash)
+        .collect();
+
+    Some(GloasNewPayloadRequest {
+        execution_payload: &envelope.message.payload,
+        versioned_hashes,
+        parent_beacon_block_root: envelope.message.parent_beacon_block_root,
+        execution_requests: get_gloas_execution_requests_list(&envelope.message.execution_requests),
+    })
 }
 
 /// The question to ask about `block`, or `None` if there is nothing to ask.
@@ -47,8 +105,7 @@ pub struct NewPayloadRequest<'a> {
 /// (see `containers::gloas::SignedExecutionPayloadEnvelope`), so a gloas
 /// block carries nothing this function could ask about at all. The engine
 /// question gloas does ask, whether a payload is valid, belongs to that
-/// envelope rather than to the block, and this follower does not receive
-/// envelopes yet, so nothing here asks it.
+/// envelope rather than to the block: see [`gloas_new_payload_request`].
 pub fn new_payload_request(block: &SignedBeaconBlock) -> Option<NewPayloadRequest<'_>> {
     let inner = match block {
         SignedBeaconBlock::Electra(inner) | SignedBeaconBlock::Fulu(inner) => inner,
@@ -120,6 +177,29 @@ pub async fn ask(
     };
     let status = client
         .new_payload(
+            request.execution_payload,
+            &request.versioned_hashes,
+            request.parent_beacon_block_root,
+            &request.execution_requests,
+        )
+        .await?;
+    Ok(Some(verdict(&status)))
+}
+
+/// Asks the execution client about the payload `envelope` reveals for `block`,
+/// with `engine_newPayloadV5`.
+///
+/// `Ok(None)` when `block` is not a gloas block; otherwise as [`ask`].
+pub async fn ask_envelope(
+    client: &EngineClient,
+    block: &SignedBeaconBlock,
+    envelope: &containers::gloas::SignedExecutionPayloadEnvelope,
+) -> Result<Option<PayloadValidity>, EngineError> {
+    let Some(request) = gloas_new_payload_request(block, envelope) else {
+        return Ok(None);
+    };
+    let status = client
+        .new_payload_v5(
             request.execution_payload,
             &request.versioned_hashes,
             request.parent_beacon_block_root,
@@ -252,6 +332,94 @@ mod tests {
             request.versioned_hashes[0].0[0],
             ethlambda_state_transition::beacon::constants::VERSIONED_HASH_VERSION_KZG
         );
+    }
+
+    /// A gloas envelope whose payload is otherwise zero.
+    fn gloas_envelope(
+        parent_beacon_block_root: Root,
+    ) -> containers::gloas::SignedExecutionPayloadEnvelope {
+        let payload = containers::gloas::ExecutionPayload {
+            parent_hash: ExecutionBlockHash::ZERO,
+            fee_recipient: ExecutionAddress::ZERO,
+            state_root: Bytes32::ZERO,
+            receipts_root: Bytes32::ZERO,
+            logs_bloom: containers::bellatrix::LogsBloom::try_from(vec![
+                0u8;
+                preset::BYTES_PER_LOGS_BLOOM
+            ])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Bytes32::ZERO,
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Uint256::ZERO,
+            block_hash: ExecutionBlockHash::ZERO,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 5,
+        };
+        containers::gloas::SignedExecutionPayloadEnvelope {
+            message: containers::gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 0,
+                beacon_block_root: Root::repeat_byte(1),
+                parent_beacon_block_root,
+            },
+            signature: BlsSignature::default(),
+        }
+    }
+
+    #[test]
+    fn a_gloas_request_reads_each_input_from_the_place_the_spec_names() {
+        let mut block = containers::gloas::SignedBeaconBlock::default();
+        // The block's own parent root must NOT be what the request carries.
+        block.message.parent_root = Root::repeat_byte(4);
+        block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .blob_kzg_commitments
+            .push(KzgCommitment::default());
+        let block = SignedBeaconBlock::Gloas(block);
+
+        let mut envelope = gloas_envelope(Root::repeat_byte(9));
+        envelope
+            .message
+            .execution_requests
+            .builder_exits
+            .push(Default::default());
+
+        let request =
+            gloas_new_payload_request(&block, &envelope).expect("a gloas block has a request");
+
+        assert_eq!(request.parent_beacon_block_root, Root::repeat_byte(9));
+        assert_eq!(request.execution_payload.slot_number, 5);
+        assert_eq!(request.versioned_hashes.len(), 1);
+        assert_eq!(
+            request.versioned_hashes[0].0[0],
+            ethlambda_state_transition::beacon::constants::VERSIONED_HASH_VERSION_KZG
+        );
+        // The builder exit type is only in gloas's list builder.
+        assert_eq!(request.execution_requests.len(), 1);
+        assert_eq!(
+            request.execution_requests[0][0],
+            ethlambda_state_transition::beacon::constants::BUILDER_EXIT_REQUEST_TYPE
+        );
+    }
+
+    #[test]
+    fn a_pre_gloas_block_has_no_envelope_question() {
+        let block = SignedBeaconBlock::Fulu(electra_block(Root::ZERO));
+        let envelope = gloas_envelope(Root::ZERO);
+
+        assert!(gloas_new_payload_request(&block, &envelope).is_none());
     }
 
     #[test]

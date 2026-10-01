@@ -40,6 +40,7 @@ pub use types::{ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
 /// requires `engine_exchangeCapabilities` itself not to appear.
 pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_newPayloadV4",
+    "engine_newPayloadV5",
     "engine_forkchoiceUpdatedV3",
     "engine_getPayloadV5",
     "engine_getClientVersionV1",
