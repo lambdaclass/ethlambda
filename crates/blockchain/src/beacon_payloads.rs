@@ -39,7 +39,7 @@ use ethlambda_types::beacon::containers::{SignedBeaconBlock, gloas};
 use ethlambda_types::beacon::primitives::ExecutionBlockHash;
 use ethlambda_types::beacon::signing::compute_start_slot_at_epoch;
 use ethlambda_types::primitives::H256;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 use crate::BlockChainServer;
 
@@ -82,7 +82,7 @@ pub(crate) fn payload_hash_of(store: &Store, root: H256) -> Option<ExecutionBloc
 /// `notify_forkchoice_updated`": the payload a checkpoint block builds on is
 /// the one a node can know to be final, since the block's own payload may
 /// never be revealed). A pre-gloas block keeps its own payload's hash.
-fn checkpoint_hash(store: &Store, root: H256) -> ExecutionBlockHash {
+pub fn checkpoint_hash(store: &Store, root: H256) -> ExecutionBlockHash {
     if let Some(block) = store.get_signed_block(&root).ok().flatten()
         && let Some(bid) = bid_of(&block)
     {
@@ -138,90 +138,161 @@ pub(crate) fn forkchoice_plan(store: &Store, head_root: H256) -> Option<Forkchoi
     })
 }
 
+/// The slot at or below which a block is final: the EL chain walks stop there.
+fn finality_floor(store: &Store) -> (u64, H256) {
+    let finalized = store.beacon_finalized_checkpoint();
+    (compute_start_slot_at_epoch(finalized.epoch), finalized.root)
+}
+
+/// The block whose payload `root`'s payload builds on in the execution layer,
+/// or `None` when it is below what this store knows (an anchor's parent) or
+/// null.
+///
+/// A gloas block names it in its bid: the ancestor whose payload hash is
+/// `bid.parent_block_hash`, skipping every block between that built on an
+/// EMPTY node (their payloads are not in this chain). A pre-gloas block
+/// builds on its parent's payload. The one rule both
+/// [`resolve_invalid_payload`] and [`mark_payloads_validated`] walk by, since
+/// treating every verified ancestor as an EL ancestor would condemn or
+/// validate payloads the block never built on.
+fn el_parent(store: &Store, root: H256) -> Option<H256> {
+    let block = store.get_signed_block(&root).ok().flatten()?;
+    let (_slot, parent) = store.block_entry(&root)?;
+    let Some(bid) = bid_of(&block) else {
+        return payload_hash_of(store, parent).map(|_| parent);
+    };
+    if bid.parent_block_hash.is_zero() {
+        return None;
+    }
+    let (floor_slot, floor_root) = finality_floor(store);
+    let mut cursor = parent;
+    loop {
+        if payload_hash_of(store, cursor) == Some(bid.parent_block_hash) {
+            return Some(cursor);
+        }
+        // Nothing below finality is searched: the walk would only scan the
+        // whole window for an answer no verdict can act on.
+        let (slot, next) = store.block_entry(&cursor)?;
+        if cursor == floor_root || slot <= floor_slot {
+            return None;
+        }
+        cursor = next;
+    }
+}
+
+/// `start` and then each EL parent in turn, ending at the first block at or
+/// below finality (included) or the first with no EL parent.
+fn el_chain(store: &Store, start: H256) -> Vec<H256> {
+    let (floor_slot, floor_root) = finality_floor(store);
+    let mut chain = vec![start];
+    let mut cursor = start;
+    while let Some(parent) = el_parent(store, cursor) {
+        chain.push(parent);
+        let at_floor = store
+            .block_entry(&parent)
+            .is_some_and(|(slot, _)| slot <= floor_slot);
+        if parent == floor_root || at_floor {
+            break;
+        }
+        cursor = parent;
+    }
+    chain
+}
+
 /// The nearest ancestor-or-self of `from` whose payload hash is `hash`: the
 /// block a `forkchoiceUpdated` verdict about `hash` is about.
-pub(crate) fn payload_holder(
-    store: &Store,
-    index: &HashMap<H256, (u64, H256)>,
-    from: H256,
-    hash: ExecutionBlockHash,
-) -> Option<H256> {
+pub(crate) fn payload_holder(store: &Store, from: H256, hash: ExecutionBlockHash) -> Option<H256> {
+    let (floor_slot, floor_root) = finality_floor(store);
     let mut cursor = from;
     loop {
         if payload_hash_of(store, cursor) == Some(hash) {
             return Some(cursor);
         }
-        cursor = index.get(&cursor)?.1;
+        let (slot, next) = store.block_entry(&cursor)?;
+        if cursor == floor_root || slot <= floor_slot {
+            return None;
+        }
+        cursor = next;
     }
 }
 
-/// The block whose payload is the first invalid one on `holder`'s chain, per
-/// `optimistic-sync.md`'s `latestValidHash` table, reading payloads rather
+/// The block whose payload is the first invalid one on `holder`'s EL chain,
+/// per `optimistic-sync.md`'s `latestValidHash` table, reading payloads rather
 /// than blocks.
 ///
 /// [`fork_choice::resolve_invalid_block`] walks parents while each carries a
 /// cached payload hash, which stops at the first gloas block whose payload was
-/// never revealed. Here a root with no payload is skipped, since an EMPTY node
-/// inherits its parent's payload and a payload built on a FULL ancestor
-/// descends from it in the execution layer whatever sits between.
+/// never revealed. Here the walk follows [`el_parent`], so a payload applied
+/// to an ancestor that `holder` did not build on (it built on that ancestor's
+/// EMPTY node) is never reached, and an `INVALID` verdict about `holder`
+/// cannot delete it.
 ///
 /// | `latest_valid_hash` | result |
 /// |---|---|
-/// | a payload hash found on this chain | the next payload-carrying block after it |
-/// | all zeroes | the earliest payload-carrying ancestor |
+/// | a payload hash found on this chain | the next block after it on the chain |
+/// | all zeroes | the earliest block on the chain |
 /// | `None`, or a hash not on this chain | `holder` itself |
 pub(crate) fn resolve_invalid_payload(
     store: &Store,
-    index: &HashMap<H256, (u64, H256)>,
     holder: H256,
     latest_valid_hash: Option<ExecutionBlockHash>,
 ) -> H256 {
     let Some(latest_valid_hash) = latest_valid_hash else {
         return holder;
     };
-    let mut condemned = holder;
-    let mut cursor = holder;
-    while let Some(&(_slot, parent)) = index.get(&cursor) {
-        cursor = parent;
-        match payload_hash_of(store, cursor) {
-            Some(hash) if hash == latest_valid_hash => return condemned,
-            Some(_) => condemned = cursor,
-            None => {}
+    let chain = el_chain(store, holder);
+    for pair in chain.windows(2) {
+        if payload_hash_of(store, pair[1]) == Some(latest_valid_hash) {
+            return pair[0];
         }
     }
     if latest_valid_hash.is_zero() {
-        condemned
+        *chain.last().expect("the chain holds its start")
     } else {
-        // Ran off the top of what this store indexes without finding it:
-        // `optimistic-sync.md` says to treat it as `null`.
+        // Not on this chain: `optimistic-sync.md` says to treat it as `null`.
         holder
     }
 }
 
-/// Moves `root` and every optimistic ancestor to validated: pre-gloas blocks
-/// leave `optimistic_roots`, gloas payloads recorded `NOT_VALIDATED` become
-/// `VALID`. `optimistic-sync.md`: a block's ancestors transition with it.
+/// Moves `root` and every optimistic block on its EL chain to validated:
+/// pre-gloas blocks leave `optimistic_roots`, gloas payloads recorded
+/// `NOT_VALIDATED` become `VALID`. `optimistic-sync.md`: a block's ancestors
+/// transition with it. Only EL ancestors do: a payload applied to a block the
+/// chain skipped past was not part of what the execution client validated.
 ///
-/// A single walk of the whole ancestry rather than
-/// [`fork_choice::mark_validated`]'s stop at the first non-optimistic parent,
-/// since a gloas block with a settled payload can sit between two optimistic
-/// ones. Skipped entirely, with no `block_index` scan, when nothing is
-/// optimistic.
+/// Skipped entirely when nothing is optimistic, and bounded at finality
+/// otherwise.
 pub(crate) fn mark_payloads_validated(store: &mut Store, root: H256) {
-    fork_choice::mark_validated(store, root);
     if !store.has_unvalidated_block_payloads() && !store.has_beacon_optimistic_roots() {
         return;
     }
-    let index = store.block_index();
-    let mut cursor = root;
-    while let Some(&(slot, parent)) = index.get(&cursor) {
-        store.remove_beacon_optimistic_root(cursor);
-        if store.has_verified_payload(&cursor)
-            && store.beacon_block_payload_status(cursor).is_not_validated()
+    for block in el_chain(store, root) {
+        store.remove_beacon_optimistic_root(block);
+        if store.has_verified_payload(&block)
+            && store.beacon_block_payload_status(block).is_not_validated()
+            && let Some((slot, _parent)) = store.block_entry(&block)
         {
-            store.insert_beacon_block_payload_status(cursor, slot, PayloadStatusEnum::Valid);
+            store.insert_beacon_block_payload_status(block, slot, PayloadStatusEnum::Valid);
         }
-        cursor = parent;
+    }
+}
+
+/// Gives a payload restored from disk a verdict: the status map is scratch, so
+/// without this a verified payload from before a restart has no entry, reads
+/// as `NOT_VALIDATED`, and is never promoted. With an engine configured they
+/// start `SYNCING`, so the first `forkchoiceUpdated` `VALID` for the head
+/// validates them; without one the follower trusts them, as it trusts every
+/// envelope it applies.
+pub(crate) fn seed_resumed_payload_statuses(store: &mut Store, engine_configured: bool) {
+    let status = if engine_configured {
+        PayloadStatusEnum::Syncing
+    } else {
+        PayloadStatusEnum::Valid
+    };
+    for root in store.verified_payload_roots() {
+        if let Some((slot, _parent)) = store.block_entry(&root) {
+            store.insert_beacon_block_payload_status(root, slot, status);
+        }
     }
 }
 
@@ -242,9 +313,10 @@ impl BlockChainServer {
         let (PayloadValidity::Validated | PayloadValidity::Invalidated { .. }) = verdict else {
             return;
         };
-        let index = self.store.block_index();
-        let Some(holder) = payload_holder(&self.store, &index, head_root, head_hash) else {
-            warn!(
+        let Some(holder) = payload_holder(&self.store, head_root, head_hash) else {
+            // Expected for a head whose parent payload is below the index (an
+            // anchor): the specification treats it as known-null.
+            debug!(
                 head_root = %ShortRoot(&head_root.0),
                 "No block on the head's chain carries the payload forkchoiceUpdated named"
             );
@@ -276,8 +348,8 @@ impl BlockChainServer {
         holder: H256,
         latest_valid_hash: Option<ExecutionBlockHash>,
     ) -> bool {
+        let condemned = resolve_invalid_payload(&self.store, holder, latest_valid_hash);
         let index = self.store.block_index();
-        let condemned = resolve_invalid_payload(&self.store, &index, holder, latest_valid_hash);
         let mut removed = self.condemn_gloas_payload(condemned, &index);
         // The holder's own payload is invalid whichever ancestor the verdict
         // reached; when it is a gloas payload it must not stay FULL.

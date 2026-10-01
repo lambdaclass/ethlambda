@@ -278,9 +278,12 @@ node, and each call walks every latest message and every ancestor step.
 ## The execution client judges a gloas payload before the envelope is applied
 
 `verify_execution_payload_envelope` asks the execution engine last, as part of
-one boolean function. The follower asks it first, with `engine_newPayloadV5`,
-and applies the envelope with the engine's part answered "valid", because the
-answer has three outcomes and the specification's `ExecutionEngine` has two.
+one boolean function. The follower runs the pure consensus checks first
+(`check_execution_payload_envelope`: signature, bid, state, data availability),
+then asks the engine with `engine_newPayloadV5` only about an envelope that
+passed them, and records it with `accept_execution_payload_envelope`. The
+engine's part is answered "valid" inside the checks because its answer has
+three outcomes and the specification's `ExecutionEngine` has two.
 
 - **`VALID`:** applied; the payload is recorded `VALID`.
 - **`SYNCING` / `ACCEPTED`:** applied, since the consensus checks passed and the
@@ -300,12 +303,19 @@ answer has three outcomes and the specification's `ExecutionEngine` has two.
   payload, unlike the pre-gloas `resolve_invalid_block`). A `forkchoiceUpdated`
   `INVALID` for a payload already applied removes it again (its FULL node, its
   stored envelope, and every child built on it).
-- **No answer after the retry ladder:** as for a block, the payload is not
-  applied; the envelope is fetched again rather than held.
+- **`INVALID_BLOCK_HASH`:** the envelope's contents do not hash to the block
+  hash it claims, so only that envelope (by its own root) is refused; the
+  root's payload is not condemned, since the builder's real envelope may still
+  arrive.
+- **No answer after the retry ladder:** the payload is not applied, as for a
+  block, but unlike a block the envelope is consensus-valid and already held,
+  so it is kept and the per-slot redrive asks again. It is not fetched again:
+  that would repeat the ladder for every copy that arrives.
 
-The engine is asked only about an envelope whose builder signature holds: an
-unsigned copy with the honest block hash and a different body would otherwise
-earn an `INVALID` that lands on the honest payload.
+`latestValidHash` and `VALID` follow the execution-layer chain, not every
+verified ancestor: a gloas block's EL parent is the ancestor whose payload hash
+is its `bid.parent_block_hash`, skipping blocks it built past on their EMPTY
+node, and a pre-gloas block's is its parent. Both walks stop at finality.
 
 ## `forkchoiceUpdated` for a gloas head
 
