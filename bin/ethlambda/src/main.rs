@@ -60,7 +60,8 @@ use tracing_subscriber::{EnvFilter, Layer, Registry, layer::SubscriberExt};
 use ethlambda_blockchain::{BlockChain, BlockChainConfig, EventBus, SyncStatusController};
 use ethlambda_rpc::RpcConfig;
 use ethlambda_storage::{
-    MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store, backend::RocksDBBackend,
+    GetForkchoiceStoreError, MAX_RESUMABLE_DB_STATE_AGE, StorageBackend, Store,
+    backend::RocksDBBackend,
 };
 
 fn main() -> eyre::Result<()> {
@@ -861,7 +862,12 @@ async fn fetch_initial_state(
         genesis.milliseconds_per_slot,
     )
     .inspect_err(|err| error!(%err, "Failed to initialize store from anchor state and block"))
-    .map_err(|_| checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch)?;
+    .map_err(|err| match err {
+        GetForkchoiceStoreError::AnchorPairInconsistent { .. } => {
+            checkpoint_sync::CheckpointSyncError::AnchorPairingMismatch
+        }
+        GetForkchoiceStoreError::Store(err) => checkpoint_sync::CheckpointSyncError::StoreInit(err),
+    })?;
     store
         .insert_signed_block(anchor_root, signed_block)
         .inspect_err(|err| error!(%err, "Failed to insert anchor signed block into store"))

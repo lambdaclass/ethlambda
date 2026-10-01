@@ -41,6 +41,8 @@ pub enum GetForkchoiceStoreError {
         anchor_state: Box<State>,
         anchor_block: Box<Block>,
     },
+    #[error("store initialization failed: {0}")]
+    Store(#[from] crate::error::Error),
 }
 
 /// The tree hash root of an empty block body.
@@ -641,13 +643,13 @@ impl Store {
             });
         }
 
-        Ok(Self::init_store(
+        Self::init_store(
             backend,
             anchor_state,
             Some(anchor_block.body),
             milliseconds_per_slot,
         )
-        .expect("store initialization should succeed in get_forkchoice_store"))
+        .map_err(Into::into)
     }
 
     /// Build a Store from the state already persisted in the storage backend.
@@ -670,15 +672,11 @@ impl Store {
         let persisted_config = {
             // Both keys are written by `init_store`, so a backend missing
             // either has never held a chain.
-            let view = backend.begin_read().expect("read view");
-            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
+            let view = backend.begin_read()?;
+            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG)? else {
                 return Ok(None);
             };
-            if view
-                .get(Table::Metadata, KEY_LATEST_FINALIZED)
-                .expect("get latest finalized")
-                .is_none()
-            {
+            if view.get(Table::Metadata, KEY_LATEST_FINALIZED)?.is_none() {
                 return Ok(None);
             }
             ChainConfig::from_persisted_ssz_bytes(&bytes).expect("valid config")
@@ -774,7 +772,7 @@ impl Store {
 
         // Insert initial data
         {
-            let mut batch = backend.begin_write().expect("write batch");
+            let mut batch = backend.begin_write()?;
 
             // Metadata
             let metadata_entries = vec![
@@ -785,55 +783,43 @@ impl Store {
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
             ];
-            batch
-                .put_batch(Table::Metadata, metadata_entries)
-                .expect("put metadata");
+            batch.put_batch(Table::Metadata, metadata_entries)?;
 
             // Block header
             let header_entries = vec![(
                 anchor_block_root.to_ssz(),
                 anchor_state.latest_block_header.to_ssz(),
             )];
-            batch
-                .put_batch(Table::BlockHeaders, header_entries)
-                .expect("put block header");
+            batch.put_batch(Table::BlockHeaders, header_entries)?;
 
-            batch
-                .put_batch(
-                    Table::BlockRoots,
-                    vec![(
-                        encode_block_root_key(anchor_state.latest_block_header.slot),
-                        anchor_block_root.to_ssz(),
-                    )],
-                )
-                .expect("put block root index");
+            batch.put_batch(
+                Table::BlockRoots,
+                vec![(
+                    encode_block_root_key(anchor_state.latest_block_header.slot),
+                    anchor_block_root.to_ssz(),
+                )],
+            )?;
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
                 let body_entries = vec![(anchor_block_root.to_ssz(), body.to_ssz())];
-                batch
-                    .put_batch(Table::BlockBodies, body_entries)
-                    .expect("put block body");
+                batch.put_batch(Table::BlockBodies, body_entries)?;
             }
 
             // State snapshot. The anchor has no parent in the store, so it is
             // the base of every diff chain: store it as a full snapshot in
             // `States` (never pruned) so reconstruction always terminates here.
             let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
-            batch
-                .put_batch(Table::States, state_entries)
-                .expect("put state");
+            batch.put_batch(Table::States, state_entries)?;
 
             // Live chain index
             let index_entries = vec![(
                 encode_slot_root_key(anchor_state.latest_block_header.slot, &anchor_block_root),
                 anchor_state.latest_block_header.parent_root.to_ssz(),
             )];
-            batch
-                .put_batch(Table::LiveChain, index_entries)
-                .expect("put live chain index");
+            batch.put_batch(Table::LiveChain, index_entries)?;
 
-            batch.commit().expect("commit");
+            batch.commit()?;
         }
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");

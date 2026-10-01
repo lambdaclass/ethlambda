@@ -67,6 +67,8 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
+    #[error("failed to initialize store from checkpoint: {0}")]
+    StoreInit(ethlambda_storage::Error),
     #[error("no checkpoint urls configured")]
     NoCheckpointUrls,
     #[error("failed to insert anchor signed block into store")]
