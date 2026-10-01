@@ -465,17 +465,14 @@ mod tests {
     }
 
     #[test]
-    fn an_undecodable_block_is_unsupported_only_at_a_fork_the_node_does_not_follow() {
+    fn an_undecodable_block_is_an_ssz_failure_at_gloas_as_at_any_followed_fork() {
         let mut config = Config::mainnet();
         config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
         // Phase0-shaped bytes are not a valid block at either fork.
         let at_fulu = phase0_block(slot_of(config.fulu_fork_epoch)).to_ssz();
         let at_gloas = phase0_block(slot_of(config.gloas_fork_epoch)).to_ssz();
         assert_eq!(decode_block(&config, &at_fulu), Err(DecodeError::Ssz));
-        assert_eq!(
-            decode_block(&config, &at_gloas),
-            Err(DecodeError::UnsupportedFork)
-        );
+        assert_eq!(decode_block(&config, &at_gloas), Err(DecodeError::Ssz));
         assert_eq!(
             decode_block(&config, &[0xff; 3]),
             Err(DecodeError::Truncated)
