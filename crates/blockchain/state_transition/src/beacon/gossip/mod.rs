@@ -10,6 +10,8 @@ pub mod aggregate;
 pub mod attestation;
 pub mod block;
 pub mod column;
+pub mod envelope;
+pub mod payload_attestation;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -18,6 +20,8 @@ pub(crate) mod test_support;
 // topic's submodule defines it.
 pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
+pub use envelope::SeenEnvelopes;
+pub use payload_attestation::SeenPayloadAttestations;
 
 use std::num::NonZeroUsize;
 
@@ -25,13 +29,14 @@ use lru::LruCache;
 
 use crate::beacon::config::Config;
 use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
-use crate::beacon::containers::{AttestationData, BeaconState};
+use crate::beacon::containers::{AttestationData, BeaconState, gloas};
 use crate::beacon::fork::ForkName;
 use crate::beacon::fork_choice::{self, PayloadStatusEnum, Store};
 use crate::beacon::helpers::accessors::get_block_root_at_slot;
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
 use crate::beacon::lean_boundary::lean_fork_unreachable;
 use crate::beacon::precheck::PrecheckError;
+use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 
 /// A gossip message's verdict.
@@ -137,6 +142,13 @@ pub enum IgnoreReason {
     PayloadEnvelopeUnseen,
     /// A gloas vote names a payload the execution client has not validated.
     PayloadOptimistic,
+    /// A payload attestation's slot is not the current slot.
+    NotCurrentSlot,
+    /// A payload attestation names a block that is not at the attested slot.
+    BlockNotAtSlot,
+    /// The head state's payload timeliness committee window cannot answer for
+    /// the attested slot.
+    PtcUnavailable,
 }
 
 impl IgnoreReason {
@@ -159,6 +171,9 @@ impl IgnoreReason {
             Self::ParentPayloadUnverified => "parent_payload_unverified",
             Self::PayloadEnvelopeUnseen => "payload_envelope_unseen",
             Self::PayloadOptimistic => "payload_optimistic",
+            Self::NotCurrentSlot => "not_current_slot",
+            Self::BlockNotAtSlot => "block_not_at_slot",
+            Self::PtcUnavailable => "ptc_unavailable",
         }
     }
 }
@@ -224,6 +239,19 @@ pub enum RejectReason {
     SameSlotPayloadFlag,
     /// A gloas vote names a payload the execution client found invalid.
     PayloadInvalid,
+    /// A gloas envelope's builder is not the one its block's bid committed to.
+    BuilderIndexMismatch,
+    /// A gloas envelope's payload block hash is not its bid's.
+    BlockHashMismatch,
+    /// The root of a gloas envelope's execution requests is not its bid's.
+    ExecutionRequestsRootMismatch,
+    /// A gloas envelope's payload carries more withdrawals than its limit.
+    TooManyWithdrawals,
+    /// A payload attestation's slot lies before the gloas fork.
+    PreGloasSlot,
+    /// A payload attestation's validator is not in its slot's payload
+    /// timeliness committee.
+    NotInPtc,
 }
 
 impl RejectReason {
@@ -263,6 +291,12 @@ impl RejectReason {
             Self::DataIndexOutOfRange => "data_index_out_of_range",
             Self::SameSlotPayloadFlag => "same_slot_payload_flag",
             Self::PayloadInvalid => "payload_invalid",
+            Self::BuilderIndexMismatch => "builder_index_mismatch",
+            Self::BlockHashMismatch => "block_hash_mismatch",
+            Self::ExecutionRequestsRootMismatch => "execution_requests_root_mismatch",
+            Self::TooManyWithdrawals => "too_many_withdrawals",
+            Self::PreGloasSlot => "pre_gloas_slot",
+            Self::NotInPtc => "not_in_ptc",
         }
     }
 }
@@ -358,6 +392,23 @@ impl SeenBlockColumns {
     }
 }
 
+/// `verify_execution_requests_limits` (`specs/gloas/p2p-interface.md`).
+///
+/// The four lists the specification names: withdrawals, consolidations,
+/// builder deposits and builder exits. Deposit requests are deliberately not
+/// checked: gloas's `DepositRequests` is progressive and neither the
+/// specification nor the state transition bounds it, so a limit here would
+/// reject a block that import accepts.
+///
+/// Shared by [`block`] (a block's parent execution requests) and [`envelope`].
+pub(crate) fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
+    requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
+        && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
+        && requests.builder_deposits.len() as u64
+            <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
+        && requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
+}
+
 /// The specification's `compute_time_at_slot_ms`: the clock reading at the
 /// start of `slot`.
 pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
@@ -370,6 +421,18 @@ pub(crate) fn slot_start_ms(config: &Config, slot: Slot) -> u64 {
 /// plus the gossip clock disparity allowance.
 pub(crate) fn is_future_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
     slot_start_ms(config, slot) > now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+}
+
+/// The specification's `is_current_slot` (`altair/p2p-interface.md`): the
+/// clock, with the gossip clock disparity allowance on both ends, falls within
+/// `slot`'s own span. That is `is_within_slot_range` with a range of zero, so
+/// the far edge is the *next* slot's start.
+pub(crate) fn is_current_slot(config: &Config, slot: Slot, now_ms: u64) -> bool {
+    if now_ms.saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY) < slot_start_ms(config, slot) {
+        return false;
+    }
+    slot_start_ms(config, slot.saturating_add(1)).saturating_add(MAXIMUM_GOSSIP_CLOCK_DISPARITY)
+        >= now_ms
 }
 
 /// The specification's `is_within_epoch`: the clock, with the gossip clock
@@ -639,6 +702,36 @@ mod tests {
             &config,
             1,
             slot_start - MAXIMUM_GOSSIP_CLOCK_DISPARITY - 1
+        ));
+    }
+
+    #[test]
+    fn the_current_slot_holds_within_the_clock_disparity_at_either_edge() {
+        let config = Config {
+            genesis_time: 0,
+            ..Config::mainnet()
+        };
+        let start_ms = slot_start_ms(&config, 3);
+        let next_start_ms = slot_start_ms(&config, 4);
+        assert!(is_current_slot(
+            &config,
+            3,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_current_slot(
+            &config,
+            3,
+            start_ms - MAXIMUM_GOSSIP_CLOCK_DISPARITY - 1
+        ));
+        assert!(is_current_slot(
+            &config,
+            3,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY
+        ));
+        assert!(!is_current_slot(
+            &config,
+            3,
+            next_start_ms + MAXIMUM_GOSSIP_CLOCK_DISPARITY + 1
         ));
     }
 
