@@ -197,6 +197,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
         maximum_gossip_clock_disparity == constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY,
         max_request_blocks == protocols::MAX_REQUEST_BLOCKS,
         max_request_blocks_deneb == protocols::MAX_REQUEST_BLOCKS_DENEB,
+        max_request_payloads == protocols::MAX_REQUEST_PAYLOADS,
         max_request_data_column_sidecars == protocols::max_request_data_column_sidecars(),
         max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
         message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
@@ -458,6 +459,15 @@ mod tests {
             err.contains("MESSAGE_DOMAIN_VALID_SNAPPY is [2, 0, 0, 0]"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn a_config_that_changes_the_envelope_request_ceiling_is_refused() {
+        let mut config = Config::mainnet();
+        config.max_request_payloads = 64;
+
+        let err = check_constants(&config).unwrap_err().to_string();
+        assert!(err.contains("MAX_REQUEST_PAYLOADS is 64"), "got {err}");
     }
 
     #[test]

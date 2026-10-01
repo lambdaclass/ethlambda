@@ -378,12 +378,20 @@ where
     Ok(())
 }
 
+/// Whether `fork` has execution payload envelopes: gloas and every beacon fork
+/// after it, which the schedule's digests can name. Lean is not on the beacon
+/// timeline, though it sorts after every beacon fork.
+fn carries_envelopes(fork: ForkName) -> bool {
+    fork >= ForkName::Gloas && fork != ForkName::Lean
+}
+
 /// Read an envelope response: one `SignedExecutionPayloadEnvelope` per chunk,
 /// until the peer closes.
 ///
 /// The counterpart of [`decode_data_column_sidecars_response`]: the fork comes
 /// from the context bytes, and a digest no scheduled fork uses ends the stream.
-/// Envelopes exist only from gloas, so any other fork's digest is refused too.
+/// Envelopes exist only from gloas on, so the digest of an earlier fork is
+/// refused too ([`carries_envelopes`]).
 /// The context is then checked against the digest the payload's own
 /// `slot_number` implies.
 pub async fn decode_execution_payload_envelopes_response<T>(
@@ -404,9 +412,9 @@ where
         let fork = <[u8; 4]>::try_from(context)
             .ok()
             .and_then(|digest| schedule.fork_for_digest(digest));
-        if fork != Some(ForkName::Gloas) {
+        if !fork.is_some_and(carries_envelopes) {
             return Err(invalid(format!(
-                "execution payload envelope chunk context {} is not the gloas fork digest",
+                "execution payload envelope chunk context {} is not a gloas-or-later fork digest",
                 hex::encode(context),
             )));
         }

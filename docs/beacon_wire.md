@@ -274,6 +274,8 @@ choice.
 | `beacon_blocks_by_root/2` | both |
 | `data_column_sidecars_by_root/1` | both |
 | `data_column_sidecars_by_range/1` | both |
+| `execution_payload_envelopes_by_range/1` | both; served only, nothing asks yet |
+| `execution_payload_envelopes_by_root/1` | both; served only, nothing asks yet |
 
 The two data column sidecar protocols are registered because this node
 custodies the columns its node id selects and can answer for them out of
@@ -380,6 +382,27 @@ what the digest exists to say and is not otherwise visible until a signature
 fails. A mismatch ends the stream, logged at `warn` with both digests: the one way to
 reach it in good faith is a blob schedule of ours that has fallen behind the
 network's.
+
+### Execution payload envelopes
+
+Both gloas envelope protocols are registered `Full` so the server side can
+answer; no request is issued yet. A chunk carries one
+`SignedExecutionPayloadEnvelope` under the fork digest of its block's epoch.
+The envelope has no slot of its own, so the epoch comes from
+`payload.slot_number`, which `verify_execution_payload_envelope` pins to the
+block's slot. A chunk whose digest names no gloas-or-later scheduled fork, or
+not the digest its slot implies, ends the stream.
+
+| Protocol | Served from |
+| --- | --- |
+| `execution_payload_envelopes_by_root/1` | a point lookup per root in `Table::ExecutionPayloadEnvelopes`; unknown roots are left out, answers follow the order asked |
+| `execution_payload_envelopes_by_range/1` | the canonical blocks of the window (`BlockRoots`), each envelope kept only when the next canonical block builds on its payload; see [spec_deviations.md](./spec_deviations.md) for the head |
+
+Both are bounded by `MAX_REQUEST_PAYLOADS`: a by-root list over it fails to
+decode, and a by-range `count` over it is truncated, which the specification's
+"Clients MAY limit the number of payload envelopes in the response" allows.
+A by-range request starting below `Store::anchor_slot` gets
+`RESOURCE_UNAVAILABLE`, and a window before gloas is simply empty.
 
 ### Data column sidecars
 
