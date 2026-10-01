@@ -170,6 +170,15 @@ mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_execution_payload_envelope(
+            &self,
+            _envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to

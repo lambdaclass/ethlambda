@@ -39,6 +39,7 @@ hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true
 datatest-stable = "0.3.3"
+snap = "1.1.1"
 
 [[test]]
 name = "forkchoice_spectests"

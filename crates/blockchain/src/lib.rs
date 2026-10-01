@@ -45,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::beacon_columns::{ColumnParking, ParkedColumn};
+use crate::beacon_envelope::EnvelopeQueues;
 use crate::block_builder::ProposerConfig;
 use crate::events::ChainEventSnapshot;
 use crate::import_timing::{BlockImportReport, CascadeTimings, HeadTimings, ImportTimings};
@@ -56,6 +57,7 @@ pub mod aggregation;
 mod beacon_aggregates;
 mod beacon_columns;
 pub mod beacon_engine;
+mod beacon_envelope;
 pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
@@ -404,6 +406,7 @@ impl BlockChain {
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
+            envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
             custody_columns,
             engine,
@@ -510,6 +513,10 @@ pub struct BlockChainServer {
     /// What bounds [`Self::sidecars_awaiting_parent`]: its running size, and
     /// which gloas roots are parked at each slot.
     column_parking: ColumnParking,
+
+    /// Gloas execution payload envelopes held for their block or columns, and
+    /// blocks held for their parent's envelope. See `beacon_envelope`.
+    envelopes: EnvelopeQueues,
 
     /// The columns this node samples, computed once at startup from its node
     /// id (see `das::custody_columns`). Empty on lean.
@@ -845,17 +852,12 @@ fn data_availability_for(
         | SignedBeaconBlock::Bellatrix(_)
         | SignedBeaconBlock::Capella(_) => Some(fork_choice::DataAvailability::NotRequired),
         // ePBS (EIP-7732) moves the availability question onto the payload
-        // envelope's data columns, not this block's own (nonexistent)
-        // `blob_kzg_commitments`, so this gate has nothing gloas-shaped to
-        // check yet. Unreachable from network input today:
-        // `process_or_pend_block` refuses every gloas block before this
-        // function is ever called, because this node cannot yet deliver the
-        // payload envelopes and payload attestations a gloas chain needs.
-        // `on_block` itself accepts a gloas block and reads no availability
-        // evidence for it. `None` here regardless, defensively: were that
-        // gate ever bypassed, `None` keeps a block this node cannot follow
-        // out of `on_block` entirely.
-        SignedBeaconBlock::Gloas(_) => None,
+        // envelope: the commitments are in the block's bid, and the columns
+        // they commit to gate the envelope that reveals the payload, not the
+        // block's own import (see `beacon_envelope`). So a gloas block has
+        // nothing to wait for here, and `on_block` reads no availability
+        // evidence for it.
+        SignedBeaconBlock::Gloas(_) => Some(fork_choice::DataAvailability::NotRequired),
         // `process_block` dispatches a lean block to `store::on_block` before
         // this function is ever reached, so this arm is never observed for
         // one; named on its own rather than folded into the group above so
@@ -1042,7 +1044,10 @@ impl BlockChainServer {
         // why nothing else evicts a held block nobody redelivers.
         self.evict_held_blocks_at_or_below_finality();
         self.evict_sidecars_awaiting_parent_at_or_below_finality();
+        self.evict_envelope_queues_at_or_below_finality();
         self.redrive_held_blocks().await;
+        self.redrive_envelopes_awaiting_columns();
+        self.settle_envelopes().await;
 
         // Per-interval duties for this tick. Lean-only, so this is where a
         // beacon follower's tick ends: it has no validator duties (see
@@ -1910,6 +1915,7 @@ impl BlockChainServer {
         // held block nobody redelivers; see the method's own documentation.
         self.evict_held_blocks_at_or_below_finality();
         self.evict_sidecars_awaiting_parent_at_or_below_finality();
+        self.evict_envelope_queues_at_or_below_finality();
 
         self.refresh_chain_metrics();
 
@@ -1962,6 +1968,7 @@ impl BlockChainServer {
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
+            envelopes: EnvelopeQueues::default(),
             custody_columns: Vec::new(),
             engine,
             safe_slots_to_import_optimistically,
@@ -2598,38 +2605,6 @@ impl BlockChainServer {
         let proposer = signed_block.proposer_index();
         timings.guards_start = Some(Instant::now());
 
-        // Refused before anything else, including the columns/finalized-slot
-        // checks below: this node cannot follow a gloas chain yet, since
-        // nothing delivers the payload envelopes a block's full branch needs
-        // (`fork_choice::on_execution_payload_envelope`) or the payload
-        // attestations that vote on them, so persisting a gloas block as
-        // pending is pure waste. Worse than waste were this not here
-        // first: a gloas block whose parent is missing would otherwise be
-        // `insert_pending_block`-ed and tracked in `pending_block_parents`,
-        // and every later block naming it as an ancestor would walk back to
-        // it, fetch it out of storage, and requeue it, paying that same
-        // round trip again on every single delivery, forever, since nothing
-        // ever marks it imported. `discard_pending_subtree` clears any
-        // children already queued under it before this landed; logged once,
-        // here, rather than once per retry, since after this there is no
-        // retry.
-        //
-        // Decided by chain first: a lean block is not a point on the beacon
-        // fork schedule, and `ForkName::is_followed` refuses to answer for it.
-        let refused = match self.store.chain() {
-            Chain::Lean => false,
-            Chain::Beacon => !signed_block.fork_name().is_followed(),
-        };
-        if refused {
-            warn!(
-                %slot,
-                block_root = %ShortRoot(&block_root.0),
-                "Refusing a gloas block: this build cannot follow a gloas chain yet"
-            );
-            self.discard_pending_subtree(block_root);
-            return None;
-        }
-
         // Asked before the parent check, so that an absent `columns_wait` row
         // can be read two ways rather than one: the columns were never
         // missing, or they landed while this block was held for its parent.
@@ -2769,7 +2744,9 @@ impl BlockChainServer {
                     // a checkpoint sync, the 68 blocks behind the first one
                     // re-held it 68 times over 54 s while its columns were
                     // already on their way.
-                    if self.blocks_awaiting_columns.contains_key(&missing_root) {
+                    if self.blocks_awaiting_columns.contains_key(&missing_root)
+                        || self.envelopes.is_block_held(&missing_root)
+                    {
                         return None;
                     }
                     // Parent state available — enqueue for processing, cascade
@@ -2804,6 +2781,17 @@ impl BlockChainServer {
 
             // Request the actual missing block from network
             self.request_missing_block(missing_root);
+            return None;
+        }
+
+        // A gloas block built on its parent's FULL node cannot be imported
+        // until that parent's envelope is verified (`on_block` asserts
+        // `is_payload_verified`). Held until the envelope arrives rather than
+        // failed, since it is a block the network accepted. `None`: the
+        // payload queue is now responsible for it.
+        if self.parent_payload_unverified(&signed_block) {
+            timings.guards_end = Some(Instant::now());
+            self.hold_block_for_parent_payload(signed_block, timings);
             return None;
         }
 
@@ -2855,6 +2843,9 @@ impl BlockChainServer {
                 // This root now has a post-state, which is the one thing every
                 // sidecar parked under it was waiting for.
                 self.drain_sidecars_awaiting_parent(block_root);
+
+                // An envelope that arrived ahead of this block can be judged now.
+                self.note_block_imported_for_envelope(block_root);
 
                 Some(ImportOutcome::Imported)
             }
@@ -3107,6 +3098,8 @@ impl BlockChainServer {
             metrics::set_blocks_held_for_columns(self.blocks_awaiting_columns.len() as u64);
         }
 
+        self.forget_block_held_for_parent_payload(block_root);
+
         // Both eviction paths reach this function, so removing here is what
         // keeps `held_timings` from outliving the blocks it describes.
         self.held_timings.remove(&block_root);
@@ -3313,6 +3306,8 @@ impl BlockChainServer {
 
         // A held block may now be complete.
         self.release_block_if_columns_complete(block_root).await;
+        // And so may a held gloas envelope.
+        self.note_column_stored_for_envelope(block_root);
     }
 
     /// Once a slot, revisit every held block: release the ones whose columns
@@ -3659,7 +3654,7 @@ impl BlockChainServer {
 
 use ethlambda_network_api::p2p_to_block_chain::{
     DataColumnSidecarsAwaitingParent, NewAggregatedAttestation, NewAttestation, NewBeaconAggregate,
-    NewBlock, NewDataColumnSidecars,
+    NewBlock, NewDataColumnSidecars, NewExecutionPayloadEnvelope,
 };
 
 impl Handler<InitP2P> for BlockChainServer {
@@ -3776,6 +3771,24 @@ impl Handler<NewBlock> for BlockChainServer {
             .unwrap_or(u64::MAX);
         self.advance_beacon_clock_to(arrival_ms.saturating_sub(in_flight_ms));
         self.on_block(msg.block, timings).await;
+        // A gloas envelope that arrived ahead of this block is judgeable now.
+        self.settle_envelopes().await;
+    }
+}
+
+impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
+    async fn handle(&mut self, msg: NewExecutionPayloadEnvelope, _ctx: &Context<Self>) {
+        // Beacon-only: lean has no execution payload envelopes.
+        let ChainDuties::Beacon = &self.duties else {
+            return;
+        };
+        let arrival_ms = unix_now_ms();
+        let picked_up = Instant::now();
+        let received = msg.arrival.decode_start.unwrap_or(msg.arrival.handed_off);
+        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
+            .unwrap_or(u64::MAX);
+        self.receive_envelope(*msg.envelope, arrival_ms.saturating_sub(in_flight_ms));
+        self.settle_envelopes().await;
     }
 }
 
@@ -3826,6 +3839,7 @@ impl Handler<NewAggregatedAttestation> for BlockChainServer {
 impl Handler<NewDataColumnSidecars> for BlockChainServer {
     async fn handle(&mut self, msg: NewDataColumnSidecars, _ctx: &Context<Self>) {
         self.on_checked_data_columns(msg.sidecars).await;
+        self.settle_envelopes().await;
     }
 }
 
@@ -4278,6 +4292,7 @@ mod tests {
             held_timings: HashMap::new(),
             sidecars_awaiting_parent: HashMap::new(),
             column_parking: ColumnParking::default(),
+            envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
             custody_columns: Vec::new(),
             engine: None,

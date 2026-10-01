@@ -592,6 +592,15 @@ mod tests {
             self.0.store(true, Ordering::SeqCst);
             Ok(())
         }
+        fn new_execution_payload_envelope(
+            &self,
+            _envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
