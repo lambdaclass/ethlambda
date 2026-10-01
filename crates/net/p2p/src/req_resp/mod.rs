@@ -1,6 +1,7 @@
 pub(crate) mod behaviour;
 pub(crate) mod codec;
 pub(crate) mod encoding;
+mod envelopes;
 pub mod handlers;
 pub(crate) mod messages;
 
