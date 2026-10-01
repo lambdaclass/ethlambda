@@ -162,6 +162,21 @@ pub struct DeferredFrom {
 }
 
 impl BlockArrival {
+    /// The Unix millisecond this delivery came off the wire, given that the
+    /// actor picked it up at `picked_up` (an [`Instant`]) at `picked_up_ms`
+    /// (Unix milliseconds).
+    ///
+    /// The wire receipt predates validation and the mailbox wait, and it is
+    /// what a sub-slot deadline should be judged against. Meant for every
+    /// delivery carrying a [`BlockArrival`], blocks, envelopes and payload
+    /// attestations alike.
+    pub fn wire_ms(&self, picked_up: Instant, picked_up_ms: u64) -> u64 {
+        let received = self.decode_start.unwrap_or(self.handed_off);
+        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
+            .unwrap_or(u64::MAX);
+        picked_up_ms.saturating_sub(in_flight_ms)
+    }
+
     /// An arrival whose earliest knowable moment is now.
     ///
     /// For producers that did not decode the block themselves, so have no

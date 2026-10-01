@@ -4719,7 +4719,13 @@ pub fn notify_ptc_messages(
                 data: payload_attestation.data,
                 signature: Default::default(),
             };
-            apply_payload_attestation_message(store, &attested_state, &message, true, config)?;
+            apply_payload_attestation_message(
+                store,
+                &attested_state,
+                &message,
+                PtcMessageSource::Block,
+                config,
+            )?;
         }
     }
     Ok(())
@@ -4751,7 +4757,56 @@ pub fn on_payload_attestation_message(
         .ok_or(Error::SpecAssert(
             "data.beacon_block_root in store.block_states",
         ))?;
-    apply_payload_attestation_message(store, &state, ptc_message, is_from_block, config)
+    let source = if is_from_block {
+        PtcMessageSource::Block
+    } else {
+        PtcMessageSource::Wire
+    };
+    apply_payload_attestation_message(store, &state, ptc_message, source, config)
+}
+
+/// [`on_payload_attestation_message`] for a message that
+/// `ethlambda-p2p`'s `payload_attestation_message` gossip validation already
+/// accepted: the same store-state checks (the block's state is known, the
+/// vote is for the current slot, the validator holds a seat in the block's
+/// committee, which also locates the seats to write), without the signature
+/// check and the indexed-attestation validation behind it, which cost a BLS
+/// verification per vote on the chain actor.
+///
+/// Only a gossip-verified message may call this. A message from anywhere else
+/// (a block's payload attestations go through [`notify_ptc_messages`], which
+/// has its own verified path) would be applied unauthenticated.
+pub fn apply_verified_payload_attestation(
+    store: &mut Store,
+    ptc_message: &gloas::PayloadAttestationMessage,
+    config: &Config,
+) -> Result<()> {
+    let state = store
+        .get_state(&ptc_message.data.beacon_block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.block_states",
+        ))?;
+    apply_payload_attestation_message(
+        store,
+        &state,
+        ptc_message,
+        PtcMessageSource::VerifiedWire,
+        config,
+    )
+}
+
+/// Where a payload attestation message came from, which decides what
+/// [`apply_payload_attestation_message`] still has to check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtcMessageSource {
+    /// Inside a block, already verified with it: no slot or signature check.
+    Block,
+    /// Straight off the wire: current slot, then the signature.
+    Wire,
+    /// Off the wire and already signature-verified by gossip validation:
+    /// current slot only.
+    VerifiedWire,
 }
 
 /// The body of [`on_payload_attestation_message`] after its state read, given
@@ -4762,7 +4817,7 @@ fn apply_payload_attestation_message(
     store: &mut Store,
     state: &BeaconState,
     ptc_message: &gloas::PayloadAttestationMessage,
-    is_from_block: bool,
+    source: PtcMessageSource,
     config: &Config,
 ) -> Result<()> {
     let data = ptc_message.data;
@@ -4787,11 +4842,13 @@ fn apply_payload_attestation_message(
 
     // Verify the signature and check that it is for the current slot if it is
     // coming from the wire.
-    if !is_from_block {
+    if source != PtcMessageSource::Block {
         verify(
             data.slot == get_current_slot(store, config),
             "data.slot == get_current_slot(store)",
         )?;
+    }
+    if source == PtcMessageSource::Wire {
         let indexed = gloas::IndexedPayloadAttestation {
             attesting_indices: gloas::PayloadTimelinessCommitteeIndices::try_from(vec![
                 ptc_message.validator_index,
@@ -7679,10 +7736,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn on_payload_attestation_message_writes_every_seat_the_validator_holds() {
-        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
-        let root = Root::repeat_byte(0xb1);
+    /// A store holding a gloas block at slot 1 whose state seats validator 3
+    /// twice in the slot's committee (every other seat is validator 0), with
+    /// empty vote vectors.
+    fn payload_attestation_store(root: Root) -> Store {
         let mut store = store_anchored_at(root);
         store
             .insert_signed_block(
@@ -7712,6 +7769,14 @@ mod tests {
         store.insert_state(root, state).unwrap();
         store.set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
         store.set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+        store
+    }
+
+    #[test]
+    fn on_payload_attestation_message_writes_every_seat_the_validator_holds() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let root = Root::repeat_byte(0xb1);
+        let mut store = payload_attestation_store(root);
 
         let message = |validator_index: u64, slot: Slot| gloas::PayloadAttestationMessage {
             validator_index,
@@ -7756,6 +7821,89 @@ mod tests {
         assert_eq!(
             seats(store.payload_data_availability_vote(&root).unwrap()),
             vec![(2, false), (7, false)]
+        );
+    }
+
+    fn payload_attestation_message(
+        root: Root,
+        validator_index: u64,
+        slot: Slot,
+    ) -> gloas::PayloadAttestationMessage {
+        gloas::PayloadAttestationMessage {
+            validator_index,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A gossip-verified vote is applied to every seat of its validator
+    /// without a signature check (the zero signature here would fail one),
+    /// but still only in the slot it is for, and only from a committee member.
+    #[test]
+    fn apply_verified_payload_attestation_skips_the_signature_but_not_the_slot() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let root = Root::repeat_byte(0xb1);
+        let mut store = payload_attestation_store(root);
+        let seated = |store: &Store| -> Vec<usize> {
+            store
+                .payload_timeliness_vote(&root)
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(seat, vote)| vote.map(|_| seat))
+                .collect()
+        };
+
+        // The store clock reads slot 0: a vote for slot 1 is not current yet.
+        assert_eq!(
+            failed_assertion(apply_verified_payload_attestation(
+                &mut store,
+                &payload_attestation_message(root, 3, 1),
+                &config
+            )),
+            Some("data.slot == get_current_slot(store)")
+        );
+        assert!(seated(&store).is_empty());
+
+        store
+            .set_time_ms(config.slot_duration_ms)
+            .expect("set the clock to slot 1");
+        // A validator outside the committee still writes nothing.
+        assert_eq!(
+            failed_assertion(apply_verified_payload_attestation(
+                &mut store,
+                &payload_attestation_message(root, 2, 1),
+                &config
+            )),
+            Some("len(ptc_indices) > 0")
+        );
+        apply_verified_payload_attestation(
+            &mut store,
+            &payload_attestation_message(root, 3, 1),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(seated(&store), vec![2, 7]);
+
+        // The unverified entry point refuses the same message: its signature
+        // is not valid.
+        let mut fresh = payload_attestation_store(root);
+        fresh
+            .set_time_ms(config.slot_duration_ms)
+            .expect("set the clock to slot 1");
+        assert!(
+            on_payload_attestation_message(
+                &mut fresh,
+                &payload_attestation_message(root, 3, 1),
+                false,
+                &config
+            )
+            .is_err()
         );
     }
 
