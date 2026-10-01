@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ethlambda_types::beacon::containers::deneb;
+use ethlambda_types::beacon::containers::{deneb, gloas};
 use ethlambda_types::beacon::primitives::{Bytes32, Root};
 use serde_json::json;
 use tracing::{debug, warn};
@@ -10,8 +10,8 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, ExecutionPayloadV3, ForkchoiceStateV1, ForkchoiceUpdatedResponse,
-    PayloadStatusV1, data,
+    ClientVersionV1, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
+    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
 };
 
 /// Per-attempt timeout.
@@ -20,6 +20,11 @@ use crate::types::{
 /// `engine_forkchoiceUpdated`. It is a ceiling, not a target: a healthy
 /// `newPayload` on mainnet answers in 50-500 ms.
 pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-attempt timeout for `engine_newPayloadV5`, the value `amsterdam.md`
+/// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
+/// for the older methods.
+pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How many times one call is attempted before it is given up on.
 ///
@@ -87,11 +92,21 @@ impl EngineClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, EngineError> {
+        self.call_with_timeout(method, params, ENGINE_TIMEOUT).await
+    }
+
+    /// [`Self::call`] with a per-attempt `timeout` of the method's own.
+    async fn call_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<T, EngineError> {
         let mut backoff = ENGINE_INITIAL_BACKOFF;
         let mut last = EngineError::Transport("no attempt was made".to_string());
 
         for attempt in 1..=ENGINE_MAX_ATTEMPTS {
-            match self.call_once(method, &params).await {
+            match self.call_once(method, &params, timeout).await {
                 Ok(value) => return Ok(value),
                 // An answer, not a failure to get one. Do not retry.
                 Err(err @ EngineError::Rpc { .. }) => return Err(err),
@@ -113,6 +128,7 @@ impl EngineClient {
         &self,
         method: &str,
         params: &serde_json::Value,
+        timeout: Duration,
     ) -> Result<T, EngineError> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -125,12 +141,13 @@ impl EngineClient {
             .http
             .post(&self.endpoint)
             .bearer_auth(self.secret.token())
+            .timeout(timeout)
             .json(&body)
             .send()
             .await
             .map_err(|err| {
                 if err.is_timeout() {
-                    EngineError::Timeout(ENGINE_TIMEOUT)
+                    EngineError::Timeout(timeout)
                 } else {
                     EngineError::Transport(err.to_string())
                 }
@@ -200,6 +217,36 @@ impl EngineClient {
             requests,
         ]);
         self.call("engine_newPayloadV4", params).await
+    }
+
+    /// `engine_newPayloadV5`: Amsterdam's `newPayload`, which gloas asks about
+    /// a revealed execution payload envelope.
+    ///
+    /// The parameters are the same four as V4's, with the payload as
+    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`). The
+    /// response is V4's. An execution client answers `-38005` when the
+    /// payload's timestamp is not Amsterdam's, which surfaces as
+    /// [`EngineError::Rpc`] and is not retried.
+    pub async fn new_payload_v5(
+        &self,
+        payload: &gloas::ExecutionPayload,
+        versioned_hashes: &[Bytes32],
+        parent_beacon_block_root: Root,
+        execution_requests: &[Vec<u8>],
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
+        let requests: Vec<String> = execution_requests
+            .iter()
+            .map(|request| data(request))
+            .collect();
+        let params = json!([
+            ExecutionPayloadV4(payload),
+            hashes,
+            data(&parent_beacon_block_root.0),
+            requests,
+        ]);
+        self.call_with_timeout("engine_newPayloadV5", params, ENGINE_NEW_PAYLOAD_V5_TIMEOUT)
+            .await
     }
 
     /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
@@ -278,6 +325,14 @@ impl EngineClient {
                     "The execution client does not advertise a method this node needs"
                 );
             }
+        }
+        // Kept out of the list above: V5 is only called from gloas on, and a
+        // node on an earlier fork never needs it.
+        if !theirs.iter().any(|method| method == "engine_newPayloadV5") {
+            warn!(
+                method = "engine_newPayloadV5",
+                "The execution client does not advertise a method this node needs from gloas on"
+            );
         }
         match self.client_version(ours).await {
             Ok(versions) => {
