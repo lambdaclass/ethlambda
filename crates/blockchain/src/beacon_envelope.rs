@@ -71,6 +71,16 @@ pub(crate) const MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT: usize = 4;
 /// when the block imports each is tried until one verifies.
 pub(crate) const MAX_ENVELOPES_PER_UNMATCHED_ROOT: usize = 3;
 
+/// How many slots an envelope for a block this node has not imported is kept.
+///
+/// A builder reveals its payload after the block it bid in, so the block
+/// should reach this node within the slot or the next; an envelope still
+/// unmatched after that is for a block that is not coming, or one the fetch
+/// path (`FetchRequest::needs_envelope`) recovers later. Bounds the queue by
+/// time where the per-slot and per-root caps bound it by count, so the total
+/// stays finite while the chain does not finalize.
+pub(crate) const ENVELOPE_AWAITING_BLOCK_TTL_SLOTS: u64 = 2;
+
 /// How many blocks may wait on one parent's payload.
 ///
 /// The children of a block that all name it as a FULL parent: one per slot the
@@ -452,6 +462,20 @@ impl BlockChainServer {
         }
     }
 
+    /// Once a slot: ask for the envelope of every parent that has blocks held
+    /// for its payload and no envelope held or verified, so one failed fetch
+    /// does not stall the child for good.
+    pub(crate) fn redrive_missing_envelopes(&self) {
+        for &parent_root in self.envelopes.blocks_awaiting_parent_payload.keys() {
+            if !self.envelopes.awaiting_block.contains_key(&parent_root)
+                && !self.envelopes.awaiting_columns.contains_key(&parent_root)
+                && !self.store.has_verified_payload(&parent_root)
+            {
+                self.request_missing_envelope(parent_root);
+            }
+        }
+    }
+
     /// Once a slot: look at every envelope waiting for columns, and ask peers
     /// for whatever is still missing.
     pub(crate) fn redrive_envelopes_awaiting_columns(&mut self) {
@@ -523,7 +547,10 @@ impl BlockChainServer {
         loop {
             if let Some(root) = self.envelopes.work.pop_front() {
                 // The first that verifies wins; the rest are forgeries or
-                // duplicates of it.
+                // duplicates of it. One parked for columns is enough too: it
+                // matched the bid, whose block hash commits to the whole
+                // payload, so a second bid-consistent candidate differs only
+                // in a signature p2p already checked.
                 for held in self.take_ready_envelopes(root) {
                     if self.apply_or_hold_envelope(held) {
                         break;
@@ -705,8 +732,14 @@ impl BlockChainServer {
         // execution hash is from `prune_beacon_el_block_hashes`: the
         // checkpoint slot is an epoch boundary, and the block can sit before
         // a skipped one.
+        let config = self.store.config();
+        let current_slot = fork_choice::get_current_slot(&self.store, &config);
         self.envelopes.awaiting_block.retain(|root, held| {
-            held.retain(|other| other.slot >= finalized_slot || *root == finalized.root);
+            held.retain(|other| {
+                let fresh =
+                    other.slot.saturating_add(ENVELOPE_AWAITING_BLOCK_TTL_SLOTS) >= current_slot;
+                fresh && (other.slot >= finalized_slot || *root == finalized.root)
+            });
             !held.is_empty()
         });
         self.envelopes
@@ -728,7 +761,8 @@ impl BlockChainServer {
     }
 
     pub(crate) fn publish_envelope_queues(&self) {
-        metrics::set_envelopes_awaiting_block(self.envelopes.awaiting_block.len() as u64);
+        let unmatched: usize = self.envelopes.awaiting_block.values().map(Vec::len).sum();
+        metrics::set_envelopes_awaiting_block(unmatched as u64);
         metrics::set_envelopes_awaiting_columns(self.envelopes.awaiting_columns.len() as u64);
         metrics::set_blocks_awaiting_parent_payload(self.envelopes.held_blocks() as u64);
     }
@@ -1278,5 +1312,108 @@ mod tests {
 
         assert!(server.pending_blocks.is_empty());
         assert!(server.pending_block_parents.is_empty());
+    }
+
+    #[test]
+    fn each_slot_re_asks_for_the_envelope_of_a_parent_with_held_children() {
+        let (mut server, p2p) =
+            crate::tests::beacon_server_recording(beacon_store(GENESIS_TIME, 0));
+        let parent = H256::repeat_byte(5);
+        server
+            .envelopes
+            .blocks_awaiting_parent_payload
+            .insert(parent, HashMap::from([(H256::repeat_byte(6), 3)]));
+
+        server.redrive_missing_envelopes();
+        server.redrive_missing_envelopes();
+
+        let fetches = p2p.fetches.lock().unwrap();
+        assert_eq!(fetches.len(), 2, "one ask per call, so one per slot");
+        assert!(fetches.iter().all(|request| request.needs_envelope
+            && !request.needs_block
+            && request.block_root == parent));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    fn a_parent_whose_envelope_is_already_held_is_not_asked_for() {
+        let (mut server, p2p) =
+            crate::tests::beacon_server_recording(beacon_store(GENESIS_TIME, 0));
+        let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
+        let parent = H256::repeat_byte(5);
+        server
+            .envelopes
+            .blocks_awaiting_parent_payload
+            .insert(parent, HashMap::from([(H256::repeat_byte(6), 3)]));
+        server
+            .envelopes
+            .awaiting_block
+            .insert(parent, vec![HeldEnvelope::new(envelope, 0, 0)]);
+
+        server.redrive_missing_envelopes();
+
+        assert!(p2p.fetches.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    fn an_unmatched_envelope_ages_out_after_the_ttl() {
+        // The store clock reads slot 10.
+        let mut server = beacon_server(crate::tests::beacon_store_at_slot_10());
+        let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
+        let fresh = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let fresh_slot = 10 - ENVELOPE_AWAITING_BLOCK_TTL_SLOTS;
+        server.envelopes.awaiting_block.insert(
+            fresh,
+            vec![HeldEnvelope::new(envelope.clone(), fresh_slot, 0)],
+        );
+        server
+            .envelopes
+            .awaiting_block
+            .insert(stale, vec![HeldEnvelope::new(envelope, fresh_slot - 1, 0)]);
+
+        server.evict_envelope_queues_at_or_below_finality();
+
+        assert!(server.envelopes.awaiting_block.contains_key(&fresh));
+        assert!(!server.envelopes.awaiting_block.contains_key(&stale));
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    fn the_unmatched_queue_is_bounded_across_slots_by_the_ttl() {
+        // Fill every slot the TTL keeps to the per-slot cap and per-root cap,
+        // then read off the most the queue can hold.
+        let mut server = beacon_server(crate::tests::beacon_store_at_slot_10());
+        let envelope = Case::new("get_head", TIEBREAK).envelope(PARENT_ENVELOPE);
+        for slot in 0..=10u64 {
+            for byte in 0..MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT as u8 {
+                let mut root_bytes = [0u8; 32];
+                root_bytes[0] = slot as u8;
+                root_bytes[1] = byte;
+                server.envelopes.awaiting_block.insert(
+                    H256(root_bytes),
+                    vec![HeldEnvelope::new(envelope.clone(), slot, 0)],
+                );
+            }
+        }
+
+        server.evict_envelope_queues_at_or_below_finality();
+
+        let kept: usize = server.envelopes.awaiting_block.values().map(Vec::len).sum();
+        assert_eq!(
+            kept,
+            (ENVELOPE_AWAITING_BLOCK_TTL_SLOTS as usize + 1)
+                * MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT
+        );
     }
 }

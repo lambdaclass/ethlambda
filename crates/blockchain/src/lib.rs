@@ -1047,6 +1047,7 @@ impl BlockChainServer {
         self.evict_envelope_queues_at_or_below_finality();
         self.redrive_held_blocks().await;
         self.redrive_envelopes_awaiting_columns();
+        self.redrive_missing_envelopes();
         self.settle_envelopes().await;
 
         // Per-interval duties for this tick. Lean-only, so this is where a
