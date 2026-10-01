@@ -1411,9 +1411,8 @@ impl Store {
         }
         // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
         let snapshot = {
-            let view = self.backend.begin_read().expect("read view");
-            view.get(Table::States, &root.to_ssz())
-                .expect("get")
+            let view = self.backend.begin_read()?;
+            view.get(Table::States, &root.to_ssz())?
                 .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
         };
         let state = if let Some(s) = snapshot {
@@ -1437,15 +1436,14 @@ impl Store {
     /// Returns `Ok(None)` when the root is unknown or the diff chain is broken.
     fn reconstruct_state(&self, root: &H256) -> Result<Option<State>, Error> {
         // Walk back collecting diffs until we reach a snapshot.
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let mut diffs: Vec<StateDiff> = Vec::new();
         let mut cursor = *root;
         let snapshot = loop {
-            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
+            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz())? {
                 break State::from_ssz_bytes(&bytes).expect("valid state");
             }
-            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
-            else {
+            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz())? else {
                 return Ok(None);
             };
             let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
@@ -1505,33 +1503,26 @@ impl Store {
         // The post-state's latest_block_header is the block's own header, so its
         // parent_root identifies the parent (base) state to diff against.
         let parent_root = state.latest_block_header.parent_root;
-        let parent_state = self
-            .get_state(&parent_root)
-            .expect("parent state must exist to diff against")
-            .unwrap();
+        let parent_state = self.get_state(&parent_root)?.unwrap();
         let is_anchor =
             state.slot / SNAPSHOT_ANCHOR_INTERVAL > parent_state.slot / SNAPSHOT_ANCHOR_INTERVAL;
 
         // Snapshot only at anchors; serialize before `state` is consumed.
         let snapshot_bytes = is_anchor.then(|| state.to_ssz());
-        // Memoize the post-state for fast reads, then move it into the diff so
-        // its multi-MB justification fields are not cloned again.
-        self.state_cache.lock().unwrap().put(root, state.clone());
-        let diff_bytes = StateDiff::from_states(&parent_state, state)
+        let diff_bytes = StateDiff::from_states(&parent_state, state.clone())
             .expect("state transition produced a non-append historical_block_hashes")
             .to_ssz();
 
         let key = root.to_ssz();
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])
-            .expect("put state diff");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])?;
         if let Some(snapshot_bytes) = snapshot_bytes {
-            batch
-                .put_batch(Table::States, vec![(key, snapshot_bytes)])
-                .expect("put state snapshot");
+            batch.put_batch(Table::States, vec![(key, snapshot_bytes)])?;
         }
-        batch.commit().expect("commit");
+        batch.commit()?;
+
+        // Cache the state only after it has been persisted successfully.
+        self.state_cache.lock().unwrap().put(root, state);
         Ok(())
     }
 
