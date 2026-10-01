@@ -24,7 +24,7 @@ use ethlambda_state_transition::beacon::fork_choice::{
 };
 use ethlambda_state_transition::beacon::gossip::{
     self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
-    SeenColumns,
+    SeenColumns, SeenEnvelopes, SeenPayloadAttestations,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
@@ -41,6 +41,8 @@ const HANDLERS: &[&str] = &[
     "gossip_data_column_sidecar",
     "gossip_beacon_aggregate_and_proof",
     "gossip_beacon_attestation",
+    "gossip_execution_payload_envelope",
+    "gossip_payload_attestation_message",
 ];
 
 /// The forks each of [`HANDLERS`] validates. A case from any other fork is
@@ -59,6 +61,9 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => {
             &[ForkName::Fulu, ForkName::Gloas]
         }
+        "gossip_execution_payload_envelope" | "gossip_payload_attestation_message" => {
+            &[ForkName::Gloas]
+        }
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
 }
@@ -72,11 +77,10 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
 /// list, the same way [`super::UNMODELED_FORKS`] forces a decision on a new
 /// fork directory.
 ///
-/// `gossip_execution_payload_bid`, `gossip_execution_payload_envelope`,
-/// `gossip_payload_attestation_message`, and `gossip_proposer_preferences`
-/// are gloas's own topics (EIP-7732 ePBS): the builder's bid, the revealed
-/// payload envelope, the payload timeliness committee's vote, and a
-/// builder's advertised preferences, respectively. None of them existed
+/// `gossip_execution_payload_bid` and `gossip_proposer_preferences` are
+/// gloas's own topics (EIP-7732 ePBS): the builder's bid and a builder's
+/// advertised preferences, respectively. (Its envelope and payload
+/// attestation topics are in [`HANDLERS`].) None of them existed
 /// until gloas's fixture directory started parsing (`ForkName::Gloas`), so
 /// they land here rather than silently in `unknown` the first time this
 /// runner sees them. Alphabetized with the rest rather than kept together.
@@ -85,9 +89,7 @@ const IGNORED_HANDLERS: &[&str] = &[
     "gossip_blob_sidecar",
     "gossip_bls_to_execution_change",
     "gossip_execution_payload_bid",
-    "gossip_execution_payload_envelope",
     "gossip_partial_data_column_sidecar",
-    "gossip_payload_attestation_message",
     "gossip_proposer_preferences",
     "gossip_proposer_slashing",
     "gossip_sync_committee_contribution_and_proof",
@@ -119,6 +121,14 @@ const SKIPPED: &[(&str, &str)] = &[
     ),
     (
         "gossip_beacon_attestation__reject_block_failed_validation",
+        "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_execution_payload_envelope__reject_block_failed_validation",
+        "a block seen without a post-state is queued, not rejected, until a bad-block cache exists",
+    ),
+    (
+        "gossip_payload_attestation_message__reject_block_failed_validation",
         "a vote block seen without a post-state is ignored, not rejected, until a bad-block cache exists",
     ),
 ];
@@ -403,6 +413,8 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_block_columns = SeenBlockColumns::new(capacity);
     let mut seen_aggregates = SeenAggregates::new(capacity, capacity);
     let mut seen_attestations = SeenAttestations::new(capacity);
+    let mut seen_envelopes = SeenEnvelopes::new(capacity);
+    let mut seen_payload_attestations = SeenPayloadAttestations::new(capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
         let now_ms = config.genesis_time_ms()
@@ -488,6 +500,37 @@ fn run_case(case: &Case) -> Result<(), String> {
                 );
                 if outcome == Outcome::Accept {
                     seen_attestations.record(&attestation);
+                }
+                outcome
+            }
+            "execution_payload" => {
+                let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(
+                    &case.ssz_bytes(&message.message),
+                )
+                .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let outcome = rules::envelope::validate(&seen_envelopes, &store, &envelope);
+                if outcome == Outcome::Accept {
+                    seen_envelopes.record(
+                        envelope.message.beacon_block_root,
+                        envelope.message.builder_index,
+                    );
+                }
+                outcome
+            }
+            "payload_attestation_message" => {
+                let attestation = gloas::PayloadAttestationMessage::from_ssz_bytes(
+                    &case.ssz_bytes(&message.message),
+                )
+                .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let outcome = rules::payload_attestation::validate(
+                    &seen_payload_attestations,
+                    &store,
+                    &attestation,
+                    now_ms,
+                );
+                if outcome == Outcome::Accept {
+                    seen_payload_attestations
+                        .record(attestation.data.slot, attestation.validator_index);
                 }
                 outcome
             }
