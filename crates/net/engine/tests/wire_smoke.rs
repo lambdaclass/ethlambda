@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use ethlambda_engine::types::{ForkchoiceStateV1, PayloadStatusValue};
+use ethlambda_engine::types::{CustodyColumns, ForkchoiceStateV1, PayloadStatusValue};
 use ethlambda_engine::{EngineClient, EngineError, JwtSecret};
 use ethlambda_types::beacon::primitives::ExecutionBlockHash;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -193,4 +193,31 @@ async fn new_payload_v5_sends_four_params_under_its_own_method() {
     assert_eq!(params[1][0], format!("0x{}", "01".repeat(32)));
     assert_eq!(params[2], format!("0x{}", "02".repeat(32)));
     assert_eq!(params[3][0], "0x00aa");
+}
+
+#[tokio::test]
+async fn forkchoice_updated_v4_sends_three_params_and_parses_syncing() {
+    let (endpoint, seen) = serve_once(
+        r#"{"jsonrpc":"2.0","id":1,"result":{"payloadStatus":{"status":"SYNCING","latestValidHash":null,"validationError":null},"payloadId":null}}"#,
+    )
+    .await;
+
+    let state = ForkchoiceStateV1 {
+        head_block_hash: ExecutionBlockHash::repeat_byte(1),
+        safe_block_hash: ExecutionBlockHash::repeat_byte(2),
+        finalized_block_hash: ExecutionBlockHash::repeat_byte(3),
+    };
+    let columns = CustodyColumns::from_indices([0, 9]);
+    let status = client(endpoint)
+        .forkchoice_updated_v4(&state, columns)
+        .await
+        .expect("the mock answers");
+
+    assert_eq!(status.status, PayloadStatusValue::Syncing);
+
+    let request = seen.lock().await.clone().expect("the mock saw a request");
+    assert!(request.contains("engine_forkchoiceUpdatedV4"));
+    assert!(request.contains("headBlockHash"));
+    // The attributes are null and the bitmap follows them.
+    assert!(request.contains(",null,\"0x01020000000000000000000000000000\"]"));
 }

@@ -31,7 +31,7 @@ pub mod types;
 pub use auth::JwtSecret;
 pub use client::EngineClient;
 pub use error::EngineError;
-pub use types::{ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
+pub use types::{CustodyColumns, ForkchoiceStateV1, PayloadStatusV1, PayloadStatusValue};
 
 /// The methods this client will call, sent in the `engine_exchangeCapabilities`
 /// handshake.
@@ -42,6 +42,7 @@ pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_newPayloadV4",
     "engine_newPayloadV5",
     "engine_forkchoiceUpdatedV3",
+    "engine_forkchoiceUpdatedV4",
     "engine_getPayloadV5",
     "engine_getClientVersionV1",
 ];

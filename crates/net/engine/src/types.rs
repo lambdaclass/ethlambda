@@ -11,6 +11,7 @@
 
 use ethlambda_types::beacon::containers::capella::Withdrawal;
 use ethlambda_types::beacon::containers::{deneb, gloas};
+use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Uint256};
 use ethlambda_types::beacon::serde_helpers::HexPrefixed;
 use serde::{Deserialize, Serialize, Serializer};
@@ -194,6 +195,44 @@ pub fn data(bytes: &[u8]) -> String {
     HexPrefixed(bytes).to_string()
 }
 
+/// The `custodyColumns` parameter of `engine_forkchoiceUpdatedV4`: a bitarray
+/// of `CELLS_PER_EXT_BLOB` bits marking the columns the consensus client
+/// custodies.
+///
+/// Little-endian bit order, as an SSZ `Bitvector` has it: column `i` is bit
+/// `i % 8` of byte `i / 8`. ethrex parses it the same way (`u128::from_le_bytes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CustodyColumns([u8; Self::BYTES]);
+
+impl CustodyColumns {
+    /// Wire length of the bitmap, which the specification fixes at 16 bytes.
+    pub const BYTES: usize = 16;
+
+    /// Builds the bitmap from column indices, or `None` when any index is not
+    /// below `NUMBER_OF_COLUMNS`. Duplicates are harmless.
+    pub fn from_indices(indices: impl IntoIterator<Item = u64>) -> Option<Self> {
+        let mut bits = [0u8; Self::BYTES];
+        for index in indices {
+            if index >= preset::NUMBER_OF_COLUMNS as u64 {
+                return None;
+            }
+            bits[(index / 8) as usize] |= 1 << (index % 8);
+        }
+        Some(Self(bits))
+    }
+
+    /// The `DATA` encoding: `0x` and 32 hex digits.
+    pub fn to_data(self) -> String {
+        data(&self.0)
+    }
+}
+
+impl Serialize for CustodyColumns {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_data())
+    }
+}
+
 /// Encodes a `QUANTITY`: `0x`-prefixed, leading zeros stripped, `0x0` for zero.
 pub fn quantity(value: u64) -> String {
     format!("0x{value:x}")
@@ -219,10 +258,30 @@ pub fn uint256(value: &Uint256) -> String {
 #[cfg(test)]
 mod tests {
     use ethlambda_types::beacon::containers::bellatrix;
-    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, U256};
 
     use super::*;
+
+    #[test]
+    fn custody_columns_use_little_endian_bit_order() {
+        // Column 0 is bit 0 of byte 0; column 9 is bit 1 of byte 1; column 127
+        // is bit 7 of byte 15.
+        let columns = CustodyColumns::from_indices([0, 9, 127]).unwrap();
+        assert_eq!(columns.to_data(), "0x01020000000000000000000000000080");
+    }
+
+    #[test]
+    fn custody_columns_reject_an_out_of_range_index() {
+        let bound = preset::NUMBER_OF_COLUMNS as u64;
+        assert!(CustodyColumns::from_indices([bound - 1]).is_some());
+        assert!(CustodyColumns::from_indices([0, bound]).is_none());
+    }
+
+    #[test]
+    fn empty_custody_columns_encode_as_sixteen_zero_bytes() {
+        let columns = CustodyColumns::from_indices([]).unwrap();
+        assert_eq!(columns.to_data(), format!("0x{}", "00".repeat(16)));
+    }
 
     /// An otherwise-zero deneb execution payload whose `block_hash` is
     /// `block_hash`.
