@@ -112,10 +112,11 @@ impl ForkName {
 
     /// Whether this node follows a chain that has reached this fork.
     ///
-    /// Phase0 through fulu are followed. Gloas is not: nothing delivers the
-    /// payload envelopes or payload attestations a gloas chain needs, so the
-    /// node refuses gloas blocks and anchors, ignores gloas gossip and reports
-    /// syncing once the clock reaches the fork. This is the one place to
+    /// Phase0 through fulu are followed. Gloas is not yet: the chain actor
+    /// imports gloas blocks and payload envelopes, but the network side does
+    /// not deliver envelopes or payload attestations, so the node still
+    /// refuses gloas anchors, ignores gloas gossip and reports syncing once
+    /// the clock reaches the fork. This is the one place to
     /// change when the node starts following gloas; every site whose rule is
     /// "does this node follow the fork" calls it.
     ///

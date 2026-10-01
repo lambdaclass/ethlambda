@@ -182,9 +182,9 @@ pub fn wire_params(
     // `SUBSCRIBE_LEAD_EPOCHS` and `UNSUBSCRIBE_LAG_EPOCHS`. Say what is coming.
     //
     // The gloas boundary keeps its own warning: crossing its digest works like
-    // any other, but the chain actor refuses every gloas block (nothing
-    // delivers payload envelopes or payload attestations to it yet), so the
-    // node stops tracking the chain there regardless.
+    // any other, but the network side delivers neither gloas blocks nor
+    // payload envelopes or payload attestations to the chain actor yet, so
+    // the node stops tracking the chain there regardless.
     let schedule = ForkSchedule::new(&chain, genesis.genesis_validators_root);
     match schedule.next_boundary_after(epoch) {
         Some(next) if !next.fork.is_followed() => warn!(

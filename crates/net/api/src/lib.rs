@@ -4,6 +4,7 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
+        gloas::SignedExecutionPayloadEnvelope,
     },
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
@@ -62,6 +63,10 @@ pub struct FetchRequest {
     /// reading its own store to find out would pay a DB read per request to
     /// re-derive what the caller already knew.
     pub needs_block: bool,
+    /// Whether the block's execution payload envelope is missing (gloas): the
+    /// block is known, and it names a payload this node has no envelope for.
+    /// Fetched by root, like the block.
+    pub needs_envelope: bool,
     /// Columns of this block that this node custodies and does not have.
     ///
     /// Empty when nothing is missing, or when the block itself is, since a
@@ -251,6 +256,19 @@ pub trait P2PToBlockChain: Send + Sync {
         aggregate: Box<SignedAggregateAndProof>,
         attesting_indices: Vec<ValidatorIndex>,
         arrival: AggregateArrival,
+    ) -> Result<(), ActorError>;
+    /// A gloas execution payload envelope that passed gossip validation (or
+    /// was fetched), for the chain actor to verify against its block's
+    /// post-state and apply to fork choice.
+    ///
+    /// Boxed for the reason [`Self::new_beacon_aggregate`] is: the envelope
+    /// carries a whole execution payload. `arrival` is the same shape a block
+    /// brings, since the actor reads the clock the envelope arrived at to
+    /// judge its payload timeliness.
+    fn new_execution_payload_envelope(
+        &self,
+        envelope: Box<SignedExecutionPayloadEnvelope>,
+        arrival: BlockArrival,
     ) -> Result<(), ActorError>;
 }
 

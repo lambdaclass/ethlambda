@@ -11,8 +11,8 @@
 //! A fulu sidecar carries a signed header, which the p2p checks verify against
 //! the head state before it is ever sent here. A gloas sidecar carries no
 //! signature at all, so a peer can invent `(slot, root, index)` triples as fast
-//! as it can send them. Gloas sidecars are therefore parked only while the node
-//! follows gloas, only when their shape passes
+//! as it can send them. Gloas sidecars are therefore parked only when their shape
+//! passes
 //! [`is_parkable_gloas`](ethlambda_state_transition::beacon::gossip::column::is_parkable_gloas),
 //! and at most [`MAX_PARKED_GLOAS_ROOTS_PER_SLOT`] distinct roots per slot.
 
@@ -58,6 +58,12 @@ pub(crate) struct ColumnParking {
     pub(crate) count: usize,
     /// The gloas roots with sidecars parked, by the slot they were parked at.
     pub(crate) gloas_roots: HashMap<u64, HashSet<H256>>,
+    /// The slot each root in [`Self::gloas_roots`] was parked at, kept as its
+    /// own map rather than read back off any parked sidecar: the parked set
+    /// for a root is keyed by the awaited root alone, so a fulu sidecar whose
+    /// parent is a gloas root shares it, and its slot says nothing about the
+    /// gloas root's.
+    pub(crate) gloas_root_slots: HashMap<H256, u64>,
 }
 
 /// The root whose post-state `sidecar` cannot be checked without.
@@ -84,24 +90,7 @@ impl BlockChainServer {
     /// finality evicts it. Asked with the same predicate the checks use
     /// ([`Self::is_ready_to_judge`]), so a sidecar sent back is one they will
     /// find everything for.
-    ///
-    /// A sidecar of a fork the node does not follow is dropped: no block of
-    /// that fork will import, so nothing would ever drain it.
     pub(crate) fn park_data_columns(&mut self, sidecars: Vec<DataColumnSidecar>) {
-        let (followed, unfollowed): (Vec<_>, Vec<_>) = sidecars
-            .into_iter()
-            .partition(|sidecar| sidecar.fork().is_followed());
-        if !unfollowed.is_empty() {
-            trace!(
-                count = unfollowed.len(),
-                "Dropping data column sidecars of a fork this node does not follow"
-            );
-        }
-        self.park_followed_columns(followed);
-    }
-
-    /// [`Self::park_data_columns`] for sidecars of a followed fork.
-    pub(crate) fn park_followed_columns(&mut self, sidecars: Vec<DataColumnSidecar>) {
         let config = self.store.config();
         let mut ready = Vec::new();
         for sidecar in sidecars {
@@ -252,6 +241,9 @@ impl BlockChainServer {
                 .entry(parked.slot)
                 .or_default()
                 .insert(awaited);
+            self.column_parking
+                .gloas_root_slots
+                .insert(awaited, parked.slot);
         }
         let inserted = self
             .sidecars_awaiting_parent
@@ -266,21 +258,37 @@ impl BlockChainServer {
 
     /// Whether a gloas sidecar for `root` at `slot` may be parked: the root is
     /// not already parked at another slot, and this slot has room for it.
+    ///
+    /// A root this actor already holds as a pending or held block is exempt
+    /// from the per-slot cap: an honest block is known, so
+    /// [`MAX_PARKED_GLOAS_ROOTS_PER_SLOT`] forged roots at its slot cannot shut
+    /// its columns out. It still has to match the slot
+    /// it was first parked at.
     fn gloas_root_fits(&self, root: H256, slot: u64) -> bool {
-        let parked_slot = self
-            .sidecars_awaiting_parent
+        if self
+            .column_parking
+            .gloas_root_slots
             .get(&root)
-            .and_then(|parked| parked.iter().next())
-            .map(|parked| parked.slot);
-        if parked_slot.is_some_and(|parked_slot| parked_slot != slot) {
+            .is_some_and(|&parked_slot| parked_slot != slot)
+        {
             return false;
         }
         self.column_parking
             .gloas_roots
             .get(&slot)
             .is_none_or(|roots| {
-                roots.contains(&root) || roots.len() < MAX_PARKED_GLOAS_ROOTS_PER_SLOT
+                roots.contains(&root)
+                    || roots.len() < MAX_PARKED_GLOAS_ROOTS_PER_SLOT
+                    || self.holds_block(&root)
             })
+    }
+
+    /// Whether this actor holds the block `root` names as pending (missing a
+    /// parent) or held (for columns, or for its parent's payload).
+    fn holds_block(&self, root: &H256) -> bool {
+        self.pending_block_parents.contains_key(root)
+            || self.blocks_awaiting_columns.contains_key(root)
+            || self.envelopes.is_block_held(root)
     }
 
     /// Republish how many sidecars are parked, from the running count.
@@ -308,7 +316,7 @@ impl BlockChainServer {
             .column_parking
             .count
             .saturating_sub(parked_columns.len());
-        if let Some(slot) = parked_columns.iter().next().map(|parked| parked.slot)
+        if let Some(slot) = self.column_parking.gloas_root_slots.remove(&block_root)
             && let Some(roots) = self.column_parking.gloas_roots.get_mut(&slot)
         {
             roots.remove(&block_root);
@@ -357,14 +365,25 @@ impl BlockChainServer {
     /// uptime. A sidecar at or below the finalized slot can never be needed
     /// again, since the chain checks would drop it outright now.
     pub(crate) fn evict_sidecars_awaiting_parent_at_or_below_finality(&mut self) {
-        if self.sidecars_awaiting_parent.is_empty() {
-            return;
-        }
         let finalized_slot = self
             .store
             .latest_finalized()
             .expect("finalized checkpoint exists")
             .slot;
+
+        // Swept on every call, not only when a row is dropped: a root whose
+        // sidecars were all replayed or refused leaves its bookkeeping behind,
+        // and nothing else would clear it.
+        self.column_parking
+            .gloas_roots
+            .retain(|slot, _| *slot > finalized_slot);
+        self.column_parking
+            .gloas_root_slots
+            .retain(|_, slot| *slot > finalized_slot);
+
+        if self.sidecars_awaiting_parent.is_empty() {
+            return;
+        }
 
         let mut dropped: Vec<ParkedColumn> = Vec::new();
         self.sidecars_awaiting_parent.retain(|_, parked_columns| {
@@ -380,9 +399,6 @@ impl BlockChainServer {
 
         if !dropped.is_empty() {
             self.column_parking.count = self.column_parking.count.saturating_sub(dropped.len());
-            self.column_parking
-                .gloas_roots
-                .retain(|slot, _| *slot > finalized_slot);
             info!(
                 finalized_slot,
                 count = dropped.len(),
@@ -527,7 +543,7 @@ mod tests {
         let block_root = H256::repeat_byte(5);
         let sidecar = gloas_sidecar_at(10, block_root, 3);
 
-        server.park_followed_columns(vec![sidecar.clone()]);
+        server.park_data_columns(vec![sidecar.clone()]);
 
         assert_eq!(
             server.sidecars_awaiting_parent.get(&block_root),
@@ -573,7 +589,7 @@ mod tests {
             .expect("insert");
         let sidecar = gloas_sidecar_at(10, block_root, 3);
 
-        server.park_followed_columns(vec![sidecar.clone()]);
+        server.park_data_columns(vec![sidecar.clone()]);
 
         assert!(server.sidecars_awaiting_parent.is_empty());
         assert_eq!(*p2p.checks.lock().unwrap(), vec![vec![sidecar]]);
@@ -591,31 +607,107 @@ mod tests {
             .insert_state(block_root, bare_state())
             .expect("insert");
 
-        server.park_followed_columns(vec![gloas_sidecar_at(10, block_root, 3)]);
+        server.park_data_columns(vec![gloas_sidecar_at(10, block_root, 3)]);
 
         assert!(server.sidecars_awaiting_parent.contains_key(&block_root));
         assert!(p2p.checks.lock().unwrap().is_empty());
     }
 
     #[test]
-    fn a_gloas_sidecar_is_dropped_while_the_node_does_not_follow_gloas() {
-        // `ForkName::is_followed` is false for gloas today: no gloas block
-        // imports, so nothing would ever drain a parked row.
+    fn a_gloas_sidecar_parks_although_gloas_is_not_in_the_followed_set() {
+        // Gloas blocks import now, so a parked row has a block to drain it;
+        // `ForkName::is_followed` belongs to the anchor, RPC and gossip side
+        // and no longer decides whether the parking lot keeps a column.
         let (mut server, p2p) = gloas_server();
         let block_root = H256::repeat_byte(5);
 
         server.park_data_columns(vec![gloas_sidecar_at(10, block_root, 3)]);
 
-        assert!(server.sidecars_awaiting_parent.is_empty());
-        assert_eq!(server.column_parking.count, 0);
-        assert!(
-            server
-                .store
-                .take_pending_data_column(10, &block_root, 3)
-                .expect("DB read should succeed")
-                .is_none()
-        );
+        assert!(server.sidecars_awaiting_parent.contains_key(&block_root));
+        assert_eq!(server.column_parking.count, 1);
         assert!(p2p.checks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_fulu_sidecar_naming_a_gloas_root_as_parent_does_not_decide_that_roots_slot() {
+        // The parked set is keyed by the awaited root alone, so a forged fulu
+        // sidecar whose parent is the gloas root R shares R's set. R's slot
+        // must come from its own record, not from whichever element the set
+        // yields first.
+        let (mut server, _p2p) = gloas_server();
+        let root = H256::repeat_byte(5);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar_at(7, root))]);
+
+        server.park_data_columns(vec![
+            gloas_sidecar_at(10, root, 0),
+            gloas_sidecar_at(10, root, 1),
+        ]);
+
+        assert_eq!(server.column_parking.gloas_root_slots.get(&root), Some(&10));
+        assert_eq!(server.sidecars_awaiting_parent[&root].len(), 3);
+
+        // Draining the root frees its bookkeeping even though the first parked
+        // element was the fulu one.
+        server.drain_sidecars_awaiting_parent(root);
+        assert!(server.column_parking.gloas_roots.is_empty());
+        assert!(server.column_parking.gloas_root_slots.is_empty());
+    }
+
+    #[test]
+    fn a_gloas_root_parked_at_one_slot_refuses_a_sidecar_naming_another() {
+        let (mut server, _p2p) = gloas_server();
+        let root = H256::repeat_byte(5);
+        server.park_data_columns(vec![DataColumnSidecar::Fulu(sidecar_at(7, root))]);
+        server.park_data_columns(vec![gloas_sidecar_at(10, root, 0)]);
+
+        server.park_data_columns(vec![gloas_sidecar_at(9, root, 1)]);
+
+        assert!(
+            !server.sidecars_awaiting_parent[&root]
+                .iter()
+                .any(|parked| parked.slot == 9)
+        );
+        assert_count_matches(&server);
+    }
+
+    #[test]
+    fn eviction_clears_gloas_bookkeeping_even_when_no_sidecar_is_left_to_drop() {
+        // A root whose sidecars were all replayed leaves its entries behind;
+        // the sweep must not return early on an empty parking map.
+        let mut server = beacon_server(beacon_store(GENESIS_TIME, 10));
+        let root = H256::repeat_byte(5);
+        server
+            .column_parking
+            .gloas_roots
+            .insert(10, HashSet::from([root]));
+        server.column_parking.gloas_root_slots.insert(root, 10);
+        assert!(server.sidecars_awaiting_parent.is_empty());
+
+        server.evict_sidecars_awaiting_parent_at_or_below_finality();
+
+        assert!(server.column_parking.gloas_roots.is_empty());
+        assert!(server.column_parking.gloas_root_slots.is_empty());
+    }
+
+    #[test]
+    fn a_root_the_actor_already_holds_as_a_block_is_exempt_from_the_slot_cap() {
+        let (mut server, _p2p) = gloas_server();
+        for byte in 1..=MAX_PARKED_GLOAS_ROOTS_PER_SLOT as u8 {
+            server.park_data_columns(vec![gloas_sidecar_at(10, H256::repeat_byte(byte), 0)]);
+        }
+        let honest = H256::repeat_byte(0xaa);
+        let forged = H256::repeat_byte(0xbb);
+        // The honest block is pending on a parent this node does not have.
+        server.pending_block_parents.insert(honest, H256::ZERO);
+
+        server.park_data_columns(vec![
+            gloas_sidecar_at(10, forged, 0),
+            gloas_sidecar_at(10, honest, 0),
+        ]);
+
+        assert!(!server.sidecars_awaiting_parent.contains_key(&forged));
+        assert!(server.sidecars_awaiting_parent.contains_key(&honest));
+        assert_count_matches(&server);
     }
 
     #[test]
@@ -631,7 +723,7 @@ mod tests {
             sidecar.kzg_proofs = Default::default();
         }
 
-        server.park_followed_columns(vec![uncustodied, empty]);
+        server.park_data_columns(vec![uncustodied, empty]);
 
         assert!(server.sidecars_awaiting_parent.is_empty());
         assert_eq!(server.column_parking.count, 0);
@@ -653,7 +745,7 @@ mod tests {
             .map(H256::repeat_byte)
             .collect();
         for &root in &roots {
-            server.park_followed_columns(vec![gloas_sidecar_at(10, root, 0)]);
+            server.park_data_columns(vec![gloas_sidecar_at(10, root, 0)]);
         }
 
         let (admitted, refused) = roots.split_at(MAX_PARKED_GLOAS_ROOTS_PER_SLOT);
@@ -675,7 +767,7 @@ mod tests {
 
         // A root already parked keeps taking its other columns, and another
         // slot has a cap of its own.
-        server.park_followed_columns(vec![
+        server.park_data_columns(vec![
             gloas_sidecar_at(10, admitted[0], 1),
             gloas_sidecar_at(9, refused[0], 0),
         ]);
@@ -688,7 +780,7 @@ mod tests {
     fn every_sidecar_parked_for_a_gloas_root_shares_its_slot() {
         let (mut server, _p2p) = gloas_server();
         let root = H256::repeat_byte(5);
-        server.park_followed_columns(vec![
+        server.park_data_columns(vec![
             gloas_sidecar_at(10, root, 0),
             gloas_sidecar_at(9, root, 1),
         ]);
