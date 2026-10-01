@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use lru::LruCache;
 
 use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
+use crate::pools::{AttestationPool, OperationPool};
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -839,6 +840,10 @@ pub struct Store {
     fork_choice: Arc<Mutex<ForkChoiceState>>,
     /// In-memory gossip signatures, consumed at interval 2 aggregation.
     gossip_signatures: Arc<Mutex<GossipSignatureBuffer>>,
+    /// Beacon attestation pool. See [`Store::attestation_pool`].
+    attestation_pool: Arc<Mutex<AttestationPool>>,
+    /// Beacon operation pool. See [`Store::operation_pool`].
+    operation_pool: Arc<Mutex<OperationPool>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -1512,12 +1517,34 @@ impl Store {
             gossip_signatures: Arc::new(Mutex::new(GossipSignatureBuffer::new(
                 GOSSIP_SIGNATURE_CAP,
             ))),
+            attestation_pool: Default::default(),
+            operation_pool: Default::default(),
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
             beacon: Default::default(),
             state_writer,
         }
+    }
+
+    /// The beacon attestation pool: validated votes and single-committee
+    /// aggregates, read by the aggregate endpoint and block production.
+    ///
+    /// Shared by every clone of this `Store`, so there is exactly one per
+    /// node. Hold the guard briefly and never across an `.await`. Always empty
+    /// on lean.
+    pub fn attestation_pool(&self) -> MutexGuard<'_, AttestationPool> {
+        self.attestation_pool
+            .lock()
+            .expect("attestation pool lock poisoned")
+    }
+
+    /// The beacon operation pool. Same sharing and locking rules as
+    /// [`Store::attestation_pool`].
+    pub fn operation_pool(&self) -> MutexGuard<'_, OperationPool> {
+        self.operation_pool
+            .lock()
+            .expect("operation pool lock poisoned")
     }
 
     // ============ Metadata Helpers ============

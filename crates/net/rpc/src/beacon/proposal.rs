@@ -27,7 +27,6 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     block_production::{
         BlockInputs, advance_to_slot, assemble_block, pack_attestations, parse_execution_requests,
         payload_inputs,
@@ -173,7 +172,6 @@ async fn get_block(
     Query(query): Query<ProduceQuery>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
-    Extension(pool): Extension<SharedAttestationPool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     headers: HeaderMap,
 ) -> Response {
@@ -190,7 +188,6 @@ async fn get_block(
     let produced = produce(
         &store,
         &engine,
-        &pool,
         &fee_recipients,
         slot,
         query.randao_reveal,
@@ -237,7 +234,6 @@ async fn get_block(
 async fn produce(
     store: &Store,
     engine: &EngineClient,
-    pool: &SharedAttestationPool,
     fee_recipients: &FeeRecipients,
     slot: Slot,
     randao_reveal: BlsSignature,
@@ -271,10 +267,7 @@ async fn produce(
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     let payload_value = decimal(&built.block_value);
 
-    let candidates = pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .block_candidates();
+    let candidates = store.attestation_pool().block_candidates();
     let attestations = pack_attestations(&state, candidates);
     let inputs = |attestations| BlockInputs {
         randao_reveal,

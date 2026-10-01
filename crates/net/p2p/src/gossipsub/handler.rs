@@ -708,11 +708,7 @@ pub fn prune_attestation_pool(server: &P2PServer) {
         return;
     };
     let now = beacon_wall_slot(wire);
-    server
-        .attestation_pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .prune_before(now);
+    server.store.attestation_pool().prune_before(now);
 }
 
 /// Leave every aggregator subnet whose last slot has passed.

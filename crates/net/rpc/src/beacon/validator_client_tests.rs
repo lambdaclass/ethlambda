@@ -12,7 +12,6 @@ use std::sync::Arc;
 use axum::Extension;
 use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::helpers::{
     accessors::get_domain,
     fulu::initialize_proposer_lookahead,
@@ -89,7 +88,6 @@ async fn serve_with_engine(
     let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
-        .layer(Extension(SharedAttestationPool::default()))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
         .layer(Extension(engine));
 

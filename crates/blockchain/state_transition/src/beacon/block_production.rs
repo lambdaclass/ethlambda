@@ -33,7 +33,6 @@ use ethlambda_types::beacon::{
 use libssz::SszDecode as _;
 use libssz_types::SszList;
 
-use super::attestation_pool::single_committee;
 use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
@@ -45,6 +44,7 @@ use super::helpers::electra::{
     get_attesting_indices, get_indexed_attestation, is_valid_indexed_attestation,
 };
 use super::stf::{self, ExecutionEngine};
+use ethlambda_storage::pools::single_committee;
 
 /// `state` advanced through empty slots to `slot`, as a block for `slot` is
 /// applied to it. A state already at `slot` is returned as it is.
