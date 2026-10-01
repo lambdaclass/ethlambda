@@ -277,6 +277,11 @@ actual_slot = finalized_slot + 1 + relative_index
   proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
   which recycles the prover's large buffers across proofs instead of re-faulting
   them, so its pages stay resident for the node's lifetime
+- Every proof runs on one dedicated `leanvm-prover` thread (`prove` in
+  `ethlambda-crypto`). The arena pins a slab to each thread that ever drives a
+  proof, so proving from the calling thread (tokio's blocking pool, the actors)
+  grew RSS one proof peak per new thread until aggregators were OOM-killed.
+  `tests/arena_slabs.rs` guards this
 - `ethlambda keygen` generates genesis validator keys through the same
   `ValidatorSecretKey` the node loads them with, so a key set cannot be built
   against a different leanVM than the client reading it. Keys are only usable by
