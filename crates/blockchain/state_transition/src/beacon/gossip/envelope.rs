@@ -13,7 +13,9 @@
 //! - A block seen without a post-state is [`Outcome::Queue`] where the
 //!   specification rejects it, the same deviation every other topic makes until
 //!   a bad-block cache exists. A block never seen is `Queue` too (the
-//!   specification's "MAY be queued").
+//!   specification's "MAY be queued"), and so is a block whose post-state
+//!   exists but is not cached, since the chain actor verifies the signature
+//!   itself.
 //! - The block-independent limits (withdrawal and request counts) run in
 //!   [`cheap_checks`], so a message that no block could make valid is never
 //!   queued.
@@ -29,7 +31,8 @@ use lru::LruCache;
 
 use super::column::judgeable_block_gloas;
 use super::{
-    IgnoreReason, Outcome, RejectReason, execution_requests_within_limits, finalized_start_slot,
+    IgnoreReason, Outcome, QueueReason, RejectReason, execution_requests_within_limits,
+    finalized_start_slot,
 };
 use crate::beacon::containers::gloas::BuilderIndex;
 use crate::beacon::containers::{SignedBeaconBlock, gloas};
@@ -101,6 +104,17 @@ pub fn cheap_checks(
 
 /// The rules that need the envelope's block and its post-state, then the
 /// signature. Runs on a blocking thread.
+///
+/// A block that is known and has a post-state, but whose state is not in the
+/// cache this reads, is [`Outcome::Queue`] ([`QueueReason::StateNotCached`]),
+/// not an ignore. The state is never rebuilt here, since a miss would stall
+/// the verdict gossipsub waits on, and a block imported moments ago is
+/// exactly when it is missing. The chain actor fully verifies every envelope
+/// it receives (bid consistency, the builder's signature against the block's
+/// post-state before parking it, then `verify_execution_payload_envelope`),
+/// so forwarding it without propagating is safe, whereas dropping it stalls
+/// sync: a fetched envelope for a block the actor is holding would be lost
+/// until the next per-slot re-ask.
 pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEnvelope) -> Outcome {
     let message = &envelope.message;
     let payload = &message.payload;
@@ -146,7 +160,7 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
     // post-state, never rebuilt: a miss would stall the verdict gossipsub
     // waits on.
     let Some(state) = store.cached_state(CacheKey::BlockState(message.beacon_block_root)) else {
-        return Outcome::Ignore(IgnoreReason::StateUnavailable);
+        return Outcome::Queue(QueueReason::StateNotCached);
     };
     // An error (a builder the state has no entry for) is a signature that
     // cannot be valid.
@@ -176,9 +190,10 @@ pub fn validate(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::beacon::containers::electra;
-    use crate::beacon::gossip::QueueReason;
     use crate::beacon::gossip::test_support::{fulu_parent, seen_envelopes, store};
     use crate::beacon::primitives::Slot;
 
@@ -295,6 +310,51 @@ mod tests {
         assert_eq!(
             validate(&seen_envelopes(), &store, &envelope(5, 0)),
             Outcome::Queue(QueueReason::BlockNotReady)
+        );
+    }
+
+    /// A known gloas block with a post-state on disk, but with that state
+    /// evicted from the cache the checks read, must be forwarded (queued), not
+    /// dropped: the observed stall was a fetched envelope lost this way.
+    #[test]
+    fn an_envelope_whose_block_state_is_not_cached_is_queued_not_ignored() {
+        let envelope = envelope(5, 0);
+        let mut block = gloas::SignedBeaconBlock::default();
+        block.message.slot = 5;
+        block
+            .message
+            .body
+            .signed_execution_payload_bid
+            .message
+            .execution_requests_root = envelope.message.execution_requests.hash_tree_root();
+        let mut store = store(0);
+        store
+            .insert_pending_block(BLOCK_ROOT, SignedBeaconBlock::Gloas(block))
+            .expect("insert the block");
+        let state = fulu_parent(3);
+        store
+            .insert_state(BLOCK_ROOT, state.clone())
+            .expect("insert the state");
+        // Churn the cache past its capacity with other keys until the block's
+        // state is evicted; the pending-state buffer still answers `has_state`.
+        let filler = Arc::new(state);
+        for epoch in 0..1024 {
+            store.cache_state(
+                CacheKey::CheckpointState {
+                    epoch,
+                    root: Root::ZERO,
+                },
+                filler.clone(),
+            );
+        }
+        assert!(
+            store
+                .cached_state(CacheKey::BlockState(BLOCK_ROOT))
+                .is_none()
+        );
+        assert_eq!(
+            validate(&seen_envelopes(), &store, &envelope),
+            Outcome::Queue(QueueReason::StateNotCached)
         );
     }
 

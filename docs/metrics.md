@@ -366,7 +366,10 @@ label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
 `payload_attestation_message` are labelled by their own name. `queue` means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only `execution_payload` answers it, for an envelope
-whose block is not known yet. The aggregate, attestation and
+whose block is not known yet (`block_unknown`), has no post-state yet
+(`block_not_ready`), or has one that is not in the cache the checks read
+(`state_not_cached`, as when the block was imported moments ago; the actor
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
 `payload_attestation_message` topics never answer `queue`, since the vote
 block's post-state is either cached or it is not
 (`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the

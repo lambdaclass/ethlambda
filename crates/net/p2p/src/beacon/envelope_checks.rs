@@ -239,6 +239,7 @@ pub(crate) mod tests {
     fn only_accept_and_queue_reach_the_chain_actor() {
         assert!(forwards(&Outcome::Accept));
         assert!(forwards(&Outcome::Queue(QueueReason::BlockUnknown)));
+        assert!(forwards(&Outcome::Queue(QueueReason::StateNotCached)));
         assert!(!forwards(&Outcome::Ignore(IgnoreReason::Finalized)));
         assert!(!forwards(&Outcome::Reject(RejectReason::BadSignature)));
     }
