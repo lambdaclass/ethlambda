@@ -1231,9 +1231,9 @@ impl Store {
         root: H256,
         signed_block: SignedBlock,
     ) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        write_signed_block(batch.as_mut(), &root, signed_block);
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        write_signed_block(batch.as_mut(), &root, signed_block)?;
+        batch.commit()?;
         Ok(())
     }
 
@@ -1249,18 +1249,16 @@ impl Store {
         root: H256,
         signed_block: SignedBlock,
     ) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let block = write_signed_block(batch.as_mut(), &root, signed_block);
+        let mut batch = self.backend.begin_write()?;
+        let block = write_signed_block(batch.as_mut(), &root, signed_block)?;
 
         let index_entries = vec![(
             encode_slot_root_key(block.slot, &root),
             block.parent_root.to_ssz(),
         )];
-        batch
-            .put_batch(Table::LiveChain, index_entries)
-            .expect("put non-finalized chain index");
+        batch.put_batch(Table::LiveChain, index_entries)?;
 
-        batch.commit().expect("commit");
+        batch.commit()?;
         self.record_known_attestation_votes(&block.body.attestations);
         Ok(())
     }
@@ -1304,26 +1302,34 @@ impl Store {
     /// a missing proof surfaces as `None` (a pruned finalized block can no
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(Self::signed_block_from_view(view.as_ref(), root))
+        let view = self.backend.begin_read()?;
+        let block = Self::signed_block_from_view(view.as_ref(), root)?;
+        Ok(block)
     }
 
-    fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
+    fn signed_block_from_view(
+        view: &dyn StorageReadView,
+        root: &H256,
+    ) -> Result<Option<SignedBlock>, Error> {
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key)? else {
+            return Ok(None);
+        };
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
+                return Ok(None);
+            };
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
+        let proof = match view.get(Table::BlockProof, &sig_key)? {
             Some(proof_bytes) => {
                 MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
@@ -1331,15 +1337,15 @@ impl Store {
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
             None if header.slot == 0 => MultiMessageAggregate::default(),
-            None => return None,
+            None => return Ok(None),
         };
 
         let block = Block::from_header_and_body(header, body);
 
-        Some(SignedBlock {
+        Ok(Some(SignedBlock {
             message: block,
             proof,
-        })
+        }))
     }
 
     /// Return the canonical block root at `slot`, or `None` when the canonical
@@ -1371,21 +1377,19 @@ impl Store {
         start_slot: u64,
         end_slot: u64,
     ) -> Result<Vec<SignedBlock>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let mut blocks = Vec::new();
         for slot in start_slot..=end_slot {
             // Read the index through this range's own view rather than via
             // `canonical_root_at_slot`, which opens a fresh one per call: a
             // range must be served from a single snapshot so a head change
             // partway through cannot splice two branches into one response.
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root_bytes) = view.get(Table::BlockRoots, &encode_block_root_key(slot))?
             else {
                 continue;
             };
             let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
-            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
+            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root)? {
                 blocks.push(block);
             }
         }
@@ -1904,7 +1908,7 @@ fn write_signed_block(
     batch: &mut dyn StorageWriteBatch,
     root: &H256,
     signed_block: SignedBlock,
-) -> Block {
+) -> Result<Block, Error> {
     let SignedBlock {
         message: block,
         proof,
@@ -1914,26 +1918,20 @@ fn write_signed_block(
     let root_bytes = root.to_ssz();
 
     let header_entries = vec![(root_bytes.clone(), header.to_ssz())];
-    batch
-        .put_batch(Table::BlockHeaders, header_entries)
-        .expect("put block header");
+    batch.put_batch(Table::BlockHeaders, header_entries)?;
 
     // Skip storing empty bodies - they can be reconstructed from the header's body_root
     if header.body_root != *EMPTY_BODY_ROOT {
         let body_entries = vec![(root_bytes.clone(), block.body.to_ssz())];
-        batch
-            .put_batch(Table::BlockBodies, body_entries)
-            .expect("put block body");
+        batch.put_batch(Table::BlockBodies, body_entries)?;
     }
 
     // Store the merged multi-message aggregate proof blob, keyed by slot||root
     // so proof pruning can scan in slot order and stop early.
     let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
-    batch
-        .put_batch(Table::BlockProof, proof_entries)
-        .expect("put block proof");
+    batch.put_batch(Table::BlockProof, proof_entries)?;
 
-    block
+    Ok(block)
 }
 
 #[cfg(test)]
