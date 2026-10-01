@@ -173,10 +173,10 @@ impl Validated {
     /// An envelope goes on when accepted, and also when queued: the chain
     /// actor holds an envelope whose block it has not imported yet, which is
     /// exactly what `Queue` means, and its own checks judge it again once the
-    /// block is there. Any other outcome keeps it away, since the actor trusts
-    /// the signature gossip verified. A payload attestation goes on only when
-    /// accepted: a vote for a block not imported here is only valid within its
-    /// own slot, so there is nothing to hold it for.
+    /// block is there; a queued one has not had its signature checked, so the
+    /// actor checks it before it parks one. Any other outcome keeps it away. A
+    /// payload attestation goes on only when accepted: it is only valid within
+    /// its own slot, and the specification makes queueing one optional.
     ///
     /// What an accepted subnet attestation does feed is the attestation pool,
     /// when its subnet is one a validator client's aggregator had this node
@@ -412,6 +412,23 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
     forward
 }
 
+/// The permit pool `object`'s stateful checks draw from: blocks, columns and
+/// envelopes from the gossip pool, everything the attesters send from the
+/// attestation pool, so neither burst starves the other.
+fn permits_for<'a>(
+    server: &'a P2PServer,
+    object: &Validated,
+) -> &'a std::sync::Arc<tokio::sync::Semaphore> {
+    match object {
+        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
+            &server.gossip_validation_permits
+        }
+        Validated::Aggregate { .. }
+        | Validated::Attestation { .. }
+        | Validated::PayloadAttestation(_) => &server.attestation_validation_permits,
+    }
+}
+
 /// Run `object`'s stateful checks on a blocking thread. The verdict comes back
 /// to the actor as a [`GossipVerdict`].
 ///
@@ -437,15 +454,7 @@ pub(crate) fn spawn_stateful_checks(
     id: GossipId,
     object: Validated,
 ) {
-    let permits = match &object {
-        Validated::Block { .. } | Validated::Column(_) | Validated::Envelope(_) => {
-            &server.gossip_validation_permits
-        }
-        Validated::Aggregate { .. }
-        | Validated::Attestation { .. }
-        | Validated::PayloadAttestation(_) => &server.attestation_validation_permits,
-    };
-    let Ok(permit) = permits.clone().try_acquire_owned() else {
+    let Ok(permit) = permits_for(server, &object).clone().try_acquire_owned() else {
         let received_at = id.received_at;
         let outcome = Outcome::Ignore(IgnoreReason::Overloaded);
         report(server, id, outcome);
@@ -502,7 +511,7 @@ mod tests {
     use spawned_concurrency::error::ActorError;
 
     use super::*;
-    use crate::test_support::{unconnected_beacon_server, valid_shaped_sidecar};
+    use crate::test_support::{envelope, unconnected_beacon_server, valid_shaped_sidecar};
 
     /// A minimal fulu block for a given `(slot, proposer)`: `settle` and
     /// `record_seen` only ever read those two fields plus the root passed
@@ -859,10 +868,6 @@ mod tests {
         assert!(!chain.0.load(Ordering::SeqCst));
     }
 
-    /// The pool an aggregate or a subnet attestation draws its stateful-check
-    /// permit from is not the pool a block or a column draws from: exhausting
-    /// one must leave the other untouched, or a burst on this topic could
-    /// make a block or a column answer `Ignore(Overloaded)` too.
     /// What `forward` handed the chain actor, by method.
     #[derive(Debug, PartialEq)]
     enum Sent {
@@ -938,8 +943,6 @@ mod tests {
         message.data.slot = slot;
         message
     }
-
-    use crate::test_support::envelope;
 
     #[tokio::test]
     async fn the_first_accept_for_an_envelope_key_stands_and_the_second_is_marked_seen() {
@@ -1027,10 +1030,32 @@ mod tests {
         assert_eq!(received.try_recv(), Ok(Sent::PayloadAttestation));
     }
 
+    /// The pool an aggregate or a subnet attestation draws its stateful-check
+    /// permit from is not the pool a block or a column draws from: exhausting
+    /// one must leave the other untouched, or a burst on this topic could
+    /// make a block or a column answer `Ignore(Overloaded)` too.
+    ///
+    /// An envelope shares the block pool and a payload attestation the
+    /// attestation pool, for the same reason: a slot's committee votes arrive
+    /// in a burst that must not starve block validation.
     #[tokio::test]
     async fn the_block_column_and_attestation_permit_pools_are_independent() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
         let attestation_permits_before = server.attestation_validation_permits.available_permits();
+
+        let same_pool = |a: &std::sync::Arc<tokio::sync::Semaphore>, b: &std::sync::Arc<_>| {
+            std::sync::Arc::ptr_eq(a, b)
+        };
+        let envelope = Validated::Envelope(Box::new(envelope(1, 3)));
+        let vote = Validated::PayloadAttestation(payload_attestation(5, 1));
+        assert!(same_pool(
+            permits_for(&server, &envelope),
+            &server.gossip_validation_permits
+        ));
+        assert!(same_pool(
+            permits_for(&server, &vote),
+            &server.attestation_validation_permits
+        ));
 
         let mut held = Vec::new();
         while let Ok(permit) = server.gossip_validation_permits.clone().try_acquire_owned() {

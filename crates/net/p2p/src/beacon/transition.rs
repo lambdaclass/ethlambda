@@ -363,6 +363,38 @@ mod tests {
         assert_eq!(window, vec![schedule.digest_at(GLOAS - 1)]);
     }
 
+    /// While the rollover window holds a fulu and a gloas digest, only the
+    /// gloas one carries the two topics gloas adds, whether the gloas digest
+    /// is joined ahead of the fork or is current.
+    #[tokio::test]
+    async fn only_the_gloas_digest_holds_the_gloas_topics() {
+        let has_gloas_kinds = |held: &BeaconTopics| {
+            topics::GLOAS_TOPIC_KINDS.iter().all(|kind| {
+                let name = topics::topic_name(held.fork_digest, kind);
+                held.topics.iter().any(|topic| topic.to_string() == name)
+            })
+        };
+        let has_no_gloas_kinds = |held: &BeaconTopics| {
+            topics::GLOAS_TOPIC_KINDS.iter().all(|kind| {
+                let name = topics::topic_name(held.fork_digest, kind);
+                held.topics.iter().all(|topic| topic.to_string() != name)
+            })
+        };
+
+        let mut server = unconnected_beacon_server(config(), 0).await;
+        // Ahead of the fork: fulu is current, gloas is joined in the window.
+        apply(&mut server, GLOAS - 1);
+        let wire = server.wire.beacon().unwrap();
+        assert!(has_no_gloas_kinds(&wire.topics));
+        assert!(has_gloas_kinds(&wire.window_topics[0]));
+
+        // After it: gloas is current, fulu is still held.
+        apply(&mut server, GLOAS);
+        let wire = server.wire.beacon().unwrap();
+        assert!(has_gloas_kinds(&wire.topics));
+        assert!(has_no_gloas_kinds(&wire.window_topics[0]));
+    }
+
     #[tokio::test]
     async fn a_message_takes_its_fork_from_its_topic() {
         let config = config();

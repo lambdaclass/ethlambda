@@ -365,10 +365,12 @@ label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
 `beacon_attestation`. The gloas topics `execution_payload` and
 `payload_attestation_message` are labelled by their own name. `queue` means
 IGNORE to gossipsub while the chain actor still receives the object and parks
-it (an `execution_payload` whose block is unknown answers it); neither the aggregate nor the
-attestation topic ever answers `queue`, since the vote block's post-state is
-either cached or it is not (`IgnoreReason::UnknownBlock`/`StateUnavailable`),
-with nothing to hold the message for. **`verdict_expired_total` should stay at
+it; of the gloas topics only `execution_payload` answers it, for an envelope
+whose block is not known yet. The aggregate, attestation and
+`payload_attestation_message` topics never answer `queue`, since the vote
+block's post-state is either cached or it is not
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
+message for. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 

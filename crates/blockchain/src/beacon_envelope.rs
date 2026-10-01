@@ -46,6 +46,7 @@ use ethlambda_network_api::FetchRequest;
 use ethlambda_state_transition::beacon::fork::ForkName;
 use ethlambda_state_transition::beacon::fork_choice::{self, PayloadStatus, PayloadStatusEnum};
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
+use ethlambda_state_transition::beacon::stf::gloas as stf_gloas;
 use ethlambda_types::ShortRoot;
 use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock, gloas};
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
@@ -272,7 +273,10 @@ impl BlockChainServer {
 
         // The cheap half of verification, before anything is held: only an
         // envelope that matches the bid its block committed to may occupy a
-        // hold or cost a fetch. The signature is p2p's gossip check.
+        // hold or cost a fetch. The signature is checked later, where an
+        // envelope is parked (see `Self::hold_envelope_awaiting_columns`), or
+        // by `on_execution_payload_envelope` when it is applied: gossip
+        // validation does not reach it for an envelope it queued.
         if !envelope_matches_bid(&held.envelope.message, bid, slot) {
             warn!(
                 %slot,
@@ -422,6 +426,20 @@ impl BlockChainServer {
         self.publish_envelope_queues();
     }
 
+    /// Whether `envelope`'s builder signature holds against the post-state of
+    /// the block `root`, which must be imported. A state that cannot be read,
+    /// or a builder the state does not know, reads as an invalid signature.
+    fn envelope_signature_holds(
+        &self,
+        root: H256,
+        envelope: &gloas::SignedExecutionPayloadEnvelope,
+    ) -> bool {
+        let Some(state) = self.store.get_state(&root).ok().flatten() else {
+            return false;
+        };
+        stf_gloas::verify_execution_payload_envelope_signature(&state, envelope).unwrap_or(false)
+    }
+
     fn hold_envelope_awaiting_columns(
         &mut self,
         root: H256,
@@ -432,6 +450,21 @@ impl BlockChainServer {
         held.slot = slot;
         // One envelope per root; a re-delivery replaces nothing.
         if self.envelopes.awaiting_columns.contains_key(&root) {
+            return;
+        }
+        // Gossip validation answered `Queue` for an envelope whose block it
+        // had not seen, before it reached the signature, so nothing has
+        // checked this one yet. A forged copy carrying the honest payload and
+        // a bad signature would otherwise take the root's one slot here and
+        // shut the honest envelope out. One BLS verification per root, against
+        // the state of the block it names.
+        if !self.envelope_signature_holds(root, &held.envelope) {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&root.0),
+                "Dropping an envelope with an invalid signature"
+            );
+            self.refetch_envelope_if_children_wait(root);
             return;
         }
         info!(
@@ -550,7 +583,7 @@ impl BlockChainServer {
                 // duplicates of it. One parked for columns is enough too: it
                 // matched the bid, whose block hash commits to the whole
                 // payload, so a second bid-consistent candidate differs only
-                // in a signature p2p already checked.
+                // in a signature, which a parked one has had checked.
                 for held in self.take_ready_envelopes(root) {
                     if self.apply_or_hold_envelope(held) {
                         break;
@@ -1056,6 +1089,46 @@ mod tests {
                 .envelopes
                 .awaiting_columns
                 .contains_key(&root(PARENT))
+        );
+    }
+
+    /// Gossip validation queues an envelope for an unseen block before it
+    /// reaches the signature, so the actor checks it where it parks one: a
+    /// copy with the honest payload and a bad signature, arriving first, must
+    /// not take the root's one slot from the honest envelope.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn a_bad_signature_copy_does_not_take_the_parking_slot() {
+        let case = Case::new("get_head", TIEBREAK);
+        let mut server = case.server(12);
+        server
+            .on_block(case.block(PARENT), ImportTimings::default())
+            .await;
+        let honest = case.envelope(PARENT_ENVELOPE);
+        let mut forged = honest.clone();
+        forged.signature = Default::default();
+        assert_ne!(forged.signature, honest.signature);
+
+        server.hold_envelope_awaiting_columns(
+            root(PARENT),
+            1,
+            HeldEnvelope::new(forged, 1, 0),
+            vec![],
+        );
+        assert!(server.envelopes.awaiting_columns.is_empty());
+
+        server.hold_envelope_awaiting_columns(
+            root(PARENT),
+            1,
+            HeldEnvelope::new(honest.clone(), 1, 0),
+            vec![],
+        );
+        assert_eq!(
+            server.envelopes.awaiting_columns[&root(PARENT)].envelope,
+            honest
         );
     }
 

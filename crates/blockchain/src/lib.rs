@@ -3546,23 +3546,19 @@ impl BlockChainServer {
     /// and only the arrival says which slot that is.
     ///
     /// An error is logged at `debug` and the vote dropped. The common cause
-    /// is a vote for a block not imported here yet, which per the
-    /// specification is only valid within its slot, so holding it would
-    /// serve nothing.
+    /// is a vote for a block not imported here yet. The vote is only valid
+    /// within its own slot and the specification makes queueing it optional,
+    /// so it is not held.
+    ///
+    /// The message passed gossip validation in `ethlambda-p2p`, which
+    /// verified its signature and the sender's committee seat, so only the
+    /// store-state checks run here.
     fn apply_payload_attestation_message(
         &mut self,
         message: &gloas::PayloadAttestationMessage,
         arrival: &BlockArrival,
     ) {
-        let arrival_ms = unix_now_ms();
-        let received = arrival.decode_start.unwrap_or(arrival.handed_off);
-        let in_flight_ms = u64::try_from(
-            Instant::now()
-                .saturating_duration_since(received)
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        self.advance_beacon_clock_to(arrival_ms.saturating_sub(in_flight_ms));
+        self.advance_beacon_clock_to(arrival.wire_ms(Instant::now(), unix_now_ms()));
         let config = self.store.config();
         let slot = message.data.slot;
         let validator = message.validator_index;
@@ -3809,10 +3805,7 @@ impl Handler<NewBlock> for BlockChainServer {
         // the attestation and payload timeliness deadlines. The arrival is the
         // wire receipt (`decode_start`), which predates validation and the
         // mailbox wait; `arrival_ms` was sampled at pickup.
-        let received = msg.arrival.decode_start.unwrap_or(msg.arrival.handed_off);
-        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
-            .unwrap_or(u64::MAX);
-        self.advance_beacon_clock_to(arrival_ms.saturating_sub(in_flight_ms));
+        self.advance_beacon_clock_to(msg.arrival.wire_ms(picked_up, arrival_ms));
         self.on_block(msg.block, timings).await;
         // A gloas envelope that arrived ahead of this block is judgeable now.
         self.settle_envelopes().await;
@@ -3827,20 +3820,27 @@ impl Handler<NewExecutionPayloadEnvelope> for BlockChainServer {
         };
         let arrival_ms = unix_now_ms();
         let picked_up = Instant::now();
-        let received = msg.arrival.decode_start.unwrap_or(msg.arrival.handed_off);
-        let in_flight_ms = u64::try_from(picked_up.saturating_duration_since(received).as_millis())
-            .unwrap_or(u64::MAX);
-        self.receive_envelope(*msg.envelope, arrival_ms.saturating_sub(in_flight_ms));
+        self.receive_envelope(*msg.envelope, msg.arrival.wire_ms(picked_up, arrival_ms));
         self.settle_envelopes().await;
     }
 }
 
 impl Handler<NewPayloadAttestationMessage> for BlockChainServer {
-    async fn handle(&mut self, msg: NewPayloadAttestationMessage, _ctx: &Context<Self>) {
+    async fn handle(&mut self, msg: NewPayloadAttestationMessage, ctx: &Context<Self>) {
         // Beacon-only: lean has no payload timeliness committee.
         let ChainDuties::Beacon = &self.duties else {
             return;
         };
+        // The catch-up tick a block gets: a tick still owed for the vote's
+        // slot would otherwise leave the store a slot behind and drop every
+        // vote of the new slot as not current.
+        let slot = msg.message.data.slot;
+        let config = self.store.config();
+        if self.ms_until_slot_start(slot) == 0
+            && fork_choice::get_current_slot(&self.store, &config) < slot
+        {
+            self.on_tick(unix_now_ms(), ctx).await;
+        }
         self.apply_payload_attestation_message(&msg.message, &msg.arrival);
     }
 }
