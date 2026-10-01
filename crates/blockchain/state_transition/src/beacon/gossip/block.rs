@@ -6,8 +6,8 @@ use ethlambda_storage::CacheKey;
 use tracing::warn;
 
 use super::{
-    IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, finalized_ancestry,
-    finalized_start_slot, is_future_slot,
+    IgnoreReason, Outcome, QueueReason, RejectReason, SeenBlocks, execution_requests_within_limits,
+    finalized_ancestry, finalized_start_slot, is_future_slot,
 };
 use crate::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
 use crate::beacon::fork_choice::{self, Store};
@@ -132,21 +132,6 @@ fn body_operations_within_limits(body: &gloas::BeaconBlockBody) -> bool {
         && body.voluntary_exits.len() <= preset::MAX_VOLUNTARY_EXITS
         && body.bls_to_execution_changes.len() <= preset::MAX_BLS_TO_EXECUTION_CHANGES
         && body.payload_attestations.len() as u64 <= preset::MAX_PAYLOAD_ATTESTATIONS
-}
-
-/// `verify_execution_requests_limits` (`specs/gloas/p2p-interface.md`).
-///
-/// The four lists the specification names: withdrawals, consolidations,
-/// builder deposits and builder exits. Deposit requests are deliberately not
-/// checked: gloas's `DepositRequests` is progressive and neither the
-/// specification nor the state transition bounds it, so a limit here would
-/// reject a block that import accepts.
-fn execution_requests_within_limits(requests: &gloas::ExecutionRequests) -> bool {
-    requests.withdrawals.len() <= preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
-        && requests.consolidations.len() <= preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
-        && requests.builder_deposits.len() as u64
-            <= preset::MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
-        && requests.builder_exits.len() as u64 <= preset::MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
 }
 
 /// The rules that need the parent's post-state. Runs on a blocking thread.
