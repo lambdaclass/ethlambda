@@ -9,9 +9,12 @@
 //!
 //! - `Accept`: forwarded.
 //! - `Queue`: forwarded too. The envelope's block (or its post-state) is not
-//!   here yet, and the actor holds such an envelope until the block imports,
-//!   which is exactly what a range answer needs, since its envelopes arrive
-//!   while the blocks they belong to are still queued in the actor's mailbox.
+//!   here yet, so the actor keeps it, but only briefly and in small numbers
+//!   (`ENVELOPE_AWAITING_BLOCK_TTL_SLOTS` by arrival slot, at most
+//!   `MAX_ENVELOPES_AWAITING_BLOCK_PER_SLOT` of them per slot), and the rest
+//!   are dropped. A range answer is therefore only safe to deliver while the
+//!   blocks it belongs to are imported in order, which is why range pacing
+//!   waits on it: see [`check_and_forward_then`].
 //! - `Ignore` and `Reject`: dropped.
 //!
 //! Envelopes go to the actor in the order given. The caller sorts them by
@@ -61,10 +64,36 @@ pub(crate) fn check_and_forward(
     server: &P2PServer,
     envelopes: Vec<SignedExecutionPayloadEnvelope>,
 ) {
+    check_and_forward_then(server, envelopes, None);
+}
+
+/// A completion callback: runs once every envelope that passed has been handed
+/// to the chain actor.
+pub(crate) type Done = Box<dyn FnOnce() + Send>;
+
+/// [`check_and_forward`], then `done` once the last passing envelope has been
+/// sent, or at once when there is nothing to check.
+///
+/// This is how range sync paces itself on a gloas batch: the next batch's
+/// blocks are requested only after `done`, so the actor never sees them ahead
+/// of this batch's envelopes. All of the batch's envelopes are sent by one
+/// task, in the order given, with nothing from another batch between them.
+pub(crate) fn check_and_forward_then(
+    server: &P2PServer,
+    envelopes: Vec<SignedExecutionPayloadEnvelope>,
+    done: Option<Done>,
+) {
+    let run_done = |done: Option<Done>| {
+        if let Some(done) = done {
+            done();
+        }
+    };
     if envelopes.is_empty() {
+        run_done(done);
         return;
     }
     let Some(blockchain) = server.blockchain.clone() else {
+        run_done(done);
         return;
     };
     let store = server.store.clone();
@@ -75,6 +104,9 @@ pub(crate) fn check_and_forward(
             // The semaphore is never closed, so this only returns once a
             // permit is free.
             let Ok(permit) = permits.clone().acquire_owned().await else {
+                if let Some(done) = done {
+                    done();
+                }
                 return;
             };
             let store = store.clone();
@@ -106,6 +138,9 @@ pub(crate) fn check_and_forward(
             let _ = blockchain
                 .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
                 .inspect_err(|err| warn!(%err, "Failed to forward a fetched envelope"));
+        }
+        if let Some(done) = done {
+            done();
         }
     });
 }
