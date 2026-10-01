@@ -246,7 +246,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed block (`publishBlockV2`, SSZ) |
-| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
+| `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 
 ### Validator endpoints
 
@@ -312,6 +312,17 @@ the chain actor writes, so no request waits on the actor.
   `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
   **`503`** without a configured execution client, or when the payload carries
   blobs.
+- **Graffiti** is the validator client's, with both clients' codes and
+  commits appended as far as they fit: `hello RH1a2bLA3c4d` for reth at
+  `1a2b…` under ethlambda at `3c4d…`. The execution client's half comes from
+  `engine_getClientVersionV1`, asked alongside the payload build and given up
+  on after `EL_VERSION_TIMEOUT`, and is left out when it cannot be had
+  (`hello LA3c4d`). The
+  suffix shrinks rather than cutting the validator's text short, in
+  Lighthouse's tiers, and is appended to every block with no opt-out; the
+  `graffiti_policy` parameter Lighthouse's validator client sends is not read.
+  `LA` is ethlambda's own code: `identification.md` reserves none for it and
+  lets an unlisted client pick any two letters no listed client uses.
 - **`POST beacon/blocks`** takes SSZ `SignedBlockContents`, checks the block
   is after the head and its proposer signature, then gossips it on
   `beacon_block` and hands it to the chain actor to import.
