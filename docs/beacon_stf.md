@@ -316,12 +316,15 @@ wholesale, so its code sits beside the pre-gloas code rather than inside it: `st
 section of `fork_choice.rs` (fork choice), and `containers/gloas.rs` in
 `ethlambda-types`. Every gloas case that is not ignored passes on both presets.
 
-The live follower does not follow gloas yet. `process_or_pend_block` refuses a
-gloas block and `refuse_unfollowable_fork` refuses a gloas anchor at startup,
-because nothing delivers payload envelopes or payload attestations to the chain
-actor. Gloas blocks and data columns are validated by their own gossip rules;
-the other gloas topics are answered with `Ignore(UnsupportedFork)` rather than
-scored, so an honest peer past the fork epoch is not penalized.
+The live follower follows gloas (`ForkName::Gloas.is_followed()`): the chain
+actor imports gloas blocks and their payload envelopes, a gloas checkpoint
+anchor is accepted (it starts EMPTY, with no payload known), and the clock
+passing the fork epoch no longer forces the sync status to syncing. Fork choice
+records the head node's payload status next to the head root
+(`Store::head_payload_status`, in memory, recomputed by the first head
+computation after a restart), which the envelope by-range server reads to
+withhold the head's envelope while the head is the EMPTY node. The node is
+still only a follower: the validator-client endpoints refuse a gloas epoch.
 
 ### The deferred payload
 

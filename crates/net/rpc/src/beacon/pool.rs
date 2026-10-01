@@ -49,7 +49,7 @@ use ethlambda_types::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::beacon::{ApiError, refuse_unfollowed_epoch, validator::head};
+use crate::beacon::{ApiError, refuse_validator_duties_from_gloas, validator::head};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -364,7 +364,7 @@ async fn get_aggregate_attestation(
     // The pool holds electra-shaped votes, and the response is labelled with
     // the slot's fork, so a gloas slot would be served as gloas with a body of
     // the wrong shape.
-    if let Err(err) = refuse_unfollowed_epoch(
+    if let Err(err) = refuse_validator_duties_from_gloas(
         &store.config(),
         compute_epoch_at_slot(query.slot),
         "gloas aggregates are not supported",
