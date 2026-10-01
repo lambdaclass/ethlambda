@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use ethlambda_network_api::FetchRequest;
+use ethlambda_network_api::{BlockSource, FetchRequest};
 use ethlambda_state_transition::beacon::fork::ForkName;
 use ethlambda_state_transition::beacon::fork_choice::{self, PayloadStatus, PayloadStatusEnum};
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
@@ -662,9 +662,16 @@ impl BlockChainServer {
             .entry(parent_root)
             .or_default()
             .insert(block_root, slot);
+        let arrived_by_sync = timings.source == Some(BlockSource::Sync);
         self.held_timings.insert(block_root, timings);
         self.publish_envelope_queues();
-        self.request_missing_envelope(parent_root);
+        // A synced block comes from a range batch, whose envelopes are already
+        // being fetched alongside it. Asking again at once would fetch each
+        // envelope twice, and each costs a post-state load and a signature
+        // check; the once-a-slot re-ask covers any the range answer lacks.
+        if !arrived_by_sync {
+            self.request_missing_envelope(parent_root);
+        }
     }
 
     /// Ask p2p for `root`'s envelope by root. The request carries nothing but
@@ -1385,6 +1392,41 @@ mod tests {
 
         assert!(server.pending_blocks.is_empty());
         assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// A held child that came from range sync does not ask for its parent's
+    /// envelope at once, since the range answer carries it; one that came from
+    /// gossip does, as nothing else is fetching it.
+    #[tokio::test]
+    #[cfg_attr(
+        not(feature = "beacon-spec-tests"),
+        ignore = "needs the fork choice fixtures; run `make consensus-spec-tests`"
+    )]
+    async fn only_a_synced_held_child_skips_the_immediate_envelope_request() {
+        for (source, asks) in [
+            (Some(BlockSource::Sync), 0),
+            (Some(BlockSource::Gossip), 1),
+            (None, 1),
+        ] {
+            let case = Case::new("get_head", TIEBREAK);
+            let mut server = case.server(12);
+            let p2p = std::sync::Arc::new(crate::tests::RecordingP2P::default());
+            server.p2p = Some(p2p.clone());
+            let child = case.block(CHILD);
+            let parent = child.parent_root();
+
+            let timings = ImportTimings {
+                source,
+                ..ImportTimings::default()
+            };
+            server.hold_block_for_parent_payload(child, timings);
+
+            let fetches = p2p.fetches.lock().unwrap();
+            assert_eq!(fetches.len(), asks, "source {source:?}");
+            assert!(fetches.iter().all(|request| request.needs_envelope
+                && !request.needs_block
+                && request.block_root == parent));
+        }
     }
 
     #[test]
