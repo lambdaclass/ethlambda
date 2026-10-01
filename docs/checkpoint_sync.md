@@ -99,7 +99,7 @@ request that fires when a FULL child arrives recovers it.
 
 If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.
 
-After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins the resolved network's gossip and logs what it decodes, without advancing its state past the anchor (see `docs/cli.md`, "What `ethlambda beacon` does today").
+After successful initialization, the node starts normally: `node` connects to the P2P network and begins participating from the checkpoint slot; `beacon` joins the resolved network's gossip and follows the chain from the anchor, importing blocks (a gloas anchor starts EMPTY, see [the envelope](#gloas-anchor-the-payload-envelope-beacon-only)).
 
 ## Restarts and Existing State
 

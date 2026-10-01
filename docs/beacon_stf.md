@@ -326,6 +326,36 @@ computation after a restart), which the envelope by-range server reads to
 withhold the head's envelope while the head is the EMPTY node. The node is
 still only a follower: the validator-client endpoints refuse a gloas epoch.
 
+### The envelope pipeline in the chain actor
+
+Order of arrival is not order of validity: an envelope can beat its block, a
+block can name a parent payload that has not arrived, and the columns an
+envelope's commitments need can lag both. `beacon_envelope.rs` holds each case
+in a queue with its own bound, and `beacon_columns.rs` bounds the parked
+sidecars of the same fork.
+
+| Queue | Holds | Released when |
+|---|---|---|
+| `awaiting_block` | an envelope whose block has no post-state | the block imports; evicted after `ENVELOPE_AWAITING_BLOCK_TTL_SLOTS`, capped per slot and per root |
+| `awaiting_columns` | a consensus-checked envelope whose bid has commitments and whose sampled columns are not all stored | the last column is stored |
+| `awaiting_engine` | a consensus-valid envelope the execution client gave no answer for | the per-slot redrive gets an answer (see [beacon_engine.md](./beacon_engine.md#gloas)) |
+| `blocks_awaiting_parent_payload` | a block whose parent is FULL with a payload not yet verified, capped per parent | that parent's envelope verifies |
+
+Data availability moves with the payload: a gloas block's commitments are in its
+bid, so the columns gate the envelope that reveals the payload, not the block's
+own import. A held block's parent envelope is requested through
+`FetchRequest.needs_envelope`, and the tick re-asks once a slot for every parent
+still missing one, which is what recovers a fetch that gave up. Everything is
+swept at finality, except the finalized block's own envelope.
+
+Fork-choice events are timed at their arrival: the store clock is advanced to
+the moment an envelope, block or payload vote reached the node before its
+handler runs, because the tick fires once per slot and the timeliness deadlines
+would otherwise be judged at the slot's start. Payload votes already verified
+in p2p are applied without a second signature check
+(`apply_verified_payload_attestation`). The PTC vote vectors are not persisted
+and are reseeded empty on resume; see [data_storage.md](./data_storage.md).
+
 ### The deferred payload
 
 A gloas block has no execution payload. Its body commits to a builder's bid
