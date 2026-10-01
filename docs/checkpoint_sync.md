@@ -77,6 +77,24 @@ This is the recommended option for production deployments since it reduces trust
 
 3. **Initialize**: the node stores the anchor block's header, its body (present unless the fetched block's own body happens to be empty, same as any other block), and the full state from the checkpoint. On `node`, persisting the block itself also means it can be served over `BlocksByRoot`; without that, peers requesting the anchor by root would get a synthetic block whose hash differs from `latest_finalized.root` and would score-penalize this node. `beacon`'s req/resp protocol has no `BlocksByRoot` handler yet, so that benefit doesn't apply there today; the block is stored anyway, since the pairing check above needs it.
 
+#### Gloas anchor: the payload envelope (beacon only)
+
+A gloas block's execution payload is not in the block, so a node anchored on
+one holds the block and state but not the payload its children may build on.
+Once the chain actor is running, a node that anchored on a gloas block with no
+stored envelope asks the checkpoint URLs for it, in order:
+`GET /eth/v1/beacon/execution_payload_envelopes/{anchor_root}` as SSZ. A
+success is handed to the chain actor as `new_execution_payload_envelope`, the
+same entry a gossiped envelope takes, so the bid check, the column check and
+the verification all apply. The fetch runs in the background and never delays
+startup.
+
+It is a fast path and nothing depends on it. A `404` means the peer does not
+know the payload, **not** that the payload is empty, so the node concludes
+nothing from it; any failure (network, decoding, an envelope naming another
+block) is logged at `info` and ignored. Without the envelope, the by-root
+request that fires when a FULL child arrives recovers it.
+
 ### Failure and success
 
 If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.

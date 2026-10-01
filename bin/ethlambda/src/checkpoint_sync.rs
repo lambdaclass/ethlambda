@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use ethlambda_p2p::beacon::decode;
 use ethlambda_types::beacon::config::Config;
-use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock};
+use ethlambda_types::beacon::containers::{BeaconState, SignedBeaconBlock, gloas};
 use ethlambda_types::beacon::preset;
 use ethlambda_types::block::SignedBlock;
 use ethlambda_types::genesis::{GenesisMismatch, verify_state_genesis};
@@ -59,6 +59,12 @@ const BEACON_FINALIZED_STATE_PATH: &str = "/eth/v2/debug/beacon/states/finalized
 /// Path of the block-by-slot endpoint on a Beacon API server.
 fn beacon_block_path(slot: u64) -> String {
     format!("/eth/v2/beacon/blocks/{slot}")
+}
+
+/// Path of the execution-payload-envelope endpoint on a Beacon API server, for
+/// the block at `root`.
+fn beacon_envelope_path(root: H256) -> String {
+    format!("/eth/v1/beacon/execution_payload_envelopes/0x{root:x}")
 }
 
 /// Maximum attempts to refetch the anchor pair if the state and block roots don't match.
@@ -698,6 +704,77 @@ pub async fn fetch_beacon_anchor(
     Ok((state, block))
 }
 
+/// Why a peer did not hand over the anchor's envelope.
+///
+/// `Unknown` is not "the payload is empty": a peer answers 404 both for a
+/// payload it never saw and one that was withheld, and a checkpoint source
+/// cannot tell the two apart for us either.
+#[derive(Debug, thiserror::Error)]
+enum EnvelopeFetchError {
+    #[error("the peer does not know the anchor's envelope")]
+    Unknown,
+    #[error("request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("SSZ deserialization failed: {0:?}")]
+    Decode(DecodeError),
+    #[error("the envelope is for another block")]
+    WrongBlock,
+}
+
+/// Fetch the execution payload envelope of the block at `anchor_root` from one
+/// peer.
+async fn fetch_envelope(
+    client: &Client,
+    base_url: &str,
+    anchor_root: H256,
+) -> Result<gloas::SignedExecutionPayloadEnvelope, EnvelopeFetchError> {
+    let url = format!("{base_url}{}", beacon_envelope_path(anchor_root));
+    let response = client
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(EnvelopeFetchError::Unknown);
+    }
+    let bytes = response.error_for_status()?.bytes().await?;
+    let envelope = gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&bytes)
+        .map_err(EnvelopeFetchError::Decode)?;
+    if envelope.message.beacon_block_root != anchor_root {
+        return Err(EnvelopeFetchError::WrongBlock);
+    }
+    Ok(envelope)
+}
+
+/// Best-effort fetch of a gloas anchor's execution payload envelope, so the
+/// node can serve and build on the anchor's payload without waiting for a FULL
+/// child to make the req/resp by-root path fetch it.
+///
+/// Tries each URL in order and returns the first envelope that names
+/// `anchor_root`. Every failure is logged at `info!` and skipped, including a
+/// 404: it means the peer does not know the payload, which is not evidence the
+/// payload is empty, so the caller must not conclude that. Verification is the
+/// chain actor's job; this only transports.
+pub async fn fetch_anchor_envelope(
+    urls: &[String],
+    anchor_root: H256,
+) -> Option<gloas::SignedExecutionPayloadEnvelope> {
+    let client = build_client()
+        .inspect_err(|err| info!(%err, "Skipping the anchor envelope fetch"))
+        .ok()?;
+    for url in urls {
+        let base_url = trim_trailing_slash(url);
+        match fetch_envelope(&client, base_url, anchor_root).await {
+            Ok(envelope) => {
+                info!(%url, "Fetched the anchor's execution payload envelope");
+                return Some(envelope);
+            }
+            Err(err) => info!(%url, %err, "No anchor execution payload envelope from this peer"),
+        }
+    }
+    None
+}
+
 /// Try each checkpoint URL in order, then retry the whole round, exactly as
 /// the lean path does. The two loops are shared rather than duplicated:
 /// `try_urls_in_order` and the fixed backoff mean the same thing on both
@@ -1285,5 +1362,133 @@ mod tests {
                 block: ForkName::Altair,
             })
         ));
+    }
+}
+
+/// The anchor-envelope fast path, against a one-shot HTTP server.
+#[cfg(test)]
+mod anchor_envelope_tests {
+    use super::*;
+    use libssz::SszEncode as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpListener;
+
+    /// Serves `status` and `body` to every request until dropped, and returns
+    /// the base URL. The request line is captured on the channel.
+    async fn serve(
+        status: &'static str,
+        body: Vec<u8>,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buffer = vec![0u8; 4096];
+                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let line = request.lines().next().unwrap_or_default().to_owned();
+                let _ = tx.send(line);
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = socket.write_all(head.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        (url, rx)
+    }
+
+    fn envelope_for(root: H256) -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: root,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_envelope_is_fetched_from_the_peers_endpoint() {
+        let root = H256::from([7u8; 32]);
+        let envelope = envelope_for(root);
+        let (url, mut requests) = serve("200 OK", envelope.to_ssz()).await;
+
+        let fetched = fetch_anchor_envelope(&[url], root).await;
+
+        assert_eq!(fetched, Some(envelope));
+        let line = requests.recv().await.unwrap();
+        assert!(
+            line.starts_with(&format!(
+                "GET /eth/v1/beacon/execution_payload_envelopes/0x{root:x} "
+            )),
+            "unexpected request: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_404_is_unknown_and_falls_through_to_the_next_peer() {
+        let root = H256::from([7u8; 32]);
+        let envelope = envelope_for(root);
+        let (unknown, _) = serve("404 Not Found", Vec::new()).await;
+        let (knows, _) = serve("200 OK", envelope.to_ssz()).await;
+
+        assert_eq!(
+            fetch_anchor_envelope(std::slice::from_ref(&unknown), root).await,
+            None,
+            "a 404 is not an envelope"
+        );
+        assert_eq!(
+            fetch_anchor_envelope(&[unknown, knows], root).await,
+            Some(envelope)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_or_wrong_envelope_is_ignored() {
+        let root = H256::from([7u8; 32]);
+        let (broken, _) = serve("500 Internal Server Error", Vec::new()).await;
+        let (garbage, _) = serve("200 OK", vec![1, 2, 3]).await;
+        let (other, _) = serve("200 OK", envelope_for(H256::from([8u8; 32])).to_ssz()).await;
+
+        assert_eq!(fetch_anchor_envelope(&[broken], root).await, None);
+        assert_eq!(fetch_anchor_envelope(&[garbage], root).await, None);
+        assert_eq!(
+            fetch_anchor_envelope(&[other], root).await,
+            None,
+            "an envelope for another block must not be handed over"
+        );
     }
 }
