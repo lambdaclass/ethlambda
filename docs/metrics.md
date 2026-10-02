@@ -422,6 +422,25 @@ is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
 
+### Beacon Justified Balances
+
+Beacon fork choice weighs every vote by the voter's effective balance at the
+justified checkpoint. `justified_balances` (in
+`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+`get_head` after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cached snapshot served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
+| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from the checkpoint state | On every miss, around the registry pass (the checkpoint state lookup is not included) | |
+
+**Read the miss rate against the justified-checkpoint rate**: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track `get_head` calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,
