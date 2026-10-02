@@ -91,7 +91,12 @@ pub type EpochParticipation = SszList<ParticipationFlags, { preset::VALIDATOR_RE
 
 /// Per-validator inactivity scores, positionally parallel to [`Validators`]
 /// (altair and later).
-pub type InactivityScores = SszList<u64, { preset::VALIDATOR_REGISTRY_LIMIT }>;
+///
+/// Tree-backed: outside a leak almost every score is zero and epoch processing
+/// skips writes that change nothing, so a state derived from another shares
+/// nearly the whole list with it and rehashes only the touched leaves. Writes
+/// are buffered in a `BTreeMap`, since they are sparse in that case.
+pub type InactivityScores = List<u64, { preset::VALIDATOR_REGISTRY_LIMIT }, BTreeMap<usize, u64>>;
 
 /// Accumulated [`HistoricalSummary`] entries, which replace [`HistoricalRoots`]
 /// as the commitment to history from capella onward.
