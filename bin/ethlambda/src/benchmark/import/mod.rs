@@ -86,6 +86,11 @@ pub(crate) struct ReplayOptions {
     /// of the same name.
     #[arg(long, default_value_t = ethlambda_types::beacon::constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY)]
     pub safe_slots_to_import_optimistically: u64,
+    /// Milliseconds to sleep after each block's import before feeding the
+    /// next, so the background state writer can drain between blocks. The
+    /// sleep is outside every measured span. 0 feeds blocks back to back.
+    #[arg(long, value_name = "MILLISECONDS", default_value_t = 0)]
+    pub block_delay: u64,
     /// Report format printed to stdout. Logs go to stderr, so JSON output can
     /// be piped directly (e.g. into jq).
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -168,4 +173,30 @@ async fn run_replay(options: ReplayOptions) -> eyre::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    #[derive(Debug, clap::Parser)]
+    struct Harness {
+        #[command(flatten)]
+        replay: ReplayOptions,
+    }
+
+    fn parse(extra: &[&str]) -> ReplayOptions {
+        let base = ["replay", "--corpus", "/tmp/c", "--data-dir", "/tmp/d"];
+        Harness::try_parse_from(base.iter().chain(extra))
+            .expect("replay flags parse")
+            .replay
+    }
+
+    #[test]
+    fn block_delay_defaults_to_zero_and_parses_milliseconds() {
+        assert_eq!(parse(&[]).block_delay, 0);
+        assert_eq!(parse(&["--block-delay", "1500"]).block_delay, 1500);
+    }
 }
