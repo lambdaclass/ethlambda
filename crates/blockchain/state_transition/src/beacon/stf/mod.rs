@@ -319,6 +319,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state;
+    use crate::beacon::primitives::Root;
 
     #[test]
     fn process_slot_leaves_no_buffered_registry_writes() {
@@ -332,6 +333,10 @@ mod tests {
 
         assert!(!state.balances().has_pending_updates());
         assert!(!state.validators().has_pending_updates());
+        // Its own two roots writes stay buffered until the next flush, which
+        // the following slot (or `process_slots`' last step) performs.
+        assert!(state.state_roots().has_pending_updates());
+        assert!(state.block_roots().has_pending_updates());
     }
 
     /// Epoch processing (`process_rewards_and_penalties` here) writes every
@@ -348,8 +353,19 @@ mod tests {
 
         process_slots(&mut state, target_slot, &config).unwrap();
 
-        assert!(!state.balances().has_pending_updates());
-        assert!(!state.validators().has_pending_updates());
+        assert!(!state.has_pending_mutations());
+    }
+
+    #[test]
+    fn process_slots_flushes_the_roots_it_wrote_in_its_last_slot() {
+        for fork in BEACON_FORKS {
+            let mut state = test_state::with_validators_at(fork, 4);
+            let target_slot = state.slot() + 1;
+
+            process_slots(&mut state, target_slot, &Config::mainnet()).unwrap();
+
+            assert!(!state.has_pending_mutations(), "{fork:?}");
+        }
     }
 
     const BEACON_FORKS: [ForkName; 7] = [
@@ -362,36 +378,83 @@ mod tests {
         ForkName::Fulu,
     ];
 
+    /// Writes one element of the field a case names, or answers `false` if the
+    /// fork does not have it.
+    type Write = fn(&mut BeaconState) -> bool;
+
+    fn push_historical_summary(state: &mut BeaconState) -> bool {
+        let summary = containers::HistoricalSummary::default();
+        match state {
+            BeaconState::Capella(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Deneb(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Electra(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Fulu(s) => s.historical_summaries.push(summary).unwrap(),
+            _ => return false,
+        }
+        true
+    }
+
     /// One write to every tree-backed field of every fork: the flush and the
     /// pending check must both see all of them, since both come from one
     /// field list.
     #[test]
     fn every_tree_field_of_every_fork_is_flushed_and_checked() {
+        let cases: [(&str, Write); 11] = [
+            ("validators", |s| {
+                s.validator_mut(0).unwrap().effective_balance -= 1;
+                true
+            }),
+            ("balances", |s| {
+                s.balances_mut()[0] += 1;
+                true
+            }),
+            ("block_roots", |s| {
+                s.block_roots_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("state_roots", |s| {
+                s.state_roots_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("historical_roots", |s| {
+                s.historical_roots_mut().push(Root::repeat_byte(1)).unwrap();
+                true
+            }),
+            ("eth1_data_votes", |s| {
+                s.eth1_data_votes_mut().push(Default::default()).unwrap();
+                true
+            }),
+            ("randao_mixes", |s| {
+                s.randao_mixes_mut()[0] = Root::repeat_byte(1);
+                true
+            }),
+            ("slashings", |s| {
+                s.slashings_mut()[0] += 1;
+                true
+            }),
+            ("inactivity_scores", |s| {
+                match s.altair_validator_lists_mut() {
+                    Ok((_, _, scores)) => {
+                        scores[0] += 1;
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }),
+            ("historical_summaries", push_historical_summary),
+            // A read-only pass writes nothing and must leave nothing pending.
+            ("none", |_| false),
+        ];
+
         for fork in BEACON_FORKS {
             let mut state = test_state::with_validators_at(fork, 4);
             assert!(!state.has_pending_mutations(), "{fork:?} starts flushed");
 
-            state.validator_mut(0).unwrap().effective_balance -= 1;
-            assert!(state.has_pending_mutations(), "{fork:?} validators");
-            state.apply_pending_mutations();
-            assert!(
-                !state.has_pending_mutations(),
-                "{fork:?} validators flushed"
-            );
-
-            state.balances_mut()[0] += 1;
-            assert!(state.has_pending_mutations(), "{fork:?} balances");
-            state.apply_pending_mutations();
-            assert!(!state.has_pending_mutations(), "{fork:?} balances flushed");
-
-            if let Ok((_, _, scores)) = state.altair_validator_lists_mut() {
-                scores[0] += 1;
-                assert!(state.has_pending_mutations(), "{fork:?} inactivity_scores");
+            for (name, write) in cases {
+                let wrote = write(&mut state);
+                assert_eq!(state.has_pending_mutations(), wrote, "{fork:?} {name}");
                 state.apply_pending_mutations();
-                assert!(
-                    !state.has_pending_mutations(),
-                    "{fork:?} inactivity_scores flushed"
-                );
+                assert!(!state.has_pending_mutations(), "{fork:?} {name} flushed");
             }
         }
     }

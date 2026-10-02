@@ -420,13 +420,31 @@ macro_rules! tree_fields {
     (@count $head:ident $($tail:ident)*) => { 1usize + tree_fields!(@count $($tail)*) };
 }
 
-tree_fields!(phase0::BeaconState => validators, balances);
-tree_fields!(altair::BeaconState => validators, balances, inactivity_scores);
-tree_fields!(bellatrix::BeaconState => validators, balances, inactivity_scores);
-tree_fields!(capella::BeaconState => validators, balances, inactivity_scores);
-tree_fields!(deneb::BeaconState => validators, balances, inactivity_scores);
-tree_fields!(electra::BeaconState => validators, balances, inactivity_scores);
-tree_fields!(fulu::BeaconState => validators, balances, inactivity_scores);
+tree_fields!(
+    phase0::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings
+);
+tree_fields!(
+    altair::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+);
+tree_fields!(
+    bellatrix::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores
+);
+tree_fields!(
+    capella::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    deneb::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    electra::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
+tree_fields!(
+    fulu::BeaconState => validators, balances, block_roots, state_roots, historical_roots, eth1_data_votes, randao_mixes, slashings, inactivity_scores,
+    historical_summaries
+);
 
 /// Generates read and write accessors for state fields that every fork shares.
 ///
@@ -620,6 +638,13 @@ impl BeaconState {
         }
         self.validators_mut().rebase_on(base.validators());
         self.balances_mut().rebase_on(base.balances());
+        self.block_roots_mut().rebase_on(base.block_roots());
+        self.state_roots_mut().rebase_on(base.state_roots());
+        self.historical_roots_mut()
+            .rebase_on(base.historical_roots());
+        self.eth1_data_votes_mut().rebase_on(base.eth1_data_votes());
+        self.randao_mixes_mut().rebase_on(base.randao_mixes());
+        self.slashings_mut().rebase_on(base.slashings());
         // Phase0 has no scores; the two states may also differ in fork.
         if let (Ok((_, _, scores)), Ok((_, _, base_scores))) = (
             self.altair_validator_lists_mut(),

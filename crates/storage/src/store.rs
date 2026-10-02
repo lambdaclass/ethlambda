@@ -5646,6 +5646,7 @@ mod tests {
         *child.slot_mut() += 1;
         child.latest_block_header_mut().parent_root = parent_root;
         child.balances_mut()[0] += 1;
+        child.block_roots_mut()[10] = parent_root;
         child.apply_pending_mutations();
         store
             .insert_signed_block(child_root, beacon_test_block(11, parent_root))
@@ -5663,6 +5664,14 @@ mod tests {
         let (_, _, decoded_scores) = decoded.altair_validator_lists().unwrap();
         let (_, _, resident_scores) = resident.altair_validator_lists().unwrap();
         assert!(decoded_scores.ptr_eq(resident_scores));
+        assert!(decoded.randao_mixes().ptr_eq(resident.randao_mixes()));
+        assert!(decoded.slashings().ptr_eq(resident.slashings()));
+        assert!(
+            decoded
+                .historical_roots()
+                .ptr_eq(resident.historical_roots())
+        );
+        assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
