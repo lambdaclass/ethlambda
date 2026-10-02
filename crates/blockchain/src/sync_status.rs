@@ -122,6 +122,12 @@ impl SyncStatusTracker {
         }
     }
 
+    /// Whether the tracker currently considers the node to be syncing,
+    /// regardless of whether that gates duties.
+    pub(crate) fn is_syncing(&self) -> bool {
+        self.syncing
+    }
+
     pub(crate) fn duties_allowed(&self) -> bool {
         // Gate disabled: the syncing state is observe-only, never suppresses duties.
         !self.gate_duties || !self.syncing
