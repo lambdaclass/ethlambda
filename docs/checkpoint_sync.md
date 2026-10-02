@@ -95,6 +95,14 @@ nothing from it; any failure (network, decoding, an envelope naming another
 block) is logged at `info` and ignored. Without the envelope, the by-root
 request that fires when a FULL child arrives recovers it.
 
+An anchor whose bid carries blobs also needs its sampled columns before its
+envelope verifies, and those are fetched by root like any other block's. They
+sit at the finalized slot, or below it for an anchor state advanced past empty
+slots, which is where the chain checks drop every other block's columns. So
+the finalized block's own columns are exempt from that rule
+(`column::chain_checks_gloas`); without the exemption such an anchor never gets
+its payload, and the node never imports past it.
+
 ### Failure and success
 
 If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.
