@@ -383,6 +383,16 @@ mod tests {
             assert!(state.has_pending_mutations(), "{fork:?} balances");
             state.apply_pending_mutations();
             assert!(!state.has_pending_mutations(), "{fork:?} balances flushed");
+
+            if let Ok((_, _, scores)) = state.altair_validator_lists_mut() {
+                scores[0] += 1;
+                assert!(state.has_pending_mutations(), "{fork:?} inactivity_scores");
+                state.apply_pending_mutations();
+                assert!(
+                    !state.has_pending_mutations(),
+                    "{fork:?} inactivity_scores flushed"
+                );
+            }
         }
     }
 }
