@@ -96,6 +96,25 @@ static LEAN_GOSSIP_AGGREGATION_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::ne
     .unwrap()
 });
 
+static LEAN_GOSSIP_BLOCK_BODY_PROOF_SIZE_BYTES: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_gossip_block_body_proof_size_bytes",
+        "Bytes size of a gossip block body proof message",
+        &["compression"],
+        vec![
+            10_000.0,
+            50_000.0,
+            100_000.0,
+            250_000.0,
+            500_000.0,
+            1_000_000.0,
+            2_000_000.0,
+            5_000_000.0
+        ]
+    )
+    .unwrap()
+});
+
 /// Observe the size of a gossip block message, recording both the raw SSZ
 /// size and the snappy-compressed on-wire size.
 pub fn observe_gossip_block_size(raw: usize, snappy: usize) {
@@ -114,6 +133,17 @@ pub fn observe_gossip_attestation_size(raw: usize, snappy: usize) {
         .with_label_values(&["raw"])
         .observe(raw as f64);
     LEAN_GOSSIP_ATTESTATION_SIZE_BYTES
+        .with_label_values(&["snappy"])
+        .observe(snappy as f64);
+}
+
+/// Observe the size of a gossip block body proof message, recording both the
+/// raw SSZ size and the snappy-compressed on-wire size.
+pub fn observe_gossip_block_body_proof_size(raw: usize, snappy: usize) {
+    LEAN_GOSSIP_BLOCK_BODY_PROOF_SIZE_BYTES
+        .with_label_values(&["raw"])
+        .observe(raw as f64);
+    LEAN_GOSSIP_BLOCK_BODY_PROOF_SIZE_BYTES
         .with_label_values(&["snappy"])
         .observe(snappy as f64);
 }

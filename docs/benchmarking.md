@@ -1,7 +1,14 @@
 # Benchmarking block building
 
-`ethlambda benchmark` measures block building the way the node performs it when
-it proposes, against a reproducible synthetic workload, with no devnet running.
+`ethlambda benchmark` measures block building — packing a body out of the
+attestation pool and sealing it — against a reproducible synthetic workload,
+with no devnet running.
+
+That path is now the aggregation worker's, not the proposer's: since
+[block body proofs](./slots_and_intervals.md#block-body-proofs), a proposer
+adopts a candidate body someone else packed. What the benchmark measures is
+unchanged, but read its numbers as the cost of producing a candidate body proof
+rather than the cost of a proposal.
 
 Block building is otherwise only observable through the Prometheus histograms a
 live node exports. Those are noisy, depend on whatever the network happened to
@@ -52,7 +59,7 @@ into `jq`.
 
 ## What it measures
 
-Each iteration enters `produce_block_with_signatures` and then `seal_block` —
+Each iteration enters `produce_block_with_signatures` and then `sign_and_prove_block` —
 the same functions `BlockChainServer::propose_block` calls — and the harness
 reports the phases inside them:
 
@@ -62,14 +69,13 @@ reports the phases inside them:
 | `compact` | Collapsing or picking among proofs for the same data; with `--enable-proposer-aggregation` this is a real recursive leanVM aggregation |
 | `stf_simulate` | The state transition that seals `state_root` |
 | `sign_proposer` | The proposer's XMSS signature over the block root (real crypto only) |
-| `wrap_proposer` | Wrapping that signature into a singleton type-1 proof (real crypto only) |
 | `merge_type2` | Merging every type-1 proof into the block's type-2 proof (real crypto only) |
 | `overhead` | The rest of the measured span: tick processing, attestation promotion, fork-choice head, pool clone, pubkey resolution |
 | `wall` | The whole span |
 
 `overhead` is `wall` minus the sum of the phases, so the columns add up by
 construction. In mock mode there is nothing to sign with, so the seal is skipped
-and its three phases are absent.
+and its two phases are absent.
 
 Deliberately **outside** the measured span, matching the boundary of the node's
 own `lean_block_building_time_seconds` metric: gossip publish, the

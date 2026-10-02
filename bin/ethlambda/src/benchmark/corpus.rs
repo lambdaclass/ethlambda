@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use ethlambda_blockchain::block_builder::seal_block;
+use ethlambda_blockchain::block_builder::sign_and_prove_block;
 use ethlambda_blockchain::key_manager::KeyManager;
 use ethlambda_blockchain::metrics::{
     BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES, BLOCK_PROPOSAL_SEAL_PHASES,
@@ -17,7 +17,7 @@ use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_storage::{Store, backend::InMemoryBackend};
 use ethlambda_types::{
     attestation::{AggregationBits, HashedAttestationData, validator_indices},
-    block::{Block, MultiMessageAggregate, SignedBlock, SingleMessageAggregate},
+    block::{Block, BlockProof, SignedBlock, SingleMessageAggregate},
     constants::DEFAULT_MILLISECONDS_PER_SLOT,
     primitives::HashTreeRoot as _,
     state::{PUBLIC_KEY_SIZE, State, Validator, ValidatorPubkeyBytes},
@@ -195,11 +195,16 @@ impl SyntheticCorpus {
         match &mut self.crypto {
             CryptoMode::Mock => Ok(SignedBlock {
                 message: block,
-                proof: MultiMessageAggregate::default(),
+                proof: BlockProof::default(),
             }),
             CryptoMode::Real { key_manager, .. } => {
                 let head_state = store.head_state();
-                Ok(seal_block(&head_state, key_manager, block, aggregates)?)
+                Ok(sign_and_prove_block(
+                    &head_state,
+                    key_manager,
+                    block,
+                    aggregates,
+                )?)
             }
         }
     }

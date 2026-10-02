@@ -14,9 +14,7 @@ use ethlambda_types::{
         AggregatedAttestation, AggregationBits, AttestationData, HashedAttestationData,
         bits_is_subset, bits_same_set, validator_indices,
     },
-    block::{
-        Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock, SingleMessageAggregate,
-    },
+    block::{Block, BlockBody, BlockHeader, BlockProof, SignedBlock, SingleMessageAggregate},
     chain_config::ChainConfig,
     checkpoint::Checkpoint,
     constants::INTERVALS_PER_SLOT,
@@ -1345,12 +1343,12 @@ impl Store {
         let sig_key = encode_slot_root_key(header.slot, root);
         let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
             Some(proof_bytes) => {
-                MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
+                BlockProof::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
             // Synthesis only covers the genesis-style anchor (slot 0). For any
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
-            None if header.slot == 0 => MultiMessageAggregate::default(),
+            None if header.slot == 0 => BlockProof::default(),
             None => return None,
         };
 
@@ -2095,7 +2093,7 @@ mod tests {
                 state_root: H256::ZERO,
                 body: BlockBody::default(),
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 
@@ -2114,7 +2112,7 @@ mod tests {
                     attestations: attestations.try_into().unwrap(),
                 },
             },
-            proof: MultiMessageAggregate::default(),
+            proof: BlockProof::default(),
         }
     }
 
@@ -3553,7 +3551,7 @@ mod tests {
             .expect("genesis block must be retrievable with synthetic proof");
 
         assert_eq!(signed.message.slot, 0);
-        assert_eq!(signed.proof, MultiMessageAggregate::default());
+        assert_eq!(signed.proof, BlockProof::default());
     }
 
     /// The synthesis branch must be confined to the slot-0 anchor: a

@@ -76,11 +76,13 @@ pub fn reaggregate_from_block(
     let validators = &parent_state.validators;
     let num_validators = validators.len() as u64;
 
-    // The claims the merged proof carries: one per body attestation in order,
-    // then the proposer's. The layout is invariant per block, so it is resolved
-    // once and reused for every split call below. Every split needs all of
-    // them, since none is on the wire and the decode rebuilds the whole set.
-    let mut components: Vec<SignerSet> = Vec::with_capacity(attestations.len() + 1);
+    // The claims the attestation aggregate carries: one per body attestation in
+    // order, and nothing else. The proposer signature lives outside the
+    // aggregate, so there is no trailing proposer claim. The layout is
+    // invariant per block, so it is resolved once and reused for every split
+    // call below. Every split needs all of them, since none is on the wire and
+    // the decode rebuilds the whole set.
+    let mut components: Vec<SignerSet> = Vec::with_capacity(attestations.len());
     for att in &attestations {
         let mut pubkeys = Vec::new();
         for vid in validator_indices(&att.aggregation_bits) {
@@ -105,26 +107,6 @@ pub fn reaggregate_from_block(
         };
         components.push(SignerSet::new(att.data.hash_tree_root(), att_slot, pubkeys));
     }
-    if block.proposer_index >= num_validators {
-        return Vec::new();
-    }
-    let Ok(proposer_pubkey) =
-        ValidatorPublicKey::from_bytes(&validators[block.proposer_index as usize].proposal_pubkey)
-    else {
-        return Vec::new();
-    };
-    let Ok(block_slot) = u32::try_from(block.slot) else {
-        warn!(
-            slot = block.slot,
-            "Reaggregation aborted: block slot out of range"
-        );
-        return Vec::new();
-    };
-    components.push(SignerSet::new(
-        block.hash_tree_root(),
-        block_slot,
-        vec![proposer_pubkey],
-    ));
 
     let candidates = select_candidates(store, &attestations);
     if candidates.is_empty() {
@@ -144,8 +126,8 @@ pub fn reaggregate_from_block(
         let slot_u32 = components[candidate.idx].slot;
 
         // Step 1: SNARK-split this attestation's component out of the block's
-        // merged multi-message aggregate proof.
-        let merged_bytes = signed_block.proof.proof_bytes();
+        // attestation multi-message aggregate proof.
+        let merged_bytes = signed_block.proof.attestation_proof.proof_bytes();
         let split_bytes = match ethlambda_crypto::split_type_2_by_message(
             merged_bytes,
             &components,

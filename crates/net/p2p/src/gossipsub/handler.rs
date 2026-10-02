@@ -2,7 +2,7 @@ use ethlambda_network_api::BlockSource;
 use ethlambda_types::{
     ShortRoot,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::SignedBlock,
+    block::{BlockBodyProof, SignedBlock},
     primitives::HashTreeRoot as _,
 };
 use libp2p::gossipsub::Event;
@@ -12,8 +12,8 @@ use tracing::{error, info, trace};
 use super::{
     encoding::{compress_message, decompress_message},
     messages::{
-        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        attestation_subnet_topic,
+        AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_BODY_PROOF_TOPIC_KIND,
+        BLOCK_TOPIC_KIND, attestation_subnet_topic,
     },
 };
 use crate::{P2PServer, metrics};
@@ -94,6 +94,35 @@ pub async fn handle_gossipsub_message(server: &mut P2PServer, event: Event) {
                     .inspect_err(
                         |err| error!(%err, "Failed to forward aggregated attestation to blockchain"),
                     );
+            }
+        }
+        Some(BLOCK_BODY_PROOF_TOPIC_KIND) => {
+            trace!(
+                kind = "block_body_proof",
+                peer_count, "P2P message received"
+            );
+            let compressed_len = message.data.len();
+            let Ok(uncompressed_data) = decompress_message(&message.data)
+                .inspect_err(|err| error!(%err, "Failed to decompress gossipped block body proof"))
+            else {
+                return;
+            };
+            metrics::observe_gossip_block_body_proof_size(uncompressed_data.len(), compressed_len);
+
+            let Ok(body_proof) = BlockBodyProof::from_ssz_bytes(&uncompressed_data)
+                .inspect_err(|err| error!(?err, "Failed to decode gossipped block body proof"))
+            else {
+                return;
+            };
+            info!(
+                attestation_count = body_proof.block_body.attestations.len(),
+                proof_bytes = body_proof.proof.proof.len(),
+                "Received block body proof from gossip"
+            );
+            if let Some(ref blockchain) = server.blockchain {
+                let _ = blockchain.new_block_body_proof(body_proof).inspect_err(
+                    |err| error!(%err, "Failed to forward block body proof to blockchain"),
+                );
             }
         }
         Some(kind) if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
@@ -194,6 +223,28 @@ pub async fn publish_block(server: &mut P2PServer, signed_block: SignedBlock) {
         parent_root = %ShortRoot(&parent_root.0),
         attestation_count,
         "Published block to gossipsub"
+    );
+}
+
+pub async fn publish_block_body_proof(server: &mut P2PServer, body_proof: BlockBodyProof) {
+    let attestation_count = body_proof.block_body.attestations.len();
+
+    // Encode to SSZ
+    let ssz_bytes = body_proof.to_ssz();
+
+    // Compress with raw snappy
+    let compressed = compress_message(&ssz_bytes);
+
+    metrics::observe_gossip_block_body_proof_size(ssz_bytes.len(), compressed.len());
+
+    // Publish to the block-body-proof topic
+    server
+        .swarm_handle
+        .publish(server.block_body_proof_topic.clone(), compressed);
+    info!(
+        attestation_count,
+        proof_bytes = body_proof.proof.proof.len(),
+        "Published block body proof to gossipsub"
     );
 }
 
