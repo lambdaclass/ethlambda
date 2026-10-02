@@ -75,3 +75,4 @@ sha2.workspace = true
 
 [build-dependencies]
 vergen-git2.workspace = true
+git2.workspace = true

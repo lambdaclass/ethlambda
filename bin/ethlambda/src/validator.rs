@@ -5,13 +5,9 @@
 
 use std::path::PathBuf;
 
-// `Bytes32` is an alias for `H256`, so the value is built through `H256`; the
-// alias names the field's role and is what the config field is typed as.
-use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160, H256};
+use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, H160};
 use ethlambda_validator::ValidatorConfig;
-
-/// A block's graffiti field is exactly this wide.
-const GRAFFITI_BYTES: usize = 32;
+use ethlambda_validator::proposer_settings::{GRAFFITI_BYTES, graffiti_from_text};
 
 /// An execution address is exactly this wide.
 const ADDRESS_BYTES: usize = 20;
@@ -46,19 +42,22 @@ pub(crate) struct ValidatorOptions {
     #[arg(long, default_value = "5064")]
     pub(crate) metrics_port: u16,
 
-    /// Text to put in the graffiti field of every block this client proposes.
+    /// Text to put in the graffiti field of every block this client proposes,
+    /// unless the keymanager API gives a validator its own.
     ///
     /// At most 32 bytes once encoded as UTF-8, right-padded with zeros.
     /// Consensus never reads it.
     ///
-    /// Empty by default. Most clients default to their own name and version;
-    /// this one does not, because doing so tells anyone reading the chain which
-    /// software built a block, and an operator who wants that can ask for it.
+    /// Empty by default. An ethlambda beacon node appends its own and its
+    /// execution client's codes and commits to whatever this is, so an empty
+    /// graffiti still names both clients; other beacon nodes apply their own
+    /// policy.
     #[arg(long, default_value = "")]
     pub(crate) graffiti: String,
 
     /// Execution address to receive block rewards from blocks this client
-    /// proposes, as `0x`-prefixed hex.
+    /// proposes, as `0x`-prefixed hex, for every validator the keymanager API
+    /// gives no address of its own.
     ///
     /// Optional, and it should not be. Without it the beacon node picks an
     /// address of its own, which will not be yours, and every block this client
@@ -68,7 +67,8 @@ pub(crate) struct ValidatorOptions {
     #[arg(long)]
     pub(crate) suggested_fee_recipient: Option<String>,
 
-    /// Serve the keymanager API.
+    /// Serve the keymanager API: keystores, plus each validator's own fee
+    /// recipient, graffiti and gas limit, which are held in memory only.
     ///
     /// Off by default because it mutates key material. It binds to
     /// `--http-address` with bearer-token auth; a deployment that exposes it
@@ -89,16 +89,12 @@ impl ValidatorOptions {
     /// holds. A 32-character string of anything outside ASCII does not fit, and
     /// saying so in bytes is the only way the message helps.
     pub(crate) fn graffiti(&self) -> eyre::Result<Bytes32> {
-        let text = self.graffiti.as_bytes();
-        if text.len() > GRAFFITI_BYTES {
-            eyre::bail!(
+        graffiti_from_text(&self.graffiti).ok_or_else(|| {
+            eyre::eyre!(
                 "--graffiti is {} bytes encoded as UTF-8; the field holds {GRAFFITI_BYTES}",
-                text.len()
-            );
-        }
-        let mut bytes = [0u8; GRAFFITI_BYTES];
-        bytes[..text.len()].copy_from_slice(text);
-        Ok(H256(bytes))
+                self.graffiti.len()
+            )
+        })
     }
 
     /// The configured fee recipient, or `None` if the operator named none.
@@ -181,7 +177,7 @@ mod tests {
     #[test]
     fn the_default_graffiti_is_empty() {
         let bytes = options("").graffiti().expect("valid");
-        assert_eq!(bytes, H256([0u8; GRAFFITI_BYTES]));
+        assert_eq!(bytes, Bytes32::ZERO);
     }
 
     #[test]
