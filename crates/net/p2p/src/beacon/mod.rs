@@ -19,6 +19,7 @@ pub mod encoding;
 pub mod handler;
 pub mod messages;
 pub mod protocols;
+pub mod scoring;
 pub mod subnets;
 pub mod swarm;
 pub mod topics;
