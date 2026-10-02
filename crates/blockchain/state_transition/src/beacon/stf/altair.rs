@@ -31,11 +31,12 @@ use crate::beacon::constants;
 use crate::beacon::containers::{BeaconState, altair, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root_at_slot,
-    get_current_epoch, get_domain, get_previous_epoch, get_total_active_balance,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    get_beacon_proposer_index, get_block_root_at_slot, get_current_epoch, get_domain,
+    get_previous_epoch,
 };
 use crate::beacon::helpers::altair::{
-    add_flag, get_attestation_participation_flag_indices, get_base_reward_per_increment, has_flag,
+    add_flag, base_reward_per_increment, get_attestation_participation_flag_indices, has_flag,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
@@ -82,6 +83,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -160,7 +162,8 @@ pub fn process_attestation(
     };
 
     // Hoisted: see the comment on the same line in `electra::process_attestation`.
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    let base_reward_per_increment =
+        base_reward_per_increment(active_balances.total_active_balance(state)?);
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
@@ -289,6 +292,7 @@ pub fn process_attestation(
 pub fn process_sync_aggregate(
     state: &mut BeaconState,
     sync_aggregate: &altair::SyncAggregate,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let committee_bits = &sync_aggregate.sync_committee_bits;
 
@@ -358,9 +362,9 @@ pub fn process_sync_aggregate(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let total_active_increments =
-        get_total_active_balance(state)? / preset::EFFECTIVE_BALANCE_INCREMENT;
-    let total_base_rewards = get_base_reward_per_increment(state)?
+    let total_active_balance = active_balances.total_active_balance(state)?;
+    let total_active_increments = total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+    let total_base_rewards = base_reward_per_increment(total_active_balance)
         .checked_mul(total_active_increments)
         .ok_or(Error::ArithmeticOverflow(
             "get_base_reward_per_increment(state) * total_active_increments",
@@ -407,7 +411,8 @@ mod tests {
     use super::*;
     use crate::beacon::containers::altair::SyncCommittee;
     use crate::beacon::containers::shared::{AttestationData, Checkpoint, Validator};
-    use crate::beacon::helpers::accessors::get_beacon_committee;
+    use crate::beacon::helpers::accessors::{get_beacon_committee, get_total_active_balance};
+    use crate::beacon::helpers::altair::get_base_reward_per_increment;
     use crate::beacon::primitives::{
         BLS_SIGNATURE_SIZE, BlsPubkey, BlsSignature, Bytes32, HashTreeRoot as _, Root,
     };
@@ -577,7 +582,13 @@ mod tests {
         let proposer_index = get_beacon_proposer_index(&state).unwrap();
         let balance_before = state.balance(proposer_index).unwrap();
 
-        process_attestation(&mut state, &attestation, &CommitteeCache::default()).unwrap();
+        process_attestation(
+            &mut state,
+            &attestation,
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+        )
+        .unwrap();
 
         let (previous_epoch_participation, _, _) = state.altair_validator_lists().unwrap();
         for &index in &committee {
@@ -607,7 +618,13 @@ mod tests {
         // so reprocessing the identical attestation must grant nothing new, and
         // the proposer's balance must not move.
         let balance_before_replay = state.balance(proposer_index).unwrap();
-        process_attestation(&mut state, &attestation, &CommitteeCache::default()).unwrap();
+        process_attestation(
+            &mut state,
+            &attestation,
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+        )
+        .unwrap();
         let balance_after_replay = state.balance(proposer_index).unwrap();
         assert_eq!(
             balance_before_replay, balance_after_replay,
@@ -683,7 +700,8 @@ mod tests {
             .map(|index| state.balance(index).unwrap())
             .collect();
 
-        process_sync_aggregate(&mut state, &sync_aggregate).unwrap();
+        process_sync_aggregate(&mut state, &sync_aggregate, &ActiveBalanceCache::default())
+            .unwrap();
 
         // Independently derived expected rewards, sharing only the
         // already-tested building blocks (`get_total_active_balance`,
@@ -748,7 +766,8 @@ mod tests {
             sync_committee_signature: BlsSignature::default(),
         };
         assert!(
-            process_sync_aggregate(&mut state.clone(), &wrong).is_err(),
+            process_sync_aggregate(&mut state.clone(), &wrong, &ActiveBalanceCache::default())
+                .is_err(),
             "the all-zero signature is not the point at infinity, so this must be rejected"
         );
 
@@ -757,7 +776,7 @@ mod tests {
             sync_committee_signature: g2_point_at_infinity(),
         };
         let balance_before = state.balance(0).unwrap();
-        process_sync_aggregate(&mut state, &correct).unwrap();
+        process_sync_aggregate(&mut state, &correct, &ActiveBalanceCache::default()).unwrap();
 
         // The sole validator holds every seat and none of them participated,
         // so it is penalized once per seat and the proposer (itself, the only
