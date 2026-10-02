@@ -66,6 +66,14 @@ pub struct BlockChainConfig {
     pub gate_duties: bool,
     /// Attestation subnets this node subscribes to.
     pub subscribed_subnets: HashSet<u64>,
+    /// The subnet this aggregator is responsible for when scoring recursive
+    /// aggregation. Aggregators on different duty subnets merge different
+    /// children, which is what stops them all producing the same proof.
+    pub aggregation_duty_subnet: u64,
+    /// Whether the aggregator sits out candidates whose level another duty
+    /// subnet owns in the slot, trading window overlap for less duplicated prover
+    /// work.
+    pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -251,6 +259,8 @@ impl BlockChain {
             attestation_committee_count,
             gate_duties,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
         } = config;
 
@@ -258,17 +268,9 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Catch XMSS keys up to the current slot before the first tick
-        // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap we need to catch up through
-        let now_ms = unix_now_ms();
-        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot) as u32;
-        key_manager.advance_keys_to(current_slot);
-
-        let handle = BlockChainServer {
+        let server = BlockChainServer {
             store,
             p2p: None,
             key_manager,
@@ -282,13 +284,55 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+        };
+
+        // Warm the XMSS signing caches for the next duties before the first
+        // tick, which fires right away and runs the current interval's duty.
+        // store.time() doesn't work here: after an offline gap it lags
+        // wall-clock by exactly the gap the first duty will be at.
+        let ms_since_genesis = unix_now_ms().saturating_sub(time_config.genesis_time_ms());
+        let current_slot = ms_since_genesis / time_config.milliseconds_per_slot;
+        match SlotInterval::from_ms_since_genesis(ms_since_genesis, &time_config) {
+            // The first tick assembles and signs the current slot's block, then
+            // the next one attests at the current slot, so both keys sign here.
+            SlotInterval::BlockPublication => {
+                let num_validators = server.store.head_state().validators.len() as u64;
+                let proposer = server.get_our_proposer(current_slot, num_validators);
+                server
+                    .key_manager
+                    .prepare_keys_for(current_slot as u32, proposer);
+            }
+            // The first tick still attests at the current slot. No proposal
+            // key: the current slot's block was assembled at its interval 0,
+            // before we started, and the interval-1 tick warms the next slot's.
+            SlotInterval::AttestationProduction => {
+                server
+                    .key_manager
+                    .prepare_keys_for(current_slot as u32, None);
+            }
+            // This slot's attestations are behind us, so the next signatures
+            // are the next slot's block, assembled at its own interval 0, and
+            // that slot's attestations.
+            SlotInterval::Aggregation
+            | SlotInterval::SafeTargetUpdate
+            | SlotInterval::EndOfSlot => {
+                let num_validators = server.store.head_state().validators.len() as u64;
+                let next_slot = current_slot + 1;
+                let proposer = server.get_our_proposer(next_slot, num_validators);
+                server
+                    .key_manager
+                    .prepare_keys_for(next_slot as u32, proposer);
+            }
         }
-        .start();
+
+        let handle = server.start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -376,6 +420,16 @@ pub struct BlockChainServer {
     /// Handed to the aggregation worker to scale its vote-propagation gate.
     subscribed_subnets: HashSet<u64>,
 
+    /// The subnet this aggregator is responsible for. Scores which children
+    /// recursive aggregation merges, so aggregators on different duty subnets
+    /// build different proofs.
+    aggregation_duty_subnet: u64,
+
+    /// Whether to sit out aggregation candidates whose level another duty
+    /// subnet owns this slot, trading window overlap for less duplicated
+    /// prover work. See [`aggregation::owns_width`] for the rotation.
+    skip_redundant_aggregation: bool,
+
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
 
@@ -431,8 +485,10 @@ impl BlockChainServer {
         }
 
         // Fail fast: a state with zero validators is invalid and would cause
-        // panics in proposer selection and attestation processing.
-        if self.store.head_state().validators.is_empty() {
+        // panics in proposer selection and attestation processing. Read once
+        // per tick, since `head_state` clones the whole state.
+        let num_validators = self.store.head_state().validators.len() as u64;
+        if num_validators == 0 {
             error!("Head state has no validators, skipping tick");
             return;
         }
@@ -484,7 +540,7 @@ impl BlockChainServer {
         // Whether one of our validators proposes this slot. Drives the store's
         // interval-0 attestation acceptance.
         let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
-            .then(|| self.get_our_proposer(slot))
+            .then(|| self.get_our_proposer(slot, num_validators))
             .flatten()
             .is_some();
 
@@ -512,7 +568,7 @@ impl BlockChainServer {
             // no prover work — so it no longer needs an interval of headroom.
             SlotInterval::BlockPublication => {
                 let proposer = (slot > 0)
-                    .then(|| self.get_our_proposer(slot))
+                    .then(|| self.get_our_proposer(slot, num_validators))
                     .flatten()
                     .filter(|_| self.sync_status.duties_allowed());
 
@@ -562,6 +618,20 @@ impl BlockChainServer {
                 } else if !self.key_manager.validator_ids().is_empty() {
                     info!(%slot, "Skipping attestations while syncing");
                 }
+
+                // Warm the XMSS signing caches for the next slot so the signing
+                // paths don't have to, now that this slot's attestations are
+                // signed: a key caches one bottom subtree, so warming any earlier
+                // evicts the subtree this slot's attestation signs with whenever
+                // the two slots straddle a subtree boundary. This lands well
+                // before the next slot's interval 0 signs its block. A skipped interval-1
+                // tick costs only latency, since `sign` rebuilds the subtree
+                // itself on a miss. Runs off the actor so a subtree boundary
+                // doesn't stall the tick.
+                let next_slot = slot + 1;
+                let proposer = self.get_our_proposer(next_slot, num_validators);
+                self.key_manager
+                    .prepare_keys_in_background(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====
@@ -624,9 +694,6 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
-
-        // Advance XMSS keys for next slot so the signing paths don't have to
-        self.key_manager.advance_keys_to((slot + 1) as u32);
     }
 
     /// Whether an aggregate finishing right now should go straight to gossip
@@ -821,10 +888,7 @@ impl BlockChainServer {
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
-    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = self.store.head_state();
-        let num_validators = head_state.validators.len() as u64;
-
+    fn get_our_proposer(&self, slot: u64, num_validators: u64) -> Option<u64> {
         self.key_manager
             .validator_ids()
             .into_iter()
@@ -1080,11 +1144,13 @@ impl BlockChainServer {
         // Must be the same baseline selection uses. Against the seen-votes
         // map every candidate scores zero on both axes, so this would drop the
         // whole ring on precisely the slots the head-vote axis exists to serve.
-        let latest_head_votes = self.store.extract_on_chain_votes();
+        let head_window = self
+            .store
+            .extract_head_vote_window(head_root, block_builder::HEAD_VOTE_WINDOW_BLOCKS);
 
         let dropped = self
             .body_proof_candidates
-            .prune_scoreless(&head_state, &latest_head_votes);
+            .prune_scoreless(&head_state, &head_window);
         if dropped > 0 {
             info!(
                 dropped,
@@ -1491,6 +1557,8 @@ impl BlockChainServer {
             WorkerConfig {
                 attestation_committee_count: self.attestation_committee_count,
                 subscribed_subnets: self.subscribed_subnets.clone(),
+                aggregation_duty_subnet: self.aggregation_duty_subnet,
+                skip_redundant_aggregation: self.skip_redundant_aggregation,
                 proposer_config: self.proposer_config,
             },
         ));

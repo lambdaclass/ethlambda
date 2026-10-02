@@ -8,11 +8,13 @@ on:
       - main
     paths:
       - "docs/**"
+      - "theme/**"
       - "book.toml"
       - ".github/workflows/pr-main_mdbook.yml"
   pull_request:
     paths:
       - "docs/**"
+      - "theme/**"
       - "book.toml"
       - ".github/workflows/pr-main_mdbook.yml"
   workflow_dispatch:
@@ -78,12 +80,13 @@ jobs:
         with:
           # eprint.iacr.org returns 403 to non-browser User-Agents (anti-bot
           # protection on the IACR preprint server); the URLs themselves are
-          # valid in a real browser.
+          # valid in a real browser. Same for x.com.
           args: >-
             --no-progress
             --exclude 'localhost'
             --exclude '127\.0\.0\.1'
             --exclude 'eprint\.iacr\.org'
+            --exclude '^https?://(www\.)?x\.com'
             docs/
           fail: true
 

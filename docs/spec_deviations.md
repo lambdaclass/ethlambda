@@ -23,7 +23,7 @@ grid.
 The block proof is a pair — the proposer's raw signature and the attestation aggregate —
 rather than one merged proof over both.
 
-- **ethlambda:** `SignedBlock.proof` is a `BlockProof { proposer_signature, attestation_proof }` (`crates/common/types/src/block.rs`). `proposer_signature` is the raw XMSS signature over the block root, verified directly against the proposer's `proposal_pubkey` with the hash-based verifier; `attestation_proof` is the lean-multisig Type-2 over the body's attestations only, and is empty when the block carries none (`verify_block_signatures`, `crates/blockchain/src/store.rs`).
+- **ethlambda:** `SignedBlock.proof` is a `BlockProof { proposer_signature, attestation_proof }` (`crates/common/types/src/block.rs`). `proposer_signature` is the raw XMSS signature over the block root, verified directly against the proposer's `proposal_pubkey` with the hash-based verifier; `attestation_proof` is the leanVM Type-2 over the body's attestations only, and is empty when the block carries none (`verify_block_signatures`, `crates/blockchain/src/store.rs`).
 - **leanSpec:** the proposer signature is wrapped as a singleton Type-1 and merged into a single block Type-2 alongside every attestation.
 - **Why:** the merged form makes the proposer signature the reason a block needs a prover at all — even an attestation-less one — and it ties the merge to the block root, so nothing can be merged before the block exists. Splitting removes prover work from the empty case entirely and is what makes a gossiped block body proof possible.
 - **Consequence:** this is a wire-format divergence. The signature and SSZ fixtures no longer apply, and a node running this cannot interop with one that does not.

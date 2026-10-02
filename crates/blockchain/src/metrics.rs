@@ -36,6 +36,13 @@ pub const ATTESTATION_AGGREGATE_COVERAGE_DIFF_DIRECTIONS: &[&str] = &["block_onl
 pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
     &["select_payloads", "compact", "stf_simulate"];
 
+/// Phases of sealing a built block (`block_builder::sign_and_prove_block`),
+/// observed on the same histogram: `sign_proposer` (XMSS signature over the
+/// block root, carried raw outside the aggregate), `merge_type2` (merge of every
+/// attestation single-message aggregate into the body's multi-message
+/// aggregate).
+pub const BLOCK_PROPOSAL_SEAL_PHASES: &[&str] = &["sign_proposer", "merge_type2"];
+
 /// Where a gossip message landed relative to the interval it was due in.
 ///
 /// Kept private to the module: unlike [`SyncStatus`] (which the RPC layer
@@ -297,6 +304,24 @@ static LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL: std::sync::LazyLock<Int
         .unwrap()
     });
 
+static LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_skipped_redundant_total",
+            "Candidates the redundancy-skipping check left to another duty subnet"
+        )
+        .unwrap()
+    });
+
+static LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_aggregation_window_fallback_total",
+            "Merges the subnet window would have dropped, recovered by retrying at the full committee set"
+        )
+        .unwrap()
+    });
+
 // --- Histograms ---
 
 static LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
@@ -448,6 +473,16 @@ static LEAN_FORK_CHOICE_REORG_DEPTH: std::sync::LazyLock<Histogram> =
         .unwrap()
     });
 
+static LEAN_AGGREGATION_WINDOW_WIDTH: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_aggregation_window_width",
+            "Width in subnets of the subnet window derived for one aggregation candidate",
+            vec![1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0]
+        )
+        .unwrap()
+    });
+
 /// Buckets clustered just past 0.8 s, the interval width of the default
 /// 4-second cadence ([`crate::DEFAULT_MILLISECONDS_PER_SLOT`]). Prometheus
 /// fixes buckets at registration, so a network on a different slot duration
@@ -513,15 +548,16 @@ static LEAN_BLOCK_BUILDING_FAILURES_TOTAL: std::sync::LazyLock<IntCounter> =
         register_int_counter!("lean_block_building_failures_total", "Failed block builds").unwrap()
     });
 
-// --- Block Proposal Attestation Selection (build_block fixed-point loop) ---
+// --- Block Proposal (build_block phases, then the seal in sign_and_prove_block) ---
 
 static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
     std::sync::LazyLock::new(|| {
         register_histogram_vec!(
             "lean_block_proposal_attestation_build_phase_seconds",
-            "Phase-level time in block-proposal attestation selection: select_payloads (greedy \
-             per-AttestationData proof pick), compact (recursive merge of proofs per \
-             AttestationData), stf_simulate (candidate block state transition).",
+            "Phase-level time in block proposal: select_payloads (greedy per-AttestationData \
+             proof pick), compact (recursive merge of proofs per AttestationData), \
+             stf_simulate (candidate block state transition), sign_proposer (XMSS block-root \
+             signature), merge_type2 (multi-message aggregate merge).",
             &["phase"],
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
@@ -868,6 +904,8 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_VALID_TOTAL);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNATURES_INVALID_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL);
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
@@ -879,6 +917,7 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_COMMITTEE_SIGNATURES_AGGREGATION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_AGGREGATED_PROOF_SIZE_BYTES);
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_REORG_DEPTH);
+    std::sync::LazyLock::force(&LEAN_AGGREGATION_WINDOW_WIDTH);
     std::sync::LazyLock::force(&LEAN_TICK_INTERVAL_DURATION_SECONDS);
     // Block production
     std::sync::LazyLock::force(&LEAN_BLOCK_AGGREGATED_PAYLOADS);
@@ -1132,6 +1171,29 @@ pub fn inc_aggregator_skipped_other(count: u64) {
         .inc_by(count);
 }
 
+/// Observe one candidate's derived subnet window width. Climbs as the proof
+/// pool climbs the reduction tree, pinning at the committee count once the
+/// best proof reaches half the committees; a candidate pinned there means the
+/// window no longer restricts selection.
+pub fn observe_aggregation_window_width(width: u64) {
+    LEAN_AGGREGATION_WINDOW_WIDTH.observe(width as f64);
+}
+
+/// Add to the count of candidates this aggregator sat out because the
+/// redundancy-skipping rotation gave their level to another duty subnet.
+pub fn inc_aggregation_skipped_redundant(count: u64) {
+    LEAN_AGGREGATION_SKIPPED_REDUNDANT_TOTAL.inc_by(count);
+}
+
+/// Add to the count of merges recovered by the full-committee-width retry:
+/// the windowed selection produced no viable job (a strided proof pool can
+/// leave a contiguous window holding a single proof) and the retry did.
+/// Recoveries, not attempts, so candidates that no window could have made
+/// viable are not counted.
+pub fn inc_aggregation_window_fallback(count: u64) {
+    LEAN_AGGREGATION_WINDOW_FALLBACK_TOTAL.inc_by(count);
+}
+
 /// Update a table byte size gauge.
 pub fn update_table_bytes(table_name: &str, bytes: u64) {
     LEAN_TABLE_BYTES
@@ -1220,8 +1282,8 @@ pub fn inc_block_building_failures() {
     LEAN_BLOCK_BUILDING_FAILURES_TOTAL.inc();
 }
 
-/// Observe the duration of a block-proposal attestation-selection phase.
-/// `phase` must be one of [`BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`].
+/// Observe the duration of a block-proposal phase. `phase` must be one of
+/// [`BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES`] or [`BLOCK_PROPOSAL_SEAL_PHASES`].
 pub fn observe_block_proposal_phase(phase: &str, elapsed: Duration) {
     LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS
         .with_label_values(&[phase])
