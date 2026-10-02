@@ -1822,10 +1822,10 @@ impl BlockChainServer {
                     Some(block_state) => {
                         // One `Table::LiveChain` scan for the whole body, not
                         // one per attestation: the table carries a row per
-                        // block this node imported and is never pruned on
-                        // beacon, so the scan is the expensive part and every
-                        // attestation in the block asks the same question of
-                        // it.
+                        // unfinalized block, and every attestation in the
+                        // block asks the same question of it, so building the
+                        // index once is what keeps that a single scan rather
+                        // than one per attestation.
                         let index = self.store.block_index();
                         for attestation in &attestations {
                             let _ = fork_choice::on_block_attestation(

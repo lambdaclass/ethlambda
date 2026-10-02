@@ -68,8 +68,10 @@ pub enum QueueReason {
     ParentUnknown,
     /// Its parent is stored but has no cached post-state yet: held for its
     /// columns, still importing, or evicted from the state cache. Also used
-    /// when the finalized-ancestry walk cannot finish: a `LiveChain` row is
-    /// missing for a block on the way, as after a late `invalidate_subtree`.
+    /// when the finalized-ancestry walk cannot finish above the finalized
+    /// block's own slot: a `LiveChain` row is missing for a block on the way,
+    /// as after a late `invalidate_subtree`. A row missing at or below that
+    /// slot is a REJECT instead; see [`finalized_ancestry`].
     ParentNotReady,
     /// Its slot is outside the parent state's proposer lookahead.
     ShufflingUnavailable,
@@ -355,8 +357,14 @@ pub(crate) enum FinalizedAncestry {
     /// The finalized checkpoint is an ancestor.
     Descends,
     /// The chain passes the finalized epoch at a different block: a fork.
+    /// Also a walk that falls off `LiveChain` at a block other than the
+    /// finalized one, at or below the finalized block's own slot: a fork that
+    /// split off below the finalized block, whose rows pruning has dropped.
     Conflicts,
-    /// The walk could not finish: a block on the way has no `LiveChain` row.
+    /// The walk could not finish, and where it stopped says nothing about a
+    /// fork: the block missing a `LiveChain` row sits above the finalized
+    /// block's own slot, or one of the two has no stored block to read a slot
+    /// from.
     Unknown,
 }
 
@@ -373,27 +381,66 @@ impl FinalizedAncestry {
 }
 
 /// Where `root`'s chain stands relative to the finalized checkpoint. The same
-/// walk the chain actor's `parent_is_on_the_finalized_chain` does, but
-/// three-way rather than a bool: `fork_choice::get_checkpoint_block` erroring
-/// means a row is missing from `LiveChain`, which happens after
-/// `fork_choice::invalidate_subtree` deletes a late-invalidated parent's rows
-/// while its cached state stays, not that `root`'s chain has forked away from
-/// the finalized checkpoint. A caller that folded that into "not an ancestor"
-/// would REJECT a child of a parent whose payload was invalidated, penalizing
-/// peers who forwarded it before they learned of the invalidation, where the
-/// specification asks for IGNORE.
+/// walk the chain actor's `parent_is_on_the_finalized_chain` does
+/// (`fork_choice::get_checkpoint_block`), but three-way rather than a bool.
+///
+/// The walk fails when a block on the way has no `LiveChain` row, which
+/// happens for two reasons that need opposite verdicts. The slot of the block
+/// the walk could not look up tells them apart, measured against the
+/// finalized block's own slot (both read from `BlockHeaders`, which is never
+/// pruned):
+///
+/// - **At or below it**: the beacon arm of `Store::update_checkpoints` prunes
+///   every row below the finalized block's own slot, so a chain that forked
+///   off below the finalized block walks into a pruned row. Every descendant
+///   of the finalized block has a strictly higher slot, so a different block
+///   at or below that slot cannot be on the finalized chain, whatever removed
+///   its row: [`FinalizedAncestry::Conflicts`], the specification's REJECT.
+///   Lighthouse's `is_finalized_checkpoint_or_descendant` reads a walk that
+///   falls off its own pruned tree the same way.
+/// - **Above it**: pruning never reaches there, so the row went some other
+///   way, as when `fork_choice::invalidate_subtree` deletes a late-invalidated
+///   parent's rows while its cached state stays. That says nothing about
+///   whether `root`'s chain has forked away from the finalized checkpoint:
+///   [`FinalizedAncestry::Unknown`]. A caller that folded it into "not an
+///   ancestor" would REJECT a child of a parent whose payload was
+///   invalidated, penalizing peers who forwarded it before they learned of
+///   the invalidation, where the specification asks for IGNORE.
+///
+/// If either block has no `BlockHeaders` row there is no slot to compare, so
+/// that is `Unknown` too, and so is a walk that falls off at the finalized
+/// block's own row, which pruning always keeps.
 pub(crate) fn finalized_ancestry(store: &Store, root: Root) -> FinalizedAncestry {
     let finalized = store.beacon_finalized_checkpoint();
     let index = store.block_index();
-    match fork_choice::get_checkpoint_block(&index, root, finalized.epoch) {
+    let checkpoint_slot = compute_start_slot_at_epoch(finalized.epoch);
+    match fork_choice::get_ancestor_or_missing(&index, root, checkpoint_slot) {
         Ok(ancestor) if ancestor == finalized.root => FinalizedAncestry::Descends,
         Ok(_) => FinalizedAncestry::Conflicts,
-        Err(_) => FinalizedAncestry::Unknown,
+        Err(missing) => missing_row_ancestry(store, finalized.root, missing),
+    }
+}
+
+/// [`finalized_ancestry`]'s verdict for a walk that fell off `LiveChain` at
+/// `missing`. Its two `BlockHeaders` reads each decode a whole block, which
+/// only a walk that has already failed pays for.
+fn missing_row_ancestry(store: &Store, finalized_root: Root, missing: Root) -> FinalizedAncestry {
+    let Some((missing_slot, _)) = store.block_entry(&missing) else {
+        return FinalizedAncestry::Unknown;
+    };
+    let Some((finalized_slot, _)) = store.block_entry(&finalized_root) else {
+        return FinalizedAncestry::Unknown;
+    };
+    if missing != finalized_root && missing_slot <= finalized_slot {
+        FinalizedAncestry::Conflicts
+    } else {
+        FinalizedAncestry::Unknown
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::{PastAFork, empty_block, store, store_finalized_past_a_fork};
     use super::*;
 
     fn capacity(n: usize) -> NonZeroUsize {
@@ -459,6 +506,77 @@ mod tests {
             Outcome::Reject(RejectReason::from(PrecheckError::BadSignature)).labels(),
             ("reject", "bad_signature")
         );
+    }
+
+    // -- finalized_ancestry --------------------------------------------------
+
+    #[test]
+    fn a_walk_off_the_pruned_tree_below_the_finalized_block_conflicts() {
+        let PastAFork {
+            store,
+            finalized,
+            descendant,
+            fork_base,
+            fork_tip,
+        } = store_finalized_past_a_fork();
+
+        assert_eq!(
+            finalized_ancestry(&store, finalized),
+            FinalizedAncestry::Descends
+        );
+        assert_eq!(
+            finalized_ancestry(&store, descendant),
+            FinalizedAncestry::Descends
+        );
+        // The walk from the tip falls off at `fork_base`, whose row the
+        // advance pruned: a block below the finalized one, so not on its
+        // chain. Before `LiveChain` was pruned on beacon, the same walk found
+        // `fork_base` and answered `Conflicts` through the `Ok` arm.
+        assert_eq!(
+            finalized_ancestry(&store, fork_tip),
+            FinalizedAncestry::Conflicts
+        );
+        assert_eq!(
+            finalized_ancestry(&store, fork_base),
+            FinalizedAncestry::Conflicts
+        );
+    }
+
+    #[test]
+    fn a_walk_off_the_tree_above_the_finalized_block_is_unknown() {
+        let PastAFork {
+            mut store,
+            descendant,
+            ..
+        } = store_finalized_past_a_fork();
+
+        // What a late `INVALID` does to a block above finality: its
+        // `LiveChain` row goes, its `BlockHeaders` row stays.
+        assert_eq!(fork_choice::invalidate_subtree(&mut store, descendant), 1);
+        assert_eq!(
+            finalized_ancestry(&store, descendant),
+            FinalizedAncestry::Unknown
+        );
+        // A root nothing ever stored has no slot to place it by.
+        assert_eq!(
+            finalized_ancestry(&store, Root::repeat_byte(0xee)),
+            FinalizedAncestry::Unknown
+        );
+    }
+
+    #[test]
+    fn a_finalized_root_with_no_stored_block_leaves_a_failed_walk_unknown() {
+        // `store(0)` finalizes `Root::ZERO` without storing a block for it,
+        // so there is no finalized slot to measure the missing block against.
+        let mut store = store(0);
+        let missing = Root::repeat_byte(0x01);
+        let tip = Root::repeat_byte(0x02);
+        store
+            .insert_pending_block(missing, empty_block(0, Root::ZERO))
+            .expect("insert pending block");
+        store.insert_live_chain_entry(5, tip, missing);
+
+        assert_eq!(finalized_ancestry(&store, tip), FinalizedAncestry::Unknown);
     }
 
     #[test]

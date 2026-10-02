@@ -660,10 +660,12 @@ pub fn resolve_invalid_block(
 ///
 /// # A dangling vote this can create
 ///
-/// Unlike `Store::promote_beacon_anchor`, which only ever prunes below a
-/// finality horizon, this removes rows from the *live* window, so a validator
-/// whose freshest vote named a branch the execution layer has since rejected
-/// keeps pointing at a root no longer in the index, until it attests again.
+/// Unlike the beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints),
+/// which only ever prunes below the finalized block's own slot, this removes
+/// rows from the *live* window, so a validator whose freshest vote named a
+/// branch the execution layer has since rejected keeps pointing at a root no
+/// longer in the index, until it attests again.
 ///
 /// [`compute_weights`] already drops such a vote rather than raising, so
 /// [`get_head`] is unaffected. [`get_weight`] deliberately does not: it is the
@@ -754,8 +756,11 @@ pub fn mark_validated(store: &mut Store, root: Root) {
     // With a healthy execution client nothing is optimistic, and the walk below
     // would exit on its own first iteration. Ask that before paying for
     // `block_index`, which is an uncached prefix scan of the whole `LiveChain`
-    // table (never pruned on beacon) plus a map build, on a path that runs once
-    // per imported block and once per `forkchoiceUpdated`.
+    // table plus a map build, on a path that runs once per imported block and
+    // once per `forkchoiceUpdated`. The table holds the unfinalized window
+    // (each finalization advance prunes it below the finalized block's own
+    // slot), which still grows with every block for as long as finality
+    // stalls.
     if !store.has_beacon_optimistic_roots() {
         return;
     }
@@ -1035,11 +1040,11 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// slot is at or before `slot`, found by walking parent links.
 ///
 /// The specification defines this recursively; implemented here as a loop
-/// instead, so that a long unfinalized suffix cannot risk a stack overflow.
-/// An unknown `root` is exactly the "unhandled exception" case the
-/// specification calls out as invalid (`store.blocks[root]` would raise
-/// `KeyError` in the reference implementation), so it becomes a `SpecAssert`
-/// here rather than a panic.
+/// instead (in [`get_ancestor_or_missing`], which this wraps), so that a long
+/// unfinalized suffix cannot risk a stack overflow. An unknown `root` is
+/// exactly the "unhandled exception" case the specification calls out as
+/// invalid (`store.blocks[root]` would raise `KeyError` in the reference
+/// implementation), so it becomes a `SpecAssert` here rather than a panic.
 ///
 /// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
 /// shape) rather than `&Store`: a caller in a per-validator loop
@@ -1048,11 +1053,26 @@ pub fn compute_slots_since_epoch_start(slot: Slot) -> Slot {
 /// naive by a backend round trip. Every caller builds `index` once, outside
 /// its own loop, and threads it down.
 pub fn get_ancestor(index: &HashMap<Root, (Slot, Root)>, root: Root, slot: Slot) -> Result<Root> {
+    get_ancestor_or_missing(index, root, slot)
+        .map_err(|_missing| Error::SpecAssert("root in store.blocks"))
+}
+
+/// [`get_ancestor`], except that a walk falling off `index` names the root it
+/// could not look up: `root` itself, or the parent of the last block it
+/// found.
+///
+/// The specification has no use for that root, so [`get_ancestor`] drops it.
+/// A caller asking *why* the walk failed does: `LiveChain` loses rows both to
+/// finality pruning and to `invalidate_subtree`, and the missing block's own
+/// slot is what tells the two apart (see `gossip::finalized_ancestry`).
+pub fn get_ancestor_or_missing(
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    slot: Slot,
+) -> std::result::Result<Root, Root> {
     let mut root = root;
     loop {
-        let &(block_slot, parent_root) = index
-            .get(&root)
-            .ok_or(Error::SpecAssert("root in store.blocks"))?;
+        let &(block_slot, parent_root) = index.get(&root).ok_or(root)?;
         if block_slot > slot {
             root = parent_root;
         } else {
@@ -1177,8 +1197,10 @@ pub fn get_weight(
 /// cache, and no registry scan at all.
 ///
 /// A vote for a block no longer in `index` is dropped rather than raising.
-/// `Store::promote_beacon_anchor` prunes the block index below the oldest kept
-/// finalized anchor, and a validator whose freshest recorded vote is for a
+/// The beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints)
+/// prunes the block index below the finalized block's own slot on every
+/// finalization advance, and a validator whose freshest recorded vote is for a
 /// block down there keeps that vote until it attests again. Such a vote cannot
 /// distinguish between candidates above the justified checkpoint (all of them
 /// descend from the finalized block it voted below), so it weighs nothing, and
@@ -2133,8 +2155,12 @@ pub fn validate_on_attestation(
 /// Takes `index` (`root -> (slot, parent_root)`, [`Store::block_index`]'s own
 /// shape) for the reason [`filter_block_tree`] does: a caller validating every
 /// attestation carried in one block ([`on_block_attestation`]) would otherwise
-/// re-scan `Table::LiveChain` once per attestation, and that table grows one
-/// row per imported block on a chain whose blocks are never pruned from it.
+/// re-scan `Table::LiveChain` once per attestation, and that table holds a
+/// row per imported block in the unfinalized window: the beacon arm of
+/// [`Store::update_checkpoints`](ethlambda_storage::Store::update_checkpoints)
+/// prunes it below the finalized block's own slot on each finalization
+/// advance, so its size follows the distance from the finalized block to the
+/// head, and grows with every block while finality stalls.
 fn validate_on_attestation_indexed(
     store: &Store,
     data: AttestationData,
@@ -2866,12 +2892,12 @@ mod tests {
         );
     }
 
-    /// The failure a live mainnet follower hit: `promote_beacon_anchor` prunes
-    /// the block index below the oldest kept anchor, and any validator whose
-    /// freshest vote was for a block down there kept pointing at it. The
-    /// specification's `get_weight` raises on that vote and takes the whole
-    /// head computation with it; the head froze for as long as one stale voter
-    /// stayed stale.
+    /// The failure a live mainnet follower hit: the beacon arm of
+    /// `Store::update_checkpoints` prunes the block index below the finalized
+    /// block's own slot, and any validator whose freshest vote was for a block
+    /// down there kept pointing at it. The specification's `get_weight` raises
+    /// on that vote and takes the whole head computation with it; the head
+    /// froze for as long as one stale voter stayed stale.
     #[test]
     fn a_vote_for_a_pruned_block_weighs_nothing_instead_of_failing() {
         let config = Config::active();
@@ -2943,6 +2969,91 @@ mod tests {
         // "unhandled exception" case it calls invalid, so this must be an
         // error rather than a panic.
         assert!(get_ancestor(&index, Root::repeat_byte(9), 0).is_err());
+    }
+
+    #[test]
+    fn get_ancestor_or_missing_names_the_root_the_walk_could_not_look_up() {
+        let pruned_root = Root::repeat_byte(1);
+        let a_root = Root::repeat_byte(2);
+        let b_root = Root::repeat_byte(3);
+
+        // `pruned_root` has no row of its own, as after finality pruning.
+        let mut index = HashMap::new();
+        index.insert(a_root, (5, pruned_root));
+        index.insert(b_root, (7, a_root));
+
+        // A walk that stops before the gap is unaffected by it.
+        assert_eq!(get_ancestor_or_missing(&index, b_root, 5), Ok(a_root));
+        // One that has to cross it names the parent it could not find, not
+        // the root it started from.
+        assert_eq!(get_ancestor_or_missing(&index, b_root, 4), Err(pruned_root));
+        // A starting root with no row is itself the missing one.
+        let unknown = Root::repeat_byte(9);
+        assert_eq!(get_ancestor_or_missing(&index, unknown, 0), Err(unknown));
+    }
+
+    /// The scenario `Store::update_checkpoints`' beacon arm exists for: the
+    /// finalized checkpoint names epoch 1, whose start slot nobody built a
+    /// block for, so the finalized block itself sits at the slot before. Once
+    /// finalization advances (a real `update_checkpoints` call, which prunes
+    /// `LiveChain` as a side effect), `filter_block_tree`'s own
+    /// `get_checkpoint_block(index, ..., 1)` must still resolve to that block
+    /// rather than fail: `on_block` and `get_head` both call it on every
+    /// leaf, and either one erroring here is `get_head` freezing on a live
+    /// follower.
+    ///
+    /// Reproduces the bug this fixes: pruning to the epoch's start slot
+    /// instead of the finalized block's own slot (the one before it) would
+    /// delete that block's row along with genesis', and this same call would
+    /// return `Err(SpecAssert("root in store.blocks"))` instead.
+    ///
+    /// Every slot is derived from the preset's epoch length: under the
+    /// minimal preset, slots hardcoded for mainnet name a finalized block in
+    /// a later epoch than its checkpoint, and the walk to epoch 1 then runs
+    /// into the pruned anchor.
+    #[test]
+    fn get_checkpoint_block_succeeds_after_pruning_past_an_empty_epoch_boundary() {
+        let genesis_root = Root::repeat_byte(1);
+        let mut store = store_anchored_at(genesis_root);
+        store
+            .insert_signed_block(genesis_root, block(0, Root::ZERO))
+            .unwrap();
+
+        // The finalized-block-to-be: the last block before epoch 1's start
+        // slot, which is never built.
+        let boundary = compute_start_slot_at_epoch(1);
+        let finalized_root = Root::repeat_byte(2);
+        store
+            .insert_signed_block(finalized_root, block(boundary - 1, genesis_root))
+            .unwrap();
+
+        // The current head, one slot past the empty boundary.
+        let head_root = Root::repeat_byte(3);
+        store
+            .insert_signed_block(head_root, block(boundary + 1, finalized_root))
+            .unwrap();
+
+        let finalized = Checkpoint {
+            epoch: 1,
+            root: finalized_root,
+        };
+        update_checkpoints(&mut store, finalized, finalized);
+        assert_eq!(
+            store.beacon_finalized_checkpoint(),
+            finalized,
+            "the checkpoint must have actually advanced for pruning to run"
+        );
+
+        let index = store.block_index();
+        assert!(
+            !index.contains_key(&genesis_root),
+            "the anchor is below the finalized block's own slot and must be pruned"
+        );
+        assert_eq!(
+            get_checkpoint_block(&index, head_root, 1).unwrap(),
+            finalized_root,
+            "the walk from head must still reach the finalized block across the empty boundary slot"
+        );
     }
 
     #[test]
