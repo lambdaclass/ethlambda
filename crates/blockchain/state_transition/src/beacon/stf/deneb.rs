@@ -377,6 +377,10 @@ pub fn process_attestation(
                 })?;
 
         let mut new_flags: ParticipationFlags = 0;
+        // The attester's validator is read at most once, on the first flag
+        // it newly earns: each read is a tree descent, and the effective
+        // balance cannot change inside this read-only phase.
+        let mut attester_increments: Option<Gwei> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -388,8 +392,15 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let increments =
-                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let increments = match attester_increments {
+                Some(increments) => increments,
+                None => {
+                    let increments = state.validator(index)?.effective_balance
+                        / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    attester_increments = Some(increments);
+                    increments
+                }
+            };
             let reward = (increments * base_reward_per_increment)
                 .checked_mul(weight)
                 .ok_or(Error::ArithmeticOverflow(
