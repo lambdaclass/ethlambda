@@ -317,6 +317,7 @@ pub(crate) fn phase0_state_ref<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state;
 
     #[test]
@@ -349,5 +350,39 @@ mod tests {
 
         assert!(!state.balances().has_pending_updates());
         assert!(!state.validators().has_pending_updates());
+    }
+
+    const BEACON_FORKS: [ForkName; 7] = [
+        ForkName::Phase0,
+        ForkName::Altair,
+        ForkName::Bellatrix,
+        ForkName::Capella,
+        ForkName::Deneb,
+        ForkName::Electra,
+        ForkName::Fulu,
+    ];
+
+    /// One write to every tree-backed field of every fork: the flush and the
+    /// pending check must both see all of them, since both come from one
+    /// field list.
+    #[test]
+    fn every_tree_field_of_every_fork_is_flushed_and_checked() {
+        for fork in BEACON_FORKS {
+            let mut state = test_state::with_validators_at(fork, 4);
+            assert!(!state.has_pending_mutations(), "{fork:?} starts flushed");
+
+            state.validator_mut(0).unwrap().effective_balance -= 1;
+            assert!(state.has_pending_mutations(), "{fork:?} validators");
+            state.apply_pending_mutations();
+            assert!(
+                !state.has_pending_mutations(),
+                "{fork:?} validators flushed"
+            );
+
+            state.balances_mut()[0] += 1;
+            assert!(state.has_pending_mutations(), "{fork:?} balances");
+            state.apply_pending_mutations();
+            assert!(!state.has_pending_mutations(), "{fork:?} balances flushed");
+        }
     }
 }

@@ -395,6 +395,39 @@ impl BeaconState {
     }
 }
 
+/// Lists the tree-backed fields of one fork's state, once, and derives from
+/// that list both the flush (`apply_pending_mutations`) and the pending check
+/// (`has_pending_mutations`), so the two cannot drift apart when a field moves
+/// onto the tree.
+///
+/// The fields are handed out as `dyn Buffered`, since they differ in element
+/// type and update map.
+macro_rules! tree_fields {
+    ($fork:ty => $($field:ident),+ $(,)?) => {
+        impl $fork {
+            fn buffered(&self) -> [&dyn ethlambda_ssz_tree::Buffered; tree_fields!(@count $($field)+)] {
+                [$(&self.$field),+]
+            }
+
+            fn buffered_mut(
+                &mut self,
+            ) -> [&mut dyn ethlambda_ssz_tree::Buffered; tree_fields!(@count $($field)+)] {
+                [$(&mut self.$field),+]
+            }
+        }
+    };
+    (@count) => { 0usize };
+    (@count $head:ident $($tail:ident)*) => { 1usize + tree_fields!(@count $($tail)*) };
+}
+
+tree_fields!(phase0::BeaconState => validators, balances);
+tree_fields!(altair::BeaconState => validators, balances);
+tree_fields!(bellatrix::BeaconState => validators, balances);
+tree_fields!(capella::BeaconState => validators, balances);
+tree_fields!(deneb::BeaconState => validators, balances);
+tree_fields!(electra::BeaconState => validators, balances);
+tree_fields!(fulu::BeaconState => validators, balances);
+
 /// Generates read and write accessors for state fields that every fork shares.
 ///
 /// The `copy` and `reference` lists are this crate's statement of which state
@@ -537,9 +570,9 @@ impl BeaconState {
             .ok_or(Error::UnknownValidator(index))
     }
 
-    /// Folds every buffered write into the tree-backed fields (`validators`,
-    /// `balances`), so the next `hash_tree_root` rehashes only the touched
-    /// paths and keeps the hashes it computes.
+    /// Folds every buffered write into the tree-backed fields (see
+    /// `tree_fields!` for which ones), so the next `hash_tree_root` rehashes
+    /// only the touched paths and keeps the hashes it computes.
     ///
     /// Hashing with writes still pending gives the right root but caches
     /// nothing for those paths, so the state transition calls this before
@@ -549,11 +582,13 @@ impl BeaconState {
         if matches!(self, BeaconState::Lean(_)) {
             return;
         }
-        self.validators_mut().apply_updates();
-        self.balances_mut().apply_updates();
+        dispatch_state!(self, "apply_pending_mutations", |state| state
+            .buffered_mut()
+            .into_iter()
+            .for_each(|field| field.apply_updates()))
     }
 
-    /// Whether `validators` or `balances` has a write [`apply_pending_mutations`]
+    /// Whether any tree-backed field has a write [`apply_pending_mutations`]
     /// has not folded into its tree yet.
     ///
     /// Always `false` on a lean state, which has no tree-backed fields. Meant
@@ -566,7 +601,10 @@ impl BeaconState {
         if matches!(self, BeaconState::Lean(_)) {
             return false;
         }
-        self.validators().has_pending_updates() || self.balances().has_pending_updates()
+        dispatch_state!(self, "has_pending_mutations", |state| state
+            .buffered()
+            .into_iter()
+            .any(|field| field.has_pending_updates()))
     }
 
     /// Makes this state's tree-backed fields share every unchanged subtree
@@ -574,8 +612,8 @@ impl BeaconState {
     /// of the registry. The state's contents do not change, only which
     /// allocations back them.
     ///
-    /// Works across forks, since `validators` and `balances` have one type in
-    /// every fork. A no-op if either state is lean.
+    /// Works across forks, since the shared fields have one type in every
+    /// fork. A no-op if either state is lean.
     pub fn rebase_on(&mut self, base: &BeaconState) {
         if matches!(self, BeaconState::Lean(_)) || matches!(base, BeaconState::Lean(_)) {
             return;
