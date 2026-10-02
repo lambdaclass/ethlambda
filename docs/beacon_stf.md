@@ -308,6 +308,12 @@ so they are filtered per vote. `get_weight` stays as the specification's
 per-root definition, and the fork-choice fixture runner checks
 `compute_weights` against it at every `checks` step.
 
+The latest votes are stored the same way, as a dense table indexed by validator
+index rather than a hash map, so the vote loop reads votes and snapshot
+balances in index order. The table grows to the highest voting index, which is
+why `set_latest_message` only takes indices from validated attestations (a
+debug assertion bounds it).
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that
