@@ -68,7 +68,7 @@ pub(crate) fn json_response<T: serde::Serialize>(value: T) -> axum::response::Re
     response
 }
 
-fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
+pub(crate) fn ssz_response(bytes: Vec<u8>) -> axum::response::Response {
     let mut response = bytes.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,

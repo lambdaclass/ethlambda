@@ -7,14 +7,17 @@ use axum::{
 };
 use ethlambda_storage::Store;
 use ethlambda_types::primitives::H256;
+use libssz::SszEncode as _;
 use serde_json::json;
 
-use crate::json_response;
+use crate::{json_response, ssz_response};
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
         .route("/lean/v0/blocks/{block_id}", get(get_block))
         .route("/lean/v0/blocks/{block_id}/header", get(get_block_header))
+        .route("/lean/v0/blocks/{block_id}/ssz", get(get_block_ssz))
+        .route("/lean/v0/states/{block_id}", get(get_state_by_id))
 }
 
 /// `GET /lean/v0/blocks/:block_id` — returns the block as JSON.
@@ -50,6 +53,47 @@ pub(crate) async fn get_block_header(
         Ok(Some(header)) => json_response(header),
         Ok(None) => BlockIdError::NotFound.into_response(),
         Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `GET /lean/v0/blocks/:block_id/ssz` — returns the block as SSZ bytes.
+pub(crate) async fn get_block_ssz(
+    Path(block_id): Path<String>,
+    State(store): State<Store>,
+) -> impl IntoResponse {
+    let root = match resolve_block_id(&store, &block_id) {
+        Ok(root) => root,
+        Err(err) => return err.into_response(),
+    };
+
+    match store.get_block(&root) {
+        Ok(Some(block)) => ssz_response(block.to_ssz()),
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// `GET /lean/v0/states/:block_id` — returns that block's post-state as SSZ.
+///
+/// The replay tool fetches a block's pre-state as the post-state of its parent
+/// (`states/{parent_root}`). `state_root` is zeroed to the canonical post-state
+/// form, matching `/states/finalized`.
+pub(crate) async fn get_state_by_id(
+    Path(block_id): Path<String>,
+    State(store): State<Store>,
+) -> impl IntoResponse {
+    let root = match resolve_block_id(&store, &block_id) {
+        Ok(root) => root,
+        Err(err) => return err.into_response(),
+    };
+
+    match store.get_state(&root) {
+        Ok(Some(mut state)) => {
+            state.latest_block_header.state_root = H256::ZERO;
+            ssz_response(state.to_ssz())
+        }
+        Ok(None) => BlockIdError::NotFound.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

@@ -1,0 +1,20 @@
+# Standalone workspace: this crate is excluded from the root workspace because
+# its build script needs the SP1 (`cargo prove`) toolchain.  
+[workspace]
+
+[package]
+name = "ethlambda-prover-sp1"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+sp1-sdk = "6.3.1"
+ethlambda-prover-core = { path = "../core" }
+ethlambda-types = { path = "../../common/types" }
+# Serializes the whole SP1ProofWithPublicValues into `Proof` so verify can
+# recover the committed public values.
+bincode = "1.3"
+
+[build-dependencies]
+sp1-build = "6.3.1"
