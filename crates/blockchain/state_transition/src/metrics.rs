@@ -62,6 +62,54 @@ pub fn inc_committee_cache_lookups(result: &str) {
         .inc();
 }
 
+static LEAN_BEACON_EPOCH_PRECOMPUTE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_epoch_precompute_lookups_total",
+        "Epoch-crossing block imports, by whether a precomputed epoch-boundary state was cached",
+        &["result"]
+    )
+    .unwrap()
+});
+
+/// Count one epoch-crossing import's lookup of a precomputed state: `hit` or
+/// `miss`.
+pub fn inc_epoch_precompute_lookups(result: &str) {
+    LEAN_BEACON_EPOCH_PRECOMPUTE_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
+static LEAN_BEACON_EPOCH_PRECOMPUTE_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_beacon_epoch_precompute_seconds",
+        "Duration of one epoch-transition precompute: advance, flush and hash",
+        vec![0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 8.0]
+    )
+    .unwrap()
+});
+
+/// Start timing one epoch precompute. Records duration when the guard is dropped.
+pub fn time_epoch_precompute() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_EPOCH_PRECOMPUTE_SECONDS)
+}
+
+static LEAN_BEACON_EPOCH_PRECOMPUTE_STARTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_epoch_precompute_started_total",
+        "Epoch precompute workers started, by what triggered them",
+        &["trigger"]
+    )
+    .unwrap()
+});
+
+/// Count one precompute worker started: `head` (a last-slot block became head)
+/// or `timer` (three quarters into a last slot with nothing computed).
+pub fn inc_epoch_precompute_started(trigger: &str) {
+    LEAN_BEACON_EPOCH_PRECOMPUTE_STARTED_TOTAL
+        .with_label_values(&[trigger])
+        .inc();
+}
+
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "lean_state_transition_time_seconds",

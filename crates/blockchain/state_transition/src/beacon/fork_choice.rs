@@ -877,6 +877,114 @@ pub fn checkpoint_state(
     Ok(state)
 }
 
+/// The state of `parent_root` advanced to the first slot of `epoch`, computed
+/// without the store.
+///
+/// What [`checkpoint_state`] derives on a miss, taking the checkpoint block's
+/// post-state as an argument so a worker thread can run it off the actor.
+/// Hashes the result after flushing buffered writes, so the import that later
+/// resumes from a clone of it finds the tree nodes' hashes already memoized
+/// and pays only for the flat fields. A state already at or past the epoch's
+/// first slot comes back unchanged, as `checkpoint_state` returns it.
+pub fn advance_to_epoch_start(
+    parent_state: &BeaconState,
+    epoch: Epoch,
+    config: &Config,
+) -> Result<BeaconState> {
+    let target_slot = compute_start_slot_at_epoch(epoch);
+    let mut state = parent_state.clone();
+    if state.slot() < target_slot {
+        stf::process_slots(&mut state, target_slot, config)?;
+    }
+    state.apply_pending_mutations();
+    let _ = state.hash_tree_root();
+    Ok(state)
+}
+
+/// Applies `signed_block` to a copy of its parent's post-state, resuming from
+/// the precomputed epoch-boundary state when the block crosses into an epoch
+/// and one is cached.
+///
+/// Returns the copy with the transition's outcome, since a failed transition
+/// still leaves the caller a state to inspect. Both starting points reach the
+/// same post-state: the precomputed one is what `process_slots` would produce
+/// from the parent. Either way the copy is independent, so a failing block
+/// cannot corrupt a cached entry.
+#[allow(clippy::too_many_arguments)]
+fn transition_block(
+    store: &Store,
+    parent_state: &BeaconState,
+    parent_root: Root,
+    signed_block: &SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &stf::ExecutionEngine,
+    committees: &CommitteeCache,
+) -> (BeaconState, Result<()>) {
+    let block_slot = signed_block.slot();
+    let Some(precomputed) =
+        precomputed_epoch_state(store, parent_state.slot(), parent_root, block_slot)
+    else {
+        let mut state = parent_state.clone();
+        let outcome = stf::state_transition(
+            &mut state,
+            signed_block,
+            validate_result,
+            config,
+            engine,
+            committees,
+        );
+        return (state, outcome);
+    };
+
+    let mut state = (*precomputed).clone();
+    // Only the slots skipped past the boundary are left to advance; none when
+    // the block sits on the boundary itself.
+    let outcome = if state.slot() < block_slot {
+        stf::process_slots(&mut state, block_slot, config)
+    } else {
+        Ok(())
+    }
+    .and_then(|()| {
+        stf::apply_block(
+            &mut state,
+            signed_block,
+            validate_result,
+            config,
+            engine,
+            committees,
+        )
+    });
+    (state, outcome)
+}
+
+/// The precomputed epoch-boundary state an import can resume from, if any.
+///
+/// Applies to a block that crosses into a new epoch: its parent's post-state
+/// is before the first slot of the block's epoch, and the block is at or after
+/// that slot. The precompute worker stores it under the key
+/// [`checkpoint_state`] uses for `(block_epoch, parent_root)`, since the two
+/// name the same state. Counts a hit or a miss for every such import and for
+/// no other.
+fn precomputed_epoch_state(
+    store: &Store,
+    parent_slot: Slot,
+    parent_root: Root,
+    block_slot: Slot,
+) -> Option<Arc<BeaconState>> {
+    let epoch = compute_epoch_at_slot(block_slot);
+    let epoch_start = compute_start_slot_at_epoch(epoch);
+    if !(parent_slot < epoch_start && epoch_start <= block_slot) {
+        return None;
+    }
+    let cached = store.cached_state(CacheKey::CheckpointState {
+        epoch,
+        root: parent_root,
+    });
+    crate::metrics::inc_epoch_precompute_lookups(if cached.is_some() { "hit" } else { "miss" });
+    cached
+}
+
 // ---------------------------------------------------------------------------
 // get_forkchoice_store
 // ---------------------------------------------------------------------------
@@ -2301,7 +2409,6 @@ pub fn on_block(
         .get_state(&parent_root)
         .expect("get")
         .ok_or(Error::SpecAssert("block.parent_root in store.block_states"))?;
-    let mut state = (*parent_state).clone();
 
     // Blocks cannot be in the future. If they are, their consideration must
     // be delayed until they are in the past.
@@ -2370,8 +2477,22 @@ pub fn on_block(
             stf::ExecutionEngine::valid()
         }
     };
-    let transition =
-        stf::state_transition(&mut state, &signed_block, true, config, &engine, committees);
+    //
+    // An epoch-crossing block starts from the precomputed boundary state when
+    // one is cached, and from the parent's own post-state otherwise. Both reach
+    // the same post-state: the precomputed one is exactly what `process_slots`
+    // would have produced from the parent. Either way `state` is an independent
+    // clone, so a failing block cannot corrupt a cached entry.
+    let (mut state, transition) = transition_block(
+        store,
+        &parent_state,
+        parent_root,
+        &signed_block,
+        true,
+        config,
+        &engine,
+        committees,
+    );
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
     // in the canonical chain. That is stated here, on the verdict, rather than
@@ -3420,5 +3541,174 @@ mod tests {
         assert!(is_optimistic_candidate_block(
             &store, 300, 90, parent, safe_slots
         ));
+    }
+
+    // ---- epoch precompute ----
+
+    use crate::beacon::block_production::{
+        BlockInputs, advance_to_slot, assemble_block, payload_inputs,
+    };
+    use crate::beacon::containers::electra;
+    use crate::beacon::helpers::accessors::{get_beacon_proposer_index, get_domain};
+    use crate::beacon::helpers::misc::compute_signing_root;
+    use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::primitives::{BlsSignature, Bytes32};
+    use ethlambda_types::beacon::containers::deneb::ExecutionPayload;
+    use ethlambda_types::beacon::containers::electra::{BeaconBlockBody, ExecutionRequests};
+
+    /// A fulu state at the last slot of epoch 1, the parent of every
+    /// epoch-crossing block below.
+    fn last_slot_parent() -> BeaconState {
+        let mut state = with_signing_validators_at(crate::beacon::ForkName::Fulu, 64);
+        let lookahead =
+            crate::beacon::helpers::fulu::initialize_proposer_lookahead(&state).expect("lookahead");
+        let sync_committee =
+            crate::beacon::helpers::altair::get_next_sync_committee(&state).expect("committee");
+        let BeaconState::Fulu(inner) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        inner.proposer_lookahead = lookahead.try_into().expect("lookahead length");
+        inner.current_sync_committee = sync_committee.clone();
+        inner.next_sync_committee = sync_committee;
+        let last_slot = 2 * preset::SLOTS_PER_EPOCH - 1;
+        advance_to_slot(&state, last_slot, &Config::mainnet()).expect("advance")
+    }
+
+    /// A block at `slot` built on `parent` the way a proposer would, and the
+    /// post-state root it commits to.
+    fn block_on(parent: &BeaconState, slot: Slot) -> (SignedBeaconBlock, Root) {
+        let config = Config::mainnet();
+        let advanced = advance_to_slot(parent, slot, &config).expect("advance");
+        let proposer = get_beacon_proposer_index(&advanced).expect("proposer");
+        let epoch = get_current_epoch(&advanced);
+        let domain = get_domain(&advanced, constants::DOMAIN_RANDAO, Some(epoch));
+        let randao_reveal: BlsSignature = sign_for(
+            proposer as usize,
+            compute_signing_root(epoch.hash_tree_root(), domain),
+        );
+        let payload = payload_inputs(&advanced, &config).expect("payload inputs");
+        let inputs = BlockInputs {
+            randao_reveal,
+            graffiti: Bytes32::ZERO,
+            attestations: Vec::new(),
+            execution_payload: ExecutionPayload {
+                parent_hash: payload.parent_hash,
+                prev_randao: payload.prev_randao,
+                timestamp: payload.timestamp,
+                withdrawals: payload.withdrawals.try_into().expect("withdrawals"),
+                ..BeaconBlockBody::empty().execution_payload
+            },
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+        };
+        let message = assemble_block(&advanced, inputs, &config).expect("assemble");
+        let state_root = message.state_root;
+        let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message,
+            signature: BlsSignature::default(),
+        });
+        (signed, state_root)
+    }
+
+    fn post_state_root(
+        store: &Store,
+        parent: &BeaconState,
+        parent_root: Root,
+        block: &SignedBeaconBlock,
+    ) -> Root {
+        let (mut state, outcome) = transition_block(
+            store,
+            parent,
+            parent_root,
+            block,
+            false,
+            &Config::mainnet(),
+            &stf::ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+        );
+        outcome.expect("the block applies");
+        state.apply_pending_mutations();
+        state.hash_tree_root()
+    }
+
+    fn store_with_precompute(parent: &BeaconState, parent_root: Root, epoch: Epoch) -> Store {
+        let store = empty_store();
+        let precomputed =
+            advance_to_epoch_start(parent, epoch, &Config::mainnet()).expect("precompute");
+        store.cache_state(
+            CacheKey::CheckpointState {
+                epoch,
+                root: parent_root,
+            },
+            Arc::new(precomputed),
+        );
+        store
+    }
+
+    /// Resuming from the precomputed state is not a different transition: the
+    /// post-state is the one the inline path commits to, for a block on the
+    /// boundary and for one past a skipped first slot.
+    #[test]
+    fn resuming_from_a_precomputed_state_gives_the_inline_post_state() {
+        let parent = last_slot_parent();
+        let parent_root = Root::repeat_byte(0x42);
+        let epoch = 2;
+        let first_slot = compute_start_slot_at_epoch(epoch);
+
+        for slot in [first_slot, first_slot + 1, first_slot + 3] {
+            let (block, committed) = block_on(&parent, slot);
+            let hit_store = store_with_precompute(&parent, parent_root, epoch);
+            assert!(
+                precomputed_epoch_state(&hit_store, parent.slot(), parent_root, slot).is_some()
+            );
+
+            let inline = post_state_root(&empty_store(), &parent, parent_root, &block);
+            let resumed = post_state_root(&hit_store, &parent, parent_root, &block);
+            assert_eq!(inline, committed, "slot {slot}: inline matches the block");
+            assert_eq!(resumed, inline, "slot {slot}: resumed matches inline");
+        }
+    }
+
+    #[test]
+    fn only_an_epoch_crossing_import_looks_for_a_precomputed_state() {
+        let parent = last_slot_parent();
+        let parent_root = Root::repeat_byte(0x42);
+        let store = store_with_precompute(&parent, parent_root, 2);
+        let first_slot = compute_start_slot_at_epoch(2);
+
+        // Crosses: parent before the boundary, block at or after it.
+        assert!(precomputed_epoch_state(&store, parent.slot(), parent_root, first_slot).is_some());
+        // Same epoch as its parent: nothing to resume.
+        assert!(precomputed_epoch_state(&store, first_slot, parent_root, first_slot + 1).is_none());
+        // A different parent has no entry.
+        assert!(
+            precomputed_epoch_state(&store, parent.slot(), Root::repeat_byte(1), first_slot)
+                .is_none()
+        );
+    }
+
+    /// The worker's result is what `checkpoint_state` derives for the same
+    /// `(epoch, root)`, which is why one cache key can serve both.
+    #[test]
+    fn the_precompute_equals_checkpoint_state_for_the_same_key() {
+        let config = Config::mainnet();
+        let parent = last_slot_parent();
+        let root = Root::repeat_byte(0x42);
+        let mut store = empty_store();
+        store
+            .insert_signed_block(root, block(parent.slot(), Root::ZERO))
+            .expect("insert block");
+        store
+            .insert_state(root, parent.clone())
+            .expect("insert state");
+        let epoch = 2;
+
+        let worker = advance_to_epoch_start(&parent, epoch, &config).expect("precompute");
+        let derived =
+            checkpoint_state(&store, &Checkpoint { epoch, root }, &config).expect("checkpoint");
+
+        assert_eq!(worker.slot(), compute_start_slot_at_epoch(epoch));
+        assert_eq!(worker.slot(), derived.slot());
+        assert_eq!(worker.hash_tree_root(), derived.hash_tree_root());
     }
 }
