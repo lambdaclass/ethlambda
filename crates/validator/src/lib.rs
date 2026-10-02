@@ -122,6 +122,17 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         );
     }
 
+    let discovered = keys::definitions::ValidatorDefinitions::discover_if_absent(
+        &config.validators_dir,
+        &config.secrets_dir,
+    )?;
+    if discovered > 0 {
+        info!(
+            count = discovered,
+            "No validator definitions file; wrote one from the keystores found in the validators \
+             directory"
+        );
+    }
     let store = ValidatorStore::load(&config.validators_dir)?;
     if store.is_empty() {
         warn!("No validators loaded; the client will idle");
