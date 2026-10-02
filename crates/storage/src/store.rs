@@ -41,6 +41,8 @@ pub enum GetForkchoiceStoreError {
         anchor_state: Box<State>,
         anchor_block: Box<Block>,
     },
+    #[error("store initialization failed: {0}")]
+    Store(#[from] crate::error::Error),
 }
 
 /// The tree hash root of an empty block body.
@@ -641,13 +643,13 @@ impl Store {
             });
         }
 
-        Ok(Self::init_store(
+        Self::init_store(
             backend,
             anchor_state,
             Some(anchor_block.body),
             milliseconds_per_slot,
         )
-        .expect("store initialization should succeed in get_forkchoice_store"))
+        .map_err(Into::into)
     }
 
     /// Build a Store from the state already persisted in the storage backend.
@@ -670,15 +672,11 @@ impl Store {
         let persisted_config = {
             // Both keys are written by `init_store`, so a backend missing
             // either has never held a chain.
-            let view = backend.begin_read().expect("read view");
-            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
+            let view = backend.begin_read()?;
+            let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG)? else {
                 return Ok(None);
             };
-            if view
-                .get(Table::Metadata, KEY_LATEST_FINALIZED)
-                .expect("get latest finalized")
-                .is_none()
-            {
+            if view.get(Table::Metadata, KEY_LATEST_FINALIZED)?.is_none() {
                 return Ok(None);
             }
             ChainConfig::from_persisted_ssz_bytes(&bytes).expect("valid config")
@@ -774,7 +772,7 @@ impl Store {
 
         // Insert initial data
         {
-            let mut batch = backend.begin_write().expect("write batch");
+            let mut batch = backend.begin_write()?;
 
             // Metadata
             let metadata_entries = vec![
@@ -785,55 +783,43 @@ impl Store {
                 (KEY_LATEST_JUSTIFIED.to_vec(), anchor_checkpoint.to_ssz()),
                 (KEY_LATEST_FINALIZED.to_vec(), anchor_checkpoint.to_ssz()),
             ];
-            batch
-                .put_batch(Table::Metadata, metadata_entries)
-                .expect("put metadata");
+            batch.put_batch(Table::Metadata, metadata_entries)?;
 
             // Block header
             let header_entries = vec![(
                 anchor_block_root.to_ssz(),
                 anchor_state.latest_block_header.to_ssz(),
             )];
-            batch
-                .put_batch(Table::BlockHeaders, header_entries)
-                .expect("put block header");
+            batch.put_batch(Table::BlockHeaders, header_entries)?;
 
-            batch
-                .put_batch(
-                    Table::BlockRoots,
-                    vec![(
-                        encode_block_root_key(anchor_state.latest_block_header.slot),
-                        anchor_block_root.to_ssz(),
-                    )],
-                )
-                .expect("put block root index");
+            batch.put_batch(
+                Table::BlockRoots,
+                vec![(
+                    encode_block_root_key(anchor_state.latest_block_header.slot),
+                    anchor_block_root.to_ssz(),
+                )],
+            )?;
 
             // Block body (if provided)
             if let Some(body) = anchor_body {
                 let body_entries = vec![(anchor_block_root.to_ssz(), body.to_ssz())];
-                batch
-                    .put_batch(Table::BlockBodies, body_entries)
-                    .expect("put block body");
+                batch.put_batch(Table::BlockBodies, body_entries)?;
             }
 
             // State snapshot. The anchor has no parent in the store, so it is
             // the base of every diff chain: store it as a full snapshot in
             // `States` (never pruned) so reconstruction always terminates here.
             let state_entries = vec![(anchor_block_root.to_ssz(), anchor_state.to_ssz())];
-            batch
-                .put_batch(Table::States, state_entries)
-                .expect("put state");
+            batch.put_batch(Table::States, state_entries)?;
 
             // Live chain index
             let index_entries = vec![(
                 encode_slot_root_key(anchor_state.latest_block_header.slot, &anchor_block_root),
                 anchor_state.latest_block_header.parent_root.to_ssz(),
             )];
-            batch
-                .put_batch(Table::LiveChain, index_entries)
-                .expect("put live chain index");
+            batch.put_batch(Table::LiveChain, index_entries)?;
 
-            batch.commit().expect("commit");
+            batch.commit()?;
         }
 
         info!(%anchor_state_root, %anchor_block_root, "Initialized store");
@@ -854,20 +840,21 @@ impl Store {
     // ============ Metadata Helpers ============
 
     fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> Result<T, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::Metadata, key)
-            .expect("get")
-            .expect("metadata key exists");
+        let view = self.backend.begin_read()?;
+        let bytes = view.get(Table::Metadata, key)?.ok_or_else(|| {
+            let key_str = std::str::from_utf8(key)
+                .expect("keys are valid UTF-8 string")
+                .to_string();
+
+            Error::MissingMetadata(key_str)
+        })?;
         Ok(T::from_ssz_bytes(&bytes).expect("valid encoding"))
     }
 
     fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])
-            .expect("put metadata");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::Metadata, vec![(key.to_vec(), value.to_ssz())])?;
+        batch.commit()?;
         Ok(())
     }
 
@@ -959,15 +946,11 @@ impl Store {
             entries.push((KEY_LATEST_FINALIZED.to_vec(), finalized.to_ssz()));
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch.put_batch(Table::Metadata, entries).expect("put");
-        batch
-            .delete_batch(Table::BlockRoots, block_root_deletes)
-            .expect("delete old canonical block roots");
-        batch
-            .put_batch(Table::BlockRoots, block_root_entries)
-            .expect("put canonical block roots");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::Metadata, entries)?;
+        batch.delete_batch(Table::BlockRoots, block_root_deletes)?;
+        batch.put_batch(Table::BlockRoots, block_root_entries)?;
+        batch.commit()?;
 
         // Lightweight pruning that should happen immediately on finalization advance:
         // live chain index, signatures, and attestation data. These are cheap and
@@ -976,9 +959,7 @@ impl Store {
         if let Some(finalized) = checkpoints.finalized
             && finalized.slot > old_finalized_slot
         {
-            let pruned_chain = self
-                .prune_live_chain(finalized.slot)
-                .expect("prune live chain");
+            let pruned_chain = self.prune_live_chain(finalized.slot)?;
             let pruned_sigs = self.prune_gossip_signatures(finalized.slot);
 
             let pruned_payloads = self.prune_stale_aggregated_payloads(finalized.slot);
@@ -1002,18 +983,14 @@ impl Store {
     /// This is separated from `update_checkpoints` so callers can defer heavy
     /// pruning until after a batch of blocks has been fully processed.
     pub fn prune_old_data(&mut self) -> Result<(), Error> {
-        let finalized_slot = self
-            .latest_finalized()
-            .expect("Failed to get latest finalized checkpoint")
-            .slot;
+        let finalized_slot = self.latest_finalized()?.slot;
+        let head = self.head()?;
         let tip_slot = self
-            .get_block_header(&self.head().expect("Failed to get head block root"))
-            .map_or(finalized_slot, |header| {
-                header.expect("Failed to get block header").slot
-            });
-        let pruned_below_slot = self
-            .prune_old_block_proofs(finalized_slot, tip_slot)
-            .expect("prune old block proofs");
+            .get_block_header(&head)?
+            .ok_or(Error::UnexpectedMissingBlockHeader(head))?
+            .slot;
+
+        let pruned_below_slot = self.prune_old_block_proofs(finalized_slot, tip_slot)?;
         if pruned_below_slot > 0 {
             info!(pruned_below_slot, "Pruned old finalized block proofs");
         }
@@ -1069,11 +1046,13 @@ impl Store {
     /// Iterates only the LiveChain table, avoiding Block deserialization.
     /// Returns only non-finalized blocks, automatically pruned on finalization.
     pub fn get_live_chain(&self) -> Result<HashMap<H256, (u64, H256)>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+
+        Ok(entries
+            .into_iter()
             .map(|(k, v)| {
                 let (slot, root) = decode_slot_root_key(&k);
                 let parent_root = H256::from_ssz_bytes(&v).expect("valid parent_root");
@@ -1084,11 +1063,12 @@ impl Store {
 
     /// Return the highest slot in the live chain.
     pub fn max_live_chain_slot(&self) -> Result<Option<u64>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(Result::ok)
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+        Ok(entries
+            .into_iter()
             .map(|(key, _)| decode_slot_root_key(&key).0)
             .max())
     }
@@ -1097,11 +1077,12 @@ impl Store {
     ///
     /// Useful for checking block existence without deserializing.
     pub fn get_block_roots(&self) -> Result<HashSet<H256>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
+        let view = self.backend.begin_read()?;
+        let entries: Vec<_> = view
+            .prefix_iterator(Table::LiveChain, &[])?
+            .collect::<Result<_, _>>()?;
+        Ok(entries
+            .into_iter()
             .map(|(k, _)| {
                 let (_, root) = decode_slot_root_key(&k);
                 root
@@ -1116,32 +1097,33 @@ impl Store {
     ///
     /// Returns the number of entries pruned.
     pub fn prune_live_chain(&mut self, finalized_slot: u64) -> Result<usize, Error> {
-        let view = self.backend.begin_read().expect("read view");
-
         // Collect keys to delete - stop once we hit finalized_slot
         // Keys are sorted by slot (big-endian encoding) so we can stop early
-        let keys_to_delete: Vec<_> = view
-            .prefix_iterator(Table::LiveChain, &[])
-            .expect("iterator")
-            .filter_map(|res| res.ok())
-            .take_while(|(k, _)| {
-                let (slot, _) = decode_slot_root_key(k);
-                slot < finalized_slot
-            })
-            .map(|(k, _)| k.to_vec())
-            .collect();
-        drop(view);
+        let keys_to_delete: Vec<_> = {
+            let view = self.backend.begin_read()?;
+
+            let entries: Vec<_> = view
+                .prefix_iterator(Table::LiveChain, &[])?
+                .take_while(|res| match res {
+                    Ok((k, _)) => {
+                        let (slot, _) = decode_slot_root_key(k);
+                        slot < finalized_slot
+                    }
+                    _ => true,
+                })
+                .collect::<Result<_, _>>()?;
+
+            entries.into_iter().map(|(k, _)| k.to_vec()).collect()
+        };
 
         let count = keys_to_delete.len();
         if count == 0 {
             return Ok(0);
         }
 
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_batch(Table::LiveChain, keys_to_delete)
-            .expect("delete non-finalized chain entries");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.delete_batch(Table::LiveChain, keys_to_delete)?;
+        batch.commit()?;
         Ok(count)
     }
 
@@ -1200,25 +1182,22 @@ impl Store {
         // before it, and keys at the cutoff sort after it (they extend it with
         // a root). A single range delete drops them all without reading the
         // table (and without walking the tombstones left by earlier prunes).
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .delete_range(
-                Table::BlockProof,
-                &0u64.to_be_bytes(),
-                &cutoff.to_be_bytes(),
-            )
-            .expect("delete finalized block proofs");
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        batch.delete_range(
+            Table::BlockProof,
+            &0u64.to_be_bytes(),
+            &cutoff.to_be_bytes(),
+        )?;
+        batch.commit()?;
 
         Ok(cutoff)
     }
 
     /// Get the block header by root.
     pub fn get_block_header(&self, root: &H256) -> Result<Option<BlockHeader>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         Ok(view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
+            .get(Table::BlockHeaders, &root.to_ssz())?
             .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header")))
     }
 
@@ -1238,9 +1217,9 @@ impl Store {
         root: H256,
         signed_block: SignedBlock,
     ) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        write_signed_block(batch.as_mut(), &root, signed_block);
-        batch.commit().expect("commit");
+        let mut batch = self.backend.begin_write()?;
+        write_signed_block(batch.as_mut(), &root, signed_block)?;
+        batch.commit()?;
         Ok(())
     }
 
@@ -1256,18 +1235,16 @@ impl Store {
         root: H256,
         signed_block: SignedBlock,
     ) -> Result<(), Error> {
-        let mut batch = self.backend.begin_write().expect("write batch");
-        let block = write_signed_block(batch.as_mut(), &root, signed_block);
+        let mut batch = self.backend.begin_write()?;
+        let block = write_signed_block(batch.as_mut(), &root, signed_block)?;
 
         let index_entries = vec![(
             encode_slot_root_key(block.slot, &root),
             block.parent_root.to_ssz(),
         )];
-        batch
-            .put_batch(Table::LiveChain, index_entries)
-            .expect("put non-finalized chain index");
+        batch.put_batch(Table::LiveChain, index_entries)?;
 
-        batch.commit().expect("commit");
+        batch.commit()?;
         self.record_known_attestation_votes(&block.body.attestations);
         Ok(())
     }
@@ -1277,10 +1254,10 @@ impl Store {
     /// Unlike [`get_signed_block`](Self::get_signed_block), this works for the
     /// genesis block, which has no signature entry.
     pub fn get_block(&self, root: &H256) -> Result<Option<Block>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key)? else {
             return Ok(None);
         };
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
@@ -1288,7 +1265,7 @@ impl Store {
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
                 return Ok(None);
             };
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
@@ -1311,26 +1288,34 @@ impl Store {
     /// a missing proof surfaces as `None` (a pruned finalized block can no
     /// longer be served with its proof) rather than as a fabricated block.
     pub fn get_signed_block(&self, root: &H256) -> Result<Option<SignedBlock>, Error> {
-        let view = self.backend.begin_read().expect("read view");
-        Ok(Self::signed_block_from_view(view.as_ref(), root))
+        let view = self.backend.begin_read()?;
+        let block = Self::signed_block_from_view(view.as_ref(), root)?;
+        Ok(block)
     }
 
-    fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
+    fn signed_block_from_view(
+        view: &dyn StorageReadView,
+        root: &H256,
+    ) -> Result<Option<SignedBlock>, Error> {
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
+        let Some(header_bytes) = view.get(Table::BlockHeaders, &key)? else {
+            return Ok(None);
+        };
         let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
+            let Some(body_bytes) = view.get(Table::BlockBodies, &key)? else {
+                return Ok(None);
+            };
             BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
+        let proof = match view.get(Table::BlockProof, &sig_key)? {
             Some(proof_bytes) => {
                 MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
             }
@@ -1338,15 +1323,15 @@ impl Store {
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
             None if header.slot == 0 => MultiMessageAggregate::default(),
-            None => return None,
+            None => return Ok(None),
         };
 
         let block = Block::from_header_and_body(header, body);
 
-        Some(SignedBlock {
+        Ok(Some(SignedBlock {
             message: block,
             proof,
-        })
+        }))
     }
 
     /// Return the canonical block root at `slot`, or `None` when the canonical
@@ -1362,10 +1347,9 @@ impl Store {
     /// bootstrapped from. Callers that use this to *reject* something must treat
     /// `None` as "unknown" rather than "not canonical".
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         Ok(view
-            .get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
+            .get(Table::BlockRoots, &encode_block_root_key(slot))?
             .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root")))
     }
 
@@ -1379,21 +1363,19 @@ impl Store {
         start_slot: u64,
         end_slot: u64,
     ) -> Result<Vec<SignedBlock>, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let mut blocks = Vec::new();
         for slot in start_slot..=end_slot {
             // Read the index through this range's own view rather than via
             // `canonical_root_at_slot`, which opens a fresh one per call: a
             // range must be served from a single snapshot so a head change
             // partway through cannot splice two branches into one response.
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root_bytes) = view.get(Table::BlockRoots, &encode_block_root_key(slot))?
             else {
                 continue;
             };
             let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
-            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
+            if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root)? {
                 blocks.push(block);
             }
         }
@@ -1415,9 +1397,8 @@ impl Store {
         }
         // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
         let snapshot = {
-            let view = self.backend.begin_read().expect("read view");
-            view.get(Table::States, &root.to_ssz())
-                .expect("get")
+            let view = self.backend.begin_read()?;
+            view.get(Table::States, &root.to_ssz())?
                 .map(|bytes| State::from_ssz_bytes(&bytes).expect("valid state"))
         };
         let state = if let Some(s) = snapshot {
@@ -1441,15 +1422,14 @@ impl Store {
     /// Returns `Ok(None)` when the root is unknown or the diff chain is broken.
     fn reconstruct_state(&self, root: &H256) -> Result<Option<State>, Error> {
         // Walk back collecting diffs until we reach a snapshot.
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let mut diffs: Vec<StateDiff> = Vec::new();
         let mut cursor = *root;
         let snapshot = loop {
-            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
+            if let Some(bytes) = view.get(Table::States, &cursor.to_ssz())? {
                 break State::from_ssz_bytes(&bytes).expect("valid state");
             }
-            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get")
-            else {
+            let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz())? else {
                 return Ok(None);
             };
             let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
@@ -1478,10 +1458,10 @@ impl Store {
     ///
     /// True if a snapshot exists or the state can be reconstructed from a diff.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
-        let view = self.backend.begin_read().expect("read view");
+        let view = self.backend.begin_read()?;
         let key = root.to_ssz();
-        let states = view.get(Table::States, &key).expect("get");
-        let diffs = view.get(Table::StateDiffs, &key).expect("get");
+        let states = view.get(Table::States, &key)?;
+        let diffs = view.get(Table::StateDiffs, &key)?;
         Ok(states.is_some() || diffs.is_some())
     }
 
@@ -1509,33 +1489,26 @@ impl Store {
         // The post-state's latest_block_header is the block's own header, so its
         // parent_root identifies the parent (base) state to diff against.
         let parent_root = state.latest_block_header.parent_root;
-        let parent_state = self
-            .get_state(&parent_root)
-            .expect("parent state must exist to diff against")
-            .unwrap();
+        let parent_state = self.get_state(&parent_root)?.unwrap();
         let is_anchor =
             state.slot / SNAPSHOT_ANCHOR_INTERVAL > parent_state.slot / SNAPSHOT_ANCHOR_INTERVAL;
 
         // Snapshot only at anchors; serialize before `state` is consumed.
         let snapshot_bytes = is_anchor.then(|| state.to_ssz());
-        // Memoize the post-state for fast reads, then move it into the diff so
-        // its multi-MB justification fields are not cloned again.
-        self.state_cache.lock().unwrap().put(root, state.clone());
-        let diff_bytes = StateDiff::from_states(&parent_state, state)
+        let diff_bytes = StateDiff::from_states(&parent_state, state.clone())
             .expect("state transition produced a non-append historical_block_hashes")
             .to_ssz();
 
         let key = root.to_ssz();
-        let mut batch = self.backend.begin_write().expect("write batch");
-        batch
-            .put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])
-            .expect("put state diff");
+        let mut batch = self.backend.begin_write()?;
+        batch.put_batch(Table::StateDiffs, vec![(key.clone(), diff_bytes)])?;
         if let Some(snapshot_bytes) = snapshot_bytes {
-            batch
-                .put_batch(Table::States, vec![(key, snapshot_bytes)])
-                .expect("put state snapshot");
+            batch.put_batch(Table::States, vec![(key, snapshot_bytes)])?;
         }
-        batch.commit().expect("commit");
+        batch.commit()?;
+
+        // Cache the state only after it has been persisted successfully.
+        self.state_cache.lock().unwrap().put(root, state);
         Ok(())
     }
 
@@ -1912,7 +1885,7 @@ fn write_signed_block(
     batch: &mut dyn StorageWriteBatch,
     root: &H256,
     signed_block: SignedBlock,
-) -> Block {
+) -> Result<Block, Error> {
     let SignedBlock {
         message: block,
         proof,
@@ -1922,26 +1895,20 @@ fn write_signed_block(
     let root_bytes = root.to_ssz();
 
     let header_entries = vec![(root_bytes.clone(), header.to_ssz())];
-    batch
-        .put_batch(Table::BlockHeaders, header_entries)
-        .expect("put block header");
+    batch.put_batch(Table::BlockHeaders, header_entries)?;
 
     // Skip storing empty bodies - they can be reconstructed from the header's body_root
     if header.body_root != *EMPTY_BODY_ROOT {
         let body_entries = vec![(root_bytes.clone(), block.body.to_ssz())];
-        batch
-            .put_batch(Table::BlockBodies, body_entries)
-            .expect("put block body");
+        batch.put_batch(Table::BlockBodies, body_entries)?;
     }
 
     // Store the merged multi-message aggregate proof blob, keyed by slot||root
     // so proof pruning can scan in slot order and stop early.
     let proof_entries = vec![(encode_slot_root_key(header.slot, root), proof.to_ssz())];
-    batch
-        .put_batch(Table::BlockProof, proof_entries)
-        .expect("put block proof");
+    batch.put_batch(Table::BlockProof, proof_entries)?;
 
-    block
+    Ok(block)
 }
 
 #[cfg(test)]
