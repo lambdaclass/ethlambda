@@ -5621,6 +5621,60 @@ mod tests {
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
+    /// The tree-backed fields beyond the registry share with the resident
+    /// parent too, across a state whose scores and previous participation did
+    /// not change but whose balances did.
+    #[test]
+    fn a_decoded_electra_state_shares_its_tree_fields_with_the_resident_parent() {
+        use crate::beacon_state_delta::tests::electra_state_with_validators;
+
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let parent_root = H256::from([1u8; 32]);
+        let child_root = H256::from([2u8; 32]);
+
+        let mut parent = BeaconState::Electra(electra_state_with_validators(600));
+        parent.apply_pending_mutations();
+        store
+            .insert_signed_block(parent_root, beacon_test_block(10, H256::ZERO))
+            .expect("insert parent block");
+        store
+            .insert_state(parent_root, parent.clone())
+            .expect("insert parent state");
+
+        let mut child = parent;
+        *child.slot_mut() += 1;
+        child.latest_block_header_mut().parent_root = parent_root;
+        child.balances_mut()[0] += 1;
+        child.block_roots_mut()[10] = parent_root;
+        child.apply_pending_mutations();
+        store
+            .insert_signed_block(child_root, beacon_test_block(11, parent_root))
+            .expect("insert child block");
+        store
+            .insert_state(child_root, child.clone())
+            .expect("insert child state");
+
+        drop(store);
+        let cold = beacon_test_store(backend);
+        let resident = cold.get_state(&parent_root).expect("get").expect("present");
+        let decoded = cold.get_state(&child_root).expect("get").expect("present");
+
+        assert!(decoded.validators().ptr_eq(resident.validators()));
+        let (_, _, decoded_scores) = decoded.altair_validator_lists().unwrap();
+        let (_, _, resident_scores) = resident.altair_validator_lists().unwrap();
+        assert!(decoded_scores.ptr_eq(resident_scores));
+        assert!(decoded.randao_mixes().ptr_eq(resident.randao_mixes()));
+        assert!(decoded.slashings().ptr_eq(resident.slashings()));
+        assert!(
+            decoded
+                .historical_roots()
+                .ptr_eq(resident.historical_roots())
+        );
+        assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
+        assert_eq!(decoded.to_ssz(), child.to_ssz());
+    }
+
     /// `beacon_test_state` with its parent linked in, the way `insert_state`'s
     /// beacon arm expects: it reads the base to diff against off the
     /// post-state's own `latest_block_header.parent_root`, mirroring how the

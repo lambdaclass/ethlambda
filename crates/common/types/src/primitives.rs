@@ -31,10 +31,23 @@ pub type ByteList<const N: usize> = libssz_types::SszList<u8, N>;
     Hash,
     libssz_derive::SszEncode,
     libssz_derive::SszDecode,
-    libssz_derive::HashTreeRoot,
 )]
 #[ssz(transparent)]
 pub struct H256(pub [u8; 32]);
+
+/// Written out rather than derived because the `transparent` derive does not
+/// forward `is_basic_type`. Without it a collection of `H256` is treated as
+/// composite: the same root, but a tree-backed list would cache a second copy
+/// of every element's root (see `ethlambda_ssz_tree`).
+impl libssz_merkle::HashTreeRoot for H256 {
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        libssz_merkle::HashTreeRoot::hash_tree_root(&self.0, hasher)
+    }
+
+    fn is_basic_type() -> bool {
+        <[u8; 32] as libssz_merkle::HashTreeRoot>::is_basic_type()
+    }
+}
 
 impl serde::Serialize for H256 {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -182,5 +195,100 @@ mod tests {
     #[should_panic(expected = "H256::from_slice requires exactly 32 bytes")]
     fn h256_from_slice_too_long() {
         H256::from_slice(&[0u8; 33]);
+    }
+
+    /// Reporting `H256` as basic must not change any root: a collection of it
+    /// merkleizes like one of the plain arrays it wraps.
+    mod basic_type {
+        use super::*;
+        use libssz_types::{SszList, SszVector};
+
+        #[derive(libssz_derive::HashTreeRoot)]
+        struct WithH256 {
+            list: SszList<H256, 64>,
+            vector: SszVector<H256, 8>,
+            tail: u64,
+        }
+
+        #[derive(libssz_derive::HashTreeRoot)]
+        struct WithArrays {
+            list: SszList<[u8; 32], 64>,
+            vector: SszVector<[u8; 32], 8>,
+            tail: u64,
+        }
+
+        fn items(n: usize) -> Vec<[u8; 32]> {
+            (0..n).map(|i| [i as u8 ^ 0x5a; 32]).collect()
+        }
+
+        #[test]
+        fn h256_reports_basic_like_its_array() {
+            assert!(<H256 as libssz_merkle::HashTreeRoot>::is_basic_type());
+        }
+
+        #[test]
+        fn list_and_vector_of_h256_hash_like_arrays() {
+            for n in [0, 1, 2, 3, 33, 64] {
+                let arrays = items(n);
+                let hashes: Vec<H256> = arrays.iter().copied().map(H256).collect();
+                let a = SszList::<[u8; 32], 64>::try_from(arrays).unwrap();
+                let h = SszList::<H256, 64>::try_from(hashes).unwrap();
+                assert_eq!(
+                    HashTreeRoot::hash_tree_root(&a),
+                    HashTreeRoot::hash_tree_root(&h),
+                    "list of {n}"
+                );
+            }
+            let arrays = items(8);
+            let hashes: Vec<H256> = arrays.iter().copied().map(H256).collect();
+            let a = SszVector::<[u8; 32], 8>::try_from(arrays).unwrap();
+            let h = SszVector::<H256, 8>::try_from(hashes).unwrap();
+            assert_eq!(
+                HashTreeRoot::hash_tree_root(&a),
+                HashTreeRoot::hash_tree_root(&h)
+            );
+        }
+
+        #[test]
+        fn a_container_holding_h256_collections_keeps_its_root() {
+            let arrays = items(8);
+            let hashes: Vec<H256> = arrays.iter().copied().map(H256).collect();
+            let with_arrays = WithArrays {
+                list: arrays.clone().try_into().unwrap(),
+                vector: arrays.try_into().unwrap(),
+                tail: 7,
+            };
+            let with_h256 = WithH256 {
+                list: hashes.clone().try_into().unwrap(),
+                vector: hashes.try_into().unwrap(),
+                tail: 7,
+            };
+            assert_eq!(
+                HashTreeRoot::hash_tree_root(&with_arrays),
+                HashTreeRoot::hash_tree_root(&with_h256)
+            );
+        }
+
+        /// The lean state's `H256` lists go through the same path.
+        #[test]
+        fn lean_state_root_is_unchanged_by_the_basic_report() {
+            use crate::state::State;
+            let mut state = State::from_genesis(0, Vec::new());
+            let hashes: Vec<H256> = items(5).into_iter().map(H256).collect();
+            state.historical_block_hashes = hashes.try_into().unwrap();
+            let mirror = SszList::<[u8; 32], 262_144>::try_from(items(5)).unwrap();
+            let expected =
+                libssz_merkle::HashTreeRoot::hash_tree_root(&mirror, &libssz_merkle::Sha2Hasher);
+            let got = libssz_merkle::HashTreeRoot::hash_tree_root(
+                &state.historical_block_hashes,
+                &libssz_merkle::Sha2Hasher,
+            );
+            assert_eq!(got, expected);
+            // The container root is computed and stable across calls.
+            assert_eq!(
+                HashTreeRoot::hash_tree_root(&state),
+                HashTreeRoot::hash_tree_root(&state.clone())
+            );
+        }
     }
 }
