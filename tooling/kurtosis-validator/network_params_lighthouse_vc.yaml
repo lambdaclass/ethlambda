@@ -12,7 +12,7 @@
 #     asks for sync duties from the first epoch.
 #
 # Run from the repository root, after
-# `make docker-build DOCKER_TAG=beacon-api-liveness`:
+# `make docker-build DOCKER_TAG=beacon-api-lighthouse-defaults`:
 #
 #   kurtosis run --enclave ethlambda-lighthouse-vc tooling/kurtosis-validator \
 #     --args-file tooling/kurtosis-validator/network_params_lighthouse_vc.yaml
@@ -36,7 +36,7 @@ ethlambda_validator:
   client: lighthouse
   doppelganger: true
   # ethlambda beacon's image; the validator client is Lighthouse's.
-  image: ghcr.io/lambdaclass/ethlambda:beacon-api-liveness
+  image: ghcr.io/lambdaclass/ethlambda:beacon-api-lighthouse-defaults
   name: lighthouse-vc
   suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
 
