@@ -9,8 +9,9 @@
 //! - a gossiped sidecar reported `Queue` or `Ignore(Overloaded)`, whose
 //!   stateful checks stopped early or never ran;
 //! - every `DataColumnsByRoot` and `DataColumnsByRange` answer;
-//! - sidecars the chain actor had parked, handed back once their parent
-//!   imported (`BlockChainToP2P::check_data_column_sidecars`).
+//! - sidecars the chain actor had parked, handed back once the block they
+//!   wait on imported (`BlockChainToP2P::check_data_column_sidecars`): a fulu
+//!   sidecar's parent, a gloas sidecar's own block.
 //!
 //! Each sidecar is checked on a blocking thread, bounded by
 //! [`P2PServer::column_check_permits`]. Unlike a gossip verdict, nothing here
@@ -19,14 +20,14 @@
 
 use ethlambda_state_transition::beacon::gossip::column::{self, ChainVerdict};
 use ethlambda_state_transition::beacon::gossip::{IgnoreReason, Outcome};
-use ethlambda_types::beacon::containers::fulu::DataColumnSidecar;
+use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::time::unix_now_ms;
 use tracing::{error, warn};
 
 use crate::{P2PServer, metrics};
 
 /// Run the chain checks on `sidecars`, then send the chain actor the ones that
-/// passed as one batch and the ones waiting on a parent as another.
+/// passed as one batch and the ones waiting on a block as another.
 ///
 /// Returns at once: the checks run on a task of their own, so the p2p actor
 /// goes on handling swarm events while a range batch's KZG proofs are
@@ -51,7 +52,7 @@ pub(crate) fn check_and_forward(server: &P2PServer, sidecars: Vec<DataColumnSide
             let store = store.clone();
             checks.push(tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                let verdict = column::chain_checks(&store, &sidecar, unix_now_ms());
+                let verdict = column::chain_checks_for(&store, &sidecar, unix_now_ms());
                 (sidecar, verdict)
             }));
         }
@@ -111,8 +112,8 @@ mod tests {
     use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource, P2PToBlockChain};
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock};
-    use ethlambda_types::beacon::primitives::ValidatorIndex;
+    use ethlambda_types::beacon::containers::{SignedAggregateAndProof, SignedBeaconBlock, gloas};
+    use ethlambda_types::beacon::primitives::{Root, ValidatorIndex};
     use spawned_concurrency::error::ActorError;
     use tokio::sync::mpsc;
 
@@ -169,6 +170,22 @@ mod tests {
         ) -> Result<(), ActorError> {
             Ok(())
         }
+        fn new_execution_payload_envelope(
+            &self,
+            _envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
+        fn new_payload_attestation_message(
+            &self,
+            _message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+            _arrival: BlockArrival,
+        ) -> Result<(), ActorError> {
+            Ok(())
+        }
     }
 
     /// A sidecar the checks cannot judge yet goes back to the chain actor to
@@ -185,14 +202,55 @@ mod tests {
         let mut malformed = valid_shaped_sidecar(5, 1);
         malformed.kzg_commitments = Default::default();
 
-        check_and_forward(&server, vec![orphan.clone(), malformed]);
+        check_and_forward(
+            &server,
+            vec![
+                DataColumnSidecar::Fulu(orphan.clone()),
+                DataColumnSidecar::Fulu(malformed),
+            ],
+        );
 
         assert_eq!(
             received.recv().await,
-            Some(Forwarded::AwaitingParent(vec![orphan]))
+            Some(Forwarded::AwaitingParent(vec![DataColumnSidecar::Fulu(
+                orphan
+            )]))
         );
         // The task sends at most one message per kind and has now finished,
         // so the channel closes with nothing else in it.
+        drop(server);
+        assert_eq!(received.recv().await, None);
+    }
+
+    /// A gloas sidecar is judged against its own block, not a parent: one
+    /// whose block this node has not seen goes back to the chain actor to be
+    /// parked, and one from a slot that has not started is dropped, so neither
+    /// reaches the batch the chain actor stores unchecked.
+    #[tokio::test]
+    async fn a_gloas_sidecar_for_an_unknown_block_is_parked_and_a_future_one_dropped() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, mut received) = mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(RecordingChain(sender)));
+
+        let unknown_block = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 0,
+            slot: 5,
+            beacon_block_root: Root::repeat_byte(9),
+            ..Default::default()
+        });
+        let future = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 1,
+            slot: u64::MAX / 2,
+            beacon_block_root: Root::repeat_byte(9),
+            ..Default::default()
+        });
+
+        check_and_forward(&server, vec![unknown_block.clone(), future]);
+
+        assert_eq!(
+            received.recv().await,
+            Some(Forwarded::AwaitingParent(vec![unknown_block]))
+        );
         drop(server);
         assert_eq!(received.recv().await, None);
     }

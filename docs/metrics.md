@@ -362,32 +362,38 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
-`beacon_attestation`. `queue` means IGNORE to gossipsub while the chain actor
-still receives the object and parks it; neither the aggregate nor the
-attestation topic ever answers `queue`, since the vote block's post-state is
-either cached or it is not (`IgnoreReason::UnknownBlock`/`StateUnavailable`),
-with nothing to hold the message for. **`verdict_expired_total` should stay at
+`beacon_attestation`. The gloas topics `execution_payload` and
+`payload_attestation_message` are labelled by their own name. `queue` means
+IGNORE to gossipsub while the chain actor still receives the object and parks
+it; of the gloas topics only `execution_payload` answers it, for an envelope
+whose block is not known yet (`block_unknown`), has no post-state yet
+(`block_not_ready`), or has one that is not in the cache the checks read
+(`state_not_cached`, as when the block was imported moments ago; the actor
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
+`payload_attestation_message` topics never answer `queue`, since the vote
+block's post-state is either cached or it is not
+(`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
+message for. **`verdict_expired_total` should stay at
 zero**: a rising count means validation is too slow for gossipsub's message
 cache.
 
 The two topics add reasons the others do not, all `reason` label values on
 `lean_beacon_gossip_validation_total`: `outside_epoch_window`, `covered_bits`
 (aggregate only), `unknown_block`, `state_unavailable`,
-`finalized_not_ancestor`, `ancestry_unknown` on the ignore side;
+`finalized_not_ancestor`, `ancestry_unknown`, `payload_envelope_unseen` and
+`payload_optimistic` (gloas only) on the ignore side;
 `epoch_mismatch`, `no_participants` (aggregate only), `non_zero_data_index`,
 `committee_bits` (aggregate only), `committee_index`, `bits_length` (aggregate
 only), `not_aggregator` (aggregate only), `not_in_committee`,
 `unknown_validator`, `selection_proof` (aggregate only),
 `aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
-only), `target_not_ancestor`, `wrong_subnet` (attestation only) on the reject
-side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+only), `target_not_ancestor`, `wrong_subnet` (attestation only), and gloas's
+`data_index_out_of_range`, `same_slot_payload_flag` and `payload_invalid` on the
+reject side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
 other topics: `unsupported_fork` is an ignore reason for a message of a fork this
-build has no gossip rules for (gloas today), on the block, data column,
-aggregate, attestation and attester-slashing topics, so an honest peer past the
-fork epoch is not scored as a bad decoder. The same label value appears as
-`result` on `lean_beacon_gossip_messages_total` for every one of those but the
-block topic: a gloas block decodes, so it counts as `decoded` there and
-`unsupported_fork` shows only as a verdict reason.
+build has no gossip rules for, so an honest peer past the fork epoch is not
+scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
+are validated, so they carry their own verdict reasons instead.
 
 Two permit pools bound the blocking-thread half of validation:
 `gossip_validation_permits` for blocks and columns,
@@ -466,6 +472,9 @@ spec.
 | `lean_data_column_fetch_failures_total` | Counter | `DataColumnsByRoot` lookups this node gave up on, by reason | On lookup abandonment | reason=no_peers,max_retries | |
 | `lean_blocks_held_for_columns` | Gauge | Blocks held out of fork choice pending their custody columns | On every hold, release, and finality eviction of the held-block set | | |
 | `lean_sidecars_awaiting_parent` | Gauge | Sidecars parked until their block's parent has a post-state | On every park, replay, and finality eviction of the parked set | | |
+| `lean_envelopes_awaiting_block` | Gauge | Gloas execution payload envelopes held until their block is imported | On every hold, release, and finality eviction of the held envelopes | | |
+| `lean_envelopes_awaiting_columns` | Gauge | Gloas execution payload envelopes held until every sampled column is stored | On every hold, release, and finality eviction of the held envelopes | | |
+| `lean_blocks_awaiting_parent_payload` | Gauge | Gloas blocks held until their FULL parent's payload envelope is verified | On every hold, release, and finality eviction of the held blocks | | |
 
 `lean_data_columns_rejected_total` counts the chain checks, which run in the
 p2p layer on every sidecar gossip did not accept: every fetched sidecar, a

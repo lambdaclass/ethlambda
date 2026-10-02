@@ -23,22 +23,25 @@ use tracing::{debug, error, info, trace, warn};
 use ethlambda_state_transition::beacon::das;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants;
-use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::{
-    ColumnIndices, DataColumnSidecar, DataColumnsByRootIdentifier,
-};
+use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRootIdentifier};
+use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::checkpoint::Checkpoint;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
+pub(crate) use super::envelope_client::release_envelope_gate;
+use super::envelope_client::{
+    handle_envelope_fetch_failure, handle_envelopes_by_range_response,
+    handle_envelopes_by_root_response, request_beacon_envelopes_by_range,
+};
 use super::{
-    Request, Response, ResponsePayload,
+    Request, Response, ResponsePayload, envelopes,
     messages::{ResponseCode, error_message},
 };
 use crate::beacon::BeaconWire;
 use crate::beacon::column_checks;
-use crate::beacon::decode::{decode_data_column_sidecar, fork_at_slot};
+use crate::beacon::decode::fork_at_slot;
 use crate::beacon::handler::{self as beacon_handler, StatusVersion};
 use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
@@ -46,6 +49,7 @@ use crate::beacon::messages::{
 use crate::beacon::protocols::{
     MAX_REQUEST_BLOCKS as MAX_BEACON_REQUEST_BLOCKS, MAX_REQUEST_BLOCKS_DENEB,
 };
+use crate::beacon::transition;
 use crate::discovery::enr::node_id_from_peer_id;
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots, Status};
 use crate::lean::protocols::MAX_REQUEST_BLOCKS;
@@ -56,6 +60,7 @@ use crate::{
     RangeSyncState, ReqRespProtocol, ReqRespRequestId, UNKNOWN_CUSTODY_RANGE_PEERS, metrics,
     p2p_protocol,
 };
+use ethlambda_types::time::unix_now_ms;
 use libp2p::request_response::ResponseChannel;
 
 /// `protocol` names which [`ReqResp`](super::ReqResp) field `event` came
@@ -167,6 +172,26 @@ pub async fn handle_req_resp_message(
                         )
                         .await;
                     }
+                    Request::ExecutionPayloadEnvelopesByRange(request) => {
+                        trace!(
+                            kind = "execution_payload_envelopes_by_range_request",
+                            peer_count, "P2P message received"
+                        );
+                        envelopes::handle_execution_payload_envelopes_by_range_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
+                    }
+                    Request::ExecutionPayloadEnvelopesByRoot(roots) => {
+                        trace!(
+                            kind = "execution_payload_envelopes_by_root_request",
+                            peer_count, "P2P message received"
+                        );
+                        envelopes::handle_execution_payload_envelopes_by_root_request(
+                            server, peer, roots, channel,
+                        )
+                        .await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -222,9 +247,9 @@ pub async fn handle_req_resp_message(
                             // event: this response is the terminal outcome for
                             // the id either way.
                             match server.outbound_requests.remove(&request_id) {
-                                Some(PendingRequestKind::Columns(block_root)) => {
+                                Some(PendingRequestKind::Columns(block_root, requested)) => {
                                     handle_data_column_sidecars_response(
-                                        server, peer, block_root, sidecars, ctx,
+                                        server, peer, block_root, &requested, sidecars, ctx,
                                     )
                                     .await;
                                 }
@@ -248,7 +273,10 @@ pub async fn handle_req_resp_message(
                                 // exactly the way #608 fixed, since no further
                                 // event will ever name this id again.
                                 Some(
-                                    PendingRequestKind::Root(_) | PendingRequestKind::Range { .. },
+                                    kind @ (PendingRequestKind::Root(_)
+                                    | PendingRequestKind::Range { .. }
+                                    | PendingRequestKind::EnvelopeRoot(_)
+                                    | PendingRequestKind::EnvelopeRange { .. }),
                                 ) => {
                                     error!(
                                         %peer,
@@ -256,6 +284,7 @@ pub async fn handle_req_resp_message(
                                         count = sidecars.len(),
                                         "Data column sidecars response answered a non-column request id"
                                     );
+                                    retire_unanswered(server, kind, peer, ctx).await;
                                 }
                                 None => {
                                     debug!(
@@ -263,6 +292,56 @@ pub async fn handle_req_resp_message(
                                         ?request_id,
                                         count = sidecars.len(),
                                         "Received data column sidecars response for unknown request_id"
+                                    );
+                                }
+                            }
+                        }
+                        ResponsePayload::ExecutionPayloadEnvelopes(envelopes) => {
+                            trace!(
+                                kind = "execution_payload_envelopes_response",
+                                peer_count, "P2P message received"
+                            );
+                            // Removed here, like the other terminal answers: this
+                            // response is the whole exchange for the id.
+                            match server.outbound_requests.remove(&request_id) {
+                                Some(PendingRequestKind::EnvelopeRoot(block_root)) => {
+                                    handle_envelopes_by_root_response(
+                                        server, peer, block_root, envelopes, ctx,
+                                    )
+                                    .await;
+                                }
+                                Some(PendingRequestKind::EnvelopeRange {
+                                    start_slot,
+                                    end_slot,
+                                }) => {
+                                    handle_envelopes_by_range_response(
+                                        server, peer, start_slot, end_slot, envelopes, ctx,
+                                    )
+                                    .await;
+                                }
+                                // Unreachable by construction, as for the
+                                // column payload above: only the two envelope
+                                // kinds are sent on the envelope protocols.
+                                Some(
+                                    kind @ (PendingRequestKind::Root(_)
+                                    | PendingRequestKind::Range { .. }
+                                    | PendingRequestKind::Columns(..)
+                                    | PendingRequestKind::ColumnRange { .. }),
+                                ) => {
+                                    error!(
+                                        %peer,
+                                        ?request_id,
+                                        count = envelopes.len(),
+                                        "Envelopes response answered a non-envelope request id"
+                                    );
+                                    retire_unanswered(server, kind, peer, ctx).await;
+                                }
+                                None => {
+                                    debug!(
+                                        %peer,
+                                        ?request_id,
+                                        count = envelopes.len(),
+                                        "Received envelopes response for unknown request_id"
                                     );
                                 }
                             }
@@ -305,13 +384,16 @@ pub async fn handle_req_resp_message(
                                 // data column protocol, which answers with
                                 // `DataColumnSidecars`, never with `Blocks`.
                                 Some(
-                                    PendingRequestKind::Columns(_)
-                                    | PendingRequestKind::ColumnRange { .. },
+                                    kind @ (PendingRequestKind::Columns(..)
+                                    | PendingRequestKind::ColumnRange { .. }
+                                    | PendingRequestKind::EnvelopeRoot(_)
+                                    | PendingRequestKind::EnvelopeRange { .. }),
                                 ) => {
                                     error!(
                                         %peer,
-                                        "Blocks response answered a data column request id"
+                                        "Blocks response answered a non-block request id"
                                     );
+                                    retire_unanswered(server, kind, peer, ctx).await;
                                 }
                                 None => {
                                     debug!(%peer, ?request_id, "Received blocks response for unknown request_id");
@@ -334,7 +416,7 @@ pub async fn handle_req_resp_message(
                                 // forever and deduplicates every later fetch.
                                 handle_fetch_failure(server, root, peer, ctx).await;
                             }
-                            Some(PendingRequestKind::Columns(block_root)) => {
+                            Some(PendingRequestKind::Columns(block_root, _)) => {
                                 // Same reasoning as the `Root` arm above: an
                                 // error response is the whole exchange, so
                                 // this is the only place that can retire it.
@@ -346,6 +428,16 @@ pub async fn handle_req_resp_message(
                             // just means these columns come from gossip or
                             // from the by-root path instead.
                             Some(PendingRequestKind::ColumnRange { .. }) => {}
+                            Some(PendingRequestKind::EnvelopeRoot(block_root)) => {
+                                // Same reasoning as the `Root` arm above.
+                                handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
+                            }
+                            // Nothing retries it, and the chain actor re-asks
+                            // by root; but range pacing waits on the answer,
+                            // so it must be released here.
+                            Some(PendingRequestKind::EnvelopeRange { .. }) => {
+                                release_envelope_gate(server, ctx).await;
+                            }
                             None => {}
                         }
                     }
@@ -383,7 +475,7 @@ pub async fn handle_req_resp_message(
                         "BlocksByRange request failed; retry is disabled"
                     );
                 }
-                Some(PendingRequestKind::Columns(block_root)) => {
+                Some(PendingRequestKind::Columns(block_root, _)) => {
                     handle_column_fetch_failure(server, block_root, peer, ctx).await;
                 }
                 // Nothing waits on a range prefetch, so a failure is only
@@ -400,6 +492,21 @@ pub async fn handle_req_resp_message(
                         end_slot,
                         "DataColumnsByRange request failed; columns fall back to the by-root path"
                     );
+                }
+                Some(PendingRequestKind::EnvelopeRoot(block_root)) => {
+                    handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
+                }
+                Some(PendingRequestKind::EnvelopeRange {
+                    start_slot,
+                    end_slot,
+                }) => {
+                    debug!(
+                        %peer,
+                        start_slot,
+                        end_slot,
+                        "ExecutionPayloadEnvelopesByRange request failed; envelopes fall back to the by-root path"
+                    );
+                    release_envelope_gate(server, ctx).await;
                 }
                 // The handshake is the only *tracked* request kind absent
                 // here: every other outcome for a `Root`, `Range` or `Columns`
@@ -462,14 +569,18 @@ fn lean_blocks(blocks: Vec<SignedBeaconBlock>) -> Vec<SignedBlock> {
 ///
 /// Every request handler on either chain ends here, which is most of what the
 /// two have in common above encoding.
-fn respond(server: &mut P2PServer, channel: ResponseChannel<Response>, payload: ResponsePayload) {
+pub(super) fn respond(
+    server: &mut P2PServer,
+    channel: ResponseChannel<Response>,
+    payload: ResponsePayload,
+) {
     server
         .swarm_handle
         .send_response(channel, Response::success(payload));
 }
 
 /// Answer a request with an error code and a reason.
-fn refuse(
+pub(super) fn refuse(
     server: &mut P2PServer,
     channel: ResponseChannel<Response>,
     code: ResponseCode,
@@ -785,44 +896,17 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         return false;
     }
 
-    // Exclude peers that already returned empty responses for this root
-    let failed = server
-        .pending_root_requests
-        .get(&root)
-        .map(|p| &p.failed_peers);
-    let pool: Vec<_> = if failed.is_none_or(|f| f.is_empty()) {
-        server.connected_peers.keys().copied().collect()
-    } else {
-        let failed = failed.unwrap();
+    let Some((peer, excluded)) = choose_fetch_peer(
+        &server.connected_peers,
         server
-            .connected_peers
-            .keys()
-            .copied()
-            .filter(|p| !failed.contains(p))
-            .collect()
+            .pending_root_requests
+            .get_mut(&root)
+            .map(|pending| &mut pending.failed_peers),
+        &root,
+    ) else {
+        debug!(%root, "Failed to select random peer");
+        return false;
     };
-
-    // Fall back to full set if all peers have failed (new peers may have connected,
-    // or previously-failing peers may have caught up). Clear failed_peers so subsequent
-    // retries start a fresh round of elimination.
-    let pool = if pool.is_empty() {
-        debug!(%root, "All peers failed for this block, retrying with full peer set");
-        if let Some(pending) = server.pending_root_requests.get_mut(&root) {
-            pending.failed_peers.clear();
-        }
-        server.connected_peers.keys().copied().collect()
-    } else {
-        pool
-    };
-
-    let peer = match pool.choose(&mut rand::thread_rng()) {
-        Some(&p) => p,
-        None => {
-            debug!(%root, "Failed to select random peer");
-            return false;
-        }
-    };
-    let excluded = server.connected_peers.len() - pool.len();
 
     let sent = if server.wire.is_beacon() {
         trace!(%peer, %root, excluded, "Sending BeaconBlocksByRoot request for missing block");
@@ -876,6 +960,39 @@ pub async fn fetch_block_from_peer(server: &mut P2PServer, root: H256) -> bool {
         });
 
     true
+}
+
+/// Pick a random connected peer that has not already failed this lookup.
+///
+/// Returns the peer and how many were excluded. When every peer has failed it
+/// falls back to the full set (new peers may have connected, or failing ones
+/// may have caught up) and clears `failed`, so the next retries start a fresh
+/// round of elimination. Shared by the block and envelope by-root fetches,
+/// whose peer choice has nothing to do with what is being fetched.
+pub(super) fn choose_fetch_peer<V>(
+    connected: &HashMap<PeerId, V>,
+    failed: Option<&mut HashSet<PeerId>>,
+    root: &H256,
+) -> Option<(PeerId, usize)> {
+    let pool: Vec<PeerId> = match failed.as_deref() {
+        Some(failed) if !failed.is_empty() => connected
+            .keys()
+            .copied()
+            .filter(|peer| !failed.contains(peer))
+            .collect(),
+        _ => connected.keys().copied().collect(),
+    };
+    let pool = if pool.is_empty() {
+        debug!(%root, "All peers failed for this lookup, retrying with full peer set");
+        if let Some(failed) = failed {
+            failed.clear();
+        }
+        connected.keys().copied().collect()
+    } else {
+        pool
+    };
+    let peer = *pool.choose(&mut rand::thread_rng())?;
+    Some((peer, connected.len() - pool.len()))
 }
 
 /// Record what columns `peer` custodies, given the custody group count it
@@ -1050,6 +1167,7 @@ pub async fn fetch_data_columns_from_peer(
     let mut sent_count = 0usize;
     for (peer, columns) in by_peer {
         let count = columns.len();
+        let requested = columns.clone();
         let column_indices = match ColumnIndices::try_from(columns) {
             Ok(indices) => indices,
             Err(err) => {
@@ -1078,9 +1196,10 @@ pub async fn fetch_data_columns_from_peer(
             debug!(%block_root, %peer, "Failed to send DataColumnsByRoot request (swarm adapter closed)");
             continue;
         };
-        server
-            .outbound_requests
-            .insert(request_id, PendingRequestKind::Columns(block_root));
+        server.outbound_requests.insert(
+            request_id,
+            PendingRequestKind::Columns(block_root, requested),
+        );
         sent_count += 1;
     }
 
@@ -1193,7 +1312,10 @@ async fn request_next_range_batch(server: &mut P2PServer) -> bool {
 /// nothing failed. The batch is re-checked when a peer's metadata arrives (see
 /// [`resume_range_batch_held_for_custody`]), on every call that would have sent
 /// it anyway, and at the deadline.
-async fn request_next_beacon_range_batch(server: &mut P2PServer, ctx: &Context<P2PServer>) -> bool {
+pub(super) async fn request_next_beacon_range_batch(
+    server: &mut P2PServer,
+    ctx: &Context<P2PServer>,
+) -> bool {
     let Some((peer, batch)) = server
         .range_sync_state
         .as_ref()
@@ -1319,13 +1441,11 @@ fn range_batch_needs_columns(server: &P2PServer, batch: &std::ops::Range<u64>) -
 /// range sync skips its custody-peer check before PeerDAS for the same reason:
 /// a batch with no columns to fetch has no custodian to wait for.
 ///
-/// Gloas answers yes as fulu does, though its columns have a different shape.
-/// A batch ending in gloas can begin in fulu, whose blocks need their columns.
-/// A batch lying entirely in gloas also reaches this, since
-/// `beacon_fetched_through` advances past the gloas blocks the chain actor
-/// refuses. It is then held for custody for nothing, and its column prefetch
-/// fails to decode against fulu's shape; that failure logs at debug and
-/// penalizes no peer. No gloas column is ever consumed from here.
+/// Gloas answers yes as fulu does, though its columns have a different shape
+/// and decode as gloas sidecars by the chunk's context bytes. A batch ending in
+/// gloas can begin in fulu, whose blocks need their columns; a batch lying
+/// entirely in gloas still needs them too, since a later change makes the chain
+/// actor gate a block's payload envelope on its columns.
 fn range_needs_columns(
     config: &Config,
     custody_columns: &[u64],
@@ -1399,23 +1519,33 @@ async fn handle_fetch_failure(
         return;
     };
 
-    pending.failed_peers.insert(peer);
-
-    if pending.attempts >= MAX_FETCH_RETRIES {
-        error!(%root, %peer, attempts=%pending.attempts,
+    let attempts = pending.attempts;
+    let Some(backoff) = retire_root_attempt(pending, peer) else {
+        error!(%root, %peer, attempts,
                "Block fetch failed after max retries, giving up");
         server.pending_root_requests.remove(&root);
         return;
+    };
+
+    debug!(%root, %peer, attempts, ?backoff, "Block fetch failed, scheduling retry");
+
+    send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+}
+
+/// Charge `peer` with a failed attempt and say how long to wait before the
+/// next one: `None` once the ladder is exhausted. The step shared by the block
+/// and envelope by-root lookups, whose bookkeeping is the same
+/// [`PendingRequest`].
+pub(super) fn retire_root_attempt(pending: &mut PendingRequest, peer: PeerId) -> Option<Duration> {
+    pending.failed_peers.insert(peer);
+
+    if pending.attempts >= MAX_FETCH_RETRIES {
+        return None;
     }
 
     let backoff_ms = INITIAL_BACKOFF_MS * BACKOFF_MULTIPLIER.pow(pending.attempts - 1);
-    let backoff = Duration::from_millis(backoff_ms);
-
-    debug!(%root, %peer, attempts=%pending.attempts, ?backoff, "Block fetch failed, scheduling retry");
-
     pending.attempts += 1;
-
-    send_after(backoff, ctx.clone(), p2p_protocol::RetryBlockFetch { root });
+    Some(Duration::from_millis(backoff_ms))
 }
 
 /// Retire one failed attempt at fetching `block_root`'s missing columns.
@@ -1576,7 +1706,7 @@ async fn handle_status_request(
     // `refuse` above (which needs `&mut server`) is behind us.
     let wire = server.wire.beacon().expect("checked above");
 
-    if peer_status.fork_digest() != wire.fork_digest {
+    if !wire.holds_digest(peer_status.fork_digest()) {
         // Not grounds for closing the stream: the peer told us who it is and we
         // answer honestly. Counting it is how a digest that has moved under us
         // becomes visible.
@@ -1688,7 +1818,7 @@ async fn handle_status_response(
     let Some(wire) = server.wire.beacon() else {
         return;
     };
-    if status.fork_digest() != wire.fork_digest {
+    if !wire.holds_digest(status.fork_digest()) {
         warn!(
             %peer,
             peer_digest = %hex::encode(status.fork_digest()),
@@ -1696,6 +1826,18 @@ async fn handle_status_response(
             "Handshake answered from another fork digest"
         );
         metrics::inc_beacon_status_digest_mismatch();
+        return;
+    }
+    // Answered at any held digest, but only synced from on the current one (or
+    // the next, within clock skew): after a boundary, a peer still on the old
+    // digest has not upgraded, and its chain is not the one being followed.
+    if !transition::is_syncable_digest(wire, status.fork_digest(), unix_now_ms()) {
+        debug!(
+            %peer,
+            peer_digest = %hex::encode(status.fork_digest()),
+            our_digest = %hex::encode(wire.fork_digest),
+            "Not syncing from a peer on a superseded fork digest"
+        );
         return;
     }
     let peer_head_slot = status.head_slot();
@@ -1764,7 +1906,7 @@ fn handle_metadata_response(server: &mut P2PServer, peer: PeerId, metadata: Beac
 /// to block requests" (data column sidecar requests name the same code for
 /// the same reason), where an empty stream claims we looked and had nothing,
 /// and `INVALID_REQUEST` would blame the asker for a request that was fine.
-fn beacon_block_store_or_refuse(
+pub(super) fn beacon_block_store_or_refuse(
     server: &mut P2PServer,
     peer: PeerId,
     channel: ResponseChannel<Response>,
@@ -1927,21 +2069,18 @@ async fn handle_data_column_sidecars_by_root_request(
             continue;
         };
         for &column in identifier.columns.iter() {
-            let Ok(Some(encoded)) =
-                server
-                    .store
-                    .get_data_column_sidecar(slot, &identifier.block_root, column)
-            else {
-                continue;
-            };
-            match decode_data_column_sidecar(&encoded) {
-                Ok(sidecar) => sidecars.push(sidecar),
+            match server
+                .store
+                .get_data_column(slot, &identifier.block_root, column)
+            {
+                Ok(Some(sidecar)) => sidecars.push(sidecar),
+                Ok(None) => {}
                 Err(err) => error!(
                     %peer,
                     slot,
                     column,
                     %err,
-                    "Stored data column sidecar failed to decode"
+                    "Stored data column sidecar failed to read"
                 ),
             }
         }
@@ -2025,7 +2164,7 @@ async fn handle_data_column_sidecars_by_range_request(
     let columns = request.columns.to_vec();
     let sidecars: Vec<_> = server
         .store
-        .data_column_sidecars_in_range(request.start_slot, end_slot, &columns)
+        .data_column_rows_in_range(request.start_slot, end_slot, &columns)
         .inspect_err(|err| {
             warn!(
                 start_slot = request.start_slot,
@@ -2036,8 +2175,10 @@ async fn handle_data_column_sidecars_by_range_request(
         })
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|encoded| {
-            decode_data_column_sidecar(&encoded)
+        .filter_map(|(slot, encoded)| {
+            server
+                .store
+                .decode_data_column_sidecar(slot, &encoded)
                 .inspect_err(
                     |err| error!(%peer, %err, "Stored data column sidecar failed to decode"),
                 )
@@ -2314,7 +2455,7 @@ async fn handle_data_column_sidecars_range_response(
     let in_range: Vec<DataColumnSidecar> = sidecars
         .into_iter()
         .filter(|sidecar| {
-            let slot = sidecar.signed_block_header.message.slot;
+            let slot = sidecar.slot();
             let keep = slot >= start_slot && slot <= end_slot;
             if !keep {
                 debug!(%peer, slot, start_slot, end_slot, "Dropping an out-of-range data column sidecar");
@@ -2334,15 +2475,48 @@ async fn handle_data_column_sidecars_range_response(
     column_checks::check_and_forward(server, in_range);
 }
 
+/// Keep the sidecars of `sidecars` that answer the request: the requested
+/// block's, at a requested column. Returns them with how many were dropped.
+///
+/// Mirrors [`handle_blocks_by_root_response`], which keeps only the block the
+/// request named. Nothing downstream re-asks whether a sidecar was wanted, and
+/// an unsolicited one would otherwise be parked or stored on a peer's say-so.
+fn retain_requested_columns(
+    sidecars: Vec<DataColumnSidecar>,
+    block_root: H256,
+    requested: &[u64],
+) -> (Vec<DataColumnSidecar>, usize) {
+    let received = sidecars.len();
+    let kept: Vec<_> = sidecars
+        .into_iter()
+        .filter(|sidecar| {
+            sidecar.block_root() == block_root && requested.contains(&sidecar.index())
+        })
+        .collect();
+    let dropped = received - kept.len();
+    (kept, dropped)
+}
+
 async fn handle_data_column_sidecars_response(
     server: &mut P2PServer,
     peer: PeerId,
     block_root: H256,
+    requested: &[u64],
     sidecars: Vec<DataColumnSidecar>,
     ctx: &Context<P2PServer>,
 ) {
     let received = sidecars.len();
     trace!(%peer, %block_root, received, "Received DataColumnsByRoot response");
+
+    let (sidecars, unrequested) = retain_requested_columns(sidecars, block_root, requested);
+    if unrequested > 0 {
+        debug!(
+            %peer,
+            %block_root,
+            unrequested,
+            "Dropping data column sidecars the DataColumnsByRoot request did not ask for"
+        );
+    }
 
     if sidecars.is_empty() {
         debug!(%peer, %block_root, "DataColumnsByRoot response carried no sidecars");
@@ -2428,6 +2602,18 @@ async fn handle_beacon_blocks_by_range_response(
 
     debug!(%peer, received, accepted, "Beacon blocks received");
 
+    // The batch's blocks are all in the actor's mailbox now; ask for the
+    // envelopes of the same span only after that. On a gloas span the next
+    // batch is then held back until the answer has been delivered (see
+    // `RangeSyncState::envelopes_pending`).
+    let waiting_on_envelopes = request_beacon_envelopes_by_range(
+        server,
+        peer,
+        start_slot,
+        end_slot.saturating_sub(start_slot).saturating_add(1),
+    )
+    .await;
+
     // Highest slot *handed to* the actor, not the highest imported: see
     // `beacon_fetched_through`'s own doc comment on `P2PServer` for why range
     // sync must be driven off this rather than the store's head.
@@ -2441,14 +2627,43 @@ async fn handle_beacon_blocks_by_range_response(
             return;
         }
     }
+    if waiting_on_envelopes {
+        return;
+    }
     request_next_beacon_range_batch(server, ctx).await;
 }
 
+/// Retire a request whose id was answered on a protocol that never carries its
+/// kind. The codec cannot produce such an answer, but if one ever arrived the
+/// exchange is over all the same: leaving the entry would keep its root in the
+/// matching pending map, deduplicating every later ask for it, or leave range
+/// sync waiting on a request that already ended.
+async fn retire_unanswered(
+    server: &mut P2PServer,
+    kind: PendingRequestKind,
+    peer: PeerId,
+    ctx: &Context<P2PServer>,
+) {
+    match kind {
+        PendingRequestKind::Root(root) => handle_fetch_failure(server, root, peer, ctx).await,
+        PendingRequestKind::Range { .. } => fail_range_request(server, &peer),
+        PendingRequestKind::Columns(block_root, _) => {
+            handle_column_fetch_failure(server, block_root, peer, ctx).await;
+        }
+        PendingRequestKind::ColumnRange { .. } => {}
+        PendingRequestKind::EnvelopeRoot(block_root) => {
+            handle_envelope_fetch_failure(server, block_root, peer, ctx).await;
+        }
+        PendingRequestKind::EnvelopeRange { .. } => release_envelope_gate(server, ctx).await,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ConnectionDirection;
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
+    use ethlambda_types::beacon::containers::gloas;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::enr::EnrForkId;
     use ethlambda_types::{
@@ -2470,7 +2685,7 @@ mod tests {
     /// had a harness for; see 64a6bce9), the fetch path only touches
     /// `&mut P2PServer`, so building one real server is the whole cost of
     /// testing it.
-    async fn unconnected_server() -> P2PServer {
+    pub(crate) async fn unconnected_server() -> P2PServer {
         let built = crate::build_swarm(crate::SwarmConfig {
             node_key: vec![3u8; 32],
             bootnodes: Vec::new(),
@@ -2485,8 +2700,9 @@ mod tests {
         })
         .expect("swarm builds");
 
-        let (_swarm_stream, swarm_handle) =
+        let (swarm_stream, swarm_handle) =
             crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+        crate::test_support::drain_swarm_events(swarm_stream);
 
         let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
             node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
@@ -2527,6 +2743,7 @@ mod tests {
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_envelope_requests: HashMap::new(),
             pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
@@ -2540,6 +2757,16 @@ mod tests {
             seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
                 crate::SEEN_COLUMNS_CAPACITY,
             ),
+            seen_block_columns: ethlambda_state_transition::beacon::gossip::SeenBlockColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_envelopes: ethlambda_state_transition::beacon::gossip::SeenEnvelopes::new(
+                crate::SEEN_ENVELOPES_CAPACITY,
+            ),
+            seen_payload_attestations:
+                ethlambda_state_transition::beacon::gossip::SeenPayloadAttestations::new(
+                    crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
+                ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,
@@ -2920,5 +3147,32 @@ mod tests {
         let mut peer_gone = RangeSyncState::new(10..20, lone_peer, 15);
         peer_gone.fail_peer(&lone_peer);
         assert!(range_session_exhausted(&peer_gone));
+    }
+
+    fn gloas_column(block_root: H256, index: u64) -> DataColumnSidecar {
+        DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index,
+            slot: 5,
+            beacon_block_root: block_root,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_by_root_answer_keeps_only_the_requested_block_and_columns() {
+        let asked = H256::repeat_byte(1);
+        let other = H256::repeat_byte(2);
+        let answer = vec![
+            gloas_column(asked, 3),
+            // A column of the right block that was not asked for.
+            gloas_column(asked, 4),
+            // A column of a block that was not asked for.
+            gloas_column(other, 3),
+        ];
+
+        let (kept, dropped) = retain_requested_columns(answer, asked, &[3]);
+
+        assert_eq!(kept, vec![gloas_column(asked, 3)]);
+        assert_eq!(dropped, 2);
     }
 }

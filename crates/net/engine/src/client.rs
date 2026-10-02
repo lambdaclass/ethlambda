@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ethlambda_types::beacon::containers::deneb;
+use ethlambda_types::beacon::containers::{deneb, gloas};
 use ethlambda_types::beacon::primitives::{Bytes32, Root};
 use serde_json::json;
 use tracing::{debug, warn};
@@ -10,8 +10,8 @@ use tracing::{debug, warn};
 use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
-    ClientVersionV1, ExecutionPayloadV3, ForkchoiceStateV1, ForkchoiceUpdatedResponse,
-    PayloadStatusV1, data,
+    ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
+    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
 };
 
 /// Per-attempt timeout.
@@ -20,6 +20,11 @@ use crate::types::{
 /// `engine_forkchoiceUpdated`. It is a ceiling, not a target: a healthy
 /// `newPayload` on mainnet answers in 50-500 ms.
 pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Per-attempt timeout for `engine_newPayloadV5`, the value `amsterdam.md`
+/// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
+/// for the older methods.
+pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// How many times one call is attempted before it is given up on.
 ///
@@ -87,11 +92,21 @@ impl EngineClient {
         method: &str,
         params: serde_json::Value,
     ) -> Result<T, EngineError> {
+        self.call_with_timeout(method, params, ENGINE_TIMEOUT).await
+    }
+
+    /// [`Self::call`] with a per-attempt `timeout` of the method's own.
+    async fn call_with_timeout<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        timeout: Duration,
+    ) -> Result<T, EngineError> {
         let mut backoff = ENGINE_INITIAL_BACKOFF;
         let mut last = EngineError::Transport("no attempt was made".to_string());
 
         for attempt in 1..=ENGINE_MAX_ATTEMPTS {
-            match self.call_once(method, &params).await {
+            match self.call_once(method, &params, timeout).await {
                 Ok(value) => return Ok(value),
                 // An answer, not a failure to get one. Do not retry.
                 Err(err @ EngineError::Rpc { .. }) => return Err(err),
@@ -113,6 +128,7 @@ impl EngineClient {
         &self,
         method: &str,
         params: &serde_json::Value,
+        timeout: Duration,
     ) -> Result<T, EngineError> {
         let body = json!({
             "jsonrpc": "2.0",
@@ -125,12 +141,13 @@ impl EngineClient {
             .http
             .post(&self.endpoint)
             .bearer_auth(self.secret.token())
+            .timeout(timeout)
             .json(&body)
             .send()
             .await
             .map_err(|err| {
                 if err.is_timeout() {
-                    EngineError::Timeout(ENGINE_TIMEOUT)
+                    EngineError::Timeout(timeout)
                 } else {
                     EngineError::Transport(err.to_string())
                 }
@@ -202,6 +219,36 @@ impl EngineClient {
         self.call("engine_newPayloadV4", params).await
     }
 
+    /// `engine_newPayloadV5`: Amsterdam's `newPayload`, which gloas asks about
+    /// a revealed execution payload envelope.
+    ///
+    /// The parameters are the same four as V4's, with the payload as
+    /// `ExecutionPayloadV4` (adding `blockAccessList` and `slotNumber`). The
+    /// response is V4's. An execution client answers `-38005` when the
+    /// payload's timestamp is not Amsterdam's, which surfaces as
+    /// [`EngineError::Rpc`] and is not retried.
+    pub async fn new_payload_v5(
+        &self,
+        payload: &gloas::ExecutionPayload,
+        versioned_hashes: &[Bytes32],
+        parent_beacon_block_root: Root,
+        execution_requests: &[Vec<u8>],
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
+        let requests: Vec<String> = execution_requests
+            .iter()
+            .map(|request| data(request))
+            .collect();
+        let params = json!([
+            ExecutionPayloadV4(payload),
+            hashes,
+            data(&parent_beacon_block_root.0),
+            requests,
+        ]);
+        self.call_with_timeout("engine_newPayloadV5", params, ENGINE_NEW_PAYLOAD_V5_TIMEOUT)
+            .await
+    }
+
     /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
     ///
     /// A follower never proposes, so it never asks an execution client to start
@@ -214,6 +261,24 @@ impl EngineClient {
         let params = json!([state, serde_json::Value::Null]);
         let response: ForkchoiceUpdatedResponse =
             self.call("engine_forkchoiceUpdatedV3", params).await?;
+        Ok(response.payload_status)
+    }
+
+    /// `engine_forkchoiceUpdatedV4`: Amsterdam's fork choice notification, with
+    /// a `null` `payloadAttributes` and the consensus client's custody set.
+    ///
+    /// Follower only: there is no variant taking `PayloadAttributesV4`, since a
+    /// follower never asks for a build. `custody_columns` of `None` sends
+    /// `null`, meaning the consensus client provides no custody. The response
+    /// is V3's.
+    pub async fn forkchoice_updated_v4(
+        &self,
+        state: &ForkchoiceStateV1,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<PayloadStatusV1, EngineError> {
+        let params = forkchoice_updated_v4_params(state, custody_columns);
+        let response: ForkchoiceUpdatedResponse =
+            self.call("engine_forkchoiceUpdatedV4", params).await?;
         Ok(response.payload_status)
     }
 
@@ -264,10 +329,17 @@ impl EngineClient {
     /// Runs the startup handshake, logging what the execution client is and
     /// warning about any method this client needs that it does not advertise.
     ///
+    /// `gloas_scheduled` says whether the network's fork schedule includes
+    /// gloas, which is what makes `engine_newPayloadV5` a needed method.
+    ///
     /// Warns rather than refuses: an execution client that under-reports its
     /// capabilities still works, and refusing to start over a handshake would
     /// turn a cosmetic mismatch into an outage.
-    pub async fn handshake(&self, ours: &ClientVersionV1) -> Result<(), EngineError> {
+    pub async fn handshake(
+        &self,
+        ours: &ClientVersionV1,
+        gloas_scheduled: bool,
+    ) -> Result<(), EngineError> {
         let theirs = self
             .exchange_capabilities(crate::ETHLAMBDA_ENGINE_CAPABILITIES)
             .await?;
@@ -277,6 +349,19 @@ impl EngineClient {
                     method = required,
                     "The execution client does not advertise a method this node needs"
                 );
+            }
+        }
+        // Kept out of the list above: these are only called from gloas on, so a
+        // network that does not schedule gloas never needs it, and an
+        // execution client that predates Amsterdam is right not to offer it.
+        if gloas_scheduled {
+            for required in ["engine_newPayloadV5", "engine_forkchoiceUpdatedV4"] {
+                if !theirs.iter().any(|method| method == required) {
+                    warn!(
+                        method = required,
+                        "The execution client does not advertise a method this node needs from gloas on"
+                    );
+                }
             }
         }
         match self.client_version(ours).await {
@@ -295,5 +380,48 @@ impl EngineClient {
             Err(err) => debug!(%err, "The execution client did not report its version"),
         }
         Ok(())
+    }
+}
+
+/// The three positional parameters of `engine_forkchoiceUpdatedV4`: the state,
+/// a `null` `payloadAttributes`, and the custody bitmap or `null`.
+fn forkchoice_updated_v4_params(
+    state: &ForkchoiceStateV1,
+    custody_columns: Option<CustodyColumns>,
+) -> serde_json::Value {
+    json!([state, serde_json::Value::Null, custody_columns])
+}
+
+#[cfg(test)]
+mod tests {
+    use ethlambda_types::beacon::primitives::ExecutionBlockHash;
+
+    use super::*;
+
+    fn state() -> ForkchoiceStateV1 {
+        ForkchoiceStateV1 {
+            head_block_hash: ExecutionBlockHash::repeat_byte(1),
+            safe_block_hash: ExecutionBlockHash::repeat_byte(2),
+            finalized_block_hash: ExecutionBlockHash::repeat_byte(3),
+        }
+    }
+
+    #[test]
+    fn forkchoice_updated_v4_params_are_state_null_and_bitmap() {
+        let columns = CustodyColumns::from_indices([0, 9]);
+        let params = forkchoice_updated_v4_params(&state(), columns);
+        let params = params.as_array().expect("an array of params");
+        assert_eq!(params.len(), 3);
+        assert!(params[0].get("headBlockHash").is_some());
+        assert!(params[1].is_null());
+        assert_eq!(params[2], "0x01020000000000000000000000000000");
+    }
+
+    #[test]
+    fn forkchoice_updated_v4_without_custody_sends_a_third_null() {
+        let params = forkchoice_updated_v4_params(&state(), None);
+        let params = params.as_array().expect("an array of params");
+        assert_eq!(params.len(), 3);
+        assert!(params[2].is_null());
     }
 }

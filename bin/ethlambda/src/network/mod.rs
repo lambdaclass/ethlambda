@@ -197,6 +197,7 @@ pub(crate) fn check_constants(config: &Config) -> Result<(), ConstantsMismatch> 
         maximum_gossip_clock_disparity == constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY,
         max_request_blocks == protocols::MAX_REQUEST_BLOCKS,
         max_request_blocks_deneb == protocols::MAX_REQUEST_BLOCKS_DENEB,
+        max_request_payloads == protocols::MAX_REQUEST_PAYLOADS,
         max_request_data_column_sidecars == protocols::max_request_data_column_sidecars(),
         max_payload_size == ethlambda_p2p::MAX_PAYLOAD_SIZE as u64,
         message_domain_invalid_snappy == ethlambda_p2p::MESSAGE_DOMAIN_INVALID_SNAPPY,
@@ -246,8 +247,9 @@ fn derive_genesis_fields(config: &mut Config, genesis_time: u64) {
 /// config parsed. A loaded network reaches this the same as a built-in one,
 /// and can even schedule such a fork at epoch 0, in which case its own genesis
 /// state already decodes as that fork and startup refuses it outright
-/// (`refuse_unfollowable_fork` in `main.rs`, since fork choice itself accepts
-/// a gloas anchor); this warning fires first either way.
+/// (`refuse_unfollowable_fork` in `main.rs`); this warning fires first either
+/// way. Every fork `ForkName` models is followed today, gloas included, so
+/// this is the guard for the next fork the node cannot follow.
 fn warn_if_unfollowed_fork_scheduled(network: &str, config: &Config) {
     let unfollowed = ethlambda_types::beacon::fork::ForkName::ALL
         .into_iter()
@@ -458,6 +460,15 @@ mod tests {
             err.contains("MESSAGE_DOMAIN_VALID_SNAPPY is [2, 0, 0, 0]"),
             "got {err}"
         );
+    }
+
+    #[test]
+    fn a_config_that_changes_the_envelope_request_ceiling_is_refused() {
+        let mut config = Config::mainnet();
+        config.max_request_payloads = 64;
+
+        let err = check_constants(&config).unwrap_err().to_string();
+        assert!(err.contains("MAX_REQUEST_PAYLOADS is 64"), "got {err}");
     }
 
     #[test]

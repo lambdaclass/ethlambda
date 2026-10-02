@@ -38,7 +38,16 @@ hex.workspace = true
 hex = { workspace = true }
 libssz.workspace = true
 libssz-types.workspace = true
+# The mock execution client the payload-validity tests talk to over a socket.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 datatest-stable = "0.3.3"
+snap = "1.1.1"
+
+[features]
+# Run the fork choice fixture cases the actor tests read from
+# `consensus-spec-tests`. Off by default so `cargo test` needs no fixture
+# download; `make test-beacon-mainnet` turns it on.
+beacon-spec-tests = []
 
 [[test]]
 name = "forkchoice_spectests"

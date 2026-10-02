@@ -112,12 +112,13 @@ impl ForkName {
 
     /// Whether this node follows a chain that has reached this fork.
     ///
-    /// Phase0 through fulu are followed. Gloas is not: nothing delivers the
-    /// payload envelopes or payload attestations a gloas chain needs, so the
-    /// node refuses gloas blocks and anchors, ignores gloas gossip and reports
-    /// syncing once the clock reaches the fork. This is the one place to
-    /// change when the node starts following gloas; every site whose rule is
-    /// "does this node follow the fork" calls it.
+    /// Every beacon fork is followed. Gloas needs the payload envelopes and
+    /// payload attestations that phase0 through fulu do not: the chain actor
+    /// imports the envelopes, the network side delivers them and the two
+    /// gloas gossip topics, and fork choice keeps the head's payload status.
+    /// The question stays a function so a fork this node cannot follow has
+    /// one place to say so; every site whose rule is "does this node follow
+    /// the fork" calls it.
     ///
     /// # Panics
     ///
@@ -131,9 +132,30 @@ impl ForkName {
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra
-            | ForkName::Fulu => true,
-            ForkName::Gloas => false,
+            | ForkName::Fulu
+            | ForkName::Gloas => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
+        }
+    }
+
+    /// Whether blocks of this fork reveal their execution payload in a separate
+    /// envelope (gloas, EIP-7732, and any fork after it).
+    ///
+    /// An explicit match rather than `self >= ForkName::Gloas`: the derived
+    /// order puts [`ForkName::Lean`] after every beacon fork, so that
+    /// comparison is true for lean, which has no envelopes. A fork added after
+    /// gloas must be listed here, so the compiler forces the decision.
+    pub const fn has_payload_envelopes(self) -> bool {
+        match self {
+            ForkName::Gloas => true,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Lean => false,
         }
     }
 
@@ -222,6 +244,14 @@ mod tests {
     }
 
     #[test]
+    fn only_gloas_and_later_beacon_forks_have_payload_envelopes() {
+        for fork in ForkName::ALL {
+            assert_eq!(fork.has_payload_envelopes(), fork >= ForkName::Gloas);
+        }
+        assert!(!ForkName::Lean.has_payload_envelopes());
+    }
+
+    #[test]
     fn parse_round_trips_every_fork() {
         for fork in ForkName::ALL {
             assert_eq!(ForkName::parse(fork.as_str()), Some(fork));
@@ -300,9 +330,9 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_fulu_is_followed_and_gloas_is_not() {
+    fn every_beacon_fork_through_gloas_is_followed() {
         for fork in ForkName::ALL {
-            assert_eq!(fork.is_followed(), fork != ForkName::Gloas, "{fork:?}");
+            assert!(fork.is_followed(), "{fork:?}");
         }
     }
 
