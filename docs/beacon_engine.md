@@ -119,11 +119,12 @@ finality: an execution client doing a long state sync answers `NOT_VALIDATED` to
 every block, so without that bound the set would take one root per import for
 the life of the process.
 
-Nothing outside `mark_validated`'s own ancestor walk reads the set yet. The
-readers it is waiting for are the ones that need to answer "is my head
-optimistic?": the Beacon API's `execution_optimistic` response field, and a sync
-status that separates a head this node has vouched for from one it has merely
-imported.
+Besides `mark_validated`'s own ancestor walk, the Beacon API reads the set:
+every `execution_optimistic` response field, `is_optimistic` on
+`/eth/v1/node/syncing` and the `206` on `/eth/v1/node/health` (both about the
+head only), and `attestation_data` and `aggregate_attestation`, which answer
+`503` rather than hand a validator a vote for a block the execution client has
+not validated (see [`rpc.md`](rpc.md#validator-endpoints)).
 
 ### `is_optimistic_candidate_block`
 
