@@ -798,16 +798,17 @@ impl BlockChainServer {
         // Produce attestation data once for all validators
         let attestation_data = store::produce_attestation_data(&self.store, slot);
 
-        // For each registered validator, produce and publish attestation
-        for validator_id in self.key_manager.validator_ids() {
-            // Sign the attestation
-            let Ok(signature) = self
-                .key_manager
-                .sign_attestation(validator_id, &attestation_data)
-                .inspect_err(
-                    |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
-                )
-            else {
+        // Sign every validator's attestation at once, then deliver and publish
+        // each. Signing them in parallel is what keeps a node's last vote from
+        // trailing its first by the sum of every signature before it.
+        let validator_ids = self.key_manager.validator_ids();
+        let signatures = self
+            .key_manager
+            .sign_attestations(&validator_ids, &attestation_data);
+        for (validator_id, signature) in validator_ids.into_iter().zip(signatures) {
+            let Ok(signature) = signature.inspect_err(
+                |err| error!(%slot, %validator_id, %err, "Failed to sign attestation"),
+            ) else {
                 continue;
             };
 
