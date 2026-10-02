@@ -1784,6 +1784,9 @@ impl BlockChainServer {
                     }
                 }
 
+                // Drop any hand-off span left by an insert outside this call,
+                // so the one taken below is this block's alone.
+                let _ = self.store.take_state_handoff();
                 timings.stf_start = Some(Instant::now());
                 let imported = fork_choice::on_block(
                     &mut self.store,
@@ -1794,6 +1797,11 @@ impl BlockChainServer {
                     &committees,
                 );
                 timings.stf_end = Some(Instant::now());
+                (timings.writer_wait_start, timings.writer_wait_end) =
+                    match self.store.take_state_handoff() {
+                        Some((start, end)) => (Some(start), Some(end)),
+                        None => (None, None),
+                    };
                 if let Err(err) = imported {
                     return (timings, Err(err.into()));
                 }
