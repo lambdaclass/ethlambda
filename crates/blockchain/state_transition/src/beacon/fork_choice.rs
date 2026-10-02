@@ -4497,8 +4497,18 @@ pub fn on_block(
             stf::ExecutionEngine::valid()
         }
     };
-    let transition =
-        stf::state_transition(&mut state, &signed_block, true, config, &engine, committees);
+    // The store's own cache, so every block of this chain shares one entry per
+    // epoch; see `ActiveBalanceCacheExt`.
+    let active_balances = store.active_balance_cache();
+    let transition = stf::state_transition(
+        &mut state,
+        &signed_block,
+        true,
+        config,
+        &engine,
+        committees,
+        &active_balances,
+    );
 
     // `optimistic-sync.md`: a block deemed `INVALIDATED` MUST NOT be included
     // in the canonical chain. That is stated here, on the verdict, rather than
@@ -5171,7 +5181,7 @@ mod tests {
     use super::*;
     use crate::beacon::bls;
     use crate::beacon::containers::BeaconBlockHeader;
-    use crate::beacon::helpers::accessors;
+    use crate::beacon::helpers::accessors::{self, ActiveBalanceCache};
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::BlsSignature;
@@ -6001,6 +6011,7 @@ mod tests {
             &config,
             &stf::ExecutionEngine::valid(),
             &trial_committees,
+            &ActiveBalanceCache::default(),
         )
         .expect("the drafted block must transition cleanly");
         let state_root = trial_state.hash_tree_root();

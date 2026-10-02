@@ -36,10 +36,11 @@ use crate::beacon::containers::{BeaconState, deneb, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_block_root,
-    get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
+    ActiveBalanceCache, ActiveBalanceCacheExt, CommitteeCache, CommitteeCacheExt,
+    get_beacon_proposer_index, get_block_root, get_block_root_at_slot, get_current_epoch,
+    get_previous_epoch, get_randao_mix,
 };
-use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
+use crate::beacon::helpers::altair::{add_flag, base_reward_per_increment, has_flag};
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::math::integer_squareroot;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
@@ -77,6 +78,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -105,8 +107,9 @@ pub fn process_block(
         &block.body.bls_to_execution_changes,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
@@ -147,6 +150,7 @@ fn process_operations(
     bls_to_execution_changes: &[SignedBLSToExecutionChange],
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let outstanding = state
         .eth1_data()
@@ -167,7 +171,7 @@ fn process_operations(
         super::operations::process_attester_slashing(state, attester_slashing, config)?;
     }
     for attestation in attestations {
-        process_attestation(state, attestation, committees)?;
+        process_attestation(state, attestation, committees, active_balances)?;
     }
     for deposit in deposits {
         super::operations::process_deposit(state, deposit, config)?;
@@ -281,6 +285,7 @@ pub fn process_attestation(
     state: &mut BeaconState,
     attestation: &phase0::Attestation,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     let data = attestation.data;
     let current_epoch = get_current_epoch(state);
@@ -356,7 +361,8 @@ pub fn process_attestation(
     };
 
     // Hoisted: see the comment on the same line in `electra::process_attestation`.
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    let base_reward_per_increment =
+        base_reward_per_increment(active_balances.total_active_balance(state)?);
 
     let mut proposer_reward_numerator: Gwei = 0;
     let mut updates: Vec<(ValidatorIndex, ParticipationFlags)> = Vec::new();
@@ -371,6 +377,10 @@ pub fn process_attestation(
                 })?;
 
         let mut new_flags: ParticipationFlags = 0;
+        // The attester's validator is read at most once, on the first flag
+        // it newly earns: each read is a tree descent, and the effective
+        // balance cannot change inside this read-only phase.
+        let mut attester_increments: Option<Gwei> = None;
         for &flag_index in &participation_flag_indices {
             if has_flag(current_flags, flag_index) {
                 continue;
@@ -382,8 +392,15 @@ pub fn process_attestation(
             // the result is bit-identical. See `electra::process_attestation`
             // for why the hoist is not a tidy-up but the difference between
             // importing a block at mainnet scale and not.
-            let increments =
-                state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+            let increments = match attester_increments {
+                Some(increments) => increments,
+                None => {
+                    let increments = state.validator(index)?.effective_balance
+                        / preset::EFFECTIVE_BALANCE_INCREMENT;
+                    attester_increments = Some(increments);
+                    increments
+                }
+            };
             let reward = (increments * base_reward_per_increment)
                 .checked_mul(weight)
                 .ok_or(Error::ArithmeticOverflow(
