@@ -539,6 +539,10 @@ pub fn assemble_block(
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
     )?;
+    // Fold the block's writes into their trees first, so the root is computed
+    // on (and cached in) the state's own nodes rather than a throwaway copy,
+    // as `state_transition` does before it checks a block's state root.
+    post.apply_pending_mutations();
     block.state_root = post.hash_tree_root();
     Ok(block)
 }

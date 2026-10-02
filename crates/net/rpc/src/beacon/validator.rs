@@ -706,8 +706,8 @@ mod tests {
             unreachable!("built as fulu")
         };
         fulu.proposer_lookahead = lookahead.try_into().unwrap();
-        for (slot, root) in fulu.block_roots.iter_mut().enumerate() {
-            *root = H256::repeat_byte(slot as u8 + 1);
+        for slot in 0..fulu.block_roots.len() {
+            fulu.block_roots[slot] = H256::repeat_byte(slot as u8 + 1);
         }
         state
     }
