@@ -19,7 +19,7 @@ use ethlambda_types::{
         config::Config,
         containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
         fork::ForkName,
-        fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
+        fork_choice::{JustifiedBalances, LatestMessage, PayloadStatusV1, PowBlock},
         preset::{Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
     },
@@ -667,6 +667,10 @@ pub(crate) struct BeaconScratch {
     pub(crate) block_timeliness: HashMap<H256, bool>,
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
+    /// The justified checkpoint state's balances, flattened for the vote loop
+    /// and keyed by their own checkpoint. A derived cache: a miss is rebuilt
+    /// from `checkpoint_states`, so nothing needs to persist it.
+    pub(crate) justified_balances: Option<Arc<JustifiedBalances>>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
@@ -3208,6 +3212,32 @@ impl Store {
                 f(index, message);
             }
         }
+    }
+
+    /// The cached justified-balances snapshot, if it was built for exactly
+    /// `checkpoint`.
+    ///
+    /// The checkpoint is the whole key, so a caller never has to know which
+    /// code moved the justified checkpoint: a stale snapshot just misses.
+    pub fn justified_balances(
+        &self,
+        checkpoint: &BeaconCheckpoint,
+    ) -> Option<Arc<JustifiedBalances>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .justified_balances
+            .as_ref()
+            .filter(|balances| balances.checkpoint() == *checkpoint)
+            .cloned()
+    }
+
+    /// Replaces the cached justified-balances snapshot.
+    ///
+    /// Takes `&self`, like [`Self::cache_state`]: the read-only fork-choice
+    /// helpers fill it on a miss.
+    pub fn set_justified_balances(&self, balances: Arc<JustifiedBalances>) {
+        self.beacon.lock().unwrap().justified_balances = Some(balances);
     }
 
     /// Looks up a PoW block by its own hash, standing in for the
