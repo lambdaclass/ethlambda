@@ -619,9 +619,9 @@ pub struct SwarmConfig {
     /// Ignored on lean, which runs [`unlimited_connections`].
     pub target_peers: usize,
     /// Which network's wire to build. Decides the gossip topics, the req/resp
-    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version and
-    /// the connection limits, and so decides the [`Wire`] the built swarm
-    /// carries.
+    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version,
+    /// the connection limits and whether peers are scored, and so decides the
+    /// [`Wire`] the built swarm carries.
     pub wire: WireConfig,
 }
 
@@ -771,6 +771,11 @@ pub enum SwarmBuildError {
     Subscription(#[from] libp2p::gossipsub::SubscriptionError),
 }
 
+/// Gossipsub's target mesh size, the spec's `D`. Named because beacon peer
+/// scoring sizes its first-delivery caps by it; see
+/// [`beacon::scoring::ScoreSettings`].
+pub(crate) const MESH_N: usize = 8;
+
 /// The gossipsub parameters both wires share.
 ///
 /// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
@@ -789,7 +794,7 @@ pub(crate) fn gossipsub_config(
     let mut builder = libp2p::gossipsub::ConfigBuilder::default();
     builder
         // d
-        .mesh_n(8)
+        .mesh_n(MESH_N)
         // d_low
         .mesh_n_low(6)
         // d_high
@@ -817,9 +822,10 @@ pub(crate) fn gossipsub_config(
 /// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
 ///
 /// One builder for both networks. Four things differ at the behaviour level and
-/// are resolved in the first match below; the topic set differs and is resolved
-/// in the last one. Everything in between, the transport, the QUIC and TCP
-/// listeners and the static bootnode dialing, is the same on either wire.
+/// are resolved in the first match below, peer scoring (beacon only) just after
+/// it; the topic set differs and is resolved in the last one. Everything in
+/// between, the transport, the QUIC and TCP listeners and the static bootnode
+/// dialing, is the same on either wire.
 pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     let SwarmConfig {
         node_key,
@@ -853,11 +859,27 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     };
 
     let validate_messages = matches!(wire, WireConfig::Beacon(_));
-    let gossipsub = libp2p::gossipsub::Behaviour::new(
+    let mut gossipsub = libp2p::gossipsub::Behaviour::new(
         MessageAuthenticity::Anonymous,
         gossipsub_config(seen_ttl, validate_messages),
     )
     .expect("failed to initiate behaviour");
+    // Beacon only: the parameters are sized from the beacon chain's topics
+    // and message rates, and lean has no set of its own. Without a verdict
+    // on each message (lean's are auto-accepted) the invalid-message term
+    // would have nothing to count either. Built for a placeholder validator
+    // count; `P2PServer`'s first scoring refresh, at startup, replaces the
+    // topic parameters with the head's.
+    if let WireConfig::Beacon(beacon) = &wire {
+        let settings = beacon::scoring::ScoreSettings::new(&beacon.config, MESH_N);
+        let params = settings.peer_score_params(
+            beacon.fork_digest,
+            beacon::scoring::ScoreInputs::placeholder(),
+        );
+        gossipsub
+            .with_peer_score(params, beacon::scoring::thresholds())
+            .expect("valid peer score parameters");
+    }
 
     let req_resp = ReqResp::new(codec, &wire);
 
@@ -877,8 +899,6 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         gossipsub,
         req_resp,
     };
-
-    // TODO: set peer scoring params
 
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
@@ -1110,6 +1130,10 @@ impl P2P {
             .wire
             .beacon()
             .map_or(0, |beacon| beacon.attestation_subnets.len());
+        let peer_scoring = built
+            .wire
+            .beacon()
+            .map(|beacon| beacon::scoring::PeerScoring::new(&beacon.config));
 
         let server = P2PServer {
             swarm_handle,
@@ -1150,9 +1174,20 @@ impl P2P {
                 ATTESTATION_VALIDATION_PERMITS,
             )),
             aggregator_subnets: HashMap::new(),
+            peer_scoring,
         };
+        let scores_peers = server.peer_scoring.is_some();
         let discovery_enabled = server.discovery.is_some();
         let handle = server.start();
+        // At once rather than a slot in: the swarm starts on placeholder
+        // topic scores, and the head's are already known.
+        if scores_peers {
+            send_after(
+                Duration::ZERO,
+                handle.context(),
+                p2p_protocol::RefreshPeerScoring,
+            );
+        }
         send_after(
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
@@ -1289,6 +1324,10 @@ pub struct P2PServer {
     /// advertised in `attnets`, and left once the slot has passed. The
     /// backbone subnets are separate and never left.
     pub(crate) aggregator_subnets: HashMap<u64, u64>,
+
+    /// Gossipsub scoring's inputs and gate. `None` on lean, which runs
+    /// without peer scoring. See [`beacon::scoring`].
+    pub(crate) peer_scoring: Option<beacon::scoring::PeerScoring>,
 }
 
 impl P2PServer {
@@ -1382,6 +1421,8 @@ pub(crate) trait P2PProtocol: Send + Sync {
     /// then by its own timer for the next join, switch or leave.
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn advance_fork_schedule(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn refresh_peer_scoring(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -1536,6 +1577,21 @@ impl P2PServer {
             DIAL_INTERVAL_AT_TARGET
         };
         send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
+    }
+
+    /// Rebuild the gossipsub topic scores from the head, once a slot. Beacon
+    /// only: never scheduled on lean. See [`beacon::scoring::refresh`].
+    #[send_handler]
+    async fn handle_refresh_peer_scoring(
+        &mut self,
+        _msg: p2p_protocol::RefreshPeerScoring,
+        ctx: &Context<Self>,
+    ) {
+        if let Some(wire) = self.wire.beacon() {
+            let slot = Duration::from_millis(wire.config.slot_duration_ms);
+            send_after(slot, ctx.clone(), p2p_protocol::RefreshPeerScoring);
+        }
+        beacon::scoring::refresh(self);
     }
 
     /// The deadline of a range batch held back for custody. Scheduled once,
@@ -2845,6 +2901,7 @@ pub(crate) mod test_support {
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
             aggregator_subnets: HashMap::new(),
+            peer_scoring: None,
         }
     }
 

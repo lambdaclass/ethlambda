@@ -83,6 +83,10 @@ const COMMITTEE_CACHE_CAPACITY: usize = 8;
 /// pins: its previous, current, and next epochs'.
 const HEAD_SHUFFLINGS: usize = 3;
 
+/// Where the head's current epoch sits among [`CommitteeCache::pin_head`]'s
+/// keys, which name its previous, current and next epochs in that order.
+const HEAD_CURRENT_EPOCH: usize = 1;
+
 const _: () = assert!(
     COMMITTEE_CACHE_CAPACITY > HEAD_SHUFFLINGS,
     "the cache must hold at least one shuffling the head does not pin"
@@ -267,6 +271,22 @@ impl CommitteeCache {
     pub fn pin_head(&self, head_root: Root, keys: [Option<ShufflingKey>; HEAD_SHUFFLINGS]) {
         self.state.lock().unwrap().head = Some((head_root, keys));
     }
+
+    /// The pinned head's current-epoch committees, if that shuffling has been
+    /// built.
+    ///
+    /// Never builds one: a caller that only wants a figure off the head (the
+    /// active validator count gossipsub scoring sizes its expected message
+    /// rates by) has no state to build from, and waiting for the chain actor
+    /// to need that shuffling is cheaper than deriving it here. `None` until
+    /// a head has been pinned and its current epoch's shuffling filled in.
+    pub fn head_current_committees(&self) -> Option<Arc<EpochCommittees>> {
+        let state = self.state.lock().unwrap();
+        let (_, keys) = state.head.as_ref()?;
+        let current = keys[HEAD_CURRENT_EPOCH]?;
+        let (_, slot) = state.entries.iter().find(|(key, _)| *key == current)?;
+        slot.get().cloned()
+    }
 }
 
 #[cfg(test)]
@@ -378,6 +398,28 @@ mod tests {
             assert!(resident.contains(&k), "pinned {k:?} was evicted");
         }
         assert!(cache.state.lock().unwrap().entries.len() <= COMMITTEE_CACHE_CAPACITY);
+    }
+
+    /// `head_current_committees` answers with the pinned head's
+    /// current-epoch entry, the middle of the three it pins, and only once
+    /// that entry has been built: it is a read, never a derivation.
+    #[test]
+    fn the_head_current_committees_are_the_middle_pin_once_built() {
+        let cache = CommitteeCache::default();
+        assert!(cache.head_current_committees().is_none(), "nothing pinned");
+
+        let pinned_keys = [Some(key(1, 1)), Some(key(2, 2)), Some(key(3, 3))];
+        cache.pin_head(Root::repeat_byte(0xAA), pinned_keys);
+        assert!(
+            cache.head_current_committees().is_none(),
+            "pinned but not built"
+        );
+
+        cache.get_or_init(key(2, 2), || EpochCommittees::new(2, vec![7, 8, 9], 1));
+        let current = cache
+            .head_current_committees()
+            .expect("the current epoch's shuffling is built");
+        assert_eq!(current.active_validator_count(), 3);
     }
 
     /// Concurrent misses on the same key must run `build` exactly once: the

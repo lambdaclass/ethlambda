@@ -104,6 +104,13 @@ impl EpochCommittees {
         self.committees_per_slot
     }
 
+    /// How many validators are active in this epoch: the shuffle is a
+    /// permutation of exactly that set, so its length is the count without
+    /// another registry scan.
+    pub fn active_validator_count(&self) -> u64 {
+        self.shuffled.len() as u64
+    }
+
     /// The committee at `slot` with `index`.
     ///
     /// The same members `ethlambda-state-transition`'s `get_beacon_committee`

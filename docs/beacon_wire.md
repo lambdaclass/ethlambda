@@ -235,6 +235,70 @@ goes through fanout), all under the digest the block's slot falls in. Operations
 posted to the `pool/*` routes are published on their topics the same way, under
 the digest of the wall-clock slot.
 
+### Peer scoring
+
+Gossipsub peer scoring is on for this wire only
+(`crate::beacon::scoring`). The parameters are lighthouse's
+(`gossipsub_scoring_parameters.rs`), ported formula for formula; Grandine,
+Teku and Lodestar use the same constants, so thresholds mean the same thing
+here as on most of mainnet.
+
+| Threshold | Score | Effect |
+| --- | --- | --- |
+| gossip | -4000 | no IHAVE/IWANT to or from the peer |
+| publish | -8000 | left out of this node's publishes |
+| graylist | -16000 | every RPC ignored, and the peer is disconnected |
+
+| Topic | Weight | Mesh deliveries (P3) |
+| --- | --- | --- |
+| `beacon_block` | 0.5 | scored |
+| `beacon_aggregate_and_proof` | 0.5 | scored |
+| `beacon_attestation_{0..63}` | 1/64 each | scored |
+| `voluntary_exit`, `proposer_slashing`, `attester_slashing` | 0.05 each | off |
+
+Columns, sync committee contributions and BLS changes carry no topic
+parameters. Only Prysm scores columns. This node `Ignore`s every contribution
+and change (no consumer), and a delivery is only credited once accepted, so
+scoring P3 there would penalize every mesh peer for this node's own gap. All
+64 attestation subnets get parameters, not just the backbone ones, because
+aggregator duties join others at runtime.
+
+Two differences from lighthouse:
+
+- `mesh_n` is this node's `D` (8), not lighthouse's 5. It only enters the
+  first-message-delivery cap.
+- **P3 waits for this node to keep up.** Lighthouse joins these topics only
+  once synced, so it has no mesh while it catches up. This node subscribes at
+  startup, and while catching up it `Ignore`s every aggregate and attestation
+  voting for a block it has not imported. A mesh peer credited with no
+  aggregates scores below the graylist, so a restart would graylist the whole
+  aggregate mesh because of this node's lag. `MeshDeliveryGate` turns P3 off
+  while the head lags the wall clock by more than
+  `MESH_DELIVERY_MAX_HEAD_LAG` slots, and back on only after an epoch within
+  that lag, so the counters have refilled. While P3 is off its threshold and
+  weight are zero but its cap is not, so the counters keep counting to their
+  real ceiling. `SyncStatus` cannot serve as this gate: on the mainnet
+  follower it reported `synced` through a 10-minute catch-up up to 98 slots
+  behind, since its network-stall rule reads a lagging freshest-known block
+  as a stalled network.
+
+The block, aggregate and attestation parameters depend on the active
+validator count, so the p2p actor rebuilds them every slot from the head's
+pinned current-epoch shuffling (`CommitteeCache::head_current_committees`)
+and hands them to the swarm. The swarm starts on lighthouse's placeholder (32
+validators, P3 off) until the first refresh, which runs at startup. Every 10
+s the swarm task disconnects peers below the graylist. There is no ban list:
+a peer's negative score is kept for `retain_score` (100 epochs) after it
+leaves, so a peer that reconnects comes back graylisted and is dropped again.
+
+The refresh names the block, aggregate and attestation topics for the
+digest current at that slot, so they follow a fork-schedule switch within a
+slot. The exit and slashing topics keep the startup digest's parameters
+only, and the old digest's topics keep their weight (lighthouse zeroes it
+with `remove_topic_weight_except`). Gossipsub only tracks a mesh peer for a
+topic that had parameters when the peer was grafted, so the mesh formed in a
+fork's subscription window is not scored for P3 at the switch.
+
 ## Aggregate attestations
 
 `beacon_aggregate_and_proof` reaches fork choice. It is how a follower learns
@@ -672,6 +736,9 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
 | `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
+| `lean_gossipsub_peers_by_score{band}` | Gossipsub peers by score band; see [Peer scoring](#peer-scoring) |
+| `lean_gossipsub_score_disconnects_total` | Peers disconnected for a score below the graylist |
+| `lean_gossipsub_mesh_delivery_scoring` | 1 while P3 is scored, 0 while the head lags or is warming up |
 
 The four aggregate histograms no longer cover what they used to: gossip
 validation (committees, all three signatures, the seen caches) runs in p2p now

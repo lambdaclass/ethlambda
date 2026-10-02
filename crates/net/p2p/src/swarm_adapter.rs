@@ -4,18 +4,20 @@ use std::time::Duration;
 use libp2p::{
     PeerId,
     futures::StreamExt,
+    gossipsub::{IdentTopic, TopicScoreParams},
     request_response,
     swarm::{SwarmEvent, dial_opts::DialOpts},
 };
 use tokio::{sync::mpsc, time::MissedTickBehavior};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
-    Behaviour, BehaviourEvent, ReqRespProtocol, ReqRespRequestId, metrics, req_resp::Request,
-    req_resp::Response,
+    Behaviour, BehaviourEvent, ReqRespProtocol, ReqRespRequestId, beacon::scoring, metrics,
+    req_resp::Request, req_resp::Response,
 };
 
-/// Interval between gossipsub mesh peer metric refreshes.
+/// Interval between gossipsub mesh peer metric refreshes, and between the
+/// checks that disconnect peers scored below the graylist.
 const MESH_METRIC_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 pub enum SwarmCommand {
@@ -49,6 +51,9 @@ pub enum SwarmCommand {
         channel: request_response::ResponseChannel<Response>,
         response: Response,
     },
+    /// Replace these topics' score parameters (beacon only; see
+    /// [`scoring::refresh`]).
+    SetTopicScoreParams(Vec<(IdentTopic, TopicScoreParams)>),
     /// A verdict for a gossip message gossipsub is holding (beacon only).
     ReportValidation {
         message_id: libp2p::gossipsub::MessageId,
@@ -204,6 +209,13 @@ impl SwarmHandle {
             .inspect_err(|_| debug!("Swarm adapter closed, cannot send response"));
     }
 
+    pub fn set_topic_score_params(&self, topics: Vec<(IdentTopic, TopicScoreParams)>) {
+        let _ = self
+            .cmd_tx
+            .send(SwarmCommand::SetTopicScoreParams(topics))
+            .inspect_err(|_| debug!("Swarm adapter closed, cannot set topic score parameters"));
+    }
+
     pub fn report_validation(
         &self,
         message_id: libp2p::gossipsub::MessageId,
@@ -277,10 +289,48 @@ async fn swarm_loop(
                     counters.num_established_incoming(),
                     counters.num_established_outgoing(),
                 );
+                disconnect_graylisted_peers(&mut swarm);
             }
         }
     }
     error!("Swarm adapter loop exited — P2P networking is no longer functional");
+}
+
+/// Disconnect every peer gossipsub scores below the graylist, and publish how
+/// the rest are spread across the score bands.
+///
+/// Gossipsub on its own only ignores a graylisted peer's RPCs, so the peer
+/// would keep a connection slot it is no use in. There is no ban list, so the
+/// peer may reconnect, but its score is retained for `retain_score` after it
+/// leaves: it comes back graylisted and is dropped again on the next pass.
+///
+/// Does nothing on lean, which runs without scoring.
+fn disconnect_graylisted_peers(swarm: &mut libp2p::Swarm<Behaviour>) {
+    let gossipsub = &swarm.behaviour().gossipsub;
+    // `peer_score` is `Some` for any peer id, this node's own included,
+    // exactly when scoring is on.
+    if gossipsub.peer_score(swarm.local_peer_id()).is_none() {
+        return;
+    }
+    let mut bands: HashMap<&'static str, i64> =
+        scoring::SCORE_BANDS.iter().map(|&band| (band, 0)).collect();
+    let mut graylisted = Vec::new();
+    for (peer_id, _topics) in gossipsub.all_peers() {
+        let Some(score) = gossipsub.peer_score(peer_id) else {
+            continue;
+        };
+        *bands.entry(scoring::score_band(score)).or_default() += 1;
+        if score < scoring::GRAYLIST_THRESHOLD {
+            graylisted.push((*peer_id, score));
+        }
+    }
+    metrics::set_gossipsub_peers_by_score(&bands);
+    for (peer_id, score) in graylisted {
+        if swarm.disconnect_peer_id(peer_id).is_ok() {
+            metrics::inc_gossipsub_score_disconnects();
+            info!(%peer_id, score, "Disconnecting peer scored below the gossipsub graylist");
+        }
+    }
 }
 
 fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
@@ -391,6 +441,14 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 .lean_status
                 .send_response(channel, response)
                 .inspect_err(|response| debug!(%response, "Swarm adapter: send_response failed"));
+        }
+        SwarmCommand::SetTopicScoreParams(topics) => {
+            let gossipsub = &mut swarm.behaviour_mut().gossipsub;
+            for (topic, params) in topics {
+                let _ = gossipsub
+                    .set_topic_params(topic, params)
+                    .inspect_err(|err| debug!(%err, "Swarm adapter: topic score update failed"));
+            }
         }
         SwarmCommand::ReportValidation {
             message_id,
