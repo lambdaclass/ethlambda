@@ -39,7 +39,7 @@ crates/
         └─ src/metrics.rs   # State transition timing + counters
   common/
     ├─ types/               # Core types (State, Block, Attestation, Checkpoint)
-    ├─ crypto/              # XMSS aggregation (leansig wrapper)
+    ├─ crypto/              # XMSS sign/verify + aggregation (leanVM wrapper)
     ├─ ssz-tree/            # Persistent Merkle tree (List/Vector) behind the beacon registry and balances
     ├─ metrics/             # Prometheus re-exports, TimingGuard, gather utilities
     └─ test-fixtures/       # Spec-fixture loading (prod dep of rpc's Hive test driver)
@@ -279,9 +279,44 @@ actual_slot = finalized_slot + 1 + relative_index
 
 **XMSS (eXtended Merkle Signature Scheme):**
 - Post-quantum signature scheme
-- 52-byte public keys, 2536-byte signatures (`SIGNATURE_SIZE` in `common/types/src/signature.rs`)
+- Wire sizes: `PUBLIC_KEY_SIZE` (`common/types/src/state.rs`) and `SIGNATURE_SIZE`
+  (`common/types/src/attestation.rs`), static-asserted against leanVM's scheme
+  constants in `common/crypto/src/signature.rs`
 - Epoch-based to prevent reuse
-- Aggregation via leanVM (previously leanMultisig) for efficiency
+- Signing, verification, and aggregation all come from leanVM, which internalized
+  XMSS in its own `xmss` crate; there is no external leanSig dependency
+- BLAKE2s over binary fields, not Poseidon over KoalaBear: a leanVM `main` bump
+  across that rewrite invalidates every genesis key and every stored proof, even
+  when the wire sizes happen to match
+- `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
+  proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
+  which recycles the prover's large buffers across proofs instead of re-faulting
+  them, so its pages stay resident for the node's lifetime
+- Every proof runs on one dedicated `leanvm-prover` thread (`prove` in
+  `ethlambda-crypto`). The arena pins a slab to each thread that ever drives a
+  proof, so proving from the calling thread (tokio's blocking pool, the actors)
+  grew RSS one proof peak per new thread until aggregators were OOM-killed.
+  `tests/arena_slabs.rs` guards this
+- `ethlambda keygen` generates genesis validator keys through the same
+  `ValidatorSecretKey` the node loads them with, so a key set cannot be built
+  against a different leanVM than the client reading it. Keys are only usable by
+  a client on the matching revision, and no file size changes when the scheme
+  does, so the manifest records `leanvm_rev`. See [`docs/keygen.md`](docs/keygen.md)
+
+**Aggregation shape (one leanVM `AggregateSignature`, grouped by `(epoch, message)`):**
+- Type-1 and Type-2 are the same object: one `XmssGroup` per `(epoch, message)`
+  pair, carrying that group's sorted, deduplicated keys
+- **A slot can carry several messages.** Validators attesting moments apart
+  disagree within a slot, so two distinct `AttestationData` at one slot is
+  ordinary rather than equivocation and a block routinely carries both. The
+  groups are sorted on the whole pair: with two of them at one slot, sorting on
+  the epoch alone rebuilds a different signer set and fails a valid proof
+- **The binding is off the wire.** `to_bytes_without_pubkeys()` carries neither
+  the keys nor the `(slot, message)` pairs, so every decode rebuilds the whole
+  signer set from a `SignerSet` per claim. A wrong set, message or slot decodes
+  fine and fails inside the SNARK verifier, so there is no cheap binding check
+- Narrowing replaces splitting: re-aggregate the parent with a `declare` naming
+  the group to keep (`split_type_2_by_message`)
 
 **Signature Aggregation (Two-Phase):**
 1. **Gossip signatures**: Fresh XMSS from network → aggregate via leanVM
@@ -291,7 +326,7 @@ actual_slot = finalized_slot + 1 + relative_index
 
 ### Protocols
 - **Transport**: QUIC over UDP (TLS 1.3), plus TCP (noise, then yamux or mplex) on the same port number as a fallback: a peer whose advertised `quic` doesn't answer can still be reached over TCP. Both addresses go into one dial, `quic` first, and `DIAL_ADDRESS_CONCURRENCY` pins `dial_concurrency_factor` to one, so the order is a real preference and TCP is tried only after the QUIC attempt fails. Mainnet beacon peers answer `na` to a yamux-only proposal, so TCP connections negotiate mplex (see the `muxers` module doc), which is expensive: preferring QUIC is how that cost is avoided where the peer allows it
-  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `CommonOptions::validate_ports` rejects every clash before anything binds
+  - Binding TCP puts `--gossipsub-port` in the HTTP servers' namespace, so it must now differ from `--api-port`/`--metrics-port` too. `Options::validate_ports` rejects every clash before anything binds
 - **Gossipsub**: Blocks + Attestations (snappy raw compression)
   - Topic: `/leanconsensus/{fork_digest}/{block|aggregation|attestation_N}/ssz_snappy`
   - `fork_digest` is a 4-byte hex string (no `0x` prefix); currently the dummy `12345678` agreed across clients
@@ -318,7 +353,8 @@ actual_slot = finalized_slot + 1 + relative_index
     `BeaconWire` and the codec carry `genesis_validators_root`. See [`docs/beacon_wire.md`](docs/beacon_wire.md)
 
 ### Peer Discovery (discv5)
-- Always on, on both chains, on `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `CommonOptions::validate_ports`). There is no `--discovery.enable`: mainnet bootnode ENRs are not statically dialable so a crawl is its only way to find a peer, and a lean node with no `--bootnodes` is in the same position. Co-located nodes on one host must each pass `--discovery.port`
+- Always on for `beacon` (mainnet bootnode ENRs are not statically dialable, so a crawl is its only way to find a peer); opt-in for `node` behind the lean-only `--discovery.enable`, off by default, so a lean node peers from `--bootnodes` alone and binds no discovery socket. `Network::discovery_enabled` is the one answer; `P2P::spawn` takes `Option<DiscoverySpawnConfig>` and `P2PServer.discovery` is an `Option`, `None` leaving the dial loop unscheduled
+- Where it runs: `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise (own UDP socket, must differ from `--gossipsub-port`; checked once by `Options::validate_ports`, which skips the discovery rules when it is off). Co-located nodes that run discovery must each pass `--discovery.port`
 - Reuses ethrex's `DiscoveryServer` + `PeerTable` with discv4 disabled; `spawn` takes the prepared lean ENR, so the record ethrex serves is the one we report
 - ENR follows the beacon phase0 spec: `ip`/`udp`/`quic`/`tcp`/`secp256k1`/`eth2`/`attnets`
 - Admission mirrors lighthouse: `eth2.fork_digest` must match, `next_fork_*` may differ, a `quic` or `tcp` entry required. Handed to the peer table as `LeanFilter: PeerFilter`, so records are judged on arrival, not at dial time; a reject is re-judged on a higher-`seq` ENR
@@ -675,7 +711,7 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
 GENESIS_TIME: 1770407233
 MILLISECONDS_PER_SLOT: 4000  # optional, defaults to DEFAULT_MILLISECONDS_PER_SLOT
 GENESIS_VALIDATORS:
-  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # 52-byte XMSS pubkeys (hex)
+  - attestation_pubkey: "cd323f232b34ab26d6db7402c886e74ca81cfd3a..."  # XMSS pubkeys, hex, PUBLIC_KEY_SIZE bytes
     proposal_pubkey: "b7b0f72e24801b02bda64073cb4de6699a416b37..."
 ```
 - Validator indices are assigned sequentially (0, 1, 2, ...) based on array order
@@ -781,7 +817,9 @@ behavior.
 ## External Dependencies
 
 **Critical:**
-- `leansig`: XMSS signatures (leanEthereum project)
+- `leanvm`: XMSS signatures and recursive aggregation, taken from leanVM's facade
+  crate (which re-exports `xmss`, `rec_aggregation` and its `rand`) and pinned to
+  one `main` revision (leanEthereum project)
 - `libssz` / `libssz-derive` / `libssz-types`: SSZ serialization
 - `libssz-merkle`: Merkle tree hashing (`hash_tree_root()`)
 - `spawned-concurrency`: Actor model
