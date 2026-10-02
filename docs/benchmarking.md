@@ -237,6 +237,18 @@ ethlambda benchmark import replay \
   --format json --output report.json
 ```
 
+**`--block-delay <MILLISECONDS>`** (default 0) sleeps after each block's import
+before the next block is fed. Use it to measure import work when the build
+outpaces the state writer: the replay feeds blocks back to back, while a live
+node gets one per slot, so a fast build can fill the writer's queue and
+`writer_wait` then measures the writer rather than the import. A delay longer
+than one state write (about a second on mainnet) lets the writer drain fully
+between blocks. The sleep runs after the block's phases and `wall_seconds` are
+recorded, so it appears in no per-block number and no summary row; the report
+has no end-to-end figure to adjust. The value is recorded as
+`params.block_delay_ms` in the JSON report and printed in the human header, so
+compare only reports made with the same delay.
+
 ### What is measured
 
 The measured span is one `BlockChainServer::import_block` call per block, the
