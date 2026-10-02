@@ -14,6 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
@@ -34,6 +35,7 @@ use ethlambda_state_transition::beacon::{
     fork_choice::checkpoint_state,
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
+    helpers::altair::compute_sync_committee_period,
 };
 
 use crate::beacon::ApiError;
@@ -49,6 +51,10 @@ pub(crate) fn routes() -> Router<Store> {
             post(post_attester_duties),
         )
         .route(
+            "/eth/v1/validator/duties/sync/{epoch}",
+            post(post_sync_duties),
+        )
+        .route(
             "/eth/v1/validator/attestation_data",
             get(get_attestation_data),
         )
@@ -60,6 +66,101 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/validator/prepare_beacon_proposer",
             post(post_prepare_beacon_proposer),
         )
+}
+
+#[derive(Debug, Serialize)]
+struct SyncDuty {
+    pubkey: BlsPubkey,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
+    validator_index: ValidatorIndex,
+    /// Every position the validator holds in the committee, quoted. A
+    /// validator can hold more than one, since the committee is drawn with
+    /// replacement.
+    validator_sync_committee_indices: Vec<String>,
+}
+
+/// `POST /eth/v1/validator/duties/sync/{epoch}`.
+///
+/// Answered from the head state: its `current_sync_committee` for an epoch in
+/// the head's own sync committee period, its `next_sync_committee` for the
+/// period after, which is as far ahead as the Beacon API allows. An earlier
+/// period is refused rather than answered from a historical state, since a
+/// validator client only ever asks about the current and next period.
+///
+/// A requested validator that holds no seat is left out of `data`. The
+/// answer is `503` while the node is syncing: the head state's committees are
+/// not yet the chain's.
+async fn post_sync_duties(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+    Json(indices): Json<Vec<String>>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match sync_duties(&store, &epoch, &indices) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+fn sync_duties(
+    store: &Store,
+    epoch: &str,
+    indices: &[String],
+) -> Result<serde_json::Value, ApiError> {
+    let epoch = parse_epoch(epoch)?;
+    let indices = indices
+        .iter()
+        .map(|index| index.parse::<ValidatorIndex>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
+    let (head_root, state) = head(store)?;
+
+    let (current, next) = state
+        .sync_committees()
+        .map_err(|_| ApiError::BadRequest("sync committees start at altair"))?;
+    let head_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
+    let requested_period = compute_sync_committee_period(epoch);
+    let committee = if requested_period == head_period {
+        current
+    } else if requested_period == head_period + 1 {
+        next
+    } else {
+        return Err(ApiError::BadRequest(
+            "epoch is not in the head state's current or next sync committee period",
+        ));
+    };
+
+    // One pass over the committee rather than one per requested validator:
+    // the committee stores pubkeys, so that is what a validator is matched by.
+    let mut positions: HashMap<BlsPubkey, Vec<String>> = HashMap::new();
+    for (position, pubkey) in committee.pubkeys.iter().enumerate() {
+        positions
+            .entry(*pubkey)
+            .or_default()
+            .push(position.to_string());
+    }
+
+    let mut duties = Vec::new();
+    for validator_index in indices {
+        let validator = state
+            .validator(validator_index)
+            .map_err(|_| ApiError::BadRequest("unknown validator index"))?;
+        if let Some(held) = positions.get(&validator.pubkey) {
+            duties.push(SyncDuty {
+                pubkey: validator.pubkey,
+                validator_index,
+                validator_sync_committee_indices: held.clone(),
+            });
+        }
+    }
+
+    Ok(serde_json::json!({
+        "execution_optimistic": store.is_beacon_optimistic(head_root),
+        "data": duties,
+    }))
 }
 
 /// One entry of `beacon_committee_subscriptions`. Parsed so a malformed body
@@ -809,5 +910,146 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    // --- duties/sync -----------------------------------------------------
+
+    mod sync_duties {
+        use super::*;
+        use ethlambda_types::beacon::containers::altair::SyncCommittee;
+
+        /// A committee whose seat `i` belongs to validator `first + i % 8`, so
+        /// each of those eight holds `SYNC_COMMITTEE_SIZE / 8` seats and every
+        /// other validator holds none.
+        fn committee_of(state: &BeaconState, first: u64) -> SyncCommittee {
+            let pubkeys: Vec<BlsPubkey> = (0..preset::SYNC_COMMITTEE_SIZE as u64)
+                .map(|seat| state.validator(first + seat % 8).unwrap().pubkey)
+                .collect();
+            SyncCommittee {
+                aggregate_pubkey: pubkeys[0],
+                pubkeys: pubkeys.try_into().unwrap(),
+            }
+        }
+
+        /// A fulu state whose current committee is validators 0-7 and whose
+        /// next committee is validators 8-15, so an answer drawn from the
+        /// wrong one shows up.
+        fn state_with_committees() -> BeaconState {
+            let mut state = fulu_state();
+            let current = committee_of(&state, 0);
+            let next = committee_of(&state, 8);
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.current_sync_committee = current;
+            fulu.next_sync_committee = next;
+            state
+        }
+
+        async fn post_sync(
+            state: BeaconState,
+            epoch: u64,
+            indices: &[&str],
+            sync_status: SyncStatusController,
+        ) -> (StatusCode, serde_json::Value) {
+            let (store, _root) = beacon_store_at(state);
+            let request = Request::post(format!("/eth/v1/validator/duties/sync/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes().with_state(store).layer(Extension(sync_status));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// The seats `validator` holds in [`committee_of`]`(_, first)`.
+        fn seats(validator: u64, first: u64) -> Vec<String> {
+            (0..preset::SYNC_COMMITTEE_SIZE as u64)
+                .filter(|seat| first + seat % 8 == validator)
+                .map(|seat| seat.to_string())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn the_current_period_reads_the_current_committee() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let (status, json) =
+                post_sync(state.clone(), epoch, &["3", "9", "20"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+
+            // Validator 3 sits in the current committee; 9 only in the next;
+            // 20 in neither, so only 3 is listed.
+            let duties = json["data"].as_array().unwrap();
+            assert_eq!(duties.len(), 1);
+            assert_eq!(duties[0]["validator_index"], "3");
+            let pubkey = state.validator(3).unwrap().pubkey;
+            assert_eq!(duties[0]["pubkey"], format!("0x{}", hex::encode(pubkey.0)));
+            assert_eq!(
+                duties[0]["validator_sync_committee_indices"],
+                serde_json::json!(seats(3, 0))
+            );
+            assert!(json["execution_optimistic"].is_boolean());
+        }
+
+        #[tokio::test]
+        async fn the_next_period_reads_the_next_committee() {
+            let state = state_with_committees();
+            let next_period_epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+                * (compute_sync_committee_period(compute_epoch_at_slot(state.slot())) + 1);
+            let (status, json) =
+                post_sync(state, next_period_epoch, &["3", "9"], Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let duties = json["data"].as_array().unwrap();
+            assert_eq!(duties.len(), 1);
+            assert_eq!(duties[0]["validator_index"], "9");
+            assert_eq!(
+                duties[0]["validator_sync_committee_indices"],
+                serde_json::json!(seats(9, 8))
+            );
+        }
+
+        #[tokio::test]
+        async fn the_period_after_next_is_a_400() {
+            let state = state_with_committees();
+            let period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * (period + 2);
+            let (status, _) = post_sync(state, epoch, &["3"], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        /// An earlier period would need a historical state, which a validator
+        /// client never asks for; refused rather than answered wrongly.
+        #[tokio::test]
+        async fn an_earlier_period_is_a_400() {
+            let mut state = state_with_committees();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * preset::SLOTS_PER_EPOCH;
+            let (status, _) = post_sync(state, 0, &["3"], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn an_unknown_validator_is_a_400() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let unknown = (COUNT as u64).to_string();
+            let (status, _) = post_sync(state, epoch, &[&unknown], Default::default()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_syncing_node_answers_503() {
+            let state = state_with_committees();
+            let epoch = compute_epoch_at_slot(state.slot());
+            let syncing = SyncStatusController::new(SyncStatus::Syncing);
+            let (status, _) = post_sync(state, epoch, &["3"], syncing).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
     }
 }
