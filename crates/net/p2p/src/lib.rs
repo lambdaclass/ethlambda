@@ -1460,7 +1460,7 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
 
 impl Handler<PublishBeaconAggregate> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
-        publish_beacon_aggregate(self, msg.aggregate).await;
+        publish_beacon_aggregate(self, msg.aggregate, msg.attesting_indices).await;
     }
 }
 
@@ -2428,6 +2428,69 @@ pub(crate) mod test_support {
 
     use crate::beacon::swarm::BeaconWireConfig;
     use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
+
+    /// A chain actor stand-in recording what reaches it: each block's
+    /// announcement and each aggregate with its attesting indices. The rest
+    /// of the protocol is accepted and dropped.
+    #[derive(Default)]
+    pub(crate) struct RecordingChain {
+        pub(crate) announcements: std::sync::Mutex<Vec<ethlambda_network_api::BlockAnnouncement>>,
+        pub(crate) aggregates: std::sync::Mutex<
+            Vec<(
+                ethlambda_types::beacon::containers::SignedAggregateAndProof,
+                Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            )>,
+        >,
+    }
+
+    impl ethlambda_network_api::P2PToBlockChain for RecordingChain {
+        fn new_block(
+            &self,
+            _block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+            _source: ethlambda_network_api::BlockSource,
+            _arrival: ethlambda_network_api::BlockArrival,
+            announcement: ethlambda_network_api::BlockAnnouncement,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.announcements.lock().unwrap().push(announcement);
+            Ok(())
+        }
+        fn new_attestation(
+            &self,
+            _attestation: ethlambda_types::attestation::SignedAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_aggregated_attestation(
+            &self,
+            _attestation: ethlambda_types::attestation::SignedAggregatedAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_data_column_sidecars(
+            &self,
+            _sidecars: Vec<fulu::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn data_column_sidecars_awaiting_parent(
+            &self,
+            _sidecars: Vec<fulu::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            Ok(())
+        }
+        fn new_beacon_aggregate(
+            &self,
+            aggregate: Box<ethlambda_types::beacon::containers::SignedAggregateAndProof>,
+            attesting_indices: Vec<ethlambda_types::beacon::primitives::ValidatorIndex>,
+            _arrival: ethlambda_network_api::AggregateArrival,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.aggregates
+                .lock()
+                .unwrap()
+                .push((*aggregate, attesting_indices));
+            Ok(())
+        }
+    }
 
     /// A real, unconnected beacon `P2PServer`, built the same way
     /// `req_resp::handlers::tests::unconnected_server` builds a lean one:
