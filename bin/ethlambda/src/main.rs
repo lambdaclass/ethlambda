@@ -769,7 +769,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
     let rpc_identity = beacon_identity(
-        p2p.local_enr(),
+        p2p.local_enr().unwrap_or_default(),
         common.discovery.advertise_ip,
         common.gossipsub_port,
         common.discovery.port,
