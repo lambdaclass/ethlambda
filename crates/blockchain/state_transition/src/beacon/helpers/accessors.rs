@@ -398,9 +398,23 @@ pub fn get_total_balance(state: &BeaconState, indices: &[ValidatorIndex]) -> Res
 }
 
 /// The combined effective balance of the currently active validators.
+///
+/// One in-order pass over the registry, summing as it goes: the same value as
+/// [`get_total_balance`] over [`get_active_validator_indices`] (same
+/// saturating sum, same one-increment floor), without the intermediate index
+/// list or a tree descent per active validator. `state.validators().iter()`
+/// walks the leaves, whereas `state.validator(i)` descends from the root each
+/// time.
 pub fn get_total_active_balance(state: &BeaconState) -> Result<Gwei> {
-    let indices = get_active_validator_indices(state, get_current_epoch(state));
-    get_total_balance(state, &indices)
+    let epoch = get_current_epoch(state);
+    let total = state
+        .validators()
+        .iter()
+        .filter(|validator| is_active_validator(validator, epoch))
+        .fold(0, |sum: Gwei, validator| {
+            sum.saturating_add(validator.effective_balance)
+        });
+    Ok(total.max(preset::EFFECTIVE_BALANCE_INCREMENT))
 }
 
 /// The signing domain for `domain_type` at `epoch`, or at the current epoch when
@@ -645,6 +659,74 @@ mod tests {
         let state = crate::beacon::helpers::test_state::with_validators(4);
         assert_eq!(
             get_total_balance(&state, &[]).unwrap(),
+            preset::EFFECTIVE_BALANCE_INCREMENT
+        );
+    }
+
+    /// SplitMix64: a tiny deterministic generator, so the randomized tests
+    /// below need no dependency.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// A state at `epoch` whose validators get random activation and exit
+    /// epochs around it and random effective balances.
+    fn random_registry_state(rng: &mut SplitMix64, count: usize, epoch: Epoch) -> BeaconState {
+        let mut state = with_validators(count);
+        *state.slot_mut() = compute_start_slot_at_epoch(epoch);
+        for index in 0..count {
+            let validator = state.validator_mut(index as ValidatorIndex).unwrap();
+            validator.activation_epoch = rng.next() % (epoch + 3);
+            validator.exit_epoch = match rng.next() % 3 {
+                0 => constants::FAR_FUTURE_EPOCH,
+                _ => rng.next() % (epoch + 3),
+            };
+            validator.effective_balance = match rng.next() % 4 {
+                0 => 0,
+                1 => u64::MAX - rng.next() % 4,
+                _ => (rng.next() % 64) * preset::EFFECTIVE_BALANCE_INCREMENT,
+            };
+        }
+        state.apply_pending_mutations();
+        state
+    }
+
+    /// The one-pass total is the spec's `get_total_balance` over the active
+    /// indices, including its saturation and its floor.
+    #[test]
+    fn the_one_pass_total_matches_the_spec_formulation() {
+        let mut rng = SplitMix64(0x5EED);
+        for round in 0..64 {
+            let count = (rng.next() % 40) as usize;
+            let epoch = rng.next() % 6;
+            let state = random_registry_state(&mut rng, count, epoch);
+            let indices = get_active_validator_indices(&state, get_current_epoch(&state));
+            assert_eq!(
+                get_total_active_balance(&state).unwrap(),
+                get_total_balance(&state, &indices).unwrap(),
+                "round {round}"
+            );
+        }
+    }
+
+    /// An all-zero registry hits the floor, not zero.
+    #[test]
+    fn the_one_pass_total_is_floored_for_a_zero_registry() {
+        let mut state = with_validators(8);
+        for index in 0..8 {
+            state.validator_mut(index).unwrap().effective_balance = 0;
+        }
+        state.apply_pending_mutations();
+        assert_eq!(
+            get_total_active_balance(&state).unwrap(),
             preset::EFFECTIVE_BALANCE_INCREMENT
         );
     }
