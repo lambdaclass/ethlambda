@@ -2645,6 +2645,26 @@ impl Store {
         self.state_cache.lock().unwrap().put(key, state);
     }
 
+    /// Loads the head block's post-state into the state cache, for a store
+    /// just resumed from disk.
+    ///
+    /// Beacon gossip validation reads states only through
+    /// [`Self::cached_state`], and after a resume nothing else puts the head's
+    /// there before the first import: fork choice judges a head from an
+    /// earlier epoch by its persisted unrealized justification, not its state.
+    /// Until then, a block whose parent has no post-state yet would find no
+    /// state to check its proposer signature against, and be dropped.
+    ///
+    /// A head with no state leaves the cache as it was: the resume path has
+    /// already refused a directory like that before it gets here.
+    pub fn cache_head_state(&self) -> Result<(), Error> {
+        let head = self.head()?;
+        if let Some(state) = self.get_state(&head)? {
+            self.cache_state(CacheKey::BlockState(head), state);
+        }
+        Ok(())
+    }
+
     /// The committee-shuffling cache shared by every clone of this `Store`.
     ///
     /// Returns a cloned `Arc` (an atomic increment, like [`Self::config`])
@@ -5553,6 +5573,28 @@ mod tests {
                 .cached_state(CacheKey::CheckpointState { epoch: 6, root })
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_resumed_store_caches_its_head_state_on_request() {
+        let backend = Arc::new(InMemoryBackend::new());
+        {
+            // `beacon_test_store` names `H256::ZERO` as the head. Dropping the
+            // store drains its state writer, so the state is on the backend,
+            // not only in this instance's cache, before the resume below.
+            let mut store = beacon_test_store(backend.clone());
+            store
+                .insert_state(H256::ZERO, beacon_test_state(7))
+                .expect("insert");
+        }
+
+        let resumed = Store::from_db_state(backend).unwrap().unwrap();
+        let key = CacheKey::BlockState(H256::ZERO);
+        assert!(resumed.cached_state(key).is_none());
+
+        resumed.cache_head_state().expect("cache head state");
+        let cached = resumed.cached_state(key).expect("the head state is cached");
+        assert_eq!(cached.slot(), 7);
     }
 
     #[test]

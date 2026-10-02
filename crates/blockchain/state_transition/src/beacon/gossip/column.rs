@@ -269,12 +269,13 @@ fn advanced_proposer(
 /// `Queue(reason)`, unless the head state already shows the header's
 /// signature is forged.
 ///
-/// Mirrors [`super::block::queue_unless_forged`]: validator indices never
-/// move, so the head state's key for the header's proposer is the one it was
-/// signed with, even when that state cannot yet say whether this proposer is
-/// the *expected* one for the slot. A column queued here is written to the
-/// chain actor's `PendingDataColumns`, so without this check a forged one
-/// would sit there rather than being refused up front.
+/// Mirrors the signature check in [`super::block::queue_if_signed`]:
+/// validator indices never move, so the head state's key for the header's
+/// proposer is the one it was signed with, even when that state cannot yet say
+/// whether this proposer is the *expected* one for the slot. A column queued
+/// here is written to the chain actor's `PendingDataColumns`, so without this
+/// check a forged one would sit there rather than being refused up front.
+/// Unlike a block, a sidecar no cached state can judge is still queued.
 fn queue_unless_forged(store: &Store, sidecar: &DataColumnSidecar, reason: QueueReason) -> Outcome {
     let head_state = store
         .head()

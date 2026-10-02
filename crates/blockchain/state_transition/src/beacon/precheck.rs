@@ -42,7 +42,12 @@ pub enum PrecheckError {
         proposer: ValidatorIndex,
         expected: ValidatorIndex,
     },
-    #[error("proposer {proposer} names no validator in the parent's state")]
+    /// Against [`Reference::Parent`], a refusal: the state the block builds
+    /// on has no such validator. Against [`Reference::Recent`], only that
+    /// this state cannot answer for the proposer (a validator newer than it),
+    /// so the signature went unchecked; the caller decides what that costs
+    /// the block.
+    #[error("proposer {proposer} names no validator in the reference state")]
     UnknownProposer { proposer: ValidatorIndex },
     #[error("the signature is not the proposer's over this block")]
     BadSignature,
@@ -67,11 +72,11 @@ pub enum Reference<'a> {
     /// The post-state of the block's own parent. Every rule applies.
     Parent(&'a BeaconState),
     /// Some recent state of the chain, for a block whose parent has no
-    /// post-state yet. Only the signature is checked, and only when this
-    /// state already holds the proposer. Validator indices never move, so a
-    /// key found here is the key the block was signed with; a validator newer
-    /// than this state is simply not one it can answer for, and such a block
-    /// passes rather than being refused on missing information.
+    /// post-state yet. Only the signature is checked. Validator indices never
+    /// move, so a key found here is the key the block was signed with. A
+    /// validator newer than this state is one it cannot answer for, reported
+    /// as [`PrecheckError::UnknownProposer`] rather than passed: `Ok` from
+    /// this reference always means the signature verified.
     Recent(&'a BeaconState),
 }
 
@@ -110,13 +115,10 @@ pub fn precheck_block(
         Reference::Recent(state) => state,
     };
 
-    let pubkey = match (state.validator(proposer), reference) {
-        (Ok(validator), _) => &validator.pubkey,
-        (Err(_), Reference::Parent(_)) => {
-            return Err(PrecheckError::UnknownProposer { proposer });
-        }
-        (Err(_), Reference::Recent(_)) => return Ok(()),
-    };
+    let pubkey = &state
+        .validator(proposer)
+        .map_err(|_| PrecheckError::UnknownProposer { proposer })?
+        .pubkey;
 
     let fork_version = config.fork_version(config.fork_at_epoch(compute_epoch_at_slot(slot)));
     let domain = compute_domain(
@@ -322,7 +324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_proposer_missing_from_the_parents_state_is_refused_but_not_from_a_recent_one() {
+    fn a_proposer_missing_from_the_reference_state_is_unknown_to_both_references() {
         let config = Config::mainnet();
         // A pre-fulu parent, so the lookahead cannot answer first.
         let parent = keyed_state(ForkName::Electra);
@@ -336,7 +338,13 @@ mod tests {
             check(&unknown, Reference::Parent(&parent), &config),
             Err(PrecheckError::UnknownProposer { proposer: 100 })
         );
-        assert_eq!(check(&unknown, Reference::Recent(&parent), &config), Ok(()));
+        // A recent state reports the same thing rather than passing the
+        // block: its signature went unchecked, and `Ok` must never say
+        // otherwise.
+        assert_eq!(
+            check(&unknown, Reference::Recent(&parent), &config),
+            Err(PrecheckError::UnknownProposer { proposer: 100 })
+        );
     }
 
     /// The first block of a fork is signed under the new version while its
