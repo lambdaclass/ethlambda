@@ -6,33 +6,37 @@ instead of relying only on the static bootnode list. The implementation reuses
 [ethrex](https://github.com/lambdaclass/ethrex)'s discovery stack, with discv4
 disabled.
 
-Discovery is **always on**, on both chains. `beacon` never had a choice:
-published mainnet bootnode ENRs carry no `quic` entry, so none of them is
-statically dialable and a crawl is the only way to reach a peer. On lean it used
-to be opt-in behind `--discovery.enable`, because nothing else on that network
-speaks discv5 yet, so a crawl there finds only other ethlambda nodes. The flag is
-gone: what limits a lean node to the peers it was handed is an empty
-`--bootnodes` list, not a switch.
+Discovery is **always on for `beacon`** and **opt-in for `node`**. `beacon`
+never had a choice: published mainnet bootnode ENRs carry no `quic` entry, so
+none of them is statically dialable and a crawl is the only way to reach a peer.
+On lean it stays behind `--discovery.enable` (off by default), because nothing
+else on that network speaks discv5 yet, so a crawl there finds only other
+ethlambda nodes. Without the flag a lean node binds no discovery socket and
+peers from its `--bootnodes` list alone, which is also what lets several devnet
+nodes share one host without a `--discovery.port` each.
 
 ## Configuring it
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
+| `--discovery.enable` | `false` | `node` only: run discv5. `beacon` has no such flag and always runs it |
 | `--discovery.port` | `9000` (`DEFAULT_DISCOVERY_PORT`) | UDP port for the discv5 socket |
 | `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
 | `--discovery.target-peers` | `200` | Peers this node holds: the dial loop's cutoff, and on `beacon` the connection limits too |
 
-These are common flags with the same default on `node` and `beacon`. See [the
-CLI reference](./cli.md).
+All but `--discovery.enable` are common flags with the same default on `node`
+and `beacon`; on a `node` without `--discovery.enable` they are accepted and
+ignored. See [the CLI reference](./cli.md).
 
 `--discovery.port` and `--gossipsub-port` (default `9001`, libp2p QUIC) are both
 UDP and so cannot share a port. `--gossipsub-port` also binds a libp2p TCP
 listener on the same number, which collides with neither: TCP and UDP are
 separate namespaces. The defaults are one apart, so a default invocation works;
 pointing either flag at the other's port is rejected at startup, before the node
-touches its data directory. Co-located nodes on one host need an explicit
-`--discovery.port` each, the same way they already need an explicit
-`--gossipsub-port`.
+touches its data directory. Co-located nodes on one host that run discovery need
+an explicit `--discovery.port` each, the same way they already need an explicit
+`--gossipsub-port`. Neither check applies to a `node` without
+`--discovery.enable`, since it binds no discovery socket and publishes no ENR.
 
 The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the

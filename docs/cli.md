@@ -69,16 +69,18 @@ carries none and each chain resolves an absent value itself:
 | Flag | Absent on `node` | Absent on `beacon` |
 |---|---|---|
 | `--node-key` | ephemeral in-memory key, warned about | same |
-| `--bootnodes` | no bootnodes: peers only via discv5, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
+| `--bootnodes` | no bootnodes: peers only via discv5 (with `--discovery.enable`) or by being dialed, warned about | falls back to the resolved network's own bootnode list: a built-in network's embedded list, or a loaded directory's `bootstrap_nodes.yaml`/`.txt` |
 | `--checkpoint-sync-url` | start from a resumable DB, else from genesis | start from a resumable DB, else anchor at the resolved network's own genesis (loaded network only), else abort |
 
-There is no `--discovery.enable`. discv5 is always on, on both chains, on
-`DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says otherwise.
-`beacon` never had the choice, since published mainnet bootnode ENRs carry no
-`quic` entry and so are not statically dialable; a lean node handed no
-`--bootnodes` file has no other way to reach a peer either. The two defaults are
-one apart because both sockets are UDP; pointing either flag at the other's port
-is rejected at startup, before the node touches its data directory.
+Whether discv5 runs is not a common flag. `beacon` always runs it, since
+published mainnet bootnode ENRs carry no `quic` entry and so are not statically
+dialable; `node` runs it only with `--discovery.enable` (see below). Where it
+runs, it binds `DEFAULT_DISCOVERY_PORT` (9000) unless `--discovery.port` says
+otherwise. The two defaults are one apart because both sockets are UDP; pointing
+either flag at the other's port is rejected at startup, before the node touches
+its data directory. Without discovery neither that check nor the ban on
+`--gossipsub-port 0` applies, since nothing binds the discovery port and no ENR
+is published.
 
 ## `node` flags
 
@@ -92,6 +94,7 @@ On top of the common flags above.
 | `--hash-sig-keys-dir` | required | Directory of per-validator XMSS keys |
 | `--node-id` | required | The key in `annotated_validators.yaml` naming this node, e.g. `ethlambda_0` |
 | `--is-aggregator` | `false` | Seed the runtime aggregator flag |
+| `--discovery.enable` | `false` | Run discv5 peer discovery; off, the node peers from `--bootnodes` alone. See [Peer discovery](./discovery.md) |
 | `--aggregate-subnet-ids` | this node's subnets | Subnets to aggregate on; requires `--is-aggregator` |
 | `--attestation-committee-count` | from `validator-config.yaml`, else `1` | Committees per slot |
 | `--enable-proposer-aggregation` | `false` | Merge same-data proofs when building a block |
@@ -221,7 +224,7 @@ not chain-specific, branches once, and shares the shutdown:
 
 | step | lean | mainnet |
 |---|---|---|
-| validate the discv5 port | shared | shared |
+| validate the ports (discv5 rules only where it runs) | shared | shared |
 | register metrics, print the banner, log the version | shared | shared |
 | raise `RLIMIT_NOFILE` | shared | shared |
 | `HIVE_LEAN_TEST_DRIVER` early return | yes | no: those endpoints are lean's |
@@ -231,7 +234,7 @@ not chain-specific, branches once, and shares the shutdown:
 | build the aggregator, sync-status and event handles | shared | shared |
 | open `--data-dir`'s RocksDB backend | shared | shared |
 | **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | `beacon::wire_params` (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend |
-| build the swarm, spawn P2P, start discv5 | shared | shared |
+| build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
 | spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
 | ctrl-c, stop and join the actors | shared | shared |

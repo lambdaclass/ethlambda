@@ -39,7 +39,7 @@ use crate::beacon::primitives::{Bytes32, H256, KzgCommitment, KzgProof};
 
 /// The cells (equivalently, proofs) produced from one extended blob: the
 /// fulu spec's `CELLS_PER_EXT_BLOB`-length vectors.
-type CellsPerExtBlob = [c_kzg::Cell; c_kzg::CELLS_PER_EXT_BLOB];
+pub type CellsPerExtBlob = [c_kzg::Cell; c_kzg::CELLS_PER_EXT_BLOB];
 /// A proof for each cell of an extended blob.
 type ProofsPerExtBlob = [KzgProof; c_kzg::CELLS_PER_EXT_BLOB];
 

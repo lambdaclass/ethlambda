@@ -127,13 +127,16 @@ pub fn topic_digest(topic: &str) -> Option<ForkDigest> {
 
 /// The column subnets a custody set maps onto, in custody order.
 ///
-/// A column's subnet is `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed
-/// rather than assumed so a network that ever separates the two counts still
-/// subscribes to the right topic. `BeaconTopics::new` deduplicates.
+/// A column's subnet is the specification's
+/// `compute_subnet_for_data_column_sidecar`, computed rather than assumed so a
+/// network that ever separates the two counts still subscribes to the right
+/// topic. `BeaconTopics::new` deduplicates.
 pub fn column_subnets(custody_columns: &[u64]) -> Vec<u64> {
     custody_columns
         .iter()
-        .map(|column| column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT)
+        .map(|&column| {
+            ethlambda_state_transition::beacon::das::compute_subnet_for_data_column_sidecar(column)
+        })
         .collect()
 }
 

@@ -18,12 +18,13 @@ use super::{
 };
 use crate::beacon::bls;
 use crate::beacon::config::Config;
-use crate::beacon::constants::{DATA_COLUMN_SIDECAR_SUBNET_COUNT, DOMAIN_BEACON_PROPOSER};
+use crate::beacon::constants::DOMAIN_BEACON_PROPOSER;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::containers::DataColumnSidecar as AnyDataColumnSidecar;
 use crate::beacon::containers::SignedBeaconBlock;
 use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
+use crate::beacon::das;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
 use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
@@ -51,7 +52,7 @@ pub fn cheap_checks(
         return Err(Outcome::Reject(RejectReason::Malformed));
     }
     // [REJECT] The sidecar is for the correct subnet.
-    if sidecar.index % DATA_COLUMN_SIDECAR_SUBNET_COUNT != subnet_id {
+    if das::compute_subnet_for_data_column_sidecar(sidecar.index) != subnet_id {
         return Err(Outcome::Reject(RejectReason::WrongSubnet));
     }
     let header = &sidecar.signed_block_header.message;
@@ -387,7 +388,7 @@ pub fn cheap_checks_gloas(
         return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
     }
     // [REJECT] The sidecar is for the correct subnet.
-    if sidecar.index % DATA_COLUMN_SIDECAR_SUBNET_COUNT != subnet_id {
+    if das::compute_subnet_for_data_column_sidecar(sidecar.index) != subnet_id {
         return Err(Outcome::Reject(RejectReason::WrongSubnet));
     }
     // [IGNORE] The sidecar is not from a future slot.
@@ -585,7 +586,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY;
+    use crate::beacon::constants::{
+        DATA_COLUMN_SIDECAR_SUBNET_COUNT, MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
+    };
     use crate::beacon::containers::{SignedBeaconBlock, electra, fulu, shared};
     use crate::beacon::fork::ForkName;
     use crate::beacon::gossip::test_support::{fulu_parent, seen_columns, slot_start_ms, store};

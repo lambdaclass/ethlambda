@@ -5,6 +5,7 @@ mod committee_cache;
 mod error;
 mod liveness;
 mod metrics;
+pub mod pools;
 mod state_codec;
 mod state_diff;
 mod state_writer;

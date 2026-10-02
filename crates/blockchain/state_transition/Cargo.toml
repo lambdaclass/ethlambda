@@ -37,6 +37,7 @@ test-utils = []
 
 [dependencies]
 ethlambda-types.workspace = true
+ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-storage.workspace = true
 

@@ -13,10 +13,12 @@ use std::path::PathBuf;
 /// both now, which is what lets one declaration serve both: each sub-command
 /// decides what an absent value means, and says so on the field below.
 ///
-/// The `--discovery.*` flags are here too, in one [`DiscoveryConfig`], and mean
-/// the same thing on both: discv5 is always on, on [`DEFAULT_DISCOVERY_PORT`]
-/// unless `--discovery.port` says otherwise. See
-/// [`CommonOptions::validate_ports`].
+/// The `--discovery.*` tuning flags are here too, in one [`DiscoveryConfig`],
+/// and mean the same thing on both whenever discv5 runs: on
+/// [`DEFAULT_DISCOVERY_PORT`] unless `--discovery.port` says otherwise. Whether
+/// it runs is not a common flag: always on `beacon`, and on `node` only with
+/// `--discovery.enable` ([`LeanOptions::discovery_enable`]). See
+/// [`Options::validate_ports`].
 ///
 /// `--node-id` is still not here: it exists only on `node`.
 #[derive(Debug, clap::Args)]
@@ -138,6 +140,36 @@ pub(crate) struct ExecutionOptions {
 pub(crate) struct Options {
     pub(crate) common: CommonOptions,
     pub(crate) network: Network,
+}
+
+impl Network {
+    /// Whether this chain runs discv5.
+    ///
+    /// Always on `beacon`, which never had the choice: published mainnet
+    /// bootnode ENRs carry no `quic` entry, so a crawl is its only way to reach
+    /// a peer. Opt-in on `node`, behind `--discovery.enable`: nothing else on
+    /// a lean network speaks discv5 yet, so a crawl there finds only other
+    /// ethlambda nodes, and every co-located devnet node would otherwise bind
+    /// the same default UDP port.
+    pub(crate) fn discovery_enabled(&self) -> bool {
+        match self {
+            Network::Lean(lean) => lean.discovery_enable,
+            Network::Mainnet { .. } => true,
+        }
+    }
+}
+
+impl Options {
+    /// Reject port assignments that cannot all bind, before anything binds.
+    ///
+    /// Called once at the top of `run_node`, for either chain, so a port that
+    /// cannot work aborts before the metrics registry, the file-descriptor
+    /// limit and the data directory are touched. Here rather than on
+    /// [`CommonOptions`] because half the rules depend on whether discv5 runs,
+    /// which is a chain's own answer.
+    pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
+        self.common.validate_ports(self.network.discovery_enabled())
+    }
 }
 
 impl From<NodeOptions> for Options {
@@ -306,6 +338,16 @@ pub(crate) struct LeanOptions {
     /// use the admin endpoint to rotate duties (hot-standby model).
     #[arg(long, default_value = "false")]
     pub(crate) is_aggregator: bool,
+    /// Run discv5 peer discovery.
+    ///
+    /// Off by default, so the node peers from `--bootnodes` alone and binds no
+    /// discovery socket: nothing else on a lean network speaks discv5 yet, and
+    /// co-located devnet nodes would otherwise all claim the default
+    /// `--discovery.port`. Without it the other `--discovery.*` flags are
+    /// accepted and ignored. `beacon` has no such flag, since discovery is
+    /// always on there.
+    #[arg(long = "discovery.enable", default_value = "false")]
+    pub(crate) discovery_enable: bool,
     /// Number of attestation committees (subnets) per slot.
     ///
     /// If unset, falls back to `config.attestation_committee_count` from
@@ -407,13 +449,12 @@ pub(crate) struct LeanOptions {
 }
 
 /// The discv5 peer-discovery flags, taken by both chains and meaning the same
-/// thing on each.
+/// thing on each whenever discv5 runs.
 ///
-/// There is no `--discovery.enable`: discv5 is always on. `beacon` never had a
-/// choice, since published mainnet bootnode ENRs carry no `quic` entry and so
-/// are not statically dialable, and a lean node given no `--bootnodes` file has
-/// no other way to reach a peer either. What used to be the off switch is now
-/// the bootnode list plus whatever the crawl finds.
+/// The on switch is not here: see [`Network::discovery_enabled`]. `beacon`
+/// always runs discovery and so has no switch at all, and a single flattened
+/// struct can carry only one default, so `--discovery.enable` lives in
+/// [`LeanOptions`].
 #[derive(Debug, clap::Args)]
 pub(crate) struct DiscoveryConfig {
     /// UDP port for the discv5 socket. Must differ from `--gossipsub-port`:
@@ -444,7 +485,8 @@ pub(crate) struct DiscoveryConfig {
     pub(crate) target_peers: usize,
 }
 
-/// The discv5 port both chains bind when `--discovery.port` is absent.
+/// The discv5 port a node running discovery binds when `--discovery.port` is
+/// absent.
 ///
 /// A fixed number rather than one derived from `--gossipsub-port`: devnet
 /// configuration has passed this pair explicitly since discv5 landed, and
@@ -452,51 +494,49 @@ pub(crate) struct DiscoveryConfig {
 pub(crate) const DEFAULT_DISCOVERY_PORT: u16 = 9000;
 
 impl CommonOptions {
-    /// Reject port assignments that cannot all bind, before anything binds.
-    ///
-    /// Called once at the top of `run_node`, for either chain, so a port that
-    /// cannot work aborts before the metrics registry, the file-descriptor
-    /// limit and the data directory are touched.
+    /// The rules behind [`Options::validate_ports`], given whether discv5 runs.
     ///
     /// There are two clashes to catch, on two protocols. `--discovery.port` and
-    /// `--gossipsub-port` are both UDP. `--gossipsub-port` also binds TCP for
-    /// the noise+yamux listener, which puts it in the same namespace as the
-    /// HTTP servers: sharing that number with `--api-port` was legal while the
-    /// swarm bound UDP only, and is now a real collision. Without these checks
-    /// either surfaces at bind time as an opaque `EADDRINUSE` on whichever
-    /// socket loses the race.
+    /// `--gossipsub-port` are both UDP, which matters only while discovery
+    /// binds its socket. `--gossipsub-port` also binds TCP for the noise+yamux
+    /// listener, which puts it in the same namespace as the HTTP servers:
+    /// sharing that number with `--api-port` was legal while the swarm bound
+    /// UDP only, and is now a real collision. Without these checks either
+    /// surfaces at bind time as an opaque `EADDRINUSE` on whichever socket
+    /// loses the race.
     ///
-    /// The TCP comparisons skip `0`, which is not a port but a request for one:
+    /// Every comparison skips `0`, which is not a port but a request for one:
     /// two `0` binds always land on different OS-assigned ports and can never
     /// collide. Rejecting a pair of them would refuse the setup that exists to
     /// avoid collisions, which test harnesses and several-nodes-per-host runs
-    /// rely on. `--gossipsub-port 0` is rejected on its own grounds below, so
-    /// the UDP comparison never sees one.
-    pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
-        // discv5 is always on, so the ENR always names this port. Port 0 asks
-        // the OS to pick, so the two listeners land on different real ports and
-        // the record advertises neither of them: a peer reading it finds
-        // nothing dialable.
-        if self.gossipsub_port == 0 {
-            eyre::bail!(
-                "--gossipsub-port 0 cannot be used: discv5 publishes an ENR \
-                 naming that port, which no peer can dial"
-            );
-        }
-        let discovery_port = self.discovery.port;
+    /// rely on. With discovery on, `--gossipsub-port 0` is rejected on its own
+    /// grounds instead, so the UDP comparison never sees one.
+    fn validate_ports(&self, discovery_enabled: bool) -> eyre::Result<()> {
         let gossipsub_port = self.gossipsub_port;
-        if discovery_port == gossipsub_port {
-            eyre::bail!(
-                "--discovery.port ({discovery_port}) must differ from \
-                 --gossipsub-port ({gossipsub_port}): both bind UDP and cannot \
-                 share a port"
-            );
+        if discovery_enabled {
+            // The ENR names this port. Port 0 asks the OS to pick, so the two
+            // listeners land on different real ports and the record advertises
+            // neither of them: a peer reading it finds nothing dialable.
+            if gossipsub_port == 0 {
+                eyre::bail!(
+                    "--gossipsub-port 0 cannot be used while discv5 runs: it \
+                     publishes an ENR naming that port, which no peer can dial"
+                );
+            }
+            let discovery_port = self.discovery.port;
+            if discovery_port == gossipsub_port {
+                eyre::bail!(
+                    "--discovery.port ({discovery_port}) must differ from \
+                     --gossipsub-port ({gossipsub_port}): both bind UDP and \
+                     cannot share a port"
+                );
+            }
         }
         for (flag, port) in [
             ("--api-port", self.api_port),
             ("--metrics-port", self.metrics_port),
         ] {
-            if port == gossipsub_port {
+            if gossipsub_port != 0 && port == gossipsub_port {
                 eyre::bail!(
                     "{flag} ({port}) must differ from --gossipsub-port \
                      ({gossipsub_port}): the libp2p swarm binds TCP on that \
@@ -588,20 +628,58 @@ mod tests {
         }
     }
 
-    /// The two defaults have to work together: discv5 is always on, so a
+    /// Validate a `node` argv's ports the way `run_node` does: through
+    /// [`Options`], so the chain's own answer on discovery decides which rules
+    /// apply.
+    fn node_ports(extra: &[&str]) -> eyre::Result<()> {
+        Options::from(parse(extra)).validate_ports()
+    }
+
+    /// [`node_ports`] for a `beacon` argv.
+    fn beacon_ports(args: Vec<&str>) -> eyre::Result<()> {
+        Options::from(parse_beacon(args)).validate_ports()
+    }
+
+    #[test]
+    fn discovery_is_opt_in_on_node_and_always_on_on_beacon() {
+        assert!(!Options::from(parse(&[])).network.discovery_enabled());
+        assert!(
+            Options::from(parse(&["--discovery.enable"]))
+                .network
+                .discovery_enabled()
+        );
+        assert!(
+            Options::from(parse_beacon(beacon_args()))
+                .network
+                .discovery_enabled()
+        );
+    }
+
+    /// `beacon` cannot turn discovery off, so it has no switch to accept: the
+    /// flag is a lean one and is a usage error here, not silently ignored.
+    #[test]
+    fn beacon_has_no_discovery_enable_flag() {
+        let mut args = beacon_args();
+        args.push("--discovery.enable");
+        let err = try_parse_from(args).expect_err("--discovery.enable is lean-only");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// The two defaults have to work together wherever discovery runs: a
     /// default discovery port equal to the default gossip port would make every
-    /// out-of-the-box run fail the collision check.
+    /// out-of-the-box `beacon` run, and every `node --discovery.enable` one,
+    /// fail the collision check.
     #[test]
     fn the_default_ports_do_not_collide_on_either_chain() {
-        let node = parse(&[]);
+        let node = parse(&["--discovery.enable"]);
         assert_eq!(node.common.discovery.port, DEFAULT_DISCOVERY_PORT);
         assert_ne!(DEFAULT_DISCOVERY_PORT, node.common.gossipsub_port);
-        assert!(node.common.validate_ports().is_ok());
+        assert!(node_ports(&["--discovery.enable"]).is_ok());
 
         let beacon = parse_beacon(beacon_args());
         assert_eq!(beacon.common.discovery.port, DEFAULT_DISCOVERY_PORT);
         assert_ne!(DEFAULT_DISCOVERY_PORT, beacon.common.gossipsub_port);
-        assert!(beacon.common.validate_ports().is_ok());
+        assert!(beacon_ports(beacon_args()).is_ok());
     }
 
     /// Both sockets are UDP, so a clash cannot be left to bind time, where it
@@ -610,28 +688,31 @@ mod tests {
     fn a_discovery_port_equal_to_the_gossipsub_port_is_rejected() {
         // Reached from either direction: move the gossip port onto the
         // discovery default, or the discovery port onto the gossip default.
-        assert!(
-            parse(&["--gossipsub-port", "9000"])
-                .common
-                .validate_ports()
-                .is_err()
-        );
+        assert!(node_ports(&["--discovery.enable", "--gossipsub-port", "9000"]).is_err());
         let mut args = beacon_args();
         args.extend(["--discovery.port", "9001"]);
-        assert!(parse_beacon(args).common.validate_ports().is_err());
+        assert!(beacon_ports(args).is_err());
+    }
+
+    /// Without discovery nothing binds `--discovery.port`, so it cannot clash
+    /// with anything. This is what lets co-located devnet nodes share a host
+    /// without each passing its own `--discovery.port`.
+    #[test]
+    fn without_discovery_the_discovery_port_is_not_checked() {
+        assert!(node_ports(&["--gossipsub-port", "9000"]).is_ok());
     }
 
     #[test]
     fn an_explicit_discovery_port_wins_on_both_chains() {
-        let node = parse(&["--discovery.port", "9100"]);
+        let node = parse(&["--discovery.enable", "--discovery.port", "9100"]);
         assert_eq!(node.common.discovery.port, 9100);
-        assert!(node.common.validate_ports().is_ok());
+        assert!(node_ports(&["--discovery.enable", "--discovery.port", "9100"]).is_ok());
 
         let mut args = beacon_args();
         args.extend(["--discovery.port", "9100"]);
-        let beacon = parse_beacon(args);
+        let beacon = parse_beacon(args.clone());
         assert_eq!(beacon.common.discovery.port, 9100);
-        assert!(beacon.common.validate_ports().is_ok());
+        assert!(beacon_ports(args).is_ok());
     }
 
     /// Unlike the UDP clash above, this one has nothing to do with discovery:
@@ -643,15 +724,17 @@ mod tests {
         // the message can be checked for naming it.
         const SHARED: &str = "9100";
 
-        for flag in ["--api-port", "--metrics-port"] {
-            let err = parse(&["--gossipsub-port", SHARED, flag, SHARED])
-                .common
-                .validate_ports()
-                .expect_err("a TCP clash with an HTTP port must be rejected");
-            assert!(
-                err.to_string().contains(flag),
-                "the message must name the offending flag, got: {err}"
-            );
+        for discovery in [&[][..], &["--discovery.enable"][..]] {
+            for flag in ["--api-port", "--metrics-port"] {
+                let mut args = vec!["--gossipsub-port", SHARED, flag, SHARED];
+                args.extend_from_slice(discovery);
+                let err =
+                    node_ports(&args).expect_err("a TCP clash with an HTTP port must be rejected");
+                assert!(
+                    err.to_string().contains(flag),
+                    "the message must name the offending flag, got: {err}"
+                );
+            }
         }
     }
 
@@ -660,47 +743,55 @@ mod tests {
     /// must not sweep that up.
     #[test]
     fn api_and_metrics_may_share_a_port() {
-        let options = parse(&["--api-port", "5052", "--metrics-port", "5052"]);
-
-        assert!(options.common.validate_ports().is_ok());
+        assert!(node_ports(&["--api-port", "5052", "--metrics-port", "5052"]).is_ok());
     }
 
     /// Port 0 leaves the two listeners on different OS-assigned ports, so the
-    /// one number the ENR publishes describes neither. discv5 is always on, so
-    /// there is no invocation left where that is harmless.
+    /// one number the ENR publishes describes neither. Harmful only where an
+    /// ENR is published, which is wherever discovery runs.
     #[test]
-    fn gossipsub_port_zero_is_rejected() {
-        let err = parse(&["--gossipsub-port", "0"])
-            .common
-            .validate_ports()
-            .expect_err("gossipsub port 0 cannot be published in an ENR");
-        assert!(
-            !err.to_string().contains("must differ"),
-            "0 must be rejected on its own grounds, not as a clash, got: {err}"
-        );
+    fn gossipsub_port_zero_is_rejected_while_discovery_runs() {
+        let mut args = beacon_args();
+        args.extend(["--gossipsub-port", "0"]);
+        for result in [
+            node_ports(&["--discovery.enable", "--gossipsub-port", "0"]),
+            beacon_ports(args),
+        ] {
+            let err = result.expect_err("gossipsub port 0 cannot be published in an ENR");
+            assert!(
+                !err.to_string().contains("must differ"),
+                "0 must be rejected on its own grounds, not as a clash, got: {err}"
+            );
+        }
+    }
+
+    /// Without discovery no ENR is published, so an OS-picked gossip port has
+    /// no record to contradict.
+    #[test]
+    fn gossipsub_port_zero_is_accepted_without_discovery() {
+        assert!(node_ports(&["--gossipsub-port", "0"]).is_ok());
     }
 
     /// Two `0`s are two OS-assigned ports, so the TCP equality checks must not
     /// read them as a clash: an HTTP port asking the OS to pick is a supported
-    /// configuration, and the rejection it meets under `--gossipsub-port 0` has
-    /// to be the ENR one above rather than a collision that is not there.
+    /// configuration. With discovery on, `--gossipsub-port 0` still fails, but
+    /// on the ENR grounds above rather than as a collision that is not there.
     #[test]
     fn port_zero_never_counts_as_a_clash() {
         for flag in ["--api-port", "--metrics-port"] {
-            let err = parse(&["--gossipsub-port", "0", flag, "0"])
-                .common
-                .validate_ports()
-                .expect_err("gossipsub port 0 stays invalid under discv5");
+            assert!(
+                node_ports(&["--gossipsub-port", "0", flag, "0"]).is_ok(),
+                "0 == 0 must not be reported as a clash"
+            );
+            let err = node_ports(&["--discovery.enable", "--gossipsub-port", "0", flag, "0"])
+                .expect_err("gossipsub port 0 stays invalid while discv5 runs");
             assert!(
                 !err.to_string().contains("must differ"),
                 "0 == 0 must not be reported as a clash, got: {err}"
             );
         }
         assert!(
-            parse(&["--api-port", "0", "--metrics-port", "0"])
-                .common
-                .validate_ports()
-                .is_ok(),
+            node_ports(&["--api-port", "0", "--metrics-port", "0"]).is_ok(),
             "HTTP ports asking the OS to pick must be accepted"
         );
     }
@@ -842,12 +933,6 @@ mod tests {
             "--genesis is a lean flag and must not parse under beacon"
         );
     }
-
-    // `beacon_has_no_discovery_enable_flag` lived here, and after that a test
-    // asserting `beacon` parsed `--discovery.enable=false` and ignored it. The
-    // flag is gone: discv5 is always on, on both chains, so there is no longer
-    // an argv that says otherwise and nothing left to ignore. See
-    // `the_default_ports_do_not_collide_on_either_chain` above.
 
     #[test]
     fn lean_still_requires_its_own_flags() {

@@ -353,7 +353,16 @@ pub struct Deposit {
 /// A block without its body, which is what the state retains and what proposer
 /// slashings compare.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct BeaconBlockHeader {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -371,7 +380,16 @@ pub struct BeaconBlockHeader {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedBeaconBlockHeader {
     pub message: BeaconBlockHeader,
@@ -380,7 +398,16 @@ pub struct SignedBeaconBlockHeader {
 
 /// Evidence that a proposer signed two different blocks for the same slot.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct ProposerSlashing {
     pub signed_header_1: SignedBeaconBlockHeader,
@@ -389,7 +416,17 @@ pub struct ProposerSlashing {
 
 /// A validator's request to stop validating.
 #[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct VoluntaryExit {
     /// The earliest epoch the exit may be processed at.
@@ -400,7 +437,16 @@ pub struct VoluntaryExit {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,

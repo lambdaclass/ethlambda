@@ -269,11 +269,13 @@ struct ChainSetup {
 #[cfg_attr(not(feature = "shadow-integration"), tokio::main)]
 #[cfg_attr(feature = "shadow-integration", tokio::main(flavor = "current_thread"))]
 async fn run_node(options: Options) -> eyre::Result<()> {
-    let Options { common, network } = options;
-
     // Before any side effect, so a port collision aborts ahead of the metrics
     // registry, the fd limit and the data directory.
-    common.validate_ports()?;
+    options.validate_ports()?;
+
+    let Options { common, network } = options;
+    // Read before the chain match below moves `network`.
+    let discovery_enabled = network.discovery_enabled();
 
     #[cfg(feature = "shadow-integration")]
     if let Network::Lean(lean) = &network {
@@ -653,8 +655,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     // The operator-supplied half of the discv5 configuration, which neither
     // chain varies. Built before `build_swarm` because that moves the node key
-    // and the bootnode list.
-    let discovery = DiscoverySpawnConfig {
+    // and the bootnode list. `None` on a lean node without `--discovery.enable`,
+    // which then peers from the bootnode list alone.
+    let discovery = discovery_enabled.then(|| DiscoverySpawnConfig {
         node_key: node_p2p_key.clone(),
         bind_ip: p2p_socket.ip(),
         discovery_port: common.discovery.port,
@@ -668,7 +671,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         attestation_committee_count: setup.discovery.attestation_committee_count,
         fork_id: setup.discovery.fork_id,
         custody_group_count: setup.discovery.custody_group_count,
-    };
+    });
 
     let built = build_swarm(SwarmConfig {
         node_key: node_p2p_key,
@@ -688,19 +691,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
-    // Filled by the Beacon API's pool endpoint and the aggregator subnets, and
-    // read by the aggregate endpoint and block production; unused on lean.
-    let attestation_pool =
-        ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool::default();
-    let p2p = P2P::spawn(
-        built,
-        setup.store.clone(),
-        setup.node_names,
-        discovery,
-        attestation_pool.clone(),
-    )
-    .await
-    .wrap_err("failed to start discv5 discovery")?;
+    let p2p = P2P::spawn(built, setup.store.clone(), setup.node_names, discovery)
+        .await
+        .wrap_err("failed to start discv5 discovery")?;
 
     let shutdown = CancellationToken::new();
     let rpc_shutdown = shutdown.clone();
@@ -731,7 +724,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_sync_status,
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
-                    attestation_pool: attestation_pool.clone(),
                     engine: rpc_engine,
                     events: rpc_events,
                     client_version: version::engine_client_version(),
@@ -910,14 +902,15 @@ async fn wait_for_shutdown(node: RunningNode) {
 /// A resolved network (built-in mainnet, or a loaded directory) publishes its
 /// own bootnode list, so an absent flag means "use it". A lean network's ENRs
 /// are per-deployment, so there is nothing to default to and an absent flag
-/// means this node reaches peers only through discv5. That case warns, because
+/// means this node reaches peers only through discv5, which a lean node runs
+/// only with `--discovery.enable`, or by being dialed. That case warns, because
 /// a node that then finds nobody is islanded and otherwise looks healthy.
 fn default_bootnodes(source: Option<&network::NetworkSource>) -> Vec<String> {
     match source {
         None => {
             warn!(
                 "No --bootnodes file supplied: starting with no bootnodes. This node can \
-                 only find peers via discv5."
+                 only find peers via discv5 (--discovery.enable) or by being dialed."
             );
             Vec::new()
         }

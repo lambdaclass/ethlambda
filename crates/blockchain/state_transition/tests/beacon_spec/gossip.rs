@@ -22,6 +22,7 @@ use ethlambda_state_transition::beacon::containers::{
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, PayloadStatusEnum, PayloadValidity, Store,
 };
+use ethlambda_state_transition::beacon::gossip::operations::SeenOperations;
 use ethlambda_state_transition::beacon::gossip::{
     self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
     SeenColumns, SeenEnvelopes, SeenPayloadAttestations,
@@ -30,6 +31,8 @@ use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_storage::ForkCheckpoints;
+use ethlambda_types::beacon::containers::{capella, shared};
+use ethlambda_types::beacon::operation::BeaconOperation;
 use libssz::SszDecode;
 use libtest_mimic::{Failed, Trial};
 
@@ -43,6 +46,10 @@ const HANDLERS: &[&str] = &[
     "gossip_beacon_attestation",
     "gossip_execution_payload_envelope",
     "gossip_payload_attestation_message",
+    "gossip_voluntary_exit",
+    "gossip_proposer_slashing",
+    "gossip_attester_slashing",
+    "gossip_bls_to_execution_change",
 ];
 
 /// The forks each of [`HANDLERS`] validates. A case from any other fork is
@@ -64,6 +71,13 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         "gossip_execution_payload_envelope" | "gossip_payload_attestation_message" => {
             &[ForkName::Gloas]
         }
+        // `gossip::operations` validates electra-shaped operations against an
+        // electra or fulu head state and ignores every other one, so gloas's
+        // vectors (builder exits included) are a known gap rather than a run.
+        "gossip_voluntary_exit"
+        | "gossip_proposer_slashing"
+        | "gossip_attester_slashing"
+        | "gossip_bls_to_execution_change" => &[ForkName::Fulu],
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
 }
@@ -85,16 +99,20 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
 /// they land here rather than silently in `unknown` the first time this
 /// runner sees them. Alphabetized with the rest rather than kept together.
 const IGNORED_HANDLERS: &[&str] = &[
-    "gossip_attester_slashing",
     "gossip_blob_sidecar",
-    "gossip_bls_to_execution_change",
     "gossip_execution_payload_bid",
     "gossip_partial_data_column_sidecar",
     "gossip_proposer_preferences",
-    "gossip_proposer_slashing",
     "gossip_sync_committee_contribution_and_proof",
     "gossip_sync_committee_message",
-    "gossip_voluntary_exit",
+];
+
+/// The topics whose vectors need [`rebase_stale_header`].
+const OPERATION_TOPICS: &[&str] = &[
+    "voluntary_exit",
+    "proposer_slashing",
+    "attester_slashing",
+    "bls_to_execution_change",
 ];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
@@ -142,8 +160,38 @@ struct Meta {
     #[serde(default)]
     blocks: Vec<StoreBlock>,
     finalized_checkpoint: Option<FinalizedOverride>,
-    current_time_ms: u64,
+    /// Read through [`Meta::base_ms`]: only the operation vectors may omit it.
+    current_time_ms: Option<u64>,
     messages: Vec<GossipMessage>,
+}
+
+impl Meta {
+    fn is_operation_topic(&self) -> bool {
+        OPERATION_TOPICS.contains(&self.topic.as_str())
+    }
+
+    /// The case's clock. The state-only operation vectors omit it, and their
+    /// clock is genesis; every other topic must say.
+    fn base_ms(&self) -> Result<u64, String> {
+        match self.current_time_ms {
+            Some(ms) => Ok(ms),
+            None if self.is_operation_topic() => Ok(0),
+            None => Err("meta.yaml lacks current_time_ms".into()),
+        }
+    }
+
+    /// The clock reading `message` arrives at, in milliseconds since genesis
+    /// (see [`GossipMessage::arrival_ms`]). The operation vectors may omit
+    /// the message's timing too, and then arrive at the case clock; every
+    /// other topic must name it.
+    fn arrival_ms(&self, message: &GossipMessage) -> Result<u64, String> {
+        let base_ms = self.base_ms()?;
+        let untimed = message.offset_ms.is_none() && message.current_time_ms.is_none();
+        if untimed && self.is_operation_topic() {
+            return Ok(base_ms);
+        }
+        message.arrival_ms(base_ms)
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -282,6 +330,45 @@ fn deliver_payload(
     .map_err(|err| format!("delivering {name}: {err:?}"))
 }
 
+/// The operation vectors build their anchor pair loosely: the state's
+/// `latest_block_header` need not describe the anchor block (different slot,
+/// proposer, parent or body), and the block's `state_root` is simply the
+/// state's root.
+///
+/// The specification's `get_forkchoice_store` asserts only
+/// `anchor_block.state_root == hash_tree_root(anchor_state)`, which these
+/// vectors satisfy. `fork_choice::get_forkchoice_store` runs a different
+/// check on purpose (a checkpoint-synced anchor state can be past its block,
+/// where the spec's condition fails): it asserts
+/// `hash_tree_root(anchor_state.latest_block_header) ==
+/// hash_tree_root(anchor_block.message)`, after filling the header's
+/// `state_root`. That is looser for a state advanced past its block, but these
+/// vectors' stale headers fail it. Rewriting is safe for these four topics
+/// because their rules read only the state's slot, validators, fork and
+/// `genesis_validators_root`, never its header or the anchor block's contents. So the header is made to name
+/// the anchor block with the state root left for the store to fill in, and the
+/// block's `state_root` is the root of the state so amended.
+fn rebase_stale_header(state: &mut BeaconState, anchor: &mut SignedBeaconBlock) {
+    use ethlambda_state_transition::beacon::containers::BeaconBlockHeader;
+    use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
+
+    let SignedBeaconBlock::Fulu(block) = anchor else {
+        return;
+    };
+    if state.slot() != block.message.slot {
+        return;
+    }
+    let message = &mut block.message;
+    *state.latest_block_header_mut() = BeaconBlockHeader {
+        slot: message.slot,
+        proposer_index: message.proposer_index,
+        parent_root: message.parent_root,
+        state_root: Root::ZERO,
+        body_root: message.body.hash_tree_root(),
+    };
+    message.state_root = state.hash_tree_root();
+}
+
 /// The store the case describes: its anchor, then each listed block.
 fn build_store(
     case: &Case,
@@ -293,7 +380,18 @@ fn build_store(
         .blocks
         .split_first()
         .ok_or("a gossip case lists at least its anchor block")?;
-    let anchor_block = decode_block(case, &anchor.block)?;
+    let mut anchor_block = decode_block(case, &anchor.block)?;
+    let mut state = state;
+    if meta.is_operation_topic() {
+        if !rest.is_empty() {
+            return Err(
+                "an operation vector lists blocks after its anchor, which the \
+                 rebased anchor could not be their parent"
+                    .into(),
+            );
+        }
+        rebase_stale_header(&mut state, &mut anchor_block);
+    }
     let backend = Arc::new(ethlambda_storage::backend::InMemoryBackend::new());
     let mut store = fork_choice::get_forkchoice_store(backend, state, anchor_block, config)
         .map_err(|err| format!("get_forkchoice_store: {err:?}"))?;
@@ -302,7 +400,7 @@ fn build_store(
     // listed block; a block from a slot past that time advances it to that
     // slot's start, since a vector may place its base time just before the
     // slot a clock-disparity case sends its sidecar for.
-    let mut clock_s = (config.genesis_time_ms() + meta.current_time_ms) / 1000;
+    let mut clock_s = (config.genesis_time_ms() + meta.base_ms()?) / 1000;
     fork_choice::on_tick(&mut store, clock_s, config);
     deliver_payload(&mut store, case, anchor, config)?;
 
@@ -401,6 +499,20 @@ fn check(message: &GossipMessage, outcome: Outcome) -> Result<(), String> {
     ))
 }
 
+/// The four operation topics share one verdict-then-record shape.
+fn validate_operation(
+    seen: &mut SeenOperations,
+    store: &Store,
+    operation: BeaconOperation,
+    now_ms: u64,
+) -> Outcome {
+    let outcome = rules::operations::validate(seen, store, &operation, now_ms);
+    if outcome == Outcome::Accept {
+        seen.record(&operation);
+    }
+    outcome
+}
+
 fn run_case(case: &Case) -> Result<(), String> {
     let meta: Meta = case.yaml("meta");
     let state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("state"))
@@ -415,11 +527,12 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_attestations = SeenAttestations::new(capacity);
     let mut seen_envelopes = SeenEnvelopes::new(capacity);
     let mut seen_payload_attestations = SeenPayloadAttestations::new(capacity);
+    let mut seen_operations = SeenOperations::default();
 
     for (index, message) in meta.messages.iter().enumerate() {
         let now_ms = config.genesis_time_ms()
-            + message
-                .arrival_ms(meta.current_time_ms)
+            + meta
+                .arrival_ms(message)
                 .map_err(|err| format!("message {index}: {err}"))?;
         let outcome = match meta.topic.as_str() {
             "beacon_block" => {
@@ -533,6 +646,50 @@ fn run_case(case: &Case) -> Result<(), String> {
                         .record(attestation.data.slot, attestation.validator_index);
                 }
                 outcome
+            }
+            "voluntary_exit" => {
+                let bytes = case.ssz_bytes(&message.message);
+                let exit = shared::SignedVoluntaryExit::from_ssz_bytes(&bytes)
+                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                validate_operation(
+                    &mut seen_operations,
+                    &store,
+                    BeaconOperation::VoluntaryExit(exit),
+                    now_ms,
+                )
+            }
+            "proposer_slashing" => {
+                let bytes = case.ssz_bytes(&message.message);
+                let slashing = shared::ProposerSlashing::from_ssz_bytes(&bytes)
+                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                validate_operation(
+                    &mut seen_operations,
+                    &store,
+                    BeaconOperation::ProposerSlashing(slashing),
+                    now_ms,
+                )
+            }
+            "attester_slashing" => {
+                let bytes = case.ssz_bytes(&message.message);
+                let slashing = electra::AttesterSlashing::from_ssz_bytes(&bytes)
+                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                validate_operation(
+                    &mut seen_operations,
+                    &store,
+                    BeaconOperation::AttesterSlashing(slashing),
+                    now_ms,
+                )
+            }
+            "bls_to_execution_change" => {
+                let bytes = case.ssz_bytes(&message.message);
+                let change = capella::SignedBLSToExecutionChange::from_ssz_bytes(&bytes)
+                    .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                validate_operation(
+                    &mut seen_operations,
+                    &store,
+                    BeaconOperation::BlsToExecutionChange(change),
+                    now_ms,
+                )
             }
             other => return Err(format!("topic {other} has no runner")),
         };

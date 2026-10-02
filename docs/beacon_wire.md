@@ -10,7 +10,8 @@ gossip announces and what range sync fetches, and the two block protocols serve
 other peers from the same store. Fork choice learns its votes from block bodies
 and from the aggregate topic, which is how it sees votes for the *current* head
 rather than only ones at least a block old; see [Aggregate
-attestations](#aggregate-attestations). It publishes nothing. It also custodies
+attestations](#aggregate-attestations). It publishes only what its Beacon API clients submit (attestations, aggregates,
+blocks with their columns, operations) and relays validated gossip. It also custodies
 and serves a slice of the fulu data column matrix, and backbones a slice of the
 attestation subnets, both sized and selected by its own node id; see [Data
 column sidecars](#data-column-sidecars).
@@ -151,14 +152,16 @@ out over req/resp is under [Data column sidecars](#data-column-sidecars).
 
 Every beacon message is held by gossipsub until it has a verdict
 (`validate_messages()` is on for this wire only). Blocks, data column
-sidecars, aggregates and subnet attestations are all validated by fulu's
-gossip rules, or gloas's modified ones from the fork on (`ethlambda_state_transition::beacon::gossip`, one module per
+sidecars, aggregates, subnet attestations and the four operation topics are all
+validated by fulu's gossip rules, or (operations aside) gloas's modified ones
+from the fork on (`ethlambda_state_transition::beacon::gossip`, one module per
 topic family): the checks that need no state run inline in the p2p actor, the
 rest on a bounded `spawn_blocking` task whose verdict comes back to the actor
 (`crate::beacon::verdict`). Two permit pools bound how many of these run at
 once, so a burst on one family cannot starve another:
 `gossip_validation_permits` for blocks and columns,
-`attestation_validation_permits` for aggregates and subnet attestations. A
+`attestation_validation_permits` for aggregates, subnet attestations and the
+operation topics. A
 mainnet slot carries up to `MAX_COMMITTEES_PER_SLOT *
 TARGET_AGGREGATORS_PER_COMMITTEE` aggregates alone, arriving every slot rather
 than only during a range sync, which is why that traffic needs a pool of its
@@ -203,10 +206,34 @@ verifies every envelope itself, without being propagated. And a
 signature, with the actor re-checking only the store-state conditions (known
 block, current slot, committee seat).
 
-The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
-since nothing consumes them; an undecodable payload on any topic is REJECTed.
-Nothing is published on any topic, columns included: nothing this node can
-produce today would be signature-valid.
+`voluntary_exit`, `proposer_slashing`, `attester_slashing` and
+`bls_to_execution_change` are validated in p2p like aggregates, by
+`gossip::operations`: the specification's `validate_*_gossip` functions
+(consensus-specs v1.7.0-beta.1), run against the fork-choice head's post-state
+as it is, with no state advance and no `process_*`. The seen records (the
+first valid exit or credential change per validator, proposer slashing per
+proposer, and the validators an attester slashing slashes) live in
+`SeenOperations`, are recorded only on `Accept` and never pruned, so an
+operation a block already included and a peer re-gossips is IGNOREd rather than
+REJECTed. An attester slashing's range and slashability checks run before its
+BLS checks. What Accepts goes into `Store::operation_pool`, which block
+production packs from (see [rpc.md](./rpc.md#validator-endpoints)). The rules
+are electra's shapes against an electra or fulu head: under a gloas head every
+operation is IGNOREd (`state_unavailable`), and a gloas-shaped attester
+slashing is IGNOREd (`no_consumer`) at decode, like a phase0-shaped one.
+
+`sync_committee_contribution_and_proof` is decoded, logged at `debug`, and
+IGNOREd, since nothing consumes it; an undecodable payload on any topic is
+REJECTed.
+
+Publication runs on the Beacon API's `POST /eth/v2/beacon/blocks`, the only
+path that puts a block of this node's own on the wire. It gossips the block on
+`beacon_block`, then, if it carries blobs, all 128 data column sidecars, each on
+`data_column_sidecar_{compute_subnet_for_data_column_sidecar(index)}` whether or
+not this node custodies that subnet (publishing to a subnet one has not joined
+goes through fanout), all under the digest the block's slot falls in. Operations
+posted to the `pool/*` routes are published on their topics the same way, under
+the digest of the wall-clock slot.
 
 ## Aggregate attestations
 
@@ -644,6 +671,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 | `lean_beacon_aggregate_end_to_end_seconds` | Wire to fork choice, for aggregates applied on arrival |
 | `lean_beacon_aggregate_total{outcome}` | Aggregates by `applied`, `invalid`, `known_subset` or `queue_full` |
 | `lean_beacon_aggregates_deferred` | Aggregates held until their own slot has passed |
+| `lean_beacon_publish_data_columns_seconds` | Time to compute and verify a published block's cells and build its sidecars; see [metrics.md](./metrics.md) |
 
 The four aggregate histograms no longer cover what they used to: gossip
 validation (committees, all three signatures, the seen caches) runs in p2p now
@@ -700,7 +728,9 @@ Local ENR  enr=enr:-…
 ```
 
 The `Advertising cgc=…` line names what is still true: this node subscribes to
-no sync-committee subnet and publishes nothing of its own. Storing and serving
+no sync-committee subnet and publishes only what its Beacon API clients submit
+(attestations, aggregates, blocks with their columns, operations), plus relayed
+validated gossip. Storing and serving
 the columns it custodies (see [Data column
 sidecars](#data-column-sidecars)) is no longer part of that gap, and neither is
 the attestation subnet backbone.

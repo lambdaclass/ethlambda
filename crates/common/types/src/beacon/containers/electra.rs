@@ -161,11 +161,24 @@ pub struct Attestation {
 /// the state transition converts an [`Attestation`] into this form before
 /// checking it. `attesting_indices` now spans every committee an
 /// [`Attestation`] covers, following the same widening as [`AggregationBits`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct IndexedAttestation {
     /// The attesters, which the specification requires to be sorted and
     /// unique.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(
+        serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize",
+        deserialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::deserialize"
+    )]
     pub attesting_indices: AttestingIndices,
     pub data: AttestationData,
     pub signature: BlsSignature,
@@ -179,7 +192,17 @@ pub struct IndexedAttestation {
 /// `MAX_ATTESTER_SLASHINGS_ELECTRA` rather than phase0's larger
 /// `MAX_ATTESTER_SLASHINGS`: evidence spanning a whole slot is proportionally
 /// more expensive to include.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct AttesterSlashing {
     pub attestation_1: IndexedAttestation,
     pub attestation_2: IndexedAttestation,

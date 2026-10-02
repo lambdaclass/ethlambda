@@ -2761,7 +2761,10 @@ pub(crate) mod tests {
             beacon_fetched_through: 0,
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
-            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: Some(crate::discovery::dial::DiscoveryState::new(
+                discovery,
+                built.local_peer_id,
+            )),
             seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
@@ -2787,6 +2790,7 @@ pub(crate) mod tests {
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
                     crate::seen_attestations_capacity(backbone_attestation_subnets),
                 ),
+            seen_operations: Default::default(),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
@@ -2796,7 +2800,6 @@ pub(crate) mod tests {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

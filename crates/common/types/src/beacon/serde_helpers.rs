@@ -132,11 +132,10 @@ impl std::fmt::Display for HexPrefixed<'_> {
 
 /// A sequence of integers, each written quoted.
 ///
-/// Serialize-only: nothing reads one back yet. Takes any `IntoIterator` of
-/// `Display` by reference so it serves a `Vec<u64>` and an `SszList<u64, N>`
-/// alike, which is what the containers need — `libssz-types` has no serde
-/// support and is a foreign crate, so its collections cannot carry an impl of
-/// their own.
+/// Takes any `IntoIterator` of `Display` by reference so it serves a
+/// `Vec<u64>` and an `SszList<u64, N>` alike, which is what the containers
+/// need: `libssz-types` has no serde support and is a foreign crate, so its
+/// collections cannot carry an impl of their own.
 ///
 /// Carries the same caveat as [`quoted_or_bare::serialize`]: it is intended
 /// for sequences of the unsigned integer aliases (`Slot`, `Epoch`, `Gwei`,
@@ -178,6 +177,71 @@ pub mod quoted_u64_seq {
             seq.serialize_element(&Quoted(item))?;
         }
         seq.end()
+    }
+
+    /// The inverse, into an `SszList<u64, N>`: each element is read quoted or
+    /// bare, and a sequence past the list's bound fails as soon as the extra
+    /// element arrives rather than after buffering all of it.
+    pub fn deserialize<'de, D, const N: usize>(
+        deserializer: D,
+    ) -> Result<libssz_types::SszList<u64, N>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// One element, accepted as a bare integer or a decimal string.
+        struct Element(u64);
+
+        impl<'de> serde::Deserialize<'de> for Element {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct ElementVisitor;
+
+                impl serde::de::Visitor<'_> for ElementVisitor {
+                    type Value = Element;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("an unsigned integer, bare or quoted")
+                    }
+
+                    fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Element, E> {
+                        Ok(Element(value))
+                    }
+
+                    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Element, E> {
+                        value.trim().parse().map(Element).map_err(E::custom)
+                    }
+                }
+
+                deserializer.deserialize_any(ElementVisitor)
+            }
+        }
+
+        struct ListVisitor<const N: usize>;
+
+        impl<'de, const N: usize> serde::de::Visitor<'de> for ListVisitor<N> {
+            type Value = libssz_types::SszList<u64, N>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(f, "a sequence of at most {N} unsigned integers")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut list = libssz_types::SszList::new();
+                while let Some(Element(value)) = seq.next_element()? {
+                    list.push(value).map_err(|err| {
+                        serde::de::Error::custom(format!("sequence exceeds its bound: {err:?}"))
+                    })?;
+                }
+                Ok(list)
+            }
+        }
+
+        deserializer.deserialize_seq(ListVisitor::<N>)
     }
 }
 
@@ -537,5 +601,21 @@ mod tests {
         // an otherwise-empty byte, not an empty string and not an all-zero
         // byte.
         assert_eq!(json["bits"], serde_json::json!("0x01"));
+    }
+
+    #[test]
+    fn a_list_of_integers_reads_quoted_or_bare_and_stops_at_its_bound() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Holder {
+            #[serde(deserialize_with = "super::quoted_u64_seq::deserialize")]
+            values: libssz_types::SszList<u64, 2>,
+        }
+
+        let ok: Holder = serde_json::from_str(r#"{"values": ["1", 2]}"#).unwrap();
+        assert_eq!(ok.values.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+        let err = serde_json::from_str::<Holder>(r#"{"values": [1, 2, 3]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds its bound"), "got {err}");
     }
 }

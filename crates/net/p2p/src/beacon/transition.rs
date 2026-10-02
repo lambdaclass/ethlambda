@@ -218,10 +218,11 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         .iter()
         .map(|topics| topics.fork_digest)
         .collect();
-    server
-        .discovery
-        .filter()
-        .set_fork_id(fork_id, also_admitted);
+    // A beacon wire always runs discovery; `None` is a lean node's, which
+    // never reaches a fork boundary.
+    if let Some(discovery) = &server.discovery {
+        discovery.filter().set_fork_id(fork_id, also_admitted);
+    }
     if switched {
         discovery::update_served_enr(&fork_id);
     }
