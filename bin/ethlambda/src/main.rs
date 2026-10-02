@@ -758,7 +758,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_events = events.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     let rpc_identity = beacon_identity(
-        p2p.local_enr(),
+        p2p.local_enr().unwrap_or_default(),
         common.discovery.advertise_ip,
         common.gossipsub_port,
         common.discovery.port,
