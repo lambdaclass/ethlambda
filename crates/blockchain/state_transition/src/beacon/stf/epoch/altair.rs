@@ -20,16 +20,15 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::error::{Error, Result};
-use crate::beacon::helpers::accessors::{
-    get_current_epoch, get_previous_epoch, get_total_active_balance, get_total_balance,
-};
+use crate::beacon::helpers::accessors::{get_current_epoch, get_previous_epoch};
 use crate::beacon::helpers::altair::{
-    get_flag_index_deltas, get_inactivity_penalty_deltas, get_next_sync_committee,
-    get_unslashed_participating_indices,
+    compute_total_active_balance, get_flag_index_deltas, get_inactivity_penalty_deltas,
+    get_next_sync_committee, get_unslashed_participating_balance, has_flag,
 };
-use crate::beacon::helpers::finality::{get_eligible_validator_indices, is_in_inactivity_leak};
+use crate::beacon::helpers::finality::is_in_inactivity_leak;
 use crate::beacon::helpers::math::saturating_sub;
 use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::predicates::is_active_validator;
 use crate::beacon::preset;
 use crate::beacon::primitives::ValidatorIndex;
 
@@ -61,7 +60,7 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
 /// timely, correct target vote for the previous and current epoch.
 ///
 /// The only difference from phase0's version: the two target balances come
-/// from [`get_unslashed_participating_indices`] over the epoch's participation
+/// from [`get_unslashed_participating_balance`] over the epoch's participation
 /// flags rather than from matching stored `PendingAttestation`s against the
 /// block root history. Once those two balances are in hand, the actual
 /// bitfield and finality bookkeeping is identical, so this hands off to
@@ -74,19 +73,17 @@ pub fn process_justification_and_finalization(state: &mut BeaconState) -> Result
         return Ok(());
     }
 
-    let previous_indices = get_unslashed_participating_indices(
+    let previous_target_balance = get_unslashed_participating_balance(
         state,
         constants::TIMELY_TARGET_FLAG_INDEX,
         get_previous_epoch(state),
     )?;
-    let current_indices = get_unslashed_participating_indices(
+    let current_target_balance = get_unslashed_participating_balance(
         state,
         constants::TIMELY_TARGET_FLAG_INDEX,
         get_current_epoch(state),
     )?;
-    let total_active_balance = get_total_active_balance(state)?;
-    let previous_target_balance = get_total_balance(state, &previous_indices)?;
-    let current_target_balance = get_total_balance(state, &current_indices)?;
+    let total_active_balance = compute_total_active_balance(state);
     weigh_justification_and_finalization(
         state,
         total_active_balance,
@@ -116,51 +113,85 @@ pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> R
         return Ok(());
     }
 
-    // Every read below needs `&BeaconState`, so they all run before this takes
-    // the mutable borrow `inactivity_scores` requires: `altair_validator_lists_mut`
-    // borrows the whole state, and there is no way to hold that mutably while
-    // also calling `get_eligible_validator_indices`, `get_unslashed_participating_indices`,
-    // or `is_in_inactivity_leak`, each of which needs its own `&BeaconState`.
-    // `process_effective_balance_updates` in the parent module resolves the
-    // identical conflict the same way: decide everything in one pass over
-    // immutable state, then apply it in a second pass over a mutable borrow.
-    let eligible_indices = get_eligible_validator_indices(state);
+    // The decisions come from one immutable walk over the registry's leaves
+    // and are applied in a second pass over the mutable score list:
+    // `altair_validator_lists_mut` borrows the whole state, so the two cannot
+    // overlap. `process_effective_balance_updates` in the parent module
+    // resolves the identical conflict the same way. The decisions are one
+    // byte per validator, not index lists searched per validator.
+    const INELIGIBLE: u8 = 0;
+    const PARTICIPATED: u8 = 1;
+    const MISSED: u8 = 2;
+
     let previous_epoch = get_previous_epoch(state);
-    let participating_indices = get_unslashed_participating_indices(
-        state,
-        constants::TIMELY_TARGET_FLAG_INDEX,
-        previous_epoch,
-    )?;
     let leaking = is_in_inactivity_leak(state);
+    // Not the genesis epoch (returned above), so "previous" is a distinct
+    // epoch with its own list, unlike the genesis case in
+    // `get_unslashed_participating_indices`.
+    let (previous_epoch_participation, _, _) = state.altair_validator_lists()?;
+
+    let mut decisions = Vec::with_capacity(state.validators().len());
+    for (index, validator) in state.validators().iter().enumerate() {
+        let active = is_active_validator(validator, previous_epoch);
+        // A participation record is only read for an active validator, as
+        // `get_unslashed_participating_indices` does, and a short list is an
+        // error there before any score is touched.
+        let flags = if active {
+            Some(previous_epoch_participation.get(index).copied().ok_or(
+                Error::IndexOutOfBounds {
+                    index,
+                    len: previous_epoch_participation.len(),
+                },
+            )?)
+        } else {
+            None
+        };
+        let eligible =
+            active || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch);
+        decisions.push(if !eligible {
+            INELIGIBLE
+        } else if flags.is_some_and(|flags| {
+            !validator.slashed && has_flag(flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        }) {
+            PARTICIPATED
+        } else {
+            MISSED
+        });
+    }
 
     let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
     let score_count = inactivity_scores.len();
-    for index in eligible_indices {
+    for (index, decision) in decisions.into_iter().enumerate() {
+        if decision == INELIGIBLE {
+            continue;
+        }
         let score = inactivity_scores
-            .get_mut(index as usize)
+            .get_mut(index)
             .ok_or(Error::IndexOutOfBounds {
-                index: index as usize,
+                index,
                 len: score_count,
             })?;
 
-        // `participating_indices` is ascending and duplicate-free (see
-        // `get_unslashed_participating_indices`), so membership is a binary
-        // search rather than a linear scan.
-        if participating_indices.binary_search(&index).is_ok() {
+        let mut updated = *score;
+        if decision == PARTICIPATED {
             // `x -= min(1, x)`, written with `saturating_sub` so a
             // already-zero score cannot underflow.
-            *score = saturating_sub(*score, 1);
+            updated = saturating_sub(updated, 1);
         } else {
             // The specification treats a `uint64` overflow here as an invalid
             // state rather than a wrapped one, so this is checked rather than
             // left to release-mode wrapping.
-            *score = score.checked_add(config.inactivity_score_bias).ok_or(
+            updated = updated.checked_add(config.inactivity_score_bias).ok_or(
                 Error::ArithmeticOverflow("inactivity_scores[index] + INACTIVITY_SCORE_BIAS"),
             )?;
         }
 
         if !leaking {
-            *score = saturating_sub(*score, config.inactivity_score_recovery_rate);
+            updated = saturating_sub(updated, config.inactivity_score_recovery_rate);
+        }
+        // Most scores sit at zero on a healthy chain; skip the write.
+        if updated != *score {
+            *score = updated;
         }
     }
 

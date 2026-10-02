@@ -31,11 +31,12 @@
 //! without changing the shape of any SSZ container. That is the only function
 //! below that takes a [`Config`]; the rest need nothing a network could vary.
 
-use super::finality::{get_eligible_validator_indices, is_in_inactivity_leak};
+use super::finality::is_in_inactivity_leak;
+use super::predicates::is_active_validator;
 use crate::beacon::bls;
 use crate::beacon::config::Config;
 use crate::beacon::constants;
-use crate::beacon::containers::shared::AttestationData;
+use crate::beacon::containers::shared::{AttestationData, EpochParticipation, Validator};
 use crate::beacon::containers::{BeaconState, altair};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
@@ -45,7 +46,7 @@ use crate::beacon::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex}
 
 use super::accessors::{
     get_active_validator_indices, get_block_root, get_block_root_at_slot, get_current_epoch,
-    get_previous_epoch, get_seed, get_total_active_balance, get_total_balance,
+    get_previous_epoch, get_seed, get_total_active_balance,
 };
 use super::math::integer_squareroot;
 use super::shuffling::compute_shuffled_index;
@@ -205,22 +206,13 @@ pub fn get_base_reward(state: &BeaconState, index: ValidatorIndex) -> Result<Gwe
     Ok(increments * get_base_reward_per_increment(state)?)
 }
 
-/// The active, unslashed validators that had `flag_index` set for `epoch`.
+/// The participation list `epoch` reads from, and the check that `epoch` is
+/// one of the two the state keeps a record for.
 ///
-/// `epoch` must be the current or previous epoch, since those are the only
-/// two altair keeps a participation record for (`current_epoch_participation`
-/// and `previous_epoch_participation`, mirroring the two-epoch window phase0
-/// keeps for `PendingAttestation`s).
-///
-/// Ascending and duplicate-free: it is built by filtering
-/// [`get_active_validator_indices`], which already returns indices in that
-/// order, so callers may binary-search it the way
-/// [`get_flag_index_deltas`] does.
-pub fn get_unslashed_participating_indices(
-    state: &BeaconState,
-    flag_index: usize,
-    epoch: Epoch,
-) -> Result<Vec<ValidatorIndex>> {
+/// At the genesis epoch the previous and current epoch coincide, and the
+/// current list is the one read, exactly as the specification's
+/// `epoch == get_current_epoch(state)` branch does.
+fn epoch_participation(state: &BeaconState, epoch: Epoch) -> Result<&EpochParticipation> {
     crate::beacon::verify(
         epoch == get_previous_epoch(state) || epoch == get_current_epoch(state),
         "epoch in (get_previous_epoch(state), get_current_epoch(state))",
@@ -228,27 +220,112 @@ pub fn get_unslashed_participating_indices(
 
     let (previous_epoch_participation, current_epoch_participation, _) =
         state.altair_validator_lists()?;
-    let epoch_participation = if epoch == get_current_epoch(state) {
+    Ok(if epoch == get_current_epoch(state) {
         current_epoch_participation
     } else {
         previous_epoch_participation
-    };
+    })
+}
 
-    let mut participating_indices = Vec::new();
-    for index in get_active_validator_indices(state, epoch) {
-        let flags =
-            epoch_participation
-                .get(index as usize)
-                .copied()
-                .ok_or(Error::IndexOutOfBounds {
-                    index: index as usize,
-                    len: epoch_participation.len(),
-                })?;
-        if has_flag(flags, flag_index) && !state.validator(index)?.slashed {
-            participating_indices.push(index);
+/// Calls `each` with the index and record of every active, unslashed validator
+/// that had `flag_index` set for `epoch`, in ascending index order.
+///
+/// One walk over the registry's leaves, reading the flat participation list by
+/// position: no index `Vec` and no per-index registry descent, which is what
+/// the callers below used to pay per participant. An active validator past the
+/// end of the participation list is an error, as before, and is reported for
+/// the lowest such index whether or not it holds the flag.
+fn for_each_unslashed_participant(
+    state: &BeaconState,
+    flag_index: usize,
+    epoch: Epoch,
+    mut each: impl FnMut(usize, &Validator),
+) -> Result<()> {
+    let epoch_participation = epoch_participation(state, epoch)?;
+
+    for (index, validator) in state.validators().iter().enumerate() {
+        if !is_active_validator(validator, epoch) {
+            continue;
+        }
+        let flags = epoch_participation
+            .get(index)
+            .copied()
+            .ok_or(Error::IndexOutOfBounds {
+                index,
+                len: epoch_participation.len(),
+            })?;
+        if has_flag(flags, flag_index) && !validator.slashed {
+            each(index, validator);
         }
     }
+    Ok(())
+}
+
+/// The active, unslashed validators that had `flag_index` set for `epoch`.
+///
+/// `epoch` must be the current or previous epoch, since those are the only
+/// two altair keeps a participation record for (`current_epoch_participation`
+/// and `previous_epoch_participation`, mirroring the two-epoch window phase0
+/// keeps for `PendingAttestation`s).
+///
+/// Ascending and duplicate-free, since it walks the registry in index order.
+/// Callers that only need the combined balance should use
+/// [`get_unslashed_participating_balance`], which skips building this list.
+pub fn get_unslashed_participating_indices(
+    state: &BeaconState,
+    flag_index: usize,
+    epoch: Epoch,
+) -> Result<Vec<ValidatorIndex>> {
+    let mut participating_indices = Vec::new();
+    for_each_unslashed_participant(state, flag_index, epoch, |index, _| {
+        participating_indices.push(index as ValidatorIndex);
+    })?;
     Ok(participating_indices)
+}
+
+/// The combined effective balance of [`get_unslashed_participating_indices`]'s
+/// result, floored at one increment like
+/// [`get_total_balance`](super::accessors::get_total_balance).
+///
+/// Exactly `get_total_balance(state, &get_unslashed_participating_indices(..)?)`
+/// (same saturating sum, same floor, same errors), computed in the one pass
+/// that finds the participants.
+pub fn get_unslashed_participating_balance(
+    state: &BeaconState,
+    flag_index: usize,
+    epoch: Epoch,
+) -> Result<Gwei> {
+    let mut total: Gwei = 0;
+    for_each_unslashed_participant(state, flag_index, epoch, |_, validator| {
+        total = total.saturating_add(validator.effective_balance);
+    })?;
+    Ok(total.max(preset::EFFECTIVE_BALANCE_INCREMENT))
+}
+
+/// The value [`get_total_active_balance`] returns, in one walk over the
+/// registry's leaves.
+///
+/// Sums every validator active at the current epoch (slashed ones included),
+/// saturating, floored at one increment. It exists so the epoch steps do not
+/// pay [`get_total_active_balance`]'s index `Vec` plus one registry descent
+/// per active validator.
+pub(crate) fn compute_total_active_balance(state: &BeaconState) -> Gwei {
+    let current_epoch = get_current_epoch(state);
+    let total = state
+        .validators()
+        .iter()
+        .filter(|validator| is_active_validator(validator, current_epoch))
+        .fold(0, |total: Gwei, validator| {
+            total.saturating_add(validator.effective_balance)
+        });
+    total.max(preset::EFFECTIVE_BALANCE_INCREMENT)
+}
+
+/// [`get_base_reward_per_increment`] for an already-computed
+/// `total_active_balance`, with the same formula and operation order.
+pub(crate) fn base_reward_per_increment_from_total(total_active_balance: Gwei) -> Gwei {
+    preset::EFFECTIVE_BALANCE_INCREMENT * preset::BASE_REWARD_FACTOR
+        / integer_squareroot(total_active_balance)
 }
 
 /// Which of the three participation flags an attestation with `data`,
@@ -306,9 +383,10 @@ pub fn get_attestation_participation_flag_indices(
 
 /// The reward and penalty for one participation flag, for every validator.
 ///
-/// Reuses [`get_eligible_validator_indices`] and [`is_in_inactivity_leak`]
-/// from phase0's rewards module unchanged, since the specification does not
-/// touch either of them in altair.
+/// Applies [`get_eligible_validator_indices`](super::finality::get_eligible_validator_indices)'s
+/// predicate inline (one walk instead of an index list) and reuses
+/// [`is_in_inactivity_leak`] from phase0's rewards module unchanged, since the
+/// specification does not touch either of them in altair.
 ///
 /// During an inactivity leak, a matching validator earns nothing here for
 /// this flag rather than the balance-weighted share the non-leaking branch
@@ -325,62 +403,53 @@ pub fn get_flag_index_deltas(
     let mut penalties = vec![0; validator_count];
 
     let previous_epoch = get_previous_epoch(state);
-    let unslashed_participating_indices =
-        get_unslashed_participating_indices(state, flag_index, previous_epoch)?;
-    let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
+    // Also the bounds check for the loop below: an active validator past the
+    // end of the participation list fails here, so the loop only indexes the
+    // list for validators this call has already proven are in range.
     let unslashed_participating_balance =
-        get_total_balance(state, &unslashed_participating_indices)?;
+        get_unslashed_participating_balance(state, flag_index, previous_epoch)?;
+    let epoch_participation = epoch_participation(state, previous_epoch)?;
+
+    let weight = constants::PARTICIPATION_FLAG_WEIGHTS[flag_index];
     let unslashed_participating_increments =
         unslashed_participating_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
-    let active_increments = get_total_active_balance(state)? / preset::EFFECTIVE_BALANCE_INCREMENT;
+    let total_active_balance = compute_total_active_balance(state);
+    let active_increments = total_active_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
 
-    // Hoisted out of the loop below, where the specification writes
-    // `get_base_reward(state, index)` per eligible validator. That helper is
-    // `increments * get_base_reward_per_increment(state)`, and the second
-    // factor is `get_total_active_balance`, an unconditional `O(registry
-    // size)` scan with no cache of its own. That is the same quantity
-    // `active_increments` above already paid for, just run through a
-    // different formula (`get_base_reward_per_increment` divides by
-    // `integer_squareroot`, `active_increments` does not), so it is not
-    // reusable as-is and has to be hoisted on its own.
-    //
-    // [`process_epoch::electra::process_epoch`] calls this (via
-    // `process_epoch::altair::process_rewards_and_penalties`) once per
-    // [`crate::beacon::constants::PARTICIPATION_FLAG_WEIGHTS`] entry, three times per
-    // epoch boundary. At mainnet's ~1M validators, the unhoisted form is
-    // three separate million-element scans per *eligible validator*, effectively
-    // unbounded, for what this function already computes once above. This is
-    // the same bug already fixed in `process_attestation`'s per-attester loop
-    // (see that function's own comment), left unfixed here because it runs
-    // once per epoch rather than once per block and so never showed up in a
-    // profile that did not cross an epoch boundary.
-    //
-    // Measured directly: `tests::measures_the_cost_of_get_flag_index_deltas`
-    // times this call at 2^15 validators. Unhoisted, that call took ~11.9s;
-    // hoisted, ~384us: roughly 31,000x at that scale, and the gap widens
-    // further at mainnet's ~2^20 validators, since the unhoisted form is
-    // O(n^2) (`1024x` slower again at that size) while this is O(n) (`32x`
-    // slower again, same as every other size-dependent cost in this crate).
-    let base_reward_per_increment = get_base_reward_per_increment(state)?;
+    // `get_base_reward(state, index)` is `increments *
+    // get_base_reward_per_increment(state)`, and the second factor depends on
+    // the total active balance, a registry-wide sum. It is the same for every
+    // validator, so it is computed once here rather than per eligible
+    // validator (which made this function quadratic in the registry size).
+    let base_reward_per_increment = base_reward_per_increment_from_total(total_active_balance);
+    let leaking = is_in_inactivity_leak(state);
 
-    for index in get_eligible_validator_indices(state) {
+    // One walk over the registry: eligibility (same predicate as
+    // `get_eligible_validator_indices`) and participation are decided from the
+    // iterated validator, so no index list, binary search or descent is needed.
+    for (index, validator) in state.validators().iter().enumerate() {
+        let active = is_active_validator(validator, previous_epoch);
+        if !(active || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch)) {
+            continue;
+        }
         // `get_base_reward(state, index)` inlined against the hoisted
         // per-increment value, in the helper's own order of operations so
         // the result is bit-identical.
-        let increments =
-            state.validator(index)?.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
+        let increments = validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT;
         let base_reward = increments * base_reward_per_increment;
-        if unslashed_participating_indices
-            .binary_search(&index)
-            .is_ok()
-        {
-            if !is_in_inactivity_leak(state) {
+        // Only an active validator has a participation record that counts;
+        // an eligible but inactive (slashed, exited) one never participates,
+        // and its index may lie past the end of the list.
+        let participated =
+            active && !validator.slashed && has_flag(epoch_participation[index], flag_index);
+        if participated {
+            if !leaking {
                 let reward_numerator = base_reward * weight * unslashed_participating_increments;
-                rewards[index as usize] +=
+                rewards[index] +=
                     reward_numerator / (active_increments * constants::WEIGHT_DENOMINATOR);
             }
         } else if flag_index != constants::TIMELY_HEAD_FLAG_INDEX {
-            penalties[index as usize] += base_reward * weight / constants::WEIGHT_DENOMINATOR;
+            penalties[index] += base_reward * weight / constants::WEIGHT_DENOMINATOR;
         }
     }
     Ok((rewards, penalties))
@@ -415,37 +484,66 @@ pub fn get_inactivity_penalty_deltas(
     let mut penalties = vec![0; validator_count];
 
     let previous_epoch = get_previous_epoch(state);
-    let matching_target_indices = get_unslashed_participating_indices(
-        state,
-        constants::TIMELY_TARGET_FLAG_INDEX,
-        previous_epoch,
-    )?;
-
+    let target_participation = epoch_participation(state, previous_epoch)?;
     let (_, _, inactivity_scores) = state.altair_validator_lists()?;
+    let inactivity_penalty_quotient =
+        preset::retuned::inactivity_penalty_quotient(state.fork_name());
 
-    for index in get_eligible_validator_indices(state) {
-        if matching_target_indices.binary_search(&index).is_err() {
-            let effective_balance = state.validator(index)?.effective_balance;
-            let inactivity_score =
-                inactivity_scores
-                    .get(index as usize)
+    // A participation-list bounds error outranks a score error from an
+    // earlier validator (the participants are resolved before any score is
+    // read), so a score error is held back while the walk keeps looking for
+    // one. Both only occur on malformed states.
+    let mut deferred_error = None;
+    for (index, validator) in state.validators().iter().enumerate() {
+        let active = is_active_validator(validator, previous_epoch);
+        let flags = if active {
+            Some(
+                target_participation
+                    .get(index)
                     .copied()
                     .ok_or(Error::IndexOutOfBounds {
-                        index: index as usize,
-                        len: inactivity_scores.len(),
-                    })?;
-
-            let penalty_numerator = effective_balance.checked_mul(inactivity_score).ok_or(
-                Error::ArithmeticOverflow("effective_balance * inactivity_scores[index]"),
-            )?;
-            let inactivity_penalty_quotient =
-                preset::retuned::inactivity_penalty_quotient(state.fork_name());
-            let penalty_denominator = config.inactivity_score_bias * inactivity_penalty_quotient;
-            penalties[index as usize] += penalty_numerator / penalty_denominator;
+                        index,
+                        len: target_participation.len(),
+                    })?,
+            )
+        } else {
+            None
+        };
+        if deferred_error.is_some() {
+            continue;
         }
+        if !(active || (validator.slashed && previous_epoch + 1 < validator.withdrawable_epoch)) {
+            continue;
+        }
+        let participated = flags.is_some_and(|flags| {
+            !validator.slashed && has_flag(flags, constants::TIMELY_TARGET_FLAG_INDEX)
+        });
+        if participated {
+            continue;
+        }
+
+        let Some(&inactivity_score) = inactivity_scores.get(index) else {
+            deferred_error = Some(Error::IndexOutOfBounds {
+                index,
+                len: inactivity_scores.len(),
+            });
+            continue;
+        };
+        let Some(penalty_numerator) = validator.effective_balance.checked_mul(inactivity_score)
+        else {
+            deferred_error = Some(Error::ArithmeticOverflow(
+                "effective_balance * inactivity_scores[index]",
+            ));
+            continue;
+        };
+        let penalty_denominator = config.inactivity_score_bias * inactivity_penalty_quotient;
+        penalties[index] += penalty_numerator / penalty_denominator;
     }
 
-    Ok((rewards, penalties))
+    match deferred_error {
+        Some(error) => Err(error),
+        None => Ok((rewards, penalties)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +585,9 @@ pub(crate) fn altair_state_ref<'a>(
         }),
     }
 }
+
+#[cfg(test)]
+mod reference_tests;
 
 #[cfg(test)]
 mod tests {
