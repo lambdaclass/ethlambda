@@ -26,7 +26,9 @@ use crate::beacon::containers::fulu::DataColumnSidecar;
 use crate::beacon::containers::gloas;
 use crate::beacon::fork_choice::{self, Store};
 use crate::beacon::helpers::accessors::get_beacon_proposer_index;
-use crate::beacon::helpers::misc::{compute_domain, compute_epoch_at_slot, compute_signing_root};
+use crate::beacon::helpers::misc::{
+    compute_domain, compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
+};
 use crate::beacon::lean_boundary::lean_block_unreachable;
 use crate::beacon::precheck;
 use crate::beacon::preset;
@@ -207,8 +209,20 @@ pub fn chain_checks_gloas(
     if is_future_slot(&config, sidecar.slot, now_ms) {
         return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::FutureSlot));
     }
-    // [IGNORE] From a slot greater than the latest finalized slot.
-    if sidecar.slot <= finalized_start_slot(store) {
+    // [IGNORE] From a slot greater than the latest finalized slot, unless it
+    // is a column of the finalized block itself. Not a gloas rule: gloas has
+    // no finalized bound on sidecars, and this one stays only to bound what a
+    // parked row can name. The finalized block is exempt because its envelope
+    // can still be waiting on these columns: a checkpoint-synced anchor is the
+    // finalized block, and no child building on its payload imports until its
+    // sampled columns arrive. Matched by root rather than by slot, since an
+    // anchor state advanced past empty slots finalizes a block from before its
+    // epoch's start slot. A column naming that root is never parked: the block
+    // and its post-state are both stored, so it is judged at once.
+    let finalized = store.beacon_finalized_checkpoint();
+    if sidecar.slot <= compute_start_slot_at_epoch(finalized.epoch)
+        && sidecar.beacon_block_root != finalized.root
+    {
         return ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized));
     }
     // [IGNORE] Already stored, as in [`chain_checks`].
@@ -1232,6 +1246,36 @@ mod tests {
             cheap_checks_gloas(&block_columns(), &store, &card, 0, slot_start_ms(&store, 5)),
             Err(Outcome::Ignore(IgnoreReason::AlreadyStored))
         );
+    }
+
+    /// A checkpoint-synced anchor is the finalized block, and its envelope
+    /// waits on its columns, so the finalized rule lets that block's own
+    /// columns through: at the finalized slot, and below it, where an anchor
+    /// state advanced past empty slots puts its block. Any other block's
+    /// columns there are still dropped.
+    #[test]
+    fn chain_checks_let_the_finalized_blocks_own_gloas_sidecars_through() {
+        let store = store(32);
+        let now = slot_start_ms(&store, 40);
+        let finalized_root = store.beacon_finalized_checkpoint().root;
+        for slot in [32, 30] {
+            let of_finalized = gloas::DataColumnSidecar {
+                beacon_block_root: finalized_root,
+                ..gloas_sidecar(slot, 0)
+            };
+            // This store holds no block, so reaching the block lookup is as
+            // far as it goes.
+            assert_eq!(
+                chain_checks_gloas(&store, &of_finalized, now),
+                ChainVerdict::AwaitParent,
+                "the finalized block's column at slot {slot}"
+            );
+            assert_eq!(
+                chain_checks_gloas(&store, &gloas_sidecar(slot, 0), now),
+                ChainVerdict::Drop(Outcome::Ignore(IgnoreReason::Finalized)),
+                "another block's column at slot {slot}"
+            );
+        }
     }
 
     #[test]
