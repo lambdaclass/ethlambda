@@ -821,6 +821,56 @@ impl BeaconState {
         }
     }
 
+    /// Runs `f` over every balance in order through the list's write cursor
+    /// (`ethlambda_ssz_tree::List::iter_cow`, or the progressive list's
+    /// equivalent from gloas on), stopping at the first error and keeping the
+    /// writes made before it.
+    ///
+    /// For a pass that rewrites most balances: nothing is buffered per element,
+    /// and a leaf whose balances all come out unchanged keeps its hash.
+    pub fn try_update_balances<E>(
+        &mut self,
+        mut f: impl FnMut(&mut ethlambda_ssz_tree::ElemCow<'_, Gwei>) -> core::result::Result<(), E>,
+    ) -> core::result::Result<(), E> {
+        dispatch_state!(self, "BeaconState::try_update_balances", |state| state
+            .balances
+            .try_update_each(&mut f))
+    }
+
+    /// Runs `f` over every validator in order through the registry's write
+    /// cursor, with that validator's balance read in step.
+    ///
+    /// `validators` and `balances` are separate lists of the same state, so a
+    /// pass that rewrites one while reading the other cannot go through
+    /// [`Self::validator_mut`] and [`Self::balance`] one call at a time: this
+    /// splits the borrow. It stops at the first error, keeping the writes made
+    /// before it, and also stops (without error) when the balances run out
+    /// before the validators do: the caller decides whether a short balances
+    /// list is an error.
+    pub fn try_update_validators_with_balances<E>(
+        &mut self,
+        mut f: impl FnMut(
+            &mut ethlambda_ssz_tree::ElemCow<'_, Validator>,
+            Gwei,
+        ) -> core::result::Result<(), E>,
+    ) -> core::result::Result<(), E> {
+        dispatch_state!(
+            self,
+            "BeaconState::try_update_validators_with_balances",
+            |state| {
+                let mut balances = state.balances.iter();
+                let mut pass = state.validators.iter_cow();
+                while let Some(mut validator) = pass.next_cow() {
+                    let Some(&balance) = balances.next() else {
+                        break;
+                    };
+                    f(&mut validator, balance)?;
+                }
+                Ok(())
+            }
+        )
+    }
+
     /// The randao mix for `epoch`, which the specification indexes modulo the
     /// vector length so the vector acts as a ring buffer.
     pub fn randao_mix(&self, epoch: Epoch) -> Bytes32 {

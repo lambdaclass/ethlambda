@@ -763,37 +763,28 @@ pub fn process_pending_consolidations(state: &mut BeaconState, _config: &Config)
 /// hysteresis test itself is [`super::leaves_hysteresis_band`], shared with
 /// that version.
 pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> {
-    // Two passes for the same reason `super::process_effective_balance_updates`
-    // needs them: `validator_mut` clones the element into the update buffer
-    // on every call, whether or not it is then written (see its own doc), so
-    // deciding and writing in one combined pass would buffer and rehash the
-    // whole registry instead of only the validators that actually move; that
-    // also keeps `get_max_effective_balance`, called here on the validator
-    // being decided on, reading rather than fighting a live mutable borrow.
     // The specification reads `state.balances[index]` for every validator, so
     // a balance list shorter than the registry fails at its first missing
-    // entry. Checked here because the zip below would stop at it silently.
+    // entry. Checked here because the paired pass below would stop at it
+    // silently.
     let balance_count = state.iter_balances().len();
     if balance_count < state.validator_count() {
         return Err(Error::UnknownValidator(balance_count as ValidatorIndex));
     }
-    let mut updates = Vec::new();
-    // Zipped rather than indexed: step 3 only writes the balances that changed,
-    // so `balance(index)` would be a tree descent for most validators.
-    for (index, (validator, balance)) in state
-        .iter_validators()
-        .zip(state.iter_balances())
-        .enumerate()
-    {
+    // Same shape as `super::process_effective_balance_updates`: the registry's
+    // write cursor, with the balances read in step.
+    // `get_max_effective_balance` reads the validator being decided on straight
+    // from the cursor's element.
+    state.try_update_validators_with_balances(|validator, balance| {
         if let Some(effective) = updated_effective_balance(validator, balance)? {
-            updates.push((index as ValidatorIndex, effective));
+            // Equal to the old value when capped at the ceiling: checked before
+            // the copy, so a validator already there dirties nothing.
+            if effective != validator.effective_balance {
+                validator.make_mut().effective_balance = effective;
+            }
         }
-    }
-
-    for (index, effective) in updates {
-        state.validator_mut(index)?.effective_balance = effective;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// The effective balance `validator` moves to given its `balance`, or `None`

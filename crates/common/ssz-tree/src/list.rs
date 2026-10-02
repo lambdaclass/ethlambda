@@ -7,6 +7,7 @@ use libssz::{DecodeError, SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher, Sha256Hasher, mix_in_length};
 use libssz_types::TypeError;
 
+use crate::cursor::{ElemCow, IterCow};
 use crate::interface::Interface;
 use crate::iter::Iter;
 use crate::update_map::{UpdateMap, VecMap};
@@ -73,6 +74,27 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
             });
         }
         self.interface.push(value);
+        Ok(())
+    }
+
+    /// An in-order pass that can rewrite any element, for updating most of the
+    /// list at once. Applies pending writes first; the pass's writes reach the
+    /// tree when it is dropped, so an early return or a panic keeps the writes
+    /// made so far.
+    pub fn iter_cow(&mut self) -> IterCow<'_, T> {
+        self.interface.iter_cow()
+    }
+
+    /// Runs `f` on every element in order, stopping at the first error and
+    /// keeping the writes made before it. See [`List::iter_cow`].
+    pub fn try_update_each<E>(
+        &mut self,
+        mut f: impl FnMut(&mut ElemCow<'_, T>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut pass = self.iter_cow();
+        while let Some(mut element) = pass.next_cow() {
+            f(&mut element)?;
+        }
         Ok(())
     }
 

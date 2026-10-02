@@ -86,7 +86,7 @@ impl<T> Tree<T> {
         })
     }
 
-    fn leaf(values: Vec<T>, roots: Option<Box<[Hash256]>>) -> Self {
+    pub(crate) fn leaf(values: Vec<T>, roots: Option<Box<[Hash256]>>) -> Self {
         Tree::Leaf(Leaf {
             hash: OnceLock::new(),
             roots: roots.map(OnceLock::from).unwrap_or_default(),
@@ -272,16 +272,32 @@ impl<T: Value> Tree<T> {
     where
         I: Iterator<Item = (usize, T)>,
     {
+        Self::with_rebuilt_leaves(node, height, first, &mut ElementUpdates(updates))
+    }
+
+    /// A copy of `node` whose leaves are rebuilt by `source`, sharing every
+    /// child the source does not touch.
+    ///
+    /// The descent behind [`Tree::with_updated_leaves`], generalized over what
+    /// happens at a leaf: `source` names, in ascending order, the next index it
+    /// has work for, and builds the new leaf. Everything above the leaves is
+    /// rebuilt only along those paths.
+    pub(crate) fn with_rebuilt_leaves<S: LeafSource<T>>(
+        node: &Arc<Self>,
+        height: usize,
+        first: usize,
+        source: &mut S,
+    ) -> Arc<Self> {
         let packing = packing_factor::<T>();
         let end = first + (packing << height);
-        match updates.peek() {
-            Some(&(index, _)) if index < end => {}
+        match source.peek() {
+            Some(index) if index < end => {}
             _ => return Arc::clone(node),
         }
         // A tree shorter than a leaf is one leaf, at its root; otherwise the
         // walk meets the leaves at the leaf height itself.
         if height <= max_leaf_height::<T>() {
-            return Arc::new(node.updated_leaf(first, end, updates));
+            return source.leaf(node, first, end);
         }
         let below = child_height::<T>(height);
         let span = packing << below;
@@ -290,24 +306,24 @@ impl<T: Value> Tree<T> {
             Tree::Zero(_) => Vec::new(),
             Tree::Leaf(_) => unreachable!("a leaf above the leaf height"),
         };
-        while let Some(&(index, _)) = updates.peek() {
+        while let Some(index) = source.peek() {
             if index >= end {
                 break;
             }
             let slot = (index - first) / span;
             let child_first = first + slot * span;
             if let Some(child) = children.get(slot) {
-                children[slot] = Self::with_updated_leaves(child, below, child_first, updates);
+                children[slot] = Self::with_rebuilt_leaves(child, below, child_first, source);
             } else {
                 // The data is a prefix, so a child past the last one only
                 // appears as the next one, grown from nothing by pushes.
                 assert_eq!(slot, children.len(), "a new child follows the last one");
                 let empty = Arc::new(Tree::Zero(below));
-                children.push(Self::with_updated_leaves(
+                children.push(Self::with_rebuilt_leaves(
                     &empty,
                     below,
                     child_first,
-                    updates,
+                    source,
                 ));
             }
         }
@@ -356,6 +372,53 @@ impl<T: Value> Tree<T> {
     }
 }
 
+/// What a descent does at the leaves it reaches: see
+/// [`Tree::with_rebuilt_leaves`].
+pub(crate) trait LeafSource<T> {
+    /// The index of the next element or leaf this source has work for, in
+    /// strictly ascending order, or `None` when it is done.
+    fn peek(&mut self) -> Option<usize>;
+
+    /// The replacement for `node`, the leaf covering elements `first..end`,
+    /// consuming the work inside that range.
+    fn leaf(&mut self, node: &Arc<Tree<T>>, first: usize, end: usize) -> Arc<Tree<T>>;
+}
+
+/// Element-level writes, folded into each leaf they land in.
+struct ElementUpdates<'a, I: Iterator>(&'a mut Peekable<I>);
+
+impl<T: Value, I: Iterator<Item = (usize, T)>> LeafSource<T> for ElementUpdates<'_, I> {
+    fn peek(&mut self) -> Option<usize> {
+        self.0.peek().map(|&(index, _)| index)
+    }
+
+    fn leaf(&mut self, node: &Arc<Tree<T>>, first: usize, end: usize) -> Arc<Tree<T>> {
+        Arc::new(node.updated_leaf(first, end, self.0))
+    }
+}
+
+/// Whole leaves built elsewhere, to swap in: `(first index, new leaf)` in
+/// ascending order.
+pub(crate) struct LeafReplacements<T>(Peekable<std::vec::IntoIter<(usize, Arc<Tree<T>>)>>);
+
+impl<T> LeafReplacements<T> {
+    pub(crate) fn new(replacements: Vec<(usize, Arc<Tree<T>>)>) -> Self {
+        Self(replacements.into_iter().peekable())
+    }
+}
+
+impl<T> LeafSource<T> for LeafReplacements<T> {
+    fn peek(&mut self) -> Option<usize> {
+        self.0.peek().map(|&(first, _)| first)
+    }
+
+    fn leaf(&mut self, _node: &Arc<Tree<T>>, first: usize, _end: usize) -> Arc<Tree<T>> {
+        let (at, leaf) = self.0.next().expect("peeked just before");
+        debug_assert_eq!(at, first, "a replacement leaf sits at its own position");
+        leaf
+    }
+}
+
 /// The root at height `height` of the subtrees in `roots`, which sit at height
 /// `below`, left to right, with zero subtrees after them.
 ///
@@ -380,7 +443,7 @@ fn fold_roots(mut layer: Vec<Hash256>, below: usize, height: usize) -> Hash256 {
 }
 
 /// A composite element's own root, as a leaf keeps it.
-fn element_root<T: Value>(value: &T) -> Hash256 {
+pub(crate) fn element_root<T: Value>(value: &T) -> Hash256 {
     HashTreeRoot::hash_tree_root(value, &Sha2Hasher)
 }
 

@@ -630,7 +630,10 @@ existing once per chain.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s** (gloas:
   `ethlambda_ssz_tree::ProgressiveList`, same method set), persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
-  states through `Arc`; they have no slices and no `iter_mut`. The registry is
+  states through `Arc`; they have no slices and no `iter_mut` (a pass that
+  rewrites most of a list uses the lazy copy-on-write cursor, `iter_cow` /
+  `try_update_each`, with `BeaconState::registry_mut` for disjoint borrows of
+  both lists). The registry is
   therefore reached through element-level `BeaconState` accessors
   (`validator`/`validator_mut`, `balance`/`balance_mut`, `push_validator`,
   `iter_validators`/`iter_balances`, `validator_count`, `validators_root`), so
