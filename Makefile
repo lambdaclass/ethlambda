@@ -200,7 +200,7 @@ CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-sp
 # `general` is dropped because it has no `networking` runner: naming its
 # members would fail the extraction.
 CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS = $(filter-out general,$(CONSENSUS_SPEC_TESTS_CONFIGS))
-CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar gossip_beacon_aggregate_and_proof gossip_beacon_attestation
+CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar gossip_beacon_aggregate_and_proof gossip_beacon_attestation gossip_voluntary_exit gossip_proposer_slashing gossip_attester_slashing gossip_bls_to_execution_change
 # Includes the handler list, not just the version and configs: growing the
 # list must re-extract an existing tree, which a stamp keyed on version and
 # configs alone would not notice, since neither of those changed.

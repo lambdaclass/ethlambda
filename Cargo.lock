@@ -2001,10 +2001,13 @@ dependencies = [
 name = "ethlambda-crypto"
 version = "0.1.0"
 dependencies = [
+ "blst",
+ "ethlambda-metrics",
  "ethlambda-types",
  "hex",
  "leanvm",
  "postcard",
+ "rayon",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2131,6 +2134,7 @@ dependencies = [
  "blst",
  "c-kzg",
  "datatest-stable",
+ "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-test-fixtures",
@@ -2157,6 +2161,7 @@ dependencies = [
 name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
+ "blst",
  "ethlambda-crypto",
  "ethlambda-metrics",
  "ethlambda-types",

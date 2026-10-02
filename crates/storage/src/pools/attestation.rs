@@ -1,5 +1,8 @@
 //! Unaggregated attestations, held until an aggregator asks for them.
 //!
+//! Lives in the store so every component that holds a [`crate::Store`] shares
+//! the one pool.
+//!
 //! What `GET /eth/v2/validator/aggregate_attestation` answers from: phase0's
 //! `validator.md` ("Aggregation selection" onward) has an aggregator collect
 //! the attestations its committee gossiped for the slot and combine every one
@@ -13,7 +16,6 @@
 //! committee's length, which it has from the same validation.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use ethlambda_types::{
     beacon::{
@@ -27,14 +29,7 @@ use ethlambda_types::{
     primitives::HashTreeRoot as _,
 };
 
-use super::bls;
-
-/// The pool, shared between whatever fills it (the Beacon API's pool
-/// endpoints, the attestation subnet handler, accepted gossip aggregates)
-/// and what reads it (the aggregate endpoint, block
-/// production). There must be exactly one per node: a second instance hides
-/// its writers' entries from the other's readers.
-pub type SharedAttestationPool = Arc<Mutex<AttestationPool>>;
+use ethlambda_crypto::bls;
 
 /// One committee's votes on one `AttestationData`.
 #[derive(Debug)]
@@ -180,7 +175,7 @@ impl AttestationPool {
 
 /// The one committee a single-committee attestation names, `None` if it names
 /// none or several.
-pub(crate) fn single_committee(attestation: &Attestation) -> Option<CommitteeIndex> {
+pub fn single_committee(attestation: &Attestation) -> Option<CommitteeIndex> {
     let mut named = (0..preset::MAX_COMMITTEES_PER_SLOT)
         .filter(|&index| attestation.committee_bits.get(index).unwrap_or(false));
     let first = named.next()?;
@@ -196,8 +191,17 @@ fn set_bits(attestation: &Attestation) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::beacon::helpers::test_state::sign_for;
     use ethlambda_types::beacon::containers::shared::Checkpoint;
+
+    /// Validator `index`'s signature over `message` under a key derived from
+    /// the index, so every call for one validator signs with the same key.
+    fn sign_for(index: usize, message: Root) -> BlsSignature {
+        let mut ikm = [0u8; 32];
+        ikm[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+        let secret = blst::min_pk::SecretKey::key_gen(&ikm, &[])
+            .expect("32 bytes of input material is enough for key generation");
+        BlsSignature(secret.sign(message.as_slice(), bls::DST, &[]).to_bytes())
+    }
 
     fn data(slot: Slot) -> AttestationData {
         AttestationData {

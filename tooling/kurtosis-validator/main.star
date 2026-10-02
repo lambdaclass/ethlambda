@@ -96,6 +96,7 @@ def run(plan, args={}):
             plan,
             beacon,
             output.all_participants[0].cl_context.enr,
+            ",".join([p.el_context.enode for p in output.all_participants]),
             vc.get("image", "ghcr.io/lambdaclass/ethlambda:validator-local"),
         )
         # With `fallback: false` the client talks to ethlambda beacon alone, so
@@ -218,15 +219,19 @@ def label_in_dora(plan, first, last, name):
     plan.start_service(name="dora", description="Restarting Dora to load the new name")
 
 
-def launch_ethlambda_beacon(plan, beacon, bootnode_enr, default_image):
+def launch_ethlambda_beacon(plan, beacon, bootnode_enr, el_enodes, default_image):
     """Run `ethlambda beacon` with a geth of its own, and return its API URL.
 
-    The geth starts from the same genesis as the devnet's and needs no
-    execution-layer peers: ethlambda beacon syncs the chain from genesis and
-    hands geth every payload in order over the Engine API, so each one extends
-    a parent geth already has. That also makes geth answer VALID rather than
-    SYNCING, which keeps the node out of optimistic mode, and the validator
-    client refuses to sign against an optimistic node.
+    The geth starts from the same genesis as the devnet's. It still syncs
+    every block from ethlambda beacon, which hands it every payload in order
+    over the Engine API, so each one extends a parent geth already has. That
+    makes geth answer VALID rather than SYNCING, which keeps the node out of
+    optimistic mode, and the validator client refuses to sign against an
+    optimistic node. It peers with every participant's execution client (not
+    just the first) so transactions (spamoor's included) reach its mempool;
+    spamoor may submit to any of them, and a transaction that reaches only some
+    of them is not reliably relayed. Without that, the blocks this node
+    builds, the only blocks on this devnet, would always be empty.
 
     geth is started first because the Engine API client does not retry a block
     once its attempts are spent.
@@ -247,8 +252,11 @@ def launch_ethlambda_beacon(plan, beacon, bootnode_enr, default_image):
                         "--authrpc.port={}".format(ENGINE_PORT),
                         "--authrpc.vhosts=*",
                         "--authrpc.jwtsecret={}/jwtsecret".format(JWT_MOUNT),
-                        "--nodiscover",
-                        "--maxpeers=0",
+                        # The other ELs run discv5 only, so match them or the
+                        # bootnode is never contacted.
+                        "--discovery.v4=false",
+                        "--discovery.v5=true",
+                        "--bootnodes={}".format(el_enodes),
                     ]
                 )
             ],

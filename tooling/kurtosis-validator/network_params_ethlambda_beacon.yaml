@@ -20,6 +20,16 @@
 # almost none. ethlambda beacon aggregates for the validator client itself, so
 # lighthouse needs no `--import-all-attestations`: it receives the aggregates on
 # `beacon_aggregate_and_proof` and packs them into the blocks it proposes.
+#
+# `spamoor` with an explicit `blob-combined` spammer, so the blocks ethlambda
+# beacon builds carry blobs, which exercises column publication and the cell
+# proof checks. It is spelled out because `main.star` imports ethereum-package
+# unpinned, so its default spammers may change. A user `spammers` list replaces
+# the default list rather than appending to it (input_parser.star overwrites
+# each `spamoor_params` key), so the default EOA spammer is dropped here.
+# `shard_committee_period: 1` shortens how long a validator must have been
+# active before it may exit, so a voluntary exit posted to the pool can be
+# tested within minutes instead of 256 epochs.
 participants:
   - el_type: geth
     cl_type: lighthouse
@@ -33,8 +43,23 @@ network_params:
   electra_fork_epoch: 0
   fulu_fork_epoch: 0
   preregistered_validator_count: 128
+  shard_committee_period: 1
 additional_services:
   - dora
+  - spamoor
+
+spamoor_params:
+  spammers:
+    - name: Blob Spammer
+      description: 3 type-4 blob transactions per slot with 1-2 sidecars each, gas/blobgas limit 20 gwei
+      scenario: blob-combined
+      config:
+        throughput: 6
+        sidecars: 2
+        max_pending: 6
+        max_wallets: 20
+        base_fee: 20
+        blob_fee: 20
 
 ethlambda_validator:
   image: ghcr.io/lambdaclass/ethlambda:beacon-block-production

@@ -706,19 +706,9 @@ async fn run_node(options: Options) -> eyre::Result<()> {
 
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
-    // Filled by the Beacon API's pool endpoint and the aggregator subnets, and
-    // read by the aggregate endpoint and block production; unused on lean.
-    let attestation_pool =
-        ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool::default();
-    let p2p = P2P::spawn(
-        built,
-        setup.store.clone(),
-        setup.node_names,
-        discovery,
-        attestation_pool.clone(),
-    )
-    .await
-    .wrap_err("failed to start discv5 discovery")?;
+    let p2p = P2P::spawn(built, setup.store.clone(), setup.node_names, discovery)
+        .await
+        .wrap_err("failed to start discv5 discovery")?;
 
     let shutdown = CancellationToken::new();
     let rpc_shutdown = shutdown.clone();
@@ -749,7 +739,6 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_sync_status,
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
-                    attestation_pool: attestation_pool.clone(),
                     engine: rpc_engine,
                 },
                 local_peer_id,
