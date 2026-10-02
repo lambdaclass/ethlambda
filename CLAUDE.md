@@ -589,7 +589,10 @@ existing once per chain.
   is the containers' own round-trip and shape tests.
 - **`Validators` and `Balances` are `ethlambda_ssz_tree::List`s**, persistent
   Merkle trees that cache node hashes and share unchanged subtrees between
-  states through `Arc`; they have no slices and no `iter_mut`. A leaf holds a
+  states through `Arc`; they have no slices and no `iter_mut` (a pass that
+  rewrites most of a list uses the lazy copy-on-write cursor, `iter_cow` /
+  `try_update_each`, with `BeaconState::registry_mut` for disjoint borrows of
+  both lists). A leaf holds a
   page-sized run of elements rather than one chunk, and an inner node a page of
   child pointers spanning several binary levels, so a lookup crosses a handful
   of nodes and a rebuilt leaf or node copies one page. Writes are

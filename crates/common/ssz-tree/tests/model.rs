@@ -521,3 +521,288 @@ proptest! {
         rebase_shrunk::<Item, 33, BTreeMap<usize, Item>>(orig_values, extra, hash_orig_first, hash_base_first)?;
     }
 }
+
+// ── Write cursor: random sweeps match a model, and clones are untouched ──
+
+/// What a sweep does to one element, picked by `action % 5`.
+type Decision<T> = (u8, T);
+
+fn decisions<T: Debug + Clone + 'static>(
+    value: impl Strategy<Value = T> + Clone + 'static,
+) -> impl Strategy<Value = Vec<Decision<T>>> {
+    vec((any::<u8>(), value), 1..9)
+}
+
+/// Runs one sweep over `list`, mirroring every write in `model`, and stops
+/// after `stop_at % (len + 1)` elements. Decision per element: skip; `set` a
+/// new value; `set` the same value; `make_mut` and write a new value;
+/// `make_mut` and write the same value.
+fn sweep<T, const N: usize, U>(
+    list: &mut List<T, N, U>,
+    model: &mut [T],
+    stop_at: usize,
+    decisions: &[Decision<T>],
+    noop_only: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let stop = stop_at % (model.len() + 1);
+    let mut pass = list.iter_cow();
+    let mut seen = 0;
+    while let Some(mut element) = pass.next_cow() {
+        if seen == stop {
+            break;
+        }
+        let index = element.index();
+        prop_assert_eq!(index, seen);
+        prop_assert_eq!(&*element, &model[index]);
+        let (action, value) = &decisions[index % decisions.len()];
+        let action = if noop_only {
+            [0, 2, 4][*action as usize % 3]
+        } else {
+            *action % 5
+        };
+        match action {
+            0 => {}
+            1 => {
+                element.set(value.clone());
+                model[index] = value.clone();
+            }
+            2 => {
+                let same = (*element).clone();
+                element.set(same);
+            }
+            3 => {
+                *element.make_mut() = value.clone();
+                model[index] = value.clone();
+            }
+            _ => {
+                let same = model[index].clone();
+                *element.make_mut() = same;
+            }
+        }
+        seen += 1;
+    }
+    drop(pass);
+    Ok(())
+}
+
+fn run_sweeps<T, const N: usize, U>(
+    initial: Vec<T>,
+    ops: Vec<Op<T>>,
+    sweeps: Vec<(usize, Vec<Decision<T>>)>,
+    hash_first: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let mut list = List::<T, N, U>::try_from(initial.clone()).unwrap();
+    let mut model = initial;
+    // Pending pushes and writes exercise the apply-first path.
+    apply_ops(&mut list, &mut model, ops);
+    if hash_first {
+        root(&list);
+    }
+    for (stop_at, decisions) in sweeps {
+        let before = list.clone();
+        let before_model = model.clone();
+        sweep(&mut list, &mut model, stop_at, &decisions, false)?;
+        check_list_matches(&list, &model)?;
+        // The clone taken before the sweep did not change.
+        check_list_matches(&before, &before_model)?;
+        if hash_first {
+            root(&list);
+        }
+    }
+    Ok(())
+}
+
+fn run_noop_sweep<T, const N: usize, U>(
+    initial: Vec<T>,
+    decisions: Vec<Decision<T>>,
+    hash_first: bool,
+) -> Result<(), TestCaseError>
+where
+    T: Value + Debug,
+    U: UpdateMap<T>,
+{
+    let mut list = List::<T, N, U>::try_from(initial.clone()).unwrap();
+    if hash_first {
+        root(&list);
+    }
+    let before = list.clone();
+    let mut model = initial;
+    sweep(&mut list, &mut model, usize::MAX - 1, &decisions, true)?;
+    prop_assert!(list.ptr_eq(&before));
+    check_list_matches(&list, &model)
+}
+
+fn sweeps<T: Debug + Clone + 'static>(
+    value: impl Strategy<Value = T> + Clone + 'static,
+) -> impl Strategy<Value = Vec<(usize, Vec<Decision<T>>)>> {
+    vec((any::<usize>(), decisions(value)), 1..4)
+}
+
+proptest! {
+    #[test]
+    fn u64_sweeps(
+        initial in vec(any::<u64>(), 0..40),
+        ops in ops(any::<u64>()),
+        sweeps in sweeps(any::<u64>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<u64, 64, VecMap<u64>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn u64_sweeps_spanning_leaves(
+        initial in vec(any::<u64>(), 0..1600),
+        ops in ops(any::<u64>()),
+        sweeps in sweeps(any::<u64>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<u64, 4096, VecMap<u64>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn u64_sweeps_at_the_registry_limit(
+        initial in vec(any::<u64>(), 0..1100),
+        ops in ops(any::<u64>()),
+        sweeps in sweeps(any::<u64>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<u64, { 1 << 40 }, VecMap<u64>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    /// A leaf holds 4096 u8s, the widest bitset.
+    #[test]
+    fn u8_sweeps_with_wide_leaves(
+        initial in vec(any::<u8>(), 0..4500),
+        sweeps in sweeps(any::<u8>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<u8, 10_000, VecMap<u8>>(initial, Vec::new(), sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn root_sweeps(
+        initial in vec(any::<[u8; 32]>(), 0..15),
+        ops in ops(any::<[u8; 32]>()),
+        sweeps in sweeps(any::<[u8; 32]>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<[u8; 32], 20, BTreeMap<usize, [u8; 32]>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn item_sweeps_spanning_leaves(
+        initial in vec(item(), 0..400),
+        ops in ops(item()),
+        sweeps in sweeps(item()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<Item, 1024, BTreeMap<usize, Item>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn blob_sweeps(
+        initial in vec(blob(), 0..6),
+        ops in ops(blob()),
+        sweeps in sweeps(blob()),
+        hash_first in any::<bool>(),
+    ) {
+        run_sweeps::<Blob, 9, VecMap<Blob>>(initial, ops, sweeps, hash_first)?;
+    }
+
+    #[test]
+    fn u64_noop_sweep_keeps_the_tree(
+        initial in vec(any::<u64>(), 0..1600),
+        decisions in decisions(any::<u64>()),
+        hash_first in any::<bool>(),
+    ) {
+        run_noop_sweep::<u64, 4096, VecMap<u64>>(initial, decisions, hash_first)?;
+    }
+
+    #[test]
+    fn item_noop_sweep_keeps_the_tree(
+        initial in vec(item(), 0..400),
+        decisions in decisions(item()),
+        hash_first in any::<bool>(),
+    ) {
+        run_noop_sweep::<Item, 1024, BTreeMap<usize, Item>>(initial, decisions, hash_first)?;
+    }
+
+    #[test]
+    fn u64_vector_sweeps(
+        initial in vec(any::<u64>(), 1500),
+        decisions in decisions(any::<u64>()),
+        stop_at in any::<usize>(),
+        hash_first in any::<bool>(),
+    ) {
+        let mut vector = Vector::<u64, 1500, VecMap<u64>>::try_from(initial.clone()).unwrap();
+        if hash_first {
+            root(&vector);
+        }
+        let mut model = initial;
+        let stop = stop_at % 1501;
+        let mut index = 0;
+        let mut pass = vector.iter_cow();
+        while let Some(mut element) = pass.next_cow() {
+            if index == stop {
+                break;
+            }
+            let (action, value) = &decisions[index % decisions.len()];
+            if action % 2 == 0 {
+                element.set(*value);
+                model[index] = *value;
+            }
+            index += 1;
+        }
+        drop(pass);
+        let reference = SszVector::<u64, 1500>::try_from(model.clone()).unwrap();
+        prop_assert_eq!(vector.to_vec(), model);
+        prop_assert_eq!(root(&vector), root(&reference));
+    }
+
+    /// A `u64` list and an `Item` list swept in one loop, each writing from the
+    /// other's element.
+    #[test]
+    fn lockstep_sweep_over_two_lists(
+        ids in vec(any::<u64>(), 0..700),
+        data in any::<[u8; 32]>(),
+        hash_first in any::<bool>(),
+    ) {
+        let items: Vec<Item> = ids.iter().map(|&id| Item { id, data }).collect();
+        let mut numbers = List::<u64, 1024, VecMap<u64>>::try_from(ids.clone()).unwrap();
+        let mut list = List::<Item, 1024, BTreeMap<usize, Item>>::try_from(items.clone()).unwrap();
+        if hash_first {
+            root(&numbers);
+            root(&list);
+        }
+        let mut numbers_model = ids;
+        let mut items_model = items;
+        {
+            let mut numbers_pass = numbers.iter_cow();
+            let mut items_pass = list.iter_cow();
+            while let (Some(mut number), Some(mut item)) =
+                (numbers_pass.next_cow(), items_pass.next_cow())
+            {
+                let index = number.index();
+                prop_assert_eq!(index, item.index());
+                if index % 3 == 0 {
+                    number.set(item.id.wrapping_add(1));
+                    numbers_model[index] = items_model[index].id.wrapping_add(1);
+                }
+                if index % 2 == 0 {
+                    item.make_mut().id = *number;
+                    items_model[index].id = numbers_model[index];
+                }
+            }
+        }
+        check_list_matches(&numbers, &numbers_model)?;
+        check_list_matches(&list, &items_model)?;
+    }
+}
