@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use ethlambda_types::{
     beacon::{containers::BeaconState, fork::ForkName},
@@ -611,17 +612,23 @@ impl StateWriterHandle {
 
     /// Hands a state to the writer, blocking while the queue is full.
     ///
+    /// Returns the instants just before and just after the blocking `send`,
+    /// so a caller can report the hand-off wait apart from the work around
+    /// it. The span is near zero unless the queue was full.
+    ///
     /// # Panics
     ///
     /// If the writer thread is gone, which only happens after it panicked. Its
     /// own panic message is already on the default hook; this is the importer
     /// learning about it, one state later.
-    pub(crate) fn send(&self, request: StateWriteRequest) {
+    pub(crate) fn send(&self, request: StateWriteRequest) -> (Instant, Instant) {
+        let start = Instant::now();
         self.tx
             .as_ref()
             .expect("the sender is taken only in Drop")
             .send(request)
             .expect("the state writer thread died; see the logged panic above");
+        (start, Instant::now())
     }
 }
 

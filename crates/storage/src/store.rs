@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::time::Instant;
 
 use lru::LruCache;
 
@@ -1033,6 +1034,10 @@ pub struct Store {
     /// The background writer, joined when the last clone of this `Store`
     /// drops. See [`StateWriterHandle`].
     state_writer: Arc<StateWriterHandle>,
+    /// The span [`Self::insert_state`] spent handing states to the writer
+    /// since the last [`Self::take_state_handoff`]: the first start and the
+    /// last end. Shared across clones, like the writer it describes.
+    state_handoff: Arc<Mutex<Option<(Instant, Instant)>>>,
 }
 
 /// Build an empty state cache sized to [`STATE_CACHE_CAPACITY`].
@@ -1664,6 +1669,7 @@ impl Store {
             active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
+            state_handoff: Default::default(),
         }
     }
 
@@ -2950,8 +2956,25 @@ impl Store {
         self.cache_state(CacheKey::BlockState(root), state.clone());
         self.pending_states.insert(root, state.clone());
         crate::metrics::inc_state_write_queue_depth();
-        self.state_writer.send(StateWriteRequest { root, state });
+        let (start, end) = self.state_writer.send(StateWriteRequest { root, state });
+        // Repeated hand-offs keep the first start and the last end, so the
+        // span covers every wait since the caller last took it.
+        let mut handoff = self.state_handoff.lock().unwrap();
+        *handoff = Some(match *handoff {
+            Some((first, _)) => (first, end),
+            None => (start, end),
+        });
         Ok(())
+    }
+
+    /// Takes the span `insert_state` spent handing states to the writer since
+    /// the last call, clearing it. `None` when no state was inserted.
+    ///
+    /// The span is the blocking `send` only, so it is the importer's wait for
+    /// the writer (a full queue), not the encode/diff/commit work, which runs
+    /// on the writer thread.
+    pub fn take_state_handoff(&self) -> Option<(Instant, Instant)> {
+        self.state_handoff.lock().unwrap().take()
     }
 
     // ============ Attestation Extraction ============
@@ -6245,6 +6268,20 @@ mod tests {
         let read = store.get_state(&root).expect("get").expect("state present");
         assert_eq!(read.fork_name(), state.fork_name());
         assert_eq!(read.slot(), 7);
+    }
+
+    #[test]
+    fn insert_state_records_the_writer_handoff_and_taking_it_clears_it() {
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        assert!(store.take_state_handoff().is_none());
+
+        store
+            .insert_state(H256::from([1u8; 32]), beacon_test_state(7))
+            .expect("insert beacon state");
+
+        let (start, end) = store.take_state_handoff().expect("a hand-off was recorded");
+        assert!(start <= end);
+        assert!(store.take_state_handoff().is_none());
     }
 
     #[test]
