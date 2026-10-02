@@ -50,6 +50,14 @@
 //!   locally built one) starts at the pull, since no earlier moment is
 //!   knowable.
 //!
+//! The beacon `stf` span is `fork_choice::on_block`, which ends by handing the
+//! post-state to the storage crate's background writer and blocks while that
+//! writer's queue is full. That wait is nested inside the `stf` pair and is
+//! recorded as its own `writer_wait` pair. The `stf` row reports its pair
+//! minus the wait (saturating), so `stf` is state-transition work and the
+//! rows still sum to the end-to-end time. A block with no recorded wait, which
+//! includes every lean block, reports `stf` unchanged.
+//!
 //! One consequence worth keeping in mind when reading the numbers: a gossip
 //! block's total and a fetched block's total do not start at the same point in
 //! the block's life, and a fetched block's total excludes the request round
@@ -79,6 +87,8 @@ pub struct StoreTimings {
     pub verify_crypto_end: Option<Instant>,
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
+    pub writer_wait_start: Option<Instant>,
+    pub writer_wait_end: Option<Instant>,
     pub db_write_start: Option<Instant>,
     pub db_write_end: Option<Instant>,
     pub fc_head_start: Option<Instant>,
@@ -181,8 +191,17 @@ pub struct ImportTimings {
     /// The state transition. On beacon this is `fork_choice::on_block`, which
     /// bundles the transition, the state root and the state write, so
     /// `db_write` stays `None` there.
+    ///
+    /// This pair brackets the whole call, writer wait included. The `stf` row
+    /// reports it minus [`Self::writer_wait_start`]..[`Self::writer_wait_end`].
     pub stf_start: Option<Instant>,
     pub stf_end: Option<Instant>,
+
+    /// Beacon: the blocking hand-off of the post-state to the storage crate's
+    /// background writer, which waits while the writer's queue is full. It
+    /// lies inside the `stf` pair; only the report separates the two.
+    pub writer_wait_start: Option<Instant>,
+    pub writer_wait_end: Option<Instant>,
 
     /// Lean: the block write (`insert_signed_block`) and the state hand-off
     /// (`insert_state`, which since the storage crate moved state writes to a
@@ -311,6 +330,8 @@ impl ImportTimings {
         self.verify_crypto_end = store.verify_crypto_end;
         self.stf_start = store.stf_start;
         self.stf_end = store.stf_end;
+        self.writer_wait_start = store.writer_wait_start;
+        self.writer_wait_end = store.writer_wait_end;
         self.db_write_start = store.db_write_start;
         self.db_write_end = store.db_write_end;
         self.fc_head_start = store.fc_head_start;
@@ -345,7 +366,16 @@ impl ImportTimings {
 
     /// Every section, in the order a block crosses them, whether or not it
     /// crossed this one.
+    ///
+    /// The `stf` row excludes `writer_wait` when one was recorded, since the
+    /// wait is nested inside the `stf` pair; that keeps the rows summing to
+    /// the end-to-end time and `stf` meaning state-transition work.
     fn rows(&self) -> Vec<Row> {
+        let mut stf = Row::new("stf", self.stf_start, self.stf_end);
+        let writer_wait = Row::new("writer_wait", self.writer_wait_start, self.writer_wait_end);
+        if let (Some(total), Some(wait)) = (stf.elapsed, writer_wait.elapsed) {
+            stf.elapsed = Some(total.saturating_sub(wait));
+        }
         vec![
             Row::new("decode", self.decode_start, self.decode_end),
             Row::new("queue", self.queue_start, self.queue_end),
@@ -376,7 +406,8 @@ impl ImportTimings {
                 self.verify_crypto_start,
                 self.verify_crypto_end,
             ),
-            Row::new("stf", self.stf_start, self.stf_end),
+            stf,
+            writer_wait,
             Row::new("db_write", self.db_write_start, self.db_write_end),
             Row::new("fc_head", self.fc_head_start, self.fc_head_end),
             Row::new("block_atts", self.block_atts_start, self.block_atts_end),
@@ -819,6 +850,65 @@ mod tests {
         beacon.absorb_tail(tail_end);
         assert_eq!(beacon.block_atts_end, Some(tail_end));
         assert_eq!(beacon.stf_end, Some(base + Duration::from_millis(90)));
+    }
+
+    fn row_elapsed(timings: &ImportTimings, name: &str) -> Option<Duration> {
+        timings
+            .rows()
+            .into_iter()
+            .find(|row| row.name == name)
+            .and_then(|row| row.elapsed)
+    }
+
+    #[test]
+    fn the_stf_row_excludes_the_writer_wait() {
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_start, timings.stf_end) = pair(base, 0, 90);
+        (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 60, 30);
+
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(60))
+        );
+        assert_eq!(
+            row_elapsed(&timings, "writer_wait"),
+            Some(Duration::from_millis(30))
+        );
+        let present: Vec<&str> = timings
+            .rows()
+            .into_iter()
+            .filter(|row| row.elapsed.is_some())
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(present, vec!["stf", "writer_wait"]);
+    }
+
+    #[test]
+    fn an_absent_writer_wait_leaves_stf_unchanged() {
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_start, timings.stf_end) = pair(base, 0, 90);
+
+        assert_eq!(
+            row_elapsed(&timings, "stf"),
+            Some(Duration::from_millis(90))
+        );
+        assert_eq!(row_elapsed(&timings, "writer_wait"), None);
+    }
+
+    #[test]
+    fn a_writer_wait_longer_than_stf_saturates_stf_to_zero() {
+        let base = Instant::now();
+        let mut timings = ImportTimings::default();
+        (timings.stf_start, timings.stf_end) = pair(base, 0, 10);
+        (timings.writer_wait_start, timings.writer_wait_end) = pair(base, 0, 25);
+
+        assert_eq!(row_elapsed(&timings, "stf"), Some(Duration::ZERO));
+        assert_eq!(
+            row_elapsed(&timings, "writer_wait"),
+            Some(Duration::from_millis(25))
+        );
     }
 
     #[test]

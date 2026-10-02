@@ -253,10 +253,17 @@ workload reads its own histogram. A replayed block reports under
 without passing for a gossip or sync arrival. The phases are the
 `BLOCK_IMPORT_PHASES` labels: `decode`, `queue`, `defer`, `admit`, `guards`,
 `preamble`, `parent_wait`, `cascade_wait`, `da_check`, `columns_wait`, `engine`,
-`verify_struct`, `verify_crypto`, `stf`, `db_write`, `fc_head`, `block_atts`;
-plus the per-arrival sections that are not spans around the others, `prune`,
+`verify_struct`, `verify_crypto`, `stf`, `writer_wait`, `db_write`, `fc_head`,
+`block_atts`; plus the per-arrival sections that are not spans around the others, `prune`,
 `get_head` and `fcu`, since each `import_block` call is one arrival. `get_head`
 is where the head recomputation after every import is charged.
+
+On beacon, `writer_wait` is the importer's blocking hand-off of the post-state
+to the storage crate's background writer, which waits while the writer's queue
+is full. It happens inside `fork_choice::on_block`, so `stf` excludes it: `stf`
+is state-transition work and the two phases do not overlap. When blocks import
+faster than the writer persists them, the wait shows up here rather than in
+`stf`.
 
 ### What is excluded, and why
 
