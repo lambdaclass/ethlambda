@@ -25,6 +25,19 @@ pub fn cheap_checks(
 ) -> Result<(), Outcome> {
     let config = store.config();
     let slot = block.slot();
+    // [IGNORE] This build does not validate a gloas-shaped block against
+    // these (fulu) rules: EIP-7732 changes what a block commits to enough
+    // that accepting one here would propagate something this node cannot
+    // itself follow (its node wiring cannot deliver a gloas block's payload
+    // envelope yet, though `fork_choice::on_block` accepts the block). Checked
+    // first, so a gloas block never reaches a rule below whose fields it
+    // happens to still answer (its `blob_kzg_commitment_count` reads the
+    // builder's bid) but whose verdict would misdescribe it. `Ignore`, not
+    // `Reject`: the sender did nothing wrong, and every honest peer sends
+    // exactly this once this node's own clock reaches gloas.
+    if !block.fork_name().is_followed() {
+        return Err(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+    }
     // [IGNORE] The block is not from a future slot.
     if is_future_slot(&config, slot, now_ms) {
         return Err(Outcome::Ignore(IgnoreReason::FutureSlot));

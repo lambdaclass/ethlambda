@@ -260,6 +260,12 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
     const KIND: &str = beacon_topics::BEACON_BLOCK;
     let block = match beacon_decode::decode_block(&wire.config, payload) {
         Ok(block) => block,
+        // A block at a fork this build has no rules for, as on the aggregate
+        // topic: an honest peer must not be scored as a bad decoder.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -290,11 +296,36 @@ fn triage_block(server: &P2PServer, wire: &BeaconWire, payload: &[u8]) -> Dispat
 
 /// Decode a data column sidecar and run its cheap gossip checks. Same shape as
 /// [`triage_block`].
+///
+/// Decodes first, unlike the clock-based gate this used to be: gossipsub
+/// topic subscriptions are frozen at startup (`build_swarm` does not
+/// resubscribe as a fork boundary is crossed), so a node running across the
+/// gloas boundary stays on its fulu-digest topic the whole time, where a
+/// late but perfectly legitimate fulu sidecar can still legally arrive. A
+/// clock check ahead of the decode would drop that one too, mistaking it for
+/// gloas-shaped just because the clock has moved on. Only on a decode
+/// failure does the clock matter, and only as an approximation: this node's
+/// *topic* fork (whichever one gossip actually subscribed under at startup)
+/// is not threaded down to this handler today, so [`beacon_decode::current_fork`]
+/// (the wall clock) stands in for it. That is exactly backwards for a node
+/// stuck on stale fulu topics past the boundary, the same case this doc
+/// opens with: a genuinely malformed fulu sidecar arriving there reads as
+/// `Ignore` instead of `Reject`, since the clock alone cannot tell "stale
+/// topic, bad bytes" apart from "current topic, gloas-shaped bytes". Safe
+/// either way, since `Ignore` never down-scores a peer; a future change that
+/// carries the topic's own fork into `BeaconWire` (or wherever else carries
+/// the fork digest to this handler) can make this exact instead of merely
+/// safe.
 fn triage_data_column(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
     const KIND: &str = beacon_topics::DATA_COLUMN_SIDECAR_KIND;
     let sidecar = match beacon_decode::decode_data_column_sidecar(payload) {
         Ok(sidecar) => sidecar,
         Err(err) => {
+            let config = server.store.config();
+            if !beacon_decode::current_fork(&config).is_followed() {
+                metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+                return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+            }
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(?err, "Dropping an undecodable data column sidecar");
             return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
@@ -326,6 +357,13 @@ fn triage_aggregate(
     const KIND: &str = beacon_topics::BEACON_AGGREGATE_AND_PROOF;
     let aggregate = match beacon_decode::decode_aggregate_and_proof(&wire.config, payload) {
         Ok(aggregate) => aggregate,
+        // `UnsupportedFork` is not the sender's fault (an honest gloas peer
+        // sends exactly this once this node's own clock reaches gloas), so it
+        // must not score like every other decode failure does.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -396,6 +434,12 @@ fn triage_attestation(
     const KIND: &str = beacon_topics::BEACON_ATTESTATION_KIND;
     let attestation = match beacon_decode::decode_attestation(wire.fork, payload) {
         Ok(attestation) => attestation,
+        // As on the aggregate topic: an honest peer on a fork this node has no
+        // attestation rules for must not be scored as a bad decoder.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(KIND, "unsupported_fork");
+            return Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork));
+        }
         Err(err) => {
             metrics::inc_beacon_gossip(KIND, "decode_failed");
             debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
@@ -446,6 +490,12 @@ fn triage_other(wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
                 "Beacon gossip decoded"
             );
             Outcome::Ignore(IgnoreReason::NoConsumer)
+        }
+        // See `triage_aggregate`'s matching arm for why this scores as
+        // `Ignore` rather than `Reject`.
+        Err(beacon_decode::DecodeError::UnsupportedFork) => {
+            metrics::inc_beacon_gossip(kind, "unsupported_fork");
+            Outcome::Ignore(IgnoreReason::UnsupportedFork)
         }
         Err(err) => {
             metrics::inc_beacon_gossip(kind, "decode_failed");
@@ -745,6 +795,7 @@ mod tests {
     use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::containers::{AttestationData, electra, phase0, shared};
     use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Slot;
 
     use super::*;
@@ -824,6 +875,65 @@ mod tests {
 
         assert!(matches!(
             triage_block(&server, wire, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    /// Phase0-shaped bytes at `slot`: not a valid block at any later fork, so
+    /// what `triage_block` answers depends on the fork `slot` names.
+    fn mismatched_block_bytes(slot: Slot) -> Vec<u8> {
+        phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: Default::default(),
+                state_root: Default::default(),
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        }
+        .to_ssz()
+    }
+
+    async fn triage_block_under(config: Config, payload: &[u8]) -> Dispatch {
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        triage_block(&server, wire, payload)
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_gloas_slot_is_ignored() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.gloas_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbage_bytes_are_still_rejected_once_gloas_is_active() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+
+        assert!(matches!(
+            triage_block_under(config, &[0xff; 3]).await,
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_block_at_a_fulu_slot_is_still_rejected_after_the_fork() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = config.fulu_fork_epoch + 1;
+        let slot = config.fulu_fork_epoch * preset::SLOTS_PER_EPOCH;
+
+        assert!(matches!(
+            triage_block_under(config, &mismatched_block_bytes(slot)).await,
             Dispatch::Report(Outcome::Reject(RejectReason::Decode))
         ));
     }
@@ -924,6 +1034,25 @@ mod tests {
         ));
     }
 
+    /// Gloas's aggregate has no modeled container here, and an honest gloas
+    /// peer sends exactly this once the clock reaches the fork, so the decode
+    /// error must not become a `Reject`, which would penalize it.
+    #[tokio::test]
+    async fn a_gloas_aggregate_is_ignored_as_an_unsupported_fork() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_aggregate(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_aggregate(&server, wire, &payload, Instant::now()),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
+        ));
+    }
+
     #[tokio::test]
     async fn garbage_bytes_on_an_attestation_subnet_are_rejected_as_undecodable() {
         let server = unconnected_beacon_server(Config::mainnet(), 0).await;
@@ -973,6 +1102,25 @@ mod tests {
         assert!(matches!(
             triage_attestation(&server, wire, &payload, 0),
             Dispatch::Report(Outcome::Reject(RejectReason::NonZeroDataIndex))
+        ));
+    }
+
+    /// A gloas `SingleAttestation` has electra's bytes, but its `data.index`
+    /// is the payload flag, so an honest `1` must not reach electra's rules
+    /// and be rejected as a nonzero index.
+    #[tokio::test]
+    async fn a_gloas_attestation_is_ignored_as_an_unsupported_fork() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let server = unconnected_beacon_server(config, 0).await;
+        let wire = server
+            .wire
+            .beacon()
+            .expect("a beacon server has a beacon wire");
+        let payload = electra_single_attestation(4, 1).to_ssz();
+
+        assert!(matches!(
+            triage_attestation(&server, wire, &payload, 0),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::UnsupportedFork))
         ));
     }
 

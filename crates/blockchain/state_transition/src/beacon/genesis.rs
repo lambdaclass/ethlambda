@@ -137,7 +137,7 @@ pub fn initialize_beacon_state_from_eth1(
     // one moment effective balance is set directly from the raw balance
     // rather than eased toward it over time: there is no previous effective
     // balance yet for hysteresis to protect.
-    for index in 0..state.validators().len() as ValidatorIndex {
+    for index in 0..state.validator_count() as ValidatorIndex {
         let balance = state.balance(index)?;
         let effective_balance = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
             .min(preset::MAX_EFFECTIVE_BALANCE);
@@ -154,7 +154,7 @@ pub fn initialize_beacon_state_from_eth1(
     // exist and what their keys are, and this root is what permanently
     // separates this chain, and every signature made on it, from any other
     // network that happens to run the same fork schedule.
-    let genesis_validators_root = state.validators().hash_tree_root();
+    let genesis_validators_root = state.validators_root();
     *state.genesis_validators_root_mut() = genesis_validators_root;
 
     Ok(state)

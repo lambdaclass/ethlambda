@@ -444,41 +444,46 @@ mod tests {
 
     use super::*;
 
-    /// Root of the downloaded consensus spec test fixtures.
+    /// Root of the downloaded BLS/KZG test vectors.
     ///
     /// The fixture harness other stages of this module share does not exist
     /// yet (it lands in a later stage), so this test module loads its own
     /// small subset of it: KZG fixtures are plain YAML with hex strings, no
-    /// SSZ and no snappy compression, so no shared machinery is needed.
+    /// SSZ and no snappy compression, so no shared machinery is needed. Since
+    /// v1.7.0-alpha.13 (consensus-specs #5398) they ship from
+    /// `ethereum/cryptography-specs` rather than consensus-spec-tests.
     fn fixtures_root() -> PathBuf {
-        let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../consensus-spec-tests/tests");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../cryptography-specs/tests");
         if !root.exists() {
             panic!(
-                "consensus spec test fixtures not found at {}; run `make consensus-spec-tests`",
+                "BLS/KZG test vectors not found at {}; run `make cryptography-specs`",
                 root.display()
             );
         }
         root
     }
 
-    /// Loads every `data.yaml` under `general/<fork>/kzg/<handler>/kzg-mainnet/*/`.
-    fn cases(fork: &str, handler: &str) -> Vec<Value> {
-        let dir = fixtures_root()
-            .join("general")
-            .join(fork)
-            .join("kzg")
-            .join(handler)
-            .join("kzg-mainnet");
+    /// Loads every `data.yaml` under `kzg/<handler>/*/`.
+    ///
+    /// The layout is flat, with no fork and no suite level: nothing about a
+    /// blob, a cell, or a KZG point is preset- or fork-dependent, so the
+    /// release ships one `kzg` tree, not one per fork.
+    fn cases(handler: &str) -> Vec<Value> {
+        let dir = fixtures_root().join("kzg").join(handler);
         let entries = fs::read_dir(&dir)
             .unwrap_or_else(|err| panic!("reading fixture directory {}: {err}", dir.display()));
         entries
-            .map(|entry| {
+            .filter_map(|entry| {
                 let case_dir = entry.expect("readable directory entry").path();
+                if !case_dir.is_dir() {
+                    return None;
+                }
                 let data = fs::read(case_dir.join("data.yaml"))
                     .unwrap_or_else(|err| panic!("reading {}: {err}", case_dir.display()));
-                serde_yaml_ng::from_slice(&data)
-                    .unwrap_or_else(|err| panic!("parsing {}: {err}", case_dir.display()))
+                Some(
+                    serde_yaml_ng::from_slice(&data)
+                        .unwrap_or_else(|err| panic!("parsing {}: {err}", case_dir.display())),
+                )
             })
             .collect()
     }
@@ -532,10 +537,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn blob_to_kzg_commitment_matches_fixtures() {
-        let cases = cases("deneb", "blob_to_kzg_commitment");
+        let cases = cases("blob_to_kzg_commitment");
         assert!(
             !cases.is_empty(),
             "no blob_to_kzg_commitment fixtures found"
@@ -556,10 +561,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_kzg_proof_matches_fixtures() {
-        let cases = cases("deneb", "compute_kzg_proof");
+        let cases = cases("compute_kzg_proof");
         assert!(!cases.is_empty(), "no compute_kzg_proof fixtures found");
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
@@ -583,10 +588,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_blob_kzg_proof_matches_fixtures() {
-        let cases = cases("deneb", "compute_blob_kzg_proof");
+        let cases = cases("compute_blob_kzg_proof");
         assert!(
             !cases.is_empty(),
             "no compute_blob_kzg_proof fixtures found"
@@ -609,10 +614,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn verify_kzg_proof_matches_fixtures() {
-        let cases = cases("deneb", "verify_kzg_proof");
+        let cases = cases("verify_kzg_proof");
         assert!(!cases.is_empty(), "no verify_kzg_proof fixtures found");
         for case in &cases {
             let expected = &case["output"];
@@ -637,10 +642,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn verify_blob_kzg_proof_matches_fixtures() {
-        let cases = cases("deneb", "verify_blob_kzg_proof");
+        let cases = cases("verify_blob_kzg_proof");
         assert!(!cases.is_empty(), "no verify_blob_kzg_proof fixtures found");
         for case in &cases {
             let expected = &case["output"];
@@ -664,10 +669,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn verify_blob_kzg_proof_batch_matches_fixtures() {
-        let cases = cases("deneb", "verify_blob_kzg_proof_batch");
+        let cases = cases("verify_blob_kzg_proof_batch");
         assert!(
             !cases.is_empty(),
             "no verify_blob_kzg_proof_batch fixtures found"
@@ -711,10 +716,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_cells_matches_fixtures() {
-        let cases = cases("fulu", "compute_cells");
+        let cases = cases("compute_cells");
         assert!(!cases.is_empty(), "no compute_cells fixtures found");
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
@@ -736,10 +741,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_cells_and_kzg_proofs_matches_fixtures() {
-        let cases = cases("fulu", "compute_cells_and_kzg_proofs");
+        let cases = cases("compute_cells_and_kzg_proofs");
         assert!(
             !cases.is_empty(),
             "no compute_cells_and_kzg_proofs fixtures found"
@@ -768,10 +773,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn recover_cells_and_kzg_proofs_matches_fixtures() {
-        let cases = cases("fulu", "recover_cells_and_kzg_proofs");
+        let cases = cases("recover_cells_and_kzg_proofs");
         assert!(
             !cases.is_empty(),
             "no recover_cells_and_kzg_proofs fixtures found"
@@ -817,10 +822,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn verify_cell_kzg_proof_batch_matches_fixtures() {
-        let cases = cases("fulu", "verify_cell_kzg_proof_batch");
+        let cases = cases("verify_cell_kzg_proof_batch");
         assert!(
             !cases.is_empty(),
             "no verify_cell_kzg_proof_batch fixtures found"
@@ -870,10 +875,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_challenge_matches_fixtures() {
-        let cases = cases("deneb", "compute_challenge");
+        let cases = cases("compute_challenge");
         assert!(!cases.is_empty(), "no compute_challenge fixtures found");
         for case in &cases {
             let blob = hex_bytes(&case["input"]["blob"]);
@@ -893,10 +898,10 @@ mod tests {
     #[test]
     #[cfg_attr(
         not(feature = "beacon-spec-tests"),
-        ignore = "needs the consensus-spec fixture tree; run `make consensus-spec-tests`"
+        ignore = "needs the KZG test vectors; run `make cryptography-specs`"
     )]
     fn compute_verify_cell_kzg_proof_batch_challenge_matches_fixtures() {
-        let cases = cases("fulu", "compute_verify_cell_kzg_proof_batch_challenge");
+        let cases = cases("compute_verify_cell_kzg_proof_batch_challenge");
         assert!(
             !cases.is_empty(),
             "no compute_verify_cell_kzg_proof_batch_challenge fixtures found"

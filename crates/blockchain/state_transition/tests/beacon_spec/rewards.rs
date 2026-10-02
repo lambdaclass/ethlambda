@@ -129,13 +129,20 @@ fn components(
         // No `inclusion_delay_deltas` here: see this module's doc for why
         // altair has nothing left for that component to compute. Bellatrix
         // through fulu reuse this same list; see this module's doc for why
-        // none of them changes it.
+        // none of them changes it. Gloas reuses it too:
+        // `BeaconState::altair_validator_lists` now reaches a gloas state's
+        // participation and inactivity lists as plain slices (progressive
+        // rather than `SszList`, EIP-7688, but both `Deref` to `[T]`), which
+        // is all `altair_helpers::get_flag_index_deltas`/
+        // `get_inactivity_penalty_deltas` ever need; see that accessor's own
+        // doc.
         ForkName::Altair
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra
-        | ForkName::Fulu => vec![
+        | ForkName::Fulu
+        | ForkName::Gloas => vec![
             (
                 "source_deltas",
                 altair_helpers::get_flag_index_deltas(state, TIMELY_SOURCE_FLAG_INDEX),

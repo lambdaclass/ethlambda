@@ -1,19 +1,23 @@
 //! Fulu-specific block processing.
 //!
-//! Fulu changes no field of a block and redefines no step of `process_block`
-//! itself: `beacon-chain.md`'s "Block processing" section for this fork
-//! contains exactly one item, a modified `process_execution_payload`. So
-//! [`process_block`] dispatches on [`electra::BeaconBlock`], the same type
-//! fulu's own [`crate::beacon::containers::SignedBeaconBlock::Fulu`] variant wraps,
-//! rather than a `fulu::BeaconBlock` that does not exist, and every step
-//! but one is [`super::electra`]'s own function, called directly rather than
+//! `beacon-chain.md`'s "Block processing" section for this fork redefines two
+//! of `process_block`'s own steps: a modified `process_execution_payload`
+//! (EIP-7892's blob schedule, below) and a modified `process_operations`,
+//! which reaches one level deeper (through `process_execution_requests`) to
+//! also redefine `process_deposit_request` (both retire the last of the
+//! former eth1-bridge deposit mechanism EIP-6110 began superseding back in
+//! electra; see [`process_operations`]'s own doc). So [`process_block`]
+//! dispatches on [`electra::BeaconBlock`], the same type fulu's own
+//! [`crate::beacon::containers::SignedBeaconBlock::Fulu`] variant wraps, rather
+//! than a `fulu::BeaconBlock` that does not exist, and every step but those
+//! two is [`super::electra`]'s own function, called directly rather than
 //! transcribed.
 //!
-//! The one change is why a block's blob commitment count stops being checked
-//! against a single network-wide constant. Through electra, a block could
-//! carry at most [`Config::max_blobs_per_block_electra`] blobs, each
-//! downloaded and verified whole by every node that wants to check it. Fulu
-//! moves to a sampling model instead (`das-core.md`): a blob is
+//! The blob-schedule change is why a block's blob commitment count stops
+//! being checked against a single network-wide constant. Through electra, a
+//! block could carry at most [`Config::max_blobs_per_block_electra`] blobs,
+//! each downloaded and verified whole by every node that wants to check it.
+//! Fulu moves to a sampling model instead (`das-core.md`): a blob is
 //! erasure-coded into a wide row of columns, and a node gains the same
 //! confidence that the data behind a commitment is available by sampling a
 //! handful of those columns rather than downloading the blob itself. That
@@ -28,11 +32,9 @@
 //! [`Config::max_blobs_per_block`], in place of electra's fixed field.
 //!
 //! [`super::block::process_block_header`], [`super::block::process_randao`],
-//! and [`super::block::process_eth1_data`] are reused because they always
-//! were fork-shared; [`super::electra::process_withdrawals`],
-//! [`super::electra::process_operations`], and
-//! [`super::altair::process_sync_aggregate`] are reused because fulu's
-//! specification never mentions any of the three. [`process_execution_payload`]
+//! [`super::block::process_eth1_data`], [`super::electra::process_withdrawals`],
+//! and [`super::altair::process_sync_aggregate`] are reused because fulu's
+//! specification never mentions any of the five. [`process_execution_payload`]
 //! itself cannot be [`super::electra::process_execution_payload`] called
 //! unchanged, for the same reason electra's own version could not be
 //! deneb's: it reads a different [`Config`] field for the one check that
@@ -42,6 +44,7 @@ use crate::beacon::config::Config;
 use crate::beacon::containers::{BeaconState, deneb, electra};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::electra::pending_queue_fields;
 use crate::beacon::helpers::fulu::{fulu_state, fulu_state_ref};
 use crate::beacon::primitives::{Bytes32, HashTreeRoot as _};
 
@@ -52,9 +55,10 @@ use super::ExecutionEngine;
 // ---------------------------------------------------------------------------
 
 /// Fulu's block processing: electra's own steps, in electra's own order,
-/// with [`process_execution_payload`] standing in for
-/// [`super::electra::process_execution_payload`]. See the module docs for
-/// why that is the only step this fork's specification asks to change.
+/// with [`process_execution_payload`] and [`process_operations`] standing in
+/// for [`super::electra::process_execution_payload`] and
+/// [`super::electra::process_operations`]. See the module docs for why these
+/// are the only steps this fork's specification asks to change.
 pub fn process_block(
     state: &mut BeaconState,
     block: &electra::BeaconBlock,
@@ -73,7 +77,7 @@ pub fn process_block(
     process_execution_payload(state, &block.body, config, engine)?;
     super::block::process_randao(state, &block.body.randao_reveal)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    super::electra::process_operations(state, &block.body, config, committees)?;
+    process_operations(state, &block.body, config, committees)?;
     super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
     Ok(())
 }
@@ -184,6 +188,126 @@ pub fn process_execution_payload(
     fulu_state(state, "process_execution_payload")?.latest_execution_payload_header = header;
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Operations
+// ---------------------------------------------------------------------------
+
+/// Runs every operation in a fulu block, in the specification's order.
+///
+/// [`super::electra::process_operations`]'s own doc explains why this takes
+/// the whole `electra::BeaconBlockBody` rather than one parameter per list;
+/// the same reasoning applies here unchanged.
+///
+/// The former eth1-bridge deposit mechanism EIP-6110 began superseding back
+/// in electra (`deposit_requests_start_index`, `body.deposits`,
+/// `process_deposit`) is fully retired as of this fork: `beacon-chain.md`'s
+/// "Modified `process_operations`" replaces electra's conditional
+/// deposit-count check with an unconditional `assert len(body.deposits) ==
+/// 0` and drops the `process_deposit` call outright, since every validator
+/// deposit arrives as a [`process_deposit_request`] by now. Electra's own
+/// [`super::electra::process_operations`] still reaches the same verdict on
+/// every state that has genuinely finished that transition (the branch it
+/// takes once `state.eth1_deposit_index` has caught up to
+/// `deposit_requests_start_index` is this same empty-deposits assertion), so
+/// the two do not diverge in practice; this copy exists to match the
+/// specification's own text for this fork rather than to fix an observed
+/// bug in the shared version.
+pub fn process_operations(
+    state: &mut BeaconState,
+    body: &electra::BeaconBlockBody,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<()> {
+    // [Modified in Fulu]
+    verify(body.deposits.is_empty(), "len(body.deposits) == 0")?;
+
+    for proposer_slashing in body.proposer_slashings.iter() {
+        super::operations::process_proposer_slashing(state, proposer_slashing, config)?;
+    }
+    for attester_slashing in body.attester_slashings.iter() {
+        super::electra::process_attester_slashing(state, attester_slashing, config)?;
+    }
+    for attestation in body.attestations.iter() {
+        super::electra::process_attestation(state, attestation, committees)?;
+    }
+    // [Modified in Fulu]
+    // Removed `process_deposit`
+    for voluntary_exit in body.voluntary_exits.iter() {
+        super::electra::process_voluntary_exit(state, voluntary_exit, config)?;
+    }
+    for signed_change in body.bls_to_execution_changes.iter() {
+        super::electra::process_bls_to_execution_change(state, signed_change, config)?;
+    }
+    process_execution_requests(state, &body.execution_requests, config)?;
+
+    Ok(())
+}
+
+/// Runs every execution-layer-triggered request in `requests`, in the
+/// specification's order: deposits, then withdrawals, then consolidations.
+///
+/// [`super::electra::process_execution_requests`]'s own copy, with
+/// [`process_deposit_request`] standing in for
+/// [`super::electra::process_deposit_request`]; withdrawal and consolidation
+/// requests are unmentioned by this fork's specification, so those two legs
+/// still call electra's own functions directly.
+pub fn process_execution_requests(
+    state: &mut BeaconState,
+    requests: &electra::ExecutionRequests,
+    config: &Config,
+) -> Result<()> {
+    for deposit in requests.deposits.iter() {
+        process_deposit_request(state, deposit)?;
+    }
+    for withdrawal in requests.withdrawals.iter() {
+        super::electra::process_withdrawal_request(state, withdrawal, config)?;
+    }
+    for consolidation in requests.consolidations.iter() {
+        super::electra::process_consolidation_request(state, consolidation, config)?;
+    }
+    Ok(())
+}
+
+/// Records an execution-layer-triggered deposit (EIP-6110) as a
+/// [`electra::PendingDeposit`], the same queue-then-drain destination every
+/// other deposit source feeds.
+///
+/// [`super::electra::process_deposit_request`]'s own doc explains
+/// `deposit_requests_start_index` and why no signature check happens here.
+/// This fork's `beacon-chain.md` ("Modified `process_deposit_request`") drops
+/// that function's other statement, the one setting
+/// `deposit_requests_start_index` to this request's index, but only the
+/// first time it is ever seen (electra's own `if` guards it on the field
+/// still being [`crate::beacon::constants::UNSET_DEPOSIT_REQUESTS_START_INDEX`]).
+/// A chain that reaches fulu having never processed a deposit request under
+/// electra still has the field at that sentinel, and calling electra's
+/// function unchanged for such a chain's first fulu request would set it,
+/// which is exactly the case [`super::epoch::fulu::process_pending_deposits`]'s
+/// own doc explains this fork's specification means to prevent: the field
+/// stays unset for good, not merely until this fork's own first request.
+///
+/// Also served, unmodified, by gloas: gloas's own `beacon-chain.md` does not
+/// redefine `process_deposit_request` either, so it inherits this fork's
+/// version rather than electra's, and the only thing that kept a gloas state
+/// from calling this exact copy was the queue's own type
+/// ([`crate::beacon::containers::gloas::PendingDeposits`], a
+/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// [`crate::beacon::helpers::electra::PendingQueueFields::push_pending_deposit`]
+/// already abstracts over.
+pub fn process_deposit_request(
+    state: &mut BeaconState,
+    request: &electra::DepositRequest,
+) -> Result<()> {
+    let deposit = electra::PendingDeposit {
+        pubkey: request.pubkey,
+        withdrawal_credentials: request.withdrawal_credentials,
+        amount: request.amount,
+        signature: request.signature,
+        slot: state.slot(),
+    };
+    pending_queue_fields(state, "process_deposit_request")?.push_pending_deposit(deposit)
 }
 
 #[cfg(test)]
@@ -394,5 +518,55 @@ mod tests {
         assert!(
             process_execution_payload(&mut state.clone(), &over_limit, &config, &engine).is_err()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // process_deposit_request
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn leaves_deposit_requests_start_index_unset_and_queues_the_deposit() {
+        use crate::beacon::constants;
+        use crate::beacon::primitives::BlsPubkey;
+
+        let mut state = fulu_state_with_validators(1, empty_execution_payload_header());
+        let BeaconState::Fulu(before) = &state else {
+            unreachable!("built as fulu above")
+        };
+        assert_eq!(
+            before.deposit_requests_start_index,
+            constants::UNSET_DEPOSIT_REQUESTS_START_INDEX
+        );
+        assert!(before.pending_deposits.is_empty());
+        let slot_before = state.slot();
+
+        let request = electra::DepositRequest {
+            pubkey: BlsPubkey::default(),
+            withdrawal_credentials: Bytes32::ZERO,
+            amount: preset::EFFECTIVE_BALANCE_INCREMENT,
+            signature: crate::beacon::primitives::BlsSignature::default(),
+            index: 64,
+        };
+        process_deposit_request(&mut state, &request).unwrap();
+
+        let BeaconState::Fulu(after) = &state else {
+            unreachable!("still fulu")
+        };
+        // Unlike electra's own version, this must leave the field alone:
+        // fulu's specification drops the statement that sets it entirely.
+        assert_eq!(
+            after.deposit_requests_start_index,
+            constants::UNSET_DEPOSIT_REQUESTS_START_INDEX
+        );
+        assert_eq!(after.pending_deposits.len(), 1);
+        let queued = &after.pending_deposits[0];
+        assert_eq!(queued.pubkey, request.pubkey);
+        assert_eq!(
+            queued.withdrawal_credentials,
+            request.withdrawal_credentials
+        );
+        assert_eq!(queued.amount, request.amount);
+        assert_eq!(queued.signature, request.signature);
+        assert_eq!(queued.slot, slot_before);
     }
 }

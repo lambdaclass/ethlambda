@@ -8,6 +8,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants::FAR_FUTURE_EPOCH;
 use crate::beacon::containers::BeaconState;
 use crate::beacon::error::{Error, Result};
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ValidatorIndex};
 
@@ -16,10 +17,7 @@ use super::misc::compute_activation_exit_epoch;
 
 /// Adds `delta` to a validator's balance.
 pub fn increase_balance(state: &mut BeaconState, index: ValidatorIndex, delta: Gwei) -> Result<()> {
-    let balance = state
-        .balances_mut()
-        .get_mut(index as usize)
-        .ok_or(crate::beacon::Error::UnknownValidator(index))?;
+    let balance = state.balance_mut(index)?;
     *balance = balance.saturating_add(delta);
     Ok(())
 }
@@ -30,10 +28,7 @@ pub fn increase_balance(state: &mut BeaconState, index: ValidatorIndex, delta: G
 /// unsigned and explicitly floors this at zero, since a penalty larger than the
 /// remaining balance is normal rather than an error.
 pub fn decrease_balance(state: &mut BeaconState, index: ValidatorIndex, delta: Gwei) -> Result<()> {
-    let balance = state
-        .balances_mut()
-        .get_mut(index as usize)
-        .ok_or(crate::beacon::Error::UnknownValidator(index))?;
+    let balance = state.balance_mut(index)?;
     *balance = balance.saturating_sub(delta);
     Ok(())
 }
@@ -59,8 +54,7 @@ pub fn initiate_validator_exit(
 
     let earliest = compute_activation_exit_epoch(get_current_epoch(state));
     let mut exit_queue_epoch = state
-        .validators()
-        .iter()
+        .iter_validators()
         .map(|validator| validator.exit_epoch)
         .filter(|epoch| *epoch != FAR_FUTURE_EPOCH)
         .chain(core::iter::once(earliest))
@@ -68,8 +62,7 @@ pub fn initiate_validator_exit(
         .unwrap_or(earliest);
 
     let churn_at_that_epoch = state
-        .validators()
-        .iter()
+        .iter_validators()
         .filter(|validator| validator.exit_epoch == exit_queue_epoch)
         .count() as u64;
     if churn_at_that_epoch >= get_validator_churn_limit(state, config) {
@@ -139,10 +132,22 @@ fn initiate_validator_exit_for_fork(
     config: &Config,
 ) -> Result<()> {
     match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => {
+        // Gloas is not a redefinition of `initiate_validator_exit` (EIP-8061
+        // touches only `compute_exit_epoch_and_update_churn`'s own churn
+        // limit, by fork dispatch there), so it reaches electra's copy
+        // unchanged, the same way pyspec's own unmodified
+        // `initiate_validator_exit` does on a gloas state: the churn it
+        // draws through `compute_exit_epoch_and_update_churn` is already
+        // gloas's own by the time it gets here.
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
             crate::beacon::helpers::electra::initiate_validator_exit(state, index, config)
         }
-        _ => initiate_validator_exit(state, index, config),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => initiate_validator_exit(state, index, config),
+        ForkName::Lean => lean_state_unreachable("initiate_validator_exit_for_fork"),
     }
 }
 
@@ -266,5 +271,43 @@ mod tests {
         // the validator keeps most of its balance for now.
         assert!(state.balance(3).unwrap() < balance_before);
         assert!(state.balance(3).unwrap() > balance_before / 2);
+    }
+
+    /// `initiate_validator_exit_for_fork` routes a gloas state to electra's
+    /// `initiate_validator_exit` unchanged, which in turn calls
+    /// `compute_exit_epoch_and_update_churn`, which is where the gloas and
+    /// electra churn split lives (a per-epoch limit chosen by fork, not a
+    /// separate gloas copy of the whole cursor update). This proves the
+    /// split reaches all the way through: with `Config::minimal()` and 64
+    /// validators, gloas's exit churn limit differs from electra's combined
+    /// activation/exit limit (the test asserts they differ before relying
+    /// on it), so the two leave a different `exit_balance_to_consume`
+    /// behind for the same single exit.
+    #[test]
+    fn initiate_validator_exit_for_fork_uses_gloas_own_exit_churn_on_a_gloas_state() {
+        let config = Config::minimal();
+        let mut state = crate::beacon::helpers::test_state::with_validators_at(ForkName::Gloas, 64);
+
+        let gloas_limit =
+            crate::beacon::helpers::gloas::get_exit_churn_limit(&state, &config).unwrap();
+        let electra_limit =
+            crate::beacon::helpers::electra::get_activation_exit_churn_limit(&state, &config)
+                .unwrap();
+        assert_ne!(
+            gloas_limit, electra_limit,
+            "the fixture must actually discriminate between the two churn formulas"
+        );
+
+        let effective_balance = state.validator(0).unwrap().effective_balance;
+        initiate_validator_exit_for_fork(&mut state, 0, &config).unwrap();
+
+        let BeaconState::Gloas(inner) = &state else {
+            unreachable!("built as Gloas");
+        };
+        assert_eq!(
+            inner.exit_balance_to_consume,
+            gloas_limit - effective_balance,
+            "the exit must have consumed gloas's own churn budget, not electra's"
+        );
     }
 }

@@ -31,7 +31,7 @@ use crate::beacon::helpers::misc::compute_signing_root;
 use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
-use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu};
+use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -68,6 +68,12 @@ pub fn process_block(
         }
         containers::SignedBeaconBlock::Fulu(signed) => {
             fulu::process_block(state, &signed.message, config, engine, committees)
+        }
+        // ePBS (EIP-7732) restructures block processing around a builder's
+        // bid rather than an embedded payload: a gloas block carries no
+        // payload for `engine` to answer for, so this arm never reaches it.
+        containers::SignedBeaconBlock::Gloas(signed) => {
+            gloas::process_block(state, &signed.message, config, committees)
         }
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")

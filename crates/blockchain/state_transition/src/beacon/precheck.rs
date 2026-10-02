@@ -142,8 +142,20 @@ pub fn precheck_block(
 /// state, which is the import's job; the specification lets such a block
 /// through rather than rejecting it, and so does this.
 pub(crate) fn fixed_proposer(parent_state: &BeaconState, slot: Slot) -> Option<ValidatorIndex> {
-    let BeaconState::Fulu(state) = parent_state else {
-        return None;
+    let state = match parent_state {
+        BeaconState::Fulu(state) => state,
+        // Gloas keeps the lookahead, but its gossip rules are not applied
+        // here yet (block and column gossip refuse it before this is asked),
+        // so no window is read from a gloas parent and the caller lets the
+        // block through as it does before fulu.
+        BeaconState::Phase0(_)
+        | BeaconState::Altair(_)
+        | BeaconState::Bellatrix(_)
+        | BeaconState::Capella(_)
+        | BeaconState::Deneb(_)
+        | BeaconState::Electra(_)
+        | BeaconState::Gloas(_)
+        | BeaconState::Lean(_) => return None,
     };
     let window_start = compute_start_slot_at_epoch(compute_epoch_at_slot(state.slot));
     let offset = usize::try_from(slot.checked_sub(window_start)?).ok()?;

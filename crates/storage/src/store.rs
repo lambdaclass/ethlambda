@@ -17,9 +17,10 @@ use ethlambda_types::{
     },
     beacon::{
         config::Config,
+        constants::NUM_BLOCK_TIMELINESS_DEADLINES,
         containers::{BeaconState, Checkpoint as BeaconCheckpoint, SignedBeaconBlock},
         fork::ForkName,
-        fork_choice::{LatestMessage, PayloadStatusV1, PowBlock},
+        fork_choice::{BlockPayloadLink, LatestMessage, PayloadStatusV1, PowBlock},
         preset::{Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
     },
@@ -172,7 +173,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 ///
 /// 4 added `PRESET_BASE` and `CONFIG_NAME` to `Config`, at the front of its
 /// encoding, for the same reason and with the same consequence as 3.
-pub const DB_VERSION: u64 = 4;
+///
+/// 5 widened `Config` with the gloas schedule, timing and churn keys
+/// (`max_request_payloads` was already claimed before this version bump), so a
+/// directory written by version 4 decodes into the wrong fields.
+pub const DB_VERSION: u64 = 5;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -649,26 +654,84 @@ impl GossipSignatureBuffer {
 /// copy of a block's post-state, which a node resuming from an anchor does
 /// anyway as it re-imports the unfinalized window. `optimistic_roots` and
 /// `payload_statuses` are likewise answers an execution client can be asked
-/// for again, and `el_block_hashes` is a cache over data already decodable
-/// from the block itself.
+/// for again, and `el_block_hashes` and `payload_links` are caches over data
+/// already decodable from the block itself.
+///
+/// Gloas's own four (`verified_payloads`, `payload_timeliness_vote`,
+/// `payload_data_availability_vote`, and `block_timeliness`'s widened shape)
+/// do not all fit the "a restarted node just gets it again" pattern above,
+/// even though they live in this same scratch. `payload_timeliness_vote` and
+/// `payload_data_availability_vote` do: they are the payload timeliness
+/// committee's per-slot ballot, gone the moment the slot it was cast for is
+/// no longer being decided, the same kind of throwaway `pow_blocks` is.
+/// `verified_payloads` and `block_timeliness` do not, and both must be
+/// persisted before this runs against a live, restarting node: losing
+/// `verified_payloads` on restart does not error, it silently drops every
+/// full payload branch from fork choice (`is_payload_verified` answers
+/// `false` for a block this store genuinely verified before restarting),
+/// and losing a `block_timeliness` entry the gloas fork choice's
+/// `should_apply_proposer_boost` needs makes that call fail outright with
+/// `Error::SpecAssert`. Unlike pre-gloas, where `block_timeliness` is read
+/// only by the same-slot reorg helpers, gloas's own weight computation
+/// reads it on the ordinary head-computation path, so that failure aborts
+/// the whole `gloas_get_weight`/`gloas_get_head` walk, not just an optional
+/// reorg decision. Nothing in this crate persists either yet.
 ///
 /// Most of this is uncapped: the per-validator maps are bounded by the
 /// validator set, and the per-block ones (`block_timeliness`,
-/// `unrealized_justifications`) grow with the blocks this process has
-/// imported. Two are the exception, `el_block_hashes` and `optimistic_roots`,
-/// each pruned to the unfinalized window by its own `prune_*` method. Both
-/// fill on a path that runs for the whole life of the process and has no other
-/// way of emptying them: `forkchoiceUpdated` reads the first once per head
-/// move, and an execution client doing a long state sync answers
-/// `NOT_VALIDATED` to every block, which writes the second once per import.
+/// `unrealized_justifications`, and gloas's own three) grow with the blocks
+/// this process has imported. Three are the exception, `el_block_hashes`,
+/// `payload_links` and `optimistic_roots`, each pruned to the unfinalized
+/// window by its own `prune_*` method. All three fill on a path that runs for
+/// the whole life of the process and has no other way of emptying them:
+/// `forkchoiceUpdated` reads the first once per head move, the head walk
+/// reads the second for every block it visits, and an execution client doing a
+/// long state sync answers `NOT_VALIDATED` to every block, which writes the
+/// third once per import.
 #[derive(Default)]
 pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
-    pub(crate) block_timeliness: HashMap<H256, bool>,
+    /// Gloas widens this from one bool to two, `[ATTESTATION_TIMELINESS_INDEX,
+    /// PTC_TIMELINESS_INDEX]`: a block is now timed against both the
+    /// attestation deadline and the (later) payload-attestation-committee
+    /// deadline. Pre-gloas code reads `ATTESTATION_TIMELINESS_INDEX` only,
+    /// the same deadline it always checked.
+    pub(crate) block_timeliness: HashMap<H256, [bool; NUM_BLOCK_TIMELINESS_DEADLINES]>,
     pub(crate) equivocating_indices: HashSet<u64>,
     pub(crate) latest_messages: HashMap<u64, LatestMessage>,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
+    /// Gloas: beacon block roots whose execution payload envelope has been
+    /// locally delivered and verified (`on_execution_payload_envelope`'s own
+    /// `store.payloads[root] = envelope`), standing in for the specification's
+    /// `store.payloads` for exactly the question this crate asks of it today,
+    /// `is_payload_verified`'s membership test. The envelope itself is not
+    /// kept: nothing here reads one back out yet, and it is not clear this
+    /// scratch is even where a kept envelope should live, since (see this
+    /// struct's own doc) `verified_payloads` needs to survive a restart and
+    /// nothing else here does.
+    pub(crate) verified_payloads: HashSet<H256>,
+    /// Each imported block's payload link (which rules it is handled under,
+    /// and which of its parent's payload branches it builds on), so the head
+    /// computation reads both without decoding a block. Written by `on_block`,
+    /// and by the head computation itself for a block it finds missing (a block
+    /// imported before a restart), the one decode that block ever costs.
+    ///
+    /// A cache over data already decodable from the block, like
+    /// `el_block_hashes`, and bounded the same way: each entry carries its
+    /// block's slot, and `prune_beacon_payload_links` drops the ones below
+    /// finality. A pruned link is derived again by decoding if anything asks
+    /// for it.
+    pub(crate) payload_links: HashMap<H256, (u64, BlockPayloadLink)>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's payload showed up on time, one slot per `PTC_SIZE` index,
+    /// `None` until that member votes. Keyed by beacon block root, like
+    /// `block_timeliness`.
+    pub(crate) payload_timeliness_vote: HashMap<H256, Vec<Option<bool>>>,
+    /// Gloas: the payload timeliness committee's per-member vote on whether
+    /// the block's blob data was available, the sibling of
+    /// `payload_timeliness_vote`.
+    pub(crate) payload_data_availability_vote: HashMap<H256, Vec<Option<bool>>>,
     /// Beacon roots imported on an execution client's `NOT_VALIDATED` answer,
     /// against the slot the unfinalized-window bound prunes them by.
     ///
@@ -1997,8 +2060,8 @@ impl Store {
     ///
     /// Dropping the row is the whole of "remove this block from fork choice":
     /// [`block_index`](Self::block_index) is the only source
-    /// `filter_block_tree`, `compute_weights` and `get_head` read, so a root
-    /// with no row contributes no weight to any ancestor and can never be
+    /// `filter_block_tree`, `compute_node_weights` and `walk_head` read, so a
+    /// root with no row contributes no weight to any ancestor and can never be
     /// walked to.
     ///
     /// The block and its state stay in their own tables. Nothing reads them
@@ -3135,9 +3198,17 @@ impl Store {
         self.beacon.lock().unwrap().proposer_boost_root = root;
     }
 
-    /// Whether `root` arrived within the same-slot reorg window. `None` when
-    /// no timeliness has been recorded for the block yet.
-    pub fn block_timeliness(&self, root: &H256) -> Option<bool> {
+    /// `root`'s two timeliness deadlines,
+    /// `[ATTESTATION_TIMELINESS_INDEX, PTC_TIMELINESS_INDEX]`. `None` when no
+    /// timeliness has been recorded for the block yet.
+    ///
+    /// A pre-gloas caller wants `ATTESTATION_TIMELINESS_INDEX`, the same-slot
+    /// reorg deadline this answered alone before gloas added the second;
+    /// `is_head_late` reads exactly that index rather than a narrower
+    /// accessor existing beside this one, since gloas and pre-gloas share
+    /// one record per block and pre-gloas code writes both entries of it
+    /// (see [`Store::set_block_timeliness`]).
+    pub fn block_timeliness(&self, root: &H256) -> Option<[bool; NUM_BLOCK_TIMELINESS_DEADLINES]> {
         self.beacon
             .lock()
             .unwrap()
@@ -3146,8 +3217,12 @@ impl Store {
             .copied()
     }
 
-    /// Records whether `root` arrived within the same-slot reorg window.
-    pub fn set_block_timeliness(&mut self, root: H256, timely: bool) {
+    /// Records `root`'s two timeliness deadlines. See [`Store::block_timeliness`].
+    pub fn set_block_timeliness(
+        &mut self,
+        root: H256,
+        timely: [bool; NUM_BLOCK_TIMELINESS_DEADLINES],
+    ) {
         self.beacon
             .lock()
             .unwrap()
@@ -3174,6 +3249,72 @@ impl Store {
             .insert(index);
     }
 
+    /// Gloas: whether `root`'s execution payload envelope has been locally
+    /// delivered and verified, the specification's `is_payload_verified`.
+    pub fn has_verified_payload(&self, root: &H256) -> bool {
+        self.beacon.lock().unwrap().verified_payloads.contains(root)
+    }
+
+    /// Gloas: records that `root`'s execution payload envelope has been
+    /// verified.
+    pub fn insert_verified_payload(&mut self, root: H256) {
+        self.beacon.lock().unwrap().verified_payloads.insert(root);
+    }
+
+    /// `root`'s payload link, if one has been recorded. See
+    /// [`BlockPayloadLink`] for what it holds and why a missing entry is not
+    /// an error.
+    pub fn payload_link(&self, root: &H256) -> Option<BlockPayloadLink> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .get(root)
+            .map(|(_slot, link)| *link)
+    }
+
+    /// Records `root`'s payload link, against the block's `slot` that the
+    /// unfinalized-window bound prunes it by.
+    ///
+    /// `&self`, unlike the other setters here: the head computation records the
+    /// link of a block it had to decode and only has a shared reference to the
+    /// store, and the scratch is behind its own lock either way.
+    pub fn set_payload_link(&self, root: H256, slot: u64, link: BlockPayloadLink) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_links
+            .insert(root, (slot, link));
+    }
+
+    /// Drops payload links strictly below `finalized_slot`, always keeping
+    /// `keep`.
+    ///
+    /// The same bound and exemption as
+    /// [`Store::prune_beacon_el_block_hashes`], with one refinement. The head
+    /// walk weighs only blocks at or above the finalized block, so nothing
+    /// below that block's own slot is read again, and a link asked for after
+    /// all is derived again. That slot can be below `finalized_slot` (the
+    /// checkpoint's stored slot is its epoch's start, and a skipped boundary
+    /// leaves the block earlier), so the bound is the lower of the two, read
+    /// from `keep`'s own recorded link.
+    ///
+    /// Prunes nothing when `keep` has no recorded link, since the block's own
+    /// slot is then unknown and a bound taken from the checkpoint could drop
+    /// links the walk still reads. A caller records that link first (see
+    /// `fork_choice::ensure_payload_link`); it is missing after this method
+    /// only when the block is not stored at all.
+    pub fn prune_beacon_payload_links(&mut self, finalized_slot: u64, keep: H256) {
+        let mut beacon = self.beacon.lock().unwrap();
+        let Some(&(keep_slot, _link)) = beacon.payload_links.get(&keep) else {
+            return;
+        };
+        let bound = keep_slot.min(finalized_slot);
+        beacon
+            .payload_links
+            .retain(|root, (slot, _link)| *slot >= bound || *root == keep);
+    }
+
     /// The latest attestation recorded for validator `index`, if any.
     pub fn latest_message(&self, index: u64) -> Option<LatestMessage> {
         self.beacon
@@ -3191,6 +3332,49 @@ impl Store {
             .unwrap()
             .latest_messages
             .insert(index, message);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s payload was timely, one entry per PTC member and `None` for a
+    /// member that has not voted yet. `None` when `root` has no vote vector at
+    /// all yet (`get_forkchoice_store`/`on_block` seed one per block).
+    pub fn payload_timeliness_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-timeliness vote vector.
+    pub fn set_payload_timeliness_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_timeliness_vote
+            .insert(root, votes);
+    }
+
+    /// Gloas: the payload timeliness committee's per-member votes on whether
+    /// `root`'s blob data was available. The sibling of
+    /// [`Store::payload_timeliness_vote`].
+    pub fn payload_data_availability_vote(&self, root: &H256) -> Option<Vec<Option<bool>>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .get(root)
+            .cloned()
+    }
+
+    /// Replaces `root`'s payload-data-availability vote vector.
+    pub fn set_payload_data_availability_vote(&mut self, root: H256, votes: Vec<Option<bool>>) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_data_availability_vote
+            .insert(root, votes);
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
@@ -5586,8 +5770,7 @@ mod tests {
                 effective_balance: i,
                 ..Default::default()
             };
-            parent.validators_mut().push(validator).unwrap();
-            parent.balances_mut().push(i).unwrap();
+            parent.push_validator(validator, i).unwrap();
         }
         parent.apply_pending_mutations();
         store
@@ -5600,7 +5783,7 @@ mod tests {
         let mut child = parent;
         *child.slot_mut() = 11;
         child.latest_block_header_mut().parent_root = parent_root;
-        child.balances_mut()[0] += 1;
+        *child.balance_mut(0).unwrap() += 1;
         child.apply_pending_mutations();
         store
             .insert_signed_block(child_root, beacon_test_block(11, parent_root))
@@ -5617,7 +5800,7 @@ mod tests {
         let resident_parent = cold.get_state(&parent_root).expect("get").expect("present");
         let decoded = cold.get_state(&child_root).expect("get").expect("present");
 
-        assert!(decoded.validators().ptr_eq(resident_parent.validators()));
+        assert!(decoded.validators_ptr_eq(&resident_parent));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
     }
 
@@ -6620,8 +6803,11 @@ mod tests {
         assert!(store.is_equivocating(42));
         assert!(!store.is_equivocating(43));
 
-        clone.set_block_timeliness(H256::from([1u8; 32]), true);
-        assert_eq!(store.block_timeliness(&H256::from([1u8; 32])), Some(true));
+        clone.set_block_timeliness(H256::from([1u8; 32]), [true, false]);
+        assert_eq!(
+            store.block_timeliness(&H256::from([1u8; 32])),
+            Some([true, false])
+        );
         assert_eq!(store.block_timeliness(&H256::from([2u8; 32])), None);
     }
 
@@ -6630,7 +6816,9 @@ mod tests {
         let mut store = Store::test_store();
         let message = LatestMessage {
             epoch: 3,
+            slot: 24,
             root: H256::from([7u8; 32]),
+            payload_present: false,
         };
 
         store.set_latest_message(1, message);
@@ -6773,6 +6961,50 @@ mod tests {
             store.beacon_el_block_hash(head),
             Some(ExecutionBlockHash::repeat_byte(0xb3))
         );
+    }
+
+    /// Payload links are pruned like the execution hashes: strictly below the
+    /// finalized slot, keeping the finalized root even when its block sits
+    /// below that slot.
+    #[test]
+    fn payload_links_prune_strictly_below_the_finalized_slot_and_keep_its_root() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let at = H256::repeat_byte(3);
+        let above = H256::repeat_byte(4);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(finalized, 30, link);
+        let between = H256::repeat_byte(5);
+        store.set_payload_link(stale, 29, link);
+        // Between the finalized block (30) and the checkpoint's slot (32): a
+        // fork block the head walk still reads.
+        store.set_payload_link(between, 31, link);
+        store.set_payload_link(at, 32, link);
+        store.set_payload_link(above, 33, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&finalized), Some(link));
+        assert_eq!(store.payload_link(&stale), None);
+        assert_eq!(store.payload_link(&between), Some(link));
+        assert_eq!(store.payload_link(&at), Some(link));
+        assert_eq!(store.payload_link(&above), Some(link));
+    }
+
+    /// Without a link for the finalized root its own slot is unknown, so the
+    /// prune leaves every link alone rather than bounding on the checkpoint.
+    #[test]
+    fn payload_links_are_not_pruned_when_the_finalized_root_has_none() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        let link = BlockPayloadLink::PreGloas;
+        store.set_payload_link(stale, 29, link);
+
+        store.prune_beacon_payload_links(32, finalized);
+
+        assert_eq!(store.payload_link(&stale), Some(link));
     }
 
     #[test]

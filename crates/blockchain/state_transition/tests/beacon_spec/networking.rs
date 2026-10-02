@@ -8,6 +8,10 @@
 //! `node_id` arrives as a decimal integer of up to 78 digits, wider than any
 //! Rust primitive, so it is read as a string and parsed into the 32 big-endian
 //! bytes the helper takes.
+//!
+//! The same runner directory also holds every `gossip_*` handler (the
+//! specification's gossip validation vectors); those belong to [`super::gossip`]
+//! instead, so [`trials`] filters them out here rather than failing on them.
 
 use ethlambda_state_transition::beacon::das::{
     compute_columns_for_custody_group, get_custody_groups,
@@ -91,11 +95,13 @@ fn check_compute_columns_for_custody_group(case: &Case) -> Result<(), String> {
 
 /// Dispatches one case to the check function its handler names.
 ///
-/// The `other` arm is what makes a fixture release adding a third handler
-/// under `networking/` visible: without it, an unrecognized handler would
-/// simply contribute no trials, and neither `discovery_trial` counts by
-/// handler name, so a silently-skipped handler would report nothing wrong.
-/// Mirrors `kzg.rs`'s own dispatch for the same reason.
+/// The `other` arm is what makes a fixture release adding a third
+/// non-`gossip_*` handler under `networking/` visible: without it, an
+/// unrecognized handler would simply contribute no trials, and neither
+/// `discovery_trial` counts by handler name, so a silently-skipped handler
+/// would report nothing wrong. `gossip_*` handlers never reach here at all;
+/// `trials` filters them out before calling this. Mirrors `kzg.rs`'s own
+/// dispatch for the same reason.
 fn run(handler: &str, case: &Case) -> Result<(), String> {
     match handler {
         "get_custody_groups" => check_get_custody_groups(case),
@@ -105,7 +111,13 @@ fn run(handler: &str, case: &Case) -> Result<(), String> {
 }
 
 pub fn trials() -> Vec<Trial> {
-    let cases = collect_all_handlers(PRESET, "networking");
+    // `gossip_*` handlers live under this same runner directory but are
+    // `super::gossip`'s to collect and run; without this filter every one of
+    // their cases would also reach `run`'s `other` arm below and fail.
+    let cases: Vec<_> = collect_all_handlers(PRESET, "networking")
+        .into_iter()
+        .filter(|(handler, _)| !handler.starts_with("gossip_"))
+        .collect();
 
     let groups_count = cases
         .iter()
