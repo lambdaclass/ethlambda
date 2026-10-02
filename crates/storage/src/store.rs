@@ -636,6 +636,12 @@ impl GossipSignatureBuffer {
     }
 }
 
+/// Bound on a validator index [`Store::set_latest_message`] accepts in debug
+/// builds. Far above any registry this client will meet, far below what a
+/// corrupt index would need to exhaust memory: the dense vote table has one slot
+/// per index up to the highest seen.
+const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
 /// chain history: nothing here survives a restart, and nothing here is worth
 /// the write amplification of persisting.
@@ -666,7 +672,10 @@ pub(crate) struct BeaconScratch {
     pub(crate) proposer_boost_root: H256,
     pub(crate) block_timeliness: HashMap<H256, bool>,
     pub(crate) equivocating_indices: HashSet<u64>,
-    pub(crate) latest_messages: HashMap<u64, LatestMessage>,
+    /// Dense, indexed by validator index: the vote loop reads votes and
+    /// snapshot balances in index order, not hash order. `None` is a validator
+    /// that has not voted (or an index below the highest one seen).
+    pub(crate) latest_messages: Vec<Option<LatestMessage>>,
     /// The justified checkpoint state's balances, flattened for the vote loop
     /// and keyed by their own checkpoint. A derived cache: a miss is rebuilt
     /// from `checkpoint_states`, so nothing needs to persist it.
@@ -3184,21 +3193,33 @@ impl Store {
             .lock()
             .unwrap()
             .latest_messages
-            .get(&index)
+            .get(usize::try_from(index).ok()?)
             .copied()
+            .flatten()
     }
 
     /// Records the latest attestation for validator `index`.
+    ///
+    /// The table grows to hold `index`, so an index must come from a validated
+    /// attestation (a member of a committee of the registry), never from raw
+    /// input: a wild index would allocate a table to match. The assertion is
+    /// the tripwire for that in debug builds and fixtures.
     pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
-        self.beacon
-            .lock()
-            .unwrap()
-            .latest_messages
-            .insert(index, message);
+        debug_assert!(
+            index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
+            "validator index {index} would grow the dense vote table far past any registry"
+        );
+        let slot = usize::try_from(index).expect("validator index fits in usize");
+        let mut beacon = self.beacon.lock().unwrap();
+        if beacon.latest_messages.len() <= slot {
+            beacon.latest_messages.resize(slot + 1, None);
+        }
+        beacon.latest_messages[slot] = Some(message);
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
-    /// message whose validator has not been observed equivocating.
+    /// message whose validator has not been observed equivocating, in
+    /// ascending validator index.
     ///
     /// Takes a closure rather than returning an iterator or a cloned map:
     /// the data lives behind a mutex, so a borrow of it cannot escape the
@@ -3207,10 +3228,17 @@ impl Store {
     /// let it count for either side of the fork it created.
     pub fn for_each_non_equivocating_latest_message(&self, mut f: impl FnMut(u64, LatestMessage)) {
         let beacon = self.beacon.lock().unwrap();
-        for (&index, &message) in &beacon.latest_messages {
-            if !beacon.equivocating_indices.contains(&index) {
-                f(index, message);
+        // Most of the time nobody has equivocated, so skip the set probe per vote.
+        let any_equivocators = !beacon.equivocating_indices.is_empty();
+        for (index, message) in beacon.latest_messages.iter().enumerate() {
+            let Some(message) = message else {
+                continue;
+            };
+            let index = index as u64;
+            if any_equivocators && beacon.equivocating_indices.contains(&index) {
+                continue;
             }
+            f(index, *message);
         }
     }
 
@@ -6673,6 +6701,31 @@ mod tests {
         let mut seen = Vec::new();
         store.for_each_non_equivocating_latest_message(|index, _| seen.push(index));
         assert_eq!(seen, vec![1]);
+    }
+
+    #[test]
+    fn latest_messages_are_visited_in_validator_index_order_and_gaps_are_skipped() {
+        let mut store = Store::test_store();
+        let message = |epoch| LatestMessage {
+            epoch,
+            root: H256::from([epoch as u8; 32]),
+        };
+
+        // Written out of order, with a gap, and one overwritten.
+        store.set_latest_message(9, message(1));
+        store.set_latest_message(2, message(2));
+        store.set_latest_message(5, message(3));
+        store.set_latest_message(5, message(4));
+
+        let mut seen = Vec::new();
+        store
+            .for_each_non_equivocating_latest_message(|index, vote| seen.push((index, vote.epoch)));
+        assert_eq!(seen, vec![(2, 2), (5, 4), (9, 1)]);
+
+        assert_eq!(store.latest_message(5).map(|vote| vote.epoch), Some(4));
+        assert_eq!(store.latest_message(3), None, "a gap is not a vote");
+        assert_eq!(store.latest_message(1_000), None, "past the table");
+        assert_eq!(store.latest_message(u64::MAX), None);
     }
 
     #[test]
