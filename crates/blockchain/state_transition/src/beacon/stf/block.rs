@@ -24,7 +24,8 @@ use crate::beacon::containers::{self, BeaconBlockHeader, BeaconState, Eth1Data, 
 use crate::beacon::error::{Result, verify};
 use crate::beacon::hash::hash;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain, get_randao_mix,
+    ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_domain,
+    get_randao_mix,
 };
 use crate::beacon::helpers::math::xor;
 use crate::beacon::helpers::misc::compute_signing_root;
@@ -46,29 +47,55 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     match signed_block {
         containers::SignedBeaconBlock::Phase0(signed) => {
-            process_block_phase0(state, &signed.message, config, committees)
+            process_block_phase0(state, &signed.message, config, committees, active_balances)
         }
         containers::SignedBeaconBlock::Altair(signed) => {
-            process_block_altair(state, &signed.message, config, committees)
+            process_block_altair(state, &signed.message, config, committees, active_balances)
         }
-        containers::SignedBeaconBlock::Bellatrix(signed) => {
-            bellatrix::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Capella(signed) => {
-            capella::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Deneb(signed) => {
-            deneb::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Electra(signed) => {
-            electra::process_block(state, &signed.message, config, engine, committees)
-        }
-        containers::SignedBeaconBlock::Fulu(signed) => {
-            fulu::process_block(state, &signed.message, config, engine, committees)
-        }
+        containers::SignedBeaconBlock::Bellatrix(signed) => bellatrix::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+        ),
+        containers::SignedBeaconBlock::Capella(signed) => capella::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+        ),
+        containers::SignedBeaconBlock::Deneb(signed) => deneb::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+        ),
+        containers::SignedBeaconBlock::Electra(signed) => electra::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+        ),
+        containers::SignedBeaconBlock::Fulu(signed) => fulu::process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+        ),
         containers::SignedBeaconBlock::Lean(_) => {
             crate::beacon::lean_block_unreachable("process_block")
         }
@@ -82,6 +109,7 @@ pub fn process_block_phase0(
     block: &phase0::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -101,6 +129,7 @@ pub fn process_block_phase0(
         &block.body.voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
     Ok(())
 }
@@ -116,6 +145,7 @@ pub fn process_block_altair(
     block: &altair::BeaconBlock,
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     process_block_header(
         state,
@@ -135,8 +165,9 @@ pub fn process_block_altair(
         &block.body.voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
