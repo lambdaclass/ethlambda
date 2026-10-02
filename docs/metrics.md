@@ -422,6 +422,22 @@ is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
 
+### Beacon Total Active Balance Cache
+
+The total active balance (the divisor of every attestation's base reward and of
+the sync aggregate's rewards) is one registry pass, and an ordinary block asks
+for it about nine times. `ActiveBalanceCache` in the `Store` keeps it per epoch,
+keyed by the epoch and the block root that fixes it. This is ethlambda-specific,
+not part of the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_total_active_balance_lookups_total` | Counter | Total active balance lookups, by whether the cache served them | On every `ActiveBalanceCacheExt::total_active_balance` call: block processing's attestations and sync aggregate | result=hit,miss,unkeyable |
+
+Expect one miss per epoch per chain, and hits otherwise. `unkeyable` is the
+genesis state asking about its own epoch, and should be zero on a
+checkpoint-synced follower.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,

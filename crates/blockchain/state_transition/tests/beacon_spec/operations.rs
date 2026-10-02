@@ -91,7 +91,7 @@ use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, altair, bellatrix, capella, deneb, electra, phase0, shared,
 };
-use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
+use ethlambda_state_transition::beacon::helpers::accessors::{ActiveBalanceCache, CommitteeCache};
 use ethlambda_state_transition::beacon::primitives::HashTreeRoot as _;
 use ethlambda_state_transition::beacon::stf::altair as altair_stf;
 use ethlambda_state_transition::beacon::stf::bellatrix as bellatrix_stf;
@@ -127,6 +127,7 @@ fn apply(
     // calls fits on one line; a case processes a single attestation, so there
     // is nothing for the cache to share between calls.
     let committees = CommitteeCache::default();
+    let active_balances = ActiveBalanceCache::default();
     let outcome = match handler {
         // Every fork's own `BeaconBlock` carries a different concrete body
         // (altair's adds a sync aggregate, bellatrix's an execution payload,
@@ -216,20 +217,20 @@ fn apply(
             // so altair's own function serves both.
             ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                altair_stf::process_attestation(state, &attestation, &committees)
+                altair_stf::process_attestation(state, &attestation, &committees, &active_balances)
             }
             // Deneb widens the inclusion window and the timely-target
             // condition (EIP-7045); the container is still phase0's.
             ForkName::Deneb => {
                 let attestation: phase0::Attestation = case.ssz("attestation");
-                deneb_stf::process_attestation(state, &attestation, &committees)
+                deneb_stf::process_attestation(state, &attestation, &committees, &active_balances)
             }
             // Electra reshapes the container itself (EIP-7549's
             // `committee_bits`), and fulu's specification makes no further
             // change to either the container or the function.
             ForkName::Electra | ForkName::Fulu => {
                 let attestation: electra::Attestation = case.ssz("attestation");
-                electra_stf::process_attestation(state, &attestation, &committees)
+                electra_stf::process_attestation(state, &attestation, &committees, &active_balances)
             }
             ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
         },
@@ -307,7 +308,7 @@ fn apply(
         // further fork match.
         "sync_aggregate" => {
             let sync_aggregate: altair::SyncAggregate = case.ssz("sync_aggregate");
-            altair_stf::process_sync_aggregate(state, &sync_aggregate)
+            altair_stf::process_sync_aggregate(state, &sync_aggregate, &active_balances)
         }
         // The fixture's operation file is a whole `BeaconBlockBody`, not a
         // bare payload: checking one needs fields that live on the body

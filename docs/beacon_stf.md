@@ -283,15 +283,29 @@ lists lighthouse keeps its state in.
 The access pattern matters. `state.validator(i)` and `balances()[i]` are tree
 descents, cheap next to a hash but far from an array index, and they add up
 when a helper calls them once per validator:
-`get_total_active_balance` builds the active-index `Vec` and then reads every
-index back, and runs several times per block (once per attestation through
-`get_base_reward_per_increment`, once per execution request through the churn
-limits). In the 2026-09-28 import profile, those per-index reads and the
-repeated whole-registry scans were the largest cost left after hashing. A loop
-over the registry should walk `validators().iter()`, zipped with
-`balances().iter()` where it needs both. The total active balance is the obvious
-candidate for computing once per epoch rather than per call, once it is shown
-that no block operation changes it mid-epoch.
+`get_total_active_balance` used to build the active-index `Vec` and then read
+every index back, and runs several times per block (once per attestation through
+`get_base_reward_per_increment`, twice per sync aggregate, once per execution
+request through the churn limits). In the 2026-09-28 import profile, those
+per-index reads and the repeated whole-registry scans were the largest cost left
+after hashing. A loop over the registry should walk `validators().iter()`,
+zipped with `balances().iter()` where it needs both; `get_total_active_balance`
+now does, in one pass.
+
+Block processing does not even pay that pass more than once per epoch. The
+total is cached in `ActiveBalanceCache` (`crates/storage/src/active_balance_cache.rs`),
+held by the `Store` beside the committee cache and consulted through
+`ActiveBalanceCacheExt::total_active_balance`. The key is the epoch plus the
+block root at the last slot of the epoch before it: effective balances are
+written only by that epoch's `process_effective_balance_updates`, and every
+activation or exit lands at least `MAX_SEED_LOOKAHEAD` epochs ahead, so no block
+inside the epoch can move the total, and two states agreeing on that root agree
+on it. The cache lives outside the state, so it adds no field to `BeaconState`
+and no SSZ concern; callers with no store (spec runners, block production,
+tests) hold a fresh `ActiveBalanceCache::default()`. Epoch processing, churn
+helpers and fork choice keep calling the uncached one-pass
+`get_total_active_balance`. In debug builds every hit is cross-checked against a
+fresh computation.
 
 ## Macros and traits
 

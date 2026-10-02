@@ -11,7 +11,9 @@ use std::sync::Arc;
 // and so on), so every existing import of the type this module used to define
 // is unaffected by its move to `ethlambda-storage`; see [`CommitteeCacheExt`]
 // below for what this crate still contributes.
-pub use ethlambda_storage::{CommitteeCache, Lookup, ShufflingKey};
+pub use ethlambda_storage::{
+    ActiveBalanceCache, ActiveBalanceKey, CommitteeCache, Lookup, ShufflingKey,
+};
 
 use crate::beacon::config::Config;
 use crate::beacon::constants;
@@ -301,6 +303,96 @@ impl CommitteeCacheExt for CommitteeCache {
     }
 }
 
+/// The key `state`'s total active balance is cached under, or `None` if
+/// `state` cannot name the block that fixes it: the state has not advanced
+/// past that block's slot (the genesis state, asked about its own epoch), or
+/// the slot has fallen out of its `SLOTS_PER_HISTORICAL_ROOT` window. `None`
+/// means the lookup is computed for its caller alone and not cached.
+///
+/// The total for a state in epoch `E` sums the effective balances of the
+/// validators active at `E`, and both inputs are fixed once epoch `E - 1`
+/// ends. Effective balances are written only by `process_effective_balance_updates`,
+/// at the end of `E - 1`; an epoch's update is the last writer before `E`'s
+/// states exist. The active set moves only through `activation_epoch` and
+/// `exit_epoch`, and every assignment goes through `compute_activation_exit_epoch`,
+/// at least `MAX_SEED_LOOKAHEAD` epochs ahead, so none can land in `E` for `E`
+/// itself. Slashing sets `slashed` and queues an exit but leaves effective
+/// balances alone, and the spec's total keeps slashed validators. Deposits
+/// append validators that are not yet active, and the Electra upgrade zeroes
+/// only never-activated validators. So the block root at the last slot of
+/// `E - 1` identifies the history that determines the total: two states
+/// agreeing on it agree on the total, however much they disagree after it.
+///
+/// That is one epoch later than [`shuffling_key`]'s root (the last slot of
+/// `E - 2`), because the shuffle's inputs are fixed `MIN_SEED_LOOKAHEAD` epochs
+/// ahead of use and the total's are not: an effective balance written at the
+/// end of `E - 1` is part of the total for `E`, so a key rooted at `E - 2`
+/// would let two branches that diverge during `E - 1` share one entry.
+///
+/// # Epoch 0
+///
+/// There is no epoch before it, so it takes the genesis block, at slot 0, as
+/// its deciding block, as [`shuffling_key`] does for its first epochs. Nothing
+/// after genesis can reach either input within epoch 0 (the effective-balance
+/// update at its end writes epoch 1's), and a state from a different genesis
+/// has a different genesis block root.
+///
+/// # Callers must be block processing
+///
+/// Between `process_effective_balance_updates` and the slot increment that
+/// follows it, a state is still in epoch `E - 1` but already carries epoch
+/// `E`'s effective balances, so its total would not match a key rooted at
+/// `E - 2`'s end. The only callers routed through the cache are block
+/// processing's (attestations, sync aggregate), which never run in that
+/// window: a block is processed on a state that `process_slots` has already
+/// advanced to the block's slot. Epoch processing keeps calling the
+/// uncached [`get_total_active_balance`].
+fn active_balance_key(state: &BeaconState) -> Option<ActiveBalanceKey> {
+    let epoch = get_current_epoch(state);
+    let decision_slot = compute_start_slot_at_epoch(epoch).saturating_sub(1);
+    let decision_root = get_block_root_at_slot(state, decision_slot).ok()?;
+    Some(ActiveBalanceKey {
+        epoch,
+        decision_root,
+    })
+}
+
+/// Extends `ethlambda-storage`'s [`ActiveBalanceCache`] with the consensus
+/// logic that keys and computes its entries, for the same reason
+/// [`CommitteeCacheExt`] lives here and not in `ethlambda-storage`.
+pub trait ActiveBalanceCacheExt {
+    /// `get_total_active_balance(state)`, computed once per key and then
+    /// served to every later caller naming the same one. Equal to the
+    /// uncached function for every state it is given; see [`active_balance_key`]
+    /// for why, and for who may call it.
+    fn total_active_balance(&self, state: &BeaconState) -> Result<Gwei>;
+}
+
+impl ActiveBalanceCacheExt for ActiveBalanceCache {
+    fn total_active_balance(&self, state: &BeaconState) -> Result<Gwei> {
+        let Some(key) = active_balance_key(state) else {
+            crate::metrics::inc_total_active_balance_lookups("unkeyable");
+            return get_total_active_balance(state);
+        };
+
+        let (total, lookup) = self.get_or_compute(key, || compute_total_active_balance(state));
+        crate::metrics::inc_total_active_balance_lookups(match lookup {
+            Lookup::Hit => "hit",
+            Lookup::Miss => "miss",
+        });
+        // The cross-check the key's soundness argument rests on: a stale hit
+        // would mean some writer moved an input mid-epoch.
+        if lookup == Lookup::Hit {
+            debug_assert_eq!(
+                total,
+                compute_total_active_balance(state),
+                "stale total active balance cache entry"
+            );
+        }
+        Ok(total)
+    }
+}
+
 /// The committee at `slot` with index `index`.
 ///
 /// One epoch's active set is shuffled once and then split across every slot and
@@ -406,6 +498,11 @@ pub fn get_total_balance(state: &BeaconState, indices: &[ValidatorIndex]) -> Res
 /// walks the leaves, whereas `state.validator(i)` descends from the root each
 /// time.
 pub fn get_total_active_balance(state: &BeaconState) -> Result<Gwei> {
+    Ok(compute_total_active_balance(state))
+}
+
+/// [`get_total_active_balance`]'s body, without the `Result` it never needed.
+fn compute_total_active_balance(state: &BeaconState) -> Gwei {
     let epoch = get_current_epoch(state);
     let total = state
         .validators()
@@ -414,7 +511,7 @@ pub fn get_total_active_balance(state: &BeaconState) -> Result<Gwei> {
         .fold(0, |sum: Gwei, validator| {
             sum.saturating_add(validator.effective_balance)
         });
-    Ok(total.max(preset::EFFECTIVE_BALANCE_INCREMENT))
+    total.max(preset::EFFECTIVE_BALANCE_INCREMENT)
 }
 
 /// The signing domain for `domain_type` at `epoch`, or at the current epoch when
@@ -728,6 +825,91 @@ mod tests {
         assert_eq!(
             get_total_active_balance(&state).unwrap(),
             preset::EFFECTIVE_BALANCE_INCREMENT
+        );
+    }
+
+    /// A state at the first slot of `epoch` whose every block root is `root`.
+    fn state_at_epoch_with_root(epoch: Epoch, root: u8) -> BeaconState {
+        let mut state = with_validators(16);
+        *state.slot_mut() = compute_start_slot_at_epoch(epoch);
+        for slot in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+            state.block_roots_mut()[slot] = Root::repeat_byte(root);
+        }
+        state
+    }
+
+    /// A lookup returns the spec value and the second one is a hit.
+    #[test]
+    fn the_active_balance_cache_serves_the_spec_value() {
+        let state = state_at_epoch_with_root(3, 1);
+        let cache = ActiveBalanceCache::default();
+        let expected = get_total_active_balance(&state).unwrap();
+
+        assert_eq!(cache.total_active_balance(&state).unwrap(), expected);
+        let key = active_balance_key(&state).unwrap();
+        assert_eq!(cache.get(key), Some(expected));
+        assert_eq!(cache.total_active_balance(&state).unwrap(), expected);
+    }
+
+    /// Two sibling states in one epoch that disagree on the deciding block
+    /// keep separate entries, each with its own registry's total.
+    #[test]
+    fn sibling_states_with_different_decision_roots_get_different_entries() {
+        let cache = ActiveBalanceCache::default();
+        let a = state_at_epoch_with_root(3, 1);
+        let mut b = state_at_epoch_with_root(3, 2);
+        // Sibling `b` has a validator the fork `a` never saw.
+        b.validator_mut(0).unwrap().effective_balance = 0;
+        b.apply_pending_mutations();
+
+        let total_a = cache.total_active_balance(&a).unwrap();
+        let total_b = cache.total_active_balance(&b).unwrap();
+
+        assert_ne!(total_a, total_b);
+        assert_eq!(total_a, get_total_active_balance(&a).unwrap());
+        assert_eq!(total_b, get_total_active_balance(&b).unwrap());
+        assert_eq!(cache.get(active_balance_key(&a).unwrap()), Some(total_a));
+        assert_eq!(cache.get(active_balance_key(&b).unwrap()), Some(total_b));
+    }
+
+    /// Across an epoch boundary the key changes, so the lookup misses and
+    /// fills a new entry instead of serving the old epoch's total.
+    #[test]
+    fn crossing_an_epoch_boundary_misses_and_refills() {
+        let cache = ActiveBalanceCache::default();
+        let mut state = state_at_epoch_with_root(3, 1);
+        let before = cache.total_active_balance(&state).unwrap();
+        let old_key = active_balance_key(&state).unwrap();
+
+        // The effective-balance update at the boundary, then the new epoch
+        // with its own deciding root.
+        state.validator_mut(0).unwrap().effective_balance = 0;
+        state.apply_pending_mutations();
+        *state.slot_mut() = compute_start_slot_at_epoch(4);
+        let last_slot =
+            (compute_start_slot_at_epoch(4) - 1) as usize % preset::SLOTS_PER_HISTORICAL_ROOT;
+        state.block_roots_mut()[last_slot] = Root::repeat_byte(9);
+
+        let new_key = active_balance_key(&state).unwrap();
+        assert_ne!(old_key, new_key);
+        let after = cache.total_active_balance(&state).unwrap();
+        assert_eq!(after, get_total_active_balance(&state).unwrap());
+        assert_ne!(before, after);
+        assert_eq!(cache.get(old_key), Some(before));
+        assert_eq!(cache.get(new_key), Some(after));
+    }
+
+    /// The genesis state cannot name the deciding block, so it is computed
+    /// for its caller alone and not cached.
+    #[test]
+    fn an_unkeyable_state_is_computed_but_not_cached() {
+        let mut state = with_validators(8);
+        *state.slot_mut() = 0;
+        assert!(active_balance_key(&state).is_none());
+        let cache = ActiveBalanceCache::default();
+        assert_eq!(
+            cache.total_active_balance(&state).unwrap(),
+            get_total_active_balance(&state).unwrap()
         );
     }
 
