@@ -62,6 +62,40 @@ pub fn inc_committee_cache_lookups(result: &str) {
         .inc();
 }
 
+static LEAN_BEACON_JUSTIFIED_BALANCES_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        register_int_counter_vec!(
+            "lean_beacon_justified_balances_lookups_total",
+            "Beacon fork-choice justified-balances snapshot lookups, by whether the cached snapshot served them",
+            &["result"]
+        )
+        .unwrap()
+    },
+);
+
+/// Count one justified-balances lookup: `hit` (the cached snapshot matched the
+/// justified checkpoint) or `miss` (it was rebuilt from the checkpoint state).
+pub fn inc_justified_balances_lookups(result: &str) {
+    LEAN_BEACON_JUSTIFIED_BALANCES_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
+static LEAN_BEACON_JUSTIFIED_BALANCES_BUILD_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_beacon_justified_balances_build_seconds",
+        "Duration of one justified-balances snapshot build (one pass over the checkpoint state's registry)",
+        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .unwrap()
+});
+
+/// Time one justified-balances snapshot build, excluding the checkpoint state
+/// lookup it starts from.
+pub fn time_justified_balances_build() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_JUSTIFIED_BALANCES_BUILD_SECONDS)
+}
+
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "lean_state_transition_time_seconds",
