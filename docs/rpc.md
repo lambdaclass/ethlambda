@@ -254,8 +254,8 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned self-built gloas block, with its envelope and blobs when asked (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
-| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`, SSZ) |
-| `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas, SSZ) |
+| `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
+| `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
 
 ### Validator endpoints
@@ -334,9 +334,9 @@ the chain actor writes, so no request waits on the actor.
   variable-size list uses, which is what prysm sends for aggregates and payload
   votes, with a JSON retry only on a `415`, and what nimbus can send for
   attestations. Any other content type is a `415`, and a body that does not
-  decode in the type's encoding a `400`. A block, an envelope and the other
-  validator-client submissions keep their own rules (SSZ only on `blocks` and
-  the envelope; JSON on the rest).
+  decode in the type's encoding a `400`. `POST beacon/blocks` and
+  `POST beacon/execution_payload_envelopes` choose the same way (below); the
+  other validator-client submissions are JSON.
 - **The attestation pool** holds, the best-covered per data root and
   committee: votes from `pool/attestations` and the aggregator subnets,
   aggregates from `aggregate_and_proofs`, and every electra gossip aggregate
@@ -362,8 +362,11 @@ the chain actor writes, so no request waits on the actor.
   blobs. A slot the schedule does not place at fulu (gloas included) is a
   `400`, checked before the execution client; `produceBlockV3` is the fulu
   endpoint, and a gloas slot goes to `produceBlockV4`.
-- **`POST beacon/blocks`** takes SSZ and the `Eth-Consensus-Version` header
-  (`fulu` or `gloas`, else `400`; a non-SSZ content type is a `415`). Fulu: a
+- **`POST beacon/blocks`** takes JSON or SSZ, by `Content-Type` as above, and
+  the `Eth-Consensus-Version` header (`fulu` or `gloas`, else `400`; any other
+  content type is a `415`). The JSON is the specification's: lodestar's and
+  nimbus's validator clients post it, teku's falls back to it, and lighthouse
+  and prysm post SSZ. Both reach the same checks after decoding. Fulu: a
   `SignedBlockContents`; the node checks the block is after the head and its
   proposer signature, then gossips it on `beacon_block` and hands it to the
   chain actor to import. A slot the schedule does not place at fulu is a `400`,
@@ -423,8 +426,11 @@ serves the cached unsigned envelope, for a client that asked for the block with
 root.
 
 **`POST /eth/v1/beacon/execution_payload_envelopes`** takes the signed envelope,
-SSZ only (`415` otherwise), with `Eth-Consensus-Version: gloas` and
-`Eth-Blob-Data-Included` (both required, else `400`):
+as JSON or SSZ by `Content-Type` (any other is a `415`; teku's validator client
+posts JSON, nimbus posts the bare envelope as JSON and the contents as SSZ,
+lighthouse posts SSZ, prysm posts SSZ and retries as JSON on a `415`), with
+`Eth-Consensus-Version: gloas` and `Eth-Blob-Data-Included` (both required, else
+`400`):
 
 - `true`: the body is `SignedExecutionPayloadEnvelopeContents` (the signed
   envelope, `kzg_proofs`, `blobs`).
