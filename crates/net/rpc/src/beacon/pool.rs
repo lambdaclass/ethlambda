@@ -52,7 +52,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::beacon::{
-    ApiError,
+    ApiError, decode_list,
     validator::{head, require_execution_client, require_validated},
 };
 
@@ -98,8 +98,9 @@ async fn post_pool_attestations(
         Ok(fork) => fork,
         Err(err) => return err.into_response(),
     };
-    let Ok(attestations) = serde_json::from_slice::<Vec<SingleAttestation>>(&body) else {
-        return ApiError::BadRequest("invalid request body").into_response();
+    let attestations = match decode_list::<SingleAttestation>(&headers, &body) {
+        Ok(attestations) => attestations,
+        Err(err) => return err.into_response(),
     };
     let (_head_root, state) = match head(&store) {
         Ok(found) => found,
@@ -349,23 +350,25 @@ async fn post_aggregate_and_proofs(
         Err(err) => return err.into_response(),
     };
     // Gloas's aggregate is its own container, so the header picks the decoder.
-    let aggregates = if header_fork == ForkName::Gloas {
-        serde_json::from_slice::<Vec<gloas::SignedAggregateAndProof>>(&body).map(|signed| {
-            signed
-                .into_iter()
-                .map(SignedAggregateAndProof::Gloas)
-                .collect()
-        })
-    } else {
-        serde_json::from_slice::<Vec<electra::SignedAggregateAndProof>>(&body).map(|signed| {
-            signed
-                .into_iter()
-                .map(SignedAggregateAndProof::Electra)
-                .collect()
-        })
-    };
-    let Ok(aggregates): Result<Vec<SignedAggregateAndProof>, _> = aggregates else {
-        return ApiError::BadRequest("invalid request body").into_response();
+    let aggregates: Result<Vec<SignedAggregateAndProof>, ApiError> =
+        if header_fork == ForkName::Gloas {
+            decode_list::<gloas::SignedAggregateAndProof>(&headers, &body).map(|signed| {
+                signed
+                    .into_iter()
+                    .map(SignedAggregateAndProof::Gloas)
+                    .collect()
+            })
+        } else {
+            decode_list::<electra::SignedAggregateAndProof>(&headers, &body).map(|signed| {
+                signed
+                    .into_iter()
+                    .map(SignedAggregateAndProof::Electra)
+                    .collect()
+            })
+        };
+    let aggregates = match aggregates {
+        Ok(aggregates) => aggregates,
+        Err(err) => return err.into_response(),
     };
 
     let now_ms = std::time::SystemTime::now()
@@ -1220,5 +1223,149 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert!(fixture.network.aggregates.lock().unwrap().is_empty());
+    }
+
+    /// POST `body` with an explicit content type, as a client that does not
+    /// send JSON would.
+    async fn post_raw(
+        fixture: &Fixture,
+        uri: &str,
+        content_type: Option<&str>,
+        version: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        let network: RpcToP2PRef = fixture.network.clone();
+        let app = routes()
+            .with_state(fixture.store.clone())
+            .layer(Extension(network));
+        let mut request = Request::post(uri).header("eth-consensus-version", version);
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    /// Nimbus submits its attestations this way.
+    #[tokio::test]
+    async fn attestations_are_accepted_as_ssz() {
+        use libssz::SszEncode as _;
+        let fixture = fixture();
+        let attestation = attestation(&fixture, 0, 0);
+        let (status, json) = post_raw(
+            &fixture,
+            "/eth/v2/beacon/pool/attestations",
+            Some("application/octet-stream"),
+            fixture.version,
+            vec![attestation.clone()].to_ssz(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let published = fixture.network.published.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].1, attestation);
+    }
+
+    #[tokio::test]
+    async fn an_unsupported_content_type_is_a_415_and_malformed_ssz_a_400() {
+        let fixture = fixture();
+        let uri = "/eth/v2/beacon/pool/attestations";
+        let (status, json) =
+            post_raw(&fixture, uri, Some("text/plain"), fixture.version, vec![]).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(json["code"], 415);
+
+        let (status, _) = post_raw(
+            &fixture,
+            uri,
+            Some("application/octet-stream"),
+            fixture.version,
+            vec![1, 2, 3],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // No content type at all is read as JSON, as it always was.
+        let (status, _) = post_raw(&fixture, uri, None, fixture.version, b"[]".to_vec()).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Prysm publishes its aggregates as SSZ and falls back to JSON only on a 415.
+    #[tokio::test]
+    async fn aggregates_are_accepted_as_ssz() {
+        use libssz::SszEncode as _;
+        let fixture = fixture();
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        submit(&fixture, &votes).await;
+        let aggregate = fixture
+            .store
+            .attestation_pool()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+        // Two entries, so the list's offset table is exercised.
+        let first = signed_aggregate(&fixture, committee[0], aggregate.clone());
+        let second = signed_aggregate(&fixture, committee[1], aggregate);
+
+        let (status, json) = post_raw(
+            &fixture,
+            "/eth/v2/validator/aggregate_and_proofs",
+            Some("application/octet-stream"),
+            "fulu",
+            vec![first.clone(), second.clone()].to_ssz(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let published = fixture.network.aggregates.lock().unwrap();
+        let published: Vec<_> = published.iter().map(|(signed, _)| signed.clone()).collect();
+        assert_eq!(
+            published,
+            [
+                SignedAggregateAndProof::Electra(first),
+                SignedAggregateAndProof::Electra(second)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn gloas_aggregates_are_accepted_as_ssz() {
+        use libssz::SszEncode as _;
+        let fixture = fixture_at(ForkName::Gloas, 0);
+        let slot = fixture.state.slot();
+        let committee = get_beacon_committee(&fixture.state, slot, 0).unwrap();
+        let votes: Vec<SingleAttestation> = (0..committee.len())
+            .map(|position| attestation(&fixture, 0, position))
+            .collect();
+        submit(&fixture, &votes).await;
+        let pooled = fixture
+            .store
+            .attestation_pool()
+            .aggregate(votes[0].data.hash_tree_root(), slot, 0)
+            .unwrap();
+        let signed = signed_gloas_aggregate(&fixture, committee[0], &pooled);
+
+        let (status, json) = post_raw(
+            &fixture,
+            "/eth/v2/validator/aggregate_and_proofs",
+            Some("application/octet-stream"),
+            "gloas",
+            vec![signed.clone()].to_ssz(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let published = fixture.network.aggregates.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].0, SignedAggregateAndProof::Gloas(signed));
     }
 }
