@@ -788,6 +788,147 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
     }
 }
 
+/// Gossip a gloas execution payload envelope a validator client signed,
+/// handed over by the Beacon API, on `execution_payload`, its data column
+/// sidecars on their subnets, and pass all of them to the chain actor.
+///
+/// Like [`publish_beacon_block`], the only way this node takes its own
+/// envelope in, since gossipsub never delivers a node its own messages. The
+/// envelope goes to the actor as it is. It is safe to hand over before the
+/// block it reveals has been imported, which is the usual case (the validator
+/// client publishes the envelope as soon as the block is on its way): the
+/// actor holds an envelope for a block it has not imported (`awaiting_block`),
+/// or for one it has stored but not imported (`awaiting_import`), and applies
+/// it when the block's post-state exists.
+///
+/// The sidecars take the route every sidecar gossip did not accept takes, the
+/// chain checks (`column_checks::check_and_forward`), which parks one whose
+/// block is not imported yet and hands it back once it is. Their subnet
+/// topics are published to whether or not this node custodies the subnet:
+/// gossipsub sends to a topic it is not subscribed to through its fanout
+/// peers.
+pub async fn publish_execution_payload_envelope(
+    server: &mut P2PServer,
+    envelope: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+    sidecars: Vec<DataColumnSidecar>,
+) {
+    let slot = envelope.message.payload.slot_number;
+    let block_root = envelope.message.beacon_block_root;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            slot,
+            "An execution payload envelope reached a lean node; dropping it"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this envelope's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        digest,
+        beacon_topics::EXECUTION_PAYLOAD,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&envelope.to_ssz()));
+    info!(
+        slot,
+        builder_index = envelope.message.builder_index,
+        block_root = %ShortRoot(&block_root.0),
+        "Published execution payload envelope to gossipsub"
+    );
+
+    let mut published_columns = 0usize;
+    for sidecar in &sidecars {
+        let DataColumnSidecar::Gloas(gloas_sidecar) = sidecar else {
+            warn!(
+                slot,
+                "Skipping a non-gloas sidecar published with a gloas envelope"
+            );
+            continue;
+        };
+        let subnet_id = gloas_sidecar.index
+            % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT;
+        let topic = IdentTopic::new(beacon_topics::data_column_topic_name(digest, subnet_id));
+        server
+            .swarm_handle
+            .publish(topic, compress_message(&gloas_sidecar.to_ssz()));
+        published_columns += 1;
+    }
+    if published_columns > 0 {
+        info!(
+            slot,
+            block_root = %ShortRoot(&block_root.0),
+            columns = published_columns,
+            "Published data column sidecars to gossipsub"
+        );
+    }
+
+    if let Some(blockchain) = server.blockchain.clone() {
+        let _ = blockchain
+            .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
+            .inspect_err(|err| error!(%err, "Failed to hand the published envelope to the chain"));
+    }
+    crate::beacon::column_checks::check_and_forward(server, sidecars);
+}
+
+/// Gossip a payload attestation message a validator client signed, handed
+/// over by the Beacon API, on `payload_attestation_message`, and pass it to
+/// the chain actor.
+///
+/// The API validated it with the checks gossip would apply, so it goes out
+/// as is. Gossipsub never delivers a node its own message, so the chain actor
+/// is handed it here to count the vote in its fork choice. The seen cache is
+/// marked as well: a peer that echoes the vote back would otherwise pass
+/// triage and be validated and forwarded a second time.
+pub async fn publish_payload_attestation_message(
+    server: &mut P2PServer,
+    message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+) {
+    let slot = message.data.slot;
+    let validator = message.validator_index;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            slot,
+            "A payload attestation reached a lean node; dropping it"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this payload attestation's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        digest,
+        beacon_topics::PAYLOAD_ATTESTATION_MESSAGE,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&message.to_ssz()));
+    server.seen_payload_attestations.record(slot, validator);
+    info!(
+        slot,
+        validator,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        payload_present = message.data.payload_present,
+        "Published payload attestation to gossipsub"
+    );
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_payload_attestation_message(message, BlockArrival::now())
+            .inspect_err(
+                |err| error!(%err, "Failed to hand the published payload attestation to the chain"),
+            );
+    }
+}
+
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.
 fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
     let genesis_ms = wire.genesis_time.saturating_mul(1000);

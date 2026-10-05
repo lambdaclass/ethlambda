@@ -2789,6 +2789,7 @@ pub(crate) mod tests {
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
             attestation_pool: Default::default(),
+            payload_attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

@@ -3,7 +3,9 @@ use std::net::{IpAddr, SocketAddr};
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
+use ethlambda_state_transition::beacon::{
+    attestation_pool::SharedAttestationPool, payload_attestation_pool::SharedPayloadAttestationPool,
+};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -184,6 +186,11 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
         .with_state(store)
 }
 
+/// The data columns this node custodies, as the chain actor's availability
+/// gate reads them. Empty on a node with nothing to custody.
+#[derive(Clone, Debug, Default)]
+pub struct CustodyColumns(pub Vec<u64>);
+
 /// What the Beacon API's validator endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
@@ -192,6 +199,14 @@ pub struct BeaconApiHandles {
     /// Filled by the attestation pool endpoint and the aggregator subnets,
     /// read by the aggregate endpoint and block production.
     pub attestation_pool: SharedAttestationPool,
+    /// Filled by gossip and the payload attestation pool endpoint, read by
+    /// block production and the pool's GET.
+    pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// The columns this node custodies: what `payload_attestation_data` checks
+    /// a block's blob availability against, and what block production tells
+    /// the execution client it samples for when asking it to build a gloas
+    /// payload.
+    pub custody_columns: CustodyColumns,
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
     pub engine: Option<ethlambda_engine::EngineClient>,
@@ -215,6 +230,8 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.attestation_pool))
+        .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine));
     start_http_servers(config, Some(api_router), shutdown).await
@@ -417,6 +434,15 @@ pub(crate) mod test_utils {
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+        pub(crate) envelopes: std::sync::Mutex<
+            Vec<(
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+                Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            )>,
+        >,
+        pub(crate) payload_attestations: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
+        >,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -453,6 +479,25 @@ pub(crate) mod test_utils {
             block: ethlambda_types::beacon::containers::SignedBeaconBlock,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.blocks.lock().unwrap().push(block);
+            Ok(())
+        }
+
+        fn publish_execution_payload_envelope(
+            &self,
+            envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            Ok(())
+        }
+
+        fn publish_payload_attestation_message(
+            &self,
+            message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.payload_attestations.lock().unwrap().push(message);
             Ok(())
         }
     }
@@ -602,6 +647,51 @@ pub(crate) mod test_utils {
             .update_checkpoints(ForkCheckpoints::head_only(root))
             .expect("make the anchor the head");
         (store, root)
+    }
+
+    /// A beacon store whose head is `block` (a block at `state`'s slot) with
+    /// `state` as its post-state, on a clock whose slot `clock_slot` began a
+    /// second ago.
+    ///
+    /// For endpoints that read the head block itself (the payload attestation
+    /// data names it) or that only accept the current slot (gossip-checked
+    /// votes), which [`beacon_store_at`]'s phase0 anchor on mainnet's real
+    /// clock cannot serve.
+    ///
+    /// The block is stored under `root`, which the caller names because a test
+    /// state's `latest_block_header` need not commit to the block built to
+    /// stand in for it, and a block built on the state names that header's root
+    /// as its parent.
+    pub(crate) fn beacon_store_with_head_block(
+        state: BeaconState,
+        config: Config,
+        block: SignedBeaconBlock,
+        root: H256,
+        clock_slot: u64,
+    ) -> Store {
+        let slot = state.slot();
+        let slot_secs = config.slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            genesis,
+            config,
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store
+            .insert_signed_block(root, block)
+            .expect("insert head block");
+        store.insert_state(root, state).expect("insert head state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("make the block the head");
+        store
     }
 
     /// Build a beacon store anchored at `anchor_slot`, with a real child block

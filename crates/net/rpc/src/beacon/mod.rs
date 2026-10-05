@@ -11,7 +11,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use ethlambda_storage::Store;
-use ethlambda_types::beacon::{config::Config, fork::ForkName, primitives::Epoch};
 use serde::Serialize;
 
 use crate::shared::block_id::IdError;
@@ -20,14 +19,28 @@ pub(crate) mod blocks;
 pub(crate) mod config;
 pub(crate) mod envelopes;
 pub(crate) mod genesis;
+pub(crate) mod gloas_proposal;
 pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod ptc;
 pub(crate) mod states;
 pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
+
+/// Request-body cap for the routes that accept blocks, envelopes and blobs.
+///
+/// Axum's default is 2 MiB, which a fulu `SignedBlockContents` outgrows at
+/// about 14 blobs (each blob is 131072 bytes, plus 128 cell proofs of 48 bytes,
+/// 6144 bytes, per blob). The preset's `MAX_BLOB_COMMITMENTS_PER_BLOCK` (4096,
+/// roughly 550 MB) is no practical bound, so this is sized from what the blob
+/// schedule allows in practice instead: a generous 128 blobs and their cell
+/// proofs come to about 17.5 MiB, a maximal execution payload (the gloas
+/// envelope carries it whole) takes up to roughly 16 MiB more, and the rest is
+/// margin for the block and its operations. Applied per route, never router-wide.
+pub(crate) const MAX_PUBLISH_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// The wrapper every fork-versioned Beacon API payload travels in.
 ///
@@ -59,36 +72,6 @@ pub(crate) enum ApiError {
     /// A request this node cannot answer right now, typically because its
     /// execution client did not (the Beacon API's 503).
     ServiceUnavailable(&'static str),
-}
-
-/// Refuses `epoch` when the node's schedule places it at gloas: validator
-/// duties are not supported from that fork.
-///
-/// The node follows gloas but only as a follower. It has no builder bid
-/// handling, no payload-timeliness committee duty and no gloas proposer
-/// flow, and its attestation pool holds electra-shaped votes. An answer for a
-/// gloas epoch would carry fulu's shapes under gloas's fork (a vote a
-/// validator client would sign as valid, an aggregate of the wrong shape), so
-/// it is refused by name, as the submit endpoints refuse the gloas header.
-/// Deliberately not [`ethlambda_types::beacon::fork::ForkName::is_followed`]:
-/// following a fork and serving its validator duties are different questions.
-pub(crate) fn refuse_validator_duties_from_gloas(
-    config: &Config,
-    epoch: Epoch,
-    message: &'static str,
-) -> Result<(), ApiError> {
-    match config.fork_at_epoch(epoch) {
-        ForkName::Phase0
-        | ForkName::Altair
-        | ForkName::Bellatrix
-        | ForkName::Capella
-        | ForkName::Deneb
-        | ForkName::Electra
-        | ForkName::Fulu => Ok(()),
-        // `Config::fork_at_epoch` never returns Lean; refused like gloas
-        // rather than answered.
-        ForkName::Gloas | ForkName::Lean => Err(ApiError::BadRequest(message)),
-    }
 }
 
 impl From<IdError> for ApiError {
@@ -133,6 +116,8 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(validator::routes())
         .merge(pool::routes())
         .merge(proposal::routes())
+        .merge(gloas_proposal::routes())
+        .merge(ptc::routes())
 }
 
 #[cfg(test)]
@@ -150,18 +135,6 @@ mod tests {
         // The Beacon API's shape, not the lean surface's `{"error": ...}`.
         assert_eq!(json["code"], 404);
         assert_eq!(json["message"], "block not found");
-    }
-
-    #[test]
-    fn validator_duties_are_refused_from_the_gloas_epoch_even_though_gloas_is_followed() {
-        let mut config = Config::mainnet();
-        config.gloas_fork_epoch = 10;
-        assert!(ForkName::Gloas.is_followed());
-        let refuse = |epoch| refuse_validator_duties_from_gloas(&config, epoch, "refused");
-        assert!(refuse(0).is_ok());
-        assert!(refuse(9).is_ok());
-        assert!(matches!(refuse(10), Err(ApiError::BadRequest("refused"))));
-        assert!(matches!(refuse(11), Err(ApiError::BadRequest("refused"))));
     }
 
     #[test]

@@ -767,8 +767,24 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the parking of gloas column sidecars (they carry no signature). Fork-choice
   events are timed at arrival, not at the slot tick, and the head's payload
   status is kept with its root (`Store::head_payload_status`, recomputed after
-  a restart). The node stays a follower: the validator-client endpoints still
-  refuse a gloas epoch (`refuse_validator_duties_from_gloas`).
+  a restart). The node also serves gloas validator duties, self-build only (no
+  bids, no proposer preferences; see `docs/spec_deviations.md`).
+  `state_transition/src/beacon/gloas_block_production.rs` assembles the block and
+  its envelope (`gloas_payload_inputs`, `parse_gloas_execution_requests`,
+  `pack_gloas_attestations`, `pack_payload_attestations`, `assemble_gloas_block`,
+  `gloas_data_column_sidecars`); `rpc/src/beacon/gloas_proposal.rs` serves
+  `produceBlockV4` and the envelope endpoints (cache of the current and previous
+  slot's builds; the envelope POST waits up to 4 s for its block, then gossips
+  the envelope and all column sidecars through `RpcToP2P`, relying on gossipsub
+  fanout for subnets the node does not subscribe to) and `rpc/src/beacon/ptc.rs`
+  the PTC duties, payload attestation data and pool. One
+  `SharedPayloadAttestationPool` is shared by p2p (filled on accepted gossip) and
+  rpc. The store keeps an in-memory envelope-arrival record
+  (`insert_beacon_envelope_seen`, keyed by root, pruned with the el-hash cache,
+  not persisted) that `payload_present` reads against
+  `fork_choice::get_payload_due_ms`; `helpers::gloas::get_ptc_assignments` backs
+  the duties. `attestation_data.index` at a gloas slot comes from
+  `Store::head_payload_status`.
   With `--execution-endpoint`, an envelope that passes the consensus checks is
   judged by `engine_newPayloadV5` (INVALID with a null `latestValidHash` is a
   hash mismatch that refuses only that envelope; INVALID with one condemns the
@@ -776,8 +792,21 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   retries once a slot, probing with the oldest), and a gloas head sends
   `engine_forkchoiceUpdatedV4` with the custody columns (head hash by the head
   node's FULL or EMPTY status, finalized and safe from the checkpoint blocks'
-  `bid.parent_block_hash`, safe being a fallback for fast confirmation). See
+  `bid.parent_block_hash`, safe being a fallback for fast confirmation). Building
+  a gloas payload for `produceBlockV4` uses `PayloadAttributesV4` (V3's fields
+  plus `slot_number` and `target_gas_limit`, the parent bid's gas limit) through
+  `forkchoice_updated_v4_with_attributes` and `get_payload_v6`
+  (`BuiltGloasPayload`, `ExecutionPayloadV4`). See
   [`docs/beacon_engine.md`](docs/beacon_engine.md).
+  The validator client (`crates/validator`) at a gloas slot runs: propose at the
+  boundary (block published bare, then the proposer-signed envelope with
+  `Eth-Blob-Data-Included: true`, both inside the proposal's attester-offset
+  budget; an envelope failure is logged and counted, not a failed proposal),
+  attest at `ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`,
+  then the PTC vote at `PAYLOAD_ATTESTATION_DUE_BPS`. `SlotClock` picks the
+  offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
+  still keeps no slashing-protection record; PTC votes have an in-memory
+  `(validator, slot)` dedup only, and envelopes are unguarded.
   `get_head_node` is one bottom-up walk for every fork, with
   the current slot's fork selecting the payload rules and the boost gate, so a
   follower on any network that schedules gloas (Sepolia does) pays work
