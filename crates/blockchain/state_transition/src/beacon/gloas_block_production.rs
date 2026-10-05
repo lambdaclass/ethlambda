@@ -206,7 +206,34 @@ pub fn pack_payload_attestations(
     if parent_slot.checked_add(1) != Some(state.slot()) {
         return Vec::new();
     }
-    let Ok(ptc) = get_ptc(state, parent_slot, config) else {
+    let messages = messages.into_iter().filter(|message| {
+        message.data.beacon_block_root == parent_root && message.data.slot == parent_slot
+    });
+    let mut packed = aggregate_payload_attestations(state, parent_slot, messages, config);
+    packed.sort_by_key(|(seats, _)| std::cmp::Reverse(*seats));
+    packed
+        .into_iter()
+        .map(|(_, attestation)| attestation)
+        .take(preset::MAX_PAYLOAD_ATTESTATIONS as usize)
+        .collect()
+}
+
+/// Aggregate the votes of `messages` cast at `slot` into one
+/// [`PayloadAttestation`] per distinct `PayloadAttestationData`, each paired
+/// with the number of committee seats it covers.
+///
+/// The committee is `get_ptc(state, slot)`, so `state` must be within the
+/// window that function reads (the slot's epoch, the one after it, or one
+/// past `state`'s). Votes for another slot are skipped, and an aggregate that
+/// does not verify against `state` is dropped. The order is the data roots',
+/// not a ranking: callers that must cap the count sort by seats themselves.
+pub fn aggregate_payload_attestations(
+    state: &BeaconState,
+    slot: Slot,
+    messages: impl IntoIterator<Item = PayloadAttestationMessage>,
+    config: &Config,
+) -> Vec<(usize, PayloadAttestation)> {
+    let Ok(ptc) = get_ptc(state, slot, config) else {
         return Vec::new();
     };
 
@@ -219,7 +246,7 @@ pub fn pack_payload_attestations(
         ),
     > = BTreeMap::new();
     for message in messages {
-        if message.data.beacon_block_root != parent_root || message.data.slot != parent_slot {
+        if message.data.slot != slot {
             continue;
         }
         groups
@@ -230,7 +257,7 @@ pub fn pack_payload_attestations(
             .or_insert(message.signature);
     }
 
-    let mut packed: Vec<(usize, PayloadAttestation)> = groups
+    groups
         .into_values()
         .filter_map(|(data, votes)| {
             let mut aggregation_bits = gloas::PayloadTimelinessCommitteeBits::default();
@@ -250,12 +277,6 @@ pub fn pack_payload_attestations(
             let indexed = get_indexed_payload_attestation(state, &attestation, config).ok()?;
             is_valid_indexed_payload_attestation(state, &indexed).then_some((seats, attestation))
         })
-        .collect();
-    packed.sort_by_key(|(seats, _)| std::cmp::Reverse(*seats));
-    packed
-        .into_iter()
-        .map(|(_, attestation)| attestation)
-        .take(preset::MAX_PAYLOAD_ATTESTATIONS as usize)
         .collect()
 }
 
