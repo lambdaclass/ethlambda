@@ -9020,15 +9020,18 @@ mod tests {
     }
 
     impl ethlambda_storage::StorageReadView for CountingView<'_> {
-        fn get(
+        // Counted at `read`, which `get` and `contains` both go through, so
+        // every lookup of the block table counts once however it is made.
+        fn read(
             &self,
             table: ethlambda_storage::Table,
             key: &[u8],
-        ) -> std::result::Result<Option<Vec<u8>>, StorageError> {
+            read_fn: &mut dyn FnMut(&[u8]) -> std::result::Result<(), StorageError>,
+        ) -> std::result::Result<bool, StorageError> {
             if table == ethlambda_storage::Table::BlockHeaders {
                 BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
             }
-            self.inner.get(table, key)
+            self.inner.read(table, key, read_fn)
         }
 
         fn prefix_iterator(

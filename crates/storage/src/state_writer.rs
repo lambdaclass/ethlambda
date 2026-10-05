@@ -39,6 +39,7 @@
 //! Splitting them apart would let the two drift until a reader silently
 //! failed to reconstruct what a writer had actually written.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -55,7 +56,7 @@ use libssz::{SszDecode, SszEncode};
 use lru::LruCache;
 use tracing::error;
 
-use crate::api::{StorageBackend, Table};
+use crate::api::{StorageBackend, StorageReadViewExt, Table};
 use crate::beacon_state_delta;
 use crate::error::Error;
 use crate::state_codec::{decode_lean_state_value, decode_state_value, encode_state_value};
@@ -170,9 +171,8 @@ pub(crate) fn read_state(
             // Anchor snapshot in `States`, otherwise reconstruct from the diff chain.
             let snapshot = {
                 let view = backend.begin_read().expect("read view");
-                view.get(Table::States, &root.to_ssz())
-                    .expect("get")
-                    .map(|bytes| decode_lean_state_value(&bytes))
+                view.read_with(Table::States, &root.to_ssz(), decode_lean_state_value)
+                    .expect("read")
             };
             let state = match snapshot {
                 Some(state) => state,
@@ -184,15 +184,17 @@ pub(crate) fn read_state(
             BeaconState::Lean(state)
         }
         Chain::Beacon => {
-            let Some(bytes) = reconstruct_beacon_state_bytes(backend, root)? else {
-                return Ok(None);
-            };
             // Decoded exactly once, after every delta in the chain has already
             // been folded in the byte domain; see
             // `reconstruct_beacon_state_bytes`'s doc comment for why an SSZ
             // decode per hop instead would be the whole cost that delta layer
-            // exists to avoid.
-            let mut state = decode_state_value(&bytes);
+            // exists to avoid. A snapshot root decodes straight from the
+            // backend's buffer.
+            let Some(mut state) =
+                reconstruct_beacon_state_bytes(backend, root, |bytes| decode_state_value(&bytes))?
+            else {
+                return Ok(None);
+            };
             rebase_onto_resident(cache, &mut state);
             state
         }
@@ -242,48 +244,78 @@ fn rebase_onto_resident(cache: &StateCache, state: &mut BeaconState) {
 /// base root read off each hop comes from
 /// [`beacon_state_delta::unframe`] instead of a `StateDiff`'s own field.
 ///
-/// Returns encoded bytes rather than a decoded [`BeaconState`] so that a
-/// caller that only needs the bytes (the writer thread's
-/// `StateWriter::encoded_parent_bytes`, for its diff base) is never made to
-/// pay for a decode it will not use. [`Store::get_state`](crate::store::Store::get_state)'s
-/// beacon arm is the one caller that decodes, and it does so exactly once,
-/// after every delta has already been folded.
+/// Hands the encoded bytes to `consume` rather than returning a decoded
+/// [`BeaconState`], so that a caller that only needs the bytes (the writer
+/// thread's `StateWriter::encoded_parent_bytes`, for its diff base) is never
+/// made to pay for a decode it will not use.
+/// [`Store::get_state`](crate::store::Store::get_state)'s beacon arm is the
+/// one caller that decodes, and it does so exactly once, after every delta
+/// has already been folded.
+///
+/// `consume` gets [`Cow::Borrowed`] when `root` is itself a snapshot: the
+/// backend's own buffer, never copied. Otherwise the first delta reads the
+/// borrowed snapshot as its base, and `consume` gets the folded result as
+/// [`Cow::Owned`], so taking ownership costs no further copy either way
+/// beyond the one a borrowed snapshot needs.
 ///
 /// `Ok(None)` when `root` is unknown, or the chain runs off the retained
 /// window before reaching a snapshot: a missing `StateDiffs` record below
 /// the pruned boundary, matching how the lean walk in
 /// [`reconstruct_state`] handles both cases.
-pub(crate) fn reconstruct_beacon_state_bytes(
+pub(crate) fn reconstruct_beacon_state_bytes<T>(
     backend: &dyn StorageBackend,
     root: &H256,
-) -> Result<Option<Vec<u8>>, Error> {
+    consume: impl FnOnce(Cow<'_, [u8]>) -> T,
+) -> Result<Option<T>, Error> {
     let view = backend.begin_read().expect("read view");
     let mut records: Vec<Vec<u8>> = Vec::new();
+    let mut consume = Some(consume);
     let mut cursor = *root;
-    let snapshot = loop {
-        if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
-            break bytes;
+    loop {
+        let key = cursor.to_ssz();
+        // The walk ends at the first snapshot, so the deltas collected so
+        // far are folded onto it while it is still borrowed.
+        let folded = view
+            .read_with(Table::States, &key, |snapshot| {
+                let consume = consume.take().expect("the walk ends at its first snapshot");
+                // `records` runs target -> snapshot child; reverse to snapshot
+                // child -> target, the order the chain was written in, so
+                // folding forward replays it correctly.
+                records.reverse();
+                fold_beacon_state_deltas(snapshot, &records, consume)
+            })
+            .expect("read");
+        if folded.is_some() {
+            return Ok(folded);
         }
-        let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get") else {
+        let Some(diff_bytes) = view.get(Table::StateDiffs, &key).expect("get") else {
             return Ok(None);
         };
         let (base_root, _, _, _) = beacon_state_delta::unframe(&diff_bytes);
         cursor = base_root;
         records.push(diff_bytes);
+    }
+}
+
+/// Applies `records` (snapshot child first) to a borrowed `snapshot` and
+/// hands the result to `consume`: the snapshot itself when there is nothing
+/// to apply, otherwise the owned output of the last delta.
+fn fold_beacon_state_deltas<T>(
+    snapshot: &[u8],
+    records: &[Vec<u8>],
+    consume: impl FnOnce(Cow<'_, [u8]>) -> T,
+) -> T {
+    let mut records = records.iter();
+    let Some(first) = records.next() else {
+        return consume(Cow::Borrowed(snapshot));
     };
-    drop(view);
-
-    // `records` runs target -> snapshot child; reverse to snapshot child
-    // -> target, the order the chain was written in, so folding forward
-    // replays it correctly.
-    records.reverse();
-
-    let mut bytes = snapshot;
-    for record in &records {
+    let (_, _, target_len, delta) = beacon_state_delta::unframe(first);
+    let mut bytes = beacon_state_delta::decode(delta, snapshot, target_len as usize);
+    for record in records {
         let (_, _, target_len, delta) = beacon_state_delta::unframe(record);
         bytes = beacon_state_delta::decode(delta, &bytes, target_len as usize);
     }
-    Ok(Some(bytes))
+    consume(Cow::Owned(bytes))
 }
 
 /// Reconstruct a state from diffs and the nearest ancestor snapshot.
@@ -313,13 +345,21 @@ pub(crate) fn reconstruct_state(
     let mut diffs: Vec<StateDiff> = Vec::new();
     let mut cursor = *root;
     let snapshot = loop {
-        if let Some(bytes) = view.get(Table::States, &cursor.to_ssz()).expect("get") {
-            break decode_lean_state_value(&bytes);
+        let key = cursor.to_ssz();
+        if let Some(snapshot) = view
+            .read_with(Table::States, &key, decode_lean_state_value)
+            .expect("read")
+        {
+            break snapshot;
         }
-        let Some(diff_bytes) = view.get(Table::StateDiffs, &cursor.to_ssz()).expect("get") else {
+        let Some(diff) = view
+            .read_with(Table::StateDiffs, &key, |bytes| {
+                StateDiff::from_ssz_bytes(bytes).expect("valid state diff")
+            })
+            .expect("read")
+        else {
             return Ok(None);
         };
-        let diff = StateDiff::from_ssz_bytes(&diff_bytes).expect("valid state diff");
         cursor = diff.base_root;
         diffs.push(diff);
     };
@@ -331,11 +371,13 @@ pub(crate) fn reconstruct_state(
     // The latest block header lives in BlockHeaders; the stored state caches
     // the real state_root there, so it equals the header byte-for-byte.
     let view = backend.begin_read().expect("read view");
-    let header_bytes = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get");
+    let header = view
+        .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+            BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+        })
+        .expect("read");
     drop(view);
-    let Some(latest_block_header) =
-        header_bytes.map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header"))
-    else {
+    let Some(latest_block_header) = header else {
         return Ok(None);
     };
 
@@ -557,9 +599,11 @@ impl StateWriter {
             .filter(|(root, _)| *root == parent_root)
             .map(|(_, bytes)| bytes.clone())
             .unwrap_or_else(|| {
-                reconstruct_beacon_state_bytes(self.backend.as_ref(), &parent_root)
-                    .expect("read parent state")
-                    .expect("parent state must exist to diff against")
+                reconstruct_beacon_state_bytes(self.backend.as_ref(), &parent_root, |bytes| {
+                    bytes.into_owned()
+                })
+                .expect("read parent state")
+                .expect("parent state must exist to diff against")
             })
     }
 }

@@ -6,7 +6,7 @@ use std::time::Instant;
 use lru::LruCache;
 
 use crate::active_balance_cache::ActiveBalanceCache;
-use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
@@ -909,11 +909,10 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
 /// path rather than by a runtime check.
 pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Option<u64> {
     let view = backend.begin_read().expect("read view");
-    let bytes = view
-        .get(Table::BlockHeaders, &root.to_ssz())
-        .expect("get")?;
-    drop(view);
-    Some(decode_beacon_block_value(&bytes).slot())
+    view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+        decode_beacon_block_value(bytes).slot()
+    })
+    .expect("read")
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -1133,14 +1132,17 @@ impl Store {
             // Written by both `init_store` and `init_beacon`, so a backend
             // missing this has never held a chain of either kind.
             let view = backend.begin_read().expect("read view");
+            // Kept as raw bytes: it may only be decoded once the version and
+            // preset checks below have passed.
             let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
                 return Ok(None);
             };
 
             let found = view
-                .get(Table::Metadata, KEY_DB_VERSION)
-                .expect("get db version")
-                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid db version"))
+                .read_with(Table::Metadata, KEY_DB_VERSION, |bytes| {
+                    u64::from_ssz_bytes(bytes).expect("valid db version")
+                })
+                .expect("read db version")
                 .unwrap_or(0);
             if found != DB_VERSION {
                 return Err(Error::DbVersionMismatch {
@@ -1155,9 +1157,9 @@ impl Store {
             // shapes back. The version check above cannot stand in for this,
             // since both presets write the same *layout* at the same version.
             let found_preset = view
-                .get(Table::Metadata, KEY_PRESET)
-                .expect("get preset")
-                .and_then(|bytes| bytes.first().copied())
+                .read_with(Table::Metadata, KEY_PRESET, |bytes| bytes.first().copied())
+                .expect("read preset")
+                .flatten()
                 .and_then(Preset::from_selector);
             if found_preset != Some(Preset::ACTIVE) {
                 return Err(Error::PresetMismatch {
@@ -1167,9 +1169,9 @@ impl Store {
             }
 
             let chain = view
-                .get(Table::Metadata, KEY_CHAIN)
-                .expect("get chain")
-                .and_then(|bytes| bytes.first().copied())
+                .read_with(Table::Metadata, KEY_CHAIN, |bytes| bytes.first().copied())
+                .expect("read chain")
+                .flatten()
                 .and_then(Chain::from_selector)
                 .expect("a versioned directory always carries a chain tag");
 
@@ -1177,9 +1179,10 @@ impl Store {
             // already turned away every directory written before they did, so
             // an absent key here is not an old directory but a corrupt one.
             let anchor_slot = view
-                .get(Table::Metadata, KEY_ANCHOR_SLOT)
-                .expect("get anchor slot")
-                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid anchor slot"))
+                .read_with(Table::Metadata, KEY_ANCHOR_SLOT, |bytes| {
+                    u64::from_ssz_bytes(bytes).expect("valid anchor slot")
+                })
+                .expect("read anchor slot")
                 .expect("a versioned directory always carries an anchor slot");
 
             (
@@ -1703,17 +1706,17 @@ impl Store {
     /// on this store, and the key is what says which one.
     pub(crate) fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
         let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::Metadata, key)
-            .expect("get")
-            .unwrap_or_else(|| {
-                panic!(
-                    "metadata key {:?} is absent on a {:?} store",
-                    String::from_utf8_lossy(key),
-                    self.chain
-                )
-            });
-        T::from_ssz_bytes(&bytes).expect("valid encoding")
+        view.read_with(Table::Metadata, key, |bytes| {
+            T::from_ssz_bytes(bytes).expect("valid encoding")
+        })
+        .expect("read")
+        .unwrap_or_else(|| {
+            panic!(
+                "metadata key {:?} is absent on a {:?} store",
+                String::from_utf8_lossy(key),
+                self.chain
+            )
+        })
     }
 
     pub(crate) fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
@@ -2270,9 +2273,10 @@ impl Store {
         }
         let view = self.backend.begin_read().expect("read view");
         Ok(view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header")))
+            .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read"))
     }
 
     // ============ Signed Blocks ============
@@ -2591,27 +2595,26 @@ impl Store {
     /// field is already in hand once the row is decoded.
     fn block_fields(&self, root: &H256) -> Option<(u64, H256, H256)> {
         let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")?;
-        Some(match self.chain {
-            Chain::Lean => {
-                let header = BlockHeader::from_ssz_bytes(&bytes).expect("valid header");
-                (header.slot, header.parent_root, header.state_root)
-            }
-            Chain::Beacon => {
-                let block = decode_beacon_block_value(&bytes);
-                (block.slot(), block.parent_root(), block.state_root())
+        view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+            match self.chain {
+                Chain::Lean => {
+                    let header = BlockHeader::from_ssz_bytes(bytes).expect("valid header");
+                    (header.slot, header.parent_root, header.state_root)
+                }
+                Chain::Beacon => {
+                    let block = decode_beacon_block_value(bytes);
+                    (block.slot(), block.parent_root(), block.state_root())
+                }
             }
         })
+        .expect("read")
     }
 
     /// Whether a block is stored under `root`.
     pub fn has_block(&self, root: &H256) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
-            .is_some()
+        view.contains(Table::BlockHeaders, &root.to_ssz())
+            .expect("contains")
     }
 
     /// Every stored beacon block as `root -> (slot, parent_root)`.
@@ -2641,18 +2644,27 @@ impl Store {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
+        let Some(header) = view
+            .read_with(Table::BlockHeaders, &key, |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read")
+        else {
             return Ok(None);
         };
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
+            let Some(body) = view
+                .read_with(Table::BlockBodies, &key, |bytes| {
+                    BlockBody::from_ssz_bytes(bytes).expect("valid body")
+                })
+                .expect("read")
+            else {
                 return Ok(None);
             };
-            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+            body
         };
 
         Ok(Some(Block::from_header_and_body(header, body)))
@@ -2683,38 +2695,43 @@ impl Store {
             Chain::Lean => {
                 Ok(Self::signed_block_from_view(view.as_ref(), root).map(SignedBeaconBlock::Lean))
             }
-            Chain::Beacon => {
-                let Some(bytes) = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get")
-                else {
-                    return Ok(None);
-                };
-
-                let block = decode_beacon_block_value(&bytes);
-
-                Ok(Some(block))
-            }
+            Chain::Beacon => Ok(view
+                .read_with(
+                    Table::BlockHeaders,
+                    &root.to_ssz(),
+                    decode_beacon_block_value,
+                )
+                .expect("read")),
         }
     }
 
     fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+        let header = view
+            .read_with(Table::BlockHeaders, &key, |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read")?;
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
-            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+            view.read_with(Table::BlockBodies, &key, |bytes| {
+                BlockBody::from_ssz_bytes(bytes).expect("valid body")
+            })
+            .expect("read")?
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
-            Some(proof_bytes) => {
-                MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
-            }
+        let proof = view
+            .read_with(Table::BlockProof, &sig_key, |bytes| {
+                MultiMessageAggregate::from_ssz_bytes(bytes).expect("valid block proof")
+            })
+            .expect("read");
+        let proof = match proof {
+            Some(proof) => proof,
             // Synthesis only covers the genesis-style anchor (slot 0). For any
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
@@ -2745,9 +2762,10 @@ impl Store {
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
         let view = self.backend.begin_read().expect("read view");
         Ok(view
-            .get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
-            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root")))
+            .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                H256::from_ssz_bytes(bytes).expect("valid block root")
+            })
+            .expect("read block root"))
     }
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
@@ -2778,13 +2796,14 @@ impl Store {
             // `canonical_root_at_slot`, which opens a fresh one per call: a
             // range must be served from a single snapshot so a head change
             // partway through cannot splice two branches into one response.
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root) = view
+                .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid block root")
+                })
+                .expect("read block root")
             else {
                 continue;
             };
-            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
             match self.chain {
                 Chain::Lean => {
                     if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
@@ -2795,9 +2814,15 @@ impl Store {
                 // lean arm's "header found but proof pruned" `None`: the row is
                 // there or the slot is skipped.
                 Chain::Beacon => {
-                    if let Some(bytes) = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get")
+                    if let Some(block) = view
+                        .read_with(
+                            Table::BlockHeaders,
+                            &root.to_ssz(),
+                            decode_beacon_block_value,
+                        )
+                        .expect("read")
                     {
-                        blocks.push(decode_beacon_block_value(&bytes));
+                        blocks.push(block);
                     }
                 }
             }
@@ -2877,19 +2902,36 @@ impl Store {
 
     /// Returns whether a state is available for the given block root.
     ///
-    /// True if `pending_states` holds the state, a snapshot exists, or the
-    /// state can be reconstructed from a diff.
+    /// True if `pending_states` or the state cache holds the state, a snapshot
+    /// exists, or the state can be reconstructed from a diff. Never reads a
+    /// value: existence checks only.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
         // Same pending-before-backend order as `read_state`; see its doc for
         // why the backend never has to consult `pending_states` on its own.
         if self.pending_states.get(root).is_some() {
             return Ok(true);
         }
+        // A cached block state is always one that was handed to the writer
+        // (`insert_state`, so in `pending_states` until committed) or read back
+        // from the backend (`read_state`); nothing deletes a persisted state.
+        // `peek`, not `get`: an existence check must not reorder the LRU.
+        // Without this, a state stored as a snapshot only (a beacon epoch
+        // anchor) costs a full-value read from RocksDB just to be found.
+        if self
+            .state_cache
+            .lock()
+            .unwrap()
+            .peek(&CacheKey::BlockState(*root))
+            .is_some()
+        {
+            return Ok(true);
+        }
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
-        let states = view.get(Table::States, &key).expect("get");
-        let diffs = view.get(Table::StateDiffs, &key).expect("get");
-        Ok(states.is_some() || diffs.is_some())
+        // Diffs first: every non-anchor state has one, so most roots never
+        // touch `States`, where even a miss is costly (no bloom filter).
+        Ok(view.contains(Table::StateDiffs, &key).expect("contains")
+            || view.contains(Table::States, &key).expect("contains"))
     }
 
     /// Persist a post-block state.
@@ -4377,9 +4419,8 @@ impl Store {
     /// gossip column.
     pub fn has_data_column(&self, slot: u64, root: &H256, index: u64) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::DataColumns, &data_column_key(slot, root, index))
-            .expect("get")
-            .is_some()
+        view.contains(Table::DataColumns, &data_column_key(slot, root, index))
+            .expect("contains")
     }
 
     /// Which columns of one block this node holds, ascending.
@@ -4463,13 +4504,14 @@ impl Store {
         let view = self.backend.begin_read().expect("read view");
         let mut found = Vec::new();
         for slot in start_slot..end_slot {
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root) = view
+                .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid block root")
+                })
+                .expect("read block root")
             else {
                 continue;
             };
-            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
             let prefix = data_column_block_prefix(slot, &root);
             let entries = view
                 .prefix_iterator(Table::DataColumns, &prefix)
@@ -4625,15 +4667,14 @@ mod tests {
     /// Check if a key exists in a table.
     fn has_key(backend: &dyn StorageBackend, table: Table, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(table, &root.to_ssz()).expect("get").is_some()
+        view.contains(table, &root.to_ssz()).expect("contains")
     }
 
     /// Check whether a block proof exists for a (slot, root) pair.
     fn has_block_proof(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(Table::BlockProof, &encode_slot_root_key(slot, root))
-            .expect("get")
-            .is_some()
+        view.contains(Table::BlockProof, &encode_slot_root_key(slot, root))
+            .expect("contains")
     }
 
     /// Canonical block root at `slot`, for storage-index assertions.
@@ -6075,6 +6116,177 @@ mod tests {
         assert_eq!(reconstructed.to_ssz(), s1.to_ssz());
     }
 
+    type BackendError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Backend wrapper counting value reads and existence checks per table, to
+    /// show which tables `has_state` touches and that it never copies a value.
+    #[derive(Default)]
+    struct ReadCounts {
+        gets: Mutex<HashMap<Table, usize>>,
+        contains: Mutex<HashMap<Table, usize>>,
+    }
+
+    impl ReadCounts {
+        fn gets(&self, table: Table) -> usize {
+            self.gets.lock().unwrap().get(&table).copied().unwrap_or(0)
+        }
+        fn contains(&self, table: Table) -> usize {
+            self.contains
+                .lock()
+                .unwrap()
+                .get(&table)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    struct CountingBackend {
+        inner: InMemoryBackend,
+        counts: Arc<ReadCounts>,
+    }
+
+    struct CountingView<'a> {
+        inner: Box<dyn StorageReadView + 'a>,
+        counts: Arc<ReadCounts>,
+    }
+
+    impl StorageBackend for CountingBackend {
+        fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, BackendError> {
+            Ok(Box::new(CountingView {
+                inner: self.inner.begin_read()?,
+                counts: self.counts.clone(),
+            }))
+        }
+
+        fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, BackendError> {
+            self.inner.begin_write()
+        }
+    }
+
+    impl StorageReadView for CountingView<'_> {
+        fn read(
+            &self,
+            table: Table,
+            key: &[u8],
+            read_fn: &mut dyn FnMut(&[u8]) -> Result<(), BackendError>,
+        ) -> Result<bool, BackendError> {
+            self.inner.read(table, key, read_fn)
+        }
+
+        // `get` and `contains` are overridden, not left to their defaults, so
+        // the two can be counted apart.
+        fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
+            *self.counts.gets.lock().unwrap().entry(table).or_default() += 1;
+            self.inner.get(table, key)
+        }
+
+        fn contains(&self, table: Table, key: &[u8]) -> Result<bool, BackendError> {
+            *self
+                .counts
+                .contains
+                .lock()
+                .unwrap()
+                .entry(table)
+                .or_default() += 1;
+            self.inner.contains(table, key)
+        }
+
+        fn prefix_iterator(
+            &self,
+            table: Table,
+            prefix: &[u8],
+        ) -> Result<Box<dyn Iterator<Item = crate::api::PrefixResult> + '_>, BackendError> {
+            self.inner.prefix_iterator(table, prefix)
+        }
+    }
+
+    fn counting_store() -> (Store, Arc<ReadCounts>) {
+        let counts = Arc::new(ReadCounts::default());
+        let backend = Arc::new(CountingBackend {
+            inner: InMemoryBackend::new(),
+            counts: counts.clone(),
+        });
+        let store = Store::from_parts(
+            backend,
+            Arc::new(Config::lean(0, DEFAULT_MILLISECONDS_PER_SLOT)),
+            Chain::Lean,
+            0,
+        );
+        (store, counts)
+    }
+
+    fn put_raw(store: &Store, table: Table, root: H256) {
+        let mut batch = store.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(table, vec![(root.to_ssz(), vec![1, 2, 3])])
+            .expect("put");
+        batch.commit().expect("commit");
+    }
+
+    /// A cached state answers without any backend read, so a snapshot-only
+    /// anchor state is not copied out of the database to test existence.
+    #[test]
+    fn has_state_is_answered_by_the_cache_without_touching_the_backend() {
+        let (store, counts) = counting_store();
+        let root = H256::from([7u8; 32]);
+        let state = BeaconState::Lean(sample_state(1, H256::ZERO, vec![]));
+        store.cache_state(CacheKey::BlockState(root), Arc::new(state));
+
+        assert!(store.has_state(&root).expect("has_state"));
+        for table in [Table::States, Table::StateDiffs] {
+            assert_eq!(counts.gets(table), 0);
+            assert_eq!(counts.contains(table), 0);
+        }
+    }
+
+    /// The existence check must not promote the entry in the LRU.
+    #[test]
+    fn has_state_does_not_reorder_the_state_cache() {
+        let (store, _counts) = counting_store();
+        let first = H256::from([1u8; 32]);
+        let second = H256::from([2u8; 32]);
+        for root in [first, second] {
+            let state = BeaconState::Lean(sample_state(1, H256::ZERO, vec![]));
+            store.cache_state(CacheKey::BlockState(root), Arc::new(state));
+        }
+        assert!(store.has_state(&first).expect("has_state"));
+        let cache = store.state_cache.lock().unwrap();
+        let (lru_key, _) = cache.iter().next_back().expect("non-empty");
+        assert_eq!(*lru_key, CacheKey::BlockState(first));
+    }
+
+    /// A root with a diff is found without consulting `States`.
+    #[test]
+    fn has_state_checks_diffs_first_and_skips_states_on_a_hit() {
+        let (store, counts) = counting_store();
+        let root = H256::from([3u8; 32]);
+        put_raw(&store, Table::StateDiffs, root);
+
+        assert!(store.has_state(&root).expect("has_state"));
+        assert_eq!(counts.contains(Table::StateDiffs), 1);
+        assert_eq!(counts.contains(Table::States), 0);
+        // Never a value read.
+        assert_eq!(counts.gets(Table::StateDiffs), 0);
+        assert_eq!(counts.gets(Table::States), 0);
+    }
+
+    /// A snapshot-only root (a beacon epoch anchor has no diff) is found.
+    #[test]
+    fn has_state_finds_a_snapshot_only_root() {
+        let (store, counts) = counting_store();
+        let root = H256::from([4u8; 32]);
+        put_raw(&store, Table::States, root);
+
+        assert!(store.has_state(&root).expect("has_state"));
+        assert_eq!(counts.gets(Table::States), 0);
+    }
+
+    #[test]
+    fn has_state_is_false_for_an_absent_root() {
+        let (store, _counts) = counting_store();
+        assert!(!store.has_state(&H256::from([5u8; 32])).expect("has_state"));
+    }
+
     /// A state that only the handoff buffer holds is still readable. The LRU
     /// is cleared first, so a pass here cannot come from the cache, and the
     /// backend was never written for this root, so it cannot come from disk.
@@ -6545,6 +6757,39 @@ mod tests {
         );
         assert!(decoded.eth1_data_votes().ptr_eq(resident.eth1_data_votes()));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
+    }
+
+    #[test]
+    fn a_cold_beacon_state_folds_every_delta_back_from_its_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let interval = ForkName::Electra.snapshot_interval();
+
+        // Slot 0 and slot `interval` are snapshots (no parent, then a boundary
+        // crossing), and every slot between them is a delta on its parent. So
+        // the reads cover a borrowed snapshot with nothing to fold, and chains
+        // of 1 up to `interval - 1` deltas applied to the borrowed snapshot.
+        let mut expected = Vec::new();
+        let mut parent = H256::ZERO;
+        for slot in 0..=interval {
+            let root = H256::from([(slot + 1) as u8; 32]);
+            let state = beacon_test_state_with_parent(slot, parent);
+            store
+                .insert_signed_block(root, beacon_test_block(slot, parent))
+                .expect("insert block");
+            expected.push((root, state.to_ssz()));
+            store.insert_state(root, state).expect("insert state");
+            parent = root;
+        }
+
+        // Dropping the store joins the writer; a fresh one has an empty cache,
+        // so every read below reconstructs from the backend.
+        drop(store);
+        let cold = beacon_test_store(backend);
+        for (root, encoded) in expected.into_iter().rev() {
+            let state = cold.get_state(&root).expect("get").expect("present");
+            assert_eq!(state.to_ssz(), encoded);
+        }
     }
 
     /// `beacon_test_state` with its parent linked in, the way `insert_state`'s
