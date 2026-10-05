@@ -280,7 +280,8 @@ Per-block phases, in the order a block crosses them, plus `total` for a complete
 | `engine` | The `engine_newPayload` round trip, including its retry ladder | beacon |
 | `verify_struct` | Participant bounds checks and pubkey resolution | lean |
 | `verify_crypto` | The leanVM multi-message aggregate verification | lean |
-| `stf` | The state transition. On beacon this bundles the transition, the state root and the state write | both |
+| `stf` | The state transition. On beacon this bundles the transition and the state root, and excludes `writer_wait`, which is nested inside it | both |
+| `writer_wait` | Beacon only: the importer's blocking hand-off of the post-state to the storage crate's background writer, which waits while the writer's queue is full. Subtracted from `stf`, so `stf` and `writer_wait` do not overlap | beacon |
 | `db_write` | The block write and handing the post-state off to the storage crate's background writer; the state's own encode/diff/commit cost is `lean_state_write_seconds` instead, not this row | lean |
 | `fc_head` | `update_head` | lean |
 | `block_atts` | Replaying the block's own attestations and slashings into fork choice | beacon |
