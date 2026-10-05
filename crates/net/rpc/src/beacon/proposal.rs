@@ -15,7 +15,7 @@
 use axum::{
     Extension, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -89,7 +89,10 @@ pub(crate) struct FuluSignedBlockContents {
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
         .route("/eth/v3/validator/blocks/{slot}", get(get_block))
-        .route("/eth/v2/beacon/blocks", post(post_block))
+        .route(
+            "/eth/v2/beacon/blocks",
+            post(post_block).layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
+        )
 }
 
 /// `POST /eth/v2/beacon/blocks`, SSZ-encoded `SignedBlockContents`.
@@ -574,6 +577,20 @@ mod tests {
         let (status, json) = respond(app, request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["message"], "blocks are accepted for fulu slots only");
+    }
+
+    #[tokio::test]
+    async fn a_block_over_the_default_body_limit_is_not_a_413() {
+        let (store, _) = gloas_scheduled_store();
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let app = routes().with_state(store).layer(Extension(network));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("eth-consensus-version", "fulu")
+            .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+            .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+            .unwrap();
+        let (status, _) = respond(app, request).await;
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
