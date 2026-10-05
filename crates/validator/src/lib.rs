@@ -39,6 +39,7 @@ pub mod error;
 pub mod http_api;
 pub mod keys;
 pub mod metrics;
+pub mod payload_attestation;
 pub mod proposal;
 pub mod proposal_guard;
 pub(crate) mod secure_fs;
@@ -64,6 +65,7 @@ use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
 use crate::keys::ValidatorStore;
+use crate::payload_attestation::PayloadAttestationService;
 use crate::proposal::ProposalService;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
@@ -176,6 +178,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let mut duties = DutiesService::new(beacon_node.clone(), Vec::new());
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
+    let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
     let proposal = ProposalService::new(
         beacon_node.clone(),
         context.clone(),
@@ -292,72 +295,167 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
 
         let slot_duties = duties.at_slot(slot, epoch);
-        if slot_duties.is_empty() {
-            continue;
-        }
+        let committee = duties.ptc_at_slot(slot, epoch);
+        serve_slot_duties(
+            &attestation,
+            &aggregation,
+            &payload_attestation,
+            &clock,
+            slot,
+            &slot_duties,
+            &committee,
+            &store,
+        )
+        .await;
+    }
+}
 
-        // Bound the slot's work by what is left of the slot.
-        //
-        // Nothing else does. The per-request timeout in `HttpBeaconNode` is 8
-        // seconds, failover tries each node in turn, and `attest` makes two
-        // calls, so one hung node can carry a 12-second slot's duty well past
-        // the slot itself and into the next one, whose duty is then late in
-        // turn. An attestation that misses its slot is worth little; one that
-        // also delays the next slot's is worth less than nothing.
-        //
-        // Dropping the future mid-flight is safe here specifically because of
-        // `AttestationGuard`: it records at signing time, so a duty abandoned
-        // between signing and submission cannot be re-signed next slot under
-        // the same target. That is the intended outcome and matches `attest`'s
-        // own "do not retry within a slot" rule; the attestation is simply
-        // lost.
-        let budget = clock.remaining_in(slot, SystemTime::now());
-        let attempt = tokio::time::timeout(budget, attestation.attest(slot, &slot_duties, &store));
-        match attempt.await.unwrap_or_else(|_| {
+/// Everything a slot owes after its proposal: attest and aggregate, then the
+/// payload timeliness committee vote.
+///
+/// The two halves are independent on purpose. Committee membership is drawn
+/// separately from attester duties, so a client can sit on a slot's committee
+/// with no attester duty in it at all, and an early return for "no attester
+/// duties" would skip exactly those votes. The committee half is also gated on
+/// the slot being a gloas one: before the fork there is no committee and no
+/// payload to vote on.
+///
+/// Three quarters into the slot the committee sleeps until its own deadline,
+/// then runs bounded by the end of the slot like the other duties.
+#[allow(clippy::too_many_arguments)]
+async fn serve_slot_duties<B: BeaconNodeApi>(
+    attestation: &AttestationService<B>,
+    aggregation: &AggregationService<B>,
+    payload_attestation: &PayloadAttestationService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
+    committee: &[crate::beacon_node::dto::PtcDutyDto],
+    store: &RwLock<ValidatorStore>,
+) {
+    if !slot_duties.is_empty() {
+        attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
+    }
+
+    if clock.is_gloas(slot) && !committee.is_empty() {
+        tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
+        payload_attest(payload_attestation, clock, slot, committee, store).await;
+    }
+}
+
+/// Run one slot's attestation duty and, when it produced data, the aggregation
+/// duty that follows it.
+///
+/// Split out of the loop so the loop can go on to the payload committee duty
+/// whether or not this client has an attester duty in the slot.
+async fn attest_and_aggregate<B: BeaconNodeApi>(
+    attestation: &AttestationService<B>,
+    aggregation: &AggregationService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
+    store: &RwLock<ValidatorStore>,
+) {
+    // Bound the slot's work by what is left of the slot.
+    //
+    // Nothing else does. The per-request timeout in `HttpBeaconNode` is 8
+    // seconds, failover tries each node in turn, and `attest` makes two
+    // calls, so one hung node can carry a 12-second slot's duty well past
+    // the slot itself and into the next one, whose duty is then late in
+    // turn. An attestation that misses its slot is worth little; one that
+    // also delays the next slot's is worth less than nothing.
+    //
+    // Dropping the future mid-flight is safe here specifically because of
+    // `AttestationGuard`: it records at signing time, so a duty abandoned
+    // between signing and submission cannot be re-signed next slot under
+    // the same target. That is the intended outcome and matches `attest`'s
+    // own "do not retry within a slot" rule; the attestation is simply
+    // lost.
+    let budget = clock.remaining_in(slot, SystemTime::now());
+    let attempt = tokio::time::timeout(budget, attestation.attest(slot, slot_duties, store));
+    match attempt.await.unwrap_or_else(|_| {
+        warn!(
+            %slot,
+            budget_ms = budget.as_millis() as u64,
+            "Attestation duty ran past the end of its slot and was abandoned"
+        );
+        metrics::inc_attestation_deadline_missed();
+        Err(Error::AttestationDeadline { slot })
+    }) {
+        // `attest` scopes its own read guard away from every await (see
+        // its doc comment), so passing the shared `store` straight
+        // through here holds nothing across this call.
+        Ok(attested) => {
+            if attested.published > 0 {
+                let elapsed = SystemTime::now()
+                    .duration_since(clock.start_of(slot))
+                    .unwrap_or_default();
+                metrics::observe_publication_delay(elapsed.as_secs_f64());
+            }
+
+            // Aggregation, for whichever of this slot's duties this client
+            // was selected for.
+            //
+            // Reached only when the attestation duty produced data, since
+            // that data is what names the aggregate to ask for. It is not
+            // gated on anything having been *published*, though: an
+            // aggregator collects the whole committee's votes, so the duty
+            // is still owed when this client's own signatures were refused.
+            if let Some(data) = attested.data {
+                let delay = clock.until_aggregation(slot, SystemTime::now());
+                tokio::time::sleep(delay).await;
+                aggregate(aggregation, clock, slot, &data, slot_duties, store).await;
+            }
+        }
+        Err(err) => {
+            error!(%slot, %err, "Failed to publish attestations for this slot");
+            metrics::inc_attestation_failures();
+            // Every error `attest` can return originates from the beacon
+            // node (a failed fetch, a bad or mismatched response, a
+            // failed submission), so a failure here is exactly the signal
+            // this gauge exists for: `refresh_epoch` only runs once an
+            // epoch and would otherwise leave it reporting stale
+            // availability for up to that long.
+            metrics::set_beacon_node_available(false);
+        }
+    }
+}
+
+/// Run one slot's payload timeliness committee duty, bounded by what is left of
+/// the slot.
+///
+/// The budget is the end of the slot, like the aggregation's and for the same
+/// reason: this is the last duty in its slot, so the only thing past its
+/// deadline is the next slot's work. A vote that arrives after its slot is
+/// worthless, since the committee's attestations are only counted for the slot
+/// they are about.
+///
+/// Abandoning it is safe: the service records per validator at signing time, so
+/// a duty dropped mid-flight is lost rather than re-signed. Failures are logged
+/// and counted rather than propagated, like every other duty's.
+async fn payload_attest<B: BeaconNodeApi>(
+    service: &PayloadAttestationService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    committee: &[crate::beacon_node::dto::PtcDutyDto],
+    store: &RwLock<ValidatorStore>,
+) {
+    let budget = clock.remaining_in(slot, SystemTime::now());
+    let attempt = tokio::time::timeout(budget, service.attest(slot, committee, store));
+    match attempt.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to publish payload attestations for this slot");
+            metrics::inc_payload_attestation_failures();
+            metrics::set_beacon_node_available(false);
+        }
+        Err(_) => {
             warn!(
                 %slot,
                 budget_ms = budget.as_millis() as u64,
-                "Attestation duty ran past the end of its slot and was abandoned"
+                "Payload attestation duty ran past the end of its slot and was abandoned"
             );
-            metrics::inc_attestation_deadline_missed();
-            Err(Error::AttestationDeadline { slot })
-        }) {
-            // `attest` scopes its own read guard away from every await (see
-            // its doc comment), so passing the shared `store` straight
-            // through here holds nothing across this call.
-            Ok(attested) => {
-                if attested.published > 0 {
-                    let elapsed = SystemTime::now()
-                        .duration_since(clock.start_of(slot))
-                        .unwrap_or_default();
-                    metrics::observe_publication_delay(elapsed.as_secs_f64());
-                }
-
-                // Aggregation, two thirds in, for whichever of this slot's
-                // duties this client was selected for.
-                //
-                // Reached only when the attestation duty produced data, since
-                // that data is what names the aggregate to ask for. It is not
-                // gated on anything having been *published*, though: an
-                // aggregator collects the whole committee's votes, so the duty
-                // is still owed when this client's own signatures were refused.
-                if let Some(data) = attested.data {
-                    let delay = clock.until_aggregation(slot, SystemTime::now());
-                    tokio::time::sleep(delay).await;
-                    aggregate(&aggregation, &clock, slot, &data, &slot_duties, &store).await;
-                }
-            }
-            Err(err) => {
-                error!(%slot, %err, "Failed to publish attestations for this slot");
-                metrics::inc_attestation_failures();
-                // Every error `attest` can return originates from the beacon
-                // node (a failed fetch, a bad or mismatched response, a
-                // failed submission), so a failure here is exactly the signal
-                // this gauge exists for: `refresh_epoch` only runs once an
-                // epoch and would otherwise leave it reporting stale
-                // availability for up to that long.
-                metrics::set_beacon_node_available(false);
-            }
+            metrics::inc_payload_attestation_failures();
         }
     }
 }
@@ -539,12 +637,41 @@ async fn refresh_epoch<B: BeaconNodeApi>(
     }
 
     let changed = duties.refresh_around(epoch).await?;
+    refresh_ptc(duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
     if changed {
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
     }
     metrics::set_beacon_node_available(true);
     Ok(())
+}
+
+/// Fetch the payload timeliness committee schedule for this epoch and the next,
+/// each only if it is a gloas epoch.
+///
+/// Gated per epoch rather than once, because the fork can activate between the
+/// two: the lookahead is the epoch the first gloas slots belong to when the
+/// current one is the last before the fork. A failed fetch is logged and
+/// shrugged off, like the proposer and lookahead ones: it must not cost this
+/// epoch's attester schedule, which is already in hand.
+async fn refresh_ptc<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    context: &SigningContext,
+) {
+    for target in [epoch, epoch + 1] {
+        if context.config.fork_at_epoch(target) < ethlambda_types::beacon::fork::ForkName::Gloas {
+            continue;
+        }
+        if let Err(err) = duties.refresh_ptc(target).await {
+            warn!(
+                epoch = target,
+                %err,
+                "Payload committee duties fetch failed; this client may miss its votes"
+            );
+        }
+    }
+    duties.prune_ptc_before(epoch);
 }
 
 #[cfg(test)]
@@ -726,5 +853,187 @@ mod tests {
 
         refresh(node.clone(), Some(H160([0xab; 20]))).await;
         assert!(node.preparations().is_empty());
+    }
+
+    // ---- gloas ----------------------------------------------------------
+
+    fn gloas_context(epoch: u64) -> SigningContext {
+        SigningContext {
+            config: ethlambda_types::beacon::config::Config::mainnet()
+                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, epoch),
+            genesis_validators_root: Root::ZERO,
+        }
+    }
+
+    fn ptc_duty(index: u64, slot: u64) -> crate::beacon_node::dto::PtcDutyDto {
+        crate::beacon_node::dto::PtcDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&[0u8; 48]),
+            validator_index: index,
+            slot,
+        }
+    }
+
+    /// The committee schedule is fetched for gloas epochs only, so a chain that
+    /// has not forked is never asked, and the lookahead is gated on its own
+    /// epoch: the last pre-gloas epoch looks ahead into the first gloas one.
+    #[tokio::test]
+    async fn the_committee_schedule_is_fetched_for_gloas_epochs_only() {
+        let node = Arc::new(
+            node()
+                .with_ptc_duties(4, Root::repeat_byte(1), vec![ptc_duty(11, 130)])
+                .with_ptc_duties(5, Root::repeat_byte(1), Vec::new()),
+        );
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+
+        // Epoch 3 is the last before gloas at epoch 4: only the lookahead asks.
+        node.set_duties(3, Root::repeat_byte(1), Vec::new());
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            None,
+            &empty_store(),
+            &gloas_context(4),
+        )
+        .await
+        .expect("refreshes");
+        assert_eq!(
+            node.ptc_call_count(),
+            1,
+            "only epoch 4, the first gloas one"
+        );
+        assert_eq!(duties.ptc_at_slot(130, 4).len(), 1);
+
+        // A chain with no gloas scheduled is never asked at all.
+        let node = Arc::new(node_without_ptc());
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            None,
+            &empty_store(),
+            &context(),
+        )
+        .await
+        .expect("refreshes");
+        assert_eq!(node.ptc_call_count(), 0);
+    }
+
+    fn node_without_ptc() -> MockBeaconNode {
+        node()
+    }
+
+    /// A failed committee fetch must not cost the epoch's attester schedule.
+    #[tokio::test]
+    async fn a_failed_committee_fetch_does_not_fail_the_refresh() {
+        let node = Arc::new(node().failing_call("ptc_duties", "node is unhappy"));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            None,
+            &empty_store(),
+            &gloas_context(0),
+        )
+        .await
+        .expect("the refresh survives it");
+        assert_eq!(duties.indices(), &[11, 22]);
+    }
+
+    /// The restructured loop: a client on a slot's committee with no attester
+    /// duty at all must still vote. This is the case the old early `continue`
+    /// on "no attester duties" would have skipped.
+    #[tokio::test]
+    async fn a_committee_member_with_no_attester_duty_still_votes() {
+        use crate::beacon_node::mock::MockBeaconNode;
+        use ethlambda_types::beacon::containers::gloas::PayloadAttestationData;
+
+        let mut config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0);
+        config.slot_duration_ms = 1_000;
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let clock = SlotClock::from_config(now_secs - 100, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = RwLock::new(store);
+
+        let node = Arc::new(MockBeaconNode::new().with_payload_attestation_data(
+            PayloadAttestationData {
+                beacon_block_root: Root::repeat_byte(5),
+                slot,
+                payload_present: true,
+                blob_data_available: true,
+            },
+        ));
+        let committee = [crate::beacon_node::dto::PtcDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&key.0),
+            validator_index: 3,
+            slot,
+        }];
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &clock,
+            slot,
+            &[],
+            &committee,
+            &store,
+        )
+        .await;
+
+        assert_eq!(node.attestation_data_call_count(), 0, "no attester duty");
+        assert_eq!(node.submitted_payload_attestations().len(), 1);
+    }
+
+    /// Before gloas there is no committee: even a stale schedule entry is not
+    /// acted on.
+    #[tokio::test]
+    async fn no_committee_vote_is_cast_before_gloas() {
+        use crate::beacon_node::mock::MockBeaconNode;
+
+        let config = ethlambda_types::beacon::config::Config::mainnet();
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let clock = SlotClock::from_config(0, &config);
+        let node = Arc::new(MockBeaconNode::new());
+        let store = empty_store();
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &clock,
+            5,
+            &[],
+            &[ptc_duty(3, 5)],
+            &store,
+        )
+        .await;
+        assert_eq!(node.payload_attestation_data_call_count(), 0);
     }
 }
