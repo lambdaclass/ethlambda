@@ -1,5 +1,5 @@
-//! The validator-facing endpoints under `/eth/v{1,2}/validator/`: what a
-//! validator client asks a beacon node for in order to do its duties.
+//! The validator-facing endpoints under `/eth/v1/validator/`: what a validator
+//! client asks a beacon node for in order to do its duties.
 //!
 //! Every answer is computed from the fork-choice head's post-state, read off
 //! the shared `Store` the chain actor writes: the head row is refreshed on each
@@ -48,10 +48,6 @@ pub(crate) fn routes() -> Router<Store> {
         .route(
             "/eth/v1/validator/duties/proposer/{epoch}",
             get(get_proposer_duties),
-        )
-        .route(
-            "/eth/v2/validator/duties/proposer/{epoch}",
-            get(get_proposer_duties_v2),
         )
         .route(
             "/eth/v1/validator/duties/attester/{epoch}",
@@ -421,57 +417,24 @@ struct ProposerDuty {
     slot: Slot,
 }
 
-/// The last slot before `epoch`: v1 proposer duties' dependent slot.
-fn last_slot_before(epoch: Epoch) -> Slot {
-    compute_start_slot_at_epoch(epoch).saturating_sub(1)
-}
-
-/// The last slot before the epoch preceding `epoch`: the dependent slot of
-/// attester duties and of v2 proposer duties. Saturates to genesis, so epochs
-/// 0 and 1 both depend on the genesis block.
-fn last_slot_before_previous(epoch: Epoch) -> Slot {
-    last_slot_before(epoch.saturating_sub(1))
-}
-
-/// `GET /eth/v1/validator/duties/proposer/{epoch}`, deprecated by the Beacon
-/// API in favour of v2.
+/// `GET /eth/v1/validator/duties/proposer/{epoch}`.
+///
+/// Read from the `proposer_lookahead` fulu introduced and gloas keeps, which
+/// the state keeps for its own epoch and the next `MIN_SEED_LOOKAHEAD` epochs,
+/// so any epoch in that window is answered without advancing a state. Any other
+/// epoch is refused.
 ///
 /// `dependent_root` is v1's definition, the block root at
 /// `compute_start_slot_at_epoch(epoch) - 1` (the genesis block's at epoch 0).
 /// It is what `ethlambda validator` compares across fetches to notice a reorg.
 async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Store>) -> Response {
-    match proposer_duties(&store, &epoch, last_slot_before) {
+    match proposer_duties(&store, &epoch) {
         Ok(body) => crate::json_response(body),
         Err(err) => err.into_response(),
     }
 }
 
-/// `GET /eth/v2/validator/duties/proposer/{epoch}`: v1's duties, with
-/// `dependent_root` at `compute_start_slot_at_epoch(epoch - 1) - 1` (the
-/// genesis block's on underflow).
-///
-/// That is the block fulu's lookahead depends on: an epoch's proposers are
-/// written into `proposer_lookahead` by the epoch transition into the epoch
-/// before it, from the state the blocks before that transition left. v1's
-/// later root also changes on reorgs that leave the duties as they were.
-async fn get_proposer_duties_v2(Path(epoch): Path<String>, State(store): State<Store>) -> Response {
-    match proposer_duties(&store, &epoch, last_slot_before_previous) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
-}
-
-/// Proposer duties for `epoch`, with `dependent_root` the block at the slot
-/// `dependent_slot` names for it, which is all that differs between versions.
-///
-/// Read from the `proposer_lookahead` fulu introduced and gloas keeps, which
-/// the state keeps for its own epoch and the next `MIN_SEED_LOOKAHEAD` epochs, so any epoch in that window
-/// is answered without advancing a state. Any other epoch is refused.
-fn proposer_duties(
-    store: &Store,
-    epoch: &str,
-    dependent_slot: fn(Epoch) -> Slot,
-) -> Result<serde_json::Value, ApiError> {
+fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
     let (head_root, state) = head(store)?;
 
@@ -512,7 +475,7 @@ fn proposer_duties(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    let dependent_root = block_root_at_or_before(&state, head_root, dependent_slot(epoch))?;
+    let dependent_root = block_root_at_or_before(&state, head_root, first_slot.saturating_sub(1))?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
         "execution_optimistic": store.is_beacon_optimistic(head_root),
@@ -614,7 +577,7 @@ fn attester_duties(
         }
     }
 
-    let dependent_slot = last_slot_before_previous(epoch);
+    let dependent_slot = compute_start_slot_at_epoch(epoch.saturating_sub(1)).saturating_sub(1);
     let dependent_root = block_root_at_or_before(&state, head_root, dependent_slot)?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
@@ -852,29 +815,6 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["dependent_root"], format!("{head_root}"));
-    }
-
-    /// v2 serves v1's duties with each epoch's dependent block an epoch
-    /// earlier. The head's epoch is 1, so its dependent slot underflows to
-    /// genesis; the next epoch's is the last slot of epoch 0, where v1 names
-    /// the head.
-    #[tokio::test]
-    async fn v2_dependent_root_is_the_block_before_the_previous_epoch() {
-        let state = fulu_state();
-        let state_epoch = compute_epoch_at_slot(state.slot());
-        for epoch in [state_epoch, state_epoch + 1] {
-            let v1_uri = format!("/eth/v1/validator/duties/proposer/{epoch}");
-            let (_, v1) = get(state.clone(), &v1_uri).await;
-            let v2_uri = format!("/eth/v2/validator/duties/proposer/{epoch}");
-            let (status, v2) = get(state.clone(), &v2_uri).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(v2["data"], v1["data"]);
-
-            let dependent = compute_start_slot_at_epoch(epoch - 1).saturating_sub(1);
-            let expected = get_block_root_at_slot(&state, dependent).unwrap();
-            assert_eq!(v2["dependent_root"], format!("{expected}"));
-            assert_ne!(v2["dependent_root"], v1["dependent_root"]);
-        }
     }
 
     async fn post(
@@ -1372,11 +1312,12 @@ mod tests {
     async fn an_epoch_outside_the_lookahead_is_a_400() {
         let state = fulu_state();
         let too_far = compute_epoch_at_slot(state.slot()) + 2;
-        for version in ["v1", "v2"] {
-            let uri = format!("/eth/{version}/validator/duties/proposer/{too_far}");
-            let (status, _) = get(state.clone(), &uri).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{version}");
-        }
+        let (status, _) = get(
+            state,
+            &format!("/eth/v1/validator/duties/proposer/{too_far}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     // --- duties/sync -----------------------------------------------------
