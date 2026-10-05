@@ -1865,8 +1865,8 @@ async fn fetch_initial_beacon_state(
     // A loaded network carries its own genesis state, which is a legitimate
     // anchor: a fresh devnet has no checkpoint provider at slot 0, so this is
     // the only way to join one. A built-in network still refuses, because
-    // every one has been live for years and this follower would sit at slot 0
-    // claiming to follow a live chain.
+    // every one is a live chain and this follower would sit at slot 0
+    // claiming to follow it.
     if checkpoint_urls.is_empty() {
         let network::NetworkSource::Loaded(loaded) = source else {
             return Err(checkpoint_sync::CheckpointSyncError::BeaconGenesisSync);
@@ -2857,9 +2857,9 @@ validators:
         );
     }
 
-    /// Every built-in network has been live for years, and this follower
-    /// imports nothing at startup, so anchoring at genesis would park it at
-    /// slot 0 while claiming to follow a live chain. That refusal is
+    /// Every built-in network is a live chain, and this follower imports
+    /// nothing at startup, so anchoring at genesis would park it at slot 0
+    /// while claiming to follow it. That refusal is
     /// deliberate and must survive; no built-in network carries a genesis
     /// state to anchor at in the first place.
     #[tokio::test]

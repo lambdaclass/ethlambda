@@ -19,8 +19,8 @@ bin/ethlambda/              # Entry point, CLI, orchestration
   ├─ src/beacon.rs          # Beacon wire params derived from a resolved network: epoch, fork digest
   ├─ src/checkpoint_sync.rs # Checkpoint sync for both chains (lean's `/lean/v0/...`, beacon's Beacon API)
   ├─ src/network/           # --network resolution: built-in name vs. directory of published files
-  │   └─ built_in.rs        # Built-in chains (mainnet, sepolia, hoodi) and their genesis constants
-  ├─ assets/{mainnet,sepolia,hoodi}/  # config.yaml + bootstrap_nodes.yaml (eth-clients/<name>'s files)
+  │   └─ built_in.rs        # Built-in chains (mainnet, sepolia, hoodi, plataberget) and their genesis constants
+  ├─ assets/{mainnet,sepolia,hoodi,plataberget}/  # config.yaml + bootstrap_nodes.yaml (each publisher's files)
   ├─ tests/fixtures/networks/mainnet/genesis.ssz  # Mainnet genesis state, test-only
   └─ src/version.rs         # Build-time version info (vergen-git2)
 crates/
@@ -428,7 +428,7 @@ lean does (it used to park on `std::future::pending()`).
 ### Built-in networks
 
 `beacon` takes a `--network` flag (built-in name `mainnet` (default),
-`sepolia` or `hoodi`, or a path to a directory of published network files)
+`sepolia`, `hoodi` or `plataberget`, or a path to a directory of published network files)
 and resolves it into a `NetworkSource` before doing anything else; see
 `bin/ethlambda/src/network/`. `genesis_time` and `genesis_validators_root`,
 which the fork digest keying every gossip topic, the ENR `eth2` entry and
@@ -436,14 +436,15 @@ discv5 admission are computed from, come from that resolved network.
 
 Every built-in chain is a `network::built_in::EmbeddedChain`: its
 `eth-clients` repo's `config.yaml` and `bootstrap_nodes.yaml` byte for byte
-(`bin/ethlambda/assets/<name>/`), parsed through the same
+(Platåberget's come from `ethpandaops/glamsterdam-devnets`'
+`network-configs/devnet-8`) (`bin/ethlambda/assets/<name>/`), parsed through the same
 `ConfigFile::parse`/bootnode reader a directory goes through, plus the two
 genesis values as constants. None carries a **genesis state**: a built-in
 network never anchors at genesis, and the states are 5 MB (mainnet) to 150 MB
 (Hoodi). The constants are checked offline (mainnet's against
 `tests/fixtures/networks/mainnet/genesis.ssz`, eth-clients' file, whose SHA-256
-`beacon::tests::the_fixture_state_is_eth_clients_file` pins; Sepolia's and
-Hoodi's against fork digests published in their own bootnode ENRs), and at
+`beacon::tests::the_fixture_state_is_eth_clients_file` pins; Sepolia's,
+Hoodi's and Platåberget's against fork digests published in their own bootnode ENRs), and at
 runtime by checkpoint sync and resume, which both check the anchor state
 against them. `beacon::tests::the_built_in_network_derives_what_it_always_did`
 pins the parsed mainnet config to `Config::mainnet()`, so the file and the
@@ -460,6 +461,12 @@ explicitly at startup, once per scheduled fork for which `ForkName::is_followed`
 answers no (the one place that says which forks the node follows), separately
 from the ignored-keys warning, which now only ever names heze's keys and
 `GAS_LIMIT_SCHEDULE`/`INCLUSION_LIST_DUE_BPS`.
+Platåberget (the Glamsterdam testnet) is already past its `GLOAS_FORK_EPOCH`,
+so its checkpoint anchor is a gloas state that `refuse_unfollowable_fork`
+refuses; its entry is there for when the live follower takes gloas blocks. Its
+file says `CONFIG_NAME: 'testnet'` (a placeholder for Prysm), so
+`BuiltInNetwork::resolve` sets every built-in's `CONFIG_NAME` to its
+`--network` name.
 
 A loaded network decodes its own `genesis.ssz` instead, at whatever fork its
 own schedule names for epoch 0. Every `config.yaml`, built-in or loaded, goes
