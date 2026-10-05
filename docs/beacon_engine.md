@@ -33,10 +33,16 @@ used from gloas on; the startup handshake warns when the execution client does n
 
 Three method families a full client would have are deliberately absent:
 
-- **`engine_getPayload*` and `PayloadAttributesV3`.** This node is a follower and
-  never proposes, so it never asks an execution client to start building a block.
-  That also keeps `forkchoiceUpdated` outside the fork-scheduling rules attached
-  to `payloadAttributes.timestamp`: the second parameter is always `null`.
+- **`engine_getPayload*` outside the gloas path.** The follower itself never
+  asks an execution client to start building a block, so its own
+  `forkchoiceUpdated` calls carry `null` payload attributes. Block production for
+  a validator client (`produceBlockV3` for fulu, `produceBlockV4` for gloas) does:
+  `forkchoiceUpdatedV3` with `PayloadAttributesV3` then `engine_getPayloadV5`
+  before gloas, and `forkchoiceUpdatedV4` with `PayloadAttributesV4` (V3's fields
+  plus `slotNumber` and `targetGasLimit`, the parent bid's gas limit) then
+  `engine_getPayloadV6` (`ExecutionPayloadV4`, with `blockAccessList` and
+  `slotNumber`) from gloas on. The handshake warns when a gloas network's
+  execution client does not advertise `engine_getPayloadV6`.
 - **`engine_getBlobs*`.** There is no blob-pool fetch path here; data columns come
   from peers over the network.
 - **`engine_getPayloadBodies*`.** Nothing consumes them.
