@@ -23,7 +23,7 @@ pub mod registry;
 pub mod rewards;
 
 use crate::beacon::containers::phase0::PendingAttestation;
-use crate::beacon::containers::{BeaconState, HistoricalBatch};
+use crate::beacon::containers::{BeaconState, HistoricalBatch, RegistryMut};
 use crate::beacon::error::{Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
@@ -265,27 +265,32 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     const DOWNWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_DOWNWARD_MULTIPLIER;
     const UPWARD_THRESHOLD: Gwei = HYSTERESIS_INCREMENT * preset::HYSTERESIS_UPWARD_MULTIPLIER;
 
-    // Decided in one pass and applied in another. The state is an enum over
-    // per-fork structs, so the accessors hand out a borrow of the whole state
-    // rather than of one field, and there is no way to hold `validators` mutably
-    // while reading `balances`. Collecting the decisions first keeps this
-    // fork-independent, which matters because every fork runs this step
-    // unchanged.
-    let mut updates = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
-        let balance = state.balances()[index];
+    // `registry_mut` splits the state into the two lists, so the registry's write
+    // cursor can run while the balances are read in step. It copies a leaf only
+    // for a validator whose effective balance changes and keeps every other leaf
+    // (and its hash) as it was; this stays fork-independent, which matters
+    // because every fork runs this step unchanged.
+    let RegistryMut {
+        validators,
+        balances,
+    } = state.registry_mut();
+    let mut balances = balances.iter();
+    let mut pass = validators.iter_cow();
+    while let Some(mut validator) = pass.next_cow() {
+        let balance = *balances
+            .next()
+            .expect("balances are positionally parallel to validators");
         if balance + DOWNWARD_THRESHOLD < validator.effective_balance
             || validator.effective_balance + UPWARD_THRESHOLD < balance
         {
             let effective = (balance - balance % preset::EFFECTIVE_BALANCE_INCREMENT)
                 .min(preset::MAX_EFFECTIVE_BALANCE);
-            updates.push((index, effective));
+            // Equal to the old value when capped at the maximum: checked before
+            // the copy, so a validator already at its ceiling dirties nothing.
+            if effective != validator.effective_balance {
+                validator.make_mut().effective_balance = effective;
+            }
         }
-    }
-
-    let validators = state.validators_mut();
-    for (index, effective) in updates {
-        validators[index].effective_balance = effective;
     }
     Ok(())
 }

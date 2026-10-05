@@ -46,6 +46,16 @@
 //! a throwaway copy, so none of the new hashes are kept. Call `apply_updates`
 //! before hashing on a hot path.
 //!
+//! # Rewriting most of a list: the cursor
+//!
+//! A pass that writes most elements, such as an epoch's balance update, should
+//! not go through the buffer: it would hold an entry per element and then
+//! sort them. `iter_cow` walks the list in order instead and copies a leaf
+//! only when a write in it changes something. A leaf the pass leaves as it was
+//! keeps its `Arc` and its hash, and a rebuilt composite leaf keeps the roots of
+//! the elements that did not change. The changed leaves are swapped in once,
+//! when the pass is dropped. Pending writes are applied before the pass starts.
+//!
 //! # The hasher argument
 //!
 //! `HashTreeRoot::hash_tree_root` takes a hasher; these types ignore it and
@@ -53,6 +63,7 @@
 //! valid for the function that produced it, and SHA-256 is the only one the
 //! consensus specs use.
 
+mod cursor;
 mod interface;
 mod iter;
 mod list;
@@ -61,6 +72,7 @@ mod tree;
 mod update_map;
 mod vector;
 
+pub use cursor::{ElemCow, IterCow};
 pub use iter::Iter;
 pub use list::List;
 pub use update_map::{UpdateMap, VecMap};
