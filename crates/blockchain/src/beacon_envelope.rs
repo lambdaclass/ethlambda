@@ -562,6 +562,11 @@ impl BlockChainServer {
         );
         self.store
             .insert_beacon_block_payload_status(root, slot, status);
+        // When it arrived, not when it finished verifying: a held envelope is
+        // verified late, and the committee's `payload_present` asks whether it
+        // was seen on time.
+        let seen_ms = held.event_ms.saturating_sub(config.genesis_time_ms());
+        self.store.insert_beacon_envelope_seen(root, slot, seen_ms);
         // Lets `latestValidHash` find this FULL node.
         self.store.insert_beacon_el_block_hash(
             root,

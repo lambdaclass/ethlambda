@@ -3530,6 +3530,13 @@ pub fn get_payload_attestation_due_ms(config: &Config) -> u64 {
     get_slot_component_duration_ms(config.payload_attestation_due_bps, config)
 }
 
+/// `get_payload_due_ms` (gloas `fork-choice.md`): how far into a slot, in
+/// milliseconds, an execution payload envelope must have been seen for the
+/// payload timeliness committee to vote `payload_present`.
+pub fn get_payload_due_ms(config: &Config) -> u64 {
+    get_slot_component_duration_ms(config.payload_due_bps, config)
+}
+
 // ---------------------------------------------------------------------------
 // Merge transition helpers (bellatrix)
 // ---------------------------------------------------------------------------
