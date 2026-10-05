@@ -166,11 +166,11 @@ numbers are accepted quoted or bare, and unrecognised keys (on a current
 config, the heze schedule this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
-that would fix it. Sepolia's config schedules gloas, whose keys this build
-does claim but whose blocks the chain actor refuses, since nothing delivers
-payload envelopes or payload attestations to it yet: a separate, explicit
-warning at startup names that boundary, since the chain follower stops
-tracking the chain there regardless of what parsed cleanly. The keys this
+that would fix it. Sepolia's config schedules gloas, which this build follows, so
+it parses and runs like any other fork. A scheduled fork the build claims but
+does not follow gets a separate, explicit warning at startup, since the chain
+follower would stop tracking the chain there regardless of what parsed
+cleanly; none exists today. The keys this
 build runs on compile-time constants for (the custody and subnet counts, the
 `MAX_REQUEST_*` limits, `MAX_PAYLOAD_SIZE`, the snappy message domains and
 `MAXIMUM_GOSSIP_CLOCK_DISPARITY`) must equal those
@@ -192,30 +192,25 @@ consistency (see [`checkpoint_sync.md`](checkpoint_sync.md)). The full anchor
 precedence is: a resumable data directory, then `--checkpoint-sync-url`, then,
 for a loaded network only, that directory's own `genesis.ssz`, then abort. The
 URL is therefore **required** on a fresh data directory only for a built-in
-network: this follower imports nothing past its anchor, so anchoring a built-in
-network at genesis would leave it parked at slot 0 while claiming to follow a
-live chain. A loaded network's own genesis
+network: no built-in network carries a genesis state, and anchoring one at genesis
+would leave the follower replaying a chain that has been live for years. A loaded network's own genesis
 state is a legitimate anchor instead, since a freshly started devnet has no
 checkpoint provider at slot 0 and this is the only way to join one. A
 directory already anchored from a previous run resumes without the flag
 either way, the same way `node`'s does.
 
-`--api-port` is bound here too, off `beacon`'s own anchored store now rather
-than an empty one: one HTTP call site (`start_rpc_server`) serves both chains.
-The lean-shaped `/lean/v0/...` routes read metadata keys and state variants a
-beacon directory never carries, though, so calling one of them, e.g. `GET
-/lean/v0/states/finalized`, panics that request rather than answering for a
-chain that isn't running. This is deliberate for now: giving the beacon
-follower its own HTTP surface is a change of its own. Treat `/metrics` on
-`--metrics-port` as the only meaningful HTTP surface of a `beacon` run today.
+`--api-port` is bound here too, off `beacon`'s own anchored store: one HTTP call
+site serves both chains, but it picks the router by the store's chain, so a
+`beacon` run serves the Beacon API under `/eth/v1` and `/eth/v2` and answers a
+`/lean/v0/...` path with a 404. See [`rpc.md`](./rpc.md).
 
 ## What `ethlambda beacon` does today
 
-It follows the resolved network's gossip and nothing above it. It now anchors a real,
-RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, but
-does nothing more with it: no state transition, no fork choice, and no block
-import past that anchor. The node joins the network, decodes what arrives, and
-logs it. See [`beacon_wire.md`](./beacon_wire.md) for what goes on the wire and
+It follows the resolved network as a non-validating follower. It anchors a
+RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, joins
+the network's gossip and req/resp, and the chain actor imports blocks from there
+(phase0 through gloas), runs fork choice, and, with `--execution-endpoint`,
+asks an execution client about payloads. It never proposes or attests. See [`beacon_wire.md`](./beacon_wire.md) for what goes on the wire and
 how to check a run against the live network.
 
 ### One entry point, two chains
@@ -239,16 +234,16 @@ not chain-specific, branches once, and shares the shutdown:
 | **the one `match`**: produce a `ChainSetup` | genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets | `beacon::wire_params` (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend |
 | build the swarm, spawn P2P, start discv5 | shared; discv5 only with `--discovery.enable` | shared |
 | start the HTTP server | shared | shared |
-| spawn the chain actor and wire it to P2P | yes | no: it imports nothing |
+| spawn the chain actor and wire it to P2P | yes | yes: `BlockChain::spawn_beacon` |
 | ctrl-c, stop and join the actors | shared | shared |
 
 `ChainSetup` is what the `match` produces: the wire configuration, the ENR
 entries that describe it, the store the req/resp handlers answer from, the
-node-name roster, and an `Option` holding the validator keys and
-`BlockChainConfig`. The operator-supplied half of the discv5 configuration (node
+node-name roster, and a `ChainActor` saying what to spawn: lean's validator keys
+and `BlockChainConfig`, or beacon's marker. The operator-supplied half of the discv5 configuration (node
 key, ports, bootnodes, peer target) is the same on either chain, so it is filled
-in once below the match. That `Option` being `None` is what ends the mainnet path:
-`run_node` returns straight into the shared shutdown after starting the wire.
+in once below the match; everything after it, including the chain actor spawn
+and the shutdown, is shared.
 
 `beacon::wire_params` reads `genesis_time` and `genesis_validators_root` off
 the resolved network (a built-in network's two constants, or a loaded
@@ -259,11 +254,7 @@ digest. It builds nothing: one `build_swarm` serves both chains, dispatching on
 the `WireConfig` variant for the topics, the req/resp protocol set, the
 gossipsub `seen_ttl`, the identify version and the connection limits.
 
-The chain actor is the one thing mainnet has none of, so `RunningNode`
-carries it as an `Option` and the shared shutdown skips it.
-
-Not implemented here: block import and fork choice past the anchor. A decoded
-block is logged and dropped.
+Both chains run a chain actor, so `RunningNode` carries a plain `BlockChain`.
 
 ## `validator` flags
 

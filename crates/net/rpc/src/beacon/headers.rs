@@ -66,7 +66,7 @@ async fn get_header(Path(block_id): Path<String>, State(store): State<Store>) ->
     // which is unreachable here: this router is only ever mounted on a beacon
     // store.
     crate::json_response(serde_json::json!({
-        "execution_optimistic": store.is_beacon_optimistic(root),
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
         "finalized": is_finalized(&store, block.slot()),
         "data": {
             "root": root,

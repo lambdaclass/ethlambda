@@ -132,9 +132,11 @@ provider. See
 [`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
 the remaining flags.
 
-`--network plataberget` (the Glamsterdam testnet) is built in as well, but
-Platåberget has run gloas since its `GLOAS_FORK_EPOCH` and the follower does
-not take gloas blocks or a gloas anchor yet, so the node cannot follow it yet.
+`--network plataberget` (the Glamsterdam testnet) is built in as well. It has
+run gloas since its `GLOAS_FORK_EPOCH`, which the follower follows: a gloas
+checkpoint anchor is accepted, and payload envelopes are fetched and imported.
+It stays a follower, so the validator-client endpoints still refuse a gloas
+epoch.
 
 ### Lean consensus devnet
 

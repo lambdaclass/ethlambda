@@ -242,7 +242,9 @@ pub(crate) mod test_utils {
     use ethlambda_types::{
         beacon::{
             config::Config,
-            containers::{BeaconState, SignedBeaconBlock, phase0, shared::BeaconBlockHeader},
+            containers::{
+                BeaconState, SignedBeaconBlock, gloas, phase0, shared::BeaconBlockHeader,
+            },
             preset,
         },
         block::{Block, BlockBody, BlockHeader},
@@ -452,6 +454,117 @@ pub(crate) mod test_utils {
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.blocks.lock().unwrap().push(block);
             Ok(())
+        }
+    }
+
+    /// [`beacon_fixture`]'s chain with three gloas blocks on top of its head.
+    ///
+    /// ```text
+    /// anchor(phase0) - head(phase0) - g1 - g2 - g3
+    /// ```
+    ///
+    /// `g1` builds on a pre-gloas parent, so on its FULL branch. `g2`'s bid
+    /// names `g1`'s payload as its parent block hash (FULL). `g3`'s names
+    /// something else (EMPTY), so it builds on `g1`'s payload through `g2`'s
+    /// skipped one. No verdict or envelope is recorded for any of them.
+    pub(crate) struct GloasFixture {
+        pub(crate) store: Store,
+        pub(crate) head_root: H256,
+        pub(crate) g1: (H256, u64),
+        pub(crate) g2: (H256, u64),
+        pub(crate) g3: (H256, u64),
+    }
+
+    /// A gloas block whose bid names `parent_block_hash` and `block_hash`.
+    pub(crate) fn gloas_beacon_block(
+        slot: u64,
+        parent_root: H256,
+        parent_block_hash: H256,
+        block_hash: H256,
+    ) -> SignedBeaconBlock {
+        let mut body = gloas::BeaconBlockBody::default();
+        let bid = &mut body.signed_execution_payload_bid.message;
+        bid.parent_block_hash = parent_block_hash;
+        bid.block_hash = block_hash;
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body,
+            },
+            signature: Default::default(),
+        })
+    }
+
+    pub(crate) fn gloas_fixture() -> GloasFixture {
+        let BeaconFixture {
+            mut store,
+            head_root,
+            head_slot,
+            ..
+        } = beacon_fixture(64);
+
+        let hash = |n: u8| H256::from([n; 32]);
+        let mut chain = Vec::new();
+        let mut parent = (head_root, head_slot);
+        for (parent_hash, block_hash) in
+            [(hash(0), hash(1)), (hash(1), hash(2)), (hash(9), hash(3))]
+        {
+            let slot = parent.1 + 1;
+            let block = gloas_beacon_block(slot, parent.0, parent_hash, block_hash);
+            let root = block.message_hash_tree_root();
+            store
+                .insert_signed_block(root, block)
+                .expect("insert gloas block");
+            chain.push((root, slot));
+            parent = (root, slot);
+        }
+
+        GloasFixture {
+            store,
+            head_root,
+            g1: chain[0],
+            g2: chain[1],
+            g3: chain[2],
+        }
+    }
+
+    /// A signed envelope for `root` with every other field at its zero value.
+    pub(crate) fn gloas_envelope(root: H256, slot: u64) -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: slot,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: root,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
         }
     }
 

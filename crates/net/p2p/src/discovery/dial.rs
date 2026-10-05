@@ -40,6 +40,9 @@ pub(crate) struct DiscoveryState {
     local_peer_id: PeerId,
     /// Connected-peer count above which the loop stops dialing.
     target_peers: usize,
+    /// A handle on the admission policy the peer table also runs, so a fork
+    /// boundary can move both with one call. See [`LeanFilter::set_fork_id`].
+    filter: LeanFilter,
 }
 
 impl DiscoveryState {
@@ -47,12 +50,18 @@ impl DiscoveryState {
     /// runtime. Every call site builds a `P2PServer` from an async context.
     pub(crate) fn new(handle: DiscoveryHandle, local_peer_id: PeerId) -> Self {
         Self {
-            contacts: spawn_contact_poll(handle.peer_table, handle.filter),
+            contacts: spawn_contact_poll(handle.peer_table, handle.filter.clone()),
             candidates: VecDeque::new(),
             peer_attnets: HashMap::new(),
             local_peer_id,
             target_peers: handle.target_peers,
+            filter: handle.filter,
         }
+    }
+
+    /// The admission policy shared with the peer table.
+    pub(crate) fn filter(&self) -> &LeanFilter {
+        &self.filter
     }
 
     /// Connected-peer count above which the loop stops dialing.

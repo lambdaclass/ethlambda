@@ -316,11 +316,57 @@ wholesale, so its code sits beside the pre-gloas code rather than inside it: `st
 section of `fork_choice.rs` (fork choice), and `containers/gloas.rs` in
 `ethlambda-types`. Every gloas case that is not ignored passes on both presets.
 
-The live follower does not follow gloas yet. `process_or_pend_block` refuses a
-gloas block and `refuse_unfollowable_fork` refuses a gloas anchor at startup,
-because nothing delivers payload envelopes or payload attestations to the chain
-actor. Gloas gossip is answered with `Ignore(UnsupportedFork)` rather than
-scored, so an honest peer past the fork epoch is not penalized.
+The live follower follows gloas (`ForkName::Gloas.is_followed()`): the chain
+actor imports gloas blocks and their payload envelopes, a gloas checkpoint
+anchor is accepted (it starts EMPTY, with no payload known), and the clock
+passing the fork epoch no longer forces the sync status to syncing. Fork choice
+records the head node's payload status next to the head root
+(`Store::head_payload_status`, in memory, recomputed by the first head
+computation after a restart), which the envelope by-range server reads to
+withhold the head's envelope while the head is the EMPTY node. The node is
+still only a follower: the validator-client endpoints refuse a gloas epoch.
+
+### The envelope pipeline in the chain actor
+
+Order of arrival is not order of validity: an envelope can beat its block, a
+block can name a parent payload that has not arrived, and the columns an
+envelope's commitments need can lag both. `beacon_envelope.rs` holds each case
+in a queue with its own bound, and `beacon_columns.rs` bounds the parked
+sidecars of the same fork.
+
+| Queue | Holds | Released when |
+|---|---|---|
+| `awaiting_import` | an envelope whose block is stored but has no post-state (pending on a parent, held for columns or for its parent's payload), checked against the stored block's bid | the block imports; evicted with the block when it is discarded and at finality; bounded by the stored blocks, not by arrival slot |
+| `awaiting_block` | an envelope whose block is not stored at all | the block imports; evicted after `ENVELOPE_AWAITING_BLOCK_TTL_SLOTS`, capped per slot and per root |
+| `awaiting_columns` | a consensus-checked envelope whose bid has commitments and whose sampled columns are not all stored | the last column is stored |
+| `awaiting_engine` | a consensus-valid envelope the execution client gave no answer for | the per-slot redrive gets an answer (see [beacon_engine.md](./beacon_engine.md#gloas)) |
+| `blocks_awaiting_parent_payload` | a block whose parent is FULL with a payload not yet verified, capped per parent | that parent's envelope verifies |
+
+Data availability moves with the payload: a gloas block's commitments are in its
+bid, so the columns gate the envelope that reveals the payload, not the block's
+own import. A held block's parent envelope is requested through
+`FetchRequest.needs_envelope` the moment the block is held, whatever its source:
+`BlockSource::Sync` also marks by-root answers and pending children a cascade
+released, so no range batch can be assumed to bring the envelope, and p2p dedups
+in-flight roots. The tick re-asks once a slot for every parent still missing
+one, which is only what recovers a fetch that gave up; catch-up does not wait
+for it.
+
+The two envelope-before-block queues differ in who has vouched for the root.
+A range batch's envelopes arrive when all but its first block are stored and
+unimported, so a stored block's own bid is the authority: an envelope matching
+it (`envelope_matches_bid`) goes to `awaiting_import` outside the per-slot cap,
+and one contradicting it is dropped. Only a root with no stored block, which
+nobody has authenticated, is held under the per-slot cap and the TTL.
+Everything is swept at finality, except the finalized block's own envelope.
+
+Fork-choice events are timed at their arrival: the store clock is advanced to
+the moment an envelope, block or payload vote reached the node before its
+handler runs, because the tick fires once per slot and the timeliness deadlines
+would otherwise be judged at the slot's start. Payload votes already verified
+in p2p are applied without a second signature check
+(`apply_verified_payload_attestation`). The PTC vote vectors are not persisted
+and are reseeded empty on resume; see [data_storage.md](./data_storage.md).
 
 ### The deferred payload
 
@@ -551,9 +597,8 @@ ignored runs. The ignored cases are deliberate exclusions:
   state transition and fork choice, and is not in this module's scope.
 - `networking/gossip_*` cases outside what the node validates: every fork's
   cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
-  of the four it validates, and the fulu vectors in `SKIPPED`, which assume a
-  bad-block cache. A gloas message is refused with `Ignore(UnsupportedFork)`
-  before any rule runs.
+  of the aggregate and attestation topics (block and data column validate fulu
+  and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
 - The `heze` fixture tree, one ignored entry. See "Accounting for every fork
   directory" below.
 

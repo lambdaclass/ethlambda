@@ -47,7 +47,8 @@ use ethlambda_crypto::signature::ValidatorSecretKey;
 use ethlambda_engine::types::ClientVersionV1;
 use ethlambda_engine::{EngineClient, JwtSecret};
 use ethlambda_network_api::{
-    InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef, ToRpcToP2PRef,
+    BlockArrival, InitBlockChain, InitP2P, ToBlockChainToP2PRef, ToP2PToBlockChainRef,
+    ToRpcToP2PRef,
 };
 use ethlambda_p2p::{
     LeanWireConfig, P2P, PeerId, SwarmConfig, WireConfig, attestation_subscription_subnets,
@@ -204,6 +205,9 @@ enum ChainActor {
         /// `--execution-endpoint` was not given.
         engine: Option<EngineClient>,
         safe_slots_to_import_optimistically: u64,
+        /// The checkpoint-sync URLs to ask for a gloas anchor's execution
+        /// payload envelope; empty when there is nothing to ask.
+        anchor_envelope_urls: Vec<String>,
     },
 }
 
@@ -630,8 +634,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
+                    let gloas_scheduled = store.config().gloas_fork_epoch
+                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
                     let _ = client
-                        .handshake(&ours)
+                        .handshake(&ours, gloas_scheduled)
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -663,6 +669,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     engine,
                     safe_slots_to_import_optimistically: mainnet
                         .safe_slots_to_import_optimistically,
+                    anchor_envelope_urls: clean_checkpoint_urls.clone(),
                 },
             }
         }
@@ -771,6 +778,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         let _ = served.inspect_err(|err| error!(%err, "RPC server failed"));
     });
 
+    let mut anchor_envelope_fetch: Option<(Vec<String>, H256)> = None;
     let blockchain = match setup.chain {
         ChainActor::Lean(validator_keys, config) => {
             BlockChain::spawn(setup.store, validator_keys, config, events)
@@ -779,8 +787,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
+            anchor_envelope_urls,
         } => {
             check_custody_set(&custody_columns)?;
+            anchor_envelope_fetch = missing_anchor_envelope_root(&setup.store)
+                .filter(|_| !anchor_envelope_urls.is_empty())
+                .map(|root| (anchor_envelope_urls, root));
             BlockChain::spawn_beacon(
                 setup.store,
                 sync_status,
@@ -811,6 +823,23 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         })
         .inspect_err(|err| error!(%err, "Failed to send InitBlockChain — actors not wired"))?;
 
+    // After both `Init*` sends, so the actor has its p2p handle when an
+    // envelope parks waiting for columns. Off the startup path: the fetch is best-effort and a slow peer must not
+    // delay the node. The envelope goes through the same chain-actor entry a
+    // gossiped one does, so the bid check, the column check and the
+    // verification all apply to it.
+    if let Some((urls, anchor_root)) = anchor_envelope_fetch {
+        let chain = blockchain.actor_ref().to_p2p_to_block_chain_ref();
+        tokio::spawn(async move {
+            if let Some(envelope) = checkpoint_sync::fetch_anchor_envelope(&urls, anchor_root).await
+            {
+                let _ = chain
+                    .new_execution_payload_envelope(Box::new(envelope), BlockArrival::now())
+                    .inspect_err(|err| warn!(%err, "Failed to hand over the anchor's envelope"));
+            }
+        });
+    }
+
     wait_for_shutdown(RunningNode {
         p2p,
         blockchain,
@@ -819,6 +848,25 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     })
     .await;
     Ok(())
+}
+
+/// The root of the anchor block when it is a gloas block whose execution
+/// payload envelope the store does not hold.
+///
+/// The anchor is the finalized block. A node that checkpoint-synced onto a
+/// gloas block has the block and state but not the payload its children may
+/// build on; asking the checkpoint source for it saves waiting for a FULL
+/// child to make the by-root request fetch it.
+fn missing_anchor_envelope_root(store: &Store) -> Option<H256> {
+    let root = store.latest_finalized().ok()?.root;
+    let block = store.get_signed_block(&root).ok()??;
+    // Gloas or any later fork (lean sorts last, and is not a beacon fork).
+    let fork = block.fork_name();
+    if fork < ForkName::Gloas || fork == ForkName::Lean {
+        return None;
+    }
+    let held = store.get_execution_payload_envelope(&root).ok()?.is_some();
+    (!held).then_some(root)
 }
 
 /// Reject a beacon node with no custody set before it spawns.
@@ -1690,19 +1738,16 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
     None
 }
 
-/// Refuses an anchor state in `fork` if this node cannot follow that fork yet,
-/// currently gloas.
+/// Refuses an anchor state in `fork` if this node cannot follow that fork.
 ///
-/// `fork_choice::get_forkchoice_store` accepts a gloas anchor, since fork choice
-/// itself handles the fork. This node's wiring does not: nothing delivers
-/// payload envelopes or payload attestations to the chain actor, and
-/// `process_or_pend_block` refuses every gloas block, so a follower anchored
-/// here would sit at its anchor forever, looking alive while importing
-/// nothing. Refusing at startup reports the real reason instead. Checked ahead
-/// of any store construction, on both anchor sources (a loaded network's
-/// genesis state can schedule `GLOAS_FORK_EPOCH: 0`, and a checkpoint provider
-/// can serve a gloas finalized state), so a rejected anchor writes nothing to
-/// the data directory.
+/// Every fork is followed today, gloas included, so this lets every anchor
+/// through. A gloas anchor starts with no payload known (`payloads` is empty
+/// in `fork_choice::get_forkchoice_store`), so its head is EMPTY and the
+/// first FULL child is held until the actor fetches the parent's envelope.
+/// The guard stays for the next fork the node cannot follow: checked ahead of
+/// any store construction, on both anchor sources (a loaded network's genesis
+/// state and a checkpoint provider's finalized state), so a rejected anchor
+/// writes nothing to the data directory.
 ///
 /// Keeps the refusal distinguishable from a peer serving a mismatched anchor
 /// pair: reporting both as `AnchorPairingMismatch` would tell an operator to
@@ -2161,24 +2206,15 @@ mod tests {
         assert!(validate_aggregate_subnet_ids(Some(&[]), 4).is_ok());
     }
 
-    /// Fork choice accepts a gloas anchor, so the node has to be the one to
-    /// refuse it: nothing here delivers the payload envelopes a gloas chain
-    /// needs. Every fork this node does follow must still be let through.
+    /// Gloas is followed: the envelopes and payload attestations a gloas chain
+    /// needs are delivered, so no fork is refused as an anchor.
     #[test]
-    fn startup_refuses_a_gloas_anchor_and_only_a_gloas_anchor() {
-        assert!(matches!(
-            refuse_unfollowable_fork(ForkName::Gloas),
-            Err(checkpoint_sync::CheckpointSyncError::UnsupportedFork {
-                fork: ForkName::Gloas
-            })
-        ));
+    fn startup_accepts_an_anchor_at_every_beacon_fork() {
         for fork in ForkName::ALL {
-            if fork != ForkName::Gloas {
-                assert!(
-                    refuse_unfollowable_fork(fork).is_ok(),
-                    "{fork} must stay followable"
-                );
-            }
+            assert!(
+                refuse_unfollowable_fork(fork).is_ok(),
+                "{fork} must be followable"
+            );
         }
     }
 
@@ -2694,11 +2730,10 @@ validators:
     }
 
     /// A loaded network can schedule gloas at epoch 0, which makes its own
-    /// genesis state a gloas one. Fork choice accepts that anchor, so startup
-    /// has to be what refuses it, with the reason that names the fork, and
-    /// before anything is written to the data directory.
+    /// genesis state a gloas one. That is a legitimate anchor now that gloas
+    /// is followed: the store is built, at the genesis slot.
     #[tokio::test]
-    async fn a_gloas_genesis_is_refused_before_the_store_is_built() {
+    async fn a_gloas_genesis_becomes_an_anchor() {
         use ethlambda_state_transition::beacon::config::Config;
         use ethlambda_state_transition::beacon::upgrade::upgrade_state;
 
@@ -2739,6 +2774,10 @@ validators:
             state = upgrade_state(&state, fork, &config).unwrap();
         }
         assert_eq!(state.fork_name(), ForkName::Gloas);
+        // A real gloas genesis commits to gloas's empty body; the upgrade
+        // chain above leaves phase0's in the header.
+        state.latest_block_header_mut().body_root =
+            gloas::BeaconBlockBody::empty().hash_tree_root();
 
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.yaml"), config_text).unwrap();
@@ -2747,23 +2786,13 @@ validators:
         let source = network::NetworkSource::Loaded(Box::new(loaded));
         let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
 
-        // `Store` is not `Debug`, so take the error by pattern.
-        let Err(err) = fetch_initial_beacon_state(&[], backend.clone(), &source).await else {
-            panic!("a gloas genesis must not become an anchor");
-        };
-        assert!(
-            matches!(
-                err,
-                checkpoint_sync::CheckpointSyncError::UnsupportedFork {
-                    fork: ForkName::Gloas
-                }
-            ),
-            "the refusal must name the fork: {err}"
-        );
-        assert!(
-            Store::from_db_state(backend).unwrap().is_none(),
-            "a refused anchor leaves the directory empty"
-        );
+        let store = fetch_initial_beacon_state(&[], backend, &source)
+            .await
+            .expect("a gloas genesis anchors");
+        let (head_slot, _) = store
+            .beacon_head()
+            .expect("an anchored directory has a head");
+        assert_eq!(head_slot, 0, "a genesis anchor is at slot 0");
     }
 
     /// A changed fork epoch leaves genesis time and the validators root
@@ -3100,5 +3129,109 @@ validators:
         let fallback = default_bootnodes(Some(&mainnet_source));
         assert!(!fallback.is_empty());
         assert_eq!(fallback, mainnet_source.bootnodes());
+    }
+}
+
+#[cfg(test)]
+mod anchor_envelope_root_tests {
+    use super::*;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::checkpoint::Checkpoint;
+
+    fn anchored_at(block: SignedBeaconBlock) -> (Store, H256, u64) {
+        let slot = block.slot();
+        let root = block.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store.insert_signed_block(root, block).expect("insert");
+        (store, root, slot)
+    }
+
+    fn gloas_block(slot: u64) -> SignedBeaconBlock {
+        SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: gloas::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: Default::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    #[test]
+    fn a_gloas_anchor_without_its_envelope_is_asked_about() {
+        let (store, root, _) = anchored_at(gloas_block(64));
+        assert_eq!(missing_anchor_envelope_root(&store), Some(root));
+    }
+
+    #[test]
+    fn a_gloas_anchor_that_holds_its_envelope_is_not() {
+        let (mut store, root, slot) = anchored_at(gloas_block(64));
+        let mut envelope = test_envelope();
+        envelope.message.beacon_block_root = root;
+        store.insert_verified_payload(slot, &envelope);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    #[test]
+    fn a_pre_gloas_anchor_has_no_envelope_to_ask_for() {
+        let block = SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot: 64,
+                proposer_index: 0,
+                parent_root: H256::ZERO,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        });
+        let (store, _, _) = anchored_at(block);
+        assert_eq!(missing_anchor_envelope_root(&store), None);
+    }
+
+    fn test_envelope() -> gloas::SignedExecutionPayloadEnvelope {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; ethlambda_types::beacon::preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 7,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 3,
+                beacon_block_root: H256::ZERO,
+                parent_beacon_block_root: H256::ZERO,
+            },
+            signature: Default::default(),
+        }
     }
 }

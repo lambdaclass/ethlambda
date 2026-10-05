@@ -929,7 +929,9 @@ pub fn is_optimistic_candidate_block(
 /// unrealized justifications in their own table, and the per-slot/per-epoch
 /// scratch (`proposer_boost_root`, `block_timeliness`, `equivocating_indices`,
 /// `latest_messages`, `pow_blocks`) in an in-memory struct cheap enough to
-/// rebuild after a restart rather than worth persisting. See
+/// rebuild after a restart rather than worth persisting; the exceptions are
+/// a gloas block's timeliness and verified payload, which are also stored
+/// and reloaded on resume. See
 /// [`ethlambda_storage::Store`]'s own documentation for the full
 /// field-by-field accounting; this module reads and writes it exclusively
 /// through its public accessors.
@@ -1134,7 +1136,7 @@ pub fn get_forkchoice_store(
     store.set_payload_link(anchor_root, anchor_slot, anchor_rules.payload_link(None));
     match anchor_rules {
         ForkRules::Gloas => {
-            store.set_block_timeliness(anchor_root, [true, true]);
+            store.set_gloas_block_timeliness(anchor_root, [true, true]);
             store.set_payload_timeliness_vote(anchor_root, vec![None; preset::PTC_SIZE]);
             store.set_payload_data_availability_vote(anchor_root, vec![None; preset::PTC_SIZE]);
         }
@@ -2158,6 +2160,9 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// on its first tick. That writer also keeps the canonical `BlockRoots` index
 /// in step with the branch fork choice just picked.
 ///
+/// The head node's payload status is recorded too ([`Store::head_payload_status`]):
+/// the root alone cannot say which payload branch of a gloas block was picked.
+///
 /// Written unconditionally on every call, not only when the head changes: a
 /// value written once and then left alone is a second source of truth a bug
 /// can let drift, and the write is one small metadata row plus an index diff
@@ -2165,6 +2170,9 @@ pub fn get_head_node(store: &Store, config: &Config) -> Result<ForkChoiceNode> {
 /// tree walk.
 pub fn get_head(store: &mut Store, config: &Config) -> Result<Root> {
     let head = get_head_node(store, config)?;
+    // Recorded with its root, so a reader can tell which head the status is
+    // for whichever of the two writes it sees first.
+    store.set_head_payload_status(head.root, head.payload_status);
     store
         .update_checkpoints(ForkCheckpoints::head_only(head.root))
         .expect("record beacon head");
@@ -2746,6 +2754,27 @@ pub fn is_payload_verified(store: &Store, root: Root) -> bool {
     store.has_verified_payload(&root) || is_known_pre_gloas_block(store, root)
 }
 
+/// The execution verdict gloas's attestation gossip rules read for `root`'s
+/// payload, as the specification's `block_payload_statuses`.
+///
+/// A pre-gloas block's payload ran inside the block, so its verdict is the
+/// block's own: `NOT_VALIDATED` while it sits in the optimistic set, `VALID`
+/// otherwise (an invalidated block is dropped from the store, so is never
+/// asked about). This keeps an honest gloas-slot vote for the last pre-gloas
+/// block, which this node's boundary rule treats as FULL, from being ignored as
+/// optimistic. A gloas root reads [`Store::beacon_block_payload_status`].
+pub fn block_payload_status(store: &Store, root: Root) -> PayloadStatusEnum {
+    if is_known_pre_gloas_block(store, root) {
+        if store.is_beacon_optimistic(root) {
+            PayloadStatusEnum::Syncing
+        } else {
+            PayloadStatusEnum::Valid
+        }
+    } else {
+        store.beacon_block_payload_status(root)
+    }
+}
+
 /// `payload_timeliness` (gloas `fork-choice.md`): whether `root`'s payload is
 /// considered `timely` (or not, when `timely` is `false`), taking into
 /// account both local availability and the payload timeliness committee's
@@ -3165,9 +3194,9 @@ fn payload_status_tiebreaker_with(
 /// **Implementation choice, not spec text**: a candidate with no recorded
 /// [`Store::block_timeliness`](ethlambda_storage::Store::block_timeliness)
 /// entry reads as not timely by either deadline, rather than raising
-/// `Error::SpecAssert`. That scratch is in-memory only, so every entry is
-/// gone after a restart; reading a gap as "not an early equivocation"
-/// rather than aborting the whole weight computation over it is the
+/// `Error::SpecAssert`. A gloas block's entry is stored and reloaded on
+/// resume, so a gap is a block with no entry at all; reading it as "not an
+/// early equivocation" rather than aborting the whole weight computation is the
 /// conservative answer (it can only ever miss withholding a boost, never
 /// wrongly withhold one), the same shape of tolerance
 /// [`gloas_get_attestation_score`]'s own doc gives for a pruned vote.
@@ -4640,7 +4669,10 @@ pub fn on_block(
     // first, and shares the pre-import head's proposer shuffling. Both calls
     // are infallible: nothing from here to the end of this function can turn
     // into an `Err`, and the store has already been mutated above.
-    store.set_block_timeliness(block_root, timeliness);
+    match rules {
+        ForkRules::Gloas => store.set_gloas_block_timeliness(block_root, timeliness),
+        ForkRules::PreGloas => store.set_block_timeliness(block_root, timeliness),
+    }
     if let Some(pre_block_head) = pre_block_head {
         update_proposer_boost_root(store, &index, pre_block_head, block_root, config);
     }
@@ -4693,7 +4725,13 @@ pub fn notify_ptc_messages(
                 data: payload_attestation.data,
                 signature: Default::default(),
             };
-            apply_payload_attestation_message(store, &attested_state, &message, true, config)?;
+            apply_payload_attestation_message(
+                store,
+                &attested_state,
+                &message,
+                PtcMessageSource::Block,
+                config,
+            )?;
         }
     }
     Ok(())
@@ -4725,7 +4763,56 @@ pub fn on_payload_attestation_message(
         .ok_or(Error::SpecAssert(
             "data.beacon_block_root in store.block_states",
         ))?;
-    apply_payload_attestation_message(store, &state, ptc_message, is_from_block, config)
+    let source = if is_from_block {
+        PtcMessageSource::Block
+    } else {
+        PtcMessageSource::Wire
+    };
+    apply_payload_attestation_message(store, &state, ptc_message, source, config)
+}
+
+/// [`on_payload_attestation_message`] for a message that
+/// `ethlambda-p2p`'s `payload_attestation_message` gossip validation already
+/// accepted: the same store-state checks (the block's state is known, the
+/// vote is for the current slot, the validator holds a seat in the block's
+/// committee, which also locates the seats to write), without the signature
+/// check and the indexed-attestation validation behind it, which cost a BLS
+/// verification per vote on the chain actor.
+///
+/// Only a gossip-verified message may call this. A message from anywhere else
+/// (a block's payload attestations go through [`notify_ptc_messages`], which
+/// has its own verified path) would be applied unauthenticated.
+pub fn apply_verified_payload_attestation(
+    store: &mut Store,
+    ptc_message: &gloas::PayloadAttestationMessage,
+    config: &Config,
+) -> Result<()> {
+    let state = store
+        .get_state(&ptc_message.data.beacon_block_root)
+        .expect("get")
+        .ok_or(Error::SpecAssert(
+            "data.beacon_block_root in store.block_states",
+        ))?;
+    apply_payload_attestation_message(
+        store,
+        &state,
+        ptc_message,
+        PtcMessageSource::VerifiedWire,
+        config,
+    )
+}
+
+/// Where a payload attestation message came from, which decides what
+/// [`apply_payload_attestation_message`] still has to check.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtcMessageSource {
+    /// Inside a block, already verified with it: no slot or signature check.
+    Block,
+    /// Straight off the wire: current slot, then the signature.
+    Wire,
+    /// Off the wire and already signature-verified by gossip validation:
+    /// current slot only.
+    VerifiedWire,
 }
 
 /// The body of [`on_payload_attestation_message`] after its state read, given
@@ -4736,7 +4823,7 @@ fn apply_payload_attestation_message(
     store: &mut Store,
     state: &BeaconState,
     ptc_message: &gloas::PayloadAttestationMessage,
-    is_from_block: bool,
+    source: PtcMessageSource,
     config: &Config,
 ) -> Result<()> {
     let data = ptc_message.data;
@@ -4761,11 +4848,13 @@ fn apply_payload_attestation_message(
 
     // Verify the signature and check that it is for the current slot if it is
     // coming from the wire.
-    if !is_from_block {
+    if source != PtcMessageSource::Block {
         verify(
             data.slot == get_current_slot(store, config),
             "data.slot == get_current_slot(store)",
         )?;
+    }
+    if source == PtcMessageSource::Wire {
         let indexed = gloas::IndexedPayloadAttestation {
             attesting_indices: gloas::PayloadTimelinessCommitteeIndices::try_from(vec![
                 ptc_message.validator_index,
@@ -4835,6 +4924,28 @@ pub fn on_execution_payload_envelope(
     sidecars: &[gloas::DataColumnSidecar],
     engine: &stf::ExecutionEngine,
 ) -> Result<()> {
+    check_execution_payload_envelope(store, signed_envelope, config, sidecars, engine)?;
+    accept_execution_payload_envelope(store, signed_envelope);
+    Ok(())
+}
+
+/// Every check of [`on_execution_payload_envelope`], without recording the
+/// payload.
+///
+/// Split out so a caller whose execution engine answers over the network can
+/// run the pure consensus checks first, ask the engine only about an envelope
+/// that passed them, and record the payload with
+/// [`accept_execution_payload_envelope`] once the answer allows it. The
+/// `engine` argument still answers the engine's part of
+/// `verify_execution_payload_envelope`; such a caller passes
+/// [`stf::ExecutionEngine::valid`] and consults the real engine itself.
+pub fn check_execution_payload_envelope(
+    store: &Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+    config: &Config,
+    sidecars: &[gloas::DataColumnSidecar],
+    engine: &stf::ExecutionEngine,
+) -> Result<()> {
     let envelope = &signed_envelope.message;
     let block_root = envelope.beacon_block_root;
 
@@ -4863,11 +4974,24 @@ pub fn on_execution_payload_envelope(
     // Verify the execution payload envelope.
     stf::gloas::verify_execution_payload_envelope(&state, signed_envelope, config, engine)?;
 
-    // Add execution payload envelope to the store. Only the fact that it is
-    // verified is kept: nothing in fork choice reads the payload itself.
-    store.insert_verified_payload(block_root);
-
     Ok(())
+}
+
+/// The recording half of [`on_execution_payload_envelope`]: adds a checked
+/// envelope to the store. Persisted, so a restarted follower keeps the full
+/// branch of this block.
+///
+/// The caller must have run [`check_execution_payload_envelope`] on the same
+/// envelope; a block the store does not hold is the only case this refuses.
+pub fn accept_execution_payload_envelope(
+    store: &mut Store,
+    signed_envelope: &gloas::SignedExecutionPayloadEnvelope,
+) {
+    let block_root = signed_envelope.message.beacon_block_root;
+    let Some((slot, _parent)) = store.block_entry(&block_root) else {
+        return;
+    };
+    store.insert_verified_payload(slot, signed_envelope);
 }
 
 /// Validates `attestation` and, if valid, records it as each attester's
@@ -4974,10 +5098,11 @@ pub fn on_block_attestation(
 /// records it against `attesting_indices`, resolved by the caller's gossip
 /// validation rather than recomputed here.
 ///
-/// The rules are [`ForkRules::PreGloas`]: an aggregate reaches this function
-/// only as a pre-gloas (phase0- or electra-shaped) one, since gloas's own
-/// aggregate is refused when the gossip payload is decoded and never gets as
-/// far as gossip validation.
+/// The rules are those of the vote's own fork, read off `data.slot`: under
+/// gloas `data.index` is the payload flag that [`update_latest_messages`]
+/// records, and the electra-shaped callers that reach here (a gloas aggregate
+/// has its own container but yields the same `AttestationData`) do not say
+/// which fork they came from.
 ///
 /// `is_from_block` is fixed at `false`, matching [`on_attestation`]'s call for
 /// this topic: an aggregate here is by definition not carried in a block, so
@@ -4994,8 +5119,9 @@ pub fn apply_verified_aggregate(
     config: &Config,
     index: &HashMap<Root, (Slot, Root)>,
 ) -> Result<()> {
-    validate_on_attestation_indexed(store, data, ForkRules::PreGloas, false, config, index)?;
-    update_latest_messages(store, attesting_indices, data, ForkRules::PreGloas);
+    let rules = ForkRules::of(config.fork_at_epoch(compute_epoch_at_slot(data.slot)));
+    validate_on_attestation_indexed(store, data, rules, false, config, index)?;
+    update_latest_messages(store, attesting_indices, data, rules);
     Ok(())
 }
 
@@ -5154,6 +5280,53 @@ mod tests {
             },
             signature: Default::default(),
         })
+    }
+
+    /// Marks `root`'s payload verified by storing a default envelope for it.
+    /// The block must already be in the store: the envelope's row is keyed by
+    /// the block's slot.
+    fn verify_payload(store: &mut Store, root: Root) {
+        let payload = gloas::ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: crate::beacon::containers::bellatrix::LogsBloom::try_from(vec![
+                0u8;
+                preset::BYTES_PER_LOGS_BLOOM
+            ])
+            .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash: Default::default(),
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: 0,
+        };
+        let envelope = gloas::SignedExecutionPayloadEnvelope {
+            message: gloas::ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 0,
+                beacon_block_root: root,
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
+        };
+        let slot = store
+            .get_signed_block(&root)
+            .expect("get")
+            .expect("the block is in the store")
+            .slot();
+        store.insert_verified_payload(slot, &envelope);
     }
 
     /// A fulu signed block with an empty body and a zero signature, for the
@@ -6232,7 +6405,7 @@ mod tests {
             "no verified payload yet: only the empty branch exists"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         assert_eq!(
             get_node_children(&store, &blocks, node).unwrap(),
             vec![
@@ -6431,7 +6604,7 @@ mod tests {
             "a payload nobody verified must not be extended, so full loses the tiebreak"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         let strong_votes = vec![Some(true); preset::PTC_SIZE];
         store.set_payload_timeliness_vote(a_root, strong_votes.clone());
         store.set_payload_data_availability_vote(a_root, strong_votes);
@@ -6460,7 +6633,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let exactly_threshold = vec![Some(true); preset::PAYLOAD_TIMELY_THRESHOLD as usize];
         store.set_payload_timeliness_vote(a_root, exactly_threshold.clone());
@@ -6529,7 +6702,7 @@ mod tests {
             "a payload nobody verified must not be extended"
         );
 
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
         let weak_votes = vec![Some(false); preset::PTC_SIZE];
         store.set_payload_timeliness_vote(a_root, weak_votes.clone());
         store.set_payload_data_availability_vote(a_root, weak_votes);
@@ -6589,7 +6762,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let state = test_state::with_validators_at(ForkName::Gloas, 4);
         store.insert_state(anchor_root, state.clone()).unwrap();
@@ -6965,7 +7138,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        store.insert_verified_payload(a_root);
+        verify_payload(&mut store, a_root);
 
         let state = test_state::with_validators_at(ForkName::Gloas, 4);
         store.insert_state(anchor_root, state.clone()).unwrap();
@@ -7134,6 +7307,31 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_gloas_root_reads_its_own_validity_as_a_payload_status() {
+        let mut store = empty_store();
+        let root = Root::repeat_byte(0xa1);
+        store
+            .insert_signed_block(root, fulu_block(1, Root::ZERO))
+            .unwrap();
+        assert_eq!(block_payload_status(&store, root), PayloadStatusEnum::Valid);
+
+        store.insert_beacon_optimistic_root(root, 1);
+        assert_eq!(
+            block_payload_status(&store, root),
+            PayloadStatusEnum::Syncing
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_recorded_verdict_is_not_validated() {
+        let store = empty_store();
+        assert!(
+            block_payload_status(&store, Root::repeat_byte(0xee)).is_not_validated(),
+            "the specification's default for a root absent from the map"
+        );
+    }
+
+    #[test]
     fn is_payload_verified_is_false_for_an_unknown_root() {
         let store = empty_store();
         assert!(
@@ -7263,8 +7461,7 @@ mod tests {
 
         // A same-slot, same-proposer sibling of the parent that would be an
         // early equivocation if its timeliness were known, but whose
-        // `block_timeliness` entry was never recorded: the scratch is
-        // in-memory only and does not survive a restart. Deliberately no
+        // `block_timeliness` entry was never recorded. Deliberately no
         // `store.set_block_timeliness(twin_root, ...)` call.
         let twin_root = Root::repeat_byte(0xb1);
         store
@@ -7469,7 +7666,7 @@ mod tests {
         assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
 
         // Once the envelope is verified the full child clears the check too.
-        store.insert_verified_payload(anchor_root);
+        verify_payload(&mut store, anchor_root);
         let rejected = import(&mut store, full_child);
         assert!(rejected.is_err());
         assert_ne!(failed_assertion(rejected), Some(UNVERIFIED_PAYLOAD_PARENT));
@@ -7545,7 +7742,7 @@ mod tests {
         assert!(validate(&store, vote(2, 1), ForkRules::PreGloas).is_ok());
         assert!(validate(&store, vote(2, 2), ForkRules::PreGloas).is_ok());
 
-        store.insert_verified_payload(b_root);
+        verify_payload(&mut store, b_root);
         assert!(validate(&store, vote(2, 1), ForkRules::Gloas).is_ok());
     }
 
@@ -7580,10 +7777,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn on_payload_attestation_message_writes_every_seat_the_validator_holds() {
-        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
-        let root = Root::repeat_byte(0xb1);
+    /// A store holding a gloas block at slot 1 whose state seats validator 3
+    /// twice in the slot's committee (every other seat is validator 0), with
+    /// empty vote vectors.
+    fn payload_attestation_store(root: Root) -> Store {
         let mut store = store_anchored_at(root);
         store
             .insert_signed_block(
@@ -7613,6 +7810,14 @@ mod tests {
         store.insert_state(root, state).unwrap();
         store.set_payload_timeliness_vote(root, vec![None; preset::PTC_SIZE]);
         store.set_payload_data_availability_vote(root, vec![None; preset::PTC_SIZE]);
+        store
+    }
+
+    #[test]
+    fn on_payload_attestation_message_writes_every_seat_the_validator_holds() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let root = Root::repeat_byte(0xb1);
+        let mut store = payload_attestation_store(root);
 
         let message = |validator_index: u64, slot: Slot| gloas::PayloadAttestationMessage {
             validator_index,
@@ -7658,6 +7863,178 @@ mod tests {
             seats(store.payload_data_availability_vote(&root).unwrap()),
             vec![(2, false), (7, false)]
         );
+    }
+
+    fn payload_attestation_message(
+        root: Root,
+        validator_index: u64,
+        slot: Slot,
+    ) -> gloas::PayloadAttestationMessage {
+        gloas::PayloadAttestationMessage {
+            validator_index,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        }
+    }
+
+    /// A gossip-verified vote is applied to every seat of its validator
+    /// without a signature check (the zero signature here would fail one),
+    /// but still only in the slot it is for, and only from a committee member.
+    #[test]
+    fn apply_verified_payload_attestation_skips_the_signature_but_not_the_slot() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let root = Root::repeat_byte(0xb1);
+        let mut store = payload_attestation_store(root);
+        let seated = |store: &Store| -> Vec<usize> {
+            store
+                .payload_timeliness_vote(&root)
+                .unwrap()
+                .iter()
+                .enumerate()
+                .filter_map(|(seat, vote)| vote.map(|_| seat))
+                .collect()
+        };
+
+        // The store clock reads slot 0: a vote for slot 1 is not current yet.
+        assert_eq!(
+            failed_assertion(apply_verified_payload_attestation(
+                &mut store,
+                &payload_attestation_message(root, 3, 1),
+                &config
+            )),
+            Some("data.slot == get_current_slot(store)")
+        );
+        assert!(seated(&store).is_empty());
+
+        store
+            .set_time_ms(config.slot_duration_ms)
+            .expect("set the clock to slot 1");
+        // A validator outside the committee still writes nothing.
+        assert_eq!(
+            failed_assertion(apply_verified_payload_attestation(
+                &mut store,
+                &payload_attestation_message(root, 2, 1),
+                &config
+            )),
+            Some("len(ptc_indices) > 0")
+        );
+        apply_verified_payload_attestation(
+            &mut store,
+            &payload_attestation_message(root, 3, 1),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(seated(&store), vec![2, 7]);
+
+        // The unverified entry point refuses the same message: its signature
+        // is not valid.
+        let mut fresh = payload_attestation_store(root);
+        fresh
+            .set_time_ms(config.slot_duration_ms)
+            .expect("set the clock to slot 1");
+        assert!(
+            on_payload_attestation_message(
+                &mut fresh,
+                &payload_attestation_message(root, 3, 1),
+                false,
+                &config
+            )
+            .is_err()
+        );
+    }
+
+    /// A restarted follower holds a verified payload (restored from its table)
+    /// but no payload-committee votes, which are never persisted. Both the
+    /// head walk (`payload_timeliness` on the tiebreaker path) and the first
+    /// child's payload attestations (`notify_ptc_messages` ends in this same
+    /// vote update) read those vectors, so resume must reseed them empty.
+    #[test]
+    fn a_resumed_store_walks_the_head_and_takes_payload_attestations() {
+        let config = Config::active().with_fork_epoch(ForkName::Gloas, 0);
+        let anchor_root = Root::repeat_byte(0xb0);
+        let root = Root::repeat_byte(0xb1);
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = store_anchored_at_on(backend.clone(), anchor_root);
+        store
+            .insert_signed_block(
+                anchor_root,
+                gloas_block(
+                    0,
+                    Root::ZERO,
+                    ExecutionBlockHash::ZERO,
+                    ExecutionBlockHash::ZERO,
+                ),
+            )
+            .unwrap();
+        store
+            .insert_signed_block(
+                root,
+                gloas_block(
+                    1,
+                    anchor_root,
+                    ExecutionBlockHash::repeat_byte(0xff),
+                    ExecutionBlockHash::repeat_byte(0x22),
+                ),
+            )
+            .unwrap();
+        let mut state = test_state::with_validators_at(ForkName::Gloas, 4);
+        store.insert_state(anchor_root, state.clone()).unwrap();
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("with_validators_at(Gloas) builds a gloas state");
+        };
+        inner.slot = 1;
+        let mut committee = vec![0; preset::PTC_SIZE];
+        committee[2] = 3;
+        let window_index = (preset::SLOTS_PER_EPOCH + 1) as usize;
+        inner.ptc_window[window_index] = committee.try_into().unwrap();
+        store.insert_state(root, state).unwrap();
+        // What `on_block` records for each gloas block, then the envelope.
+        for block_root in [anchor_root, root] {
+            store.set_gloas_block_timeliness(block_root, [true, true]);
+            store.set_payload_timeliness_vote(block_root, vec![None; preset::PTC_SIZE]);
+            store.set_payload_data_availability_vote(block_root, vec![None; preset::PTC_SIZE]);
+        }
+        verify_payload(&mut store, root);
+        // Dropping the last handle lets the state writer finish its queue.
+        drop(store);
+
+        let mut store = Store::from_db_state(backend)
+            .expect("reopen")
+            .expect("populated directory");
+        assert!(store.has_verified_payload(&root));
+
+        // The slot after the block's own: the head walk asks whether the
+        // verified payload is timely, which reads the votes.
+        store.set_time_ms(2 * config.slot_duration_ms).unwrap();
+        let committees = CommitteeCache::default();
+        let walked = gloas_get_head(&store, &config, &committees)
+            .expect("a resumed store must walk the head over a verified payload");
+        // The actor's own path: `walk_head` with the payload links re-derived
+        // (none survive a restart) and the boost and weight helpers.
+        let head = get_head_node(&store, &config)
+            .expect("the live head walk must succeed on a resumed store");
+        assert_eq!(head.root, walked.root);
+        assert_eq!(get_head(&mut store, &config).unwrap(), walked.root);
+        assert_eq!(store.head_payload_status(), Some(walked.payload_status));
+
+        let message = gloas::PayloadAttestationMessage {
+            validator_index: 3,
+            data: gloas::PayloadAttestationData {
+                beacon_block_root: root,
+                slot: 1,
+                payload_present: true,
+                blob_data_available: true,
+            },
+            signature: Default::default(),
+        };
+        on_payload_attestation_message(&mut store, &message, true, &config)
+            .expect("the first child's attestations must find the vote vectors");
+        assert_eq!(store.payload_timeliness_vote(&root).unwrap()[2], Some(true));
     }
 
     #[test]
@@ -7877,7 +8254,7 @@ mod tests {
                     .unwrap();
                 store.insert_state(root, gloas_state.clone()).unwrap();
                 if rng.chance(1, 2) {
-                    store.insert_verified_payload(root);
+                    verify_payload(&mut store, root);
                 }
                 for timely_votes in [true, false] {
                     let votes = match rng.below(4) {

@@ -366,6 +366,12 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 ReqRespProtocol::DataColumnSidecarsByRoot => behaviour
                     .data_column_sidecars_by_root
                     .send_request(&peer, request),
+                ReqRespProtocol::ExecutionPayloadEnvelopesByRange => behaviour
+                    .execution_payload_envelopes_by_range
+                    .send_request(&peer, request),
+                ReqRespProtocol::ExecutionPayloadEnvelopesByRoot => behaviour
+                    .execution_payload_envelopes_by_root
+                    .send_request(&peer, request),
             };
             if let Some(tx) = request_id_tx {
                 let _ = tx.send(ReqRespRequestId { protocol, id });

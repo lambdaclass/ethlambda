@@ -1061,13 +1061,26 @@ impl BeaconState {
     }
 }
 
+/// The one committee `bits` names, or `None` for none or several.
+fn named_committee(bits: &electra::CommitteeBits) -> Option<CommitteeIndex> {
+    let mut named = (0..bits.len()).filter(|&index| bits.get(index).unwrap_or(false));
+    let first = named.next()?;
+    // A second named committee disqualifies the aggregate outright.
+    match named.next() {
+        None => Some(first as CommitteeIndex),
+        Some(_) => None,
+    }
+}
+
 /// An aggregate attestation with the proof its aggregator was selected, in
 /// whichever fork's shape it currently has.
 ///
-/// Two variants, not one per fork, for the reason
+/// Three variants, not one per fork, for the reason
 /// [`SignedBeaconBlock::Fulu`] wraps electra's block: every fork through deneb
 /// shares [`phase0::SignedAggregateAndProof`] outright, and fulu shares
-/// electra's the same way.
+/// electra's the same way. Gloas has its own: same bytes on the wire, but its
+/// `Attestation` is a progressive container (EIP-7688), so the
+/// `hash_tree_root` the aggregator's signature covers differs.
 ///
 /// Here rather than beside the gossip decode in `ethlambda-p2p`, where it was
 /// first declared, because the gossip path no longer ends at that decode: an
@@ -1083,6 +1096,7 @@ impl BeaconState {
 pub enum SignedAggregateAndProof {
     Phase0(phase0::SignedAggregateAndProof),
     Electra(electra::SignedAggregateAndProof),
+    Gloas(gloas::SignedAggregateAndProof),
 }
 
 impl SignedAggregateAndProof {
@@ -1091,6 +1105,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregator_index,
             Self::Electra(signed) => signed.message.aggregator_index,
+            Self::Gloas(signed) => signed.message.aggregator_index,
         }
     }
 
@@ -1099,6 +1114,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.data.slot,
             Self::Electra(signed) => signed.message.aggregate.data.slot,
+            Self::Gloas(signed) => signed.message.aggregate.data.slot,
         }
     }
 
@@ -1107,6 +1123,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.data,
             Self::Electra(signed) => signed.message.aggregate.data,
+            Self::Gloas(signed) => signed.message.aggregate.data,
         }
     }
 
@@ -1122,6 +1139,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.selection_proof,
             Self::Electra(signed) => signed.message.selection_proof,
+            Self::Gloas(signed) => signed.message.selection_proof,
         }
     }
 
@@ -1130,6 +1148,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.signature,
             Self::Electra(signed) => signed.signature,
+            Self::Gloas(signed) => signed.signature,
         }
     }
 
@@ -1152,16 +1171,21 @@ impl SignedAggregateAndProof {
     pub fn committee_index(&self) -> Option<CommitteeIndex> {
         match self {
             Self::Phase0(signed) => Some(signed.message.aggregate.data.index),
-            Self::Electra(signed) => {
-                let bits = &signed.message.aggregate.committee_bits;
-                let mut named = (0..bits.len()).filter(|&index| bits.get(index).unwrap_or(false));
-                let first = named.next()?;
-                // A second named committee disqualifies the aggregate outright.
-                match named.next() {
-                    None => Some(first as CommitteeIndex),
-                    Some(_) => None,
-                }
-            }
+            // Gloas reuses electra's `CommitteeBits` outright.
+            Self::Electra(signed) => named_committee(&signed.message.aggregate.committee_bits),
+            Self::Gloas(signed) => named_committee(&signed.message.aggregate.committee_bits),
+        }
+    }
+
+    /// The length of the aggregation bitfield, read without expanding it.
+    ///
+    /// For callers that must bound the bitfield before anything iterates it:
+    /// gloas's is unbounded by its type.
+    pub fn aggregation_bits_len(&self) -> usize {
+        match self {
+            Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.len(),
+            Self::Electra(signed) => signed.message.aggregate.aggregation_bits.len(),
+            Self::Gloas(signed) => signed.message.aggregate.aggregation_bits.len(),
         }
     }
 
@@ -1175,6 +1199,7 @@ impl SignedAggregateAndProof {
         match self {
             Self::Phase0(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
             Self::Electra(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
+            Self::Gloas(signed) => signed.message.aggregate.aggregation_bits.count_ones(),
         }
     }
 
@@ -1193,6 +1218,12 @@ impl SignedAggregateAndProof {
                     .collect()
             }
             Self::Electra(signed) => {
+                let bits = &signed.message.aggregate.aggregation_bits;
+                (0..bits.len())
+                    .map(|i| bits.get(i).unwrap_or(false))
+                    .collect()
+            }
+            Self::Gloas(signed) => {
                 let bits = &signed.message.aggregate.aggregation_bits;
                 (0..bits.len())
                     .map(|i| bits.get(i).unwrap_or(false))
@@ -1514,6 +1545,90 @@ signed_beacon_block_accessors!(
         (signature, BlsSignature),
     ],
 );
+
+/// A data column sidecar in either shape: fulu's carries a signed header and
+/// an inclusion proof, gloas's names its block by root and reads its
+/// commitments from that block's bid.
+///
+/// Two variants rather than one per fork, since the shape changes only at
+/// gloas; [`DataColumnSidecar::fork`] answers which fork's rules apply.
+// Fulu's carries a header and an inclusion proof inline, so the variants differ
+// in size; a sidecar is held and passed by value, and boxing one would only make
+// every reader dereference it.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DataColumnSidecar {
+    Fulu(fulu::DataColumnSidecar),
+    Gloas(gloas::DataColumnSidecar),
+}
+
+impl DataColumnSidecar {
+    /// The column this sidecar carries.
+    pub fn index(&self) -> u64 {
+        match self {
+            Self::Fulu(sidecar) => sidecar.index,
+            Self::Gloas(sidecar) => sidecar.index,
+        }
+    }
+
+    /// The slot of the block this sidecar belongs to.
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Fulu(sidecar) => sidecar.signed_block_header.message.slot,
+            Self::Gloas(sidecar) => sidecar.slot,
+        }
+    }
+
+    /// The root of the block this sidecar belongs to: fulu's is the header's
+    /// hash tree root, gloas's is named outright.
+    pub fn block_root(&self) -> Root {
+        match self {
+            Self::Fulu(sidecar) => sidecar.signed_block_header.message.hash_tree_root(),
+            Self::Gloas(sidecar) => sidecar.beacon_block_root,
+        }
+    }
+
+    /// The fork whose rules apply to this sidecar.
+    pub fn fork(&self) -> ForkName {
+        match self {
+            Self::Fulu(_) => ForkName::Fulu,
+            Self::Gloas(_) => ForkName::Gloas,
+        }
+    }
+
+    /// Decodes a sidecar of a known fork; the bytes carry no tag, so the fork
+    /// comes from context (the gossip topic's digest, a request's fork digest).
+    ///
+    /// Forks before fulu have no data columns and lean has none at all, so
+    /// they answer with an error rather than a panic: the fork comes off the
+    /// wire.
+    pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
+        match fork {
+            ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
+            ForkName::Gloas => Ok(Self::Gloas(gloas::DataColumnSidecar::from_ssz_bytes(
+                bytes,
+            )?)),
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Lean => Err(Error::UnsupportedForFork {
+                function: "DataColumnSidecar",
+                fork,
+            }),
+        }
+    }
+
+    /// Encodes the sidecar.
+    pub fn to_ssz(&self) -> Vec<u8> {
+        match self {
+            Self::Fulu(sidecar) => sidecar.to_ssz(),
+            Self::Gloas(sidecar) => sidecar.to_ssz(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2203,5 +2318,80 @@ mod tests {
 
         assert_eq!(block.blob_kzg_commitment_count(), 0);
         assert_eq!(block.execution_payload_timestamp(), None);
+    }
+
+    fn fulu_sidecar(index: u64, header: BeaconBlockHeader) -> fulu::DataColumnSidecar {
+        fulu::DataColumnSidecar {
+            index,
+            column: Default::default(),
+            kzg_commitments: Default::default(),
+            kzg_proofs: Default::default(),
+            signed_block_header: SignedBeaconBlockHeader {
+                message: header,
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                Root::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_data_column_sidecar_round_trips_per_fork() {
+        let header = BeaconBlockHeader {
+            slot: 9,
+            ..Default::default()
+        };
+        let fulu = DataColumnSidecar::Fulu(fulu_sidecar(7, header));
+        let gloas = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 3,
+            slot: 11,
+            beacon_block_root: Root::from([5; 32]),
+            ..Default::default()
+        });
+        for sidecar in [fulu, gloas] {
+            let decoded = DataColumnSidecar::from_ssz(sidecar.fork(), &sidecar.to_ssz()).unwrap();
+            assert_eq!(decoded, sidecar);
+        }
+    }
+
+    #[test]
+    fn a_data_column_sidecar_reports_its_block_root_per_variant() {
+        let header = BeaconBlockHeader {
+            slot: 9,
+            proposer_index: 2,
+            ..Default::default()
+        };
+        let fulu = DataColumnSidecar::Fulu(fulu_sidecar(7, header.clone()));
+        assert_eq!(fulu.block_root(), header.hash_tree_root());
+        assert_eq!((fulu.index(), fulu.slot()), (7, 9));
+        assert_eq!(fulu.fork(), ForkName::Fulu);
+
+        let root = Root::from([5; 32]);
+        let gloas = DataColumnSidecar::Gloas(gloas::DataColumnSidecar {
+            index: 3,
+            slot: 11,
+            beacon_block_root: root,
+            ..Default::default()
+        });
+        assert_eq!(gloas.block_root(), root);
+        assert_eq!((gloas.index(), gloas.slot()), (3, 11));
+        assert_eq!(gloas.fork(), ForkName::Gloas);
+    }
+
+    #[test]
+    fn a_data_column_sidecar_does_not_decode_before_fulu_or_as_lean() {
+        let valid = DataColumnSidecar::Fulu(fulu_sidecar(7, BeaconBlockHeader::default())).to_ssz();
+        // Bytes that decode fine as fulu's, so the error can only be the fork.
+        assert!(DataColumnSidecar::from_ssz(ForkName::Fulu, &valid).is_ok());
+        for fork in [ForkName::Electra, ForkName::Lean] {
+            assert!(matches!(
+                DataColumnSidecar::from_ssz(fork, &valid),
+                Err(Error::UnsupportedForFork { fork: got, .. }) if got == fork
+            ));
+        }
     }
 }

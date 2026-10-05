@@ -61,10 +61,29 @@ pub enum Table {
     /// re-deriving anything. Emptied by the replay that verifies a row and by
     /// the finality eviction that gives up on one.
     PendingDataColumns,
+    /// Verified gloas execution payload envelopes:
+    /// (slot || beacon_block_root) -> `SignedExecutionPayloadEnvelope`
+    ///
+    /// A row exists only for an envelope that passed verification, so the
+    /// table is the durable form of the store's `verified_payloads` set: a
+    /// restart rebuilds that set from it. Keyed slot-first, with the slot of
+    /// the block the envelope fulfills (the envelope carries none itself), so
+    /// a by-range handler can scan a slot window, like `DataColumns`.
+    ///
+    /// Never pruned, as beacon block rows are not either.
+    ExecutionPayloadEnvelopes,
+    /// Block timeliness: beacon_block_root -> one byte per deadline (0 or 1)
+    ///
+    /// The durable form of the store's `block_timeliness` map. Fork choice
+    /// reads it on the ordinary head-computation path, and a block whose entry
+    /// is lost fails the whole head walk, so it cannot be left to memory.
+    ///
+    /// Never pruned; a row is a few bytes.
+    BlockTimeliness,
 }
 
 /// All table variants.
-pub const ALL_TABLES: [Table; 10] = [
+pub const ALL_TABLES: [Table; 12] = [
     Table::BlockHeaders,
     Table::BlockBodies,
     Table::BlockProof,
@@ -75,6 +94,8 @@ pub const ALL_TABLES: [Table; 10] = [
     Table::LiveChain,
     Table::DataColumns,
     Table::PendingDataColumns,
+    Table::ExecutionPayloadEnvelopes,
+    Table::BlockTimeliness,
 ];
 
 impl Table {
@@ -91,6 +112,8 @@ impl Table {
             Table::LiveChain => "live_chain",
             Table::DataColumns => "data_columns",
             Table::PendingDataColumns => "pending_data_columns",
+            Table::ExecutionPayloadEnvelopes => "execution_payload_envelopes",
+            Table::BlockTimeliness => "block_timeliness",
         }
     }
 }

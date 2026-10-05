@@ -34,8 +34,10 @@
 use std::io;
 
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
-use ethlambda_types::beacon::containers::fulu::DataColumnSidecar;
+use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::fork_digest::compute_fork_digest;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::Root;
@@ -44,6 +46,7 @@ use libssz::{SszDecode, SszEncode};
 use tracing::warn;
 
 use super::decode;
+use super::fork_schedule::ForkSchedule;
 use super::messages::{
     BeaconBlocksByRangeRequest, BeaconMetaData, BeaconStatus, MetaDataV1, MetaDataV2, MetaDataV3,
     StatusV1, StatusV2,
@@ -253,16 +256,15 @@ where
         let encoded = sidecar.to_ssz();
         if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
             warn!(
-                index = sidecar.index,
+                index = sidecar.index(),
                 size = encoded.len(),
                 "Skipping oversized data column sidecar in response"
             );
             continue;
         }
-        // The sidecar's own epoch, taken from the header it carries rather
-        // than the one this node runs on, so a backfill labels each chunk
-        // with its own fork.
-        let epoch = sidecar.signed_block_header.message.slot / preset::SLOTS_PER_EPOCH;
+        // The sidecar's own epoch rather than the one this node runs on, so a
+        // backfill labels each chunk with its own fork.
+        let epoch = sidecar.slot() / preset::SLOTS_PER_EPOCH;
         let digest = compute_fork_digest(config, genesis_validators_root, epoch);
         write_success_chunk(io, label, &digest, encoded).await?;
     }
@@ -272,14 +274,16 @@ where
 /// Read a data column sidecar response: one `DataColumnSidecar` per chunk,
 /// until the peer closes.
 ///
-/// The counterpart of [`decode_blocks_response`]. Only fulu defines this
-/// container, so there is no fork ladder to select a decoder from the way a
-/// block chunk's slot selects one; [`super::decode::decode_data_column_sidecar`]
-/// decodes unconditionally. The context bytes are still checked against the
-/// digest the sidecar's own slot implies, for the same reason a block chunk's
-/// are: it catches a peer whose `genesis_validators_root` or fork schedule
-/// differs from ours, which a signature failure would otherwise be the only
-/// way to notice.
+/// The counterpart of [`decode_blocks_response`]. A gloas sidecar carries no
+/// header to read a slot from ahead of decoding, so the fork comes from the
+/// chunk's context bytes instead ([`ForkSchedule::fork_for_digest`]), and
+/// [`super::decode::decode_data_column_sidecar`] decodes by it. A digest no
+/// scheduled fork uses ends the stream like any other mismatch. The context
+/// bytes are then checked against the digest the sidecar's own slot implies,
+/// for the same reason a block chunk's are: it catches a peer whose
+/// `genesis_validators_root` or fork schedule differs from ours, which a
+/// signature failure would otherwise be the only way to notice. It also
+/// catches a sidecar of one fork's shape sent under another's context.
 ///
 /// A mismatch ends the stream rather than skipping the chunk, matching
 /// [`decode_blocks_response`]: a peer that disagrees about a historical digest
@@ -300,16 +304,25 @@ where
         // column protocol; see `protocols::max_request_data_column_sidecars`.
         max_chunks: protocols::max_request_data_column_sidecars() as usize,
     };
+    let schedule = ForkSchedule::new(config, genesis_validators_root);
     read_chunked_response(io, protocol_label, limits, |context, payload| {
-        let sidecar = decode::decode_data_column_sidecar(payload)
+        let Some(fork) = <[u8; 4]>::try_from(context)
+            .ok()
+            .and_then(|digest| schedule.fork_for_digest(digest))
+        else {
+            return Err(invalid(format!(
+                "data column sidecar chunk context {} is no scheduled fork digest",
+                hex::encode(context),
+            )));
+        };
+        let sidecar = decode::decode_data_column_sidecar(fork, payload)
             .map_err(|err| invalid(format!("data column sidecar chunk: {err}")))?;
-        let slot = sidecar.signed_block_header.message.slot;
-        let epoch = slot / preset::SLOTS_PER_EPOCH;
-        let expected = compute_fork_digest(config, genesis_validators_root, epoch);
+        let slot = sidecar.slot();
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
         if context != expected {
             warn!(
                 slot,
-                index = sidecar.index,
+                index = sidecar.index(),
                 peer_context = %hex::encode(context),
                 our_context = %hex::encode(expected),
                 "Data column sidecar chunk names another fork digest"
@@ -324,4 +337,158 @@ where
         Ok(sidecar)
     })
     .await
+}
+
+/// Write an envelope response: one result code, one `ForkDigest` and one
+/// payload per envelope.
+///
+/// The counterpart of [`write_blocks_response`]. The spec keys the context
+/// epoch off the block the envelope fulfills; an envelope carries no slot of
+/// its own, but `verify_execution_payload_envelope` pins
+/// `payload.slot_number` to that block's slot, so a stored envelope's
+/// `slot_number` is the block's slot.
+pub async fn write_execution_payload_envelopes_response<T>(
+    io: &mut T,
+    label: &'static str,
+    config: &Config,
+    genesis_validators_root: Root,
+    envelopes: &[SignedExecutionPayloadEnvelope],
+) -> io::Result<()>
+where
+    T: AsyncWrite + Unpin + Send,
+{
+    for envelope in envelopes {
+        let encoded = envelope.to_ssz();
+        let slot = envelope.message.payload.slot_number;
+        if encoded.len() > MAX_PAYLOAD_SIZE - 1024 {
+            warn!(
+                slot,
+                size = encoded.len(),
+                "Skipping oversized execution payload envelope in response"
+            );
+            continue;
+        }
+        let digest = compute_fork_digest(
+            config,
+            genesis_validators_root,
+            slot / preset::SLOTS_PER_EPOCH,
+        );
+        write_success_chunk(io, label, &digest, encoded).await?;
+    }
+    Ok(())
+}
+
+/// Whether `fork` has execution payload envelopes: gloas and every beacon fork
+/// after it, which the schedule's digests can name. Lean is not on the beacon
+/// timeline, though it sorts after every beacon fork.
+fn carries_envelopes(fork: ForkName) -> bool {
+    fork >= ForkName::Gloas && fork != ForkName::Lean
+}
+
+/// Read an envelope response: one `SignedExecutionPayloadEnvelope` per chunk,
+/// until the peer closes.
+///
+/// The counterpart of [`decode_data_column_sidecars_response`]: the fork comes
+/// from the context bytes, and a digest no scheduled fork uses ends the stream.
+/// Envelopes exist only from gloas on, so the digest of an earlier fork is
+/// refused too ([`carries_envelopes`]).
+/// The context is then checked against the digest the payload's own
+/// `slot_number` implies.
+pub async fn decode_execution_payload_envelopes_response<T>(
+    io: &mut T,
+    protocol_label: &str,
+    config: &Config,
+    genesis_validators_root: Root,
+) -> io::Result<Vec<SignedExecutionPayloadEnvelope>>
+where
+    T: AsyncRead + Unpin + Send,
+{
+    let limits = ChunkLimits {
+        has_context: true,
+        max_chunks: protocols::MAX_REQUEST_PAYLOADS as usize,
+    };
+    let schedule = ForkSchedule::new(config, genesis_validators_root);
+    read_chunked_response(io, protocol_label, limits, |context, payload| {
+        let fork = <[u8; 4]>::try_from(context)
+            .ok()
+            .and_then(|digest| schedule.fork_for_digest(digest));
+        if !fork.is_some_and(carries_envelopes) {
+            return Err(invalid(format!(
+                "execution payload envelope chunk context {} is not a gloas-or-later fork digest",
+                hex::encode(context),
+            )));
+        }
+        let envelope = SignedExecutionPayloadEnvelope::from_ssz_bytes(payload)
+            .map_err(|err| invalid(format!("execution payload envelope chunk: {err:?}")))?;
+        let slot = envelope.message.payload.slot_number;
+        let expected = schedule.digest_at(slot / preset::SLOTS_PER_EPOCH);
+        if context != expected {
+            warn!(
+                slot,
+                peer_context = %hex::encode(context),
+                our_context = %hex::encode(expected),
+                "Execution payload envelope chunk names another fork digest"
+            );
+            return Err(invalid(format!(
+                "execution payload envelope chunk context {} does not match {} for slot {}",
+                hex::encode(context),
+                hex::encode(expected),
+                slot,
+            )));
+        }
+        Ok(envelope)
+    })
+    .await
+}
+
+/// Test fixtures shared by the codec and handler tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use ethlambda_types::beacon::containers::gloas::{
+        ExecutionPayload, ExecutionPayloadEnvelope, SignedExecutionPayloadEnvelope,
+    };
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{ExecutionBlockHash, Root};
+
+    /// An otherwise-empty envelope for the block `beacon_block_root` at `slot`,
+    /// revealing the payload `block_hash`.
+    pub(crate) fn envelope(
+        beacon_block_root: Root,
+        slot: u64,
+        block_hash: ExecutionBlockHash,
+    ) -> SignedExecutionPayloadEnvelope {
+        let payload = ExecutionPayload {
+            parent_hash: Default::default(),
+            fee_recipient: Default::default(),
+            state_root: Default::default(),
+            receipts_root: Default::default(),
+            logs_bloom: vec![0u8; preset::BYTES_PER_LOGS_BLOOM]
+                .try_into()
+                .expect("built at exactly BYTES_PER_LOGS_BLOOM"),
+            prev_randao: Default::default(),
+            block_number: 0,
+            gas_limit: 0,
+            gas_used: 0,
+            timestamp: 0,
+            extra_data: Default::default(),
+            base_fee_per_gas: Default::default(),
+            block_hash,
+            transactions: Default::default(),
+            withdrawals: Default::default(),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+            block_access_list: Default::default(),
+            slot_number: slot,
+        };
+        SignedExecutionPayloadEnvelope {
+            message: ExecutionPayloadEnvelope {
+                payload,
+                execution_requests: Default::default(),
+                builder_index: 0,
+                beacon_block_root,
+                parent_beacon_block_root: Root::ZERO,
+            },
+            signature: Default::default(),
+        }
+    }
 }
