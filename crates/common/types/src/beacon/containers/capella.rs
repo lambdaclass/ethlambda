@@ -32,6 +32,12 @@
 //! imported, since every field of both is repeated here with `withdrawals`
 //! (respectively `withdrawals_root`) appended, and a derive needs the whole
 //! field list in one struct.
+//!
+//! [`NewPayloadRequest`] does not gain a field here the way the containers
+//! above do; the specification does not even redefine it for this fork. It
+//! still gets its own type, because its one field's type is this fork's own
+//! [`ExecutionPayload`], which carries `withdrawals` and so is not
+//! `hash_tree_root`-compatible with bellatrix's.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::SszList;
@@ -178,6 +184,19 @@ pub struct ExecutionPayloadHeader {
     pub transactions_root: Root,
     /// The merkle root of the corresponding [`ExecutionPayload::withdrawals`].
     pub withdrawals_root: Root,
+}
+
+/// What `process_execution_payload` hands `execution_engine.verify_and_notify_new_payload`
+/// to validate a proposed payload, capella `beacon-chain.md`.
+///
+/// Capella does not redefine this container's field list (still just
+/// `execution_payload`), but it still needs its own type here: the field's
+/// type is this fork's own [`ExecutionPayload`], which differs in shape from
+/// bellatrix's by the appended `withdrawals`, so the two forks' requests are
+/// not `hash_tree_root`-compatible.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+pub struct NewPayloadRequest {
+    pub execution_payload: ExecutionPayload,
 }
 
 // ---------------------------------------------------------------------------

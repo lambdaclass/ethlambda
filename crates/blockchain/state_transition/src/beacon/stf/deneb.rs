@@ -222,7 +222,7 @@ pub fn process_withdrawals(
             .ok_or(Error::ArithmeticOverflow("latest_withdrawal.index + 1"))?;
     }
 
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
     let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
     {
         let latest_withdrawal = expected_withdrawals

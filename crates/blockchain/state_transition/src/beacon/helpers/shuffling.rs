@@ -93,7 +93,7 @@ pub fn compute_shuffled_index(index: u64, index_count: u64, seed: Bytes32) -> Re
 /// The algorithm is protolambda's, as lighthouse ships it in
 /// `swap_or_not_shuffle::shuffle_list` with `forwards = false`. Verified
 /// position by position against [`compute_shuffled_index`] by
-/// [`tests::whole_list_shuffle_matches_the_per_index_shuffle`]: a mistake in
+/// `tests::whole_list_shuffle_matches_the_per_index_shuffle`: a mistake in
 /// the pairing would still yield *a* permutation, quietly wrong, rather than a
 /// panic.
 pub fn shuffle_list(mut list: Vec<ValidatorIndex>, seed: Bytes32) -> Vec<ValidatorIndex> {

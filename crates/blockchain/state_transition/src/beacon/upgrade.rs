@@ -16,22 +16,26 @@
 //! out once, in one place, checkable against the specification's own
 //! constructor line by line.
 
+use std::collections::{HashMap, HashSet};
+
 use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{
     BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
-    electra, fulu, phase0,
+    electra, fulu, gloas, phase0,
 };
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
-use crate::beacon::helpers::accessors::CommitteeCache;
+use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch};
 use crate::beacon::helpers::attestation::get_attesting_indices;
-use crate::beacon::helpers::misc::{compute_activation_exit_epoch, compute_epoch_at_slot};
+use crate::beacon::helpers::misc::{
+    compute_activation_exit_epoch, compute_epoch_at_slot, compute_start_slot_at_epoch,
+};
 use crate::beacon::lean_fork_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Root, Uint256,
-    ValidatorIndex,
+    BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, HashTreeRoot as _,
+    Root, Uint256, ValidatorIndex,
 };
 
 /// Replays `pending_attestations` into `post`'s `previous_epoch_participation`.
@@ -224,9 +228,14 @@ pub fn upgrade_to_altair(
 // here that mutates a post-state field-by-field rather than only building
 // one, and the fields it reaches for that [`BeaconState`]'s own accessors do
 // not cover (`exit_balance_to_consume`, `consolidation_balance_to_consume`,
-// `pending_deposits`) already have a projection to reuse in
-// `crate::beacon::helpers::electra` (`electra_state`, returning `ElectraOrFuluMut`),
-// so this file does not need a second one of its own.
+// `pending_deposits`) already have projections to reuse in
+// `crate::beacon::helpers::electra`: the first two through `churn_cursors_mut`
+// (returning `ChurnCursorsMut`), and `pending_deposits` indirectly, through
+// [`crate::beacon::helpers::electra::queue_excess_active_balance`] and
+// [`crate::beacon::helpers::electra::queue_entire_balance_and_reset_validator`]
+// (both reaching it through `pending_queue_fields`, returning
+// `PendingQueueFields`), so this file does not need a second projection of
+// its own.
 
 /// The bellatrix state, or an error naming the function that needs one.
 fn bellatrix_state_ref<'a>(
@@ -685,7 +694,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
         crate::beacon::helpers::electra::get_consolidation_churn_limit(&post, config)?;
     {
         let mut fields =
-            crate::beacon::helpers::electra::electra_state(&mut post, "upgrade_to_electra")?;
+            crate::beacon::helpers::electra::churn_cursors_mut(&mut post, "upgrade_to_electra")?;
         *fields.exit_balance_to_consume_mut() = exit_balance_to_consume;
         *fields.consolidation_balance_to_consume_mut() = consolidation_balance_to_consume;
     }
@@ -696,8 +705,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     // by `(activation_eligibility_epoch, index)`, matching the
     // specification's own tie-break exactly.
     let mut pre_activation: Vec<ValidatorIndex> = post
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| validator.activation_epoch == constants::FAR_FUTURE_EPOCH)
         .map(|(index, _)| index as ValidatorIndex)
@@ -705,7 +713,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     pre_activation.sort_by_key(|&index| {
         let eligibility_epoch = post
             .validator(index)
-            .expect("index was read from post.validators() above")
+            .expect("index was read from post.iter_validators() above")
             .activation_eligibility_epoch;
         (eligibility_epoch, index)
     });
@@ -722,8 +730,7 @@ pub fn upgrade_to_electra(pre: &BeaconState, config: &Config) -> Result<BeaconSt
     // it, since compounding eligibility and pre-activation are independent
     // conditions on the same registry.
     let compounding_indices: Vec<ValidatorIndex> = post
-        .validators()
-        .iter()
+        .iter_validators()
         .enumerate()
         .filter(|(_, validator)| {
             crate::beacon::helpers::electra::has_compounding_withdrawal_credential(validator)
@@ -813,6 +820,435 @@ pub fn upgrade_to_fulu(pre: &BeaconState, config: &Config) -> Result<BeaconState
     Ok(BeaconState::Fulu(post))
 }
 
+/// An all-zero payload timeliness committee, [`preset::PTC_SIZE`] entries:
+/// the placeholder both [`initialize_ptc_window`] (the previous epoch's
+/// slice, which has no earlier committee to have cached) and
+/// [`upgrade_to_gloas`] (`post.ptc_window` as a whole, before
+/// `initialize_ptc_window` can run) need before a real committee exists to
+/// fill that slot.
+fn empty_ptc() -> gloas::PayloadTimelinessCommittee {
+    vec![0 as ValidatorIndex; preset::PTC_SIZE]
+        .try_into()
+        .expect("built at exactly PTC_SIZE")
+}
+
+/// The cached payload timeliness committee window [`upgrade_to_gloas`] seeds
+/// `post.ptc_window` with.
+///
+/// Transcribed from `specs/gloas/fork.md`'s `initialize_ptc_window`: the
+/// previous epoch's slice starts all-zero (there is no earlier payload
+/// timeliness committee to have cached at the fork boundary), and the current
+/// epoch through [`preset::MIN_SEED_LOOKAHEAD`] epochs ahead are each computed
+/// fresh via [`crate::beacon::helpers::gloas::compute_ptc`]. `state` is the
+/// [`BeaconState`] enum, not the bare `gloas::BeaconState` `post` is still
+/// being assembled as when this runs: `compute_ptc` reads through
+/// fork-invariant accessors (`get_seed`, the epoch's committees), which need
+/// the enum to dispatch through.
+///
+/// Shares one [`CommitteeCache`] across every one of the
+/// `(1 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH` [`compute_ptc`](crate::beacon::helpers::gloas::compute_ptc)
+/// calls this makes, the same reason that function's own doc gives for taking
+/// one in: an epoch's committees are the same shuffle no matter which slot of
+/// it is asked about, so computing that shuffle once and reusing it is what
+/// keeps filling the whole window affordable.
+fn initialize_ptc_window(state: &BeaconState) -> Result<gloas::PayloadTimelinessCommitteeWindow> {
+    let mut window = vec![empty_ptc(); preset::SLOTS_PER_EPOCH as usize];
+
+    let committees = CommitteeCache::default();
+    let current_epoch = get_current_epoch(state);
+    for offset in 0..=preset::MIN_SEED_LOOKAHEAD {
+        let epoch = current_epoch
+            .checked_add(offset)
+            .ok_or(Error::ArithmeticOverflow(
+                "initialize_ptc_window: current_epoch + offset",
+            ))?;
+        let start_slot = compute_start_slot_at_epoch(epoch);
+        for slot_offset in 0..preset::SLOTS_PER_EPOCH {
+            let slot = start_slot
+                .checked_add(slot_offset)
+                .ok_or(Error::ArithmeticOverflow(
+                    "initialize_ptc_window: start_slot + slot_offset",
+                ))?;
+            window.push(crate::beacon::helpers::gloas::compute_ptc(
+                state,
+                slot,
+                &committees,
+            )?);
+        }
+    }
+
+    Ok(window.try_into()?)
+}
+
+/// An incremental index over [`onboard_builders_from_pending_deposits`]'s
+/// growing `pending_deposits` list, by pubkey, with each entry's deposit
+/// signature verdict memoized the first time it is needed.
+///
+/// The specification's `is_pending_validator` scans the list and re-verifies
+/// a signature per matching entry, and its own text notes that a caller
+/// iterating many pubkeys should cache verification results rather than
+/// calling it in a loop. This is that cache: the pending deposit queue might
+/// be large at the fork, and this index turns that query into a pubkey lookup
+/// plus, at most once per entry, one signature check.
+#[derive(Default)]
+struct PendingValidatorIndex {
+    by_pubkey: HashMap<BlsPubkey, Vec<usize>>,
+    verdicts: Vec<Option<bool>>,
+}
+
+impl PendingValidatorIndex {
+    /// Records that `pending_deposits[index]` (just pushed) carries `pubkey`.
+    fn push(&mut self, index: usize, pubkey: BlsPubkey) {
+        self.by_pubkey.entry(pubkey).or_default().push(index);
+        debug_assert_eq!(self.verdicts.len(), index);
+        self.verdicts.push(None);
+    }
+
+    /// The result the specification's `is_pending_validator` gives
+    /// for `pubkey`, reached through the pubkey index instead of
+    /// a linear scan, with each candidate's signature verdict computed at
+    /// most once no matter how many later deposits ask the same question.
+    fn is_pending_validator(
+        &mut self,
+        pending_deposits: &[electra::PendingDeposit],
+        pubkey: BlsPubkey,
+        config: &Config,
+    ) -> bool {
+        let Some(indices) = self.by_pubkey.get(&pubkey) else {
+            return false;
+        };
+        for &index in indices {
+            let verdict = *self.verdicts[index].get_or_insert_with(|| {
+                let deposit = &pending_deposits[index];
+                crate::beacon::stf::electra::is_valid_deposit_signature(
+                    deposit.pubkey,
+                    deposit.withdrawal_credentials,
+                    deposit.amount,
+                    &deposit.signature,
+                    config,
+                )
+            });
+            if verdict {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Pushes `deposit` back onto the rebuilt `pending_deposits` queue and
+/// records it in `pending_index` under its own pubkey, keeping the two in
+/// step: every push is one of the specification's own `pending_deposits.append(deposit)`
+/// calls, never bypassed.
+fn requeue(
+    pending_deposits: &mut Vec<electra::PendingDeposit>,
+    pending_index: &mut PendingValidatorIndex,
+    deposit: electra::PendingDeposit,
+) {
+    let pubkey = deposit.pubkey;
+    pending_deposits.push(deposit);
+    pending_index.push(pending_deposits.len() - 1, pubkey);
+}
+
+/// Applies every pending deposit the fulu pre-state was still holding,
+/// onboarding a builder for any whose withdrawal credential and signature
+/// qualify.
+///
+/// Transcribed from `specs/gloas/fork.md`'s `onboard_builders_from_pending_deposits`:
+/// the only path through the validator deposit contract that ever creates a
+/// builder. From the fork onward, a builder is created or topped up only
+/// through a `BuilderDepositRequest` (EIP-8282).
+///
+/// A deposit for an already-registered validator stays queued untouched. A
+/// deposit whose pubkey neither registry recognizes yet is onboarded as a
+/// builder only if its withdrawal credential is builder-prefixed, no deposit
+/// already re-queued in this same pass could still turn that pubkey into a
+/// validator instead (the specification's `is_pending_validator`),
+/// and its signature checks out. A deposit that fails the credential or
+/// pending-validator check stays queued instead; one that fails the
+/// signature check is dropped outright, matching phase0's own "an invalid
+/// signature just means the deposit is not credited" rule one level up. A
+/// deposit for an already-registered builder tops up its balance directly
+/// instead of registering a second record.
+///
+/// The pending deposit queue might be large at the fork, so every
+/// membership question this asks per deposit is kept O(1) amortized rather
+/// than a rescan: `validator_pubkeys` is a set built from the *deposit*
+/// queue's own pubkeys (at most `D` of them), narrowed against the registry
+/// in one O(V) pass rather than a `Vec` scanned once per deposit;
+/// `builder_indices` is a map kept in step with the registry, updated the
+/// moment [`add_builder_to_registry`](crate::beacon::helpers::gloas::add_builder_to_registry)
+/// returns the index it used, so a lookup a few iterations later still sees
+/// a builder this same pass already onboarded. The specification's own
+/// comment says `builder_pubkeys` must be recomputed every iteration for
+/// exactly that reason, and a map kept current does the same job without the
+/// recomputation. Finally, [`PendingValidatorIndex`] answers
+/// `is_pending_validator`'s own question without a rescan or a repeated
+/// signature check.
+fn onboard_builders_from_pending_deposits(
+    state: &mut gloas::BeaconState,
+    config: &Config,
+) -> Result<()> {
+    // Narrowed to the deposit queue's own pubkeys rather than every
+    // validator: this only ever answers "is this pubkey already a
+    // validator's" for a pubkey a deposit actually names, so it need not
+    // hold more than `D` entries even when the registry itself holds `V`.
+    let deposit_pubkeys: HashSet<BlsPubkey> = state
+        .pending_deposits
+        .iter()
+        .map(|deposit| deposit.pubkey)
+        .collect();
+    let validator_pubkeys: HashSet<BlsPubkey> = state
+        .validators
+        .iter()
+        .map(|validator| validator.pubkey)
+        .filter(|pubkey| deposit_pubkeys.contains(pubkey))
+        .collect();
+
+    let mut builder_indices: HashMap<BlsPubkey, gloas::BuilderIndex> = state
+        .builders
+        .iter()
+        .enumerate()
+        .map(|(index, builder)| (builder.pubkey, index as gloas::BuilderIndex))
+        .collect();
+
+    let mut pending_deposits: Vec<electra::PendingDeposit> = Vec::new();
+    let mut pending_index = PendingValidatorIndex::default();
+
+    // Moved out rather than cloned: nothing below reads the old
+    // `state.pending_deposits` (the loop below rebuilds it from scratch),
+    // and taking ownership here is what lets the loop body hold `state`
+    // mutably (`add_builder_to_registry`, the balance top-up) without a
+    // lingering borrow of one of its own fields.
+    for deposit in std::mem::take(&mut state.pending_deposits) {
+        if validator_pubkeys.contains(&deposit.pubkey) {
+            requeue(&mut pending_deposits, &mut pending_index, deposit);
+            continue;
+        }
+
+        match builder_indices.get(&deposit.pubkey).copied() {
+            None => {
+                if !crate::beacon::helpers::gloas::is_builder_withdrawal_credential(
+                    deposit.withdrawal_credentials,
+                ) {
+                    requeue(&mut pending_deposits, &mut pending_index, deposit);
+                    continue;
+                }
+                if pending_index.is_pending_validator(&pending_deposits, deposit.pubkey, config) {
+                    requeue(&mut pending_deposits, &mut pending_index, deposit);
+                    continue;
+                }
+                if !crate::beacon::stf::electra::is_valid_deposit_signature(
+                    deposit.pubkey,
+                    deposit.withdrawal_credentials,
+                    deposit.amount,
+                    &deposit.signature,
+                    config,
+                ) {
+                    continue;
+                }
+
+                let index = crate::beacon::helpers::gloas::add_builder_to_registry(
+                    state,
+                    deposit.pubkey,
+                    constants::PAYLOAD_BUILDER_VERSION,
+                    ExecutionAddress::from_slice(&deposit.withdrawal_credentials.0[12..]),
+                    deposit.amount,
+                    deposit.slot,
+                );
+                builder_indices.insert(deposit.pubkey, index);
+            }
+            Some(builder_index) => {
+                let len = state.builders.len();
+                let builder = state.builders.get_mut(builder_index as usize).ok_or(
+                    Error::IndexOutOfBounds {
+                        index: builder_index as usize,
+                        len,
+                    },
+                )?;
+                builder.balance = builder.balance.checked_add(deposit.amount).ok_or(
+                    Error::ArithmeticOverflow(
+                        "onboard_builders_from_pending_deposits: builder.balance + deposit.amount",
+                    ),
+                )?;
+            }
+        }
+    }
+
+    state.pending_deposits = pending_deposits.into();
+    Ok(())
+}
+
+/// Upgrades a fulu state to gloas's shape.
+///
+/// Transcribed from `specs/gloas/fork.md`'s `upgrade_to_gloas`. Fields
+/// through `pending_consolidations` are fulu's, field for field, with the
+/// eight registry-shaped ones (`validators`, `balances`,
+/// `previous_epoch_participation`, `current_epoch_participation`,
+/// `inactivity_scores`, `pending_deposits`, `pending_partial_withdrawals`,
+/// `pending_consolidations`) rebuilt as their progressive counterparts
+/// (EIP-7688): one full rehash at the fork, the same cost every earlier
+/// fork's `upgrade_to_*` pays whenever a list's *contents* change, except here
+/// it is the list's *kind* that changes while the contents do not.
+/// `proposer_lookahead` carries over unchanged (fulu's own shape survives
+/// into gloas; see `containers::gloas`'s module doc).
+///
+/// `latest_execution_payload_header` has no gloas counterpart at all
+/// (EIP-7732 moves the payload itself out of the state): only its
+/// `block_hash` survives, as the new `latest_block_hash` field, and its other
+/// fields seed `latest_execution_payload_bid` instead, a synthetic
+/// self-build bid ([`constants::BUILDER_INDEX_SELF_BUILD`]) describing the
+/// payload the pre-state had already applied. Its `slot` is
+/// `pre.latest_block_header.slot`, the last applied block's own slot, which
+/// can be earlier than the fork's own slot when slots were missed right
+/// before the fork: the bid describes that already-applied payload, not a
+/// claim about the fork slot itself.
+///
+/// Every field from `builders` onward is new. `execution_payload_availability`
+/// starts every bit set (every slot in the window is "available": there is no
+/// missing payload to report yet) rather than at its `Default`, whose
+/// all-zero value would claim the opposite. `builder_pending_payments` and
+/// `ptc_window` are `SszVector`s, so each starts at its own fixed length
+/// ([`preset::BUILDER_PENDING_PAYMENTS_LENGTH`]/[`preset::PTC_WINDOW_LENGTH`]
+/// entries) built explicitly rather than through `Default`, which a fixed
+/// vector has none of; `ptc_window`'s placeholder entries are then
+/// overwritten by [`initialize_ptc_window`] once `post` exists as a full
+/// [`BeaconState`], the same reason [`upgrade_to_altair`] computes its sync
+/// committees only after `post` exists as `BeaconState::Altair`.
+/// [`onboard_builders_from_pending_deposits`] runs last, after `ptc_window`,
+/// matching the specification's own ordering.
+pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let pre = crate::beacon::helpers::fulu::fulu_state_ref(pre, "upgrade_to_gloas")?;
+    let epoch = compute_epoch_at_slot(pre.slot);
+
+    let fork = Fork {
+        previous_version: pre.fork.current_version,
+        current_version: config.gloas_fork_version,
+        epoch,
+    };
+
+    // Seeds `latest_execution_payload_bid` from the pre-state's already-
+    // applied payload; see this function's own doc for why.
+    let execution_header = &pre.latest_execution_payload_header;
+    let latest_execution_payload_bid = gloas::ExecutionPayloadBid {
+        parent_block_hash: execution_header.parent_hash,
+        parent_block_root: pre.latest_block_header.parent_root,
+        block_hash: execution_header.block_hash,
+        prev_randao: execution_header.prev_randao,
+        fee_recipient: ExecutionAddress::ZERO,
+        gas_limit: execution_header.gas_limit,
+        builder_index: constants::BUILDER_INDEX_SELF_BUILD,
+        slot: pre.latest_block_header.slot,
+        value: 0,
+        execution_payment: 0,
+        blob_kzg_commitments: Default::default(),
+        execution_requests_root: gloas::ExecutionRequests::default().hash_tree_root(),
+    };
+
+    // Every slot starts "available"; see this function's own doc.
+    let mut execution_payload_availability = gloas::ExecutionPayloadAvailability::new();
+    for index in 0..preset::SLOTS_PER_HISTORICAL_ROOT {
+        execution_payload_availability
+            .set(index, true)
+            .expect("index is in [0, SLOTS_PER_HISTORICAL_ROOT)");
+    }
+
+    // A placeholder, overwritten by `initialize_ptc_window` below once `post`
+    // exists as a full `BeaconState`; see this function's own doc for why
+    // that has to wait.
+    let placeholder_ptc_window: gloas::PayloadTimelinessCommitteeWindow =
+        vec![empty_ptc(); preset::PTC_WINDOW_LENGTH]
+            .try_into()
+            .expect("built at exactly PTC_WINDOW_LENGTH");
+
+    let post = gloas::BeaconState {
+        genesis_time: pre.genesis_time,
+        genesis_validators_root: pre.genesis_validators_root,
+        slot: pre.slot,
+        fork,
+        latest_block_header: pre.latest_block_header.clone(),
+        block_roots: pre.block_roots.clone(),
+        state_roots: pre.state_roots.clone(),
+        historical_roots: pre.historical_roots.clone(),
+        eth1_data: pre.eth1_data.clone(),
+        eth1_data_votes: pre.eth1_data_votes.clone(),
+        eth1_deposit_index: pre.eth1_deposit_index,
+        // [Modified in Gloas:EIP7688]
+        validators: pre.validators.to_vec().into(),
+        // [Modified in Gloas:EIP7688]
+        balances: pre.balances.to_vec().into(),
+        randao_mixes: pre.randao_mixes.clone(),
+        slashings: pre.slashings.clone(),
+        // [Modified in Gloas:EIP7688]
+        previous_epoch_participation: pre.previous_epoch_participation.to_vec().into(),
+        // [Modified in Gloas:EIP7688]
+        current_epoch_participation: pre.current_epoch_participation.to_vec().into(),
+        justification_bits: pre.justification_bits.clone(),
+        previous_justified_checkpoint: pre.previous_justified_checkpoint,
+        current_justified_checkpoint: pre.current_justified_checkpoint,
+        finalized_checkpoint: pre.finalized_checkpoint,
+        // [Modified in Gloas:EIP7688]
+        inactivity_scores: pre.inactivity_scores.to_vec().into(),
+        current_sync_committee: pre.current_sync_committee.clone(),
+        next_sync_committee: pre.next_sync_committee.clone(),
+        // [New in Gloas:EIP7732] Removed `latest_execution_payload_header`;
+        // see this function's own doc.
+        latest_block_hash: execution_header.block_hash,
+        next_withdrawal_index: pre.next_withdrawal_index,
+        next_withdrawal_validator_index: pre.next_withdrawal_validator_index,
+        historical_summaries: pre.historical_summaries.clone(),
+        deposit_requests_start_index: pre.deposit_requests_start_index,
+        deposit_balance_to_consume: pre.deposit_balance_to_consume,
+        exit_balance_to_consume: pre.exit_balance_to_consume,
+        earliest_exit_epoch: pre.earliest_exit_epoch,
+        consolidation_balance_to_consume: pre.consolidation_balance_to_consume,
+        earliest_consolidation_epoch: pre.earliest_consolidation_epoch,
+        // [Modified in Gloas:EIP7688]
+        pending_deposits: pre.pending_deposits.to_vec().into(),
+        // [Modified in Gloas:EIP7688]
+        pending_partial_withdrawals: pre.pending_partial_withdrawals.to_vec().into(),
+        // [Modified in Gloas:EIP7688]
+        pending_consolidations: pre.pending_consolidations.to_vec().into(),
+        proposer_lookahead: pre.proposer_lookahead.clone(),
+        // [New in Gloas:EIP7732]
+        builders: Default::default(),
+        // [New in Gloas:EIP7732]
+        next_withdrawal_builder_index: 0,
+        // [New in Gloas:EIP7732]
+        execution_payload_availability,
+        // [New in Gloas:EIP7732]
+        builder_pending_payments: vec![
+            gloas::BuilderPendingPayment::default();
+            preset::BUILDER_PENDING_PAYMENTS_LENGTH
+        ]
+        .try_into()
+        .expect("built at exactly BUILDER_PENDING_PAYMENTS_LENGTH"),
+        // [New in Gloas:EIP7732]
+        builder_pending_withdrawals: Default::default(),
+        // [New in Gloas:EIP7732]
+        latest_execution_payload_bid,
+        // [New in Gloas:EIP7732]
+        payload_expected_withdrawals: Default::default(),
+        // [New in Gloas:EIP7732] Overwritten below; see this function's own
+        // doc.
+        ptc_window: placeholder_ptc_window,
+    };
+    let mut post = BeaconState::Gloas(post);
+
+    // [New in Gloas:EIP7732]
+    let ptc_window = initialize_ptc_window(&post)?;
+    crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?.ptc_window =
+        ptc_window;
+
+    // [New in Gloas:EIP7732]
+    onboard_builders_from_pending_deposits(
+        crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_gloas")?,
+        config,
+    )?;
+
+    Ok(post)
+}
+
 /// Applies the fork upgrade that produces `to`'s state shape from `state`.
 ///
 /// Dispatches over the per-fork upgrade functions by [`ForkName`] so a caller
@@ -843,6 +1279,7 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Deneb => upgrade_to_deneb(state, config),
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
+        ForkName::Gloas => upgrade_to_gloas(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),

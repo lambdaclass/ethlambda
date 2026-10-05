@@ -42,8 +42,6 @@
 //! ([`Config::max_blobs_per_block_electra`]) rather than deneb's fixed preset
 //! (see [`process_execution_payload`]).
 
-use std::collections::HashSet;
-
 use libssz::SszEncode as _;
 
 use crate::beacon::bls;
@@ -60,27 +58,27 @@ use crate::beacon::helpers::accessors::{
     get_block_root_at_slot, get_current_epoch, get_previous_epoch, get_randao_mix,
 };
 use crate::beacon::helpers::altair::{add_flag, get_base_reward_per_increment, has_flag};
+use crate::beacon::helpers::capella::withdrawal_address;
 use crate::beacon::helpers::electra::{
-    compute_exit_epoch_and_update_churn, electra_state, get_committee_indices,
-    get_consolidation_churn_limit, get_indexed_attestation, get_max_effective_balance,
+    compute_exit_epoch_and_update_churn, get_committee_indices,
+    get_consolidation_churn_limit_for_fork, get_indexed_attestation, get_max_effective_balance,
     get_pending_balance_to_withdraw, has_compounding_withdrawal_credential,
     has_eth1_withdrawal_credential, has_execution_withdrawal_credential,
     initiate_validator_exit as electra_initiate_validator_exit, is_fully_withdrawable_validator,
-    is_partially_withdrawable_validator, is_valid_indexed_attestation,
+    is_partially_withdrawable_validator, is_valid_indexed_attestation, pending_queue_fields,
+    pending_queue_fields_ref,
 };
 use crate::beacon::helpers::math::integer_squareroot;
 use crate::beacon::helpers::misc::{
     compute_deposit_domain, compute_domain, compute_epoch_at_slot, compute_signing_root,
     is_valid_merkle_branch,
 };
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance, slash_validator};
-use crate::beacon::helpers::predicates::{
-    is_active_validator, is_slashable_attestation_data, is_slashable_validator,
-};
+use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::predicates::{is_active_validator, is_slashable_attestation_data};
 use crate::beacon::preset;
 use crate::beacon::primitives::{
-    BlsPubkey, BlsSignature, Bytes32, ExecutionAddress, Gwei, HashTreeRoot as _,
-    ParticipationFlags, ValidatorIndex, WithdrawalIndex,
+    BlsPubkey, BlsSignature, Bytes32, Gwei, HashTreeRoot as _, ParticipationFlags, ValidatorIndex,
+    WithdrawalIndex,
 };
 
 use super::ExecutionEngine;
@@ -89,22 +87,34 @@ use super::ExecutionEngine;
 // Local state projection
 // ---------------------------------------------------------------------------
 //
-// `crate::beacon::helpers::electra::{electra_state, electra_state_ref}` already
-// project a `BeaconState` down to electra's (or fulu's) concrete struct, but
-// only far enough to reach the balance-churn fields their own module needs
-// (`pending_deposits` and the four churn cursors; see that module's doc). This
-// file's block-processing steps also need `latest_execution_payload_header`,
+// `crate::beacon::helpers::electra::{pending_queue_fields, pending_queue_fields_ref}`
+// already project a `BeaconState` down to electra's, fulu's, or gloas's
+// concrete struct, but only far enough to reach the deposit-balance churn
+// cursor and the three pending queues (see that module's doc). This file's
+// other block-processing steps also need `latest_execution_payload_header`,
 // the withdrawal-sweep cursor (`next_withdrawal_index`,
-// `next_withdrawal_validator_index`), `pending_partial_withdrawals` and
-// `pending_consolidations` mutably, `deposit_requests_start_index`, and
-// (introduced at altair, not electra) `previous_epoch_participation`,
-// `current_epoch_participation`, and `inactivity_scores`. None of those are
-// fork-invariant (`crate::beacon::containers::mod`'s `shared_state_accessors!` macro
-// does not cover any of them), and reaching them would mean adding methods to
-// `helpers::electra`'s projection, which is outside this file's ownership.
-// This is a second, narrower projection kept local to this module instead,
-// for exactly the fields block processing (as opposed to balance-churn
-// accounting) needs.
+// `next_withdrawal_validator_index`), `deposit_requests_start_index` (this
+// fork's own `process_deposit_request`, unlike fulu's and gloas's, still
+// writes it), and (introduced at altair, not electra)
+// `previous_epoch_participation`, `current_epoch_participation`, and
+// `inactivity_scores`. None of those are fork-invariant
+// (`crate::beacon::containers::mod`'s `shared_state_accessors!` macro does
+// not cover any of them), gloas cannot serve every one of them (it has no
+// `latest_execution_payload_header` at all), and reaching them would mean
+// adding methods to `helpers::electra`'s own projection that only make sense
+// for two of its three forks, which is outside that module's ownership. This
+// is a second, narrower, electra-and-fulu-only projection kept local to this
+// module instead, for exactly the fields block processing (as opposed to
+// balance-churn accounting, or the pending queues) needs.
+//
+// `pending_partial_withdrawals_mut` still lives on this local projection too,
+// for `process_withdrawals`'s own sweep-drain (which, like the fields above,
+// gloas does not share: its own withdrawal sweep lives in
+// `crate::beacon::stf::gloas`). `process_withdrawal_request` and
+// `process_consolidation_request` reach that same queue, and
+// `pending_consolidations`, through `pending_queue_fields` instead,
+// specifically so gloas can share those two functions unmodified; see their
+// own docs.
 //
 // Scoped to `BeaconState::Electra` *and* `BeaconState::Fulu`, the same way
 // `helpers::electra`'s own projection is, rather than to `Electra` alone the
@@ -206,13 +216,6 @@ impl<'a> BlockMut<'a> {
         match self {
             BlockMut::Electra(state) => &mut state.pending_partial_withdrawals,
             BlockMut::Fulu(state) => &mut state.pending_partial_withdrawals,
-        }
-    }
-
-    fn pending_consolidations_mut(&mut self) -> &mut electra::PendingConsolidations {
-        match self {
-            BlockMut::Electra(state) => &mut state.pending_consolidations,
-            BlockMut::Fulu(state) => &mut state.pending_consolidations,
         }
     }
 
@@ -331,12 +334,10 @@ pub fn add_validator_to_registry(
     withdrawal_credentials: Bytes32,
     amount: Gwei,
 ) -> Result<()> {
-    state.validators_mut().push(get_validator_from_deposit(
-        pubkey,
-        withdrawal_credentials,
+    state.push_validator(
+        get_validator_from_deposit(pubkey, withdrawal_credentials, amount),
         amount,
-    ))?;
-    state.balances_mut().push(amount)?;
+    )?;
 
     let mut fields = block_mut(state, "add_validator_to_registry")?;
     fields.epoch_participation_mut(true).push(0)?;
@@ -405,7 +406,7 @@ pub fn apply_deposit(
     signature: &BlsSignature,
     config: &Config,
 ) -> Result<()> {
-    let already_registered = state.validators().iter().any(|v| v.pubkey == pubkey);
+    let already_registered = state.iter_validators().any(|v| v.pubkey == pubkey);
     if !already_registered {
         if is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature, config) {
             // The registry entry starts at a zero balance; see this
@@ -424,10 +425,7 @@ pub fn apply_deposit(
         signature: *signature,
         slot: constants::GENESIS_SLOT,
     };
-    electra_state(state, "apply_deposit")?
-        .pending_deposits_mut()
-        .push(deposit)?;
-    Ok(())
+    pending_queue_fields(state, "apply_deposit")?.push_pending_deposit(deposit)
 }
 
 /// Verifies a deposit's merkle proof, then applies it.
@@ -580,7 +578,9 @@ pub fn process_bls_to_execution_change(
 /// [`electra::AttesterSlashing`] and [`crate::beacon::helpers::electra::is_valid_indexed_attestation`]
 /// instead, the same reason that helper exists as its own copy (see its own
 /// documentation): a different concrete `IndexedAttestation` type, not
-/// different logic.
+/// different logic. See
+/// `crate::beacon::stf::operations::slash_attesting_index_intersection` for the
+/// shared walk this delegates to once both indexed attestations check out.
 pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &electra::AttesterSlashing,
@@ -602,30 +602,12 @@ pub fn process_attester_slashing(
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
-    let current_epoch = get_current_epoch(state);
-    // `is_valid_indexed_attestation` already required both index lists to be
-    // sorted and unique; see `crate::beacon::stf::operations::process_attester_slashing`
-    // for why walking `attestation_1`'s list in order while filtering by
-    // membership in `attestation_2`'s set yields the intersection already
-    // sorted.
-    let indices_2: HashSet<ValidatorIndex> =
-        attestation_2.attesting_indices.iter().copied().collect();
-
-    let mut slashed_any = false;
-    for &index in attestation_1.attesting_indices.iter() {
-        if !indices_2.contains(&index) {
-            continue;
-        }
-        if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
-            slashed_any = true;
-        }
-    }
-    verify(
-        slashed_any,
-        "at least one validator in the intersection of the two attesting index sets was slashed",
-    )?;
-    Ok(())
+    super::operations::slash_attesting_index_intersection(
+        state,
+        &attestation_1.attesting_indices,
+        &attestation_2.attesting_indices,
+        config,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -885,76 +867,66 @@ fn attestation_participation_flag_indices(
 // Withdrawals
 // ---------------------------------------------------------------------------
 
-/// The execution address a validator's payout is sent to: the low bytes of
-/// its withdrawal credentials, present regardless of whether those
-/// credentials are eth1 or compounding (both are execution-form; see
-/// `crate::beacon::helpers::electra::has_execution_withdrawal_credential`).
+/// Drains [`electra::PendingPartialWithdrawal`]s (EIP-7251's own queue,
+/// absent before this fork), oldest first: each entry is either paid (if the
+/// validator is still active, sitting on enough effective and excess
+/// balance) or simply dropped, but either way it counts toward the returned
+/// processed count, which [`process_withdrawals`] needs to know how much of
+/// the queue to drop afterward: a withdrawal request can be consumed by this
+/// sweep without ever producing an actual [`capella::Withdrawal`], and the
+/// queue still has to advance past it regardless.
 ///
-/// A duplicate of capella's own private `withdrawal_address`
-/// (`crate::beacon::stf::capella`): that function is not `pub`, so it is not visible
-/// here even within the same crate.
-fn withdrawal_address(validator: &Validator) -> ExecutionAddress {
-    ExecutionAddress::from_slice(&validator.withdrawal_credentials.0[12..])
-}
-
-/// The withdrawals this block's sweep owes, without applying them, and how
-/// many entries of `pending_partial_withdrawals` it consumed while deciding
-/// that.
+/// `prior_withdrawals` and the returned `withdrawal_index` let a caller chain
+/// several sweeps (gloas's own builder-payout and builder-registry sweeps run
+/// ahead of this one; see `crate::beacon::stf::gloas::get_expected_withdrawals`)
+/// without double-paying a balance an earlier sweep already claimed: the
+/// bound below counts `prior_withdrawals` too, and `total_withdrawn` searches
+/// both lists.
 ///
-/// Two sweeps, in the specification's order, both drawing from the same
-/// `withdrawals` list and the same `withdrawal_index` cursor so a partial
-/// withdrawal already collected by the first sweep is visible to the
-/// second's own `total_withdrawn` accounting for the same validator.
-///
-/// The first sweep drains [`electra::PendingPartialWithdrawal`]s
-/// (EIP-7251's own queue, absent before this fork): each entry is either
-/// paid (if the validator is still active, sitting on enough effective and
-/// excess balance) or simply dropped, but either way it counts toward
-/// `processed_partial_withdrawals_count`, which is the second return value
-/// [`process_withdrawals`] needs to know how much of the queue to drop
-/// afterward: a withdrawal request can be consumed by this sweep without
-/// ever producing an actual [`capella::Withdrawal`], and the queue still has
-/// to advance past it regardless.
-///
-/// The second sweep is capella's own registry walk
-/// (`crate::beacon::stf::capella::get_expected_withdrawals`), unchanged in shape,
-/// except that both withdrawability predicates are electra's
-/// ([`is_fully_withdrawable_validator`], [`is_partially_withdrawable_validator`])
-/// and a partial withdrawal's amount is capped against
-/// [`get_max_effective_balance`] (a validator's own ceiling) rather than the
-/// single fixed `MAX_EFFECTIVE_BALANCE`.
-pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Withdrawal>, usize)> {
+/// Also served, unmodified, by gloas: nothing in gloas's own
+/// `beacon-chain.md` touches this function, and the only thing that kept a
+/// gloas state from calling this exact copy was the queue's own type
+/// ([`crate::beacon::containers::gloas::PendingPartialWithdrawals`], a
+/// [`libssz_types::ProgressiveList`], EIP-7688), which
+/// [`crate::beacon::helpers::electra::PendingQueueFieldsRef::pending_partial_withdrawals`]
+/// already abstracts over as a slice.
+pub(crate) fn get_pending_partial_withdrawals(
+    state: &BeaconState,
+    mut withdrawal_index: WithdrawalIndex,
+    prior_withdrawals: &[capella::Withdrawal],
+) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
     let epoch = get_current_epoch(state);
-    let fields = block_ref(state, "get_expected_withdrawals")?;
-    let mut withdrawal_index = fields.next_withdrawal_index();
-    let mut validator_index = fields.next_withdrawal_validator_index();
+    let withdrawals_limit = (prior_withdrawals.len()
+        + preset::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP as usize)
+        .min(preset::MAX_WITHDRAWALS_PER_PAYLOAD - 1);
+    verify(
+        prior_withdrawals.len() <= withdrawals_limit,
+        "get_pending_partial_withdrawals: len(prior_withdrawals) <= withdrawals_limit",
+    )?;
 
-    let mut withdrawals: Vec<capella::Withdrawal> = Vec::new();
-    let mut processed_partial_withdrawals_count: usize = 0;
-
-    // [New in Electra:EIP7251]: consume pending partial withdrawals.
-    let electra_ref =
-        crate::beacon::helpers::electra::electra_state_ref(state, "get_expected_withdrawals")?;
-    let pending_partial_withdrawals = electra_ref.pending_partial_withdrawals();
-    for withdrawal in pending_partial_withdrawals.iter() {
-        if withdrawal.withdrawable_epoch > epoch
-            || withdrawals.len() == preset::MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP as usize
-        {
+    let mut processed_count: u64 = 0;
+    let mut withdrawals = Vec::new();
+    let fields = pending_queue_fields_ref(state, "get_pending_partial_withdrawals")?;
+    for withdrawal in fields.pending_partial_withdrawals() {
+        let is_withdrawable = withdrawal.withdrawable_epoch <= epoch;
+        if !is_withdrawable || prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
             break;
         }
 
-        let validator = state.validator(withdrawal.validator_index)?;
+        let validator_index = withdrawal.validator_index;
+        let validator = state.validator(validator_index)?;
         let has_sufficient_effective_balance =
             validator.effective_balance >= preset::MIN_ACTIVATION_BALANCE;
-        let total_withdrawn: Gwei = withdrawals
+        let total_withdrawn: Gwei = prior_withdrawals
             .iter()
-            .filter(|paid| paid.validator_index == withdrawal.validator_index)
+            .chain(withdrawals.iter())
+            .filter(|paid| paid.validator_index == validator_index)
             .fold(0, |total, paid| total.saturating_add(paid.amount));
         let balance = state
-            .balance(withdrawal.validator_index)?
+            .balance(validator_index)?
             .checked_sub(total_withdrawn)
             .ok_or(Error::ArithmeticOverflow(
-                "state.balances[withdrawal.validator_index] - total_withdrawn",
+                "get_pending_partial_withdrawals: balance - total_withdrawn",
             ))?;
         let has_excess_balance = balance > preset::MIN_ACTIVATION_BALANCE;
 
@@ -966,36 +938,72 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Wit
                 (balance - preset::MIN_ACTIVATION_BALANCE).min(withdrawal.amount);
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
-                validator_index: withdrawal.validator_index,
+                validator_index,
                 address: withdrawal_address(validator),
                 amount: withdrawable_balance,
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow("withdrawal_index + 1"))?;
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_pending_partial_withdrawals: withdrawal_index + 1",
+                ))?;
         }
 
         // Regardless of whether a withdrawal was actually produced above,
         // this queue entry is consumed either way.
-        processed_partial_withdrawals_count += 1;
+        processed_count += 1;
     }
 
-    // Sweep for the rest, the same bounded registry walk capella's own
-    // `get_expected_withdrawals` runs; see this function's own documentation
-    // for what electra changes about it.
-    let validator_count = state.validators().len() as u64;
-    let bound = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
-    for _ in 0..bound {
+    Ok((withdrawals, withdrawal_index, processed_count))
+}
+
+/// The bounded registry walk capella's own `get_expected_withdrawals` runs,
+/// unchanged in shape, except that both withdrawability predicates are
+/// electra's ([`is_fully_withdrawable_validator`],
+/// [`is_partially_withdrawable_validator`]) and a partial withdrawal's amount
+/// is capped against [`get_max_effective_balance`] (a validator's own
+/// ceiling) rather than the single fixed `MAX_EFFECTIVE_BALANCE`.
+///
+/// `prior_withdrawals` and the returned `withdrawal_index`: see
+/// [`get_pending_partial_withdrawals`]'s own doc.
+///
+/// Also served, unmodified, by gloas, for a stronger reason than that
+/// function: this one touches no gloas-changed list at all (the registry and
+/// the withdrawal cursor keep their pre-gloas shape), so it needs no
+/// projection wider than [`BeaconState`]'s own fork-invariant accessors.
+pub(crate) fn get_validators_sweep_withdrawals(
+    state: &BeaconState,
+    mut withdrawal_index: WithdrawalIndex,
+    prior_withdrawals: &[capella::Withdrawal],
+) -> Result<(Vec<capella::Withdrawal>, WithdrawalIndex, u64)> {
+    let epoch = get_current_epoch(state);
+    let validator_count = state.validator_count() as u64;
+    let validators_limit = validator_count.min(preset::MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP);
+    let withdrawals_limit = preset::MAX_WITHDRAWALS_PER_PAYLOAD;
+    verify(
+        prior_withdrawals.len() < withdrawals_limit,
+        "get_validators_sweep_withdrawals: len(prior_withdrawals) < withdrawals_limit",
+    )?;
+
+    let mut processed_count: u64 = 0;
+    let mut withdrawals = Vec::new();
+    let (_, mut validator_index) = state.withdrawal_cursor()?;
+    for _ in 0..validators_limit {
+        if prior_withdrawals.len() + withdrawals.len() >= withdrawals_limit {
+            break;
+        }
+
         let validator = state.validator(validator_index)?;
-        let total_withdrawn: Gwei = withdrawals
+        let total_withdrawn: Gwei = prior_withdrawals
             .iter()
+            .chain(withdrawals.iter())
             .filter(|paid| paid.validator_index == validator_index)
             .fold(0, |total, paid| total.saturating_add(paid.amount));
         let balance = state
             .balance(validator_index)?
             .checked_sub(total_withdrawn)
             .ok_or(Error::ArithmeticOverflow(
-                "state.balances[validator_index] - total_withdrawn",
+                "get_validators_sweep_withdrawals: balance - total_withdrawn",
             ))?;
 
         if is_fully_withdrawable_validator(validator, balance, epoch) {
@@ -1007,14 +1015,16 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Wit
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow("withdrawal_index + 1"))?;
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_validators_sweep_withdrawals: withdrawal_index + 1",
+                ))?;
         } else if is_partially_withdrawable_validator(validator, balance) {
             // [Modified in Electra:EIP7251]: capped against this validator's
             // own ceiling, not the single fixed `MAX_EFFECTIVE_BALANCE`.
             let amount = balance
                 .checked_sub(get_max_effective_balance(validator))
                 .ok_or(Error::ArithmeticOverflow(
-                    "balance - get_max_effective_balance(validator)",
+                    "get_validators_sweep_withdrawals: balance - get_max_effective_balance(validator)",
                 ))?;
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
@@ -1024,19 +1034,46 @@ pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Wit
             });
             withdrawal_index = withdrawal_index
                 .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow("withdrawal_index + 1"))?;
+                .ok_or(Error::ArithmeticOverflow(
+                    "get_validators_sweep_withdrawals: withdrawal_index + 1",
+                ))?;
         }
 
-        if withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD {
-            break;
-        }
+        // `validators_limit <= validator_count`, and this loop only ever runs
+        // when `validators_limit > 0`, so `validator_count` is never zero
+        // here.
         validator_index = validator_index
             .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow("validator_index + 1"))?
+            .ok_or(Error::ArithmeticOverflow(
+                "get_validators_sweep_withdrawals: validator_index + 1",
+            ))?
             % validator_count;
+        processed_count += 1;
     }
 
-    Ok((withdrawals, processed_partial_withdrawals_count))
+    Ok((withdrawals, withdrawal_index, processed_count))
+}
+
+/// The withdrawals this block's sweep owes, without applying them: pending
+/// partial withdrawals first ([`get_pending_partial_withdrawals`]), then the
+/// bounded validator registry walk ([`get_validators_sweep_withdrawals`]),
+/// the second sweep's own `prior_withdrawals` carrying forward every
+/// withdrawal the first already produced so neither double-pays a balance
+/// the other already claimed.
+pub fn get_expected_withdrawals(state: &BeaconState) -> Result<(Vec<capella::Withdrawal>, usize)> {
+    let fields = block_ref(state, "get_expected_withdrawals")?;
+    let withdrawal_index = fields.next_withdrawal_index();
+
+    let (partial_withdrawals, withdrawal_index, processed_partial_withdrawals_count) =
+        get_pending_partial_withdrawals(state, withdrawal_index, &[])?;
+
+    let (validators_sweep_withdrawals, _, _) =
+        get_validators_sweep_withdrawals(state, withdrawal_index, &partial_withdrawals)?;
+
+    let mut withdrawals = partial_withdrawals;
+    withdrawals.extend(validators_sweep_withdrawals);
+
+    Ok((withdrawals, processed_partial_withdrawals_count as usize))
 }
 
 /// Applies this block's withdrawal sweep: checks the block's declared
@@ -1087,7 +1124,7 @@ pub fn process_withdrawals(
             .ok_or(Error::ArithmeticOverflow("latest_withdrawal.index + 1"))?;
     }
 
-    let validator_count = state.validators().len() as u64;
+    let validator_count = state.validator_count() as u64;
     let next_validator_index = if expected_withdrawals.len() == preset::MAX_WITHDRAWALS_PER_PAYLOAD
     {
         let latest_withdrawal = expected_withdrawals
@@ -1128,6 +1165,11 @@ pub fn process_withdrawals(
 /// [`electra::BeaconBlockBody::execution_requests`] rather than carrying them
 /// as three separate body fields the way every other operation list is
 /// carried.
+///
+/// Electra's own version. Fulu redefines the deposit-request leg
+/// ([`super::fulu::process_deposit_request`]) to drop the former deposit
+/// mechanism's bookkeeping, so it keeps a copy of this whole loop
+/// ([`super::fulu::process_execution_requests`]) rather than sharing this one.
 pub fn process_execution_requests(
     state: &mut BeaconState,
     requests: &electra::ExecutionRequests,
@@ -1163,6 +1205,22 @@ pub fn process_execution_requests(
 /// [`process_withdrawal_request`] and [`process_consolidation_request`]
 /// trust the execution layer's own request rather than re-deriving a
 /// signature for it.
+///
+/// Electra's own version, in effect only through this fork. This is the
+/// function that *releases* electra's own gate in
+/// [`super::epoch::electra::process_pending_deposits`]: setting
+/// `deposit_requests_start_index` the first time a request is seen is what
+/// eventually turns that gate's `eth1_deposit_index < deposit_requests_start_index`
+/// false. By fulu the former deposit mechanism that field tracks is fully
+/// retired (`beacon-chain.md`'s "Modified `process_deposit_request`" for that
+/// fork), so [`super::fulu::process_deposit_request`] queues the same
+/// [`electra::PendingDeposit`] without touching that field at all, and
+/// [`super::epoch::fulu::process_pending_deposits`] drops the gate to match.
+/// The two changes are a package: pairing fulu's deposit handler (which never
+/// sets the field) with electra's still-gated pending-deposits step, rather
+/// than fulu's own, would leave the field permanently unset and the gate
+/// permanently true, wedging the queue for good; see that function's own
+/// doc.
 pub fn process_deposit_request(
     state: &mut BeaconState,
     request: &electra::DepositRequest,
@@ -1183,10 +1241,7 @@ pub fn process_deposit_request(
         signature: request.signature,
         slot: state.slot(),
     };
-    electra_state(state, "process_deposit_request")?
-        .pending_deposits_mut()
-        .push(deposit)?;
-    Ok(())
+    pending_queue_fields(state, "process_deposit_request")?.push_pending_deposit(deposit)
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1280,15 @@ pub fn process_deposit_request(
 /// means `activation_epoch` itself is corrupt state, not that this request is
 /// stale, so it is checked and propagated with `?` rather than folded into
 /// the silent-return chain above it.
+///
+/// Also served, unmodified, by gloas: nothing in gloas's own
+/// `beacon-chain.md` touches this function, and the only thing that kept a
+/// gloas state from calling this exact copy was the pending-partial-withdrawals
+/// queue's own type, which
+/// [`crate::beacon::helpers::electra::PendingQueueFields`] abstracts over as
+/// a slice (the length check) and a one-at-a-time push (queuing a new
+/// withdrawal), rather than this file's own [`block_mut`], which cannot
+/// serve gloas (see this file's own module doc).
 pub fn process_withdrawal_request(
     state: &mut BeaconState,
     request: &electra::WithdrawalRequest,
@@ -1233,9 +1297,10 @@ pub fn process_withdrawal_request(
     let amount = request.amount;
     let is_full_exit_request = amount == constants::FULL_EXIT_REQUEST_AMOUNT;
 
-    let pending_partial_withdrawals_len = block_mut(state, "process_withdrawal_request")?
-        .pending_partial_withdrawals_mut()
-        .len();
+    let pending_partial_withdrawals_len =
+        pending_queue_fields(state, "process_withdrawal_request")?
+            .pending_partial_withdrawals()
+            .len();
     if pending_partial_withdrawals_len == preset::PENDING_PARTIAL_WITHDRAWALS_LIMIT
         && !is_full_exit_request
     {
@@ -1243,8 +1308,7 @@ pub fn process_withdrawal_request(
     }
 
     let Some(index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.validator_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
@@ -1321,9 +1385,8 @@ pub fn process_withdrawal_request(
             amount: to_withdraw,
             withdrawable_epoch,
         };
-        block_mut(state, "process_withdrawal_request")?
-            .pending_partial_withdrawals_mut()
-            .push(withdrawal)?;
+        pending_queue_fields(state, "process_withdrawal_request")?
+            .push_pending_partial_withdrawal(withdrawal)?;
     }
 
     Ok(())
@@ -1354,8 +1417,7 @@ pub fn is_valid_switch_to_compounding_request(
     }
 
     let Some(source_validator) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .find(|validator| validator.pubkey == request.source_pubkey)
     else {
         return Ok(false);
@@ -1389,6 +1451,13 @@ pub fn is_valid_switch_to_compounding_request(
 /// in that function, is `source_validator.activation_epoch +
 /// SHARD_COMMITTEE_PERIOD`: an overflow there is checked and propagated,
 /// since it would mean corrupt state rather than a stale request.
+///
+/// Also served, unmodified, by gloas, the same reason and the same way
+/// [`process_withdrawal_request`] is: nothing in gloas's own
+/// `beacon-chain.md` touches this function, and
+/// [`crate::beacon::helpers::electra::PendingQueueFields`] abstracts over the
+/// pending-consolidations queue's own type change instead of this file's own
+/// [`block_mut`], which cannot serve gloas.
 pub fn process_consolidation_request(
     state: &mut BeaconState,
     request: &electra::ConsolidationRequest,
@@ -1398,8 +1467,7 @@ pub fn process_consolidation_request(
         // Already known to resolve, by the check just above; state has not
         // been mutated since.
         let source_index = state
-            .validators()
-            .iter()
+            .iter_validators()
             .position(|validator| validator.pubkey == request.source_pubkey)
             .map(|index| index as ValidatorIndex)
             .ok_or(Error::SpecAssert(
@@ -1416,27 +1484,25 @@ pub fn process_consolidation_request(
     if request.source_pubkey == request.target_pubkey {
         return Ok(());
     }
-    let pending_consolidations_len = block_mut(state, "process_consolidation_request")?
-        .pending_consolidations_mut()
+    let pending_consolidations_len = pending_queue_fields(state, "process_consolidation_request")?
+        .pending_consolidations()
         .len();
     if pending_consolidations_len == preset::PENDING_CONSOLIDATIONS_LIMIT {
         return Ok(());
     }
-    if get_consolidation_churn_limit(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
+    if get_consolidation_churn_limit_for_fork(state, config)? <= preset::MIN_ACTIVATION_BALANCE {
         return Ok(());
     }
 
     let Some(source_index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.source_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
         return Ok(());
     };
     let Some(target_index) = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == request.target_pubkey)
         .map(|index| index as ValidatorIndex)
     else {
@@ -1505,9 +1571,8 @@ pub fn process_consolidation_request(
         source_index,
         target_index,
     };
-    block_mut(state, "process_consolidation_request")?
-        .pending_consolidations_mut()
-        .push(consolidation)?;
+    pending_queue_fields(state, "process_consolidation_request")?
+        .push_pending_consolidation(consolidation)?;
 
     Ok(())
 }
@@ -1694,6 +1759,12 @@ pub fn get_execution_requests_list(requests: &electra::ExecutionRequests) -> Vec
 /// `eth1_deposit_index_limit - state.eth1_deposit_index` cannot underflow:
 /// the surrounding `if` already established `state.eth1_deposit_index <
 /// eth1_deposit_index_limit`.
+///
+/// Electra's own version. Fulu removes the old deposit-contract path outright
+/// (`beacon-chain.md`'s "Modified `process_operations`": `assert
+/// len(body.deposits) == 0`, unconditionally, with no `process_deposit` call
+/// at all), so it keeps its own copy, [`super::fulu::process_operations`],
+/// rather than calling this one.
 pub fn process_operations(
     state: &mut BeaconState,
     body: &electra::BeaconBlockBody,
@@ -1786,6 +1857,7 @@ pub fn process_block(
 mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
+    use crate::beacon::primitives::ExecutionAddress;
 
     /// An electra state with `count` fully active validators, each with
     /// [`preset::MIN_ACTIVATION_BALANCE`] and an eth1 withdrawal credential,
@@ -2020,7 +2092,7 @@ mod tests {
             validator.withdrawal_credentials.0[0] = constants::COMPOUNDING_WITHDRAWAL_PREFIX;
             validator.effective_balance = preset::MIN_ACTIVATION_BALANCE;
         }
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
         let pubkey = state.validator(0).unwrap().pubkey;
 
         let request = electra::WithdrawalRequest {
@@ -2047,7 +2119,7 @@ mod tests {
         // nothing even with genuine excess balance.
         let mut state = electra_state_with_validators(2);
         let config = Config::mainnet();
-        state.balances_mut()[0] = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
+        *state.balance_mut(0).unwrap() = preset::MIN_ACTIVATION_BALANCE + 1_000_000_000;
         let pubkey = state.validator(0).unwrap().pubkey;
 
         let request = electra::WithdrawalRequest {
@@ -2084,9 +2156,9 @@ mod tests {
             state.validator(0).unwrap()
         ));
         assert!(
-            block_mut(&mut state, "test assertion")
+            pending_queue_fields(&mut state, "test assertion")
                 .unwrap()
-                .pending_consolidations_mut()
+                .pending_consolidations()
                 .is_empty(),
             "a switch-to-compounding request is not a real consolidation and must not queue one"
         );
@@ -2117,11 +2189,10 @@ mod tests {
         let mut state = electra_state_with_validators(2);
         let config = Config::mainnet();
         {
-            let mut fields = block_mut(&mut state, "test setup").unwrap();
-            let queue = fields.pending_consolidations_mut();
+            let mut fields = pending_queue_fields(&mut state, "test setup").unwrap();
             for _ in 0..preset::PENDING_CONSOLIDATIONS_LIMIT {
-                queue
-                    .push(electra::PendingConsolidation {
+                fields
+                    .push_pending_consolidation(electra::PendingConsolidation {
                         source_index: 0,
                         target_index: 0,
                     })
@@ -2134,9 +2205,9 @@ mod tests {
         }
         let source_pubkey = state.validator(0).unwrap().pubkey;
         let target_pubkey = state.validator(1).unwrap().pubkey;
-        let before_len = block_mut(&mut state, "test assertion")
+        let before_len = pending_queue_fields(&mut state, "test assertion")
             .unwrap()
-            .pending_consolidations_mut()
+            .pending_consolidations()
             .len();
 
         let request = electra::ConsolidationRequest {
@@ -2148,9 +2219,9 @@ mod tests {
             .expect("a full queue drops the request silently, not with an error");
 
         assert_eq!(
-            block_mut(&mut state, "test assertion")
+            pending_queue_fields(&mut state, "test assertion")
                 .unwrap()
-                .pending_consolidations_mut()
+                .pending_consolidations()
                 .len(),
             before_len,
             "the queue must not have grown past its limit"
@@ -2199,9 +2270,9 @@ mod tests {
             FAR_FUTURE_EPOCH,
             "a genuine consolidation must start the source validator's exit"
         );
-        let queue_len = block_mut(&mut state, "test assertion")
+        let queue_len = pending_queue_fields(&mut state, "test assertion")
             .unwrap()
-            .pending_consolidations_mut()
+            .pending_consolidations()
             .len();
         assert_eq!(queue_len, 1, "the consolidation must have been queued");
     }
@@ -2212,7 +2283,7 @@ mod tests {
     fn a_new_validators_deposit_is_queued_rather_than_credited_directly() {
         let mut state = electra_state_with_validators(1);
         let config = Config::mainnet();
-        let count_before = state.validators().len();
+        let count_before = state.validator_count();
 
         let pubkey = BlsPubkey([9; 48]);
         let signature = BlsSignature::default();
@@ -2235,9 +2306,9 @@ mod tests {
 
         // An invalid signature means the deposit is not credited to a new
         // validator at all: see `apply_deposit`'s own documentation.
-        assert_eq!(state.validators().len(), count_before);
+        assert_eq!(state.validator_count(), count_before);
         assert!(
-            crate::beacon::helpers::electra::electra_state_ref(&state, "test assertion")
+            crate::beacon::helpers::electra::pending_queue_fields_ref(&state, "test assertion")
                 .unwrap()
                 .pending_partial_withdrawals()
                 .is_empty(),

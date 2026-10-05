@@ -11,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use ethlambda_storage::Store;
+use ethlambda_types::beacon::{config::Config, primitives::Epoch};
 use serde::Serialize;
 
 use crate::shared::block_id::IdError;
@@ -57,6 +58,26 @@ pub(crate) enum ApiError {
     /// A request this node cannot answer right now, typically because its
     /// execution client did not (the Beacon API's 503).
     ServiceUnavailable(&'static str),
+}
+
+/// Refuses `epoch` when the node's schedule places it at a fork the node does
+/// not follow (gloas, see
+/// [`ethlambda_types::beacon::fork::ForkName::is_followed`]).
+///
+/// The head is a fulu state, so an answer for a gloas epoch would carry fulu's
+/// shapes under gloas's fork (a vote a validator client would sign as valid,
+/// an aggregate of the wrong shape). Refused by name, as the submit endpoints
+/// refuse the gloas header.
+pub(crate) fn refuse_unfollowed_epoch(
+    config: &Config,
+    epoch: Epoch,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    if config.fork_at_epoch(epoch).is_followed() {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(message))
+    }
 }
 
 impl From<IdError> for ApiError {

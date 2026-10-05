@@ -1,28 +1,134 @@
 //! Fork-choice-adjacent data that is neither a block nor a state.
 //!
-//! Two kinds share this file. `LatestMessage` and `PowBlock` are SSZ
+//! Four kinds share this file. `LatestMessage` and `PowBlock` are SSZ
 //! consensus containers moved out of the `beacon::fork_choice` module of
 //! `ethlambda-state-transition`, which re-exports both at their old paths so
 //! every use site inside it is unchanged. `PayloadStatusEnum` and
 //! `PayloadStatusV1` are plain Engine-API-shaped data with no such former
-//! home. All four live here rather than there for the same reason: the
-//! DB-backed `ethlambda_storage::Store` holds them, and `ethlambda-storage`
-//! cannot depend on `ethlambda-state-transition`, which pulls in `blst` and
-//! `c-kzg`.
+//! home. `PayloadStatus` and `ForkChoiceNode` are gloas's own fork-choice
+//! node types, new here rather than moved, since nothing named them before
+//! gloas. `BlockPayloadLink` is not a specification type at all: it is the
+//! per-block record the head walk reads instead of decoding the block. All
+//! seven live here for the same reason: the DB-backed
+//! `ethlambda_storage::Store` holds `LatestMessage`, `PowBlock`,
+//! `PayloadStatusV1` and `BlockPayloadLink`, and `ethlambda-storage` cannot
+//! depend on `ethlambda-state-transition`, which pulls in `blst` and
+//! `c-kzg`; `PayloadStatus` and `ForkChoiceNode` join them here rather than
+//! living beside `ethlambda-state-transition`'s own fork choice, so that a
+//! `LatestMessage`'s `payload_present` field and a stored node's own
+//! `PayloadStatus` share one crate with no dependency to cross.
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
-use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Uint256};
+use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot, Uint256};
 
 /// One validator's most recent attestation: the epoch it targeted, and the
 /// block it attested to (the LMD GHOST vote).
 ///
 /// `Copy`, matching the specification's `@dataclass(eq=True, frozen=True)`:
 /// there is nothing here worth borrowing rather than copying.
+///
+/// `epoch` and `slot` both live here rather than one replacing the other:
+/// every fork through fulu keeps `epoch`, the field gloas's own modified
+/// `LatestMessage` drops in favour of `slot` (gloas compares messages by slot,
+/// since a payload can be revealed a slot late and a slot-grained comparison
+/// is what lets `update_latest_messages` tell such a re-vote apart from a
+/// stale one). Splitting the two into per-fork types would mean every reader
+/// of a [`LatestMessage`] picks a variant instead of a field, for a value that
+/// is otherwise identical; carrying both instead lets one constructor,
+/// `update_latest_messages`, fill in both for every fork (`epoch` from the
+/// attestation's target, `slot` from its data), with only the fork's own
+/// comparison reading one of them: pre-gloas orders by `epoch`, gloas by
+/// `slot`. `payload_present` is the one field a fork leaves neutral
+/// (`false` before gloas).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatestMessage {
     pub epoch: Epoch,
+    /// The attestation's slot. Gloas compares messages by slot; earlier
+    /// forks keep comparing `epoch`.
+    pub slot: Slot,
     pub root: Root,
+    /// Gloas: whether the vote is for the block's full node (`data.index ==
+    /// 1`). Always `false` before gloas, which has no payload dimension to
+    /// vote on.
+    pub payload_present: bool,
+}
+
+/// A fork-choice node's payload dimension (gloas `fork-choice.md`'s new
+/// `PayloadStatus`): whether a [`ForkChoiceNode`] stands for a block whose
+/// payload is known to be empty, known to be full, or not yet decided either
+/// way.
+///
+/// Ordered `Empty < Full < Pending`, matching the specification's own integer
+/// values (`PAYLOAD_STATUS_EMPTY = 0`, `PAYLOAD_STATUS_FULL = 1`,
+/// `PAYLOAD_STATUS_PENDING = 2`): nothing in this crate compares two
+/// `PayloadStatus` values by order today, but the derive is kept alongside
+/// the discriminants it agrees with rather than left for a future caller to
+/// get wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PayloadStatus {
+    Empty = 0,
+    Full = 1,
+    Pending = 2,
+}
+
+/// What fork choice needs to know about a block's payload dimension, recorded
+/// when the block is imported so that walking the tree never decodes a block
+/// to learn it.
+///
+/// Two facts, both read off a block's own bytes and both fixed for the life of
+/// the block: which rules it is handled under, and which of its parent's
+/// payload branches it builds on (`get_parent_payload_status`). Neither
+/// changes after import, so the record is a cache that is correct whenever it
+/// is present and can be rederived by decoding the block when it is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockPayloadLink {
+    /// A pre-gloas block: a single FULL node whose payload ran inside the
+    /// block itself. It builds on its parent's FULL branch, the
+    /// fulu-to-gloas boundary rule.
+    PreGloas,
+    /// A gloas block.
+    Gloas {
+        /// The parent payload branch the block builds on, `None` when the
+        /// store does not hold the parent (a gloas anchor, whose parent is
+        /// below the retained window, so there is no bid to compare against).
+        ///
+        /// `Some(Full)` for a block whose parent is pre-gloas, by the same
+        /// boundary rule.
+        parent_status: Option<PayloadStatus>,
+    },
+}
+
+impl BlockPayloadLink {
+    /// Whether the block is a gloas block.
+    pub fn is_gloas(self) -> bool {
+        match self {
+            BlockPayloadLink::PreGloas => false,
+            BlockPayloadLink::Gloas { .. } => true,
+        }
+    }
+
+    /// The parent payload branch the block builds on, `None` when unknown.
+    pub fn parent_status(self) -> Option<PayloadStatus> {
+        match self {
+            BlockPayloadLink::PreGloas => Some(PayloadStatus::Full),
+            BlockPayloadLink::Gloas { parent_status } => parent_status,
+        }
+    }
+}
+
+/// A gloas fork-choice node (`fork-choice.md`'s modified `ForkChoiceNode`): a
+/// block, and which of its payload branches.
+///
+/// Every earlier fork's own `ForkChoiceNode` is a one-to-one mapping with a
+/// `BeaconBlock` (see `specs/phase0/fork-choice.md`'s own note), so this
+/// crate collapses it to a bare [`Root`] wherever a pre-gloas function reads
+/// one; only gloas needs the pair, since ePBS (EIP-7732) splits a block into
+/// two branches fork choice must weigh separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForkChoiceNode {
+    pub root: Root,
+    pub payload_status: PayloadStatus,
 }
 
 /// The execution chain's own block header, as far as bellatrix's merge

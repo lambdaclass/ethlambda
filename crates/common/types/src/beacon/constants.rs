@@ -141,6 +141,14 @@ pub const DOMAIN_CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0x00, 0x00, 0x00];
 /// [`BLS_WITHDRAWAL_PREFIX`] credentials over to
 /// [`ETH1_ADDRESS_WITHDRAWAL_PREFIX`].
 pub const DOMAIN_BLS_TO_EXECUTION_CHANGE: DomainType = [0x0a, 0x00, 0x00, 0x00];
+/// Domain for a `SignedExecutionPayloadBid` (gloas).
+pub const DOMAIN_BEACON_BUILDER: DomainType = [0x0b, 0x00, 0x00, 0x00];
+/// Domain for a `PayloadAttestationMessage` (gloas).
+pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0c, 0x00, 0x00, 0x00];
+/// Domain for a `SignedProposerPreferences` (gloas).
+pub const DOMAIN_PROPOSER_PREFERENCES: DomainType = [0x0d, 0x00, 0x00, 0x00];
+/// Domain for a `BuilderDepositRequest`'s `signature` (gloas).
+pub const DOMAIN_BUILDER_DEPOSIT: DomainType = [0x0e, 0x00, 0x00, 0x00];
 
 // ---------------------------------------------------------------------------
 // Participation flags and incentivization weights (altair)
@@ -354,6 +362,60 @@ pub const MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: u64 = 4096;
 /// neighbours have no use for.
 pub const MAXIMUM_GOSSIP_CLOCK_DISPARITY: u64 = 500;
 
+// ---------------------------------------------------------------------------
+// Gloas (EIP-7732, EIP-8282)
+// ---------------------------------------------------------------------------
+
+/// Set on a `ValidatorIndex` to mean a [`crate::beacon::containers::gloas::BuilderIndex`]
+/// instead, so one `Withdrawal` container can pay out to either a validator
+/// or a builder without a second, near-identical container.
+pub const BUILDER_INDEX_FLAG: u64 = 1 << 40;
+
+/// The builder index a proposer's own `ExecutionPayloadBid` carries when it
+/// is building its own payload rather than buying one from a registered
+/// builder.
+pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
+
+/// Numerator of the fraction of a bid's value a builder's payment must clear
+/// before `settle_builder_payment` pays it out in full rather than partially.
+pub const BUILDER_PAYMENT_THRESHOLD_NUMERATOR: u64 = 6;
+/// Denominator paired with [`BUILDER_PAYMENT_THRESHOLD_NUMERATOR`].
+pub const BUILDER_PAYMENT_THRESHOLD_DENOMINATOR: u64 = 10;
+
+/// The first byte of a builder's withdrawal credentials, `Validator`'s
+/// withdrawal-prefix family extended to builders.
+pub const BUILDER_WITHDRAWAL_PREFIX: u8 = 0xb0;
+
+/// The `Builder.version` an onboarded or newly deposited builder is given.
+/// Only one version exists so far; the field exists so a future format
+/// change has somewhere to record which shape a builder's record is in.
+pub const PAYLOAD_BUILDER_VERSION: u8 = 0;
+
+/// The first byte of an execution-layer request list entry (EIP-8282) that
+/// identifies it as a builder deposit request, continuing electra's
+/// `DEPOSIT_REQUEST_TYPE`/`WITHDRAWAL_REQUEST_TYPE`/`CONSOLIDATION_REQUEST_TYPE`
+/// sequence.
+pub const BUILDER_DEPOSIT_REQUEST_TYPE: u8 = 0x03;
+/// The first byte identifying an execution layer request as a builder exit
+/// request.
+pub const BUILDER_EXIT_REQUEST_TYPE: u8 = 0x04;
+
+/// Index into `store.block_timeliness[root]` for whether the block itself
+/// arrived before the (ordinary) attestation deadline: the one deadline every
+/// fork before gloas checked, and still what `is_head_late` reads. See
+/// [`PTC_TIMELINESS_INDEX`] for the other.
+pub const ATTESTATION_TIMELINESS_INDEX: usize = 0;
+
+/// Index into `store.block_timeliness[root]` for whether the block arrived
+/// before the payload timeliness committee's own, later deadline
+/// (`get_payload_attestation_due_ms`). `should_apply_proposer_boost`'s
+/// equivocation scan reads this index.
+pub const PTC_TIMELINESS_INDEX: usize = 1;
+
+/// How many deadlines `store.block_timeliness[root]` records against: the
+/// length every entry has, one slot per index above.
+pub const NUM_BLOCK_TIMELINESS_DEADLINES: usize = 2;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,6 +447,10 @@ mod tests {
             DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
             DOMAIN_CONTRIBUTION_AND_PROOF,
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            DOMAIN_BEACON_BUILDER,
+            DOMAIN_PTC_ATTESTER,
+            DOMAIN_PROPOSER_PREFERENCES,
+            DOMAIN_BUILDER_DEPOSIT,
         ] {
             let masked = [
                 domain[0] & DOMAIN_APPLICATION_MASK[0],

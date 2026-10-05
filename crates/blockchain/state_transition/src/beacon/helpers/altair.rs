@@ -40,6 +40,7 @@ use crate::beacon::containers::{BeaconState, altair};
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
 use crate::beacon::hash::hash;
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, Gwei, ParticipationFlags, ValidatorIndex};
 
@@ -157,7 +158,17 @@ pub fn get_next_sync_committee(state: &BeaconState) -> Result<altair::SyncCommit
         ForkName::Electra | ForkName::Fulu => {
             crate::beacon::helpers::electra::get_next_sync_committee_indices(state)?
         }
-        _ => get_next_sync_committee_indices(state)?,
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => get_next_sync_committee_indices(state)?,
+        // Modified in gloas (EIP-7732): the draw is
+        // `compute_balance_weighted_selection` rather than electra's inline
+        // rejection-sampling loop, though it keeps electra's effective-balance
+        // ceiling. See `crate::beacon::helpers::gloas`'s own module doc.
+        ForkName::Gloas => crate::beacon::helpers::gloas::get_next_sync_committee_indices(state)?,
+        ForkName::Lean => lean_state_unreachable("get_next_sync_committee"),
     };
     let mut pubkeys = Vec::with_capacity(indices.len());
     for index in &indices {
@@ -320,7 +331,7 @@ pub fn get_flag_index_deltas(
     state: &BeaconState,
     flag_index: usize,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let mut rewards = vec![0; validator_count];
     let mut penalties = vec![0; validator_count];
 
@@ -410,7 +421,7 @@ pub fn get_inactivity_penalty_deltas(
     state: &BeaconState,
     config: &Config,
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let rewards = vec![0; validator_count];
     let mut penalties = vec![0; validator_count];
 

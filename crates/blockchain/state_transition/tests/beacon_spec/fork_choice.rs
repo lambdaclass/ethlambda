@@ -4,11 +4,13 @@
 //! fork's modifications to it. Each case builds a [`Store`] from an anchor
 //! state and block via [`fork_choice::get_forkchoice_store`], then replays
 //! `steps.yaml` in order. A step is one of `tick`, `block`, `attestation`,
-//! `attester_slashing`, or `on_merge_block` (bellatrix's own `pow_block`
-//! step), driving the correspondingly named handler, or `checks`, which
-//! asserts on the store's own fields and on [`fork_choice::get_head`],
-//! [`fork_choice::get_proposer_head`], and
-//! [`fork_choice::should_override_forkchoice_update`]. See
+//! `attester_slashing`, `on_merge_block` (bellatrix's own `pow_block` step),
+//! or gloas's `execution_payload` and `payload_attestation_message`, driving
+//! the correspondingly named handler, or `checks`, which asserts on the
+//! store's own fields and on [`fork_choice::get_head`] and
+//! [`fork_choice::get_proposer_head`] (gloas adds the head's payload status,
+//! the two payload committee vote checks and the viable leaf weights). Each
+//! case runs against [`super::case_config`]. See
 //! `tests/formats/fork_choice/README.md` in the pinned specification checkout
 //! for the format in full.
 //!
@@ -23,13 +25,35 @@
 //! # A step's `valid: false` means the call must be rejected
 //!
 //! Matching [`super::check_transition`]'s rule for a missing `post` state,
-//! `valid: false` on a `block`, `attestation`, or `attester_slashing` step
-//! means the handler must return an error, and the store must be left exactly
-//! as it was; treating a should-fail call that happens to succeed as a pass
-//! would let this suite go green while checking nothing. `on_tick` cannot
-//! fail in this crate, nor in the specification (it has no assertion to
-//! fail), so a `tick` step asking for rejection is reported as a failure of
-//! this suite's own assumptions rather than silently accepted.
+//! `valid: false` on a `block`, `attestation`, `attester_slashing`,
+//! `execution_payload`, or `payload_attestation_message` step means the
+//! handler must return an error, and the store must be left exactly as it
+//! was; treating a should-fail call that happens to succeed as a pass would
+//! let this suite go green while checking nothing. `on_tick` cannot fail in
+//! this crate, nor in the specification (it has no assertion to fail), so a
+//! `tick` step asking for rejection is reported as a failure of this suite's
+//! own assumptions rather than silently accepted.
+//!
+//! # Gloas payload attestations are not replayed here
+//!
+//! The README has the harness expand a gloas block's `payload_attestations`
+//! into messages and apply them with `is_from_block` set.
+//! [`fork_choice::on_block`] already does that through `notify_ptc_messages`,
+//! so expanding them again in [`apply_block`] is redundant: writing the same
+//! vote a second time changes nothing.
+//!
+//! # `viable_for_head_roots_and_weights` is compared as a set
+//!
+//! The reference generator (`get_viable_for_head_checks` in
+//! `tests/core/pyspec/eth_consensus_specs/test/helpers/fork_choice.py`) walks
+//! from the justified root's PENDING node with a stack, through
+//! `get_node_children` over `get_filtered_block_tree`, and reports every leaf
+//! with its `get_weight` and payload status. [`check_viable_for_head`] does the
+//! same walk but compares `{root, weight, payload_status}` as an unordered set,
+//! since the order the fixture lists the leaves in is not reproducible here:
+//! `get_node_children` iterates a `HashMap`, while the generator walks dicts
+//! in insertion order.
+//! Only gloas cases name it; the walk needs gloas's payload-aware nodes.
 //!
 //! # An `on_block` step implies more than the README documents
 //!
@@ -60,11 +84,9 @@
 //!
 //! # Checks this runner does not model
 //!
-//! `viable_for_head_roots_and_weights` is part of the format, but no case at
-//! any implemented fork's `checks` step names it, on either preset, so it is
-//! not modeled here rather than guessed at. `should_override_forkchoice_update`
-//! *is* exercised, once per fork from bellatrix on, and [`apply_checks`]
-//! checks it.
+//! Every key of a `checks` step this runner models is a field of [`Checks`],
+//! which rejects unknown keys, so a check the runner does not model fails its
+//! case instead of being dropped without a word.
 //!
 //! # `columns: []` means "simulate unavailable", not "vacuously available"
 //!
@@ -102,12 +124,15 @@ use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, Checkpoint, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, fulu,
-    phase0,
+    gloas, phase0,
 };
-use ethlambda_state_transition::beacon::fork_choice::{self, DataAvailability, Store};
+use ethlambda_state_transition::beacon::fork_choice::{
+    self, DataAvailability, ForkChoiceNode, ForkRules, PayloadStatus, Store,
+};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::preset;
 use ethlambda_state_transition::beacon::primitives::{KzgProof, Root};
+use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use libssz::SszDecode;
 use libssz_types::SszList;
 use libtest_mimic::Trial;
@@ -120,15 +145,17 @@ use super::{Case, PRESET, collect_all_handlers, lean_is_not_a_fixture_fork};
 
 /// One entry of a case's `steps.yaml`.
 ///
-/// The format overlays six step kinds into one YAML sequence item: exactly
+/// The format overlays eight step kinds into one YAML sequence item: exactly
 /// one of [`Step::tick`], [`Step::block`], [`Step::attestation`],
-/// [`Step::attester_slashing`], and [`Step::pow_block`] is set for an
-/// execution step, or none of them for a [`Step::checks`] step. Modeled as
-/// one struct with every field optional, rather than a `#[serde(untagged)]`
-/// enum over five variants, because the four execution kinds that carry a
-/// validity outcome also share [`Step::valid`], which an enum would have to
-/// repeat on every variant instead of naming once.
+/// [`Step::attester_slashing`], [`Step::pow_block`],
+/// [`Step::execution_payload`], and [`Step::payload_attestation_message`] is
+/// set for an execution step, or none of them for a [`Step::checks`] step.
+/// Modeled as one struct with every field optional, rather than a
+/// `#[serde(untagged)]` enum over seven variants, because the execution kinds
+/// that carry a validity outcome also share [`Step::valid`], which an enum
+/// would have to repeat on every variant instead of naming once.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Step {
     /// The Unix-second time to advance the store to, for an `on_tick` step.
     tick: Option<u64>,
@@ -156,9 +183,16 @@ struct Step {
     /// an `on_merge_block` step adds to the store for later `get_pow_block`
     /// lookups.
     pow_block: Option<String>,
+    /// `[New in Gloas]` the `execution_payload_envelope_<root>` file naming the
+    /// envelope an `on_execution_payload_envelope` step delivers.
+    execution_payload: Option<String>,
+    /// `[New in Gloas]` the `payload_attestation_message_<root>` file naming
+    /// the message an `on_payload_attestation_message` step delivers.
+    payload_attestation_message: Option<String>,
     /// Whether this step's call is expected to succeed. Only `block`,
-    /// `attestation`, and `attester_slashing` steps carry `false` in any
-    /// released fixture, but the format allows it on any execution step.
+    /// `attestation`, `attester_slashing`, `execution_payload`, and
+    /// `payload_attestation_message` steps carry `false` in any released
+    /// fixture, but the format allows it on any execution step.
     #[serde(default = "default_valid")]
     valid: bool,
     /// The assertions to check against the current store.
@@ -173,9 +207,11 @@ fn default_valid() -> bool {
 
 /// A `checks` step's assertions against the store.
 ///
-/// See the module documentation for the one field of the format this leaves
-/// out, and why.
+/// Every field of the format's `checks` step is modeled, and unknown keys are
+/// rejected, so a key added to the format fails its case instead of being
+/// dropped.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Checks {
     time: Option<u64>,
     genesis_time: Option<u64>,
@@ -184,35 +220,53 @@ pub(super) struct Checks {
     finalized_checkpoint: Option<CheckpointCheck>,
     proposer_boost_root: Option<String>,
     get_proposer_head: Option<String>,
-    /// `[New in Bellatrix]` see
-    /// [`fork_choice::should_override_forkchoice_update`].
-    should_override_forkchoice_update: Option<ShouldOverrideForkchoiceUpdateCheck>,
+    /// `[New in Gloas]` the PTC's payload timeliness votes for one block.
+    payload_timeliness_vote: Option<VoteCheck>,
+    /// `[New in Gloas]` the PTC's blob data availability votes for one block.
+    payload_data_availability_vote: Option<VoteCheck>,
+    /// `[New in Gloas]` the payload-aware leaves of the filtered block tree,
+    /// with their weights, in the generator's own order.
+    viable_for_head_roots_and_weights: Option<Vec<ViableLeafCheck>>,
+}
+
+/// One leaf of `viable_for_head_roots_and_weights`.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ViableLeafCheck {
+    root: String,
+    weight: u64,
+    /// Required on purpose: only gloas cases name this check, so a
+    /// pre-gloas-shaped leaf without a payload status fails to parse.
+    payload_status: u8,
+}
+
+/// The expected votes of one block's payload committee, ordered by PTC
+/// position, with `null` for a position that has not voted.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoteCheck {
+    block_root: String,
+    votes: Vec<Option<bool>>,
 }
 
 /// The expected value of [`fork_choice::get_head`], as `checks.head` gives it:
 /// the root and, redundantly, the slot of the block it names.
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct HeadCheck {
     slot: u64,
     root: String,
+    /// `[New in Gloas]` the head node's payload status, as its discriminant.
+    payload_status: Option<u8>,
 }
 
 /// The expected value of a checkpoint field (`justified_checkpoint` or
 /// `finalized_checkpoint`).
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CheckpointCheck {
     epoch: u64,
     root: String,
-}
-
-/// The expected value of
-/// [`fork_choice::should_override_forkchoice_update`]: the fixed
-/// `validator_is_connected` answer to call it with, and the result it must
-/// then return.
-#[derive(serde::Deserialize)]
-struct ShouldOverrideForkchoiceUpdateCheck {
-    validator_is_connected: bool,
-    result: bool,
 }
 
 /// Parses a fixture's `0x`-prefixed hex root.
@@ -287,6 +341,10 @@ pub(super) fn decode_anchor_block(case: &Case) -> Result<SignedBeaconBlock, Stri
             message: decode(case, "anchor_block")?,
             signature: Default::default(),
         })),
+        ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+            message: decode(case, "anchor_block")?,
+            signature: Default::default(),
+        })),
         ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
@@ -309,7 +367,13 @@ fn decode_attestation(case: &Case, name: &str) -> Result<fork_choice::Attestatio
         ForkName::Electra | ForkName::Fulu => {
             Ok(fork_choice::Attestation::Electra(decode(case, name)?))
         }
-        _ => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(fork_choice::Attestation::Phase0(decode(case, name)?)),
+        ForkName::Gloas => Ok(fork_choice::Attestation::Gloas(decode(case, name)?)),
+        ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
 
@@ -323,7 +387,13 @@ fn decode_attester_slashing(
         ForkName::Electra | ForkName::Fulu => {
             Ok(fork_choice::AttesterSlashing::Electra(decode(case, name)?))
         }
-        _ => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Ok(fork_choice::AttesterSlashing::Phase0(decode(case, name)?)),
+        ForkName::Gloas => Ok(fork_choice::AttesterSlashing::Gloas(decode(case, name)?)),
+        ForkName::Lean => lean_is_not_a_fixture_fork("fork_choice"),
     }
 }
 
@@ -459,9 +529,27 @@ fn apply_block(
     Ok(())
 }
 
+/// Turns a handler's outcome into a step's verdict: `valid: true` needs `Ok`,
+/// `valid: false` needs `Err`, and either mismatch names the file.
+fn expect_outcome<E: std::fmt::Debug>(
+    name: &str,
+    outcome: Result<(), E>,
+    valid: bool,
+) -> Result<(), String> {
+    match (outcome, valid) {
+        (Ok(()), false) => Err(format!(
+            "{name} was accepted, but the step expects it to be rejected"
+        )),
+        (Err(err), true) => Err(format!("{name} was rejected: {err:?}")),
+        (Ok(()), true) | (Err(_), false) => Ok(()),
+    }
+}
+
 /// Applies one non-`checks` execution step, dispatching on which of
 /// [`Step::tick`], [`Step::block`], [`Step::attestation`],
-/// [`Step::attester_slashing`], or [`Step::pow_block`] is set.
+/// [`Step::attester_slashing`], [`Step::pow_block`],
+/// [`Step::execution_payload`], or [`Step::payload_attestation_message`] is
+/// set.
 fn apply_execution_step(
     store: &mut Store,
     case: &Case,
@@ -490,30 +578,20 @@ fn apply_execution_step(
 
     if let Some(name) = &step.attestation {
         let attestation = decode_attestation(case, name)?;
-        return match (
+        return expect_outcome(
+            name,
             fork_choice::on_attestation(store, &attestation, false, config, committees),
             step.valid,
-        ) {
-            (Ok(()), false) => Err(format!(
-                "{name} was accepted, but the step expects it to be rejected"
-            )),
-            (Err(err), true) => Err(format!("{name} was rejected: {err:?}")),
-            _ => Ok(()),
-        };
+        );
     }
 
     if let Some(name) = &step.attester_slashing {
         let attester_slashing = decode_attester_slashing(case, name)?;
-        return match (
+        return expect_outcome(
+            name,
             fork_choice::on_attester_slashing(store, &attester_slashing),
             step.valid,
-        ) {
-            (Ok(()), false) => Err(format!(
-                "{name} was accepted, but the step expects it to be rejected"
-            )),
-            (Err(err), true) => Err(format!("{name} was rejected: {err:?}")),
-            _ => Ok(()),
-        };
+        );
     }
 
     if let Some(name) = &step.pow_block {
@@ -526,8 +604,35 @@ fn apply_execution_step(
         return Ok(());
     }
 
+    if let Some(name) = &step.execution_payload {
+        let signed_envelope: gloas::SignedExecutionPayloadEnvelope = decode(case, name)?;
+        // The format names no sampled columns for this step, so the evidence
+        // is the empty retrieval, which reads as available.
+        return expect_outcome(
+            name,
+            fork_choice::on_execution_payload_envelope(
+                store,
+                &signed_envelope,
+                config,
+                &[],
+                &ExecutionEngine::valid(),
+            ),
+            step.valid,
+        );
+    }
+
+    if let Some(name) = &step.payload_attestation_message {
+        let ptc_message: gloas::PayloadAttestationMessage = decode(case, name)?;
+        return expect_outcome(
+            name,
+            fork_choice::on_payload_attestation_message(store, &ptc_message, false, config),
+            step.valid,
+        );
+    }
+
     Err(
-        "step has none of tick, block, attestation, attester_slashing, or pow_block set"
+        "step has none of tick, block, attestation, attester_slashing, pow_block, \
+         execution_payload, or payload_attestation_message set"
             .to_string(),
     )
 }
@@ -583,12 +688,91 @@ fn check_checkpoint(
     }
 }
 
+/// Checks that the node's head computation ([`fork_choice::get_head_node`], the
+/// one bottom-up walk) names the same node as the spec-literal reference for
+/// the current slot's fork: [`fork_choice::gloas_get_head`] from
+/// `GLOAS_FORK_EPOCH` on, the pre-gloas [`fork_choice::compute_head`] (reported
+/// as a full node) before it. Run at every `head` check, so every step of every
+/// fixture is also a differential test of the walk.
+fn check_head_against_reference(store: &Store, config: &Config) -> Result<(), String> {
+    let walked = fork_choice::get_head_node(store, config)
+        .map_err(|err| format!("get_head_node: {err:?}"))?;
+    let current_slot = fork_choice::get_current_slot(store, config);
+    let fork = config.fork_at_epoch(current_slot / preset::SLOTS_PER_EPOCH);
+    let reference = match ForkRules::of(fork) {
+        ForkRules::Gloas => {
+            let committees = store.committee_cache();
+            fork_choice::gloas_get_head(store, config, &committees)
+                .map_err(|err| format!("reference gloas_get_head: {err:?}"))?
+        }
+        ForkRules::PreGloas => {
+            let index = store.block_index();
+            let root = fork_choice::compute_head(store, &index, config)
+                .map_err(|err| format!("reference compute_head: {err:?}"))?;
+            ForkChoiceNode {
+                root,
+                payload_status: PayloadStatus::Full,
+            }
+        }
+    };
+    if walked == reference {
+        Ok(())
+    } else {
+        Err(format!(
+            "the bottom-up walk chose 0x{} ({:?}) but the reference chose 0x{} ({:?})",
+            hex::encode(walked.root.0),
+            walked.payload_status,
+            hex::encode(reference.root.0),
+            reference.payload_status,
+        ))
+    }
+}
+
+/// Checks that every payload link `on_block` recorded is what decoding the block
+/// and its parent gives: the walk reads the link instead of the blocks.
+fn check_payload_links(store: &Store) -> Result<(), String> {
+    for root in store.block_index().into_keys() {
+        let Some(link) = store.payload_link(&root) else {
+            continue;
+        };
+        let block = store
+            .get_signed_block(&root)
+            .expect("get")
+            .ok_or("a linked block is missing from the store")?;
+        let is_gloas = match ForkRules::of(block.fork_name()) {
+            ForkRules::Gloas => true,
+            ForkRules::PreGloas => false,
+        };
+        if link.is_gloas() != is_gloas {
+            return Err(format!(
+                "payload link of 0x{} has the wrong fork",
+                hex::encode(root.0)
+            ));
+        }
+        if let Some(parent_status) = link.parent_status()
+            && store.has_block(&block.parent_root())
+        {
+            let expected = fork_choice::get_parent_payload_status(store, &block)
+                .map_err(|err| format!("get_parent_payload_status: {err:?}"))?;
+            if parent_status != expected {
+                return Err(format!(
+                    "payload link of 0x{} says {parent_status:?}, the blocks say {expected:?}",
+                    hex::encode(root.0)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Checks `head` against [`fork_choice::get_head`]'s root, and that root's
 /// slot (read through [`fork_choice::get_forkchoice_store`]'s store) against
 /// the fixture's redundant `slot` field.
 fn check_head(expected: &HeadCheck, store: &mut Store, config: &Config) -> Result<(), String> {
     let actual_root =
         fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
+    check_head_against_reference(store, config)?;
+    check_payload_links(store)?;
     let actual_slot = store
         .get_signed_block(&actual_root)
         .expect("get")
@@ -601,16 +785,26 @@ fn check_head(expected: &HeadCheck, store: &mut Store, config: &Config) -> Resul
         })?;
 
     let expected_root = parse_root(&expected.root);
-    if actual_root == expected_root && actual_slot == expected.slot {
-        Ok(())
-    } else {
-        Err(format!(
+    if actual_root != expected_root || actual_slot != expected.slot {
+        return Err(format!(
             "head: expected {{slot: {}, root: 0x{}}}, got {{slot: {actual_slot}, root: 0x{}}}",
             expected.slot,
             hex::encode(expected_root.0),
             hex::encode(actual_root.0),
-        ))
+        ));
     }
+    if let Some(expected_status) = expected.payload_status {
+        let node = fork_choice::get_head_node(store, config)
+            .map_err(|err| format!("get_head_node: {err:?}"))?;
+        if node.payload_status as u8 != expected_status {
+            return Err(format!(
+                "head payload_status: expected {expected_status}, got {} (head 0x{})",
+                node.payload_status as u8,
+                hex::encode(node.root.0)
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Checks `get_proposer_head`, computed the same way the reference test
@@ -620,39 +814,114 @@ fn check_get_proposer_head(
     expected_hex: &str,
     store: &mut Store,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
     let slot = fork_choice::get_current_slot(store, config);
-    let actual = fork_choice::get_proposer_head(store, head, slot, config)
+    let actual = fork_choice::get_proposer_head(store, head, slot, config, committees)
         .map_err(|err| format!("get_proposer_head: {err:?}"))?;
     check_root("get_proposer_head", expected_hex, actual)
 }
 
-/// Checks `should_override_forkchoice_update`, the same way
-/// [`check_get_proposer_head`] checks `get_proposer_head`: from the current
-/// head, not a root the fixture supplies separately. `validator_is_connected`
-/// is a fixed answer regardless of which proposer index is asked, matching
-/// what the fixture format itself supplies: one bool for the whole call, not
-/// a per-validator registry.
-fn check_should_override_forkchoice_update(
-    expected: &ShouldOverrideForkchoiceUpdateCheck,
-    store: &mut Store,
-    config: &Config,
+/// Checks one of the two PTC vote fields (`payload_timeliness_vote` or
+/// `payload_data_availability_vote`) against the store's votes for the named
+/// block, position by position.
+fn check_votes(
+    label: &str,
+    expected: &VoteCheck,
+    actual: Option<Vec<Option<bool>>>,
 ) -> Result<(), String> {
-    let head = fork_choice::get_head(store, config).map_err(|err| format!("get_head: {err:?}"))?;
-    let actual = fork_choice::should_override_forkchoice_update(
-        store,
-        head,
-        |_| expected.validator_is_connected,
-        config,
-    )
-    .map_err(|err| format!("should_override_forkchoice_update: {err:?}"))?;
-    if actual == expected.result {
+    let block_root = parse_root(&expected.block_root);
+    let actual =
+        actual.ok_or_else(|| format!("{label}: no votes for 0x{}", hex::encode(block_root.0)))?;
+    if actual == expected.votes {
         Ok(())
     } else {
         Err(format!(
-            "should_override_forkchoice_update: expected {}, got {actual}",
-            expected.result
+            "{label} for 0x{}: expected {:?}, got {actual:?}",
+            hex::encode(block_root.0),
+            expected.votes
+        ))
+    }
+}
+
+/// Checks `viable_for_head_roots_and_weights`: the leaves of the payload-aware
+/// tree under the justified root, each with its weight and payload status.
+///
+/// See the module documentation for why the comparison ignores order.
+fn check_viable_for_head(
+    expected: &[ViableLeafCheck],
+    store: &Store,
+    config: &Config,
+    committees: &CommitteeCache,
+) -> Result<(), String> {
+    let index = store.block_index();
+    let blocks = fork_choice::get_filtered_block_tree(store, &index, config).map_err(|err| {
+        format!("viable_for_head_roots_and_weights: get_filtered_block_tree: {err:?}")
+    })?;
+    let mut pending = vec![ForkChoiceNode {
+        root: store.beacon_justified_checkpoint().root,
+        payload_status: PayloadStatus::Pending,
+    }];
+    let mut actual: Vec<(Root, u64, u8)> = Vec::new();
+    // The bottom-up table the node's head computation weighs with, checked
+    // against the spec-literal weight at every leaf. This check only runs in
+    // gloas cases, so the current slot's rules are gloas's.
+    let walked_weights = fork_choice::compute_node_weights(
+        store,
+        &index,
+        config,
+        committees,
+        fork_choice::ForkRules::Gloas,
+    )
+    .map_err(|err| format!("viable_for_head_roots_and_weights: compute_node_weights: {err:?}"))?;
+    while let Some(node) = pending.pop() {
+        let children = fork_choice::get_node_children(store, &blocks, node).map_err(|err| {
+            format!("viable_for_head_roots_and_weights: get_node_children: {err:?}")
+        })?;
+        if children.is_empty() {
+            let weight = fork_choice::gloas_get_weight(store, node, config, committees)
+                .map_err(|err| format!("viable_for_head_roots_and_weights: get_weight: {err:?}"))?;
+            let block_slot = index
+                .get(&node.root)
+                .map(|&(slot, _)| slot)
+                .ok_or("viable_for_head_roots_and_weights: a leaf is not in the block index")?;
+            let walked = walked_weights.weight(node, block_slot);
+            if walked != weight {
+                return Err(format!(
+                    "viable_for_head_roots_and_weights: the bottom-up weight of 0x{} ({}) is {walked}, \
+                     the reference is {weight}",
+                    hex::encode(node.root.0),
+                    node.payload_status as u8,
+                ));
+            }
+            actual.push((node.root, weight, node.payload_status as u8));
+        } else {
+            pending.extend(children);
+        }
+    }
+    let mut expected: Vec<(Root, u64, u8)> = expected
+        .iter()
+        .map(|leaf| (parse_root(&leaf.root), leaf.weight, leaf.payload_status))
+        .collect();
+    expected.sort();
+    actual.sort();
+    if actual == expected {
+        Ok(())
+    } else {
+        let show = |leaves: &[(Root, u64, u8)]| {
+            leaves
+                .iter()
+                .map(|(root, weight, status)| {
+                    format!("{{0x{}, {weight}, {status}}}", hex::encode(root.0))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Err(format!(
+            "viable_for_head_roots_and_weights: expected [{}], got [{}]",
+            show(&expected),
+            show(&actual)
         ))
     }
 }
@@ -662,6 +931,7 @@ pub(super) fn apply_checks(
     store: &mut Store,
     checks: &Checks,
     config: &Config,
+    committees: &CommitteeCache,
 ) -> Result<(), String> {
     if let Some(expected) = checks.time {
         // The fixture's `time` is the specification's seconds; the store keeps
@@ -692,11 +962,19 @@ pub(super) fn apply_checks(
     if let Some(expected) = &checks.head {
         check_head(expected, store, config)?;
     }
-    if let Some(expected) = &checks.get_proposer_head {
-        check_get_proposer_head(expected, store, config)?;
+    if let Some(expected) = &checks.payload_timeliness_vote {
+        let actual = store.payload_timeliness_vote(&parse_root(&expected.block_root));
+        check_votes("payload_timeliness_vote", expected, actual)?;
     }
-    if let Some(expected) = &checks.should_override_forkchoice_update {
-        check_should_override_forkchoice_update(expected, store, config)?;
+    if let Some(expected) = &checks.payload_data_availability_vote {
+        let actual = store.payload_data_availability_vote(&parse_root(&expected.block_root));
+        check_votes("payload_data_availability_vote", expected, actual)?;
+    }
+    if let Some(expected) = &checks.viable_for_head_roots_and_weights {
+        check_viable_for_head(expected, store, config, committees)?;
+    }
+    if let Some(expected) = &checks.get_proposer_head {
+        check_get_proposer_head(expected, store, config, committees)?;
     }
     Ok(())
 }
@@ -734,7 +1012,7 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
     let steps: Vec<Step> = case.yaml("steps");
     for (index, step) in steps.iter().enumerate() {
         let outcome = match &step.checks {
-            Some(checks) => apply_checks(&mut store, checks, config),
+            Some(checks) => apply_checks(&mut store, checks, config, &committees),
             None => apply_execution_step(&mut store, case, step, config, &committees),
         };
         outcome.map_err(|err| format!("step {index}: {err}"))?;
@@ -747,14 +1025,12 @@ fn run_case(case: &Case, config: &Config) -> Result<(), String> {
 /// case in this suite runs through [`run_case`] the same way regardless of
 /// which handler it came from, unlike `ssz_static`, which dispatches on it.
 pub fn trials() -> Vec<Trial> {
-    let config = Arc::new(Config::active());
     let cases = collect_all_handlers(PRESET, "fork_choice");
     let mut trials = vec![super::discovery_trial("fork_choice", cases.len())];
 
     for (_handler, case) in cases {
-        let config = Arc::clone(&config);
-        trials.push(super::case_trial("fork_choice", case, move |case| {
-            run_case(case, &config)
+        trials.push(super::case_trial("fork_choice", case, |case| {
+            run_case(case, &super::case_config(case))
         }));
     }
 

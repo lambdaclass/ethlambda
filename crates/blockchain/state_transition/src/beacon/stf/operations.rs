@@ -36,13 +36,14 @@ use crate::beacon::helpers::mutators::{
 use crate::beacon::helpers::predicates::{
     is_active_validator, is_slashable_attestation_data, is_slashable_validator,
 };
+use crate::beacon::lean_state_unreachable;
 use crate::beacon::preset;
-use crate::beacon::primitives::{Gwei, HashTreeRoot as _, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, Gwei, HashTreeRoot as _, ValidatorIndex};
 
 /// Runs every operation in a block, in the specification's order.
 ///
 /// Takes each operation list as a slice rather than a whole body, which is
-/// what lets this one function serve every fork through deneb even though
+/// what lets this one function serve every fork through capella even though
 /// their body types are all distinct: nothing here needs to know what else a
 /// fork's body carries alongside these five lists. Capella's body adds a sixth
 /// list (BLS-to-execution changes), and electra reshapes the attestation types
@@ -73,6 +74,31 @@ pub fn process_operations(
     config: &Config,
     committees: &CommitteeCache,
 ) -> Result<()> {
+    // Checked before anything below can mutate `state`, and unconditionally
+    // rather than only when `attestations` is non-empty: a refused fork must
+    // not be able to slip an all-empty attestation list past this check and
+    // have its proposer- and attester-slashings run anyway.
+    //
+    // Deneb never reaches here: it has its own `process_operations`
+    // (`deneb.rs`), which calls its own `process_attestation` for this loop
+    // instead of this shared one. Electra and fulu each have their own
+    // `process_operations` too (`electra.rs` and `fulu.rs` respectively), and
+    // gloas will need one of its own as well (its bodies carry progressive
+    // attestations and slashings, plus the payload-attestation and
+    // builder-registry operations this signature has no parameters for), so
+    // all four are refused rather than guessed at.
+    let altair_attestations = match state.fork_name() {
+        ForkName::Phase0 => false,
+        ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => true,
+        fork @ (ForkName::Deneb | ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+            return Err(Error::UnsupportedForFork {
+                function: "process_operations",
+                fork,
+            });
+        }
+        ForkName::Lean => lean_state_unreachable("process_operations"),
+    };
+
     // `eth1_deposit_index` only ever advances by one per processed deposit,
     // and `deposit_count` only ever grows, so in a correctly-derived state the
     // index never exceeds the count. Nothing here re-derives that invariant,
@@ -98,18 +124,18 @@ pub fn process_operations(
     }
     for attestation in attestations {
         // Phase0 defers an attestation's reward to the epoch boundary, so it
-        // needs its own version of this step (below); altair scores one the
-        // moment it is processed instead, and nothing about that changed
-        // through deneb, so every later fork this signature serves shares
-        // altair's version rather than getting one of its own. This is the
-        // same coexisting-by-fork pattern `crate::beacon::helpers::altair` and
+        // needs its own version of this step; altair scores one the moment
+        // it is processed instead, and nothing about that changed through
+        // capella, so every later fork this signature serves shares altair's
+        // version rather than getting one of its own. This is the same
+        // coexisting-by-fork pattern `crate::beacon::helpers::altair` and
         // `crate::beacon::stf::epoch::rewards` already use for the two
         // `get_base_reward` implementations: neither is renamed, and the call
         // site picks between them by fully-qualified path.
-        if state.fork_name() == ForkName::Phase0 {
-            process_attestation(state, attestation, config, committees)?;
-        } else {
+        if altair_attestations {
             crate::beacon::stf::altair::process_attestation(state, attestation, committees)?;
+        } else {
+            process_attestation(state, attestation, config, committees)?;
         }
     }
     for deposit in deposits {
@@ -126,17 +152,26 @@ pub fn process_operations(
 // Proposer slashings
 // ---------------------------------------------------------------------------
 
-/// Slashes a proposer caught signing two different headers for the same slot.
+/// Checks a proposer slashing's evidence without slashing anyone: the two
+/// headers agree on slot and proposer, differ from each other, name a
+/// still-slashable proposer, and both signatures check out.
+///
+/// Shared between phase0's own [`process_proposer_slashing`] below and
+/// `crate::beacon::stf::gloas::process_proposer_slashing`: gloas's own
+/// specification modifies the function (EIP-7732: it also clears a
+/// `BuilderPendingPayment`), but not this prologue, which the two share line
+/// for line. Returns the slashed proposer's index and the state's current
+/// epoch, both of which gloas's own caller also needs for its own
+/// payment-window check, so neither has to be recomputed.
 ///
 /// The two headers must actually differ: a proposer can be asked to co-sign
 /// the same header twice (by different requesters, or the same one twice),
 /// and that is not evidence of anything. Only a genuine equivocation, two
 /// distinct headers for the one slot, is slashable.
-pub fn process_proposer_slashing(
-    state: &mut BeaconState,
+pub(crate) fn verify_proposer_slashing(
+    state: &BeaconState,
     proposer_slashing: &ProposerSlashing,
-    config: &Config,
-) -> Result<()> {
+) -> Result<(ValidatorIndex, Epoch)> {
     let header_1 = &proposer_slashing.signed_header_1.message;
     let header_2 = &proposer_slashing.signed_header_2.message;
 
@@ -175,6 +210,18 @@ pub fn process_proposer_slashing(
         )?;
     }
 
+    Ok((proposer_index, current_epoch))
+}
+
+/// Slashes a proposer caught signing two different headers for the same
+/// slot. See [`verify_proposer_slashing`] for the shared prologue this
+/// delegates to.
+pub fn process_proposer_slashing(
+    state: &mut BeaconState,
+    proposer_slashing: &ProposerSlashing,
+    config: &Config,
+) -> Result<()> {
+    let (proposer_index, _current_epoch) = verify_proposer_slashing(state, proposer_slashing)?;
     slash_validator(state, proposer_index, None, config)?;
     Ok(())
 }
@@ -183,17 +230,61 @@ pub fn process_proposer_slashing(
 // Attester slashings
 // ---------------------------------------------------------------------------
 
-/// Slashes every slashable validator in the overlap of two conflicting
-/// attestations' attesting sets.
+/// Slashes every slashable validator in the overlap of two attesting index
+/// sets, given each attestation's own already-verified indices.
+///
+/// The shared tail of `process_attester_slashing`, unchanged across every
+/// fork that has its own copy (phase0's below, electra's and gloas's own):
+/// what differs between them is only the prologue above this, validating an
+/// indexed attestation against that fork's own container type
+/// (`is_valid_indexed_attestation`). Once both are valid, this walk needs
+/// nothing fork-specific, only the two already-sorted, already-deduplicated
+/// index slices.
 ///
 /// The two indexed attestations must each be independently valid (sorted,
 /// unique, unslashed-signature-correct) before their overlap means anything:
-/// evidence built from a forged or malformed attestation proves nothing.
-/// It is not enough for the overlap to be non-empty either. If every
-/// validator in it has already been slashed (and so is past
+/// evidence built from a forged or malformed attestation proves nothing. It
+/// is not enough for the overlap to be non-empty either. If every validator
+/// in it has already been slashed (and so is past
 /// [`is_slashable_validator`]'s reach) or has already withdrawn, the
 /// operation has no effect and including it would let a block waste space
 /// (or, worse, let a proposer replay old evidence) for free.
+///
+/// `attesting_indices_1` walked in order while filtering by membership in
+/// `attesting_indices_2`'s set yields the intersection already sorted,
+/// matching the specification's `sorted(indices)` without a separate sort:
+/// `is_valid_indexed_attestation` already required both to be sorted and
+/// unique before either reaches here.
+pub(crate) fn slash_attesting_index_intersection(
+    state: &mut BeaconState,
+    attesting_indices_1: &[ValidatorIndex],
+    attesting_indices_2: &[ValidatorIndex],
+    config: &Config,
+) -> Result<()> {
+    let current_epoch = get_current_epoch(state);
+    let indices_2: HashSet<ValidatorIndex> = attesting_indices_2.iter().copied().collect();
+
+    let mut slashed_any = false;
+    for &index in attesting_indices_1 {
+        if !indices_2.contains(&index) {
+            continue;
+        }
+        if is_slashable_validator(state.validator(index)?, current_epoch) {
+            slash_validator(state, index, None, config)?;
+            slashed_any = true;
+        }
+    }
+    verify(
+        slashed_any,
+        "at least one validator in the intersection of the two attesting index sets was slashed",
+    )?;
+    Ok(())
+}
+
+/// Slashes every slashable validator in the overlap of two conflicting
+/// attestations' attesting sets. See [`slash_attesting_index_intersection`]
+/// for the shared walk this delegates to once both indexed attestations
+/// check out against phase0's own container type.
 pub fn process_attester_slashing(
     state: &mut BeaconState,
     attester_slashing: &phase0::AttesterSlashing,
@@ -215,30 +306,12 @@ pub fn process_attester_slashing(
         "is_valid_indexed_attestation(state, attestation_2)",
     )?;
 
-    let current_epoch = get_current_epoch(state);
-    // `is_valid_indexed_attestation` already required both index lists to be
-    // sorted and unique, so walking `attestation_1`'s list in order while
-    // filtering by membership in `attestation_2`'s set yields the
-    // intersection already sorted, matching the specification's
-    // `sorted(indices)` without a separate sort.
-    let indices_2: HashSet<ValidatorIndex> =
-        attestation_2.attesting_indices.iter().copied().collect();
-
-    let mut slashed_any = false;
-    for &index in attestation_1.attesting_indices.iter() {
-        if !indices_2.contains(&index) {
-            continue;
-        }
-        if is_slashable_validator(state.validator(index)?, current_epoch) {
-            slash_validator(state, index, None, config)?;
-            slashed_any = true;
-        }
-    }
-    verify(
-        slashed_any,
-        "at least one validator in the intersection of the two attesting index sets was slashed",
-    )?;
-    Ok(())
+    slash_attesting_index_intersection(
+        state,
+        &attestation_1.attesting_indices,
+        &attestation_2.attesting_indices,
+        config,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -394,24 +467,47 @@ pub fn get_validator_from_deposit(
 /// symptom.
 ///
 /// Electra replaces this function outright, since a deposit there is queued
-/// rather than credited, so `crate::beacon::stf::electra` has its own; this one serves
-/// phase0 through deneb. The altair branch still covers every later fork
-/// anyway, because being conservative here costs nothing and a silent
-/// length mismatch costs a great deal.
+/// rather than credited, so `crate::beacon::stf::electra` has its own
+/// (`electra::add_validator_to_registry`); this one serves phase0 through
+/// deneb (deneb reaches it through this module's own [`process_deposit`],
+/// which every fork through deneb calls, even the fork that no longer calls
+/// [`process_operations`] for the rest of a block's operations). Electra and
+/// fulu are refused rather than folded into the altair branch: pushing the
+/// three altair-onward lists the way altair through deneb do would be the
+/// wrong answer for either even setting reachability aside, since electra
+/// queues a deposit instead of crediting it through this function at all.
 pub fn add_validator_to_registry(
     state: &mut BeaconState,
     pubkey: crate::beacon::primitives::BlsPubkey,
     withdrawal_credentials: crate::beacon::primitives::Bytes32,
     amount: Gwei,
 ) -> Result<()> {
-    state.validators_mut().push(get_validator_from_deposit(
-        pubkey,
-        withdrawal_credentials,
-        amount,
-    ))?;
-    state.balances_mut().push(amount)?;
+    // Checked before either list is touched, so a refused fork leaves the
+    // state exactly as it found it rather than half-applying a mutation the
+    // caller's `?` then discards.
+    let grows_altair_lists = match state.fork_name() {
+        ForkName::Phase0 => false,
+        ForkName::Altair | ForkName::Bellatrix | ForkName::Capella | ForkName::Deneb => true,
+        // Gloas queues deposits the way electra does (see the pending-deposit
+        // queue in `containers::gloas`), and its three altair-onward lists
+        // are progressive rather than `SszList` (see `BeaconState::altair_validator_lists`'s
+        // own documentation), so it is refused for both reasons rather than
+        // folded into either branch above.
+        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+            return Err(Error::UnsupportedForFork {
+                function: "add_validator_to_registry",
+                fork,
+            });
+        }
+        ForkName::Lean => lean_state_unreachable("add_validator_to_registry"),
+    };
 
-    if state.fork_name() >= ForkName::Altair {
+    state.push_validator(
+        get_validator_from_deposit(pubkey, withdrawal_credentials, amount),
+        amount,
+    )?;
+
+    if grows_altair_lists {
         let (previous, current, scores) = state.altair_validator_lists_mut()?;
         previous.push(0)?;
         current.push(0)?;
@@ -444,8 +540,7 @@ pub fn apply_deposit(
     config: &Config,
 ) -> Result<()> {
     let existing_index = state
-        .validators()
-        .iter()
+        .iter_validators()
         .position(|validator| validator.pubkey == pubkey);
 
     match existing_index {

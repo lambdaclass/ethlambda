@@ -13,8 +13,6 @@
 //! Unlike the `operations` suite, these run the full [`state_transition`], so
 //! they check the proposer signature and the committed `state_root` too.
 
-use std::sync::Arc;
-
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{BeaconState, SignedBeaconBlock};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
@@ -80,15 +78,14 @@ fn apply_slots(case: &Case, state: &mut BeaconState, config: &Config) -> Result<
 
 /// Builds one runner and handler pair's trials, since all four share this shape.
 fn run(runner: &str, handler: &str, slots: bool) -> Vec<Trial> {
-    let config = Arc::new(Config::active());
     let cases = collect(PRESET, runner, handler);
     let mut trials = vec![super::discovery_trial(runner, cases.len())];
 
     for case in cases {
-        let config = Arc::clone(&config);
         trials.push(super::case_trial(runner, case, move |case| {
             let mut state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("pre"))
                 .map_err(|err| format!("the fixture's pre-state does not decode: {err:?}"))?;
+            let config = super::case_config(case);
 
             let outcome = if slots {
                 apply_slots(case, &mut state, &config)
