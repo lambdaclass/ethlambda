@@ -75,6 +75,7 @@ pub mod bls;
 pub mod das;
 pub mod fork_choice;
 pub mod genesis;
+pub mod gloas_block_production;
 pub mod gossip;
 pub mod hash;
 pub mod helpers;
