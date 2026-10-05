@@ -497,7 +497,7 @@ pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
 ///
 /// The specification lets a vote on an unseen envelope be queued and asks the
 /// node to request it by root; neither is done here, so it is an `IGNORE`.
-pub(crate) fn verify_attestation_payload_status(
+pub fn verify_attestation_payload_status(
     store: &Store,
     data: &AttestationData,
 ) -> Result<(), Outcome> {
