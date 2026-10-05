@@ -4,7 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use lru::LruCache;
 
-use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
+use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 
@@ -779,11 +779,10 @@ fn decode_beacon_block_value(bytes: &[u8]) -> SignedBeaconBlock {
 /// enforced by having exactly one caller rather than by a runtime check.
 pub(crate) fn beacon_block_slot(backend: &dyn StorageBackend, root: &H256) -> Option<u64> {
     let view = backend.begin_read().expect("read view");
-    let bytes = view
-        .get(Table::BlockHeaders, &root.to_ssz())
-        .expect("get")?;
-    drop(view);
-    Some(decode_beacon_block_value(&bytes).slot())
+    view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+        decode_beacon_block_value(bytes).slot()
+    })
+    .expect("read")
 }
 
 /// Fork choice store backed by a pluggable storage backend.
@@ -982,14 +981,17 @@ impl Store {
             // Written by both `init_store` and `init_beacon`, so a backend
             // missing this has never held a chain of either kind.
             let view = backend.begin_read().expect("read view");
+            // Kept as raw bytes: it may only be decoded once the version and
+            // preset checks below have passed.
             let Some(bytes) = view.get(Table::Metadata, KEY_CONFIG).expect("get config") else {
                 return Ok(None);
             };
 
             let found = view
-                .get(Table::Metadata, KEY_DB_VERSION)
-                .expect("get db version")
-                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid db version"))
+                .read_with(Table::Metadata, KEY_DB_VERSION, |bytes| {
+                    u64::from_ssz_bytes(bytes).expect("valid db version")
+                })
+                .expect("read db version")
                 .unwrap_or(0);
             if found != DB_VERSION {
                 return Err(Error::DbVersionMismatch {
@@ -1004,9 +1006,9 @@ impl Store {
             // shapes back. The version check above cannot stand in for this,
             // since both presets write the same *layout* at the same version.
             let found_preset = view
-                .get(Table::Metadata, KEY_PRESET)
-                .expect("get preset")
-                .and_then(|bytes| bytes.first().copied())
+                .read_with(Table::Metadata, KEY_PRESET, |bytes| bytes.first().copied())
+                .expect("read preset")
+                .flatten()
                 .and_then(Preset::from_selector);
             if found_preset != Some(Preset::ACTIVE) {
                 return Err(Error::PresetMismatch {
@@ -1016,9 +1018,9 @@ impl Store {
             }
 
             let chain = view
-                .get(Table::Metadata, KEY_CHAIN)
-                .expect("get chain")
-                .and_then(|bytes| bytes.first().copied())
+                .read_with(Table::Metadata, KEY_CHAIN, |bytes| bytes.first().copied())
+                .expect("read chain")
+                .flatten()
                 .and_then(Chain::from_selector)
                 .expect("a versioned directory always carries a chain tag");
 
@@ -1026,9 +1028,10 @@ impl Store {
             // already turned away every directory written before they did, so
             // an absent key here is not an old directory but a corrupt one.
             let anchor_slot = view
-                .get(Table::Metadata, KEY_ANCHOR_SLOT)
-                .expect("get anchor slot")
-                .map(|bytes| u64::from_ssz_bytes(&bytes).expect("valid anchor slot"))
+                .read_with(Table::Metadata, KEY_ANCHOR_SLOT, |bytes| {
+                    u64::from_ssz_bytes(bytes).expect("valid anchor slot")
+                })
+                .expect("read anchor slot")
                 .expect("a versioned directory always carries an anchor slot");
 
             (
@@ -1527,17 +1530,17 @@ impl Store {
     /// on this store, and the key is what says which one.
     pub(crate) fn get_metadata<T: SszDecode>(&self, key: &[u8]) -> T {
         let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::Metadata, key)
-            .expect("get")
-            .unwrap_or_else(|| {
-                panic!(
-                    "metadata key {:?} is absent on a {:?} store",
-                    String::from_utf8_lossy(key),
-                    self.chain
-                )
-            });
-        T::from_ssz_bytes(&bytes).expect("valid encoding")
+        view.read_with(Table::Metadata, key, |bytes| {
+            T::from_ssz_bytes(bytes).expect("valid encoding")
+        })
+        .expect("read")
+        .unwrap_or_else(|| {
+            panic!(
+                "metadata key {:?} is absent on a {:?} store",
+                String::from_utf8_lossy(key),
+                self.chain
+            )
+        })
     }
 
     pub(crate) fn set_metadata<T: SszEncode>(&self, key: &[u8], value: &T) {
@@ -2094,9 +2097,10 @@ impl Store {
         }
         let view = self.backend.begin_read().expect("read view");
         Ok(view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
-            .map(|bytes| BlockHeader::from_ssz_bytes(&bytes).expect("valid header")))
+            .read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read"))
     }
 
     // ============ Signed Blocks ============
@@ -2387,27 +2391,26 @@ impl Store {
     /// field is already in hand once the row is decoded.
     fn block_fields(&self, root: &H256) -> Option<(u64, H256, H256)> {
         let view = self.backend.begin_read().expect("read view");
-        let bytes = view
-            .get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")?;
-        Some(match self.chain {
-            Chain::Lean => {
-                let header = BlockHeader::from_ssz_bytes(&bytes).expect("valid header");
-                (header.slot, header.parent_root, header.state_root)
-            }
-            Chain::Beacon => {
-                let block = decode_beacon_block_value(&bytes);
-                (block.slot(), block.parent_root(), block.state_root())
+        view.read_with(Table::BlockHeaders, &root.to_ssz(), |bytes| {
+            match self.chain {
+                Chain::Lean => {
+                    let header = BlockHeader::from_ssz_bytes(bytes).expect("valid header");
+                    (header.slot, header.parent_root, header.state_root)
+                }
+                Chain::Beacon => {
+                    let block = decode_beacon_block_value(bytes);
+                    (block.slot(), block.parent_root(), block.state_root())
+                }
             }
         })
+        .expect("read")
     }
 
     /// Whether a block is stored under `root`.
     pub fn has_block(&self, root: &H256) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::BlockHeaders, &root.to_ssz())
-            .expect("get")
-            .is_some()
+        view.contains(Table::BlockHeaders, &root.to_ssz())
+            .expect("contains")
     }
 
     /// Every stored beacon block as `root -> (slot, parent_root)`.
@@ -2437,18 +2440,27 @@ impl Store {
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
 
-        let Some(header_bytes) = view.get(Table::BlockHeaders, &key).expect("get") else {
+        let Some(header) = view
+            .read_with(Table::BlockHeaders, &key, |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read")
+        else {
             return Ok(None);
         };
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
 
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let Some(body_bytes) = view.get(Table::BlockBodies, &key).expect("get") else {
+            let Some(body) = view
+                .read_with(Table::BlockBodies, &key, |bytes| {
+                    BlockBody::from_ssz_bytes(bytes).expect("valid body")
+                })
+                .expect("read")
+            else {
                 return Ok(None);
             };
-            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+            body
         };
 
         Ok(Some(Block::from_header_and_body(header, body)))
@@ -2479,38 +2491,43 @@ impl Store {
             Chain::Lean => {
                 Ok(Self::signed_block_from_view(view.as_ref(), root).map(SignedBeaconBlock::Lean))
             }
-            Chain::Beacon => {
-                let Some(bytes) = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get")
-                else {
-                    return Ok(None);
-                };
-
-                let block = decode_beacon_block_value(&bytes);
-
-                Ok(Some(block))
-            }
+            Chain::Beacon => Ok(view
+                .read_with(
+                    Table::BlockHeaders,
+                    &root.to_ssz(),
+                    decode_beacon_block_value,
+                )
+                .expect("read")),
         }
     }
 
     fn signed_block_from_view(view: &dyn StorageReadView, root: &H256) -> Option<SignedBlock> {
         let key = root.to_ssz();
 
-        let header_bytes = view.get(Table::BlockHeaders, &key).expect("get")?;
-        let header = BlockHeader::from_ssz_bytes(&header_bytes).expect("valid header");
+        let header = view
+            .read_with(Table::BlockHeaders, &key, |bytes| {
+                BlockHeader::from_ssz_bytes(bytes).expect("valid header")
+            })
+            .expect("read")?;
 
         // Use empty body if header indicates empty, otherwise fetch from DB
         let body = if header.body_root == *EMPTY_BODY_ROOT {
             BlockBody::default()
         } else {
-            let body_bytes = view.get(Table::BlockBodies, &key).expect("get")?;
-            BlockBody::from_ssz_bytes(&body_bytes).expect("valid body")
+            view.read_with(Table::BlockBodies, &key, |bytes| {
+                BlockBody::from_ssz_bytes(bytes).expect("valid body")
+            })
+            .expect("read")?
         };
 
         let sig_key = encode_slot_root_key(header.slot, root);
-        let proof = match view.get(Table::BlockProof, &sig_key).expect("get") {
-            Some(proof_bytes) => {
-                MultiMessageAggregate::from_ssz_bytes(&proof_bytes).expect("valid block proof")
-            }
+        let proof = view
+            .read_with(Table::BlockProof, &sig_key, |bytes| {
+                MultiMessageAggregate::from_ssz_bytes(bytes).expect("valid block proof")
+            })
+            .expect("read");
+        let proof = match proof {
+            Some(proof) => proof,
             // Synthesis only covers the genesis-style anchor (slot 0). For any
             // other slot a missing proof (pruned finalized block, or genuine
             // corruption) surfaces as `None` rather than a fabricated block.
@@ -2541,9 +2558,10 @@ impl Store {
     pub fn canonical_root_at_slot(&self, slot: u64) -> Result<Option<H256>, Error> {
         let view = self.backend.begin_read().expect("read view");
         Ok(view
-            .get(Table::BlockRoots, &encode_block_root_key(slot))
-            .expect("get block root")
-            .map(|bytes| H256::from_ssz_bytes(&bytes).expect("valid block root")))
+            .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                H256::from_ssz_bytes(bytes).expect("valid block root")
+            })
+            .expect("read block root"))
     }
 
     /// Return canonical signed blocks for the slot range `[start_slot, end_slot]`.
@@ -2574,13 +2592,14 @@ impl Store {
             // `canonical_root_at_slot`, which opens a fresh one per call: a
             // range must be served from a single snapshot so a head change
             // partway through cannot splice two branches into one response.
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root) = view
+                .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid block root")
+                })
+                .expect("read block root")
             else {
                 continue;
             };
-            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
             match self.chain {
                 Chain::Lean => {
                     if let Some(block) = Self::signed_block_from_view(view.as_ref(), &root) {
@@ -2591,9 +2610,15 @@ impl Store {
                 // lean arm's "header found but proof pruned" `None`: the row is
                 // there or the slot is skipped.
                 Chain::Beacon => {
-                    if let Some(bytes) = view.get(Table::BlockHeaders, &root.to_ssz()).expect("get")
+                    if let Some(block) = view
+                        .read_with(
+                            Table::BlockHeaders,
+                            &root.to_ssz(),
+                            decode_beacon_block_value,
+                        )
+                        .expect("read")
                     {
-                        blocks.push(decode_beacon_block_value(&bytes));
+                        blocks.push(block);
                     }
                 }
             }
@@ -3577,9 +3602,8 @@ impl Store {
     /// gossip column.
     pub fn has_data_column(&self, slot: u64, root: &H256, index: u64) -> bool {
         let view = self.backend.begin_read().expect("read view");
-        view.get(Table::DataColumns, &data_column_key(slot, root, index))
-            .expect("get")
-            .is_some()
+        view.contains(Table::DataColumns, &data_column_key(slot, root, index))
+            .expect("contains")
     }
 
     /// Which columns of one block this node holds, ascending.
@@ -3647,13 +3671,14 @@ impl Store {
         let view = self.backend.begin_read().expect("read view");
         let mut found = Vec::new();
         for slot in start_slot..end_slot {
-            let Some(root_bytes) = view
-                .get(Table::BlockRoots, &encode_block_root_key(slot))
-                .expect("get block root")
+            let Some(root) = view
+                .read_with(Table::BlockRoots, &encode_block_root_key(slot), |bytes| {
+                    H256::from_ssz_bytes(bytes).expect("valid block root")
+                })
+                .expect("read block root")
             else {
                 continue;
             };
-            let root = H256::from_ssz_bytes(&root_bytes).expect("valid block root");
             let prefix = data_column_block_prefix(slot, &root);
             let entries = view
                 .prefix_iterator(Table::DataColumns, &prefix)
@@ -3809,15 +3834,14 @@ mod tests {
     /// Check if a key exists in a table.
     fn has_key(backend: &dyn StorageBackend, table: Table, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(table, &root.to_ssz()).expect("get").is_some()
+        view.contains(table, &root.to_ssz()).expect("contains")
     }
 
     /// Check whether a block proof exists for a (slot, root) pair.
     fn has_block_proof(backend: &dyn StorageBackend, slot: u64, root: &H256) -> bool {
         let view = backend.begin_read().expect("read view");
-        view.get(Table::BlockProof, &encode_slot_root_key(slot, root))
-            .expect("get")
-            .is_some()
+        view.contains(Table::BlockProof, &encode_slot_root_key(slot, root))
+            .expect("contains")
     }
 
     /// Canonical block root at `slot`, for storage-index assertions.
@@ -5807,6 +5831,39 @@ mod tests {
 
         assert!(decoded.validators().ptr_eq(resident_parent.validators()));
         assert_eq!(decoded.to_ssz(), child.to_ssz());
+    }
+
+    #[test]
+    fn a_cold_beacon_state_folds_every_delta_back_from_its_snapshot() {
+        let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new());
+        let mut store = beacon_test_store(backend.clone());
+        let interval = ForkName::Electra.snapshot_interval();
+
+        // Slot 0 and slot `interval` are snapshots (no parent, then a boundary
+        // crossing), and every slot between them is a delta on its parent. So
+        // the reads cover a borrowed snapshot with nothing to fold, and chains
+        // of 1 up to `interval - 1` deltas applied to the borrowed snapshot.
+        let mut expected = Vec::new();
+        let mut parent = H256::ZERO;
+        for slot in 0..=interval {
+            let root = H256::from([(slot + 1) as u8; 32]);
+            let state = beacon_test_state_with_parent(slot, parent);
+            store
+                .insert_signed_block(root, beacon_test_block(slot, parent))
+                .expect("insert block");
+            expected.push((root, state.to_ssz()));
+            store.insert_state(root, state).expect("insert state");
+            parent = root;
+        }
+
+        // Dropping the store joins the writer; a fresh one has an empty cache,
+        // so every read below reconstructs from the backend.
+        drop(store);
+        let cold = beacon_test_store(backend);
+        for (root, encoded) in expected.into_iter().rev() {
+            let state = cold.get_state(&root).expect("get").expect("present");
+            assert_eq!(state.to_ssz(), encoded);
+        }
     }
 
     /// `beacon_test_state` with its parent linked in, the way `insert_state`'s

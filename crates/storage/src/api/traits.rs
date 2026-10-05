@@ -41,13 +41,11 @@ pub trait StorageReadView {
     ) -> Result<bool, Error>;
 
     /// Get a value by key from a table, copied into an owned `Vec`.
+    ///
+    /// Prefer [`StorageReadViewExt::read_with`] when the bytes are only
+    /// decoded: it decodes from the backend's buffer without the copy.
     fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        let mut value = None;
-        self.read(table, key, &mut |bytes| {
-            value = Some(bytes.to_vec());
-            Ok(())
-        })?;
-        Ok(value)
+        self.read_with(table, key, <[u8]>::to_vec)
     }
 
     /// Whether `key` is present in a table.
@@ -66,6 +64,33 @@ pub trait StorageReadView {
         prefix: &[u8],
     ) -> Result<Box<dyn Iterator<Item = PrefixResult> + '_>, Error>;
 }
+
+/// Generic conveniences over [`StorageReadView::read`].
+///
+/// A separate trait because its methods are generic, which would make
+/// `StorageReadView` itself unusable as a trait object. The blanket impl
+/// covers every view, `dyn StorageReadView` included.
+pub trait StorageReadViewExt: StorageReadView {
+    /// Decodes the value stored under `key` straight from the backend's
+    /// buffer, without copying it first. `None` when the key is absent.
+    fn read_with<T>(
+        &self,
+        table: Table,
+        key: &[u8],
+        decode: impl FnOnce(&[u8]) -> T,
+    ) -> Result<Option<T>, Error> {
+        let mut decode = Some(decode);
+        let mut value = None;
+        self.read(table, key, &mut |bytes| {
+            let decode = decode.take().expect("read calls read_fn at most once");
+            value = Some(decode(bytes));
+            Ok(())
+        })?;
+        Ok(value)
+    }
+}
+
+impl<V: StorageReadView + ?Sized> StorageReadViewExt for V {}
 
 /// A write batch that can be committed atomically.
 pub trait StorageWriteBatch: Send {
