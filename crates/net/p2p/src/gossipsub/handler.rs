@@ -810,16 +810,53 @@ pub async fn publish_execution_payload_envelope(
 /// over by the Beacon API, on `payload_attestation_message`, and pass it to
 /// the chain actor.
 ///
-/// STUB: owned by the PTC task (see the contract), which replaces this body.
+/// The API validated it with the checks gossip would apply, so it goes out
+/// as is. Gossipsub never delivers a node its own message, so the chain actor
+/// is handed it here to count the vote in its fork choice. The seen cache is
+/// marked as well: a peer that echoes the vote back would otherwise pass
+/// triage and be validated and forwarded a second time.
 pub async fn publish_payload_attestation_message(
-    _server: &mut P2PServer,
+    server: &mut P2PServer,
     message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
 ) {
-    error!(
-        slot = message.data.slot,
-        validator = message.validator_index,
-        "Publishing payload attestation messages is not implemented; dropping it"
+    let slot = message.data.slot;
+    let validator = message.validator_index;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            slot,
+            "A payload attestation reached a lean node; dropping it"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this payload attestation's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        digest,
+        beacon_topics::PAYLOAD_ATTESTATION_MESSAGE,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&message.to_ssz()));
+    server.seen_payload_attestations.record(slot, validator);
+    info!(
+        slot,
+        validator,
+        block_root = %ShortRoot(&message.data.beacon_block_root.0),
+        payload_present = message.data.payload_present,
+        "Published payload attestation to gossipsub"
     );
+    if let Some(ref blockchain) = server.blockchain {
+        let _ = blockchain
+            .new_payload_attestation_message(message, BlockArrival::now())
+            .inspect_err(
+                |err| error!(%err, "Failed to hand the published payload attestation to the chain"),
+            );
+    }
 }
 
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.

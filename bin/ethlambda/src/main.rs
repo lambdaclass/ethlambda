@@ -721,12 +721,17 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // read by the aggregate endpoint and block production; unused on lean.
     let attestation_pool =
         ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool::default();
+    // Filled by gossip and the Beacon API's payload attestation endpoint, read
+    // by block production and `GET .../pool/payload_attestations`.
+    let payload_attestation_pool =
+        ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool::default();
     let p2p = P2P::spawn(
         built,
         setup.store.clone(),
         setup.node_names,
         discovery,
         attestation_pool.clone(),
+        payload_attestation_pool.clone(),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;
@@ -740,6 +745,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
+    let rpc_custody_columns = match &setup.chain {
+        ChainActor::Beacon {
+            custody_columns, ..
+        } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
+        ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
+    };
     let rpc_engine = match &setup.chain {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,
@@ -761,6 +772,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
+                    payload_attestation_pool: payload_attestation_pool.clone(),
+                    custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                 },
                 local_peer_id,
