@@ -32,10 +32,11 @@ use ethlambda_types::{
 };
 use libssz::{SszDecode, SszEncode};
 
+use crate::metrics::StateCacheMethod;
 use crate::state_codec::encode_state_value;
 use crate::state_writer::{
     CacheKey, PendingStates, STATE_WRITE_QUEUE_CAPACITY, StateCache, StateWriteRequest,
-    StateWriterHandle, read_state,
+    StateWriterHandle, cache_get, read_state,
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -2653,7 +2654,7 @@ impl Store {
 
     /// The memoized state for `key`, if it is still resident.
     pub fn cached_state(&self, key: CacheKey) -> Option<Arc<BeaconState>> {
-        self.state_cache.lock().unwrap().get(&key).cloned()
+        cache_get(&self.state_cache, key, StateCacheMethod::Cached)
     }
 
     /// Memoizes `state` under `key`.
@@ -2685,28 +2686,30 @@ impl Store {
 
     /// Returns whether a state is available for the given block root.
     ///
-    /// True if `pending_states` or the state cache holds the state, a snapshot
+    /// True if the state cache or `pending_states` holds the state, a snapshot
     /// exists, or the state can be reconstructed from a diff. Never reads a
     /// value: existence checks only.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
-        // Same pending-before-backend order as `read_state`; see its doc for
-        // why the backend never has to consult `pending_states` on its own.
-        if self.pending_states.get(root).is_some() {
-            return Ok(true);
-        }
         // A cached block state is always one that was handed to the writer
         // (`insert_state`, so in `pending_states` until committed) or read back
         // from the backend (`read_state`); nothing deletes a persisted state.
         // `peek`, not `get`: an existence check must not reorder the LRU.
         // Without this, a state stored as a snapshot only (a beacon epoch
         // anchor) costs a full-value read from RocksDB just to be found.
-        if self
-            .state_cache
-            .lock()
-            .unwrap()
-            .peek(&CacheKey::BlockState(*root))
-            .is_some()
-        {
+        //
+        // Cache first, the same order as `read_state`: a state in flight is in
+        // both, so the order changes no answer, and cache first is what makes
+        // every call a counted lookup rather than only the ones
+        // `pending_states` missed.
+        let key = CacheKey::BlockState(*root);
+        let cached = self.state_cache.lock().unwrap().peek(&key).is_some();
+        crate::metrics::inc_state_cache_lookups(StateCacheMethod::Has, &key, cached);
+        if cached {
+            return Ok(true);
+        }
+        // Same pending-before-backend order as `read_state`; see its doc for
+        // why the backend never has to consult `pending_states` on its own.
+        if self.pending_states.get(root).is_some() {
             return Ok(true);
         }
         let view = self.backend.begin_read().expect("read view");
