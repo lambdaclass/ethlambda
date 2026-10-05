@@ -1020,7 +1020,6 @@ pub fn advance_to_epoch_start(
     let _ = state.hash_tree_root();
     Ok(state)
 }
-
 /// Applies `signed_block` to a copy of its parent's post-state, resuming from
 /// the precomputed epoch-boundary state when the block crosses into an epoch
 /// and one is cached.
@@ -1030,6 +1029,17 @@ pub fn advance_to_epoch_start(
 /// same post-state: the precomputed one is what `process_slots` would produce
 /// from the parent. Either way the copy is independent, so a failing block
 /// cannot corrupt a cached entry.
+///
+/// This is also where the epoch-boundary balances of a crossing block are
+/// built (see [`cache_boundary_balances`]): a block with empty slots between
+/// its parent and its epoch's first slot makes `(epoch, parent_root)` an
+/// epoch-boundary checkpoint, and the boundary state is right here. A
+/// precompute hit builds from the precomputed state; a miss advances the
+/// parent's copy to the epoch start once, builds from that, and carries on
+/// from there to the block's slot, so `process_slots` still runs each slot
+/// once. The balances come before the block is validated, which is harmless:
+/// the boundary state is a function of the parent alone, so an invalid block
+/// cannot make the entry wrong, and the key names a real parent either way.
 #[allow(clippy::too_many_arguments)]
 fn transition_block(
     store: &Store,
@@ -1042,21 +1052,53 @@ fn transition_block(
     committees: &CommitteeCache,
 ) -> (BeaconState, Result<()>) {
     let block_slot = signed_block.slot();
+    let epoch = compute_epoch_at_slot(block_slot);
+    let epoch_start = compute_start_slot_at_epoch(epoch);
+    // The epoch's first slot (or more) was empty: the parent is the epoch's
+    // checkpoint block. A block *at* the first slot is its own, cached from
+    // its post-state by the caller.
+    let crosses_with_empty_slots = parent_state.slot() < epoch_start && epoch_start < block_slot;
+    let boundary = Checkpoint {
+        epoch,
+        root: parent_root,
+    };
+
     let Some(precomputed) =
         precomputed_epoch_state(store, parent_state.slot(), parent_root, block_slot)
     else {
         let mut state = parent_state.clone();
-        let outcome = stf::state_transition(
-            &mut state,
-            signed_block,
-            validate_result,
-            config,
-            engine,
-            committees,
-        );
+        if !crosses_with_empty_slots {
+            let outcome = stf::state_transition(
+                &mut state,
+                signed_block,
+                validate_result,
+                config,
+                engine,
+                committees,
+            );
+            return (state, outcome);
+        }
+        // The same `process_slots` steps `state_transition` would run, split
+        // at the epoch start so the boundary state can be read in between.
+        let outcome = stf::process_slots(&mut state, epoch_start, config)
+            .inspect(|()| cache_boundary_balances(store, boundary, &state))
+            .and_then(|()| stf::process_slots(&mut state, block_slot, config))
+            .and_then(|()| {
+                stf::apply_block(
+                    &mut state,
+                    signed_block,
+                    validate_result,
+                    config,
+                    engine,
+                    committees,
+                )
+            });
         return (state, outcome);
     };
 
+    if crosses_with_empty_slots {
+        cache_boundary_balances(store, boundary, &precomputed);
+    }
     let mut state = (*precomputed).clone();
     // Only the slots skipped past the boundary are left to advance; none when
     // the block sits on the boundary itself.
@@ -1373,17 +1415,23 @@ pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
     ))
 }
 
-/// The flat balances of the store's justified checkpoint state, built on first
-/// use after the checkpoint moves and shared until it moves again.
+/// The flat balances of the store's justified checkpoint state, looked up in
+/// the store's per-checkpoint cache.
+///
+/// Block import normally filled it already ([`cache_boundary_balances`] and
+/// [`cache_first_slot_balances`]), so the tick that moves the justified
+/// checkpoint costs a lookup and a head computation reads no state. A miss,
+/// after a restart or for a checkpoint whose boundary import this node never
+/// saw, builds it from [`checkpoint_state`] and caches the result.
 ///
 /// Keyed by the checkpoint itself, which every writer of the justified
 /// checkpoint (`update_checkpoints` from three handlers, store construction,
-/// restart) already changes, so none of them needs a hook. The only source is
-/// [`checkpoint_state`], the state `get_weight` reads, so the snapshot is
-/// exactly what the specification's per-root definition sees; a later
-/// post-state of the same epoch would not be, since `slashed` can differ.
-/// A failed `checkpoint_state` fails the call, as it does for every other
-/// fork-choice reader, and the head stays where it is.
+/// restart) already changes, so none of them needs a hook. Both sources build
+/// from the state [`checkpoint_state`] returns, the one `get_weight` reads, so
+/// the snapshot is exactly what the specification's per-root definition sees;
+/// a later post-state of the same epoch would not be, since `slashed` can
+/// differ. A failed `checkpoint_state` fails the call, as it does for every
+/// other fork-choice reader, and the head stays where it is.
 pub fn justified_balances(store: &Store, config: &Config) -> Result<Arc<JustifiedBalances>> {
     let checkpoint = store.beacon_justified_checkpoint();
     if let Some(balances) = store.justified_balances(&checkpoint) {
@@ -1393,23 +1441,63 @@ pub fn justified_balances(store: &Store, config: &Config) -> Result<Arc<Justifie
     metrics::inc_justified_balances_lookups("miss");
     let state = checkpoint_state(store, &checkpoint, config)?;
     let balances = Arc::new(build_justified_balances(checkpoint, &state));
-    store.set_justified_balances(Arc::clone(&balances));
+    store.insert_justified_balances(Arc::clone(&balances));
     Ok(balances)
 }
 
+/// Caches the balances of the epoch-boundary checkpoint `checkpoint` from
+/// `state`, the checkpoint's state at the epoch's first slot, unless the cache
+/// has them.
+fn cache_boundary_balances(store: &Store, checkpoint: Checkpoint, state: &BeaconState) {
+    if store.justified_balances(&checkpoint).is_none() {
+        let balances = Arc::new(build_justified_balances(checkpoint, state));
+        store.insert_justified_balances(balances);
+    }
+}
+
+/// A block at its epoch's first slot is its own epoch-boundary block, and its
+/// post-state is what [`checkpoint_state`] returns for `(epoch, block_root)`
+/// (no advance needed): cache the balances from it.
+fn cache_first_slot_balances(store: &Store, post_state: &BeaconState, block_root: Root) {
+    let slot = post_state.slot();
+    let epoch = compute_epoch_at_slot(slot);
+    if slot != compute_start_slot_at_epoch(epoch) {
+        return;
+    }
+    let checkpoint = Checkpoint {
+        epoch,
+        root: block_root,
+    };
+    cache_boundary_balances(store, checkpoint, post_state);
+}
+
 /// One in-order pass over `state`'s registry: each validator's vote weight
-/// (zero if inactive or slashed) and, in the same pass, the total active
-/// balance with exactly the semantics of `get_total_active_balance`
-/// (slashed-but-active validators count, saturating, floored at one increment).
+/// (zero if inactive or slashed), its raw effective balance in increments, and,
+/// in the same pass, the total active balance with exactly the semantics of
+/// `get_total_active_balance` (slashed-but-active validators count,
+/// saturating, floored at one increment).
 fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> JustifiedBalances {
     let _timing = metrics::time_justified_balances_build();
     // Activity at the state's own epoch, as `get_weight` reads it; not asserted
     // equal to `checkpoint.epoch`, which the unit-test stores do not keep.
     let epoch = get_current_epoch(state);
     let mut total: Gwei = 0;
+    let mut increments: Vec<u16> = Vec::new();
     let balances = state
         .iter_validators()
         .map(|validator| {
+            // An effective balance is a whole number of increments no larger
+            // than `MAX_EFFECTIVE_BALANCE_ELECTRA`; the snapshot's exactness
+            // depends on it.
+            assert_eq!(
+                validator.effective_balance % preset::EFFECTIVE_BALANCE_INCREMENT,
+                0,
+                "effective balance is a whole number of increments"
+            );
+            increments.push(
+                u16::try_from(validator.effective_balance / preset::EFFECTIVE_BALANCE_INCREMENT)
+                    .expect("effective balance fits u16 increments"),
+            );
             if !is_active_validator(validator, epoch) {
                 return 0;
             }
@@ -1425,6 +1513,7 @@ fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> Just
         checkpoint,
         balances,
         total.max(preset::EFFECTIVE_BALANCE_INCREMENT),
+        increments.into(),
     )
 }
 
@@ -1482,6 +1571,38 @@ pub fn get_attestation_score(
             attestation_score = attestation_score.saturating_add(validator.effective_balance);
         }
     }
+    Ok(attestation_score)
+}
+
+/// [`get_attestation_score`] read from the justified-balances snapshot instead
+/// of the justified state: the same sum, since the snapshot holds a zero for
+/// exactly the validators the state version skips (inactive, slashed), and
+/// equivocators are dropped by the store. Reads no state, so the head path and
+/// the reorg checks never need the justified checkpoint's.
+fn snapshot_attestation_score(
+    store: &Store,
+    index: &HashMap<Root, (Slot, Root)>,
+    root: Root,
+    balances: &JustifiedBalances,
+) -> Result<Gwei> {
+    let block_slot = index
+        .get(&root)
+        .ok_or(Error::SpecAssert("root in store.blocks"))?
+        .0;
+    let mut attestation_score: Gwei = 0;
+    // Nothing that reads the store's own scratch may run inside the closure:
+    // see `for_each_non_equivocating_latest_message`. `get_ancestor` reads only
+    // `index`.
+    store.for_each_non_equivocating_latest_message(|validator_index, message| {
+        let balance = balances.get(validator_index);
+        if balance == 0 {
+            return;
+        }
+        if matches!(get_ancestor(index, message.root, block_slot), Ok(ancestor) if ancestor == root)
+        {
+            attestation_score = attestation_score.saturating_add(balance);
+        }
+    });
     Ok(attestation_score)
 }
 
@@ -2025,11 +2146,10 @@ pub fn compute_node_weights(
     rules: ForkRules,
 ) -> Result<NodeWeights> {
     let tree = PayloadTree { store, rules };
-    let justified_checkpoint = store.beacon_justified_checkpoint();
-    let state = checkpoint_state(store, &justified_checkpoint, config)?;
-    // The vote loop reads each voter's weight from the snapshot of this same
-    // checkpoint state rather than descending the registry per vote; `state`
-    // stays for the boost gate, which wants the committees' state itself.
+    // The vote loop, the boost score and the gloas boost gate all read the
+    // justified checkpoint's snapshot, so a head walk reads no justified state:
+    // on a hit (the usual case, since import builds it) not even a lookup of
+    // one. The gate's committees come from the head and parent *block* states.
     let balances = justified_balances(store, config)?;
     let bound = walk_bound(store, index);
     let in_window = |root: &Root| index.get(root).is_some_and(|&(slot, _)| slot >= bound);
@@ -2133,14 +2253,19 @@ pub fn compute_node_weights(
     let boost_root = store.proposer_boost_root();
     let boost_applies = match rules {
         ForkRules::PreGloas => !boost_root.is_zero() && in_window(&boost_root),
-        ForkRules::Gloas => {
-            should_apply_proposer_boost_with(store, config, committees, index, &state, |parent| {
+        ForkRules::Gloas => should_apply_proposer_boost_with(
+            store,
+            config,
+            committees,
+            index,
+            &balances,
+            |parent| {
                 Ok(weights.raw(ForkChoiceNode {
                     root: parent,
                     payload_status: PayloadStatus::Pending,
                 }))
-            })?
-        }
+            },
+        )?,
     };
     if boost_applies {
         let proposer_score = get_proposer_score(store, config)?;
@@ -2529,10 +2654,9 @@ pub fn is_head_weak(
     config: &Config,
     committees: &CommitteeCache,
 ) -> Result<bool> {
-    let justified_checkpoint = store.beacon_justified_checkpoint();
-    let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
+    let balances = justified_balances(store, config)?;
     let index = store.block_index();
-    let attestation_score = get_attestation_score(store, &index, head_root, &justified_state)?;
+    let attestation_score = snapshot_attestation_score(store, &index, head_root, &balances)?;
     let &(head_slot, _) = index
         .get(&head_root)
         .ok_or(Error::SpecAssert("head_root in store.blocks"))?;
@@ -2542,7 +2666,7 @@ pub fn is_head_weak(
         head_slot,
         config,
         committees,
-        &justified_state,
+        &balances,
         attestation_score,
     )
 }
@@ -2563,11 +2687,13 @@ fn is_head_weak_with(
     head_slot: Slot,
     config: &Config,
     committees: &CommitteeCache,
-    justified_state: &BeaconState,
+    balances: &JustifiedBalances,
     attestation_score: Gwei,
 ) -> Result<bool> {
-    let reorg_threshold =
-        calculate_committee_fraction(justified_state, config.reorg_head_weight_threshold)?;
+    let reorg_threshold = committee_fraction(
+        balances.total_active_balance(),
+        config.reorg_head_weight_threshold,
+    );
     let mut head_weight = attestation_score;
 
     let head_state = store
@@ -2579,8 +2705,11 @@ fn is_head_weak_with(
     for committee_index in 0..epoch_committees.committees_per_slot() {
         for &validator_index in epoch_committees.committee(head_slot, committee_index)? {
             if store.is_equivocating(validator_index) {
-                let validator = justified_state.validator(validator_index)?;
-                head_weight = head_weight.saturating_add(validator.effective_balance);
+                // The raw effective balance at the justified state: the
+                // snapshot's vote weight is zero for a slashed validator, and
+                // an equivocator often is.
+                head_weight =
+                    head_weight.saturating_add(balances.effective_balance(validator_index));
             }
         }
     }
@@ -2597,15 +2726,16 @@ fn is_head_weak_with(
 /// its own purposes and this function's own lookup cannot disagree about
 /// which block that is.
 pub fn is_parent_strong(store: &Store, root: Root, config: &Config) -> Result<bool> {
-    let justified_checkpoint = store.beacon_justified_checkpoint();
-    let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let parent_threshold =
-        calculate_committee_fraction(&justified_state, config.reorg_parent_weight_threshold)?;
+    let balances = justified_balances(store, config)?;
+    let parent_threshold = committee_fraction(
+        balances.total_active_balance(),
+        config.reorg_parent_weight_threshold,
+    );
     let (_, parent_root) = store
         .block_entry(&root)
         .ok_or(Error::SpecAssert("root in store.blocks"))?;
     let index = store.block_index();
-    let parent_weight = get_attestation_score(store, &index, parent_root, &justified_state)?;
+    let parent_weight = snapshot_attestation_score(store, &index, parent_root, &balances)?;
     Ok(parent_weight > parent_threshold)
 }
 
@@ -3381,16 +3511,15 @@ pub fn should_apply_proposer_boost(
     if store.proposer_boost_root().is_zero() {
         return Ok(false);
     }
-    let justified_checkpoint = store.beacon_justified_checkpoint();
-    let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
+    let balances = justified_balances(store, config)?;
     let index = store.block_index();
     should_apply_proposer_boost_with(
         store,
         config,
         committees,
         &index,
-        &justified_state,
-        |parent_root| get_attestation_score(store, &index, parent_root, &justified_state),
+        &balances,
+        |parent_root| snapshot_attestation_score(store, &index, parent_root, &balances),
     )
 }
 
@@ -3411,7 +3540,7 @@ fn should_apply_proposer_boost_with(
     config: &Config,
     committees: &CommitteeCache,
     index: &HashMap<Root, (Slot, Root)>,
-    justified_state: &BeaconState,
+    balances: &JustifiedBalances,
     parent_score: impl FnOnce(Root) -> Result<Gwei>,
 ) -> Result<bool> {
     let proposer_boost_root = store.proposer_boost_root();
@@ -3440,7 +3569,7 @@ fn should_apply_proposer_boost_with(
         parent_slot,
         config,
         committees,
-        justified_state,
+        balances,
         parent_attestation_score,
     )? {
         return Ok(true);
@@ -4731,6 +4860,11 @@ pub fn on_block(
 
     transition?;
 
+    // A block at its epoch's first slot is its own epoch-boundary block: its
+    // post-state is the checkpoint state. Cached at import so the tick that
+    // justifies it finds the balances built; see `justified_balances`.
+    cache_first_slot_balances(store, &state, block_root);
+
     // Cache the state root in the latest block header. Sound because the
     // `true` above means `state_transition` checked it against the root it
     // computed; see `BeaconState::compute_state_root`.
@@ -5839,7 +5973,7 @@ mod tests {
         state
             .validator_mut(0)
             .expect("registered")
-            .effective_balance = 5;
+            .effective_balance = 5 * preset::EFFECTIVE_BALANCE_INCREMENT;
         state.validator_mut(1).expect("registered").slashed = true;
         state.apply_pending_mutations();
         store.cache_state(
@@ -5856,9 +5990,221 @@ mod tests {
         let rebuilt = justified_balances(&store, &config).expect("planted state");
         assert!(!Arc::ptr_eq(&first, &rebuilt));
         assert_eq!(rebuilt.checkpoint(), next);
-        assert_eq!(rebuilt.get(0), 5);
+        assert_eq!(rebuilt.get(0), 5 * preset::EFFECTIVE_BALANCE_INCREMENT);
         assert_eq!(rebuilt.get(1), 0, "slashed in the new state");
         assert_eq!(rebuilt.get(2), preset::MAX_EFFECTIVE_BALANCE);
+    }
+
+    /// A checkpoint whose state is nowhere in the store, with the snapshot for
+    /// it already cached, as block import leaves it. Every head-path reader
+    /// must answer from the snapshot: any `checkpoint_state` for it fails.
+    fn store_with_only_a_justified_snapshot(
+        state: &BeaconState,
+    ) -> (Store, Checkpoint, Root, CommitteeCache) {
+        let (mut store, anchor_root, _) = anchored_store_from(state.clone());
+        let next = Checkpoint {
+            epoch: store.beacon_justified_checkpoint().epoch + 1,
+            root: Root::repeat_byte(0x77),
+        };
+        let finalized = store.beacon_finalized_checkpoint();
+        update_checkpoints(&mut store, next, finalized);
+        store.insert_justified_balances(Arc::new(build_justified_balances(next, state)));
+        (store, next, anchor_root, CommitteeCache::default())
+    }
+
+    #[test]
+    fn a_snapshot_hit_reads_no_justified_state_on_any_head_path() {
+        let config = Config::active();
+        let state = state_with_slashed_and_inactive_validators(12);
+        let (store, next, anchor_root, committees) = store_with_only_a_justified_snapshot(&state);
+        assert!(
+            checkpoint_state(&store, &next, &config).is_err(),
+            "the justified state is not anywhere to be found"
+        );
+
+        let snapshot = justified_balances(&store, &config).expect("a hit");
+        assert_eq!(snapshot.checkpoint(), next);
+        let index = store.block_index();
+        compute_weights(&store, &index, &config).expect("pre-gloas weights");
+        for rules in [ForkRules::PreGloas, ForkRules::Gloas] {
+            compute_node_weights(&store, &index, &config, &committees, rules)
+                .unwrap_or_else(|err| panic!("{rules:?} head walk: {err:?}"));
+        }
+        get_proposer_score(&store, &config).expect("boost score");
+        is_head_weak(&store, anchor_root, &config, &committees).expect("is_head_weak");
+        assert!(!should_apply_proposer_boost(&store, &config, &committees).expect("no boost root"));
+    }
+
+    /// The snapshot keeps what `is_head_weak` needs of a slashed equivocator
+    /// (its raw effective balance, though its vote weighs zero), and the
+    /// snapshot-based decision equals the specification's state-based one.
+    #[test]
+    fn a_slashed_equivocator_still_counts_toward_head_weakness_from_the_snapshot() {
+        let config = Config::active();
+        let mut state = test_state::with_validators(preset::SLOTS_PER_EPOCH as usize);
+        for index in 0..preset::SLOTS_PER_EPOCH {
+            state.validator_mut(index).expect("registered").slashed = true;
+        }
+        state.apply_pending_mutations();
+        let (mut store, anchor_root, anchor_slot) = anchored_store_from(state);
+        let committees = CommitteeCache::default();
+
+        // The specification's `is_head_weak`, read off the justified state.
+        let reference = |store: &Store| -> bool {
+            let justified_state =
+                checkpoint_state(store, &store.beacon_justified_checkpoint(), &config)
+                    .expect("justified state");
+            let index = store.block_index();
+            let mut weight =
+                get_attestation_score(store, &index, anchor_root, &justified_state).expect("score");
+            let head_state = store.get_state(&anchor_root).expect("get").expect("state");
+            let epoch_committees =
+                committees.committees(&head_state, compute_epoch_at_slot(anchor_slot));
+            for committee_index in 0..epoch_committees.committees_per_slot() {
+                for &validator in epoch_committees
+                    .committee(anchor_slot, committee_index)
+                    .expect("committee")
+                {
+                    if store.is_equivocating(validator) {
+                        weight += justified_state
+                            .validator(validator)
+                            .expect("registered")
+                            .effective_balance;
+                    }
+                }
+            }
+            let threshold =
+                calculate_committee_fraction(&justified_state, config.reorg_head_weight_threshold)
+                    .expect("total");
+            weight < threshold
+        };
+
+        assert!(is_head_weak(&store, anchor_root, &config, &committees).unwrap());
+        assert_eq!(
+            is_head_weak(&store, anchor_root, &config, &committees).unwrap(),
+            reference(&store)
+        );
+
+        let head_state = store.get_state(&anchor_root).expect("get").expect("state");
+        let equivocator = committees
+            .committees(&head_state, compute_epoch_at_slot(anchor_slot))
+            .committee(anchor_slot, 0)
+            .expect("committee 0")[0];
+        store.insert_equivocating_index(equivocator);
+
+        let snapshot = justified_balances(&store, &config).expect("snapshot");
+        assert_eq!(snapshot.get(equivocator), 0, "slashed: no vote weight");
+        assert_eq!(
+            snapshot.effective_balance(equivocator),
+            preset::MAX_EFFECTIVE_BALANCE,
+            "but its effective balance is still kept"
+        );
+        assert!(!is_head_weak(&store, anchor_root, &config, &committees).unwrap());
+        assert_eq!(
+            is_head_weak(&store, anchor_root, &config, &committees).unwrap(),
+            reference(&store)
+        );
+    }
+
+    // ---- balances built at import ----
+
+    /// Importing past empty first slots makes `(epoch, parent)` an
+    /// epoch-boundary checkpoint, and the balances cached for it are what
+    /// `checkpoint_state` for that key yields, on a precompute miss and on a
+    /// hit alike, with the block's post-state unchanged by the split.
+    #[test]
+    fn a_crossing_import_caches_the_boundary_balances_for_the_parent() {
+        let config = Config::mainnet();
+        let parent = last_slot_parent();
+        let parent_root = Root::repeat_byte(0x42);
+        let epoch = 2;
+        let boundary = Checkpoint {
+            epoch,
+            root: parent_root,
+        };
+        let expected = build_justified_balances(
+            boundary,
+            &advance_to_epoch_start(&parent, epoch, &config).expect("boundary state"),
+        );
+        let first_slot = compute_start_slot_at_epoch(epoch);
+
+        for slot in [first_slot + 1, first_slot + 3] {
+            let (block, committed) = block_on(&parent, slot);
+            let miss_store = empty_store();
+            let hit_store = store_with_precompute(&parent, parent_root, epoch);
+            for (store, label) in [(&miss_store, "miss"), (&hit_store, "hit")] {
+                assert!(store.justified_balances(&boundary).is_none());
+                let root = post_state_root(store, &parent, parent_root, &block);
+                assert_eq!(root, committed, "slot {slot} {label}: state root verifies");
+                let cached = store
+                    .justified_balances(&boundary)
+                    .unwrap_or_else(|| panic!("slot {slot} {label}: boundary balances cached"));
+                assert_eq!(*cached, expected, "slot {slot} {label}");
+            }
+        }
+    }
+
+    /// A block exactly at the epoch's first slot is its own boundary block:
+    /// nothing is cached for its parent, and its post-state's balances are
+    /// cached under `(epoch, block_root)`, equal to what `checkpoint_state`
+    /// then derives.
+    #[test]
+    fn a_first_slot_import_caches_balances_from_its_own_post_state() {
+        let config = Config::mainnet();
+        let parent = last_slot_parent();
+        let parent_root = Root::repeat_byte(0x42);
+        let block_root = Root::repeat_byte(0x99);
+        let epoch = 2;
+        let first_slot = compute_start_slot_at_epoch(epoch);
+        let (signed, _) = block_on(&parent, first_slot);
+
+        let mut store = empty_store();
+        let (mut post, outcome) = transition_block(
+            &store,
+            &parent,
+            parent_root,
+            &signed,
+            false,
+            &config,
+            &stf::ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+        );
+        outcome.expect("applies");
+        post.apply_pending_mutations();
+        assert!(
+            store
+                .justified_balances(&Checkpoint {
+                    epoch,
+                    root: parent_root
+                })
+                .is_none(),
+            "the parent is not this epoch's boundary block"
+        );
+
+        cache_first_slot_balances(&store, &post, block_root);
+        let key = Checkpoint {
+            epoch,
+            root: block_root,
+        };
+        let cached = store.justified_balances(&key).expect("cached");
+
+        store
+            .insert_signed_block(block_root, block(first_slot, parent_root))
+            .expect("insert block");
+        store.insert_state(block_root, post).expect("insert state");
+        let derived = checkpoint_state(&store, &key, &config).expect("checkpoint state");
+        assert_eq!(*cached, build_justified_balances(key, &derived));
+
+        // Any other slot of the epoch is not a boundary.
+        let other = Root::repeat_byte(0x55);
+        let mut later = (*derived).clone();
+        stf::process_slots(&mut later, first_slot + 1, &config).expect("advance");
+        cache_first_slot_balances(&store, &later, other);
+        assert!(
+            store
+                .justified_balances(&Checkpoint { epoch, root: other })
+                .is_none()
+        );
     }
 
     /// The failure a live mainnet follower hit: `promote_beacon_anchor` prunes
