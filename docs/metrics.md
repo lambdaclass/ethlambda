@@ -435,6 +435,45 @@ is a registry scan plus a whole-epoch shuffle on the import thread. `unkeyable`
 is a lookup the cache could not key at all, mostly the genesis state asking
 about its own first epochs, and should be zero on a checkpoint-synced follower.
 
+### Beacon Justified Balances
+
+Beacon fork choice weighs every vote by the voter's effective balance at the
+justified checkpoint. `justified_balances` (in
+`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) flattens that
+state into one array, keyed by the justified checkpoint and rebuilt on the first
+`get_head` after the checkpoint moves. This is ethlambda-specific, not part of
+the leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels |
+|------|------|-------|-------------------------|--------|
+| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cached snapshot served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
+| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from the checkpoint state | On every miss, around the registry pass (the checkpoint state lookup is not included) | |
+
+**Read the miss rate against the justified-checkpoint rate**: about one miss
+per justified checkpoint change, so a handful per hour on a healthy chain.
+Misses that track `get_head` calls mean the justified checkpoint is flapping
+between branches, or the snapshot is being replaced between two readers.
+
+### Beacon Epoch Precompute
+
+The beacon chain actor advances the head state across the next epoch boundary
+ahead of time, so the first block of an epoch does not run `process_epoch` on
+the import path. See "Epoch-transition precompute" in
+[`beacon_stf.md`](beacon_stf.md). This is ethlambda-specific, not part of the
+leanMetrics spec.
+
+| Name | Type | Usage | Sample collection event | Labels | Buckets |
+|------|------|-------|-------------------------|--------|---------|
+| `lean_beacon_epoch_precompute_lookups_total` | Counter | Epoch-crossing imports, by whether a precomputed boundary state was cached | On each import whose parent is before the block's epoch start and whose block is at or after it | result=hit,miss | |
+| `lean_beacon_epoch_precompute_seconds` | Histogram | Worker time to advance, flush and hash one state | When a precompute worker finishes | | 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 8 |
+| `lean_beacon_epoch_precompute_started_total` | Counter | Workers started, by trigger | When a worker is spawned | trigger=head,timer | |
+
+**Read the hit ratio against epochs.** On a synced follower nearly every
+epoch-crossing import should hit. Misses mean the worker had not finished (the
+block raced it, see `lean_beacon_epoch_precompute_seconds` against the slot
+duration), the node was syncing, or the entry was evicted from the state cache.
+A `timer` start with no matching `head` start means the last slot was skipped.
+
 ### Beacon Pubkey Cache
 
 Every BLS signature check `ethlambda beacon` runs (block import, fork choice,

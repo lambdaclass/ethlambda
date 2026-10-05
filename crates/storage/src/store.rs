@@ -24,8 +24,8 @@ use ethlambda_types::{
         },
         fork::ForkName,
         fork_choice::{
-            BlockPayloadLink, LatestMessage, PayloadStatus, PayloadStatusEnum, PayloadStatusV1,
-            PowBlock,
+            BlockPayloadLink, JustifiedBalances, LatestMessage, PayloadStatus, PayloadStatusEnum,
+            PayloadStatusV1, PowBlock,
         },
         preset::{PTC_SIZE, Preset, SLOTS_PER_EPOCH},
         primitives::ExecutionBlockHash,
@@ -647,6 +647,73 @@ impl GossipSignatureBuffer {
     }
 }
 
+/// Bound on a validator index [`Store::set_latest_message`] accepts in debug
+/// builds. Far above any registry this client will meet, far below what a
+/// corrupt index would need to exhaust memory: the dense vote table has one slot
+/// per index up to the highest seen.
+const MAX_PLAUSIBLE_VALIDATOR_INDEX: u64 = 1 << 26;
+
+/// How many epoch-boundary [`JustifiedBalances`] snapshots the store keeps.
+const JUSTIFIED_BALANCES_CAPACITY: usize = 8;
+
+/// A small cache of [`JustifiedBalances`], keyed by their checkpoint.
+///
+/// Filled at block import, for the epoch-boundary checkpoint a block makes
+/// available, so that the tick which moves the justified checkpoint finds the
+/// snapshot already built and the head computation never has to rebuild a
+/// state. Lighthouse does the same with a plain 4-entry FIFO. Eviction here is
+/// smarter, since a network with many forks (several blocks crossing one
+/// boundary from different parents) could push the canonical entry out of a
+/// FIFO within one epoch:
+///
+/// 1. when full, the entry with the lowest epoch goes first (ties: the oldest
+///    insert), because an old boundary is the least likely to be justified;
+/// 2. the entry for the store's current justified checkpoint is never evicted.
+#[derive(Default)]
+pub(crate) struct JustifiedBalancesCache {
+    /// Insert sequence number (for tie-breaking) and the snapshot.
+    entries: Vec<(u64, Arc<JustifiedBalances>)>,
+    next_sequence: u64,
+}
+
+impl JustifiedBalancesCache {
+    fn get(&self, checkpoint: &BeaconCheckpoint) -> Option<Arc<JustifiedBalances>> {
+        self.entries
+            .iter()
+            .find(|(_, balances)| balances.checkpoint() == *checkpoint)
+            .map(|(_, balances)| Arc::clone(balances))
+    }
+
+    /// Adds `balances`, evicting by the policy above if the cache is full.
+    /// `current_justified` is the entry that must survive.
+    fn insert(&mut self, balances: Arc<JustifiedBalances>, current_justified: &BeaconCheckpoint) {
+        let sequence = self.next_sequence;
+        self.next_sequence += 1;
+        let checkpoint = balances.checkpoint();
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(_, existing)| existing.checkpoint() == checkpoint)
+        {
+            *entry = (sequence, balances);
+            return;
+        }
+        if self.entries.len() >= JUSTIFIED_BALANCES_CAPACITY {
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, entry))| entry.checkpoint() != *current_justified)
+                .min_by_key(|(_, (sequence, entry))| (entry.checkpoint().epoch, *sequence))
+                .map(|(index, _)| index);
+            if let Some(victim) = victim {
+                self.entries.swap_remove(victim);
+            }
+        }
+        self.entries.push((sequence, balances));
+    }
+}
+
 /// Beacon fork-choice state that is per-slot or per-epoch scratch rather than
 /// chain history: apart from the gloas entries named below, nothing here
 /// survives a restart, and nothing here is worth the write amplification of
@@ -703,7 +770,14 @@ pub(crate) struct BeaconScratch {
     /// the same deadline it always checked.
     pub(crate) block_timeliness: HashMap<H256, [bool; NUM_BLOCK_TIMELINESS_DEADLINES]>,
     pub(crate) equivocating_indices: HashSet<u64>,
-    pub(crate) latest_messages: HashMap<u64, LatestMessage>,
+    /// Dense, indexed by validator index: the vote loop reads votes and
+    /// snapshot balances in index order, not hash order. `None` is a validator
+    /// that has not voted (or an index below the highest one seen).
+    pub(crate) latest_messages: Vec<Option<LatestMessage>>,
+    /// Epoch-boundary balances, flattened for the vote loop
+    /// and keyed by their own checkpoint. A derived cache: a miss is rebuilt
+    /// from `checkpoint_states`, so nothing needs to persist it.
+    pub(crate) justified_balances: JustifiedBalancesCache,
     pub(crate) pow_blocks: HashMap<H256, PowBlock>,
     pub(crate) unrealized_justifications: HashMap<H256, BeaconCheckpoint>,
     /// Gloas: beacon block roots whose execution payload envelope has been
@@ -3692,17 +3766,28 @@ impl Store {
             .lock()
             .unwrap()
             .latest_messages
-            .get(&index)
+            .get(usize::try_from(index).ok()?)
             .copied()
+            .flatten()
     }
 
     /// Records the latest attestation for validator `index`.
+    ///
+    /// The table grows to hold `index`, so an index must come from a validated
+    /// attestation (a member of a committee of the registry), never from raw
+    /// input: a wild index would allocate a table to match. The assertion is
+    /// the tripwire for that in debug builds and fixtures.
     pub fn set_latest_message(&mut self, index: u64, message: LatestMessage) {
-        self.beacon
-            .lock()
-            .unwrap()
-            .latest_messages
-            .insert(index, message);
+        debug_assert!(
+            index < MAX_PLAUSIBLE_VALIDATOR_INDEX,
+            "validator index {index} would grow the dense vote table far past any registry"
+        );
+        let slot = usize::try_from(index).expect("validator index fits in usize");
+        let mut beacon = self.beacon.lock().unwrap();
+        if beacon.latest_messages.len() <= slot {
+            beacon.latest_messages.resize(slot + 1, None);
+        }
+        beacon.latest_messages[slot] = Some(message);
     }
 
     /// Gloas: the payload timeliness committee's per-member votes on whether
@@ -3749,7 +3834,8 @@ impl Store {
     }
 
     /// Calls `f` with `(validator_index, latest_message)` for every latest
-    /// message whose validator has not been observed equivocating.
+    /// message whose validator has not been observed equivocating, in
+    /// ascending validator index.
     ///
     /// Takes a closure rather than returning an iterator or a cloned map:
     /// the data lives behind a mutex, so a borrow of it cannot escape the
@@ -3758,11 +3844,48 @@ impl Store {
     /// let it count for either side of the fork it created.
     pub fn for_each_non_equivocating_latest_message(&self, mut f: impl FnMut(u64, LatestMessage)) {
         let beacon = self.beacon.lock().unwrap();
-        for (&index, &message) in &beacon.latest_messages {
-            if !beacon.equivocating_indices.contains(&index) {
-                f(index, message);
+        // Most of the time nobody has equivocated, so skip the set probe per vote.
+        let any_equivocators = !beacon.equivocating_indices.is_empty();
+        for (index, message) in beacon.latest_messages.iter().enumerate() {
+            let Some(message) = message else {
+                continue;
+            };
+            let index = index as u64;
+            if any_equivocators && beacon.equivocating_indices.contains(&index) {
+                continue;
             }
+            f(index, *message);
         }
+    }
+
+    /// The cached balances snapshot for exactly `checkpoint`, if there is one.
+    ///
+    /// The checkpoint is the whole key, so a caller never has to know which
+    /// code moved the justified checkpoint: an unknown checkpoint just misses.
+    pub fn justified_balances(
+        &self,
+        checkpoint: &BeaconCheckpoint,
+    ) -> Option<Arc<JustifiedBalances>> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .justified_balances
+            .get(checkpoint)
+    }
+
+    /// Adds a balances snapshot to the cache, replacing one for the same
+    /// checkpoint. See [`JustifiedBalancesCache`] for the eviction policy.
+    ///
+    /// Takes `&self`, like [`Self::cache_state`]: the read-only fork-choice
+    /// helpers fill it on a miss.
+    pub fn insert_justified_balances(&self, balances: Arc<JustifiedBalances>) {
+        // Read before taking the lock: it is the one entry eviction must keep.
+        let current_justified = self.beacon_justified_checkpoint();
+        self.beacon
+            .lock()
+            .unwrap()
+            .justified_balances
+            .insert(balances, &current_justified);
     }
 
     /// Looks up a PoW block by its own hash, standing in for the
@@ -7640,6 +7763,33 @@ mod tests {
     }
 
     #[test]
+    fn latest_messages_are_visited_in_validator_index_order_and_gaps_are_skipped() {
+        let mut store = Store::test_store();
+        let message = |epoch| LatestMessage {
+            epoch,
+            slot: epoch * SLOTS_PER_EPOCH,
+            root: H256::from([epoch as u8; 32]),
+            payload_present: false,
+        };
+
+        // Written out of order, with a gap, and one overwritten.
+        store.set_latest_message(9, message(1));
+        store.set_latest_message(2, message(2));
+        store.set_latest_message(5, message(3));
+        store.set_latest_message(5, message(4));
+
+        let mut seen = Vec::new();
+        store
+            .for_each_non_equivocating_latest_message(|index, vote| seen.push((index, vote.epoch)));
+        assert_eq!(seen, vec![(2, 2), (5, 4), (9, 1)]);
+
+        assert_eq!(store.latest_message(5).map(|vote| vote.epoch), Some(4));
+        assert_eq!(store.latest_message(3), None, "a gap is not a vote");
+        assert_eq!(store.latest_message(1_000), None, "past the table");
+        assert_eq!(store.latest_message(u64::MAX), None);
+    }
+
+    #[test]
     fn a_pow_block_is_looked_up_by_its_own_hash() {
         let mut store = Store::test_store();
         let block = PowBlock {
@@ -8407,5 +8557,90 @@ mod tests {
         let index = store.block_index();
         assert!(index.contains_key(&kept));
         assert!(!index.contains_key(&removed));
+    }
+
+    // ---- justified-balances cache ----
+
+    fn snapshot(epoch: u64, root_byte: u8) -> Arc<JustifiedBalances> {
+        Arc::new(JustifiedBalances::new(
+            BeaconCheckpoint {
+                epoch,
+                root: H256::repeat_byte(root_byte),
+            },
+            vec![1].into(),
+            1,
+            vec![1].into(),
+        ))
+    }
+
+    fn cached(cache: &JustifiedBalancesCache, snapshot: &JustifiedBalances) -> bool {
+        cache.get(&snapshot.checkpoint()).is_some()
+    }
+
+    #[test]
+    fn the_balances_cache_is_bounded_and_evicts_the_lowest_epoch_first() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        // Inserted in an order that is not epoch order, so "lowest epoch"
+        // differs from "oldest insert".
+        let epochs = [5, 3, 9, 4, 8, 7, 6, 10];
+        let entries: Vec<_> = epochs.iter().map(|&epoch| snapshot(epoch, 1)).collect();
+        for entry in &entries {
+            cache.insert(Arc::clone(entry), &current.checkpoint());
+        }
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+
+        let newest = snapshot(11, 1);
+        cache.insert(Arc::clone(&newest), &current.checkpoint());
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+        assert!(cached(&cache, &newest));
+        assert!(!cached(&cache, &entries[1]), "epoch 3, the lowest, is gone");
+        assert!(cached(&cache, &entries[3]), "epoch 4 survives for now");
+
+        cache.insert(snapshot(12, 1), &current.checkpoint());
+        assert!(!cached(&cache, &entries[3]), "then epoch 4");
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+    }
+
+    #[test]
+    fn equal_epochs_evict_the_oldest_insert_first() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        let forks: Vec<_> = (0..JUSTIFIED_BALANCES_CAPACITY as u8)
+            .map(|byte| snapshot(7, byte))
+            .collect();
+        for fork in &forks {
+            cache.insert(Arc::clone(fork), &current.checkpoint());
+        }
+        cache.insert(snapshot(7, 200), &current.checkpoint());
+        assert!(!cached(&cache, &forks[0]), "the oldest of the tie goes");
+        assert!(cached(&cache, &forks[1]));
+    }
+
+    #[test]
+    fn the_current_justified_entry_is_never_evicted() {
+        let mut cache = JustifiedBalancesCache::default();
+        // The lowest epoch of all, and the one that must survive.
+        let current = snapshot(1, 0);
+        cache.insert(Arc::clone(&current), &current.checkpoint());
+        for epoch in 2..2 + 3 * JUSTIFIED_BALANCES_CAPACITY as u64 {
+            cache.insert(snapshot(epoch, 1), &current.checkpoint());
+            assert!(cached(&cache, &current), "after inserting epoch {epoch}");
+            assert!(cache.entries.len() <= JUSTIFIED_BALANCES_CAPACITY);
+        }
+    }
+
+    #[test]
+    fn inserting_a_known_checkpoint_replaces_it_without_evicting() {
+        let mut cache = JustifiedBalancesCache::default();
+        let current = snapshot(100, 0);
+        for epoch in 0..JUSTIFIED_BALANCES_CAPACITY as u64 {
+            cache.insert(snapshot(epoch, 1), &current.checkpoint());
+        }
+        let again = snapshot(0, 1);
+        cache.insert(Arc::clone(&again), &current.checkpoint());
+        assert_eq!(cache.entries.len(), JUSTIFIED_BALANCES_CAPACITY);
+        let found = cache.get(&again.checkpoint()).expect("still cached");
+        assert!(Arc::ptr_eq(&found, &again), "the new snapshot replaced it");
     }
 }
