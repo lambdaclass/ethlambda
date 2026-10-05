@@ -37,7 +37,9 @@ use ethlambda_types::{block::ByteList512KiB, primitives::H256};
 
 use crate::signature::{ValidatorPublicKey, ValidatorSignature};
 use leanvm::{ClaimSelection, EthereumProof, SignatureClaims, XmssClaimGroup, aggregate, xmss};
-use std::sync::{Mutex, MutexGuard};
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::{OnceLock, mpsc};
+use std::thread;
 use thiserror::Error;
 use tracing::error;
 
@@ -79,19 +81,59 @@ pub fn init_leanvm(use_arena: bool) {
     }
 }
 
-/// Claims the exclusive right to prove.
+/// A proving job queued for the prover thread.
+type ProverJob = Box<dyn FnOnce() + Send>;
+
+/// Runs `job` on the process's one prover thread and blocks until it returns.
 ///
 /// leanVM allows one proof at a time per process; a second concurrent one panics.
-/// Proving is legal only while the returned guard is alive, so take it immediately
-/// before the prove call: decoding and argument conversion need no permit.
+/// The single thread serializes them, and it is also what bounds the arena:
+/// leanVM's arena hands each thread that proves its own slab and never takes it
+/// back, and the thread driving a proof is the one whose slab fills. Proving from
+/// whichever thread asked would pin one proof's peak per thread ever used, which
+/// is how aggregators running `--prover-arena` grew until they were OOM-killed.
 ///
-/// The permit guards no data, so a poisoned lock is recovered rather than propagated:
-/// one panicking prover must not brick every later proof. It is still an incident.
-fn acquire_prover() -> MutexGuard<'static, ()> {
-    static PROVER_PERMIT: Mutex<()> = Mutex::new(());
-    PROVER_PERMIT.lock().unwrap_or_else(|poisoned| {
-        error!("a previous proving job panicked while holding the permit; continuing");
-        poisoned.into_inner()
+/// Wrap only the prove call: decoding and argument conversion run fine on the
+/// caller. A job must not call back into this function, since the prover thread
+/// would then wait on itself.
+///
+/// A panicking job is caught on the prover thread, so one bad proof cannot take
+/// down every later one, and is re-raised on the caller.
+fn prove<T, F>(job: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    let task: ProverJob = Box::new(move || {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(job));
+        if outcome.is_err() {
+            error!("a proving job panicked; the prover thread carries on");
+        }
+        // The caller waits on the reply until it arrives, so the send cannot fail.
+        let _ = reply_tx.send(outcome);
+    });
+    prover_queue()
+        .send(task)
+        .expect("the prover thread never exits");
+    reply_rx
+        .recv()
+        .expect("the prover thread replies to every job")
+        .unwrap_or_else(|payload| panic::resume_unwind(payload))
+}
+
+/// The prover thread's job queue, spawning the thread on first use.
+///
+/// The thread lives for the rest of the process.
+fn prover_queue() -> &'static mpsc::Sender<ProverJob> {
+    static QUEUE: OnceLock<mpsc::Sender<ProverJob>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<ProverJob>();
+        thread::Builder::new()
+            .name("leanvm-prover".to_string())
+            .spawn(move || rx.into_iter().for_each(|job| job()))
+            .expect("failed to spawn the leanVM prover thread");
+        tx
     })
 }
 
@@ -324,10 +366,8 @@ pub fn aggregate_signatures(
 
     let raw_xmss = raw_xmss_inputs(public_keys, signatures, message, slot);
 
-    let _permit = acquire_prover();
-
-    let proof =
-        aggregate(&[], raw_xmss, vec![], &[], None, LOG_INV_RATE).map_err(aggregation_failed)?;
+    let proof = prove(move || aggregate(&[], raw_xmss, vec![], &[], None, LOG_INV_RATE))
+        .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
 }
@@ -375,10 +415,9 @@ pub fn aggregate_mixed(
     let children_native = decompress_children(children, message, slot)?;
     let raw_xmss = raw_xmss_inputs(raw_public_keys, raw_signatures, message, slot);
 
-    let _permit = acquire_prover();
-
-    let proof = aggregate(&children_native, raw_xmss, vec![], &[], None, LOG_INV_RATE)
-        .map_err(aggregation_failed)?;
+    let proof =
+        prove(move || aggregate(&children_native, raw_xmss, vec![], &[], None, LOG_INV_RATE))
+            .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
 }
@@ -412,9 +451,7 @@ pub fn aggregate_proofs(
 
     let children_native = decompress_children(children, message, slot)?;
 
-    let _permit = acquire_prover();
-
-    let proof = aggregate(&children_native, vec![], vec![], &[], None, LOG_INV_RATE)
+    let proof = prove(move || aggregate(&children_native, vec![], vec![], &[], None, LOG_INV_RATE))
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&proof)
@@ -500,9 +537,7 @@ pub fn merge_type_1s_into_type_2(
         })
         .collect::<Result<_, _>>()?;
 
-    let _permit = acquire_prover();
-
-    let merged = aggregate(&type_1s_native, vec![], vec![], &[], None, LOG_INV_RATE)
+    let merged = prove(move || aggregate(&type_1s_native, vec![], vec![], &[], None, LOG_INV_RATE))
         .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&merged)
@@ -574,17 +609,17 @@ pub fn split_type_2_by_message(
         xmss: vec![group],
         sphincs: Vec::new(),
     };
-    // No blobs: ethlambda makes no LeanDA claim, so the selection publishes the
-    // one signature group and no DA roots.
-    let declare = ClaimSelection {
-        signatures: &kept,
-        da_commitments: &[],
-    };
 
-    let _permit = acquire_prover();
-
-    let component = aggregate(&[type_2], vec![], vec![], &[], Some(declare), LOG_INV_RATE)
-        .map_err(aggregation_failed)?;
+    let component = prove(move || {
+        // No blobs: ethlambda makes no LeanDA claim, so the selection publishes the
+        // one signature group and no DA roots.
+        let declare = ClaimSelection {
+            signatures: &kept,
+            da_commitments: &[],
+        };
+        aggregate(&[type_2], vec![], vec![], &[], Some(declare), LOG_INV_RATE)
+    })
+    .map_err(aggregation_failed)?;
 
     compress_to_byte_list(&component)
 }
@@ -639,11 +674,42 @@ mod tests {
         // (`OnceLock::get_or_init`).
         init_leanvm(false);
         init_leanvm(false);
+    }
 
-        // The permit is dropped between acquisitions: it is not reentrant, so holding
-        // both at once would deadlock. That also covers release-on-drop.
-        drop(acquire_prover());
-        drop(acquire_prover());
+    /// The arena bound rests on this: however many threads ask for a proof, one
+    /// thread runs them all, and it is none of the askers.
+    #[test]
+    fn prove_runs_every_job_on_one_thread() {
+        let askers: Vec<_> = (0..4)
+            .map(|_| {
+                thread::spawn(|| {
+                    let asker = thread::current().id();
+                    let prover = prove(|| thread::current().id());
+                    (asker, prover)
+                })
+            })
+            .collect();
+        let ids: Vec<_> = askers
+            .into_iter()
+            .map(|asker| asker.join().expect("asker thread"))
+            .collect();
+
+        let prover = ids[0].1;
+        assert!(ids.iter().all(|&(_, id)| id == prover));
+        assert!(ids.iter().all(|&(asker, _)| asker != prover));
+        assert_ne!(thread::current().id(), prover);
+    }
+
+    /// A panicking job reaches its caller, and the prover thread outlives it.
+    #[test]
+    fn prove_reraises_a_panic_and_keeps_proving() {
+        let before = prove(|| thread::current().id());
+
+        let outcome = panic::catch_unwind(|| prove(|| panic!("bad proof")));
+        let payload = outcome.expect_err("the job's panic reaches the caller");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"bad proof"));
+
+        assert_eq!(prove(|| thread::current().id()), before);
     }
 
     /// The claim list a decode rebuilds has to match what was aggregated, and
