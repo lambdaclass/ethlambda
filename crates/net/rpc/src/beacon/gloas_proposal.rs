@@ -84,13 +84,13 @@ use ethlambda_types::{
     },
     primitives::H256,
 };
-use libssz::{SszDecode as _, SszEncode as _};
+use libssz::SszEncode as _;
 use libssz_derive::{SszDecode, SszEncode};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::beacon::{
-    ApiError,
+    ApiError, BodyEncoding,
     proposal::{Blobs, CellKzgProofs, decimal, require_gloas_slot},
     validator::{FeeRecipients, head},
 };
@@ -140,22 +140,24 @@ impl PayloadCache {
 
 /// Gloas's `BlockContents`, the Beacon API's envelope for a self-built block
 /// with its payload: not a consensus container, so it lives with the API.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GloasBlockContents {
     pub(crate) block: BeaconBlock,
     pub(crate) execution_payload_envelope: ExecutionPayloadEnvelope,
-    #[serde(serialize_with = "ethlambda_types::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub(crate) kzg_proofs: CellKzgProofs,
-    #[serde(serialize_with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub(crate) blobs: Blobs,
 }
 
 /// Gloas's `SignedExecutionPayloadEnvelopeContents`, what the stateless form of
 /// `publishExecutionPayloadEnvelope` receives.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GloasSignedEnvelopeContents {
     pub(crate) signed_execution_payload_envelope: SignedExecutionPayloadEnvelope,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub(crate) kzg_proofs: CellKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub(crate) blobs: Blobs,
 }
 
@@ -756,13 +758,10 @@ async fn post_envelope_waiting(
     if consensus_version(headers) != Some(ForkName::Gloas) {
         return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
     }
-    if !is_ssz(headers) {
-        return (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "envelopes are accepted as application/octet-stream only",
-        )
-            .into_response();
-    }
+    let encoding = match BodyEncoding::from_headers(headers) {
+        Ok(encoding) => encoding,
+        Err(err) => return err.into_response(),
+    };
     let blob_data_included = match headers
         .get("eth-blob-data-included")
         .and_then(|value| value.to_str().ok())
@@ -775,8 +774,8 @@ async fn post_envelope_waiting(
         }
     };
     let (signed, supplied) = if blob_data_included {
-        match GloasSignedEnvelopeContents::from_ssz_bytes(body) {
-            Ok(contents) => (
+        match encoding.decode::<GloasSignedEnvelopeContents>(body) {
+            Some(contents) => (
                 contents.signed_execution_payload_envelope,
                 Some((
                     contents
@@ -787,7 +786,7 @@ async fn post_envelope_waiting(
                     contents.kzg_proofs.to_vec(),
                 )),
             ),
-            Err(_) => {
+            None => {
                 return ApiError::BadRequest(
                     "the body is not a gloas SignedExecutionPayloadEnvelopeContents",
                 )
@@ -795,9 +794,9 @@ async fn post_envelope_waiting(
             }
         }
     } else {
-        match SignedExecutionPayloadEnvelope::from_ssz_bytes(body) {
-            Ok(signed) => (signed, None),
-            Err(_) => {
+        match encoding.decode::<SignedExecutionPayloadEnvelope>(body) {
+            Some(signed) => (signed, None),
+            None => {
                 return ApiError::BadRequest(
                     "the body is not a gloas SignedExecutionPayloadEnvelope",
                 )
@@ -1093,6 +1092,82 @@ mod tests {
         (headers, body)
     }
 
+    /// The same as [`envelope_request`] with a JSON body, which is what teku's
+    /// validator client posts.
+    fn json_envelope_request(included: Option<&str>, body: Vec<u8>) -> (HeaderMap, Vec<u8>) {
+        let (mut headers, body) = envelope_request(included, body);
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        (headers, body)
+    }
+
+    #[tokio::test]
+    async fn an_envelope_is_accepted_as_json_exactly_as_it_is_as_ssz() {
+        let state = state_to_build_on();
+        let produced = produced_without_blobs(&state);
+        let signature = sign_block(&state, &produced.block);
+        let (store, _root, post) = store_with_block(&state, &produced, signature);
+        let signed = signed_envelope(&post, &produced);
+        let wait = Duration::from_millis(100);
+
+        let mut published = Vec::new();
+        for json in [false, true] {
+            let network = Arc::new(RecordingNetwork::default());
+            let p2p: RpcToP2PRef = network.clone();
+            let (headers, body) = if json {
+                json_envelope_request(Some("false"), serde_json::to_vec(&signed).unwrap())
+            } else {
+                envelope_request(Some("false"), signed.to_ssz())
+            };
+            let response = post_envelope_waiting(
+                &store,
+                &p2p,
+                &PayloadCache::default(),
+                &headers,
+                &body,
+                wait,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "json: {json}");
+            published.push(network.envelopes.lock().unwrap().clone());
+        }
+        assert_eq!(published[0].len(), 1);
+        assert_eq!(published[0], published[1]);
+
+        // The same refusals: a forged signature, and a body that is not an envelope.
+        let network = Arc::new(RecordingNetwork::default());
+        let p2p: RpcToP2PRef = network.clone();
+        let mut forged = signed.clone();
+        forged.signature =
+            sign_envelope(&post, produced.block.proposer_index + 1, &produced.envelope);
+        let (headers, body) =
+            json_envelope_request(Some("false"), serde_json::to_vec(&forged).unwrap());
+        let response = post_envelope_waiting(
+            &store,
+            &p2p,
+            &PayloadCache::default(),
+            &headers,
+            &body,
+            wait,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let (headers, body) = json_envelope_request(Some("false"), b"{\"message\": 1}".to_vec());
+        let response = post_envelope_waiting(
+            &store,
+            &p2p,
+            &PayloadCache::default(),
+            &headers,
+            &body,
+            wait,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(network.envelopes.lock().unwrap().is_empty());
+    }
+
     /// A produced block with no blobs, so the envelope needs no columns.
     fn produced_without_blobs(state: &BeaconState) -> GloasProduced {
         use ethlambda_state_transition::beacon::gloas_block_production::{
@@ -1242,15 +1317,21 @@ mod tests {
         let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // JSON is not accepted.
+        // Any other content type is a 415 (JSON is accepted, see
+        // `an_envelope_is_accepted_as_json_exactly_as_it_is_as_ssz`), and SSZ
+        // bytes labelled JSON are not a JSON envelope.
         let signed = signed_envelope(&post, &produced);
+        let (mut headers, body) = envelope_request(Some("false"), signed.to_ssz());
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
         let (mut headers, body) = envelope_request(Some("false"), signed.to_ssz());
         headers.insert(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
         let response = post_envelope_waiting(&store, &p2p, &cache, &headers, &body, wait).await;
-        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         // The blob-data header is required.
         let (headers, body) = envelope_request(None, signed.to_ssz());
@@ -1364,6 +1445,88 @@ mod tests {
             blob,
             proofs: proofs.to_vec(),
         }
+    }
+
+    #[tokio::test]
+    async fn json_envelope_contents_carry_the_blobs_and_are_checked_like_ssz() {
+        let WithBlob {
+            state,
+            produced,
+            blob,
+            proofs,
+        } = with_blob();
+        let signature = sign_block(&state, &produced.block);
+        let (store, _root, post) = store_with_block(&state, &produced, signature);
+        let signed = signed_envelope(&post, &produced);
+        let wait = Duration::from_millis(100);
+        let contents = |blob: &[u8]| GloasSignedEnvelopeContents {
+            signed_execution_payload_envelope: signed.clone(),
+            kzg_proofs: CellKzgProofs::try_from(proofs.clone()).unwrap(),
+            blobs: blobs_list(vec![blob.to_vec()]).unwrap(),
+        };
+        let send = |network: Arc<RecordingNetwork>, contents: GloasSignedEnvelopeContents| {
+            let store = store.clone();
+            async move {
+                let p2p: RpcToP2PRef = network;
+                let (headers, body) =
+                    json_envelope_request(Some("true"), serde_json::to_vec(&contents).unwrap());
+                post_envelope_waiting(
+                    &store,
+                    &p2p,
+                    &PayloadCache::default(),
+                    &headers,
+                    &body,
+                    wait,
+                )
+                .await
+            }
+        };
+
+        let network = Arc::new(RecordingNetwork::default());
+        let response = send(network.clone(), contents(&blob)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            network.envelopes.lock().unwrap()[0].1.len(),
+            ethlambda_types::beacon::preset::NUMBER_OF_COLUMNS
+        );
+
+        let mut tampered = blob.clone();
+        tampered[63] ^= 1;
+        let rejected = Arc::new(RecordingNetwork::default());
+        let response = send(rejected.clone(), contents(&tampered)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(rejected.envelopes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_block_and_envelope_contents_round_trip_through_json() {
+        let WithBlob {
+            state,
+            produced,
+            blob,
+            proofs,
+        } = with_blob();
+        let signature = sign_block(&state, &produced.block);
+        let (_store, _root, post) = store_with_block(&state, &produced, signature);
+        let signed = signed_envelope(&post, &produced);
+        let contents = GloasSignedEnvelopeContents {
+            signed_execution_payload_envelope: signed,
+            kzg_proofs: CellKzgProofs::try_from(proofs.clone()).unwrap(),
+            blobs: blobs_list(vec![blob.clone()]).unwrap(),
+        };
+        let back: GloasSignedEnvelopeContents =
+            serde_json::from_slice(&serde_json::to_vec(&contents).unwrap()).unwrap();
+        assert_eq!(back, contents);
+
+        let block_contents = GloasBlockContents {
+            block: produced.block.clone(),
+            execution_payload_envelope: produced.envelope.clone(),
+            kzg_proofs: CellKzgProofs::try_from(proofs).unwrap(),
+            blobs: blobs_list(vec![blob]).unwrap(),
+        };
+        let back: GloasBlockContents =
+            serde_json::from_slice(&serde_json::to_vec(&block_contents).unwrap()).unwrap();
+        assert_eq!(back, block_contents);
     }
 
     #[tokio::test]

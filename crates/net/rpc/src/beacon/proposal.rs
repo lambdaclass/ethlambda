@@ -50,13 +50,13 @@ use ethlambda_types::{
     },
     primitives::H256,
 };
-use libssz::{SszDecode as _, SszEncode as _};
+use libssz::SszEncode as _;
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use crate::beacon::{ApiError, validator::FeeRecipients, validator::head};
+use crate::beacon::{ApiError, BodyEncoding, validator::FeeRecipients, validator::head};
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
 
 /// One KZG proof per cell of every blob, fulu's `kzg_proofs` bound.
@@ -69,20 +69,22 @@ pub(crate) type Blobs = SszList<Blob, { preset::MAX_BLOB_COMMITMENTS_PER_BLOCK }
 /// Fulu's `BlockContents`, the Beacon API's envelope for an unblinded block
 /// and the blobs its proposer publishes with it. A beacon-APIs container, not
 /// a consensus one, so it lives with the API.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FuluBlockContents {
     pub(crate) block: BeaconBlock,
-    #[serde(serialize_with = "ethlambda_types::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub(crate) kzg_proofs: CellKzgProofs,
-    #[serde(serialize_with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub(crate) blobs: Blobs,
 }
 
 /// Fulu's `SignedBlockContents`, what `publishBlockV2` receives.
-#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
 pub(crate) struct FuluSignedBlockContents {
     pub(crate) signed_block: SignedBeaconBlock,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
     pub(crate) kzg_proofs: CellKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
     pub(crate) blobs: Blobs,
 }
 
@@ -95,7 +97,8 @@ pub(crate) fn routes() -> Router<Store> {
         )
 }
 
-/// `POST /eth/v2/beacon/blocks`, SSZ-encoded `SignedBlockContents`.
+/// `POST /eth/v2/beacon/blocks`, `SignedBlockContents` (fulu) or a bare
+/// `SignedBeaconBlock` (gloas), as SSZ or JSON by `Content-Type`.
 ///
 /// Checked before it goes anywhere: the fork is fulu, it carries no blobs
 /// (whose data columns this node cannot publish yet, see the module docs), it
@@ -117,21 +120,14 @@ async fn post_block(
     if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
         return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
     }
-    let is_ssz = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with(crate::SSZ_CONTENT_TYPE));
-    if !is_ssz {
-        return (
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "blocks are accepted as application/octet-stream only",
-        )
-            .into_response();
-    }
+    let encoding = match BodyEncoding::from_headers(&headers) {
+        Ok(encoding) => encoding,
+        Err(err) => return err.into_response(),
+    };
     if fork == Some(ForkName::Gloas) {
-        return post_gloas_block(&store, &p2p, &body).await;
+        return post_gloas_block(&store, &p2p, encoding, &body).await;
     }
-    let Ok(contents) = FuluSignedBlockContents::from_ssz_bytes(&body) else {
+    let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
     };
     if !contents.blobs.is_empty()
@@ -176,7 +172,7 @@ async fn post_block(
     StatusCode::OK.into_response()
 }
 
-/// The gloas half of `publishBlockV2`: a bare SSZ `SignedBeaconBlock`, since a
+/// The gloas half of `publishBlockV2`: a bare `SignedBeaconBlock`, since a
 /// gloas block carries no payload and no blobs of its own (the envelope and
 /// the data columns follow through `publishExecutionPayloadEnvelope`).
 ///
@@ -185,8 +181,13 @@ async fn post_block(
 /// slot's, and the proposer's signature verifies against the parent's state
 /// advanced to the slot. The advance and the signature are CPU-bound and run
 /// off the runtime.
-async fn post_gloas_block(store: &Store, p2p: &RpcToP2PRef, body: &[u8]) -> Response {
-    let Ok(signed) = containers::gloas::SignedBeaconBlock::from_ssz_bytes(body) else {
+async fn post_gloas_block(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    encoding: BodyEncoding,
+    body: &[u8],
+) -> Response {
+    let Some(signed) = encoding.decode::<containers::gloas::SignedBeaconBlock>(body) else {
         return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock").into_response();
     };
     let block = containers::SignedBeaconBlock::Gloas(signed);
@@ -579,6 +580,61 @@ mod tests {
         assert_eq!(json["message"], "blocks are accepted for fulu slots only");
     }
 
+    /// A fulu body in either encoding reaches the same check and gets the same
+    /// answer, here the refusal of a slot the schedule does not place at fulu.
+    #[tokio::test]
+    async fn fulu_block_contents_are_accepted_as_json_exactly_as_ssz() {
+        let (store, _) = gloas_scheduled_store();
+        let contents = FuluSignedBlockContents {
+            signed_block: containers::electra::SignedBeaconBlock {
+                message: containers::electra::BeaconBlock {
+                    slot: 64,
+                    proposer_index: 0,
+                    parent_root: H256::ZERO,
+                    state_root: H256::ZERO,
+                    body: containers::electra::BeaconBlockBody::empty(),
+                },
+                signature: Default::default(),
+            },
+            kzg_proofs: Default::default(),
+            blobs: Default::default(),
+        };
+        let back: FuluSignedBlockContents =
+            serde_json::from_slice(&serde_json::to_vec(&contents).unwrap()).unwrap();
+        assert_eq!(back, contents);
+
+        let mut answers = Vec::new();
+        for (content_type, body) in [
+            (crate::SSZ_CONTENT_TYPE, contents.to_ssz()),
+            ("application/json", serde_json::to_vec(&contents).unwrap()),
+        ] {
+            let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+            let app = routes().with_state(store.clone()).layer(Extension(network));
+            let request = Request::post("/eth/v2/beacon/blocks")
+                .header("eth-consensus-version", "fulu")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(body))
+                .unwrap();
+            answers.push(respond(app, request).await);
+        }
+        assert_eq!(answers[0].0, StatusCode::BAD_REQUEST);
+        assert_eq!(answers[0], answers[1]);
+    }
+
+    #[tokio::test]
+    async fn a_block_content_type_other_than_json_or_ssz_is_a_415() {
+        let (store, _) = gloas_scheduled_store();
+        let network: RpcToP2PRef = Arc::new(RecordingNetwork::default());
+        let app = routes().with_state(store).layer(Extension(network));
+        let request = Request::post("/eth/v2/beacon/blocks")
+            .header("eth-consensus-version", "fulu")
+            .header(header::CONTENT_TYPE, "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, _) = respond(app, request).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
     #[tokio::test]
     async fn a_block_over_the_default_body_limit_is_not_a_413() {
         let (store, _) = gloas_scheduled_store();
@@ -627,6 +683,27 @@ mod tests {
         let (status, _) = post(store.clone(), network.clone(), &signed).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(network.blocks.lock().unwrap().len(), 1);
+
+        // The same block as JSON is accepted and published identically, and a
+        // forged one refused.
+        let post_json = |network: Arc<RecordingNetwork>,
+                         signed: &containers::gloas::SignedBeaconBlock| {
+            let network: RpcToP2PRef = network;
+            let app = routes().with_state(store.clone()).layer(Extension(network));
+            let request = Request::post("/eth/v2/beacon/blocks")
+                .header("eth-consensus-version", "gloas")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(signed).unwrap()))
+                .unwrap();
+            respond(app, request)
+        };
+        let via_json = Arc::new(RecordingNetwork::default());
+        let (status, _) = post_json(via_json.clone(), &signed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            *via_json.blocks.lock().unwrap(),
+            *network.blocks.lock().unwrap()
+        );
 
         // A signature from another validator, and a block whose parent is not held.
         let rejected = Arc::new(RecordingNetwork::default());
