@@ -7,21 +7,37 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
+use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::containers::shared::Checkpoint;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
 
-use crate::beacon_node::block_contents::{Contents, ProducedBlock, empty_block_for};
+use crate::beacon_node::block_contents::{
+    Contents, GloasPayload, ProducedBlock, empty_block_for, empty_gloas_block_for,
+    empty_gloas_envelope_for,
+};
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto,
+    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    Published, ValidatorEntry,
+    AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
+    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
+
+/// What the mock produces at a gloas slot.
+#[derive(Debug, Clone, Copy)]
+pub struct GloasBlockSpec {
+    pub slot: Slot,
+    pub proposer_index: ValidatorIndex,
+    /// The builder the bid names; `BUILDER_INDEX_SELF_BUILD` for a self-build.
+    pub builder_index: u64,
+    /// Whether `produce_block` returns the envelope with the block, as
+    /// `include_payload=true` does.
+    pub include_payload: bool,
+}
 
 /// A `BeaconNodeApi` driven entirely by fields and methods a test controls,
 /// rather than by a network or a real beacon node.
@@ -49,6 +65,15 @@ pub struct MockBeaconNode {
     /// The slot and proposer the mock will produce a block for. `None` makes
     /// `produce_block` fail, the way an unset `attestation_data` does.
     pub produces_block: Option<(Slot, ValidatorIndex)>,
+    /// What the mock produces when asked for a gloas block.
+    pub produces_gloas_block: Option<GloasBlockSpec>,
+    /// When set, the envelope the mock serves is for this root instead of the
+    /// produced block's, so a test can present a wrong one.
+    pub envelope_root_override: Option<Root>,
+    /// Every envelope body published, with `Eth-Blob-Data-Included`.
+    pub published_envelopes: Mutex<Vec<(Vec<u8>, bool)>>,
+    /// Every `execution_payload_envelope` request, as (slot, block root).
+    pub envelope_requests: Mutex<Vec<(Slot, Root)>>,
     /// What `publish_block` reports. Defaults to `Imported`; a test that cares
     /// about the 202 path sets it.
     pub publish_outcome: Option<Published>,
@@ -71,6 +96,18 @@ pub struct MockBeaconNode {
     /// When set, `aggregate_attestation` answers with an aggregate over this
     /// data. `None` makes it fail the way a node with nothing to fold does.
     pub aggregate: Option<AttestationData>,
+    /// The fork the mock names for its aggregate. Defaults to electra.
+    pub aggregate_fork: Option<ForkName>,
+    /// Every published gloas aggregate batch.
+    pub published_gloas_aggregates: Mutex<Vec<(ForkName, Vec<gloas::SignedAggregateAndProof>)>>,
+    pub ptc: Mutex<Vec<(Epoch, PtcDuties)>>,
+    pub ptc_calls: Mutex<usize>,
+    /// What `payload_attestation_data` answers with. `None` is the 204.
+    pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
+    pub payload_attestation_data_calls: Mutex<usize>,
+    pub submitted_payload_attestations: Mutex<Vec<gloas::PayloadAttestationMessage>>,
+    /// The fork each `attestation_data` call named, in call order.
+    pub attestation_data_forks: Mutex<Vec<ForkName>>,
     pub duties_calls: Mutex<usize>,
     pub validator_indices_calls: Mutex<usize>,
     pub proposer_duties_calls: Mutex<usize>,
@@ -199,6 +236,117 @@ impl MockBeaconNode {
     pub fn with_block(mut self, slot: Slot, proposer_index: ValidatorIndex) -> Self {
         self.produces_block = Some((slot, proposer_index));
         self
+    }
+
+    /// Answer `produce_block` at a gloas slot with a bare gloas block whose
+    /// bid names `builder_index`, with its self-built envelope attached when
+    /// `include_payload` is set.
+    pub fn with_gloas_block(
+        mut self,
+        slot: Slot,
+        proposer_index: ValidatorIndex,
+        builder_index: u64,
+        include_payload: bool,
+    ) -> Self {
+        self.produces_gloas_block = Some(GloasBlockSpec {
+            slot,
+            proposer_index,
+            builder_index,
+            include_payload,
+        });
+        self
+    }
+
+    /// Serve an envelope for `root` whatever block was produced.
+    pub fn with_envelope_for(mut self, root: Root) -> Self {
+        self.envelope_root_override = Some(root);
+        self
+    }
+
+    /// Every envelope body published, with `Eth-Blob-Data-Included`.
+    pub fn published_envelopes(&self) -> Vec<(Vec<u8>, bool)> {
+        self.published_envelopes.lock().expect("lock").clone()
+    }
+
+    /// Every envelope fetch, as (slot, block root).
+    pub fn envelope_requests(&self) -> Vec<(Slot, Root)> {
+        self.envelope_requests.lock().expect("lock").clone()
+    }
+
+    /// Answer `aggregate_attestation` with a gloas aggregate over `data`.
+    pub fn with_gloas_aggregate(mut self, data: AttestationData) -> Self {
+        self.aggregate = Some(data);
+        self.aggregate_fork = Some(ForkName::Gloas);
+        self
+    }
+
+    /// Every gloas aggregate batch published so far.
+    pub fn published_gloas_aggregates(
+        &self,
+    ) -> Vec<(ForkName, Vec<gloas::SignedAggregateAndProof>)> {
+        self.published_gloas_aggregates
+            .lock()
+            .expect("lock")
+            .clone()
+    }
+
+    /// Give `attestation_data` answers a nonzero `index`, the way a gloas node
+    /// signals a full payload.
+    pub fn with_attestation_index(mut self, index: u64) -> Self {
+        if let Some(data) = self.attestation_data.as_mut() {
+            data.index = index;
+        }
+        self
+    }
+
+    /// The forks `attestation_data` was asked under, in call order.
+    pub fn attestation_data_forks(&self) -> Vec<ForkName> {
+        self.attestation_data_forks.lock().expect("lock").clone()
+    }
+
+    pub fn with_ptc_duties(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<PtcDutyDto>,
+    ) -> Self {
+        self.set_ptc_duties(epoch, dependent_root, duties);
+        self
+    }
+
+    /// Replace the PTC duties stored for `epoch`, the way `set_duties` does.
+    pub fn set_ptc_duties(&self, epoch: Epoch, dependent_root: Root, duties: Vec<PtcDutyDto>) {
+        let mut stored = self.ptc.lock().expect("lock");
+        let entry = PtcDuties {
+            dependent_root,
+            duties,
+        };
+        match stored.iter_mut().find(|(held, _)| *held == epoch) {
+            Some((_, existing)) => *existing = entry,
+            None => stored.push((epoch, entry)),
+        }
+    }
+
+    pub fn ptc_call_count(&self) -> usize {
+        *self.ptc_calls.lock().expect("lock")
+    }
+
+    /// Answer `payload_attestation_data` with `data`.
+    pub fn with_payload_attestation_data(mut self, data: gloas::PayloadAttestationData) -> Self {
+        self.payload_attestation_data = Some(data);
+        self
+    }
+
+    pub fn payload_attestation_data_call_count(&self) -> usize {
+        *self.payload_attestation_data_calls.lock().expect("lock")
+    }
+
+    /// Every payload attestation message submitted so far.
+    pub fn submitted_payload_attestations(&self) -> Vec<gloas::PayloadAttestationMessage> {
+        self.submitted_payload_attestations
+            .lock()
+            .expect("lock")
+            .clone()
     }
 
     pub fn with_publish_outcome(mut self, outcome: Published) -> Self {
@@ -377,9 +525,10 @@ impl BeaconNodeApi for MockBeaconNode {
             })
     }
 
-    async fn attestation_data(&self, slot: Slot) -> Result<AttestationData> {
+    async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData> {
         self.guard("attestation_data")?;
         *self.attestation_data_calls.lock().expect("lock") += 1;
+        self.attestation_data_forks.lock().expect("lock").push(fork);
         let data = self.attestation_data.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
             failure: BeaconNodeFailure::Request,
@@ -405,6 +554,28 @@ impl BeaconNodeApi for MockBeaconNode {
             .lock()
             .expect("lock")
             .push(request.clone());
+        if request.fork >= ForkName::Gloas {
+            let spec = self.produces_gloas_block.ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: "no gloas block set".into(),
+            })?;
+            let block = empty_gloas_block_for(spec.slot, spec.proposer_index, spec.builder_index);
+            let payload = spec.include_payload.then(|| {
+                use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+                Box::new(GloasPayload {
+                    envelope: empty_gloas_envelope_for(block.hash_tree_root(), spec.builder_index),
+                    kzg_proofs: Default::default(),
+                    blobs: Default::default(),
+                })
+            });
+            let block = ProducedBlock {
+                fork: ForkName::Gloas,
+                contents: Contents::Gloas { block, payload },
+            };
+            crate::beacon_node::validate_produced_block(request, &block)?;
+            return Ok(block);
+        }
         let (slot, proposer_index) = self.produces_block.ok_or_else(|| Error::BeaconNode {
             url: "mock".to_string(),
             failure: BeaconNodeFailure::Request,
@@ -432,6 +603,92 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .push((fork, body.to_vec()));
         Ok(self.publish_outcome.unwrap_or(Published::Imported))
+    }
+
+    async fn execution_payload_envelope(
+        &self,
+        slot: Slot,
+        block_root: Root,
+    ) -> Result<gloas::ExecutionPayloadEnvelope> {
+        self.guard("execution_payload_envelope")?;
+        self.envelope_requests
+            .lock()
+            .expect("lock")
+            .push((slot, block_root));
+        let spec = self
+            .produces_gloas_block
+            .ok_or_else(|| Error::BeaconNodeStatus {
+                status: 404,
+                body: "no envelope cached".to_string(),
+            })?;
+        let root = self.envelope_root_override.unwrap_or(block_root);
+        let envelope = empty_gloas_envelope_for(root, spec.builder_index);
+        // Honours the contract the real implementation does.
+        if envelope.beacon_block_root != block_root {
+            return Err(Error::InconsistentResponse(
+                "the envelope is for another block".to_string(),
+            ));
+        }
+        Ok(envelope)
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()> {
+        self.guard("publish_execution_payload_envelope")?;
+        self.published_envelopes
+            .lock()
+            .expect("lock")
+            .push((body.to_vec(), blob_data_included));
+        Ok(())
+    }
+
+    async fn ptc_duties(&self, epoch: Epoch, _indices: &[ValidatorIndex]) -> Result<PtcDuties> {
+        self.guard("ptc_duties")?;
+        *self.ptc_calls.lock().expect("lock") += 1;
+        self.ptc
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no ptc duties for epoch {epoch}"),
+            })
+    }
+
+    async fn payload_attestation_data(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<gloas::PayloadAttestationData>> {
+        self.guard("payload_attestation_data")?;
+        *self.payload_attestation_data_calls.lock().expect("lock") += 1;
+        let Some(data) = self.payload_attestation_data else {
+            return Ok(None);
+        };
+        if data.slot != slot {
+            return Err(Error::InconsistentResponse(format!(
+                "requested payload attestation data for slot {slot}, node answered for slot {}",
+                data.slot
+            )));
+        }
+        Ok(Some(data))
+    }
+
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize> {
+        self.guard("submit_payload_attestations")?;
+        self.submitted_payload_attestations
+            .lock()
+            .expect("lock")
+            .extend_from_slice(messages);
+        Ok(messages.len())
     }
 
     async fn submit_attestations(
@@ -476,27 +733,46 @@ impl BeaconNodeApi for MockBeaconNode {
                 data.slot
             )));
         }
+        if self.aggregate_fork == Some(ForkName::Gloas) {
+            return Ok(AggregateAttestation {
+                fork: ForkName::Gloas,
+                attestation: AggregateKind::Gloas(gloas::Attestation {
+                    aggregation_bits: Default::default(),
+                    data,
+                    signature: Default::default(),
+                    committee_bits: Default::default(),
+                }),
+            });
+        }
         Ok(AggregateAttestation {
             fork: ForkName::Electra,
-            attestation: Attestation {
+            attestation: AggregateKind::Electra(Attestation {
                 aggregation_bits: Default::default(),
                 data,
                 signature: Default::default(),
                 committee_bits: Default::default(),
-            },
+            }),
         })
     }
 
     async fn publish_aggregates(
         &self,
         fork: ForkName,
-        aggregates: &[SignedAggregateAndProof],
+        aggregates: &SignedAggregates,
     ) -> Result<()> {
         self.guard("publish_aggregates")?;
-        self.published_aggregates
-            .lock()
-            .expect("lock")
-            .push((fork, aggregates.to_vec()));
+        match aggregates {
+            SignedAggregates::Electra(list) => self
+                .published_aggregates
+                .lock()
+                .expect("lock")
+                .push((fork, list.clone())),
+            SignedAggregates::Gloas(list) => self
+                .published_gloas_aggregates
+                .lock()
+                .expect("lock")
+                .push((fork, list.clone())),
+        }
         Ok(())
     }
 

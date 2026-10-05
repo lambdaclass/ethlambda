@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::Slot;
+use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -105,7 +106,15 @@ impl<B: BeaconNodeApi> AttestationService<B> {
             });
         }
 
-        let data = self.beacon_node.attestation_data(slot).await?;
+        // The fork of the slot, by this client's own schedule, tells the node
+        // which form of the query to answer: from gloas the `committee_index`
+        // is omitted and the answer's `index` is the payload signal. It is
+        // signed as received, never reset to zero.
+        let slot_fork = self
+            .context
+            .config
+            .fork_at_epoch(compute_epoch_at_slot(slot));
+        let data = self.beacon_node.attestation_data(slot, slot_fork).await?;
 
         // Checked again here, having already been checked by the
         // implementation this call went through (see the contract on
