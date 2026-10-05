@@ -33,7 +33,7 @@ use std::{
 use axum::{
     Extension, Router,
     body::Bytes,
-    extract::{Path, Query, State, rejection::QueryRejection},
+    extract::{DefaultBodyLimit, Path, Query, State, rejection::QueryRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -169,7 +169,7 @@ pub(crate) fn routes() -> Router<Store> {
         )
         .route(
             "/eth/v1/beacon/execution_payload_envelopes",
-            post(post_envelope),
+            post(post_envelope).layer(DefaultBodyLimit::max(super::MAX_PUBLISH_BODY_BYTES)),
         )
         .layer(Extension(PayloadCache::default()))
 }
@@ -948,6 +948,21 @@ mod tests {
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_envelope_over_the_default_body_limit_is_not_a_413() {
+        let (store, _) = gloas_scheduled_store();
+        let network: RpcToP2PRef = std::sync::Arc::new(RecordingNetwork::default());
+        let app = routes().with_state(store).layer(Extension(network));
+        let request = Request::post("/eth/v1/beacon/execution_payload_envelopes")
+            .header("eth-consensus-version", "gloas")
+            .header("eth-blob-data-included", "true")
+            .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+            .body(Body::from(vec![0u8; 3 * 1024 * 1024]))
+            .unwrap();
+        let (status, _) = respond(app, request).await;
+        assert_ne!(status, StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     const EMPTY_CONFIG: &str = r#"{"min_bid":"0","builder_boost_factor":"0","builders":[]}"#;

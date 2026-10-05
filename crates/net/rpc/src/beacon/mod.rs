@@ -33,6 +33,18 @@ pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
 
+/// Request-body cap for the routes that accept blocks, envelopes and blobs.
+///
+/// Axum's default is 2 MiB, which a fulu `SignedBlockContents` outgrows at
+/// about 14 blobs (each blob is 131072 bytes, plus 128 cell proofs of 48 bytes,
+/// 6144 bytes, per blob). The preset's `MAX_BLOB_COMMITMENTS_PER_BLOCK` (4096,
+/// roughly 550 MB) is no practical bound, so this is sized from what the blob
+/// schedule allows in practice instead: a generous 128 blobs and their cell
+/// proofs come to about 17.5 MiB, a maximal execution payload (the gloas
+/// envelope carries it whole) takes up to roughly 16 MiB more, and the rest is
+/// margin for the block and its operations. Applied per route, never router-wide.
+pub(crate) const MAX_PUBLISH_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// The wrapper every fork-versioned Beacon API payload travels in.
 ///
 /// The fork travels here rather than inside `data` because the containers are
