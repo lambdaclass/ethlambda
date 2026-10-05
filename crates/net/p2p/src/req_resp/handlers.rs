@@ -2533,7 +2533,10 @@ mod tests {
             beacon_fetched_through: 0,
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
-            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: Some(crate::discovery::dial::DiscoveryState::new(
+                discovery,
+                built.local_peer_id,
+            )),
             seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
                 crate::SEEN_BLOCKS_CAPACITY,
             ),

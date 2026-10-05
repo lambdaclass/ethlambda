@@ -54,6 +54,11 @@ impl DiscoveryState {
             target_peers: handle.target_peers,
         }
     }
+
+    /// Connected-peer count above which the loop stops dialing.
+    pub(crate) fn target_peers(&self) -> usize {
+        self.target_peers
+    }
 }
 
 /// How long the poll task waits after the peer table offers nothing.
@@ -74,9 +79,12 @@ const CONTACT_POLL_IDLE: Duration = Duration::from_millis(250);
 ///
 /// Called from both teardown paths — a connection that closed and a dial that
 /// never established — so the map cannot outlive the peers in it and
-/// [`covered_subnets`] cannot credit a subnet to someone who left.
+/// [`covered_subnets`] cannot credit a subnet to someone who left. Without
+/// discovery there are no attnets to drop, but custody still goes.
 pub(crate) fn forget_discovered_peer(server: &mut P2PServer, peer_id: &PeerId) {
-    server.discovery.peer_attnets.remove(peer_id);
+    if let Some(discovery) = server.discovery.as_mut() {
+        discovery.peer_attnets.remove(peer_id);
+    }
     // Custody is keyed by peer id and a peer id is a public key, so a returning
     // peer recomputes to the same set. Dropped anyway: the map is only ever
     // read for a connected peer, and keeping entries for departed ones would
@@ -102,12 +110,11 @@ const DIALS_PER_TICK: usize = 1;
 /// at 140 inbound and no outbound the total ratio alone would say 0.7 and pace
 /// the loop down to a crawl, which is the exact state that stalled the mainnet
 /// follower for two days.
-pub(crate) fn dial_progress(server: &P2PServer) -> f64 {
-    let target = server.discovery.target_peers;
-    let total = if target == 0 {
+pub(crate) fn dial_progress(server: &P2PServer, target_peers: usize) -> f64 {
+    let total = if target_peers == 0 {
         1.0
     } else {
-        server.connected_peers.len() as f64 / target as f64
+        server.connected_peers.len() as f64 / target_peers as f64
     };
 
     // A ratio of 1 reads as "nothing to be short on here", which is the answer
@@ -116,7 +123,7 @@ pub(crate) fn dial_progress(server: &P2PServer) -> f64 {
     // so a node asking for no peers. Written out rather than left to the
     // division, which would hand back a NaN that only survives this because
     // `f64::min` happens to ignore one.
-    let (outbound, reservation) = outbound_standing(server);
+    let (outbound, reservation) = outbound_standing(server, target_peers);
     let outbound_ratio = match reservation {
         Some(0) | None => 1.0,
         Some(reserved) => outbound as f64 / reserved as f64,
@@ -132,7 +139,7 @@ pub(crate) fn dial_progress(server: &P2PServer) -> f64 {
 /// same two numbers to stay in step: the rate a tick is paced at and the budget
 /// that tick spends are the same policy asked twice, and the pair drifting
 /// apart is how the mainnet follower stalled in the first place.
-fn outbound_standing(server: &P2PServer) -> (usize, Option<usize>) {
+fn outbound_standing(server: &P2PServer, target_peers: usize) -> (usize, Option<usize>) {
     let outbound = server
         .connected_peers
         .values()
@@ -143,9 +150,10 @@ fn outbound_standing(server: &P2PServer) -> (usize, Option<usize>) {
     // a shortfall read here is one the swarm has somewhere to put. A flat
     // reservation is what made a target of 50 keep dialing to 60 outbound
     // peers, and a target of 0, meaning "do not dial", still have 60 to chase.
-    let reservation = server.wire.beacon().map(|_| {
-        crate::beacon::swarm::max_outbound_connections(server.discovery.target_peers) as usize
-    });
+    let reservation = server
+        .wire
+        .beacon()
+        .map(|_| crate::beacon::swarm::max_outbound_connections(target_peers) as usize);
     (outbound, reservation)
 }
 
@@ -192,10 +200,10 @@ pub(crate) fn dial_interval(progress: f64) -> Duration {
 /// Beacon only, because the reservation is: the lean swarm runs with
 /// [`crate::unlimited_connections`], where a devnet's peer count is bounded by
 /// the devnet and there is nothing to reserve against.
-fn dial_budget(server: &P2PServer) -> usize {
-    let (outbound, outbound_reservation) = outbound_standing(server);
+fn dial_budget(server: &P2PServer, target_peers: usize) -> usize {
+    let (outbound, outbound_reservation) = outbound_standing(server, target_peers);
     dial_budget_from(
-        server.discovery.target_peers,
+        target_peers,
         server.connected_peers.len(),
         outbound,
         outbound_reservation,
@@ -229,45 +237,34 @@ fn dial_budget_from(
 /// the loop at the floor forever, emptying the contact buffer tens of times a
 /// second for peers it is already connected to and keeping
 /// [`spawn_contact_poll`] drawing the peer table down to refill it.
-pub(crate) async fn dial_tick(server: &mut P2PServer) -> bool {
+///
+/// `target_peers` is the running loop's own [`DiscoveryState::target_peers`],
+/// read by the caller that already had to check discovery is on.
+pub(crate) async fn dial_tick(server: &mut P2PServer, target_peers: usize) -> bool {
     // Read once, and spent below. Nothing in between can move it: the one
     // `.await` left in this tick is the dial itself, and the `&mut P2PServer`
     // borrow held across it keeps any swarm event from touching
     // `connected_peers` for the length of the tick.
-    let budget = dial_budget(server);
+    let budget = dial_budget(server, target_peers);
     if budget == 0 {
         return false;
     }
-    // Refilled only when the queue has run out, which is what leaves
-    // `spawn_contact_poll`'s bounded channel able to do its job: draining on
-    // every tick would move contacts into this unbounded queue as fast as the
-    // table could serve them, and the backpressure that stops it being drawn
-    // down for nobody would be gone. Ranking is per refill either way, since it
-    // scores a batch against coverage this node has right now.
-    if server.discovery.candidates.is_empty() {
-        let mut admitted = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
-        while let Ok(peer) = server.discovery.contacts.try_recv() {
-            admitted.push(peer);
-        }
-        if !admitted.is_empty() {
-            let covered = covered_subnets(&server.discovery.peer_attnets, &server.connected_peers);
-            let wanted = undersupplied_custody_columns(server);
-            rank_candidates(&mut admitted, &covered, &wanted);
-            server.discovery.candidates.extend(admitted);
-        }
-    }
+    refill_candidates(server);
+    let Some(discovery) = server.discovery.as_mut() else {
+        return false;
+    };
 
     // One dial per tick, paced by `dial_interval`. Finding a peer with room is
     // a numbers game — a well-connected beacon node completes the handshake and
     // answers `Goodbye(129)`, "too many peers", within the same millisecond —
     // and the rate is what wins it. That rate used to be smuggled into the
     // batch size because the tick itself was a flat 5s; it is in the tick now.
-    let local_peer_id = server.discovery.local_peer_id;
+    let local_peer_id = discovery.local_peer_id;
     let mut dialed = false;
 
     let mut to_dial = Vec::with_capacity(budget);
     while to_dial.len() < budget {
-        let Some(candidate) = server.discovery.candidates.pop_front() else {
+        let Some(candidate) = discovery.candidates.pop_front() else {
             break;
         };
         if candidate.peer_id == local_peer_id
@@ -318,12 +315,44 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) -> bool {
         if let Some(count) = candidate.custody_group_count {
             crate::req_resp::handlers::record_peer_custody(server, candidate.peer_id, count);
         }
-        server
-            .discovery
-            .peer_attnets
-            .insert(candidate.peer_id, candidate.subnets);
+        if let Some(discovery) = server.discovery.as_mut() {
+            discovery
+                .peer_attnets
+                .insert(candidate.peer_id, candidate.subnets);
+        }
     }
     dialed
+}
+
+/// Rank whatever [`spawn_contact_poll`] has admitted since the last refill
+/// into the candidate queue, once that queue has run out.
+///
+/// Refilled only when empty, which is what leaves `spawn_contact_poll`'s
+/// bounded channel able to do its job: draining on every tick would move
+/// contacts into this unbounded queue as fast as the table could serve them,
+/// and the backpressure that stops it being drawn down for nobody would be
+/// gone. Ranking is per refill either way, since it scores a batch against
+/// coverage this node has right now.
+fn refill_candidates(server: &mut P2PServer) {
+    let Some(discovery) = server.discovery.as_mut() else {
+        return;
+    };
+    if !discovery.candidates.is_empty() {
+        return;
+    }
+    let mut admitted = Vec::with_capacity(DISCOVERY_CANDIDATE_BATCH);
+    while let Ok(peer) = discovery.contacts.try_recv() {
+        admitted.push(peer);
+    }
+    if admitted.is_empty() {
+        return;
+    }
+    let covered = covered_subnets(&discovery.peer_attnets, &server.connected_peers);
+    let wanted = undersupplied_custody_columns(server);
+    rank_candidates(&mut admitted, &covered, &wanted);
+    if let Some(discovery) = server.discovery.as_mut() {
+        discovery.candidates.extend(admitted);
+    }
 }
 
 /// Draw dialable peers from the peer table, off the p2p actor's thread.
