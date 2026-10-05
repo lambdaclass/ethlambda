@@ -745,6 +745,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
+    let rpc_custody_columns = match &setup.chain {
+        ChainActor::Beacon {
+            custody_columns, ..
+        } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
+        ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
+    };
     let rpc_engine = match &setup.chain {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,
@@ -767,6 +773,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
                     payload_attestation_pool: payload_attestation_pool.clone(),
+                    custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                 },
                 local_peer_id,
