@@ -109,12 +109,48 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// How a request body is encoded, from its `Content-Type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyEncoding {
+    Json,
+    Ssz,
+}
+
+impl BodyEncoding {
+    /// An absent `Content-Type` is read as JSON, which is what every client
+    /// that predates SSZ submission sends. Anything else is a 415 rather than a
+    /// guess, so a client that tries SSZ first (prysm) learns this node wants
+    /// the other.
+    pub(crate) fn from_headers(headers: &axum::http::HeaderMap) -> Result<Self, ApiError> {
+        let content_type = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or("").trim());
+        match content_type {
+            None | Some("application/json") => Ok(Self::Json),
+            Some(crate::SSZ_CONTENT_TYPE) => Ok(Self::Ssz),
+            Some(_) => Err(ApiError::UnsupportedMediaType(
+                "Content-Type must be application/json or application/octet-stream",
+            )),
+        }
+    }
+
+    /// Decode one container in this encoding, or `None` when the body is not
+    /// one. JSON and SSZ go through the same type, so what follows a decode
+    /// cannot depend on which one the client chose.
+    pub(crate) fn decode<T>(self, body: &[u8]) -> Option<T>
+    where
+        T: serde::de::DeserializeOwned + libssz::SszDecode,
+    {
+        match self {
+            Self::Json => serde_json::from_slice(body).ok(),
+            Self::Ssz => T::from_ssz_bytes(body).ok(),
+        }
+    }
+}
+
 /// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
 /// `List[T, ...]` of the same elements, by the request's `Content-Type`.
-///
-/// An absent `Content-Type` is read as JSON, which is what every client that
-/// predates SSZ submission sends. Anything else is a 415 rather than a guess,
-/// so a client that tries SSZ first (prysm) learns this node wants the other.
 pub(crate) fn decode_list<T>(
     headers: &axum::http::HeaderMap,
     body: &[u8],
@@ -122,19 +158,12 @@ pub(crate) fn decode_list<T>(
 where
     T: serde::de::DeserializeOwned + libssz::SszDecode,
 {
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.split(';').next().unwrap_or("").trim());
-    match content_type {
-        None | Some("application/json") => {
-            serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("invalid request body"))
+    let invalid = || ApiError::BadRequest("invalid request body");
+    match BodyEncoding::from_headers(headers)? {
+        BodyEncoding::Json => serde_json::from_slice(body).map_err(|_| invalid()),
+        BodyEncoding::Ssz => {
+            <Vec<T> as libssz::SszDecode>::from_ssz_bytes(body).map_err(|_| invalid())
         }
-        Some(crate::SSZ_CONTENT_TYPE) => <Vec<T> as libssz::SszDecode>::from_ssz_bytes(body)
-            .map_err(|_| ApiError::BadRequest("invalid request body")),
-        Some(_) => Err(ApiError::UnsupportedMediaType(
-            "Content-Type must be application/json or application/octet-stream",
-        )),
     }
 }
 

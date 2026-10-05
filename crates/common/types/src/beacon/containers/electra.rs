@@ -255,7 +255,17 @@ pub struct SingleAttestation {
 /// unlike a contract-log deposit, a request arrives already ordered by the
 /// execution layer, so there is no merkle proof to check, only a position to
 /// record.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct DepositRequest {
     pub pubkey: BlsPubkey,
     pub withdrawal_credentials: Bytes32,
@@ -273,7 +283,17 @@ pub struct DepositRequest {
 /// credentials before honoring the request. An `amount` of
 /// `FULL_EXIT_REQUEST_AMOUNT` signals a full exit rather than a partial
 /// withdrawal of that amount.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct WithdrawalRequest {
     pub source_address: ExecutionAddress,
     pub validator_pubkey: BlsPubkey,
@@ -285,7 +305,17 @@ pub struct WithdrawalRequest {
 /// to merge `source_pubkey`'s balance into `target_pubkey`'s and exit the
 /// source, which is how a validator raises its effective balance past
 /// `MAX_EFFECTIVE_BALANCE` without a fresh deposit.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct ConsolidationRequest {
     pub source_address: ExecutionAddress,
     pub source_pubkey: BlsPubkey,
@@ -295,14 +325,23 @@ pub struct ConsolidationRequest {
 /// The execution payload's envelope for every execution-layer-triggered
 /// request in this block, grouped by kind.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct ExecutionRequests {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: SszList<DepositRequest, { preset::MAX_DEPOSIT_REQUESTS_PER_PAYLOAD }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub withdrawals: SszList<WithdrawalRequest, { preset::MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub consolidations:
         SszList<ConsolidationRequest, { preset::MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD }>,
 }
@@ -317,7 +356,7 @@ pub struct ExecutionRequests {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct NewPayloadRequest {
     pub execution_payload: ExecutionPayload,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub versioned_hashes: VersionedHashes,
     pub parent_beacon_block_root: Root,
     pub execution_requests: ExecutionRequests,
@@ -390,7 +429,17 @@ pub struct PendingConsolidation {
 /// Unchanged from deneb except for three things: `attester_slashings` and
 /// `attestations` are now bounded (and, for attestations, shaped)
 /// differently, and `execution_requests` is appended at the end.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct BeaconBlockBody {
     /// The proposer's contribution to the chain's randomness, which is a
     /// signature over the current epoch and so cannot be chosen freely.
@@ -399,24 +448,24 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proposer_slashings: SszList<ProposerSlashing, { preset::MAX_PROPOSER_SLASHINGS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attester_slashings: AttesterSlashings,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attestations: Attestations,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: SszList<Deposit, { preset::MAX_DEPOSITS }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub voluntary_exits: SszList<SignedVoluntaryExit, { preset::MAX_VOLUNTARY_EXITS }>,
     /// The aggregated sync committee signature over the previous slot's block
     /// root, plus which members contributed.
     pub sync_aggregate: SyncAggregate,
     pub execution_payload: ExecutionPayload,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub bls_to_execution_changes:
         SszList<SignedBLSToExecutionChange, { preset::MAX_BLS_TO_EXECUTION_CHANGES }>,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub blob_kzg_commitments: KzgCommitments,
     /// The execution-layer-triggered deposit, withdrawal, and consolidation
     /// requests carried by this block's payload. The one field electra adds
@@ -472,7 +521,17 @@ impl BeaconBlockBody {
 }
 
 /// A block.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct BeaconBlock {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
@@ -485,7 +544,17 @@ pub struct BeaconBlock {
     pub body: BeaconBlockBody,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedBeaconBlock {
     pub message: BeaconBlock,
     pub signature: BlsSignature,
@@ -531,16 +600,16 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is
     /// where the next one will be read from. Superseded for new deposits once
@@ -550,34 +619,34 @@ pub struct BeaconState {
     pub eth1_deposit_index: u64,
 
     // -- Registry --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: Validators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: Balances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Participation --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub previous_epoch_participation: EpochParticipation,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
     pub finalized_checkpoint: Checkpoint,
 
     // -- Inactivity --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -600,7 +669,7 @@ pub struct BeaconState {
     pub next_withdrawal_validator_index: ValidatorIndex,
 
     // -- Deep history --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_summaries: HistoricalSummaries,
 
     // -- Deposit requests (EIP-6110) --
@@ -637,15 +706,15 @@ pub struct BeaconState {
     // -- Pending queues (EIP-7251) --
     /// Deposits known but not yet credited to the validator registry,
     /// drained a bounded amount per epoch by `process_pending_deposits`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_deposits: PendingDeposits,
     /// Partial withdrawals known but not yet paid out, drained a bounded
     /// amount per slot by `get_expected_withdrawals`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_partial_withdrawals: PendingPartialWithdrawals,
     /// Consolidations known but not yet applied, drained a bounded amount per
     /// epoch by `process_pending_consolidations`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_consolidations: PendingConsolidations,
 }
 
