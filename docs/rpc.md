@@ -241,7 +241,9 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
+| `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry, by index or pubkey; `404` if there is none |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
+| `GET` | `/eth/v2/validator/duties/proposer/{epoch}` | JSON | The same, with v2's `dependent_root` (what Lighthouse asks for) |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
 | `POST` | `/eth/v1/validator/liveness/{epoch}` | JSON | Whether this node saw each validator act in the epoch (doppelganger protection) |
@@ -276,12 +278,14 @@ the chain actor writes, so no request waits on the actor.
   duties read fulu's `proposer_lookahead`, which covers the head's epoch and the
   next; attester duties cover the head's previous, current and next epoch,
   which is as far as its shuffling is already fixed. Anything else is a `400`.
-  `dependent_root` follows each endpoint's v1 definition. Attester duties walk
-  every committee of the epoch, a full shuffle per request on mainnet. Gloas
-  epochs are served like fulu ones: gloas keeps fulu's `proposer_lookahead` and
-  `upgrade_to_gloas` carries it over, so a fulu head already answers proposer
-  duties for the first gloas epoch, and a gloas head answers from its own
-  lookahead.
+  `dependent_root` follows each endpoint's v1 definition, except proposer
+  duties v2, whose root is the block before the *previous* epoch (fulu fixes
+  proposers an epoch ahead), or genesis where that would underflow; v2 is a
+  `503` while syncing. Attester duties walk every committee of the epoch, a full
+  shuffle per request on mainnet. Gloas epochs are served like fulu ones: gloas
+  keeps fulu's `proposer_lookahead` and `upgrade_to_gloas` carries it over, so a
+  fulu head already answers proposer duties (v1 and v2) for the first gloas
+  epoch, and a gloas head answers from its own lookahead.
 - **Sync duties** read the head state's `current_sync_committee` for an epoch in
   the head's own sync committee period and `next_sync_committee` for the one
   after; any other period is a `400` (an earlier one would need a historical

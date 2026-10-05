@@ -50,6 +50,10 @@ pub(crate) fn routes() -> Router<Store> {
             get(get_proposer_duties),
         )
         .route(
+            "/eth/v2/validator/duties/proposer/{epoch}",
+            get(get_proposer_duties_v2),
+        )
+        .route(
             "/eth/v1/validator/duties/attester/{epoch}",
             post(post_attester_duties),
         )
@@ -428,13 +432,62 @@ struct ProposerDuty {
 /// `compute_start_slot_at_epoch(epoch) - 1` (the genesis block's at epoch 0).
 /// It is what `ethlambda validator` compares across fetches to notice a reorg.
 async fn get_proposer_duties(Path(epoch): Path<String>, State(store): State<Store>) -> Response {
-    match proposer_duties(&store, &epoch) {
+    match proposer_duties(&store, &epoch, DependentRoot::V1) {
         Ok(body) => crate::json_response(body),
         Err(err) => err.into_response(),
     }
 }
 
-fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiError> {
+/// `GET /eth/v2/validator/duties/proposer/{epoch}`: the same duties as v1,
+/// with v2's `dependent_root`.
+///
+/// Fulu fixes an epoch's proposers one epoch ahead (EIP-7917's lookahead), so
+/// they depend on the chain as of the end of epoch `epoch - 2`, not
+/// `epoch - 1` as v1 has it. A validator client that compares v1's root
+/// across fetches sees a spurious reorg every epoch; Lighthouse asks for v2
+/// by default and does not fall back to v1. `503` while syncing, as the
+/// Beacon API lists.
+async fn get_proposer_duties_v2(
+    Path(epoch): Path<String>,
+    State(store): State<Store>,
+    Extension(sync_status): Extension<SyncStatusController>,
+) -> Response {
+    if sync_status.get() == SyncStatus::Syncing {
+        return ApiError::ServiceUnavailable("the node is syncing").into_response();
+    }
+    match proposer_duties(&store, &epoch, DependentRoot::V2) {
+        Ok(body) => crate::json_response(body),
+        Err(err) => err.into_response(),
+    }
+}
+
+/// Which definition of a proposer duty's `dependent_root` to answer with.
+#[derive(Debug, Clone, Copy)]
+enum DependentRoot {
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch) - 1)`.
+    V1,
+    /// `get_block_root_at_slot(state, compute_start_slot_at_epoch(epoch - 1) - 1)`.
+    V2,
+}
+
+impl DependentRoot {
+    /// The slot whose block root this definition names for `epoch`. Either
+    /// definition names the genesis block where its subtraction would
+    /// underflow, which is slot 0.
+    fn slot(self, epoch: Epoch) -> Slot {
+        let epoch = match self {
+            Self::V1 => epoch,
+            Self::V2 => epoch.saturating_sub(1),
+        };
+        compute_start_slot_at_epoch(epoch).saturating_sub(1)
+    }
+}
+
+fn proposer_duties(
+    store: &Store,
+    epoch: &str,
+    dependent: DependentRoot,
+) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
     let (head_root, state) = head(store)?;
 
@@ -475,7 +528,7 @@ fn proposer_duties(store: &Store, epoch: &str) -> Result<serde_json::Value, ApiE
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
 
-    let dependent_root = block_root_at_or_before(&state, head_root, first_slot.saturating_sub(1))?;
+    let dependent_root = block_root_at_or_before(&state, head_root, dependent.slot(epoch))?;
     Ok(serde_json::json!({
         "dependent_root": dependent_root,
         "execution_optimistic": store.is_beacon_optimistic(head_root),
@@ -799,6 +852,76 @@ mod tests {
         let before = compute_start_slot_at_epoch(state_epoch) - 1;
         let expected = get_block_root_at_slot(&state, before).unwrap();
         assert_eq!(json["dependent_root"], format!("{expected}"));
+    }
+
+    async fn get_v2(
+        state: BeaconState,
+        epoch: u64,
+        sync_status: SyncStatusController,
+    ) -> (StatusCode, serde_json::Value) {
+        let (store, _root) = beacon_store_at(state);
+        let request = Request::get(format!("/eth/v2/validator/duties/proposer/{epoch}"))
+            .body(Body::empty())
+            .unwrap();
+        let app = routes().with_state(store).layer(Extension(sync_status));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// v2 changes only the dependent root: the duties are the same ones.
+    #[tokio::test]
+    async fn v2_proposer_duties_are_v1_s() {
+        let state = fulu_state();
+        let state_epoch = compute_epoch_at_slot(state.slot());
+        for epoch in [state_epoch, state_epoch + 1] {
+            let (_, v1) = get(
+                state.clone(),
+                &format!("/eth/v1/validator/duties/proposer/{epoch}"),
+            )
+            .await;
+            let (status, v2) = get_v2(state.clone(), epoch, Default::default()).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(v2["data"], v1["data"], "epoch {epoch}");
+        }
+    }
+
+    /// v2's root is the block before the *previous* epoch: for the head's next
+    /// epoch that is the block before the head's own epoch, v1's root for the
+    /// head's epoch.
+    #[tokio::test]
+    async fn the_v2_dependent_root_is_the_block_before_the_previous_epoch() {
+        let state = fulu_state();
+        let next = compute_epoch_at_slot(state.slot()) + 1;
+        let (_, json) = get_v2(state.clone(), next, Default::default()).await;
+        let before = compute_start_slot_at_epoch(next - 1) - 1;
+        let expected = get_block_root_at_slot(&state, before).unwrap();
+        assert_eq!(json["dependent_root"], format!("{expected}"));
+    }
+
+    /// `compute_start_slot_at_epoch(epoch - 1) - 1` underflows for epochs 0
+    /// and 1, where the spec names the genesis block instead.
+    #[tokio::test]
+    async fn the_v2_dependent_root_is_genesis_where_it_would_underflow() {
+        let state = fulu_state();
+        assert_eq!(
+            compute_epoch_at_slot(state.slot()),
+            1,
+            "the fixture's epoch"
+        );
+        let (_, json) = get_v2(state.clone(), 1, Default::default()).await;
+        let genesis = get_block_root_at_slot(&state, 0).unwrap();
+        assert_eq!(json["dependent_root"], format!("{genesis}"));
+    }
+
+    #[tokio::test]
+    async fn v2_proposer_duties_answer_503_while_syncing() {
+        let state = fulu_state();
+        let epoch = compute_epoch_at_slot(state.slot());
+        let syncing = SyncStatusController::new(SyncStatus::Syncing);
+        let (status, _) = get_v2(state, epoch, syncing).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
