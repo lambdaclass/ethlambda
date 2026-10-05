@@ -476,6 +476,27 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     if let Some(bps) = spec_u64(value, "AGGREGATE_DUE_BPS")? {
         config.aggregate_due_bps = bps;
     }
+    // The gloas offsets and the payload deadlines. Absent keeps the
+    // specification's defaults already in `Config` (2500, 5000, 5000, 7500).
+    for (key, field) in [
+        (
+            "ATTESTATION_DUE_BPS_GLOAS",
+            &mut config.attestation_due_bps_gloas,
+        ),
+        (
+            "AGGREGATE_DUE_BPS_GLOAS",
+            &mut config.aggregate_due_bps_gloas,
+        ),
+        ("PAYLOAD_DUE_BPS", &mut config.payload_due_bps),
+        (
+            "PAYLOAD_ATTESTATION_DUE_BPS",
+            &mut config.payload_attestation_due_bps,
+        ),
+    ] {
+        if let Some(bps) = spec_u64(value, key)? {
+            *field = bps;
+        }
+    }
     if let Some(version) = spec_version(value, "GENESIS_FORK_VERSION")? {
         config = config.with_fork_version(ForkName::Phase0, version);
     }
@@ -908,6 +929,27 @@ mod tests {
         let config = config_from_spec_response(&response).expect("builds");
         assert_eq!(config.attestation_due_bps, 2_500);
         assert_eq!(config.aggregate_due_bps, 5_000);
+    }
+
+    #[test]
+    fn the_gloas_offsets_are_read_and_default_to_the_specification() {
+        let response = serde_json::json!({
+            "ATTESTATION_DUE_BPS_GLOAS": "2000",
+            "AGGREGATE_DUE_BPS_GLOAS": "4000",
+            "PAYLOAD_DUE_BPS": "5500",
+            "PAYLOAD_ATTESTATION_DUE_BPS": "8000",
+        });
+        let config = config_from_spec_response(&response).expect("builds");
+        assert_eq!(config.attestation_due_bps_gloas, 2_000);
+        assert_eq!(config.aggregate_due_bps_gloas, 4_000);
+        assert_eq!(config.payload_due_bps, 5_500);
+        assert_eq!(config.payload_attestation_due_bps, 8_000);
+
+        let config = config_from_spec_response(&serde_json::json!({})).expect("builds");
+        assert_eq!(config.attestation_due_bps_gloas, 2_500);
+        assert_eq!(config.aggregate_due_bps_gloas, 5_000);
+        assert_eq!(config.payload_due_bps, 5_000);
+        assert_eq!(config.payload_attestation_due_bps, 7_500);
     }
 
     /// A node that has not moved to the basis-point form keeps the defaults,
