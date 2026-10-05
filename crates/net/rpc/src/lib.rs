@@ -649,6 +649,51 @@ pub(crate) mod test_utils {
         (store, root)
     }
 
+    /// A beacon store whose head is `block` (a block at `state`'s slot) with
+    /// `state` as its post-state, on a clock whose slot `clock_slot` began a
+    /// second ago.
+    ///
+    /// For endpoints that read the head block itself (the payload attestation
+    /// data names it) or that only accept the current slot (gossip-checked
+    /// votes), which [`beacon_store_at`]'s phase0 anchor on mainnet's real
+    /// clock cannot serve.
+    ///
+    /// The block is stored under `root`, which the caller names because a test
+    /// state's `latest_block_header` need not commit to the block built to
+    /// stand in for it, and a block built on the state names that header's root
+    /// as its parent.
+    pub(crate) fn beacon_store_with_head_block(
+        state: BeaconState,
+        config: Config,
+        block: SignedBeaconBlock,
+        root: H256,
+        clock_slot: u64,
+    ) -> Store {
+        let slot = state.slot();
+        let slot_secs = config.slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            genesis,
+            config,
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store
+            .insert_signed_block(root, block)
+            .expect("insert head block");
+        store.insert_state(root, state).expect("insert head state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("make the block the head");
+        store
+    }
+
     /// Build a beacon store anchored at `anchor_slot`, with a real child block
     /// at `anchor_slot + 1` whose import moves the head for real.
     ///
