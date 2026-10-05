@@ -218,10 +218,10 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         .iter()
         .map(|topics| topics.fork_digest)
         .collect();
-    server
-        .discovery
-        .filter()
-        .set_fork_id(fork_id, also_admitted);
+    // Without discovery there is no peer table whose admission to update.
+    if let Some(state) = &server.discovery {
+        state.filter().set_fork_id(fork_id, also_admitted);
+    }
     if switched {
         discovery::update_served_enr(&fork_id);
     }

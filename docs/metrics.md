@@ -133,7 +133,8 @@ The metrics below are not part of the [leanMetrics specification](https://github
 
 ### Peer Discovery
 
-See [Peer discovery](./discovery.md), which is always on. Counts dials
+See [Peer discovery](./discovery.md), which is always on for `beacon` and
+opt-in (`--discovery.enable`) for `node`. Counts dials
 discovery initiated, as opposed to
 the static bootnode dials every node makes. Connection outcomes are not repeated
 here: a discovery dial that succeeds or fails shows up in
