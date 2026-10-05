@@ -6,6 +6,7 @@ use ethlambda_network_api::{
 use ethlambda_state_transition::beacon::error::Error as BeaconError;
 use ethlambda_state_transition::beacon::fork_choice;
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt;
+use ethlambda_state_transition::beacon::precheck::{PrecheckError, Reference, precheck_block};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, CacheKey, Chain, Store};
 use ethlambda_types::{
@@ -685,12 +686,37 @@ impl LeanDuties {
 /// [`BeaconError`]. Wrapping both here, rather than picking one chain's
 /// error type to stand in for both, keeps each chain's own error type
 /// exactly as its own module defines it.
+///
+/// [`ImportError::Precheck`] is the chain actor's own: a beacon block refused
+/// before it could be held for its custody columns (see
+/// [`BlockChainServer::precheck_before_waiting`]).
 #[derive(Debug, thiserror::Error)]
 enum ImportError {
     #[error(transparent)]
     Lean(#[from] StoreError),
     #[error(transparent)]
     Beacon(#[from] BeaconError),
+    #[error("refused before waiting for its custody columns: {0}")]
+    Precheck(#[from] PrecheckError),
+}
+
+/// What a beacon block would wait for, if [`BlockChainServer::precheck_before_waiting`]
+/// lets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wait {
+    /// Its parent, which has no post-state yet.
+    Parent,
+    /// Its own custody columns, with the parent already imported.
+    Columns,
+}
+
+impl Wait {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Columns => "columns",
+        }
+    }
 }
 
 /// What [`BlockChainServer::process_block`] did with the block it was given.
@@ -1716,6 +1742,13 @@ impl BlockChainServer {
                     match evidence {
                         Some(evidence) => evidence,
                         None => {
+                            if let Err(err) = self.precheck_before_waiting(
+                                &beacon_block,
+                                block_root,
+                                Wait::Columns,
+                            ) {
+                                return (timings, Err(err.into()));
+                            }
                             timings.columns_wait_start =
                                 timings.columns_wait_start.or(timings.da_check_end);
                             self.hold_block_for_columns(beacon_block, current_slot, timings);
@@ -2653,6 +2686,23 @@ impl BlockChainServer {
             .has_state(&parent_root)
             .expect("DB read should succeed")
         {
+            if self.store.chain() == Chain::Beacon
+                && let Err(err) =
+                    self.precheck_before_waiting(&signed_block, block_root, Wait::Parent)
+            {
+                warn!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    %err,
+                    "Refusing a block before it waits for its parent"
+                );
+                // Anything already parked on this root waits for a block that
+                // will never import.
+                self.discard_pending_subtree(block_root);
+                return None;
+            }
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
             timings.guards_end = Some(Instant::now());
             timings.parent_wait_start = timings.parent_wait_start.or(timings.guards_end);
@@ -2942,6 +2992,51 @@ impl BlockChainServer {
             timings.cascade_wait_start = Some(released);
             queue.push_back((fetched, timings));
         }
+    }
+
+    /// Judge a beacon block by [`precheck_block`] before it is kept waiting,
+    /// for its parent or for its custody columns.
+    ///
+    /// A waiting block is kept unjudged until what it waits for arrives, and
+    /// a held one has its columns asked for again every slot until finality
+    /// evicts it. Mainnet gossip carries altered copies of real blocks (a
+    /// blob transaction re-encoded after signing, the original signature
+    /// kept) whose root nobody signed and no peer has columns for, so a block
+    /// that would fail its import is refused before it waits rather than
+    /// after. Gossip validation already refuses those, but range sync and
+    /// by-root fetches never pass through it.
+    ///
+    /// Judged against the parent's post-state when it waits for its columns
+    /// (every rule), and against the head's when it waits for its parent (the
+    /// signature only). A proposer the head state does not hold is refused
+    /// too: its signature cannot be checked, and a real block refused here
+    /// still arrives again through range sync once its parent has imported.
+    fn precheck_before_waiting(
+        &self,
+        block: &SignedBeaconBlock,
+        block_root: H256,
+        wait: Wait,
+    ) -> Result<(), PrecheckError> {
+        let config = self.store.config();
+        let reference_root = match wait {
+            Wait::Parent => self.store.head().expect("the head row exists"),
+            Wait::Columns => block.parent_root(),
+        };
+        // Both are post-states the store must have: the head's by the
+        // invariant every head move keeps, the parent's because the caller
+        // only asks once `has_state` said so.
+        let reference_state = self
+            .store
+            .get_state(&reference_root)
+            .expect("DB read should succeed")
+            .expect("the reference block has a post-state");
+        let reference = match wait {
+            Wait::Parent => Reference::Recent(&reference_state),
+            Wait::Columns => Reference::Parent(&reference_state),
+        };
+        precheck_block(block, block_root, reference, &config).inspect_err(|err| {
+            metrics::inc_beacon_blocks_refused_before_waiting(err.label(), wait.label())
+        })
     }
 
     /// Keep `block` until every column this node custodies for it has arrived.
