@@ -50,11 +50,13 @@ use ethlambda_network_api::{
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::gossip::{
     SeenBlockColumns, SeenBlocks, SeenColumns, aggregate::SeenAggregates,
     attestation::SeenAttestations, envelope::SeenEnvelopes,
     payload_attestation::SeenPayloadAttestations,
+};
+use ethlambda_state_transition::beacon::{
+    attestation_pool::SharedAttestationPool, payload_attestation_pool::SharedPayloadAttestationPool,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -1081,6 +1083,7 @@ impl P2P {
         node_names: HashMap<PeerId, String>,
         discovery: DiscoverySpawnConfig,
         attestation_pool: SharedAttestationPool,
+        payload_attestation_pool: SharedPayloadAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = spawn_discovery(discovery).await?;
         let (swarm_stream, swarm_handle) =
@@ -1137,6 +1140,7 @@ impl P2P {
                 ATTESTATION_VALIDATION_PERMITS,
             )),
             attestation_pool,
+            payload_attestation_pool,
             aggregator_subnets: HashMap::new(),
         };
         let handle = server.start();
@@ -1264,6 +1268,11 @@ pub struct P2PServer {
     /// by `verdict::forward` from the aggregator subnets below; lean never
     /// touches it.
     pub(crate) attestation_pool: SharedAttestationPool,
+
+    /// Accepted `payload_attestation_message` votes, shared with the Beacon
+    /// API that serves and fills the same pool. Filled by `verdict::forward`;
+    /// lean never touches it.
+    pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
 
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
@@ -2743,6 +2752,7 @@ pub(crate) mod test_support {
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
             attestation_pool: Default::default(),
+            payload_attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

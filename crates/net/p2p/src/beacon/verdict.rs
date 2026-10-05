@@ -199,6 +199,17 @@ impl Validated {
         {
             pool_aggregator_attestation(server, attestation);
         }
+        if let Self::PayloadAttestation(message) = &self
+            && outcome == Outcome::Accept
+        {
+            // Block production packs these, and a node with no chain actor
+            // attached still serves `GET .../pool/payload_attestations`.
+            server
+                .payload_attestation_pool
+                .lock()
+                .expect("payload attestation pool lock")
+                .insert(message.clone());
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -1028,6 +1039,36 @@ mod tests {
         assert!(received.try_recv().is_err());
         forward(Outcome::Accept);
         assert_eq!(received.try_recv(), Ok(Sent::PayloadAttestation));
+    }
+
+    /// An accepted payload attestation is pooled for block production, with
+    /// or without a chain actor attached; any other outcome stays out, since
+    /// one unverified share fails the aggregate it is packed into.
+    #[tokio::test]
+    async fn an_accepted_payload_attestation_is_pooled_and_others_are_not() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let forward = |outcome| {
+            Validated::PayloadAttestation(payload_attestation(5, 1)).forward(
+                &server,
+                Instant::now(),
+                outcome,
+            )
+        };
+        forward(Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(Outcome::Reject(RejectReason::NotInPtc));
+        assert!(
+            server
+                .payload_attestation_pool
+                .lock()
+                .unwrap()
+                .all(None)
+                .is_empty()
+        );
+        forward(Outcome::Accept);
+        assert_eq!(
+            server.payload_attestation_pool.lock().unwrap().all(None),
+            vec![payload_attestation(5, 1)]
+        );
     }
 
     /// The pool an aggregate or a subnet attestation draws its stateful-check
