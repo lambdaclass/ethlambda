@@ -245,7 +245,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas) |
-| `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The payload attestation messages the pool holds (gloas) |
+| `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
@@ -464,10 +464,13 @@ subnet publishes through gossipsub fanout.
   `{outcome}: {reason}` with its position, and the rest still go out; a
   head-state cache miss is a per-item `ignore: state_unavailable`.
 - **`GET /eth/v1/beacon/pool/payload_attestations?slot=`** answers `{version:
-  "gloas", data}` with the messages the pool holds, those of `slot` only when
-  given. They are the individual messages, not the aggregates the specification
-  names: the pool keeps them unaggregated so block production can combine the
-  ones it needs.
+  "gloas", data}` with the pool's votes as the specification's
+  `PayloadAttestation`s, those of `slot` only when given: one aggregate per slot
+  and `PayloadAttestationData`, a bit per seat of that slot's committee
+  (`get_ptc` on the head state) and the seats' signatures aggregated, the way
+  block production packs them. The pool itself keeps the individual messages.
+  JSON only; a vote whose slot falls outside the head state's committee window
+  is left out.
 
 The payload attestation pool is shared with P2P, which fills it from accepted
 gossip, so a block this node builds carries the votes its peers sent too.
