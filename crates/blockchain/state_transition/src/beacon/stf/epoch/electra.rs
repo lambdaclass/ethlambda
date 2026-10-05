@@ -66,9 +66,7 @@ use crate::beacon::primitives::{
 /// update, so a deposit credited this epoch is already reflected when
 /// effective balances round toward it).
 pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
-    super::altair::process_justification_and_finalization(state)?;
-    super::altair::process_inactivity_updates(state, config)?;
-    super::altair::process_rewards_and_penalties(state, config)?;
+    super::altair::process_participation_steps(state, config)?;
     // [Modified in Electra:EIP7251]
     process_registry_updates(state, config)?;
     // [Modified in Electra:EIP7251]: electra's own copy; see this module's
@@ -647,8 +645,14 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     // (here) while calling `get_max_effective_balance` on the validator
     // being decided on.
     let mut updates = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
-        let balance = state.balances()[index];
+    // Zipped rather than indexed: step 3 only writes the balances that changed,
+    // so `balances()[index]` would be a tree descent for most validators.
+    for (index, (validator, &balance)) in state
+        .validators()
+        .iter()
+        .zip(state.balances().iter())
+        .enumerate()
+    {
         if balance + DOWNWARD_THRESHOLD < validator.effective_balance
             || validator.effective_balance + UPWARD_THRESHOLD < balance
         {

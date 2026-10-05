@@ -15,10 +15,14 @@
 //!   is already exiting when the slashing penalty is scaled.
 
 pub mod altair;
+#[cfg(any(test, debug_assertions))]
+pub mod altair_reference;
 pub mod capella;
 pub mod electra;
 pub mod fulu;
 pub mod justification;
+#[cfg(test)]
+mod participation_equivalence;
 pub mod registry;
 pub mod rewards;
 
@@ -272,8 +276,14 @@ pub fn process_effective_balance_updates(state: &mut BeaconState) -> Result<()> 
     // fork-independent, which matters because every fork runs this step
     // unchanged.
     let mut updates = Vec::new();
-    for (index, validator) in state.validators().iter().enumerate() {
-        let balance = state.balances()[index];
+    // Zipped rather than indexed: step 3 only writes the balances that changed,
+    // so `balances()[index]` would be a tree descent for most validators.
+    for (index, (validator, &balance)) in state
+        .validators()
+        .iter()
+        .zip(state.balances().iter())
+        .enumerate()
+    {
         if balance + DOWNWARD_THRESHOLD < validator.effective_balance
             || validator.effective_balance + UPWARD_THRESHOLD < balance
         {

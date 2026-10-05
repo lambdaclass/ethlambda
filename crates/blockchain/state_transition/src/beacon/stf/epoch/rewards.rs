@@ -114,7 +114,7 @@ pub fn get_attestation_component_deltas(
             // the numerator and denominator well clear of `u64::MAX` on a
             // large validator set.
             let increment = preset::EFFECTIVE_BALANCE_INCREMENT;
-            if is_in_inactivity_leak(state) {
+            if is_in_inactivity_leak(state)? {
                 rewards[index as usize] += get_base_reward(state, index)?;
             } else {
                 let reward_numerator =
@@ -236,7 +236,7 @@ pub fn get_inactivity_penalty_deltas(
 ) -> Result<(Vec<Gwei>, Vec<Gwei>)> {
     let mut penalties = vec![0; state.validators().len()];
 
-    if is_in_inactivity_leak(state) {
+    if is_in_inactivity_leak(state)? {
         let matching_target_attestations =
             get_matching_target_attestations(state, get_previous_epoch(state))?;
         let matching_target_attesting_indices =
@@ -258,10 +258,10 @@ pub fn get_inactivity_penalty_deltas(
                 // the specification treats a `uint64` overflow here as an
                 // invalid state, not as a penalty that silently wraps small.
                 let penalty_numerator = effective_balance
-                    .checked_mul(get_finality_delay(state))
+                    .checked_mul(get_finality_delay(state)?)
                     .ok_or(Error::ArithmeticOverflow(
-                        "scaling effective balance by the finality delay for the inactivity penalty",
-                    ))?;
+                    "scaling effective balance by the finality delay for the inactivity penalty",
+                ))?;
                 penalties[index as usize] +=
                     penalty_numerator / preset::INACTIVITY_PENALTY_QUOTIENT;
             }
@@ -335,13 +335,26 @@ mod tests {
         // epoch 0, with the finalized checkpoint left at its default (epoch
         // 0): finality has not fallen behind at all.
         let state = crate::beacon::helpers::test_state::with_validators(4);
-        assert_eq!(get_finality_delay(&state), 0);
+        assert_eq!(get_finality_delay(&state).unwrap(), 0);
+    }
+
+    #[test]
+    fn finality_past_the_previous_epoch_is_an_error_not_a_wrap() {
+        // Current epoch 1, previous epoch 0: finalizing epoch 1 would make the
+        // delay `0 - 1`, an underflow the specification treats as invalid.
+        let mut state = crate::beacon::helpers::test_state::with_validators(4);
+        state.finalized_checkpoint_mut().epoch = 1;
+        assert!(matches!(
+            get_finality_delay(&state),
+            Err(Error::ArithmeticOverflow(_))
+        ));
+        assert!(is_in_inactivity_leak(&state).is_err());
     }
 
     #[test]
     fn current_finality_is_not_a_leak() {
         let state = crate::beacon::helpers::test_state::with_validators(4);
-        assert!(!is_in_inactivity_leak(&state));
+        assert!(!is_in_inactivity_leak(&state).unwrap());
     }
 
     #[test]
@@ -352,7 +365,7 @@ mod tests {
         // `MIN_EPOCHS_TO_INACTIVITY_PENALTY` epochs ahead of it.
         *state.slot_mut() =
             preset::SLOTS_PER_EPOCH * (preset::MIN_EPOCHS_TO_INACTIVITY_PENALTY + 10);
-        assert!(is_in_inactivity_leak(&state));
+        assert!(is_in_inactivity_leak(&state).unwrap());
     }
 
     #[test]
