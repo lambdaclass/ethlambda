@@ -64,6 +64,7 @@ pub mod block_builder;
 pub(crate) mod coverage;
 pub mod events;
 pub(crate) mod fork_choice_tree;
+mod glamsterdam;
 pub mod import_timing;
 pub mod key_manager;
 pub mod metrics;
@@ -416,6 +417,7 @@ impl BlockChain {
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
+            glamsterdam_banner: Default::default(),
             custody_columns,
             engine,
             safe_slots_to_import_optimistically,
@@ -567,6 +569,10 @@ pub struct BlockChainServer {
     /// [`crate::beacon_aggregates`] for why all three live on the actor rather
     /// than in the p2p layer that first sees an aggregate.
     beacon_aggregates: crate::beacon_aggregates::AggregateGossip,
+
+    /// Whether the Glamsterdam banner may still be logged. Beacon-only; see
+    /// [`crate::glamsterdam`].
+    glamsterdam_banner: crate::glamsterdam::GlamsterdamBanner,
 
     /// The lean-only or beacon-only half of this actor's state. See
     /// [`ChainDuties`].
@@ -1988,6 +1994,7 @@ impl BlockChainServer {
             events: EventBus::default(),
             duties: ChainDuties::Beacon,
             beacon_aggregates: Default::default(),
+            glamsterdam_banner: Default::default(),
         }
     }
 
@@ -2841,6 +2848,14 @@ impl BlockChainServer {
                     block_root = %ShortRoot(&block_root.0),
                     parent_root = %ShortRoot(&parent_root.0),
                     "Block imported successfully"
+                );
+                // After the block's own import log, so the banner follows the
+                // block it marks.
+                self.glamsterdam_banner.on_block_imported(
+                    &self.store,
+                    slot,
+                    block_root,
+                    parent_root,
                 );
 
                 // Recover per-attestation single-message aggregates from the
@@ -4368,6 +4383,7 @@ mod tests {
             column_parking: ColumnParking::default(),
             envelopes: EnvelopeQueues::default(),
             beacon_aggregates: Default::default(),
+            glamsterdam_banner: Default::default(),
             custody_columns: Vec::new(),
             engine: None,
             safe_slots_to_import_optimistically: constants::SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY,
