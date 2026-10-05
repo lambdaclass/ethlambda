@@ -536,14 +536,21 @@ impl RangeSyncState {
 /// at runtime.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
-    identify: libp2p::identify::Behaviour,
-    gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: ReqResp,
     /// Refuses connections past the configured ceiling. A deny from any member
     /// behaviour denies the connection, so registering this is the whole
     /// mechanism; see [`beacon::swarm::connection_limits`] for the numbers and why the
     /// beacon network needs them while lean does not.
+    ///
+    /// First, and it has to stay first. The derive asks each field for a
+    /// handler in declaration order and stops at the first refusal, and a
+    /// refused connection never produces a `ConnectionClosed`. Every
+    /// `request_response::Behaviour` in [`ReqResp`] records a connection the
+    /// moment it is asked, so behind this field a refusal left them holding a
+    /// connection the swarm never had (libp2p/rust-libp2p#4773, #4870).
     connection_limits: libp2p::connection_limits::Behaviour,
+    identify: libp2p::identify::Behaviour,
+    gossipsub: libp2p::gossipsub::Behaviour,
+    req_resp: ReqResp,
 }
 
 /// No connection limits, which is what the lean network has always run with: a
@@ -826,10 +833,10 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     );
 
     let behavior = Behaviour {
+        connection_limits,
         identify,
         gossipsub,
         req_resp,
-        connection_limits,
     };
 
     // TODO: set peer scoring params
@@ -1019,23 +1026,31 @@ impl P2P {
     /// Start discovery, start the I/O adapter, spawn the actor, and wire the
     /// swarm event stream.
     ///
-    /// The discv5 server is started here, and its handle seeds the dial loop's
-    /// state and schedules its first tick. It is started before the swarm
-    /// adapter so a fatal discovery failure (a busy UDP port, say) surfaces
-    /// before any actor is running.
+    /// `discovery` is `Some` when discv5 runs: the server is started here, and
+    /// its handle seeds the dial loop's state and schedules its first tick. It
+    /// is started before the swarm adapter so a fatal discovery failure (a busy
+    /// UDP port, say) surfaces before any actor is running. `None` leaves the
+    /// dial loop unscheduled, so peering relies solely on the static bootnode
+    /// list `build_swarm` dialed.
     ///
-    /// Discovery is not optional. It used to be, behind `--discovery.enable`,
-    /// but neither chain has another way to reach a peer it was not handed
-    /// statically, and mainnet never had the choice at all: published bootnode
-    /// ENRs carry no `quic` entry, so none of them is statically dialable.
+    /// Always `Some` on beacon, which has no other way to find a peer:
+    /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
+    /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
+    /// and co-located devnet nodes would otherwise all claim one UDP port.
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
-        discovery: DiscoverySpawnConfig,
+        discovery: Option<DiscoverySpawnConfig>,
         attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
-        let discovery = spawn_discovery(discovery).await?;
+        let discovery = match discovery {
+            Some(config) => Some(spawn_discovery(config).await?),
+            None => {
+                info!("discv5 discovery disabled; peering from the static bootnode list only");
+                None
+            }
+        };
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
@@ -1066,7 +1081,7 @@ impl P2P {
             beacon_fetched_through,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
-            discovery: DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
             seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
             seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
             seen_aggregates: SeenAggregates::new(
@@ -1086,17 +1101,22 @@ impl P2P {
             attestation_pool,
             aggregator_subnets: HashMap::new(),
         };
+        let discovery_enabled = server.discovery.is_some();
         let handle = server.start();
         send_after(
             AGGREGATOR_SUBNET_SWEEP_INTERVAL,
             handle.context(),
             p2p_protocol::LeaveExpiredAggregatorSubnets,
         );
-        send_after(
-            DIAL_INTERVAL_AT_ZERO_PEERS,
-            handle.context(),
-            p2p_protocol::DiscoverPeers,
-        );
+        // The dial loop's first tick. Nothing else schedules one, so without
+        // discovery the loop never runs.
+        if discovery_enabled {
+            send_after(
+                DIAL_INTERVAL_AT_ZERO_PEERS,
+                handle.context(),
+                p2p_protocol::DiscoverPeers,
+            );
+        }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
         Ok(P2P { handle })
     }
@@ -1162,7 +1182,9 @@ pub struct P2PServer {
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
-    pub(crate) discovery: DiscoveryState,
+    /// The dial loop's state. `None` when discv5 is off, which only a lean
+    /// node started without `--discovery.enable` is.
+    pub(crate) discovery: Option<DiscoveryState>,
 
     /// The first valid block per `(slot, proposer)` accepted from gossip.
     pub(crate) seen_blocks: SeenBlocks,
@@ -1372,7 +1394,12 @@ impl P2PServer {
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        let dialed = dial_tick(self).await;
+        // `P2P::spawn` schedules the first tick only with discovery on, so this
+        // never returns. If it did, not rescheduling is what "off" means.
+        let Some(target_peers) = self.discovery.as_ref().map(DiscoveryState::target_peers) else {
+            return;
+        };
+        let dialed = dial_tick(self, target_peers).await;
         // Rescheduled on every path out of the tick, so nothing above can stop
         // the loop. The gap is a function of how full the peer table is rather
         // than a flat heartbeat: near `MAX_DIAL_RATE_PER_SECOND` while short of
@@ -1385,7 +1412,7 @@ impl P2PServer {
         // the process, re-drawing a candidate pool of peers it is already
         // connected to. One dial opened puts it straight back on the curve.
         let interval = if dialed {
-            dial_interval(dial_progress(self))
+            dial_interval(dial_progress(self, target_peers))
         } else {
             DIAL_INTERVAL_AT_TARGET
         };
@@ -2491,7 +2518,10 @@ pub(crate) mod test_support {
             beacon_fetched_through: 0,
             bootnode_addrs: HashMap::new(),
             node_names: HashMap::new(),
-            discovery: crate::discovery::dial::DiscoveryState::new(discovery, built.local_peer_id),
+            discovery: Some(crate::discovery::dial::DiscoveryState::new(
+                discovery,
+                built.local_peer_id,
+            )),
             seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
                 crate::SEEN_BLOCKS_CAPACITY,
             ),
@@ -3510,5 +3540,108 @@ mod tests {
         assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, Some(9001));
+    }
+
+    /// A connection the limits refuse must leave no trace in any
+    /// request/response field.
+    ///
+    /// `request_response::Behaviour` records a connection when its handler is
+    /// built and forgets it only on `ConnectionClosed`. A refused connection
+    /// never gets one: the swarm reports it with a `ListenFailure` and nothing
+    /// else. So a field asked before the limits keeps a connection the swarm
+    /// never had, and once the peer's real connections close it still counts
+    /// one. With debug assertions that trips request-response's own
+    /// `debug_assert` in `on_connection_closed` and kills the P2P task; without
+    /// them, requests to that peer can be routed to the phantom and vanish
+    /// without an `OutboundFailure`.
+    ///
+    /// Drives the composed [`Behaviour`] the way the swarm does: a peer
+    /// already holding [`beacon::swarm::MAX_CONNECTIONS_PER_PEER`] connections
+    /// opens one more, then the ones it held close.
+    #[tokio::test]
+    async fn a_connection_the_limits_refuse_leaves_no_request_response_state() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::fork::ForkName;
+        use ethlambda_types::beacon::primitives::Root;
+        use libp2p::core::ConnectedPoint;
+        use libp2p::swarm::{
+            ConnectionId, ListenError,
+            behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm, ListenFailure},
+        };
+
+        let mut built = build_swarm(SwarmConfig {
+            node_key: vec![7u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
+                fork_digest: [0x11, 0x22, 0x33, 0x44],
+                fork: ForkName::Fulu,
+                config: Config::mainnet(),
+                genesis_time: 0,
+                genesis_validators_root: Root::ZERO,
+                custody_columns: Vec::new(),
+                attestation_subnets: Vec::new(),
+            })),
+        })
+        .expect("swarm builds");
+        let behaviour = built.swarm.behaviour_mut();
+
+        let peer = random_peer();
+        let local_addr: Multiaddr = "/ip4/127.0.0.1/tcp/9001".parse().expect("valid multiaddr");
+        let send_back_addr: Multiaddr = "/ip4/192.0.2.1/tcp/9001".parse().expect("valid multiaddr");
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: local_addr.clone(),
+            send_back_addr: send_back_addr.clone(),
+        };
+
+        let max_per_peer = beacon::swarm::MAX_CONNECTIONS_PER_PEER as usize;
+        let held: Vec<ConnectionId> = (0..max_per_peer).map(ConnectionId::new_unchecked).collect();
+        for (other_established, &connection_id) in held.iter().enumerate() {
+            let admitted = behaviour.handle_established_inbound_connection(
+                connection_id,
+                peer,
+                &local_addr,
+                &send_back_addr,
+            );
+            assert!(admitted.is_ok(), "within the per-peer limit");
+            behaviour.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                failed_addresses: &[],
+                other_established,
+            }));
+        }
+
+        let refused = ConnectionId::new_unchecked(max_per_peer);
+        let cause = behaviour
+            .handle_established_inbound_connection(refused, peer, &local_addr, &send_back_addr)
+            .err()
+            .expect("the per-peer limit refuses one connection too many");
+        let error = ListenError::Denied { cause };
+        behaviour.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &local_addr,
+            send_back_addr: &send_back_addr,
+            error: &error,
+            connection_id: refused,
+            peer_id: Some(peer),
+        }));
+
+        for (closed, &connection_id) in held.iter().enumerate() {
+            behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: held.len() - closed - 1,
+            }));
+        }
+
+        let blocks_by_range = &behaviour.req_resp.beacon_blocks_by_range;
+        assert!(
+            !blocks_by_range.is_connected(&peer),
+            "a request/response field still holds the connection the limits refused"
+        );
     }
 }
