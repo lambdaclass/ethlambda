@@ -45,6 +45,7 @@ use ethlambda_network_api::{
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
+        PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
         SubscribeAttestationSubnets,
     },
 };
@@ -1560,6 +1561,18 @@ impl Handler<PublishBeaconAggregate> for P2PServer {
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
         publish_beacon_block(self, msg.block).await;
+    }
+}
+
+impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _ctx: &Context<Self>) {
+        gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishPayloadAttestationMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _ctx: &Context<Self>) {
+        gossipsub::publish_payload_attestation_message(self, msg.message).await;
     }
 }
 

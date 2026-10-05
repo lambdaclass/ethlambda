@@ -79,6 +79,7 @@ pub mod gossip;
 pub mod hash;
 pub mod helpers;
 pub mod kzg;
+pub mod payload_attestation_pool;
 pub mod precheck;
 pub mod stf;
 pub mod upgrade;
