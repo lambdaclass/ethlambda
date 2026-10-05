@@ -29,6 +29,16 @@
 //! deadline safe: a proposal abandoned between signing and publishing cannot be
 //! re-signed, because the guard already counts that slot as proposed.
 //!
+//! # Gloas: the block, then its envelope
+//!
+//! From gloas the block commits to a bid and the payload is revealed in an
+//! envelope the builder signs. This client only self-builds: when the bid names
+//! the self-build sentinel, the proposer's own key signs the envelope under the
+//! builder domain, and it is published right after the block, in the same
+//! budget. A bid naming anyone else is a builder's to reveal, and is left alone.
+//!
+//! The envelope is not slashable, so the guard is untouched by it.
+//!
 //! # Do not retry this call within a slot
 //!
 //! For the same reason [`crate::attestation::AttestationService::attest`] must
@@ -40,13 +50,15 @@
 
 use std::sync::Arc;
 
+use ethlambda_types::beacon::constants::BUILDER_INDEX_SELF_BUILD;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{Bytes32, ExecutionAddress, HashTreeRoot as _, Slot};
+use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, Root, Slot};
 use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::beacon_node::dto::{ProposerDutyDto, parse_pubkey};
+use crate::beacon_node::block_contents::{GloasPayload, signed_envelope_ssz};
+use crate::beacon_node::dto::{ProposerDutyDto, encode_hex, parse_pubkey};
 use crate::beacon_node::{BeaconNodeApi, BlockRequest, Published, validate_produced_block};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
@@ -124,7 +136,9 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         let Some(expected) = self.fee_recipient else {
             return;
         };
-        let actual = produced.block().body.execution_payload.fee_recipient;
+        // The payload's before gloas, the bid's from it on: the same address
+        // the execution layer is told to pay, read where the block keeps it.
+        let actual = produced.fee_recipient();
         if actual != expected {
             tracing::error!(
                 %slot,
@@ -195,11 +209,12 @@ impl<B: BeaconNodeApi> ProposalService<B> {
 
         let request = BlockRequest {
             slot,
+            fork: self.context.config.fork_at_epoch(epoch),
             proposer_index: duty.validator_index,
             randao_reveal,
             graffiti: self.graffiti,
         };
-        let produced = self.beacon_node.produce_block(&request).await?;
+        let mut produced = self.beacon_node.produce_block(&request).await?;
 
         // Checked again here, having already been checked by the
         // implementation this call went through. Not redundant, and the
@@ -249,7 +264,7 @@ impl<B: BeaconNodeApi> ProposalService<B> {
         // The root is taken from the decoded container, never from anything
         // reassembled here, and it is taken once: the same value is what the
         // guard's slot is recorded against and what the signature covers.
-        let block_root = produced.block().hash_tree_root();
+        let block_root = produced.block_root();
 
         let signature = {
             let store = store.read().await;
@@ -278,12 +293,109 @@ impl<B: BeaconNodeApi> ProposalService<B> {
             self.context.sign_block(&store, &pubkey, block_root, slot)?
         };
 
+        // Taken out before the block is signed into its body: the envelope is
+        // published on its own, after the block, and the bare gloas block body
+        // has no place for it.
+        let payload = produced.take_gloas_payload();
+        let builder_index = produced.builder_index();
+
         let body = produced.into_signed_ssz(signature);
         let published = self
             .publish(fork, &body, slot, duty.validator_index)
             .await?;
         crate::metrics::inc_blocks_proposed();
+
+        // Only a self-built payload is this client's to reveal.
+        if builder_index == Some(BUILDER_INDEX_SELF_BUILD) {
+            // Logged and counted rather than propagated. The block is out and
+            // the proposal did happen; what failed is the reveal, which has its
+            // own series because it is the failure that costs the payload.
+            let _ = self
+                .publish_envelope(
+                    slot,
+                    duty.validator_index,
+                    &pubkey,
+                    block_root,
+                    payload,
+                    store,
+                )
+                .await
+                .inspect(|()| crate::metrics::inc_envelopes_published())
+                .inspect_err(|err| {
+                    tracing::error!(
+                        %slot,
+                        validator = duty.validator_index,
+                        block_root = %ethlambda_types::ShortRoot(&block_root.0),
+                        %err,
+                        "Block published but its envelope was not; the slot's payload is withheld"
+                    );
+                    crate::metrics::inc_envelope_failures();
+                });
+        } else if let Some(builder_index) = builder_index {
+            info!(
+                %slot,
+                builder_index,
+                "Block commits to a builder's bid; leaving the payload reveal to that builder"
+            );
+        }
         Ok(published)
+    }
+
+    /// Reveal the self-built payload of the block just published.
+    ///
+    /// `payload` is what `produceBlockV4` returned with the block, or `None`
+    /// when the node did not include it, in which case it is fetched by
+    /// `(slot, block_root)` from the node's cache. Either way it is checked to
+    /// be for this block and this self-build before it is signed: the signature
+    /// covers the envelope as it stands, so one for another block would be a
+    /// valid signature on the wrong payload.
+    async fn publish_envelope(
+        &self,
+        slot: Slot,
+        validator: u64,
+        pubkey: &BlsPubkey,
+        block_root: Root,
+        payload: Option<GloasPayload>,
+        store: &RwLock<ValidatorStore>,
+    ) -> Result<()> {
+        let included = payload.is_some();
+        let envelope = match &payload {
+            Some(payload) => payload.envelope.clone(),
+            None => {
+                self.beacon_node
+                    .execution_payload_envelope(slot, block_root)
+                    .await?
+            }
+        };
+        if envelope.beacon_block_root != block_root {
+            return Err(Error::InconsistentResponse(format!(
+                "envelope for slot {slot} reveals the payload of block {}, not of the block \
+                 this client proposed ({})",
+                encode_hex(&envelope.beacon_block_root.0),
+                encode_hex(&block_root.0)
+            )));
+        }
+        if envelope.builder_index != BUILDER_INDEX_SELF_BUILD {
+            return Err(Error::InconsistentResponse(format!(
+                "envelope for slot {slot} names builder {}, but the bid was a self-build",
+                envelope.builder_index
+            )));
+        }
+
+        let signature = {
+            let store = store.read().await;
+            self.context
+                .sign_execution_payload_envelope(&store, pubkey, &envelope, slot)?
+        };
+        let body = match payload {
+            Some(payload) => payload.into_signed_contents_ssz(signature),
+            None => signed_envelope_ssz(envelope, signature),
+        };
+        self.beacon_node
+            .publish_execution_payload_envelope(&body, included)
+            .await?;
+        info!(%slot, validator, bytes = body.len(), blob_data_included = included, "Envelope published");
+        Ok(())
     }
 
     /// Send the signed body and report what the node made of it.
@@ -328,6 +440,7 @@ mod tests {
     use crate::beacon_node::block_contents::SignedBlockContents;
     use crate::beacon_node::mock::MockBeaconNode;
     use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::primitives::HashTreeRoot as _;
     use ethlambda_types::beacon::primitives::{BlsPubkey, H160, Root};
     use libssz::SszDecode as _;
 
@@ -639,5 +752,251 @@ mod tests {
             .await
             .expect("the slot was never recorded, so it can still be proposed");
         assert_eq!(node.published_blocks().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod gloas_tests {
+    use super::*;
+    use crate::beacon_node::block_contents::SignedExecutionPayloadEnvelopeContents;
+    use crate::beacon_node::mock::MockBeaconNode;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::gloas;
+    use ethlambda_types::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::beacon::primitives::{BlsPubkey, HashTreeRoot as _};
+    use libssz::SszDecode as _;
+
+    const GLOAS_EPOCH: u64 = 10;
+    const DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+    fn secret() -> [u8; 32] {
+        hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+            .expect("valid hex")
+            .try_into()
+            .expect("32 bytes")
+    }
+
+    fn context() -> Arc<SigningContext> {
+        Arc::new(SigningContext {
+            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, GLOAS_EPOCH),
+            genesis_validators_root: Root::ZERO,
+        })
+    }
+
+    fn store() -> (RwLock<ValidatorStore>, BlsPubkey) {
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        (RwLock::new(store), pubkey)
+    }
+
+    fn slot() -> Slot {
+        GLOAS_EPOCH * SLOTS_PER_EPOCH + 5
+    }
+
+    fn duty(pubkey: &BlsPubkey) -> ProposerDutyDto {
+        ProposerDutyDto {
+            pubkey: encode_hex(&pubkey.0),
+            validator_index: 7,
+            slot: slot(),
+        }
+    }
+
+    fn service(node: Arc<MockBeaconNode>) -> ProposalService<MockBeaconNode> {
+        ProposalService::new(node, context(), Bytes32::repeat_byte(0xab), None)
+    }
+
+    fn verifies(pubkey: &BlsPubkey, signature: &[u8; 96], root: Root) -> bool {
+        use blst::min_pk::{PublicKey, Signature};
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig = Signature::from_bytes(signature).expect("valid signature");
+        sig.verify(true, root.as_slice(), DST, &[], &pk, true) == blst::BLST_ERROR::BLST_SUCCESS
+    }
+
+    /// The block goes out bare, under the gloas header, signed over the gloas
+    /// block's root, and then the envelope follows with the blobs, signed under
+    /// the builder domain by the proposer's own key.
+    #[tokio::test]
+    async fn a_self_built_block_is_published_and_then_its_envelope() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+
+        let published = service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+        assert_eq!(published, Published::Imported);
+
+        let request = node.block_requests().remove(0);
+        assert_eq!(request.fork, ForkName::Gloas);
+
+        let blocks = node.published_blocks();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].0, ForkName::Gloas);
+        let signed = gloas::SignedBeaconBlock::from_ssz_bytes(&blocks[0].1)
+            .expect("the body is a bare gloas signed block");
+        let block_root = signed.message.hash_tree_root();
+        let block_signing_root = context().block_signing_root(block_root, slot());
+        assert!(verifies(&pubkey, &signed.signature.0, block_signing_root));
+
+        let envelopes = node.published_envelopes();
+        assert_eq!(envelopes.len(), 1);
+        let (body, blob_data_included) = &envelopes[0];
+        assert!(*blob_data_included, "the contents form carries the blobs");
+        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(body)
+            .expect("the body is the signed envelope contents");
+        let envelope = &contents.signed_execution_payload_envelope;
+        assert_eq!(envelope.message.beacon_block_root, block_root);
+        assert!(
+            verifies(
+                &pubkey,
+                &envelope.signature.0,
+                context().envelope_signing_root(&envelope.message, slot())
+            ),
+            "the envelope must be signed under the builder domain"
+        );
+        assert!(
+            node.envelope_requests().is_empty(),
+            "an included payload needs no fetch"
+        );
+    }
+
+    /// The builder domain is not the proposer domain: an envelope signature
+    /// must not verify as a block signature over the same root.
+    #[tokio::test]
+    async fn the_envelope_signature_is_under_the_builder_domain_not_the_proposers() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+
+        let (body, _) = node.published_envelopes().remove(0);
+        let contents = SignedExecutionPayloadEnvelopeContents::from_ssz_bytes(&body).expect("ok");
+        let envelope = contents.signed_execution_payload_envelope;
+        let as_proposer = context().block_signing_root(envelope.message.hash_tree_root(), slot());
+        assert!(!verifies(&pubkey, &envelope.signature.0, as_proposer));
+    }
+
+    /// Without `Eth-Execution-Payload-Included` the envelope is fetched by
+    /// (slot, block root) and published bare, with the blob header false.
+    #[tokio::test]
+    async fn an_envelope_the_node_did_not_include_is_fetched_and_published_bare() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            false,
+        ));
+
+        service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+
+        let signed = gloas::SignedBeaconBlock::from_ssz_bytes(&node.published_blocks()[0].1)
+            .expect("bare block");
+        let block_root = signed.message.hash_tree_root();
+        assert_eq!(node.envelope_requests(), vec![(slot(), block_root)]);
+
+        let (body, blob_data_included) = node.published_envelopes().remove(0);
+        assert!(!blob_data_included);
+        let envelope =
+            gloas::SignedExecutionPayloadEnvelope::from_ssz_bytes(&body).expect("bare envelope");
+        assert_eq!(envelope.message.beacon_block_root, block_root);
+        assert!(verifies(
+            &pubkey,
+            &envelope.signature.0,
+            context().envelope_signing_root(&envelope.message, slot())
+        ));
+    }
+
+    /// A bid naming a builder is that builder's to reveal; this client signs
+    /// nothing for it.
+    #[tokio::test]
+    async fn a_builders_bid_gets_no_envelope_from_this_client() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(slot(), 7, 3, true));
+
+        service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("proposes");
+        assert_eq!(node.published_blocks().len(), 1);
+        assert!(node.published_envelopes().is_empty());
+        assert!(node.envelope_requests().is_empty());
+    }
+
+    /// An envelope for another block must never be signed. The block is out
+    /// already, so the proposal still reports it, but nothing is revealed.
+    #[tokio::test]
+    async fn an_envelope_for_another_block_is_not_signed() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_gloas_block(slot(), 7, BUILDER_INDEX_SELF_BUILD, false)
+                .with_envelope_for(Root::repeat_byte(9)),
+        );
+
+        let result = service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await;
+        assert!(result.is_ok(), "the block was published");
+        assert_eq!(node.published_blocks().len(), 1);
+        assert!(node.published_envelopes().is_empty());
+    }
+
+    /// The guard's semantics are unchanged: a second proposal for the slot is
+    /// refused before asking for anything, and reveals no second envelope.
+    #[tokio::test]
+    async fn a_repeated_gloas_slot_is_refused_and_reveals_nothing_more() {
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_gloas_block(
+            slot(),
+            7,
+            BUILDER_INDEX_SELF_BUILD,
+            true,
+        ));
+        let service = service(node.clone());
+        service
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("first");
+        let err = service
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect_err("a second block for one slot must be refused");
+        assert!(matches!(err, Error::ProposalRefused { .. }), "got {err:?}");
+        assert_eq!(node.block_requests().len(), 1);
+        assert_eq!(node.published_envelopes().len(), 1);
+    }
+
+    /// The block is out by the time the envelope fails, so the proposal is
+    /// still reported as published; the failure is logged and counted.
+    #[tokio::test]
+    async fn a_failed_envelope_publication_does_not_fail_the_proposal() {
+        let (store, pubkey) = store();
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_gloas_block(slot(), 7, BUILDER_INDEX_SELF_BUILD, true)
+                .failing_call("publish_execution_payload_envelope", "node is unhappy"),
+        );
+        let published = service(node.clone())
+            .propose(slot(), &duty(&pubkey), &store)
+            .await
+            .expect("the block was published");
+        assert_eq!(published, Published::Imported);
+        assert!(node.published_envelopes().is_empty());
     }
 }
