@@ -241,6 +241,10 @@ pub struct SingleAttestationDto {
     pub signature: String,
 }
 
+/// `index` is whatever the beacon node answered, never rewritten: it is part of
+/// the signed message. It is zero from electra, and from gloas it carries the
+/// payload signal (1 when the attested block's payload was seen as full), which
+/// is why it must not be normalised on the way out.
 #[derive(Debug, Clone, Serialize)]
 pub struct AttestationDataOutDto {
     #[serde(with = "quoted_u64")]
@@ -1018,5 +1022,40 @@ mod tests {
         });
         let err = config_from_spec_response(&response).expect_err("must reject");
         assert!(matches!(err, Error::Decode(_)), "got {err:?}");
+    }
+
+    /// A gloas aggregate parses straight into the gloas container, bitfields
+    /// included, and serialises back to the JSON the electra DTO produces for
+    /// the same vote, which is what the endpoint takes.
+    #[test]
+    fn a_gloas_aggregate_round_trips_through_its_json() {
+        use ethlambda_types::beacon::containers::gloas;
+
+        let electra_attestation = Attestation {
+            aggregation_bits: AggregationBits::from_ssz_bytes(&[0x3f]).expect("bits"),
+            data: AttestationData {
+                slot: 5,
+                index: 1,
+                beacon_block_root: Root::repeat_byte(3),
+                source: Checkpoint {
+                    epoch: 0,
+                    root: Root::ZERO,
+                },
+                target: Checkpoint {
+                    epoch: 0,
+                    root: Root::repeat_byte(4),
+                },
+            },
+            signature: BlsSignature([9; 96]),
+            committee_bits: CommitteeBits::from_ssz_bytes(&[0x01, 0, 0, 0, 0, 0, 0, 0])
+                .expect("bits"),
+        };
+        let json = serde_json::to_value(AttestationOutDto::from(&electra_attestation))
+            .expect("serialises");
+
+        let parsed: gloas::Attestation = serde_json::from_value(json.clone()).expect("parses");
+        assert_eq!(parsed, gloas::Attestation::from(&electra_attestation));
+        assert_eq!(parsed.data.index, 1, "the payload signal survives parsing");
+        assert_eq!(serde_json::to_value(&parsed).expect("serialises"), json);
     }
 }

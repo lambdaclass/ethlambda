@@ -529,4 +529,80 @@ mod tests {
         assert_eq!(published, 0);
         assert!(node.aggregate_requests().is_empty());
     }
+
+    fn gloas_context() -> Arc<SigningContext> {
+        Arc::new(SigningContext {
+            config: Config::mainnet().with_fork_epoch(ForkName::Gloas, 100),
+            genesis_validators_root: Root::ZERO,
+        })
+    }
+
+    /// A slot in the gloas era at which this key is selected under the gloas
+    /// fork version, found rather than written down for the reason `slots` is.
+    fn gloas_selected_slot(pubkey: &BlsPubkey, store: &ValidatorStore) -> Slot {
+        let context = gloas_context();
+        (3_200..3_600)
+            .find(|slot| {
+                let proof = context
+                    .sign_selection_proof(store, pubkey, *slot)
+                    .expect("signs");
+                is_aggregator(128, &proof)
+            })
+            .expect("some slot selects this key")
+    }
+
+    /// At a gloas slot the aggregate is gloas's container, and the wrapper is
+    /// signed over the gloas `AggregateAndProof`'s root, not electra's: the two
+    /// attestations hash differently, so the wrong root signs a message no node
+    /// can verify.
+    #[tokio::test]
+    async fn a_gloas_aggregate_is_wrapped_signed_and_published_as_gloas() {
+        use blst::min_pk::{PublicKey, Signature};
+
+        let (store, pubkey) = store();
+        let slot = {
+            let guard = store.read().await;
+            gloas_selected_slot(&pubkey, &guard)
+        };
+        let node = Arc::new(MockBeaconNode::new().with_gloas_aggregate(data(slot)));
+
+        let published = AggregationService::new(node.clone(), gloas_context())
+            .aggregate(slot, &data(slot), &[duty(&pubkey, 1, slot, 2)], &store)
+            .await
+            .expect("aggregates");
+        assert_eq!(published, 1);
+
+        assert!(
+            node.published_aggregates().is_empty(),
+            "not the electra form"
+        );
+        let (fork, list) = node.published_gloas_aggregates().remove(0);
+        assert_eq!(fork, ForkName::Gloas);
+        let entry = &list[0];
+        assert_eq!(entry.message.aggregator_index, 1);
+
+        let root =
+            gloas_context().aggregate_and_proof_signing_root(entry.message.hash_tree_root(), slot);
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig = Signature::from_bytes(&entry.signature.0).expect("valid signature");
+        assert_eq!(
+            sig.verify(
+                true,
+                root.as_slice(),
+                b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+                &[],
+                &pk,
+                true
+            ),
+            blst::BLST_ERROR::BLST_SUCCESS
+        );
+
+        // The same wrapper built from electra's container hashes differently.
+        let as_electra = electra::AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: electra::Attestation::try_from(&entry.message.aggregate).expect("converts"),
+            selection_proof: entry.message.selection_proof,
+        };
+        assert_ne!(as_electra.hash_tree_root(), entry.message.hash_tree_root());
+    }
 }

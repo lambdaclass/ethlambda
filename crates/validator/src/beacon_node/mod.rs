@@ -440,8 +440,9 @@ pub trait BeaconNodeApi: Send + Sync {
     /// `attestation_data_root` at `slot`.
     ///
     /// `committee_index` is separate from the root and not derivable from it.
-    /// From electra on, `AttestationData.index` is required to be zero, so the
-    /// root no longer distinguishes one committee's votes from another's in the
+    /// From electra on, `AttestationData.index` no longer names a committee (it
+    /// is zero, and from gloas it is the payload signal, 0 or 1), so the root
+    /// no longer distinguishes one committee's votes from another's in the
     /// same slot; the committee moved into the attestation's `committee_bits`.
     /// That is exactly why the v1 form of this endpoint was removed rather than
     /// deprecated: it had no way to ask the question.
