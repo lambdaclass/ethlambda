@@ -238,7 +238,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
-| `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
+| `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
@@ -262,10 +262,17 @@ These are what `ethlambda validator` needs to attest through this node. Every
 answer is computed from the fork-choice head's post-state, read off the store
 the chain actor writes, so no request waits on the actor.
 
-- **Duties** answer for a window around the head, not any epoch. Proposer
-  duties read fulu's `proposer_lookahead`, which covers the head's epoch and the
-  next; attester duties cover the head's previous, current and next epoch,
-  which is as far as its shuffling is already fixed. Anything else is a `400`.
+- **Duties** are bounded by the wall clock, as the Beacon API defines it: any
+  epoch up to one past the current one is served (or one past the head's, if
+  the head is ahead of a lagging clock), so a validator client's next-epoch
+  lookahead at an epoch boundary, while the head is still in the previous
+  epoch, is answered. Proposer duties read fulu's `proposer_lookahead`, which
+  covers the head's epoch and the next; attester duties read the head state as
+  it is for its previous, current and next epoch. A later epoch is computed from
+  a copy of the head advanced with `process_slots` to the first epoch that can
+  derive it, taken from fork choice's `checkpoint_state` cache and run on a
+  blocking thread. An epoch before the head's (attester: more than one before)
+  or past the bound is a `400`.
   `dependent_root` follows each endpoint's v1 definition. Attester duties walk
   every committee of the epoch, a full shuffle per request on mainnet. Gloas
   epochs are served like fulu ones: gloas keeps fulu's `proposer_lookahead` and
