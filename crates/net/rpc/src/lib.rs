@@ -417,6 +417,15 @@ pub(crate) mod test_utils {
         pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
         pub(crate) blocks:
             std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+        pub(crate) envelopes: std::sync::Mutex<
+            Vec<(
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+                Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+            )>,
+        >,
+        pub(crate) payload_attestations: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
+        >,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -453,6 +462,25 @@ pub(crate) mod test_utils {
             block: ethlambda_types::beacon::containers::SignedBeaconBlock,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.blocks.lock().unwrap().push(block);
+            Ok(())
+        }
+
+        fn publish_execution_payload_envelope(
+            &self,
+            envelope: Box<
+                ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+            >,
+            sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            Ok(())
+        }
+
+        fn publish_payload_attestation_message(
+            &self,
+            message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.payload_attestations.lock().unwrap().push(message);
             Ok(())
         }
     }

@@ -788,6 +788,40 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
     }
 }
 
+/// Gossip a gloas execution payload envelope a validator client signed,
+/// handed over by the Beacon API, on `execution_payload`, its data column
+/// sidecars on their subnets, and pass all of them to the chain actor.
+///
+/// STUB: owned by the block-production task (see the contract), which
+/// replaces this body.
+pub async fn publish_execution_payload_envelope(
+    _server: &mut P2PServer,
+    envelope: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope,
+    sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
+) {
+    error!(
+        block_root = %ShortRoot(&envelope.message.beacon_block_root.0),
+        sidecars = sidecars.len(),
+        "Publishing execution payload envelopes is not implemented; dropping it"
+    );
+}
+
+/// Gossip a payload attestation message a validator client signed, handed
+/// over by the Beacon API, on `payload_attestation_message`, and pass it to
+/// the chain actor.
+///
+/// STUB: owned by the PTC task (see the contract), which replaces this body.
+pub async fn publish_payload_attestation_message(
+    _server: &mut P2PServer,
+    message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
+) {
+    error!(
+        slot = message.data.slot,
+        validator = message.validator_index,
+        "Publishing payload attestation messages is not implemented; dropping it"
+    );
+}
+
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.
 fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
     let genesis_ms = wire.genesis_time.saturating_mul(1000);

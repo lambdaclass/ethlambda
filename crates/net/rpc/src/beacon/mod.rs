@@ -20,10 +20,12 @@ pub(crate) mod blocks;
 pub(crate) mod config;
 pub(crate) mod envelopes;
 pub(crate) mod genesis;
+pub(crate) mod gloas_proposal;
 pub(crate) mod headers;
 pub(crate) mod node;
 pub(crate) mod pool;
 pub(crate) mod proposal;
+pub(crate) mod ptc;
 pub(crate) mod states;
 pub(crate) mod validator;
 #[cfg(test)]
@@ -133,6 +135,8 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(validator::routes())
         .merge(pool::routes())
         .merge(proposal::routes())
+        .merge(gloas_proposal::routes())
+        .merge(ptc::routes())
 }
 
 #[cfg(test)]
