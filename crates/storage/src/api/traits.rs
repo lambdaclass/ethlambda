@@ -27,6 +27,14 @@ pub trait StorageReadView {
     /// Get a value by key from a table.
     fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
 
+    /// Whether `key` is present in a table.
+    ///
+    /// Same answer as `get(..)?.is_some()` but never materializes the value, so
+    /// the cost does not scale with its size. Prefer it for pure existence
+    /// checks on large values (full state snapshots are 100+ MB on mainnet-sized
+    /// beacon chains).
+    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error>;
+
     /// Iterate over all entries with a given key prefix.
     fn prefix_iterator(
         &self,

@@ -2660,19 +2660,36 @@ impl Store {
 
     /// Returns whether a state is available for the given block root.
     ///
-    /// True if `pending_states` holds the state, a snapshot exists, or the
-    /// state can be reconstructed from a diff.
+    /// True if `pending_states` or the state cache holds the state, a snapshot
+    /// exists, or the state can be reconstructed from a diff. Never reads a
+    /// value: existence checks only.
     pub fn has_state(&self, root: &H256) -> Result<bool, Error> {
         // Same pending-before-backend order as `read_state`; see its doc for
         // why the backend never has to consult `pending_states` on its own.
         if self.pending_states.get(root).is_some() {
             return Ok(true);
         }
+        // A cached block state is always one that was handed to the writer
+        // (`insert_state`, so in `pending_states` until committed) or read back
+        // from the backend (`read_state`); nothing deletes a persisted state.
+        // `peek`, not `get`: an existence check must not reorder the LRU.
+        // Without this, a state stored as a snapshot only (a beacon epoch
+        // anchor) costs a full-value read from RocksDB just to be found.
+        if self
+            .state_cache
+            .lock()
+            .unwrap()
+            .peek(&CacheKey::BlockState(*root))
+            .is_some()
+        {
+            return Ok(true);
+        }
         let view = self.backend.begin_read().expect("read view");
         let key = root.to_ssz();
-        let states = view.get(Table::States, &key).expect("get");
-        let diffs = view.get(Table::StateDiffs, &key).expect("get");
-        Ok(states.is_some() || diffs.is_some())
+        // Diffs first: every non-anchor state has one, so most roots never
+        // touch `States`, where even a miss is costly (no bloom filter).
+        Ok(view.contains(Table::StateDiffs, &key).expect("contains")
+            || view.contains(Table::States, &key).expect("contains"))
     }
 
     /// Persist a post-block state.
@@ -5240,6 +5257,166 @@ mod tests {
             .expect("reconstructs from diff")
             .expect("state exists");
         assert_eq!(reconstructed.to_ssz(), s1.to_ssz());
+    }
+
+    type BackendError = Box<dyn std::error::Error + Send + Sync>;
+
+    /// Backend wrapper counting value reads and existence checks per table, to
+    /// show which tables `has_state` touches and that it never copies a value.
+    #[derive(Default)]
+    struct ReadCounts {
+        gets: Mutex<HashMap<Table, usize>>,
+        contains: Mutex<HashMap<Table, usize>>,
+    }
+
+    impl ReadCounts {
+        fn gets(&self, table: Table) -> usize {
+            self.gets.lock().unwrap().get(&table).copied().unwrap_or(0)
+        }
+        fn contains(&self, table: Table) -> usize {
+            self.contains
+                .lock()
+                .unwrap()
+                .get(&table)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    struct CountingBackend {
+        inner: InMemoryBackend,
+        counts: Arc<ReadCounts>,
+    }
+
+    struct CountingView<'a> {
+        inner: Box<dyn StorageReadView + 'a>,
+        counts: Arc<ReadCounts>,
+    }
+
+    impl StorageBackend for CountingBackend {
+        fn begin_read(&self) -> Result<Box<dyn StorageReadView + '_>, BackendError> {
+            Ok(Box::new(CountingView {
+                inner: self.inner.begin_read()?,
+                counts: self.counts.clone(),
+            }))
+        }
+
+        fn begin_write(&self) -> Result<Box<dyn StorageWriteBatch + 'static>, BackendError> {
+            self.inner.begin_write()
+        }
+    }
+
+    impl StorageReadView for CountingView<'_> {
+        fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
+            *self.counts.gets.lock().unwrap().entry(table).or_default() += 1;
+            self.inner.get(table, key)
+        }
+
+        fn contains(&self, table: Table, key: &[u8]) -> Result<bool, BackendError> {
+            *self
+                .counts
+                .contains
+                .lock()
+                .unwrap()
+                .entry(table)
+                .or_default() += 1;
+            self.inner.contains(table, key)
+        }
+
+        fn prefix_iterator(
+            &self,
+            table: Table,
+            prefix: &[u8],
+        ) -> Result<Box<dyn Iterator<Item = crate::api::PrefixResult> + '_>, BackendError> {
+            self.inner.prefix_iterator(table, prefix)
+        }
+    }
+
+    fn counting_store() -> (Store, Arc<ReadCounts>) {
+        let counts = Arc::new(ReadCounts::default());
+        let backend = Arc::new(CountingBackend {
+            inner: InMemoryBackend::new(),
+            counts: counts.clone(),
+        });
+        let store = Store::from_parts(
+            backend,
+            Arc::new(Config::lean(0, DEFAULT_MILLISECONDS_PER_SLOT)),
+            Chain::Lean,
+            0,
+        );
+        (store, counts)
+    }
+
+    fn put_raw(store: &Store, table: Table, root: H256) {
+        let mut batch = store.backend.begin_write().expect("write batch");
+        batch
+            .put_batch(table, vec![(root.to_ssz(), vec![1, 2, 3])])
+            .expect("put");
+        batch.commit().expect("commit");
+    }
+
+    /// A cached state answers without any backend read, so a snapshot-only
+    /// anchor state is not copied out of the database to test existence.
+    #[test]
+    fn has_state_is_answered_by_the_cache_without_touching_the_backend() {
+        let (store, counts) = counting_store();
+        let root = H256::from([7u8; 32]);
+        let state = BeaconState::Lean(sample_state(1, H256::ZERO, vec![]));
+        store.cache_state(CacheKey::BlockState(root), Arc::new(state));
+
+        assert!(store.has_state(&root).expect("has_state"));
+        for table in [Table::States, Table::StateDiffs] {
+            assert_eq!(counts.gets(table), 0);
+            assert_eq!(counts.contains(table), 0);
+        }
+    }
+
+    /// The existence check must not promote the entry in the LRU.
+    #[test]
+    fn has_state_does_not_reorder_the_state_cache() {
+        let (store, _counts) = counting_store();
+        let first = H256::from([1u8; 32]);
+        let second = H256::from([2u8; 32]);
+        for root in [first, second] {
+            let state = BeaconState::Lean(sample_state(1, H256::ZERO, vec![]));
+            store.cache_state(CacheKey::BlockState(root), Arc::new(state));
+        }
+        assert!(store.has_state(&first).expect("has_state"));
+        let cache = store.state_cache.lock().unwrap();
+        let (lru_key, _) = cache.iter().next_back().expect("non-empty");
+        assert_eq!(*lru_key, CacheKey::BlockState(first));
+    }
+
+    /// A root with a diff is found without consulting `States`.
+    #[test]
+    fn has_state_checks_diffs_first_and_skips_states_on_a_hit() {
+        let (store, counts) = counting_store();
+        let root = H256::from([3u8; 32]);
+        put_raw(&store, Table::StateDiffs, root);
+
+        assert!(store.has_state(&root).expect("has_state"));
+        assert_eq!(counts.contains(Table::StateDiffs), 1);
+        assert_eq!(counts.contains(Table::States), 0);
+        // Never a value read.
+        assert_eq!(counts.gets(Table::StateDiffs), 0);
+        assert_eq!(counts.gets(Table::States), 0);
+    }
+
+    /// A snapshot-only root (a beacon epoch anchor has no diff) is found.
+    #[test]
+    fn has_state_finds_a_snapshot_only_root() {
+        let (store, counts) = counting_store();
+        let root = H256::from([4u8; 32]);
+        put_raw(&store, Table::States, root);
+
+        assert!(store.has_state(&root).expect("has_state"));
+        assert_eq!(counts.gets(Table::States), 0);
+    }
+
+    #[test]
+    fn has_state_is_false_for_an_absent_root() {
+        let (store, _counts) = counting_store();
+        assert!(!store.has_state(&H256::from([5u8; 32])).expect("has_state"));
     }
 
     /// A state that only the handoff buffer holds is still readable. The LRU

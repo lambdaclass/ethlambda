@@ -112,6 +112,17 @@ impl StorageReadView for RocksDBReadView {
         Ok(self.db.get_cf(&cf, key)?)
     }
 
+    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error> {
+        let cf = self
+            .db
+            .cf_handle(cf_name(table))
+            .ok_or_else(|| format!("Column family {} not found", cf_name(table)))?;
+
+        // Pinned: references the block-cache buffer instead of copying the
+        // value into a `Vec`.
+        Ok(self.db.get_pinned_cf(&cf, key)?.is_some())
+    }
+
     fn prefix_iterator(
         &self,
         table: Table,

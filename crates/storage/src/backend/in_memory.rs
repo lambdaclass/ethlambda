@@ -75,6 +75,14 @@ impl StorageReadView for InMemoryReadView<'_> {
             .cloned())
     }
 
+    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error> {
+        Ok(self
+            .guard
+            .get(&table)
+            .expect("table exists")
+            .contains_key(key))
+    }
+
     fn prefix_iterator(
         &self,
         table: Table,
