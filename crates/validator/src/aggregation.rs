@@ -35,7 +35,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ethlambda_types::beacon::containers::electra::{AggregateAndProof, SignedAggregateAndProof};
+use ethlambda_types::beacon::containers::electra;
+use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{HashTreeRoot as _, Slot};
@@ -43,11 +44,18 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::aggregation_selection::selection_for;
-use crate::beacon_node::BeaconNodeApi;
 use crate::beacon_node::dto::{AttesterDutyDto, parse_pubkey};
+use crate::beacon_node::{AggregateKind, BeaconNodeApi, SignedAggregates};
 use crate::error::{Error, Result};
 use crate::keys::ValidatorStore;
 use crate::signing::SigningContext;
+
+/// An `AggregateAndProof` of either fork, held between building it and
+/// signing it.
+enum Wrapper {
+    Electra(electra::AggregateAndProof),
+    Gloas(gloas::AggregateAndProof),
+}
 
 pub struct AggregationService<B> {
     beacon_node: Arc<B>,
@@ -155,7 +163,8 @@ impl<B: BeaconNodeApi> AggregationService<B> {
 
         let signed = {
             let store = store.read().await;
-            let mut signed = Vec::with_capacity(selected.len());
+            let mut electra_signed = Vec::new();
+            let mut gloas_signed = Vec::new();
             for (duty, selection_proof) in &selected {
                 let Some(aggregate) = aggregates.get(&duty.committee_index) else {
                     continue;
@@ -168,15 +177,31 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                     }
                 };
 
-                let message = AggregateAndProof {
-                    aggregator_index: duty.validator_index,
-                    aggregate: aggregate.attestation.clone(),
-                    selection_proof: *selection_proof,
+                // The wrapper is the fork's own container, and its root is taken
+                // from it: gloas's `Attestation` hashes differently from
+                // electra's, so a root computed over the wrong one would sign a
+                // message no node can verify.
+                let (root, wrapper) = match &aggregate.attestation {
+                    AggregateKind::Electra(attestation) => {
+                        let message = electra::AggregateAndProof {
+                            aggregator_index: duty.validator_index,
+                            aggregate: attestation.clone(),
+                            selection_proof: *selection_proof,
+                        };
+                        (message.hash_tree_root(), Wrapper::Electra(message))
+                    }
+                    AggregateKind::Gloas(attestation) => {
+                        let message = gloas::AggregateAndProof {
+                            aggregator_index: duty.validator_index,
+                            aggregate: attestation.clone(),
+                            selection_proof: *selection_proof,
+                        };
+                        (message.hash_tree_root(), Wrapper::Gloas(message))
+                    }
                 };
                 // Signed over the whole wrapper, not over the aggregate: that
                 // is what binds this validator's index and its selection proof
                 // to the votes it is republishing.
-                let root = message.hash_tree_root();
                 let signature = match self
                     .context
                     .sign_aggregate_and_proof(&store, &pubkey, root, slot)
@@ -187,9 +212,22 @@ impl<B: BeaconNodeApi> AggregationService<B> {
                         continue;
                     }
                 };
-                signed.push(SignedAggregateAndProof { message, signature });
+                match wrapper {
+                    Wrapper::Electra(message) => {
+                        electra_signed.push(electra::SignedAggregateAndProof { message, signature })
+                    }
+                    Wrapper::Gloas(message) => {
+                        gloas_signed.push(gloas::SignedAggregateAndProof { message, signature })
+                    }
+                }
             }
-            signed
+            // Every aggregate in a batch is one fork (see `batch_fork`), so only
+            // one of the two lists is ever filled.
+            if fork >= ForkName::Gloas {
+                SignedAggregates::Gloas(gloas_signed)
+            } else {
+                SignedAggregates::Electra(electra_signed)
+            }
         };
 
         if signed.is_empty() {

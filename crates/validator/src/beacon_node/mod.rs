@@ -16,11 +16,12 @@ use ethlambda_types::beacon::signing::compute_epoch_at_slot;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto,
+    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
     SingleAttestationDto,
 };
 use crate::error::Result;
-use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
+use ethlambda_types::beacon::containers::electra;
+use ethlambda_types::beacon::containers::gloas;
 
 pub mod block_contents;
 pub mod dto;
@@ -94,6 +95,12 @@ pub struct Duties<T> {
 /// means here.
 pub type AttesterDuties = Duties<AttesterDutyDto>;
 
+/// One epoch's payload timeliness committee duties for the indices asked
+/// about. See [`Duties`] for what `dependent_root` means; for these it is the
+/// same kind of root the attester schedule uses, since committee membership is
+/// derived from the same shuffling.
+pub type PtcDuties = Duties<PtcDutyDto>;
+
 /// Every proposer for one epoch, not only this client's. The endpoint takes no
 /// validator list, so the caller filters. See [`Duties`] for what
 /// `dependent_root` means here, and why it is the more fragile of the two.
@@ -111,6 +118,10 @@ pub type ProposerDuties = Duties<ProposerDutyDto>;
 #[derive(Debug, Clone)]
 pub struct BlockRequest {
     pub slot: Slot,
+    /// The fork `slot` is in, by this client's own schedule. Selects the
+    /// endpoint version: `produceBlockV3` before gloas, `produceBlockV4` from
+    /// it on.
+    pub fork: ForkName,
     /// The validator this client believes proposes `slot`.
     pub proposer_index: ValidatorIndex,
     /// This proposer's reveal for the slot's epoch, which the node needs
@@ -150,17 +161,19 @@ pub enum Published {
 /// else is one this client's key can only sign uselessly, while still burning
 /// the guard's record for that slot.
 pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) -> Result<()> {
-    let block = block.block();
-    if block.slot != request.slot {
+    if block.slot() != request.slot {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "requested a block for slot {}, node produced one for slot {}",
-            request.slot, block.slot
+            request.slot,
+            block.slot()
         )));
     }
-    if block.proposer_index != request.proposer_index {
+    if block.proposer_index() != request.proposer_index {
         return Err(crate::error::Error::InconsistentResponse(format!(
             "block for slot {} names proposer {}, expected {}",
-            request.slot, block.proposer_index, request.proposer_index
+            request.slot,
+            block.proposer_index(),
+            request.proposer_index
         )));
     }
     Ok(())
@@ -174,7 +187,49 @@ pub fn validate_produced_block(request: &BlockRequest, block: &ProducedBlock) ->
 #[derive(Debug, Clone)]
 pub struct AggregateAttestation {
     pub fork: ForkName,
-    pub attestation: Attestation,
+    pub attestation: AggregateKind,
+}
+
+/// The attestation container an aggregate is, by fork.
+///
+/// Gloas's `Attestation` is not electra's: its `aggregation_bits` is the
+/// unbounded progressive bitlist, so its hash tree root differs and an
+/// `AggregateAndProof` wrapping it must be signed over the gloas root.
+#[derive(Debug, Clone)]
+pub enum AggregateKind {
+    /// Electra and fulu share one layout.
+    Electra(electra::Attestation),
+    Gloas(gloas::Attestation),
+}
+
+impl AggregateKind {
+    /// The data the aggregate votes on, whichever layout carries it.
+    pub fn data(&self) -> &AttestationData {
+        match self {
+            Self::Electra(attestation) => &attestation.data,
+            Self::Gloas(attestation) => &attestation.data,
+        }
+    }
+}
+
+/// A batch of signed aggregates, all of one fork.
+#[derive(Debug, Clone)]
+pub enum SignedAggregates {
+    Electra(Vec<electra::SignedAggregateAndProof>),
+    Gloas(Vec<gloas::SignedAggregateAndProof>),
+}
+
+impl SignedAggregates {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Electra(list) => list.len(),
+            Self::Gloas(list) => list.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A validator's index and status, as resolved from its public key.
@@ -252,11 +307,15 @@ pub trait BeaconNodeApi: Send + Sync {
     /// treats the two the same way will act on a stale proposer schedule.
     async fn proposer_duties(&self, epoch: Epoch) -> Result<ProposerDuties>;
 
-    /// Produce the attestation data for `slot`.
+    /// Produce the attestation data for `slot`, which is in `fork`.
     ///
-    /// No committee index: the specification deprecated that parameter, from
-    /// Electra on `AttestationData.index` must be zero, and beacon nodes ignore
-    /// whatever is supplied. Keeping it out means a caller cannot get it wrong.
+    /// No committee index is ever a parameter here. Before gloas the query
+    /// still carries `committee_index=0`, which the specification deprecated
+    /// from electra on and nodes ignore, so a caller cannot get it wrong. From
+    /// gloas it is omitted, because the answer's `index` is no longer a
+    /// committee but the payload signal (0 for a same-slot block, 1 when the
+    /// attested block's payload was seen as full), and the caller must pass it
+    /// through unchanged: it is signed.
     ///
     /// # Contract: the answer is for `slot`, or this is an `Err`
     ///
@@ -273,9 +332,13 @@ pub trait BeaconNodeApi: Send + Sync {
     /// returned, so a node stuck on a stale head is seen as a success every
     /// slot and the next node is never consulted. Enforced here, a wrong
     /// answer is an `Err` that failover treats like any other and moves past.
-    async fn attestation_data(&self, slot: Slot) -> Result<AttestationData>;
+    async fn attestation_data(&self, slot: Slot, fork: ForkName) -> Result<AttestationData>;
 
     /// Ask the node to build a block for `request.slot`.
+    ///
+    /// From gloas the node is asked to include the self-built payload's
+    /// envelope in the answer, which saves a round trip inside the proposal's
+    /// budget.
     ///
     /// Returns the block and whatever travelled with it, decoded from SSZ.
     /// JSON is not used here: see [`block_contents`] for why a block, alone
@@ -307,6 +370,56 @@ pub trait BeaconNodeApi: Send + Sync {
     /// a `Vec` here would be cloned once per configured node on every
     /// proposal, whether or not the first one succeeded.
     async fn publish_block(&self, fork: ForkName, body: &[u8]) -> Result<Published>;
+
+    /// The envelope the node cached for the self-built payload of the block
+    /// whose root is `block_root`, proposed at `slot`.
+    ///
+    /// Only needed when `produce_block` came back without its payload
+    /// (`Eth-Execution-Payload-Included: false`). An answer whose
+    /// `beacon_block_root` is not `block_root` is an `Err`, for the reason
+    /// [`validate_produced_block`] is enforced in the implementations.
+    async fn execution_payload_envelope(
+        &self,
+        slot: Slot,
+        block_root: Root,
+    ) -> Result<gloas::ExecutionPayloadEnvelope>;
+
+    /// Publish a signed envelope, given its SSZ body.
+    ///
+    /// `blob_data_included` is the `Eth-Blob-Data-Included` header: `true`
+    /// when the body is `SignedExecutionPayloadEnvelopeContents`, `false` when
+    /// it is the bare signed envelope and the node attaches the blobs it
+    /// cached at production time.
+    async fn publish_execution_payload_envelope(
+        &self,
+        body: &[u8],
+        blob_data_included: bool,
+    ) -> Result<()>;
+
+    /// The payload timeliness committee duties for `indices` in `epoch`.
+    ///
+    /// An epoch before gloas answers with no duties rather than an error.
+    async fn ptc_duties(&self, epoch: Epoch, indices: &[ValidatorIndex]) -> Result<PtcDuties>;
+
+    /// What a payload timeliness committee member should vote on at `slot`, or
+    /// `None` when the node knows no block for it (204), which is an ordinary
+    /// outcome and not an error.
+    ///
+    /// # Contract: the answer is for `slot`, or this is an `Err`
+    ///
+    /// For the reason [`Self::attestation_data`] states.
+    async fn payload_attestation_data(
+        &self,
+        slot: Slot,
+    ) -> Result<Option<gloas::PayloadAttestationData>>;
+
+    /// Submit signed payload attestation messages to the node's pool. Returns
+    /// how many it accepted, with the same partial-success reading as
+    /// [`Self::submit_attestations`].
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize>;
 
     /// Submits signed attestations to the node's pool, so they reach gossip.
     /// `fork_name` names the fork the attestations were produced under, since
@@ -353,11 +466,8 @@ pub trait BeaconNodeApi: Send + Sync {
     /// hand-written mapping this crate avoids, which is why the two differ.
     ///
     /// The endpoint takes a list even for one aggregate, so this does too.
-    async fn publish_aggregates(
-        &self,
-        fork: ForkName,
-        aggregates: &[SignedAggregateAndProof],
-    ) -> Result<()>;
+    async fn publish_aggregates(&self, fork: ForkName, aggregates: &SignedAggregates)
+    -> Result<()>;
 
     /// Tells the node where to pay each validator's execution-layer block
     /// rewards, so it has somewhere to send them when it builds a payload.

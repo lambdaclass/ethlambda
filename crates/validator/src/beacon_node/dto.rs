@@ -205,6 +205,18 @@ pub struct ProposerDutyDto {
     pub slot: Slot,
 }
 
+/// One entry of `POST /eth/v1/validator/duties/ptc/{epoch}`: the same three
+/// fields a proposer duty has, since a committee member too is named by key,
+/// index and the one slot it votes in.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PtcDutyDto {
+    pub pubkey: String,
+    #[serde(with = "quoted_u64")]
+    pub validator_index: ValidatorIndex,
+    #[serde(with = "quoted_u64")]
+    pub slot: Slot,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ValidatorEntryDto {
     #[serde(with = "quoted_u64")]
