@@ -72,6 +72,9 @@ pub(crate) enum ApiError {
     /// A request this node cannot answer right now, typically because its
     /// execution client did not (the Beacon API's 503).
     ServiceUnavailable(&'static str),
+    /// A request body in an encoding this endpoint does not take (415). A
+    /// client that posted SSZ and gets this one falls back to JSON.
+    UnsupportedMediaType(&'static str),
 }
 
 impl From<IdError> for ApiError {
@@ -90,11 +93,41 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             ApiError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            ApiError::UnsupportedMediaType(m) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, m),
         };
         let body = serde_json::json!({ "code": status.as_u16(), "message": message });
         let mut response = crate::json_response(body);
         *response.status_mut() = status;
         response
+    }
+}
+
+/// Decode the array a batch-submission endpoint takes, as JSON or as the SSZ
+/// `List[T, ...]` of the same elements, by the request's `Content-Type`.
+///
+/// An absent `Content-Type` is read as JSON, which is what every client that
+/// predates SSZ submission sends. Anything else is a 415 rather than a guess,
+/// so a client that tries SSZ first (prysm) learns this node wants the other.
+pub(crate) fn decode_list<T>(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<Vec<T>, ApiError>
+where
+    T: serde::de::DeserializeOwned + libssz::SszDecode,
+{
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.split(';').next().unwrap_or("").trim());
+    match content_type {
+        None | Some("application/json") => {
+            serde_json::from_slice(body).map_err(|_| ApiError::BadRequest("invalid request body"))
+        }
+        Some(crate::SSZ_CONTENT_TYPE) => <Vec<T> as libssz::SszDecode>::from_ssz_bytes(body)
+            .map_err(|_| ApiError::BadRequest("invalid request body")),
+        Some(_) => Err(ApiError::UnsupportedMediaType(
+            "Content-Type must be application/json or application/octet-stream",
+        )),
     }
 }
 
