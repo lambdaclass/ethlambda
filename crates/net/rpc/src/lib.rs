@@ -186,6 +186,11 @@ pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: Str
         .with_state(store)
 }
 
+/// The data columns this node custodies, as the chain actor's availability
+/// gate reads them. Empty on a node with nothing to custody.
+#[derive(Clone, Debug, Default)]
+pub struct CustodyColumns(pub Vec<u64>);
+
 /// What the Beacon API's validator endpoints reach beyond the store.
 pub struct BeaconApiHandles {
     /// Through which the pool, aggregate and block endpoints gossip what a
@@ -197,6 +202,9 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// The columns this node samples, which `payload_attestation_data` checks a
+    /// block's blob availability against.
+    pub custody_columns: CustodyColumns,
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
     pub engine: Option<ethlambda_engine::EngineClient>,
@@ -221,6 +229,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.attestation_pool))
         .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine));
     start_http_servers(config, Some(api_router), shutdown).await
