@@ -467,6 +467,27 @@ Two new handlers, `on_execution_payload_envelope` and
 `on_payload_attestation_message`, join the spec's list of ways to change the
 store.
 
+Fork choice has the same problem on a longer loop: `get_head` weighs every
+validator's latest vote by the voter's balance at the justified checkpoint, and
+the boost needs that state's total active balance. Both read one
+`JustifiedBalances` snapshot (`ethlambda-types`, held in the store's
+`BeaconScratch`) instead of a `validator(i)` descent per vote and a registry
+scan per boost. It is built from `checkpoint_state(justified)` only, keyed by
+the checkpoint it came from, so a moved justified checkpoint is a miss with no
+hook on the writers; it holds a zero for validators that are inactive or
+slashed, and a separate total that still counts slashed-but-active validators
+(the specification's `get_total_active_balance`, floored at one increment).
+Equivocations stay out of it: they are store-level and can change at any time,
+so they are filtered per vote. `get_weight` stays as the specification's
+per-root definition, and the fork-choice fixture runner checks
+`compute_weights` against it at every `checks` step.
+
+The latest votes are stored the same way, as a dense table indexed by validator
+index rather than a hash map, so the vote loop reads votes and snapshot
+balances in index order. The table grows to the highest voting index, which is
+why `set_latest_message` only takes indices from validated attestations (a
+debug assertion bounds it).
+
 ## Macros and traits
 
 Two `macro_rules!` in the whole crate, both local, both replacing boilerplate that

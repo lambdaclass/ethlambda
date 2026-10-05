@@ -196,6 +196,7 @@ use crate::beacon::primitives::{
     ValidatorIndex,
 };
 use crate::beacon::stf;
+use crate::metrics;
 
 // ---------------------------------------------------------------------------
 // LatestMessage, PowBlock, PayloadStatusV1, ForkChoiceNode, PayloadStatus
@@ -210,8 +211,8 @@ use crate::beacon::stf;
 // keyed on plain `Root`s, and nothing about either type needs storage of its
 // own beyond what `BeaconScratch` already keeps.
 pub use ethlambda_types::beacon::fork_choice::{
-    BlockPayloadLink, ForkChoiceNode, LatestMessage, PayloadStatus, PayloadStatusEnum,
-    PayloadStatusV1, PowBlock,
+    BlockPayloadLink, ForkChoiceNode, JustifiedBalances, LatestMessage, PayloadStatus,
+    PayloadStatusEnum, PayloadStatusV1, PowBlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -1225,8 +1226,18 @@ pub fn get_ancestor(index: &HashMap<Root, (Slot, Root)>, root: Root, slot: Slot)
 /// values it is called with are themselves already expressed on a 0-100
 /// scale.
 pub fn calculate_committee_fraction(state: &BeaconState, committee_percent: u64) -> Result<Gwei> {
-    let committee_weight = get_total_active_balance(state)? / preset::SLOTS_PER_EPOCH;
-    Ok(committee_weight.saturating_mul(committee_percent) / 100)
+    Ok(committee_fraction(
+        get_total_active_balance(state)?,
+        committee_percent,
+    ))
+}
+
+/// The arithmetic of [`calculate_committee_fraction`], for a caller that
+/// already holds the total active balance (the [`JustifiedBalances`] snapshot's
+/// own).
+pub fn committee_fraction(total_active_balance: Gwei, committee_percent: u64) -> Gwei {
+    let committee_weight = total_active_balance / preset::SLOTS_PER_EPOCH;
+    committee_weight.saturating_mul(committee_percent) / 100
 }
 
 /// The checkpoint block for `epoch`, on `root`'s chain: the ancestor of `root`
@@ -1247,10 +1258,66 @@ pub fn get_checkpoint_block(
 /// See [`calculate_committee_fraction`] for why this divides by a bare
 /// `100` rather than [`constants::BASIS_POINTS`].
 pub fn get_proposer_score(store: &Store, config: &Config) -> Result<Gwei> {
-    let justified_checkpoint = store.beacon_justified_checkpoint();
-    let justified_state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let committee_weight = get_total_active_balance(&justified_state)? / preset::SLOTS_PER_EPOCH;
-    Ok(committee_weight.saturating_mul(config.proposer_score_boost) / 100)
+    let balances = justified_balances(store, config)?;
+    Ok(committee_fraction(
+        balances.total_active_balance(),
+        config.proposer_score_boost,
+    ))
+}
+
+/// The flat balances of the store's justified checkpoint state, built on first
+/// use after the checkpoint moves and shared until it moves again.
+///
+/// Keyed by the checkpoint itself, which every writer of the justified
+/// checkpoint (`update_checkpoints` from three handlers, store construction,
+/// restart) already changes, so none of them needs a hook. The only source is
+/// [`checkpoint_state`], the state `get_weight` reads, so the snapshot is
+/// exactly what the specification's per-root definition sees; a later
+/// post-state of the same epoch would not be, since `slashed` can differ.
+/// A failed `checkpoint_state` fails the call, as it does for every other
+/// fork-choice reader, and the head stays where it is.
+pub fn justified_balances(store: &Store, config: &Config) -> Result<Arc<JustifiedBalances>> {
+    let checkpoint = store.beacon_justified_checkpoint();
+    if let Some(balances) = store.justified_balances(&checkpoint) {
+        metrics::inc_justified_balances_lookups("hit");
+        return Ok(balances);
+    }
+    metrics::inc_justified_balances_lookups("miss");
+    let state = checkpoint_state(store, &checkpoint, config)?;
+    let balances = Arc::new(build_justified_balances(checkpoint, &state));
+    store.set_justified_balances(Arc::clone(&balances));
+    Ok(balances)
+}
+
+/// One in-order pass over `state`'s registry: each validator's vote weight
+/// (zero if inactive or slashed) and, in the same pass, the total active
+/// balance with exactly the semantics of `get_total_active_balance`
+/// (slashed-but-active validators count, saturating, floored at one increment).
+fn build_justified_balances(checkpoint: Checkpoint, state: &BeaconState) -> JustifiedBalances {
+    let _timing = metrics::time_justified_balances_build();
+    // Activity at the state's own epoch, as `get_weight` reads it; not asserted
+    // equal to `checkpoint.epoch`, which the unit-test stores do not keep.
+    let epoch = get_current_epoch(state);
+    let mut total: Gwei = 0;
+    let balances = state
+        .iter_validators()
+        .map(|validator| {
+            if !is_active_validator(validator, epoch) {
+                return 0;
+            }
+            total = total.saturating_add(validator.effective_balance);
+            if validator.slashed {
+                0
+            } else {
+                validator.effective_balance
+            }
+        })
+        .collect();
+    JustifiedBalances::new(
+        checkpoint,
+        balances,
+        total.max(preset::EFFECTIVE_BALANCE_INCREMENT),
+    )
 }
 
 /// The effective balance of every non-equivocating, active, unslashed
@@ -1378,8 +1445,7 @@ pub fn compute_weights(
     config: &Config,
 ) -> Result<HashMap<Root, Gwei>> {
     let justified_checkpoint = store.beacon_justified_checkpoint();
-    let state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let current_epoch = get_current_epoch(&state);
+    let balances = justified_balances(store, config)?;
 
     // Keyed on the voted block itself; the fold below turns these into subtree
     // totals in place.
@@ -1388,19 +1454,15 @@ pub fn compute_weights(
     // `for_each_non_equivocating_latest_message` for why asking it per voter
     // from in here would deadlock.
     store.for_each_non_equivocating_latest_message(|validator_index, message| {
-        // Not `get_active_validator_indices`: that allocates the whole active
-        // set (~2 million entries on mainnet) to answer a membership question,
-        // and an index past this state's registry is a validator that did not
-        // exist yet at the justified checkpoint, which is a skip rather than an
-        // error.
-        let Ok(validator) = state.validator(validator_index) else {
-            return;
-        };
-        if validator.slashed || !is_active_validator(validator, current_epoch) {
+        // An index past the snapshot is a validator that did not exist at the
+        // justified checkpoint, and an inactive or slashed one is zero in it:
+        // both are a skip rather than an error.
+        let balance = balances.get(validator_index);
+        if balance == 0 {
             return;
         }
         let entry = weights.entry(message.root).or_default();
-        *entry = entry.saturating_add(validator.effective_balance);
+        *entry = entry.saturating_add(balance);
     });
 
     // Highest slot first: see above for why that is a topological order.
@@ -1432,7 +1494,8 @@ pub fn compute_weights(
         let justified_slot = index
             .get(&justified_checkpoint.root)
             .map_or(0, |(slot, _)| *slot);
-        let proposer_score = get_proposer_score(store, config)?;
+        let proposer_score =
+            committee_fraction(balances.total_active_balance(), config.proposer_score_boost);
         let mut cursor = boost_root;
         while let Some((slot, parent_root)) = index.get(&cursor).copied() {
             let entry = weights.entry(cursor).or_default();
@@ -1856,7 +1919,10 @@ pub fn compute_node_weights(
     let tree = PayloadTree { store, rules };
     let justified_checkpoint = store.beacon_justified_checkpoint();
     let state = checkpoint_state(store, &justified_checkpoint, config)?;
-    let current_epoch = get_current_epoch(&state);
+    // The vote loop reads each voter's weight from the snapshot of this same
+    // checkpoint state rather than descending the registry per vote; `state`
+    // stays for the boost gate, which wants the committees' state itself.
+    let balances = justified_balances(store, config)?;
     let bound = walk_bound(store, index);
     let in_window = |root: &Root| index.get(root).is_some_and(|&(slot, _)| slot >= bound);
 
@@ -1866,19 +1932,18 @@ pub fn compute_node_weights(
     // from in here would deadlock, and a payload link is such a read.
     let mut votes: HashMap<(Root, Slot, bool), Gwei> = HashMap::new();
     store.for_each_non_equivocating_latest_message(|validator_index, message| {
-        // Not `get_active_validator_indices`, for the reason
-        // `compute_weights` gives; a validator past this state's registry
-        // did not exist at the justified checkpoint, which is a skip.
-        let Ok(validator) = state.validator(validator_index) else {
-            return;
-        };
-        if validator.slashed || !is_active_validator(validator, current_epoch) {
+        // An index past the snapshot is a validator that did not exist at the
+        // justified checkpoint, and an inactive or slashed one is zero in it:
+        // both are a skip rather than an error, as is a zero balance, which
+        // adds nothing either way.
+        let balance = balances.get(validator_index);
+        if balance == 0 {
             return;
         }
         let entry = votes
             .entry((message.root, message.slot, message.payload_present))
             .or_default();
-        *entry = entry.saturating_add(validator.effective_balance);
+        *entry = entry.saturating_add(balance);
     });
 
     let mut weights = NodeWeights {
@@ -5363,7 +5428,12 @@ mod tests {
     /// [`anchor_pair`] over a registry of `count` validators, for the weight
     /// tests, which name a voter per validator index.
     fn anchor_pair_with(count: usize) -> (BeaconState, SignedBeaconBlock) {
-        let mut state = test_state::with_validators(count);
+        anchor_pair_from(test_state::with_validators(count))
+    }
+
+    /// [`anchor_pair`] over a caller-built `state`, for tests that need a
+    /// registry with slashed or inactive validators in it.
+    fn anchor_pair_from(mut state: BeaconState) -> (BeaconState, SignedBeaconBlock) {
         let parent_root = state.latest_block_header().parent_root;
         let mut signed = block(state.slot(), parent_root);
 
@@ -5412,7 +5482,12 @@ mod tests {
     /// The anchor is what `checkpoint_state` resolves the justified checkpoint
     /// to, which is the one thing both weight functions need from a real store.
     fn anchored_store(count: usize) -> (Store, Root, Slot) {
-        let (anchor_state, anchor_block) = anchor_pair_with(count);
+        anchored_store_from(test_state::with_validators(count))
+    }
+
+    /// [`anchored_store`] over a caller-built state.
+    fn anchored_store_from(state: BeaconState) -> (Store, Root, Slot) {
+        let (anchor_state, anchor_block) = anchor_pair_from(state);
         let anchor_slot = anchor_state.slot();
         let anchor_root = anchor_block.message_hash_tree_root();
         let store = get_forkchoice_store(
@@ -5425,13 +5500,30 @@ mod tests {
         (store, anchor_root, anchor_slot)
     }
 
+    /// A `count`-validator state (`count >= 9`) whose registry has every kind
+    /// of validator the weight paths must tell apart, at the state's own epoch:
+    /// validator 6 is slashed but active, 7 activates one epoch later, 8 exited
+    /// at this epoch, and the rest are plain active ones.
+    fn state_with_slashed_and_inactive_validators(count: usize) -> BeaconState {
+        let mut state = test_state::with_validators(count);
+        let epoch = get_current_epoch(&state);
+        state.validator_mut(6).expect("registered").slashed = true;
+        state.validator_mut(7).expect("registered").activation_epoch = epoch + 1;
+        state.validator_mut(8).expect("registered").exit_epoch = epoch;
+        state.apply_pending_mutations();
+        state
+    }
+
     /// `compute_weights` is the specification's `get_weight` for every root at
     /// once, so the two have to agree root by root: over a fork, over voters
     /// spread across both branches, and with the proposer boost applied.
     #[test]
     fn the_single_pass_weights_match_the_specifications_per_root_weight() {
         let config = Config::active();
-        let (mut store, anchor_root, anchor_slot) = anchored_store(8);
+        // Validators 6 (slashed), 7 (not yet active) and 8 (exited) vote below
+        // and must weigh nothing; validator 40 is past the registry.
+        let (mut store, anchor_root, anchor_slot) =
+            anchored_store_from(state_with_slashed_and_inactive_validators(12));
 
         // anchor -> a -> {b, c}: a fork whose two leaves split the vote, so a
         // wrong fold shows up as a leaf carrying its sibling's balance.
@@ -5478,6 +5570,17 @@ mod tests {
             },
         );
         store.insert_equivocating_index(5);
+        for (validator_index, root) in [(6, c_root), (7, c_root), (8, c_root), (40, c_root)] {
+            store.set_latest_message(
+                validator_index,
+                LatestMessage {
+                    epoch: 0,
+                    slot: 0,
+                    root,
+                    payload_present: false,
+                },
+            );
+        }
         store.set_proposer_boost_root(b_root);
 
         let weights = compute_weights(&store, &index, &config).expect("the anchor state is there");
@@ -5493,6 +5596,145 @@ mod tests {
             weights[&b_root] > weights[&c_root],
             "three voters and the boost must outweigh one voter"
         );
+        assert_eq!(
+            weights[&c_root],
+            preset::MAX_EFFECTIVE_BALANCE,
+            "only validator 3 counts on c: the slashed, inactive, exited and unknown voters weigh nothing"
+        );
+        assert_eq!(
+            weights[&b_root],
+            3 * preset::MAX_EFFECTIVE_BALANCE
+                + get_proposer_score(&store, &config).expect("the anchor state is there"),
+        );
+    }
+
+    /// The boost's committee weight divides the total active balance, which
+    /// counts a slashed validator that is still active and leaves out one that
+    /// is not active yet or already exited: the snapshot's per-vote zeros for
+    /// the first kind must not leak into the total.
+    #[test]
+    fn the_proposer_score_counts_a_slashed_but_active_validator() {
+        let config = Config::active();
+        let (store, _anchor_root, _anchor_slot) =
+            anchored_store_from(state_with_slashed_and_inactive_validators(12));
+
+        // 12 validators, 2 of them (7 and 8) inactive; the slashed one stays.
+        let expected = committee_fraction(
+            10 * preset::MAX_EFFECTIVE_BALANCE,
+            config.proposer_score_boost,
+        );
+        assert_eq!(
+            get_proposer_score(&store, &config).expect("the anchor state is there"),
+            expected
+        );
+        assert_ne!(
+            expected,
+            committee_fraction(
+                9 * preset::MAX_EFFECTIVE_BALANCE,
+                config.proposer_score_boost
+            ),
+            "a total that dropped the slashed validator would differ"
+        );
+        // And it is the state's own definition, not a second one.
+        let state = checkpoint_state(&store, &store.beacon_justified_checkpoint(), &config)
+            .expect("the anchor state is there");
+        assert_eq!(
+            expected,
+            calculate_committee_fraction(&state, config.proposer_score_boost).expect("total"),
+        );
+    }
+
+    #[test]
+    fn building_the_snapshot_handles_activation_exit_slashing_and_an_empty_set() {
+        let mut state = test_state::with_validators(6);
+        let epoch = get_current_epoch(&state);
+        state.validator_mut(1).expect("registered").activation_epoch = epoch;
+        state.validator_mut(2).expect("registered").activation_epoch = epoch + 1;
+        state.validator_mut(3).expect("registered").exit_epoch = epoch;
+        state.validator_mut(4).expect("registered").slashed = true;
+        state.apply_pending_mutations();
+        let checkpoint = Checkpoint {
+            epoch,
+            root: Root::repeat_byte(1),
+        };
+
+        let snapshot = build_justified_balances(checkpoint, &state);
+        let full = preset::MAX_EFFECTIVE_BALANCE;
+        // Activation at the epoch counts; exit at the epoch does not; a slashed
+        // but active validator weighs zero as a voter and counts in the total.
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5].map(|index| snapshot.get(index)),
+            [full, full, 0, 0, 0, full]
+        );
+        assert_eq!(snapshot.total_active_balance(), 4 * full);
+        assert_eq!(
+            snapshot.total_active_balance(),
+            get_total_active_balance(&state).expect("total")
+        );
+        assert_eq!(snapshot.get(6), 0, "past the registry reads zero");
+        assert_eq!(snapshot.checkpoint(), checkpoint);
+
+        // No active validator at all: the total is floored like the spec's.
+        for index in 0..6 {
+            state.validator_mut(index).expect("registered").exit_epoch = epoch;
+        }
+        state.apply_pending_mutations();
+        let empty = build_justified_balances(checkpoint, &state);
+        assert_eq!(
+            empty.total_active_balance(),
+            preset::EFFECTIVE_BALANCE_INCREMENT
+        );
+        assert_eq!(
+            empty.total_active_balance(),
+            get_total_active_balance(&state).expect("total")
+        );
+        assert_eq!(empty.get(0), 0);
+    }
+
+    #[test]
+    fn a_new_justified_checkpoint_rebuilds_the_snapshot() {
+        let config = Config::active();
+        let (mut store, anchor_root, _anchor_slot) = anchored_store(8);
+
+        let first = justified_balances(&store, &config).expect("the anchor state is there");
+        let again = justified_balances(&store, &config).expect("cached");
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "same checkpoint, same snapshot"
+        );
+        assert_eq!(first.get(0), preset::MAX_EFFECTIVE_BALANCE);
+
+        // A later justified checkpoint over a state with different balances,
+        // planted where `checkpoint_state` finds it.
+        let next = Checkpoint {
+            epoch: first.checkpoint().epoch + 1,
+            root: Root::repeat_byte(0x77),
+        };
+        let mut state = test_state::with_validators(8);
+        *state.slot_mut() = compute_start_slot_at_epoch(next.epoch);
+        state
+            .validator_mut(0)
+            .expect("registered")
+            .effective_balance = 5;
+        state.validator_mut(1).expect("registered").slashed = true;
+        state.apply_pending_mutations();
+        store.cache_state(
+            CacheKey::CheckpointState {
+                epoch: next.epoch,
+                root: next.root,
+            },
+            Arc::new(state),
+        );
+        let finalized = store.beacon_finalized_checkpoint();
+        update_checkpoints(&mut store, next, finalized);
+        assert_ne!(store.beacon_justified_checkpoint().root, anchor_root);
+
+        let rebuilt = justified_balances(&store, &config).expect("planted state");
+        assert!(!Arc::ptr_eq(&first, &rebuilt));
+        assert_eq!(rebuilt.checkpoint(), next);
+        assert_eq!(rebuilt.get(0), 5);
+        assert_eq!(rebuilt.get(1), 0, "slashed in the new state");
+        assert_eq!(rebuilt.get(2), preset::MAX_EFFECTIVE_BALANCE);
     }
 
     /// The failure a live mainnet follower hit: `promote_beacon_anchor` prunes
