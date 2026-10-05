@@ -744,6 +744,14 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,
     };
+    // The same set the execution client is told it samples for when block
+    // production asks it to build a gloas payload.
+    let rpc_custody_columns = match &setup.chain {
+        ChainActor::Beacon {
+            custody_columns, ..
+        } => custody_columns.clone(),
+        ChainActor::Lean(..) => Vec::new(),
+    };
 
     // Which HTTP surface this node serves follows from the store's own chain
     // tag rather than from the sub-command, so the two can never disagree.
@@ -762,6 +770,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
                     engine: rpc_engine,
+                    custody_columns: rpc_custody_columns,
                 },
                 local_peer_id,
                 rpc_shutdown,

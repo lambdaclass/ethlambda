@@ -111,8 +111,8 @@ async fn post_block(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if fork != Some(ForkName::Fulu) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu").into_response();
+    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
     }
     let is_ssz = headers
         .get(header::CONTENT_TYPE)
@@ -124,6 +124,9 @@ async fn post_block(
             "blocks are accepted as application/octet-stream only",
         )
             .into_response();
+    }
+    if fork == Some(ForkName::Gloas) {
+        return post_gloas_block(&store, &p2p, &body).await;
     }
     let Ok(contents) = FuluSignedBlockContents::from_ssz_bytes(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
@@ -168,6 +171,88 @@ async fn post_block(
         return ApiError::Internal("the network actor is not running").into_response();
     }
     StatusCode::OK.into_response()
+}
+
+/// The gloas half of `publishBlockV2`: a bare SSZ `SignedBeaconBlock`, since a
+/// gloas block carries no payload and no blobs of its own (the envelope and
+/// the data columns follow through `publishExecutionPayloadEnvelope`).
+///
+/// Checked as the fulu one is, before it goes anywhere: the parent is held,
+/// the slot is after the parent's and scheduled at gloas, the proposer is the
+/// slot's, and the proposer's signature verifies against the parent's state
+/// advanced to the slot. The advance and the signature are CPU-bound and run
+/// off the runtime.
+async fn post_gloas_block(store: &Store, p2p: &RpcToP2PRef, body: &[u8]) -> Response {
+    let Ok(signed) = containers::gloas::SignedBeaconBlock::from_ssz_bytes(body) else {
+        return ApiError::BadRequest("the body is not a gloas SignedBeaconBlock").into_response();
+    };
+    let block = containers::SignedBeaconBlock::Gloas(signed);
+    let config = store.config();
+    if let Err(err) = require_gloas_slot(
+        &config,
+        block.slot(),
+        "blocks are accepted for gloas slots only",
+    ) {
+        return err.into_response();
+    }
+    let parent_state = match store.get_state(&block.parent_root()) {
+        Ok(Some(state)) => state,
+        Ok(None) => return ApiError::BadRequest("the block's parent is not held").into_response(),
+        Err(_) => return ApiError::Internal("store read failed").into_response(),
+    };
+    if block.slot() <= parent_state.slot() {
+        return ApiError::BadRequest("the block is not after its parent").into_response();
+    }
+    let verdict = {
+        let block = block.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = advance_to_slot(&parent_state, block.slot(), &config)
+                .map_err(|_| ApiError::Internal("advancing the parent state failed"))?;
+            let expected =
+                ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(
+                    &state,
+                )
+                .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
+            if block.proposer_index() != expected {
+                return Err(ApiError::BadRequest(
+                    "the block's proposer is not the slot's",
+                ));
+            }
+            if !verify_block_signature(&state, &block) {
+                return Err(ApiError::BadRequest("invalid block signature"));
+            }
+            Ok(())
+        })
+        .await
+    };
+    match verdict {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return err.into_response(),
+        Err(_) => return ApiError::Internal("verifying the block failed").into_response(),
+    }
+    if p2p.publish_beacon_block(block).is_err() {
+        return ApiError::Internal("the network actor is not running").into_response();
+    }
+    StatusCode::OK.into_response()
+}
+
+/// Refuses a slot the schedule does not place at gloas.
+pub(crate) fn require_gloas_slot(
+    config: &Config,
+    slot: Slot,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
+        ForkName::Gloas => Ok(()),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb
+        | ForkName::Electra
+        | ForkName::Fulu
+        | ForkName::Lean => Err(ApiError::BadRequest(message)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,7 +494,7 @@ async fn build_payload(
 }
 
 /// A wei amount as the decimal string the Beacon API's value fields carry.
-fn decimal(value: &ethlambda_types::beacon::primitives::Uint256) -> String {
+pub(crate) fn decimal(value: &ethlambda_types::beacon::primitives::Uint256) -> String {
     let hex = uint256(value);
     u128::from_str_radix(hex.trim_start_matches("0x"), 16)
         .map(|value| value.to_string())
@@ -489,5 +574,57 @@ mod tests {
         let (status, json) = respond(app, request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(json["message"], "blocks are accepted for fulu slots only");
+    }
+
+    #[tokio::test]
+    async fn a_signed_gloas_block_is_gossiped_and_a_forged_one_is_refused() {
+        use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
+            config, parent_state, produce, sign_block, state_to_build_on,
+        };
+        let parent = parent_state();
+        let state = state_to_build_on();
+        let produced = produce(&state, true, Vec::new()).unwrap();
+        let (mut store, _anchor) = beacon_store_with_config(parent.clone(), config());
+        store
+            .insert_state(produced.block.parent_root, parent)
+            .unwrap();
+
+        let signed = containers::gloas::SignedBeaconBlock {
+            signature: sign_block(&state, &produced.block),
+            message: produced.block.clone(),
+        };
+        let post = |store: Store,
+                    network: Arc<RecordingNetwork>,
+                    signed: &containers::gloas::SignedBeaconBlock| {
+            let network: RpcToP2PRef = network;
+            let app = routes().with_state(store).layer(Extension(network));
+            let request = Request::post("/eth/v2/beacon/blocks")
+                .header("eth-consensus-version", "gloas")
+                .header(header::CONTENT_TYPE, crate::SSZ_CONTENT_TYPE)
+                .body(Body::from(signed.to_ssz()))
+                .unwrap();
+            respond(app, request)
+        };
+
+        let network = Arc::new(RecordingNetwork::default());
+        let (status, _) = post(store.clone(), network.clone(), &signed).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(network.blocks.lock().unwrap().len(), 1);
+
+        // A signature from another validator, and a block whose parent is not held.
+        let rejected = Arc::new(RecordingNetwork::default());
+        let mut forged = signed.clone();
+        forged.signature = sign_block(&state, &{
+            let mut other = produced.block.clone();
+            other.proposer_index += 1;
+            other
+        });
+        let (status, _) = post(store.clone(), rejected.clone(), &forged).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut orphan = signed;
+        orphan.message.parent_root = H256::repeat_byte(5);
+        let (status, _) = post(store, rejected.clone(), &orphan).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(rejected.blocks.lock().unwrap().is_empty());
     }
 }

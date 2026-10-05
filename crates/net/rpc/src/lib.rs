@@ -195,6 +195,9 @@ pub struct BeaconApiHandles {
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
     pub engine: Option<ethlambda_engine::EngineClient>,
+    /// The columns this node custodies, passed to the execution client when
+    /// block production asks it to build a gloas payload.
+    pub custody_columns: Vec<u64>,
 }
 
 /// Start the HTTP servers for a beacon node.
@@ -216,7 +219,10 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.attestation_pool))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
-        .layer(Extension(handles.engine));
+        .layer(Extension(handles.engine))
+        .layer(Extension(beacon::gloas_proposal::NodeCustodyColumns(
+            handles.custody_columns,
+        )));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 

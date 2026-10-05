@@ -474,9 +474,11 @@ fn check_envelope(
     Ok(())
 }
 
-#[cfg(test)]
-mod gloas_block_production_tests {
-    use super::super::stf::ExecutionEngine;
+/// Gloas test fixtures shared by this module's tests and by the Beacon API's
+/// (`test-utils` feature): a gloas state a block can be built on, and the pieces
+/// an execution client would hand over.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
     use super::*;
     use crate::beacon::ForkName;
     use crate::beacon::block_production::advance_to_slot;
@@ -488,17 +490,18 @@ mod gloas_block_production_tests {
     use ethlambda_types::beacon::containers::bellatrix::{ExtraData, LogsBloom};
     use ethlambda_types::beacon::primitives::Uint256;
 
-    const PARENT_BLOCK_HASH: u8 = 0x11;
-    const GRANDPARENT_BLOCK_HASH: u8 = 0x10;
+    pub const PARENT_BLOCK_HASH: u8 = 0x11;
+    pub const GRANDPARENT_BLOCK_HASH: u8 = 0x10;
 
-    fn config() -> Config {
+    /// The schedule these fixtures assume: gloas from epoch 0.
+    pub fn config() -> Config {
         Config::mainnet().with_fork_epoch(ForkName::Gloas, 0)
     }
 
-    /// A gloas state at slot 33 whose parent block (slot 32) revealed a payload,
-    /// its PTC for slot 32 filled from the real registry, with the lookahead
-    /// and sync committee a real registry would give it.
-    fn state_to_build_on() -> BeaconState {
+    /// A gloas state at slot 32, the post-state of a parent block whose
+    /// payload was revealed, its PTC for slot 32 filled from the real registry,
+    /// with the lookahead and sync committee a real registry would give it.
+    pub fn parent_state() -> BeaconState {
         let mut state = with_signing_validators_at(ForkName::Gloas, 64);
         let lookahead = initialize_proposer_lookahead(&state).unwrap();
         let sync_committee =
@@ -525,11 +528,18 @@ mod gloas_block_production_tests {
         let window_index =
             (preset::SLOTS_PER_EPOCH + inner.slot % preset::SLOTS_PER_EPOCH) as usize;
         inner.ptc_window[window_index] = ptc;
+        state
+    }
+
+    /// [`parent_state`] advanced to slot 33, the state a block is built on.
+    pub fn state_to_build_on() -> BeaconState {
+        let state = parent_state();
         let slot = state.slot() + 1;
         advance_to_slot(&state, slot, &config()).unwrap()
     }
 
-    fn payload_for(inputs: &GloasPayloadInputs) -> ExecutionPayload {
+    /// The payload an execution client would build for `inputs`.
+    pub fn payload_for(inputs: &GloasPayloadInputs) -> ExecutionPayload {
         ExecutionPayload {
             parent_hash: inputs.head_block_hash,
             fee_recipient: Default::default(),
@@ -553,7 +563,8 @@ mod gloas_block_production_tests {
         }
     }
 
-    fn randao_reveal(state: &BeaconState) -> BlsSignature {
+    /// The proposer's real RANDAO reveal for `state`'s slot.
+    pub fn randao_reveal(state: &BeaconState) -> BlsSignature {
         let proposer = get_beacon_proposer_index(state).unwrap();
         let epoch = get_current_epoch(state);
         let domain = get_domain(state, constants::DOMAIN_RANDAO, Some(epoch));
@@ -563,7 +574,8 @@ mod gloas_block_production_tests {
         )
     }
 
-    fn produce(
+    /// A block and envelope for `state` carrying one blob commitment.
+    pub fn produce(
         state: &BeaconState,
         build_on_full: bool,
         payload_attestations: Vec<PayloadAttestation>,
@@ -585,6 +597,46 @@ mod gloas_block_production_tests {
             &config(),
         )
     }
+
+    /// The state after `block` is applied to `state`, as the chain stores it.
+    pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
+        let mut post = state.clone();
+        stf::gloas::process_block(&mut post, block, &config(), &CommitteeCache::default()).unwrap();
+        post
+    }
+
+    /// The proposer's signature over `block`, as a validator client gives it.
+    pub fn sign_block(state: &BeaconState, block: &BeaconBlock) -> BlsSignature {
+        let domain = get_domain(state, constants::DOMAIN_BEACON_PROPOSER, None);
+        sign_for(
+            block.proposer_index as usize,
+            compute_signing_root(block.hash_tree_root(), domain),
+        )
+    }
+
+    /// The proposer's signature over `envelope` under `DOMAIN_BEACON_BUILDER`,
+    /// against the block's post-state.
+    pub fn sign_envelope(
+        post: &BeaconState,
+        proposer: ValidatorIndex,
+        envelope: &ExecutionPayloadEnvelope,
+    ) -> BlsSignature {
+        let domain = get_domain(post, constants::DOMAIN_BEACON_BUILDER, None);
+        sign_for(
+            proposer as usize,
+            compute_signing_root(envelope.hash_tree_root(), domain),
+        )
+    }
+}
+
+#[cfg(test)]
+mod gloas_block_production_tests {
+    use super::super::stf::ExecutionEngine;
+    use super::test_support::*;
+    use super::*;
+    use crate::beacon::helpers::accessors::get_domain;
+    use crate::beacon::helpers::misc::compute_signing_root;
+    use crate::beacon::helpers::test_state::sign_for;
 
     /// A vote on the parent block (slot 32) signed by `validator`.
     fn ptc_message(
