@@ -6,9 +6,10 @@
 //!   signs for a slot.
 //! - `POST /eth/v1/beacon/pool/payload_attestations`: a member's signed vote,
 //!   validated as gossip would, pooled for block production and gossiped.
-//! - `GET /eth/v1/beacon/pool/payload_attestations`: what the pool holds.
+//! - `GET /eth/v1/beacon/pool/payload_attestations`: what the pool holds,
+//!   aggregated per slot and data.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -24,6 +25,7 @@ use ethlambda_blockchain::metrics::SyncStatus;
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     fork_choice::{get_current_slot, get_payload_due_ms},
+    gloas_block_production::aggregate_payload_attestations,
     gossip::{
         Outcome,
         payload_attestation::{SeenPayloadAttestations, cheap_checks, stateful_checks},
@@ -38,7 +40,7 @@ use ethlambda_types::{
     beacon::{
         containers::{
             BeaconState, SignedBeaconBlock,
-            gloas::{PayloadAttestationData, PayloadAttestationMessage},
+            gloas::{PayloadAttestation, PayloadAttestationData, PayloadAttestationMessage},
         },
         fork::ForkName,
         primitives::{BlsPubkey, Epoch, Slot, ValidatorIndex},
@@ -454,26 +456,59 @@ struct PoolQuery {
 }
 
 /// `GET /eth/v1/beacon/pool/payload_attestations?slot=`: the votes this node
-/// holds, those of `slot` only when given.
+/// holds as `PayloadAttestation`s, those of `slot` only when given.
 ///
-/// The messages themselves, not the aggregates the specification's response
-/// names: the pool keeps them unaggregated so block production can combine
-/// the ones it needs, and a consumer wanting the aggregate can build it.
+/// The pool keeps the unaggregated messages (block production combines the
+/// ones it needs), but the specification's response is the aggregate: one per
+/// distinct `PayloadAttestationData`, its bitvector over the slot's committee
+/// and one aggregated signature. Aggregated here with the logic block
+/// production uses, against the head state, which can read the committee of
+/// the slot it is in, the one before and the next one. A slot outside that
+/// window has no readable committee, so its votes are left out rather than
+/// listed unaggregated; the pool only ever accepts the current slot's votes,
+/// so in practice that is a vote the head has since left far behind.
 async fn get_pool_payload_attestations(
     Query(query): Query<PoolQuery>,
+    State(store): State<Store>,
     Extension(pool): Extension<SharedPayloadAttestationPool>,
 ) -> Response {
     let held = pool
         .lock()
         .expect("payload attestation pool lock poisoned")
         .all(query.slot);
+    let aggregated = tokio::task::spawn_blocking(move || aggregate_pool(&store, held)).await;
+    let data = match aggregated {
+        Ok(Ok(data)) => data,
+        Ok(Err(err)) => return err.into_response(),
+        Err(_) => return ApiError::Internal("aggregating the pool failed").into_response(),
+    };
     with_consensus_version(
         crate::json_response(serde_json::json!({
             "version": ForkName::Gloas.as_str(),
-            "data": held,
+            "data": data,
         })),
         ForkName::Gloas,
     )
+}
+
+/// Group `held` by slot and aggregate each slot's votes against the head state.
+fn aggregate_pool(
+    store: &Store,
+    held: Vec<PayloadAttestationMessage>,
+) -> Result<Vec<PayloadAttestation>, ApiError> {
+    let config = store.config();
+    let (_, state) = head(store)?;
+    let mut by_slot: BTreeMap<Slot, Vec<PayloadAttestationMessage>> = BTreeMap::new();
+    for message in held {
+        by_slot.entry(message.data.slot).or_default().push(message);
+    }
+    Ok(by_slot
+        .into_iter()
+        .flat_map(|(slot, messages)| {
+            aggregate_payload_attestations(&state, slot, messages, &config)
+        })
+        .map(|(_, attestation)| attestation)
+        .collect())
 }
 
 #[cfg(test)]
@@ -1050,17 +1085,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_pool_is_listed_by_slot() {
+    async fn the_pool_is_listed_as_aggregates_by_slot() {
         let state = gloas_state();
         let state_epoch = compute_epoch_at_slot(state.slot());
         let member = window_index(state_epoch, state_epoch, 0);
         let (store, root) = store_with_head(state.clone(), gloas_config(), 0);
         let pool = SharedPayloadAttestationPool::default();
         let message = vote(&state, root, member, true);
-        let mut older = message.clone();
-        older.data.slot -= 1;
-        pool.lock().unwrap().insert(older);
-        pool.lock().unwrap().insert(message.clone());
+
+        // The previous slot's committee is its own window entry, which names
+        // the validator `slot % SLOTS_PER_EPOCH` here.
+        let mut earlier_state = state.clone();
+        let BeaconState::Gloas(inner) = &mut earlier_state else {
+            unreachable!("built as gloas")
+        };
+        inner.slot -= 1;
+        let earlier_member = earlier_state.slot() % preset::SLOTS_PER_EPOCH;
+        let older = vote(&earlier_state, root, earlier_member, true);
+
+        // Not in the head slot's committee: nothing to aggregate it into.
+        let outsider = vote(&state, root, member + 1, true);
+        for held in [&older, &message, &outsider] {
+            pool.lock().unwrap().insert(held.clone());
+        }
         let list = |uri: String| {
             let store = store.clone();
             let pool = pool.clone();
@@ -1081,7 +1128,32 @@ mod tests {
         assert_eq!(all.status, StatusCode::OK);
         assert_eq!(all.headers["eth-consensus-version"], "gloas");
         assert_eq!(all.json()["version"], "gloas");
-        assert_eq!(all.json()["data"].as_array().unwrap().len(), 2);
+        let data = all.json()["data"].as_array().unwrap().clone();
+        assert_eq!(
+            data.len(),
+            2,
+            "one aggregate per slot, the outsider's dropped"
+        );
+        // Oldest slot first, each an aggregate and not a message.
+        assert_eq!(data[0]["data"]["slot"], older.data.slot.to_string());
+        assert_eq!(data[1]["data"]["slot"], message.data.slot.to_string());
+        for aggregate in &data {
+            assert!(aggregate.get("validator_index").is_none());
+            // The single seat-holder fills every position of the committee.
+            let bits = aggregate["aggregation_bits"].as_str().unwrap();
+            assert_eq!(bits, format!("0x{}", "ff".repeat(preset::PTC_SIZE / 8)));
+        }
+
+        // It is the aggregate block production would pack, which only keeps
+        // one that verifies against the state.
+        let expected = ethlambda_state_transition::beacon::gloas_block_production::aggregate_payload_attestations(
+            &state,
+            message.data.slot,
+            [message.clone()],
+            &gloas_config(),
+        );
+        assert_eq!(expected.len(), 1);
+        assert_eq!(data[1], serde_json::to_value(&expected[0].1).unwrap());
 
         let slot = message.data.slot;
         let one = list(format!(
@@ -1089,6 +1161,6 @@ mod tests {
         ))
         .await;
         assert_eq!(one.json()["data"].as_array().unwrap().len(), 1);
-        assert_eq!(one.json()["data"][0]["validator_index"], member.to_string());
+        assert_eq!(one.json()["data"][0]["data"]["slot"], slot.to_string());
     }
 }
