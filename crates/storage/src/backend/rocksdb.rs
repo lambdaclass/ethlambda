@@ -4,8 +4,8 @@ use crate::api::{
     ALL_TABLES, Error, PrefixResult, StorageBackend, StorageReadView, StorageWriteBatch, Table,
 };
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBWithThreadMode, MultiThreaded, Options,
-    WriteBatch, WriteOptions,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DBCompressionType, DBWithThreadMode,
+    MultiThreaded, Options, WriteBatch, WriteOptions,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +16,43 @@ use std::sync::Arc;
 /// single source of truth (and a new table only needs one mapping).
 fn cf_name(table: Table) -> &'static str {
     table.name()
+}
+
+/// The smallest value a blob-file table stores out of line.
+///
+/// RocksDB's default data block size: a larger value would get an oversized
+/// block of its own anyway, so it gains nothing from staying inline.
+const MIN_BLOB_SIZE: u64 = 4 * 1024;
+
+/// Whether a table keeps its values in blob files rather than inline in SSTs.
+///
+/// `States` holds full state snapshots (100+ MB on mainnet-sized beacon
+/// chains) and `StateDiffs` the deltas between them (hundreds of KB). Inline,
+/// every compaction that touches a file rewrites those values, and a lookup
+/// that misses still reads the data block around the key, which here can be
+/// a whole snapshot. In a blob file a value is written once, and the SSTs
+/// hold only small references to it.
+fn stores_values_in_blob_files(table: Table) -> bool {
+    matches!(table, Table::States | Table::StateDiffs)
+}
+
+/// Moves a column family's large values into blob files.
+///
+/// RocksDB applies the change to an existing database as it goes: new
+/// writes land in blob files, and inline values move out as compaction
+/// rewrites their SSTs. So a data directory written without it opens
+/// unchanged, and no `DB_VERSION` bump is needed.
+fn enable_blob_files(cf_opts: &mut Options) {
+    cf_opts.set_enable_blob_files(true);
+    cf_opts.set_min_blob_size(MIN_BLOB_SIZE);
+    // SST blocks get RocksDB's default Snappy, but blob files default to no
+    // compression, so moving the values out would otherwise grow the tables
+    // on disk. The values are raw SSZ.
+    cf_opts.set_blob_compression_type(DBCompressionType::Lz4);
+    // No blob garbage collection: nothing deletes or overwrites a state, so it
+    // would only relocate live blobs during compaction. Revisit if states are
+    // ever pruned. No blob cache either: the store caches decoded states
+    // itself, and a snapshot-sized entry would evict the whole block cache.
 }
 
 /// RocksDB storage backend.
@@ -52,6 +89,9 @@ impl RocksDBBackend {
             .map(|t| {
                 let mut cf_opts = Options::default();
                 cf_opts.set_block_based_table_factory(&block_opts);
+                if stores_values_in_blob_files(*t) {
+                    enable_blob_files(&mut cf_opts);
+                }
                 ColumnFamilyDescriptor::new(cf_name(*t), cf_opts)
             })
             .collect();
@@ -93,7 +133,15 @@ impl StorageBackend for RocksDBBackend {
             .ok()
             .flatten()
             .unwrap_or(0);
-        sst_bytes + memtable_bytes
+        // `estimate-live-data-size` counts SST files only, so a blob-file
+        // table's values would otherwise vanish from the estimate.
+        let blob_bytes = self
+            .db
+            .property_int_value_cf(&cf, "rocksdb.live-blob-file-size")
+            .ok()
+            .flatten()
+            .unwrap_or(0);
+        sst_bytes + memtable_bytes + blob_bytes
     }
 }
 
@@ -209,6 +257,82 @@ mod tests {
         let dir = tempdir().unwrap();
         let backend = RocksDBBackend::open(dir.path()).unwrap();
         run_backend_tests(&backend);
+    }
+
+    /// A value big enough for a blob file, and the property counting them.
+    const BLOB_VALUE_LEN: usize = 64 * 1024;
+    const NUM_BLOB_FILES: &str = "rocksdb.num-blob-files";
+
+    fn num_blob_files(backend: &RocksDBBackend, table: Table) -> u64 {
+        let cf = backend.db.cf_handle(cf_name(table)).unwrap();
+        backend
+            .db
+            .property_int_value_cf(&cf, NUM_BLOB_FILES)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn put_and_flush(backend: &RocksDBBackend, table: Table, key: &[u8], value: Vec<u8>) {
+        let mut batch = backend.begin_write().unwrap();
+        batch.put_batch(table, vec![(key.to_vec(), value)]).unwrap();
+        batch.commit().unwrap();
+        let cf = backend.db.cf_handle(cf_name(table)).unwrap();
+        backend.db.flush_cf(&cf).unwrap();
+    }
+
+    #[test]
+    fn large_state_values_live_in_blob_files() {
+        let dir = tempdir().unwrap();
+        let backend = RocksDBBackend::open(dir.path()).unwrap();
+        let value: Vec<u8> = (0..BLOB_VALUE_LEN).map(|i| (i % 251) as u8).collect();
+
+        for table in [Table::States, Table::StateDiffs] {
+            put_and_flush(&backend, table, b"big", value.clone());
+            assert_eq!(num_blob_files(&backend, table), 1, "{table:?}");
+
+            let view = backend.begin_read().unwrap();
+            assert_eq!(view.get(table, b"big").unwrap(), Some(value.clone()));
+            assert!(view.contains(table, b"big").unwrap());
+            assert!(!view.contains(table, b"absent").unwrap());
+        }
+        assert!(backend.estimate_table_bytes(Table::States) > 0);
+
+        // Small values, and every other table, stay inline.
+        put_and_flush(&backend, Table::States, b"small", vec![7; 16]);
+        assert_eq!(num_blob_files(&backend, Table::States), 1);
+        put_and_flush(&backend, Table::BlockHeaders, b"big", value);
+        assert_eq!(num_blob_files(&backend, Table::BlockHeaders), 0);
+    }
+
+    #[test]
+    fn a_directory_written_without_blob_files_still_reads() {
+        let dir = tempdir().unwrap();
+        let value: Vec<u8> = (0..BLOB_VALUE_LEN).map(|i| (i % 251) as u8).collect();
+
+        // The layout a data directory had before blob files: every table
+        // with plain options.
+        {
+            let mut opts = Options::default();
+            opts.create_if_missing(true);
+            opts.create_missing_column_families(true);
+            let cfs = ALL_TABLES.iter().map(|t| cf_name(*t));
+            let db = DBWithThreadMode::<MultiThreaded>::open_cf(&opts, dir.path(), cfs).unwrap();
+            let cf = db.cf_handle(cf_name(Table::States)).unwrap();
+            db.put_cf(&cf, b"old", &value).unwrap();
+            db.flush_cf(&cf).unwrap();
+        }
+
+        let backend = RocksDBBackend::open(dir.path()).unwrap();
+        assert_eq!(num_blob_files(&backend, Table::States), 0);
+        put_and_flush(&backend, Table::States, b"new", value.clone());
+        assert_eq!(num_blob_files(&backend, Table::States), 1);
+
+        let view = backend.begin_read().unwrap();
+        assert_eq!(
+            view.get(Table::States, b"old").unwrap(),
+            Some(value.clone())
+        );
+        assert_eq!(view.get(Table::States, b"new").unwrap(), Some(value));
     }
 
     #[test]
