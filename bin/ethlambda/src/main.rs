@@ -743,14 +743,14 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
-    // Block production builds its payloads with the same execution client the
-    // chain actor validates them with.
     let rpc_custody_columns = match &setup.chain {
         ChainActor::Beacon {
             custody_columns, ..
         } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
         ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
     };
+    // Block production builds its payloads with the same execution client the
+    // chain actor validates them with.
     let rpc_engine = match &setup.chain {
         ChainActor::Beacon { engine, .. } => engine.clone(),
         ChainActor::Lean(..) => None,

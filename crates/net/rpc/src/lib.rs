@@ -202,8 +202,10 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
-    /// The columns this node samples, which `payload_attestation_data` checks a
-    /// block's blob availability against.
+    /// The columns this node custodies: what `payload_attestation_data` checks
+    /// a block's blob availability against, and what block production tells
+    /// the execution client it samples for when asking it to build a gloas
+    /// payload.
     pub custody_columns: CustodyColumns,
     /// The execution client block production builds payloads with; `None`
     /// makes it answer 503.
