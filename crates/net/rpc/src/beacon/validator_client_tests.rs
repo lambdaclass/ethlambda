@@ -18,6 +18,7 @@ use ethlambda_state_transition::beacon::helpers::{
     fulu::initialize_proposer_lookahead,
     test_state::{sign_for, with_signing_validators_at},
 };
+use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
 use ethlambda_types::{
     beacon::{
         constants::DOMAIN_BEACON_ATTESTER,
@@ -32,7 +33,7 @@ use ethlambda_types::{
 use ethlambda_validator::{
     Error,
     beacon_node::{
-        BeaconNodeApi, BlockRequest,
+        AggregateKind, BeaconNodeApi, BlockRequest, SignedAggregates,
         dto::{
             AttestationDataOutDto, CommitteeSubscriptionDto, ProposerPreparationDto,
             SingleAttestationDto, encode_hex,
@@ -90,6 +91,8 @@ async fn serve_with_engine(
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
         .layer(Extension(SharedAttestationPool::default()))
+        .layer(Extension(SharedPayloadAttestationPool::default()))
+        .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
         .layer(Extension(engine));
 
@@ -157,7 +160,7 @@ async fn the_validator_client_can_attest_through_this_node() {
         .unwrap();
 
     // The attestation data is checked by the client itself before it signs.
-    let data = client.attestation_data(slot).await.unwrap();
+    let data = client.attestation_data(slot, ForkName::Fulu).await.unwrap();
     let domain = get_domain(&state, DOMAIN_BEACON_ATTESTER, Some(data.target.epoch));
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
     let data_dto = AttestationDataOutDto::from(&data);
@@ -197,14 +200,17 @@ async fn the_validator_client_can_attest_through_this_node() {
         .iter()
         .filter(|attestation| attestation.committee_index == duty.committee_index)
         .count();
+    let AggregateKind::Electra(attestation) = aggregate.attestation else {
+        panic!("a fulu slot's aggregate is electra's container");
+    };
     let bits = (0..duty.committee_length as usize)
-        .filter(|&i| aggregate.attestation.aggregation_bits.get(i).unwrap())
+        .filter(|&i| attestation.aggregation_bits.get(i).unwrap())
         .count();
     assert_eq!(bits, voters);
 
-    let signed = signed_aggregate(&state, duty.validator_index, aggregate.attestation);
+    let signed = signed_aggregate(&state, duty.validator_index, attestation);
     client
-        .publish_aggregates(ForkName::Fulu, &[signed])
+        .publish_aggregates(ForkName::Fulu, &SignedAggregates::Electra(vec![signed]))
         .await
         .unwrap();
     assert_eq!(network.aggregates.lock().unwrap().len(), 1);
@@ -250,6 +256,7 @@ async fn block_production_without_an_execution_client_is_retryable() {
     let (client, state, _) = serve().await;
     let request = BlockRequest {
         slot: state.slot() + 1,
+        fork: ForkName::Fulu,
         proposer_index: 0,
         randao_reveal: Default::default(),
         graffiti: Default::default(),
@@ -352,18 +359,19 @@ async fn the_validator_client_can_propose_through_this_node() {
 
     let request = BlockRequest {
         slot,
+        fork: ForkName::Fulu,
         proposer_index: proposer,
         randao_reveal,
         graffiti: Default::default(),
     };
     let produced = client.produce_block(&request).await.unwrap();
-    assert_eq!(produced.block().slot, slot);
-    assert_eq!(produced.block().proposer_index, proposer);
+    assert_eq!(produced.slot(), slot);
+    assert_eq!(produced.proposer_index(), proposer);
 
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
     let signature = sign_for(
         proposer as usize,
-        compute_signing_root(produced.block().hash_tree_root(), block_domain),
+        compute_signing_root(produced.block_root(), block_domain),
     );
     let body = produced.into_signed_ssz(signature);
     client.publish_block(ForkName::Fulu, &body).await.unwrap();
