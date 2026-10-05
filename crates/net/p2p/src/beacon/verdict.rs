@@ -18,7 +18,7 @@ use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
-use ethlambda_types::beacon::containers::electra::SingleAttestation;
+use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
 use ethlambda_types::beacon::containers::gloas::{
     PayloadAttestationMessage, SignedExecutionPayloadEnvelope,
 };
@@ -268,18 +268,26 @@ impl Validated {
 /// block fails the whole block. Pooling on arrival also means a slot's
 /// aggregates, published two thirds of the way through it, are in the pool
 /// when the next slot's block is asked for at its start, rather than
-/// waiting for the chain actor's next tick. Only electra's shape is pooled,
-/// since the pool holds electra attestations and electra is the earliest fork
-/// this node produces blocks for.
+/// waiting for the chain actor's next tick. The pool holds electra's shape, so
+/// a gloas aggregate is converted to it first.
 fn pool_gossip_aggregate(server: &P2PServer, aggregate: &SignedAggregateAndProof) {
-    let SignedAggregateAndProof::Electra(signed) = aggregate else {
-        return;
+    let pooled = match aggregate {
+        SignedAggregateAndProof::Electra(signed) => signed.message.aggregate.clone(),
+        // Gloas's aggregate converts to the pool's electra shape; the bits
+        // only fail to fit electra's bound for a size no committee reaches.
+        SignedAggregateAndProof::Gloas(signed) => {
+            let Ok(converted) = electra::Attestation::try_from(&signed.message.aggregate) else {
+                return;
+            };
+            converted
+        }
+        SignedAggregateAndProof::Phase0(_) => return,
     };
     server
         .attestation_pool
         .lock()
         .expect("attestation pool lock poisoned")
-        .insert_aggregate(signed.message.aggregate.clone());
+        .insert_aggregate(pooled);
 }
 
 /// Pool an accepted subnet attestation for a validator client's aggregator.
@@ -507,7 +515,9 @@ mod tests {
     use ethlambda_state_transition::beacon::gossip::{QueueReason, RejectReason};
     use ethlambda_types::attestation::{SignedAggregatedAttestation, SignedAttestation};
     use ethlambda_types::beacon::config::Config;
-    use ethlambda_types::beacon::containers::{AttestationData, Checkpoint, electra, phase0};
+    use ethlambda_types::beacon::containers::{
+        AttestationData, Checkpoint, electra, gloas, phase0,
+    };
     use spawned_concurrency::error::ActorError;
 
     use super::*;
@@ -823,6 +833,34 @@ mod tests {
         assert_eq!(
             pool.lock().unwrap().block_candidates(),
             vec![expected.message.aggregate]
+        );
+    }
+
+    /// A gloas aggregate is pooled as the electra-shaped aggregate it converts
+    /// to, since the pool holds electra's shape.
+    #[tokio::test]
+    async fn an_accepted_gloas_aggregate_is_pooled_in_the_pools_shape() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let SignedAggregateAndProof::Electra(electra_signed) = electra_aggregate(5, 1) else {
+            unreachable!("built as electra")
+        };
+        let expected = electra_signed.message.aggregate;
+        let gloas_signed = gloas::SignedAggregateAndProof {
+            message: gloas::AggregateAndProof {
+                aggregator_index: 1,
+                aggregate: gloas::Attestation::from(&expected),
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        Validated::Aggregate {
+            aggregate: Box::new(SignedAggregateAndProof::Gloas(gloas_signed)),
+            attesting_indices: Vec::new(),
+        }
+        .forward(&server, Instant::now(), Outcome::Accept);
+        assert_eq!(
+            server.attestation_pool.lock().unwrap().block_candidates(),
+            vec![expected]
         );
     }
 
