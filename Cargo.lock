@@ -2013,6 +2013,7 @@ dependencies = [
  "rayon",
  "thiserror 2.0.18",
  "tracing",
+ "zk_alloc",
 ]
 
 [[package]]
