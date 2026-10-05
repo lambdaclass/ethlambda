@@ -17,6 +17,8 @@ pub fn run_backend_tests(backend: &dyn StorageBackend) {
     test_delete(backend);
     test_prefix_iterator(backend);
     test_nonexistent_key(backend);
+    test_contains(backend);
+    test_read(backend);
     test_delete_then_put(backend);
     test_put_then_delete(backend);
     test_delete_range(backend);
@@ -43,6 +45,72 @@ fn test_put_and_get(backend: &dyn StorageBackend) {
         let value = view.get(Table::BlockHeaders, b"test_put_get_key").unwrap();
         assert_eq!(value, Some(b"value1".to_vec()));
     }
+}
+
+fn test_contains(backend: &dyn StorageBackend) {
+    {
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .put_batch(
+                Table::BlockHeaders,
+                vec![(b"test_contains_key".to_vec(), b"value1".to_vec())],
+            )
+            .unwrap();
+        batch.commit().unwrap();
+    }
+    let view = backend.begin_read().unwrap();
+    assert!(
+        view.contains(Table::BlockHeaders, b"test_contains_key")
+            .unwrap()
+    );
+    assert!(
+        !view
+            .contains(Table::BlockHeaders, b"test_contains_missing")
+            .unwrap()
+    );
+}
+
+fn test_read(backend: &dyn StorageBackend) {
+    {
+        let mut batch = backend.begin_write().unwrap();
+        batch
+            .put_batch(
+                Table::BlockHeaders,
+                vec![(b"test_read_key".to_vec(), b"value1".to_vec())],
+            )
+            .unwrap();
+        batch.commit().unwrap();
+    }
+    let view = backend.begin_read().unwrap();
+
+    let mut seen = Vec::new();
+    let found = view
+        .read(Table::BlockHeaders, b"test_read_key", &mut |bytes| {
+            seen.push(bytes.to_vec());
+            Ok(())
+        })
+        .unwrap();
+    assert!(found);
+    assert_eq!(seen, vec![b"value1".to_vec()]);
+
+    // A missing key never reaches the callback.
+    let mut calls = 0;
+    let found = view
+        .read(Table::BlockHeaders, b"test_read_missing", &mut |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+    assert!(!found);
+    assert_eq!(calls, 0);
+
+    // The callback's own error is what `read` returns.
+    let err = view
+        .read(Table::BlockHeaders, b"test_read_key", &mut |_| {
+            Err("decode failed".into())
+        })
+        .unwrap_err();
+    assert_eq!(err.to_string(), "decode failed");
 }
 
 fn test_delete(backend: &dyn StorageBackend) {
