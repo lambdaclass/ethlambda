@@ -64,6 +64,17 @@ same keys, already signed.
   close the shapes reachable through ordinary operation: a backward wall-clock
   step, or a duty schedule replaced mid-epoch. Both are held in memory only, so
   a restart empties them and neither knows anything about any other process.
+- **Gloas messages:** a gloas proposer also signs an execution payload
+  envelope, and a payload timeliness committee member signs a payload
+  attestation. Neither is slashable, so neither has a guard. An envelope is
+  published once per proposal, right after its block, and a failure to publish it
+  is logged at error and counted without failing the proposal. A PTC vote has an
+  in-memory dedup of `(validator, slot)` pairs recorded at signing time
+  (`PayloadAttestationService`), so a duty abandoned between signing and
+  submission is lost rather than re-signed. It is emptied by a restart and says
+  nothing about another process, so it is not slashing protection either: a
+  second, different vote for one slot is equivocation that peers penalize in
+  gossip, not a slashing.
 - **Why a proposer slashing is the worse of the two:** a double vote needs a
   second validator's attestation to be caught. Two signed block headers for one
   slot are the whole of the evidence on their own.
@@ -81,6 +92,91 @@ same keys, already signed.
 - **Operationally:** do not run these keys in any other client while this one
   runs, and treat a restart as an event that needs the same care a manual key
   move would. The client warns about this at startup on every run.
+
+## Self-build only
+
+The gloas validator duties are served for a proposer that builds its own
+payload, and for no one else.
+
+- **The specification:** a gloas proposer may take a builder's signed bid
+  (`SignedExecutionPayloadBid`, from gossip or a builder API) instead of building
+  its own payload, and publishes a `SignedProposerPreferences` so builders know
+  its fee recipient and gas limit target. `produceBlockV4` takes a
+  `BuilderConfig` (`min_bid`, `builder_boost_factor`, `builders`) to steer that
+  choice.
+- **ethlambda:** the beacon node never takes a bid, from gossip or otherwise, and
+  never builds or reads a `SignedProposerPreferences`. `produceBlockV4` decodes
+  the `BuilderConfig` body (a missing or undecodable one is a `400`, as the
+  specification requires) and ignores it, logging at debug when it names
+  builders. Every block commits to a zero-value self-build bid
+  (`BUILDER_INDEX_SELF_BUILD`, the G2 point at infinity as signature), and
+  `Eth-Consensus-Block-Value` is always `0` since there is nothing to compare.
+  The validator client signs the envelope with the proposer's own key under
+  `DOMAIN_BEACON_BUILDER`, and leaves a block that commits to anyone else's bid
+  alone.
+- **Why:** a scope decision for the first gloas duties: taking bids needs a bid
+  pool, builder payment handling and a builder-facing API, none of which this
+  node has.
+- **Consequence:** a validator run through this node never earns a builder's
+  payment, and an execution client's own block value is what
+  `Eth-Execution-Payload-Value` reports.
+
+## `target_gas_limit` is the parent bid's gas limit
+
+- **The specification:** the payload is built toward the `target_gas_limit` of
+  the proposer's `SignedProposerPreferences`, and `bid.gas_limit` must be
+  compatible with it (`is_gas_limit_target_compatible`).
+- **ethlambda:** with no preferences to read, `PayloadAttributesV4.targetGasLimit`
+  is the `gas_limit` of `latest_execution_payload_bid` of the state being built
+  on (`gloas_payload_inputs`), so the execution client holds the gas limit where
+  it is.
+- **Equivalence:** the bid is built from the payload the execution client
+  returns, so `bid.gas_limit` is whatever that payload carries and is always
+  consistent with the block. A validator that wants the limit to move cannot say
+  so through this node: it follows the previous block's.
+
+## `skip_randao_verification` is ignored
+
+- **The specification:** `produceBlockV4`'s `skip_randao_verification` lets a
+  caller skip the node's check of `randao_reveal`; when it is set, the reveal
+  must be the point at infinity.
+- **ethlambda:** the parameter is accepted and not honored. The block's state
+  root comes from running it through the state transition, which verifies the
+  reveal, so the endpoint checks the reveal against the slot's proposer up front
+  and answers `400` (`invalid randao_reveal`) for one that does not verify,
+  infinity included.
+- **Consequence:** a caller cannot get a block without a real reveal. Every
+  caller this client knows of (including its own validator client) sends one.
+
+## A pre-gloas head counts as FULL in `attestation_data.index`
+
+- **The specification:** at a gloas slot `data.index` is `0` when the attested
+  block is from the attestation's own slot, and otherwise `0` for an `EMPTY` and
+  `1` for a `FULL` payload status in the validator's fork choice. It does not say
+  which a pre-gloas block is.
+- **ethlambda:** at a gloas slot `data.index` is `0` when the head block is from
+  the requested slot, `1` when fork choice holds the head's payload as FULL
+  (`Store::head_payload_status`, or one `get_head_node` walk when none is
+  recorded), and `1` for a pre-gloas head, the same boundary rule
+  [fork choice applies](#the-fulu-to-gloas-fork-choice-boundary). So the first
+  gloas slots vote for the last fulu block's payload.
+- **Why:** the vote should name the node fork choice itself walks to, and
+  that rule makes a pre-gloas block's one node FULL.
+
+## `payload_present` is judged by the envelope's arrival time
+
+- **The specification:** a PTC member sets `payload_present` when it has
+  received the block's envelope by `get_payload_due_ms()` into the slot.
+- **ethlambda:** `GET payload_attestation_data` compares the time the envelope
+  reached the node (`Store::beacon_envelope_seen_ms`, recorded by the chain
+  actor from the arrival time of the envelope, not the time it finished
+  verifying; the earliest arrival wins) with the slot's start plus
+  `get_payload_due_ms()`. An envelope held for its block or columns is
+  therefore judged by when it came, as the rule intends. The record lives in
+  memory only, pruned with the execution block hash cache.
+- **Consequence:** a restart forgets it. Only the slot in flight can be wrong
+  (a member asked after a restart answers `payload_present = false` for an
+  envelope that arrived before it), and the next slot's record starts fresh.
 
 ## `/eth/v1/node/identity` reports no ENR
 

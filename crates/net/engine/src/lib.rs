@@ -44,5 +44,6 @@ pub const ETHLAMBDA_ENGINE_CAPABILITIES: &[&str] = &[
     "engine_forkchoiceUpdatedV3",
     "engine_forkchoiceUpdatedV4",
     "engine_getPayloadV5",
+    "engine_getPayloadV6",
     "engine_getClientVersionV1",
 ];

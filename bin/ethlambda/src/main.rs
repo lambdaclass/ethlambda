@@ -689,11 +689,22 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // `/lean/v0/node/identity` endpoint reports it.
     let local_peer_id = built.local_peer_id.to_string();
 
+    // Filled by gossip and the Beacon API's payload attestation endpoint, read
+    // by block production and `GET .../pool/payload_attestations`.
+    let payload_attestation_pool =
+        ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool::default();
+
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
-    let p2p = P2P::spawn(built, setup.store.clone(), setup.node_names, discovery)
-        .await
-        .wrap_err("failed to start discv5 discovery")?;
+    let p2p = P2P::spawn(
+        built,
+        setup.store.clone(),
+        setup.node_names,
+        discovery,
+        payload_attestation_pool.clone(),
+    )
+    .await
+    .wrap_err("failed to start discv5 discovery")?;
 
     let shutdown = CancellationToken::new();
     let rpc_shutdown = shutdown.clone();
@@ -702,6 +713,12 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let rpc_sync_status = sync_status.clone();
     let rpc_events = events.clone();
     let rpc_p2p = p2p.actor_ref().to_rpc_to_p2p_ref();
+    let rpc_custody_columns = match &setup.chain {
+        ChainActor::Beacon {
+            custody_columns, ..
+        } => ethlambda_rpc::CustodyColumns(custody_columns.clone()),
+        ChainActor::Lean(..) => ethlambda_rpc::CustodyColumns::default(),
+    };
     // Block production builds its payloads with the same execution client the
     // chain actor validates them with.
     let rpc_engine = match &setup.chain {
@@ -724,6 +741,8 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 rpc_sync_status,
                 ethlambda_rpc::BeaconApiHandles {
                     p2p: rpc_p2p,
+                    payload_attestation_pool: payload_attestation_pool.clone(),
+                    custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,
                     client_version: version::engine_client_version(),

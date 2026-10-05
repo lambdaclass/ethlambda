@@ -7,8 +7,11 @@
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::{
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+};
+use ethlambda_types::beacon::containers::gloas::{
+    ExecutionPayloadEnvelope, PayloadAttestationData,
 };
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::primitives::{
@@ -124,6 +127,28 @@ impl SigningContext {
         compute_signing_root(root, domain)
     }
 
+    /// The root an execution payload envelope's signature is computed over.
+    ///
+    /// `slot` is the slot of the block the envelope reveals the payload for,
+    /// not anything read out of the envelope: the domain is the builder's, at
+    /// the epoch containing that slot (`get_domain(state, DOMAIN_BEACON_BUILDER,
+    /// compute_epoch_at_slot(state.slot))` in the specification's
+    /// `process_execution_payload`, where the state is the block's own).
+    pub fn envelope_signing_root(&self, envelope: &ExecutionPayloadEnvelope, slot: Slot) -> Root {
+        let domain = self.domain(DOMAIN_BEACON_BUILDER, compute_epoch_at_slot(slot));
+        compute_signing_root(envelope.hash_tree_root(), domain)
+    }
+
+    /// The root a payload timeliness committee member's vote is computed over.
+    ///
+    /// The domain is taken at the epoch of `data.slot`, and the message is the
+    /// data alone: the validator index travels beside the signature in the
+    /// message wrapper and is deliberately not signed over.
+    pub fn payload_attestation_signing_root(&self, data: &PayloadAttestationData) -> Root {
+        let domain = self.domain(DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(data.slot));
+        compute_signing_root(data.hash_tree_root(), domain)
+    }
+
     /// Sign an already-computed signing root on behalf of `pubkey`.
     ///
     /// Every public signing method funnels through here, so there is one place
@@ -209,6 +234,38 @@ impl SigningContext {
             pubkey,
             self.aggregate_and_proof_signing_root(root, slot),
         )
+    }
+
+    /// Sign the envelope revealing the payload of the block proposed for `slot`
+    /// on behalf of `pubkey`, which for a self-built payload is the proposer's
+    /// own key.
+    ///
+    /// Not slashable and not guarded. The specification attaches no slashing
+    /// condition to an envelope: signing two for one slot is at worst a
+    /// payload the network ignores one of. The block it belongs to is the
+    /// guarded signature.
+    pub fn sign_execution_payload_envelope(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        envelope: &ExecutionPayloadEnvelope,
+        slot: Slot,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.envelope_signing_root(envelope, slot))
+    }
+
+    /// Sign a payload timeliness committee vote on behalf of `pubkey`.
+    ///
+    /// Not slashable by the specification, and deduplicated per validator and
+    /// slot by [`crate::payload_attestation`] only to avoid publishing the same
+    /// vote twice.
+    pub fn sign_payload_attestation(
+        &self,
+        store: &ValidatorStore,
+        pubkey: &BlsPubkey,
+        data: &PayloadAttestationData,
+    ) -> Result<BlsSignature> {
+        self.sign_root(store, pubkey, self.payload_attestation_signing_root(data))
     }
 
     /// Sign the block whose root is `block_root`, proposed for `slot`, on

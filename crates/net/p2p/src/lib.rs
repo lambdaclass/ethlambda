@@ -45,7 +45,8 @@ use ethlambda_network_api::{
     },
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
-        PublishBeaconOperation, SubscribeAttestationSubnets,
+        PublishBeaconOperation, PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
+        SubscribeAttestationSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
@@ -54,6 +55,7 @@ use ethlambda_state_transition::beacon::gossip::{
     attestation::SeenAttestations, envelope::SeenEnvelopes, operations::SeenOperations,
     payload_attestation::SeenPayloadAttestations,
 };
+use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
 use ethlambda_types::primitives::H256;
@@ -1107,6 +1109,7 @@ impl P2P {
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
+        payload_attestation_pool: SharedPayloadAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = match discovery {
             Some(config) => Some(spawn_discovery(config).await?),
@@ -1173,6 +1176,7 @@ impl P2P {
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
+            payload_attestation_pool,
             aggregator_subnets: HashMap::new(),
             peer_scoring,
         };
@@ -1319,6 +1323,10 @@ pub struct P2PServer {
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
 
+    /// Accepted `payload_attestation_message` votes, shared with the Beacon
+    /// API that serves and fills the same pool. Filled by `verdict::forward`;
+    /// lean never touches it.
+    pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
     /// advertised in `attnets`, and left once the slot has passed. The
@@ -1648,6 +1656,18 @@ impl Handler<PublishBeaconOperation> for P2PServer {
 impl Handler<PublishBeaconBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
         publish_beacon_block(self, msg.block, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishExecutionPayloadEnvelope> for P2PServer {
+    async fn handle(&mut self, msg: PublishExecutionPayloadEnvelope, _ctx: &Context<Self>) {
+        gossipsub::publish_execution_payload_envelope(self, *msg.envelope, msg.sidecars).await;
+    }
+}
+
+impl Handler<PublishPayloadAttestationMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishPayloadAttestationMessage, _ctx: &Context<Self>) {
+        gossipsub::publish_payload_attestation_message(self, msg.message).await;
     }
 }
 
@@ -2900,6 +2920,7 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            payload_attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }

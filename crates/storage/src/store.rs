@@ -802,6 +802,15 @@ pub(crate) struct BeaconScratch {
     /// specification's `block_payload_statuses`; an absent root reads as
     /// `NOT_VALIDATED`.
     pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
+    /// Gloas: beacon root to `(slot, milliseconds past genesis the block's
+    /// envelope reached this node)`. What the payload timeliness committee's
+    /// `payload_present` is decided from: the specification's vote is "an
+    /// envelope was seen before `get_payload_due_ms()` into the slot", and
+    /// nothing else this store keeps records *when*. A cache like
+    /// `el_block_hashes`, not chain history, and pruned with it by
+    /// `prune_beacon_el_block_hashes`; a restart forgets it, which can only
+    /// turn a late `payload_present` into `false` for the one slot in flight.
+    pub(crate) envelope_seen_ms: HashMap<H256, (u64, u64)>,
 }
 
 /// Encode a LiveChain key (slot, root) to bytes.
@@ -4131,8 +4140,34 @@ impl Store {
             .insert(root, (slot, block_hash));
     }
 
+    /// Records when `root`'s envelope reached this node, in milliseconds past
+    /// genesis. The earliest arrival wins: a later copy says nothing about
+    /// whether the envelope was on time.
+    pub fn insert_beacon_envelope_seen(&mut self, root: H256, slot: u64, seen_ms: u64) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .entry(root)
+            .and_modify(|(_, held)| *held = (*held).min(seen_ms))
+            .or_insert((slot, seen_ms));
+    }
+
+    /// When `root`'s envelope reached this node, in milliseconds past genesis,
+    /// if it has.
+    pub fn beacon_envelope_seen_ms(&self, root: &H256) -> Option<u64> {
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .get(root)
+            .map(|(_, seen_ms)| *seen_ms)
+    }
+
     /// Drops cached hashes strictly below `finalized_slot`, always keeping
-    /// `keep`.
+    /// `keep`. The envelope arrival times go with them, below the same bound
+    /// (they are only ever read for a slot in flight, so `keep` needs no
+    /// exemption there).
     ///
     /// Strictly below, not at or below: the justified and head blocks
     /// `forkchoiceUpdated` reads are at or above that slot, so this bound keeps
@@ -4154,6 +4189,11 @@ impl Store {
             .unwrap()
             .el_block_hashes
             .retain(|root, (slot, _hash)| *slot >= finalized_slot || *root == keep);
+        self.beacon
+            .lock()
+            .unwrap()
+            .envelope_seen_ms
+            .retain(|_, (slot, _)| *slot >= finalized_slot);
     }
 
     /// Returns `root`'s unrealized justification, if this store has computed
@@ -8267,6 +8307,24 @@ mod tests {
             store.beacon_block_payload_status(at),
             PayloadStatusEnum::Invalid
         );
+    }
+
+    #[test]
+    fn envelope_arrival_keeps_the_earliest_and_is_pruned_with_the_hash_cache() {
+        let mut store = Store::test_store();
+        let old = H256::repeat_byte(1);
+        let fresh = H256::repeat_byte(2);
+        store.insert_beacon_envelope_seen(old, 4, 100);
+        store.insert_beacon_envelope_seen(fresh, 6, 900);
+        store.insert_beacon_envelope_seen(fresh, 6, 2_000);
+        store.insert_beacon_envelope_seen(fresh, 6, 500);
+
+        assert_eq!(store.beacon_envelope_seen_ms(&fresh), Some(500));
+        assert_eq!(store.beacon_envelope_seen_ms(&H256::repeat_byte(9)), None);
+
+        store.prune_beacon_el_block_hashes(5, H256::repeat_byte(7));
+        assert_eq!(store.beacon_envelope_seen_ms(&old), None);
+        assert_eq!(store.beacon_envelope_seen_ms(&fresh), Some(500));
     }
 
     #[test]

@@ -23,6 +23,8 @@ use ethlambda_types::{
             BeaconState,
             shared::{AttestationData, Checkpoint},
         },
+        fork::ForkName,
+        fork_choice::PayloadStatus,
         preset,
         primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
         signing::{compute_epoch_at_slot, compute_start_slot_at_epoch},
@@ -33,13 +35,13 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{checkpoint_state, get_current_store_epoch},
+    fork_choice::{checkpoint_state, get_current_store_epoch, get_head_node},
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
 };
 
-use crate::beacon::{ApiError, refuse_validator_duties_from_gloas};
+use crate::beacon::ApiError;
 
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
@@ -462,8 +464,8 @@ async fn get_proposer_duties_v2(Path(epoch): Path<String>, State(store): State<S
 /// Proposer duties for `epoch`, with `dependent_root` the block at the slot
 /// `dependent_slot` names for it, which is all that differs between versions.
 ///
-/// Read from fulu's `proposer_lookahead`, which the state keeps for its own
-/// epoch and the next `MIN_SEED_LOOKAHEAD` epochs, so any epoch in that window
+/// Read from the `proposer_lookahead` fulu introduced and gloas keeps, which
+/// the state keeps for its own epoch and the next `MIN_SEED_LOOKAHEAD` epochs, so any epoch in that window
 /// is answered without advancing a state. Any other epoch is refused.
 fn proposer_duties(
     store: &Store,
@@ -471,17 +473,18 @@ fn proposer_duties(
     dependent_slot: fn(Epoch) -> Slot,
 ) -> Result<serde_json::Value, ApiError> {
     let epoch = parse_epoch(epoch)?;
-    refuse_validator_duties_from_gloas(
-        &store.config(),
-        epoch,
-        "gloas proposer duties are not supported",
-    )?;
     let (head_root, state) = head(store)?;
 
-    let BeaconState::Fulu(fulu) = state.as_ref() else {
-        return Err(ApiError::BadRequest(
-            "proposer duties are served from fulu's proposer lookahead only",
-        ));
+    // Gloas keeps fulu's lookahead as it is, and `upgrade_to_gloas` carries it
+    // over, so a fulu head already holds the first gloas epoch's proposers.
+    let proposer_lookahead = match state.as_ref() {
+        BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
+        BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "proposer duties are served from the proposer lookahead of fulu and gloas only",
+            ));
+        }
     };
     let state_epoch = compute_epoch_at_slot(state.slot());
     let offset = epoch
@@ -493,7 +496,7 @@ fn proposer_duties(
 
     let first_slot = compute_start_slot_at_epoch(epoch);
     let window_start = (offset * preset::SLOTS_PER_EPOCH) as usize;
-    let proposers = &fulu.proposer_lookahead[window_start..][..preset::SLOTS_PER_EPOCH as usize];
+    let proposers = &proposer_lookahead[window_start..][..preset::SLOTS_PER_EPOCH as usize];
     let duties = proposers
         .iter()
         .zip(first_slot..)
@@ -573,11 +576,6 @@ fn attester_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<std::collections::HashSet<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    refuse_validator_duties_from_gloas(
-        &store.config(),
-        epoch,
-        "gloas attester duties are not supported",
-    )?;
     let (head_root, state) = head(store)?;
 
     let state_epoch = compute_epoch_at_slot(state.slot());
@@ -628,10 +626,11 @@ fn attester_duties(
 #[derive(Debug, Deserialize)]
 struct AttestationDataQuery {
     slot: Slot,
-    /// Optional and deprecated in the Beacon API, and ignored: from electra on
-    /// the committee travels outside `AttestationData`, whose `index` is always
-    /// zero, so every committee of a slot attests to the same data. Parsed
-    /// rather than dropped so a malformed value is still a `400`.
+    /// Optional, ignored and deprecated in the Beacon API (gloas's dropped it):
+    /// from electra on the committee travels outside `AttestationData`, whose
+    /// `index` no longer names it, so every committee of a slot attests to the
+    /// same data. Parsed rather than dropped so a malformed value is still a
+    /// `400`.
     #[allow(dead_code)]
     committee_index: Option<CommitteeIndex>,
 }
@@ -650,7 +649,8 @@ struct AttestationDataQuery {
 /// - `target` is `slot`'s epoch and its boundary block: the head itself when
 ///   no block has filled the boundary slot since, else the root the state
 ///   recorded there.
-/// - `index` is zero, as electra requires.
+/// - `index` is zero, as electra requires. At a gloas slot it is the
+///   payload-present flag instead; see [`payload_present_index`].
 ///
 /// A slot before the head's, or more than one slot past the wall clock, is
 /// refused: neither is a slot a validator is asked to attest to. So is an
@@ -675,11 +675,6 @@ async fn get_attestation_data(
 }
 
 fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiError> {
-    refuse_validator_duties_from_gloas(
-        &store.config(),
-        compute_epoch_at_slot(slot),
-        "gloas attestation data is not supported",
-    )?;
     let (head_root, state) = head(store)?;
     if slot < state.slot() {
         return Err(ApiError::BadRequest("slot is before the head block"));
@@ -707,13 +702,54 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
+    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+        payload_present_index(store, &state, slot)?
+    } else {
+        0
+    };
+
     Ok(AttestationData {
         slot,
-        index: 0,
+        index,
         beacon_block_root: head_root,
         source,
         target,
     })
+}
+
+/// `data.index` of a gloas attestation for `slot` voting for the head block
+/// whose post-state is `head_state` (`specs/gloas/validator.md`, "Attestation
+/// data"): `0` when the head block is from `slot` itself, since its payload
+/// cannot have been revealed yet, else `1` iff this node's fork choice holds
+/// the head block's payload as FULL.
+///
+/// The head's payload status is the one fork choice recorded with its head
+/// ([`Store::head_payload_status`]); it is `None` until this process has
+/// computed a head, or while the recorded node is not the current head, and
+/// then the walk is run once to find out. A pre-gloas head counts as FULL, the
+/// boundary rule this node's fork choice applies too
+/// (`docs/spec_deviations.md`), so the first gloas slots vote for the last
+/// fulu block's payload.
+fn payload_present_index(
+    store: &Store,
+    head_state: &BeaconState,
+    slot: Slot,
+) -> Result<u64, ApiError> {
+    if head_state.slot() == slot {
+        return Ok(0);
+    }
+    if !matches!(head_state, BeaconState::Gloas(_)) {
+        return Ok(1);
+    }
+    let status = match store.head_payload_status() {
+        Some(status) => status,
+        None => {
+            get_head_node(store, &store.config())
+                .map_err(|_| ApiError::Internal("fork choice head lookup failed"))?
+                .payload_status
+        }
+    };
+    Ok(u64::from(status == PayloadStatus::Full))
 }
 
 #[cfg(test)]
@@ -728,6 +764,7 @@ mod tests {
         fulu::{get_beacon_proposer_indices, initialize_proposer_lookahead},
         test_state::with_signing_validators_at,
     };
+    use ethlambda_types::beacon::config::Config;
     use ethlambda_types::beacon::fork::ForkName;
     use http_body_util::BodyExt as _;
     use tower::ServiceExt as _;
@@ -1217,52 +1254,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attestation_data_is_answered_up_to_the_last_fulu_slot_and_refused_after() {
-        let (status, _) =
-            with_gloas_next_epoch(|_, head_slot| attestation_data_request(head_slot)).await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
-            attestation_data_request(compute_start_slot_at_epoch(head_epoch + 1))
-        })
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["message"], "gloas attestation data is not supported");
-    }
-
-    #[tokio::test]
-    async fn proposer_duties_are_answered_for_the_last_fulu_epoch_and_refused_after() {
+    async fn a_fulu_head_answers_the_first_gloas_epoch_for_every_duty() {
         let (status, _) = with_gloas_next_epoch(|head_epoch, _| {
-            get_request(format!("/eth/v1/validator/duties/proposer/{head_epoch}"))
-        })
-        .await;
-        assert_eq!(status, StatusCode::OK);
-
-        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
             get_request(format!(
                 "/eth/v1/validator/duties/proposer/{}",
                 head_epoch + 1
             ))
         })
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["message"], "gloas proposer duties are not supported");
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, _) = with_gloas_next_epoch(|head_epoch, _| {
+            Request::post(format!(
+                "/eth/v1/validator/duties/attester/{}",
+                head_epoch + 1
+            ))
+            .header("content-type", "application/json")
+            .body(Body::from("[\"0\"]"))
+            .unwrap()
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The head is a fulu block, which counts as FULL at the boundary.
+        let (status, json) = with_gloas_next_epoch(|head_epoch, _| {
+            attestation_data_request(compute_start_slot_at_epoch(head_epoch + 1))
+        })
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["data"]["index"], "1");
     }
 
     #[tokio::test]
-    async fn attester_duties_are_answered_for_the_last_fulu_epoch_and_refused_after() {
-        let attester = |epoch: Epoch| {
-            Request::post(format!("/eth/v1/validator/duties/attester/{epoch}"))
-                .header("content-type", "application/json")
-                .body(Body::from("[\"0\"]"))
-                .unwrap()
+    async fn the_gloas_proposer_duties_match_the_lookahead_of_a_gloas_state() {
+        let mut state = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let lookahead = initialize_proposer_lookahead(&state).unwrap();
+        let BeaconState::Gloas(gloas) = &mut state else {
+            unreachable!("built as gloas")
         };
-        let (status, _) = with_gloas_next_epoch(|head_epoch, _| attester(head_epoch)).await;
-        assert_eq!(status, StatusCode::OK);
+        gloas.proposer_lookahead = lookahead.clone().try_into().unwrap();
+        let epoch = compute_epoch_at_slot(state.slot());
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, _) = crate::test_utils::beacon_store_with_config(state, config);
+        let request = get_request(format!("/eth/v1/validator/duties/proposer/{epoch}"));
+        let response = routes().with_state(store).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let proposers: Vec<u64> = json["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|duty| duty["validator_index"].as_str().unwrap().parse().unwrap())
+            .collect();
+        assert_eq!(proposers, lookahead[..preset::SLOTS_PER_EPOCH as usize]);
+    }
 
-        let (status, json) = with_gloas_next_epoch(|head_epoch, _| attester(head_epoch + 1)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["message"], "gloas attester duties are not supported");
+    /// A store whose head is a gloas state `slots_past_boundary` into its
+    /// epoch, under a schedule with gloas from epoch 0, and the payload status
+    /// fork choice recorded for that head.
+    fn gloas_head(
+        slots_past_boundary: u64,
+        recorded: Option<PayloadStatus>,
+    ) -> (Store, BeaconState) {
+        let mut state = with_signing_validators_at(ForkName::Gloas, COUNT);
+        let BeaconState::Gloas(gloas) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        gloas.slot += slots_past_boundary;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 0);
+        let (store, head_root) = crate::test_utils::beacon_store_with_config(state.clone(), config);
+        if let Some(status) = recorded {
+            store.set_head_payload_status(head_root, status);
+        }
+        (store, state)
+    }
+
+    async fn gloas_index(store: Store, slot: Slot) -> (StatusCode, serde_json::Value) {
+        // No `committee_index`: gloas's request omits it.
+        let request = get_request(format!("/eth/v1/validator/attestation_data?slot={slot}"));
+        let response = routes()
+            .with_state(store)
+            .layer(Extension(idle_engine()))
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_in_the_head_blocks_own_slot_has_index_zero() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Full));
+        let (status, json) = gloas_index(store, state.slot()).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "0");
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_for_an_earlier_full_head_has_index_one() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Full));
+        let (status, json) = gloas_index(store, state.slot() + 1).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "1");
+    }
+
+    #[tokio::test]
+    async fn a_gloas_vote_for_an_earlier_empty_head_has_index_zero() {
+        let (store, state) = gloas_head(1, Some(PayloadStatus::Empty));
+        let (status, json) = gloas_index(store, state.slot() + 1).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["data"]["index"], "0");
     }
 
     #[tokio::test]
