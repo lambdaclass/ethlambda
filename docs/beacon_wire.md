@@ -677,6 +677,14 @@ which on the live follower meant 11,213 blocks off the wire to import 100, each
 duplicate paying a `hash_tree_root` before the store could reject it. Paced off
 the watermark, the ratio was 1.7:1.
 
+The watermark alone misses gossip, though. Only a range answer advances it, so a
+follower that had caught up and then imported from gossip kept it at its last
+range batch, and every peer that connected later was asked again for every block
+since: 748 blocks in 66 bursts on one follower. A `Status` answer is
+therefore measured against the higher of the watermark and the store's head
+(`beacon_sync_target`). The head is a safe floor, since a head block's whole
+ancestry is already imported.
+
 `Status` is store-derived: head from `Store::beacon_head`, the finalized
 checkpoint from `Store::beacon_finalized_checkpoint`, and
 `earliest_available_slot` from the anchor's own slot rather than

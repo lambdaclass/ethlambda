@@ -1276,8 +1276,9 @@ pub struct P2PServer {
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
-    /// Highest beacon slot handed to the chain actor, whether or not it has
-    /// been imported yet.
+    /// Highest beacon slot a range answer has handed to the chain actor,
+    /// whether or not it has been imported yet. Gossip never advances it, so
+    /// range sync reads it beside the store's head; see `beacon_sync_target`.
     pub(crate) beacon_fetched_through: u64,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
