@@ -233,22 +233,24 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
+| `GET` | `/eth/v1/config/fork_schedule` | JSON | Every scheduled fork as `{previous_version, current_version, epoch}` |
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
 | `GET` | `/eth/v1/node/identity` | JSON | Peer ID and metadata only (see below) |
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
+| `GET` | `/eth/v1/beacon/states/{state_id}/validators/{validator_id}` | JSON | One registry entry by index or `0x` pubkey; `404` when unknown |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
-| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
-| `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas) |
+| `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s (JSON or SSZ body) |
+| `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
 | `GET` | `/eth/v1/beacon/pool/payload_attestations` | JSON | The pool's votes as aggregated `PayloadAttestation`s (gloas) |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
-| `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
+| `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s (JSON or SSZ body) |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned self-built gloas block, with its envelope and blobs when asked (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
@@ -284,6 +286,12 @@ the chain actor writes, so no request waits on the actor.
   (`Store::head_payload_status`, or one fresh `get_head_node` walk when none is
   recorded for this head). A pre-gloas head counts as FULL (see
   [Spec Deviations](./spec_deviations.md#a-pre-gloas-head-counts-as-full-in-attestation_dataindex)).
+- **`states/{state_id}/validators/{validator_id}`** is one entry of the list
+  endpoint, in the same shape and with the same `state_id` handling,
+  `execution_optimistic` and `finalized`. The id is an index or a `0x` pubkey;
+  one naming no validator is a `404` (the list form omits it), a malformed one
+  a `400`. Lighthouse's validator client resolves each key to its index this
+  way, and stays inactive without it.
 - **`pool/attestations`** checks each attestation against the electra
   `beacon_attestation_{subnet_id}` gossip conditions it can evaluate (clock
   window, `data.index == 0`, target epoch, the voted block known and the target
@@ -319,6 +327,16 @@ the chain actor writes, so no request waits on the actor.
   nothing about them). What passes is gossiped on the topic and goes into the
   pool. The `Eth-Consensus-Version` header picks the decoder: `gloas` takes
   gloas's `SignedAggregateAndProof`, the others electra's.
+- **Request body encodings.** `pool/attestations`, `pool/payload_attestations`
+  and `aggregate_and_proofs` take either JSON (`application/json`, also the
+  reading of a request with no `Content-Type`) or the SSZ `List[...]` of the
+  same items (`application/octet-stream`): the offset-table encoding every
+  variable-size list uses, which is what prysm sends for aggregates and payload
+  votes, with a JSON retry only on a `415`, and what nimbus can send for
+  attestations. Any other content type is a `415`, and a body that does not
+  decode in the type's encoding a `400`. A block, an envelope and the other
+  validator-client submissions keep their own rules (SSZ only on `blocks` and
+  the envelope; JSON on the rest).
 - **The attestation pool** holds, the best-covered per data root and
   committee: votes from `pool/attestations` and the aggregator subnets,
   aggregates from `aggregate_and_proofs`, and every electra gossip aggregate
@@ -535,6 +553,20 @@ object that may arrive late or never, and two rules share the flag:
 Pre-gloas responses are unchanged. One helper implements both rules
 (`shared/optimistic.rs`) and every response that carries the flag goes through
 it.
+
+### `GET /eth/v1/config/fork_schedule`
+
+The `Fork` objects of the `Config`'s schedule, oldest first, as
+`{previous_version, current_version, epoch}` with the epoch quoted. Phase0 is
+first, at epoch `0` and its own predecessor; every later fork whose epoch is not
+`FAR_FUTURE_EPOCH` follows, and an unscheduled fork is skipped without breaking
+the chain, so each entry's `previous_version` is the one before it in the list.
+Nimbus's validator client reads this every epoch, requires that linked-list
+shape, and marks a node it cannot decode as incompatible. Nimbus also compares
+`/eth/v1/config/spec` against its own constants before use: the 13 preset
+values, the 7 domain types, `SECONDS_PER_SLOT` (or `SLOT_DURATION_MS`, which
+this node does not report) and every fork's `*_FORK_VERSION` and `*_FORK_EPOCH`,
+with altair scheduled. All are served (a unit test pins the list).
 
 ### `GET /eth/v1/config/spec`
 
