@@ -115,6 +115,16 @@ impl<T: Value, const N: usize, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
+impl<T: Value, const N: usize, U: UpdateMap<T>> crate::Buffered for List<T, N, U> {
+    fn apply_updates(&mut self) {
+        List::apply_updates(self);
+    }
+
+    fn has_pending_updates(&self) -> bool {
+        List::has_pending_updates(self)
+    }
+}
+
 impl<T: Value, const N: usize, U: UpdateMap<T>> Default for List<T, N, U> {
     fn default() -> Self {
         Self::empty()

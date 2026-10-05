@@ -105,6 +105,16 @@ mod fixtures {
         SszVector::try_from(vec![value; N]).expect("exactly N elements by construction")
     }
 
+    /// [`vector`] for the state's tree-backed ring buffers.
+    pub fn tree_vector<T, const N: usize, U>(value: T) -> ethlambda_ssz_tree::Vector<T, N, U>
+    where
+        T: ethlambda_ssz_tree::Value,
+        U: ethlambda_ssz_tree::UpdateMap<T>,
+    {
+        ethlambda_ssz_tree::Vector::try_from(vec![value; N])
+            .expect("exactly N elements by construction")
+    }
+
     pub fn checkpoint(seed: u8) -> shared::Checkpoint {
         shared::Checkpoint {
             epoch: u64::from(seed) + 1,
@@ -349,18 +359,19 @@ fn phase0_state() -> phase0::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_attestations: SszList::try_from(vec![pending_attestation(11)])
             .expect("within capacity"),
         current_epoch_attestations: SszList::try_from(vec![pending_attestation(12)])
@@ -468,18 +479,19 @@ fn altair_state() -> altair::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -490,7 +502,7 @@ fn altair_state() -> altair::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
     }
@@ -614,18 +626,19 @@ fn bellatrix_state() -> bellatrix::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -636,7 +649,7 @@ fn bellatrix_state() -> bellatrix::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
         latest_execution_payload_header: execution_payload_header(30),
@@ -770,18 +783,19 @@ fn capella_state() -> capella::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -792,13 +806,13 @@ fn capella_state() -> capella::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
         latest_execution_payload_header: capella_execution_payload_header(30),
         next_withdrawal_index: 40,
         next_withdrawal_validator_index: 41,
-        historical_summaries: SszList::try_from(vec![shared::HistoricalSummary {
+        historical_summaries: ethlambda_ssz_tree::List::try_from(vec![shared::HistoricalSummary {
             block_summary_root: H256::repeat_byte(0xbb),
             state_summary_root: H256::repeat_byte(0xcc),
         }])
@@ -938,18 +952,19 @@ fn deneb_state() -> deneb::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -960,13 +975,13 @@ fn deneb_state() -> deneb::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
         latest_execution_payload_header: deneb_execution_payload_header(30),
         next_withdrawal_index: 40,
         next_withdrawal_validator_index: 41,
-        historical_summaries: SszList::try_from(vec![shared::HistoricalSummary {
+        historical_summaries: ethlambda_ssz_tree::List::try_from(vec![shared::HistoricalSummary {
             block_summary_root: H256::repeat_byte(0xbb),
             state_summary_root: H256::repeat_byte(0xcc),
         }])
@@ -1132,18 +1147,19 @@ fn electra_state() -> electra::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -1154,13 +1170,13 @@ fn electra_state() -> electra::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
         latest_execution_payload_header: deneb_execution_payload_header(30),
         next_withdrawal_index: 40,
         next_withdrawal_validator_index: 41,
-        historical_summaries: SszList::try_from(vec![shared::HistoricalSummary {
+        historical_summaries: ethlambda_ssz_tree::List::try_from(vec![shared::HistoricalSummary {
             block_summary_root: H256::repeat_byte(0xbb),
             state_summary_root: H256::repeat_byte(0xcc),
         }])
@@ -1222,18 +1238,19 @@ fn fulu_state() -> fulu::BeaconState {
             epoch: 1,
         },
         latest_block_header: fixtures::beacon_block_header(7),
-        block_roots: fixtures::vector(H256::repeat_byte(0x77)),
-        state_roots: fixtures::vector(H256::repeat_byte(0x88)),
-        historical_roots: SszList::try_from(vec![H256::repeat_byte(0x99)])
+        block_roots: fixtures::tree_vector(H256::repeat_byte(0x77)),
+        state_roots: fixtures::tree_vector(H256::repeat_byte(0x88)),
+        historical_roots: ethlambda_ssz_tree::List::try_from(vec![H256::repeat_byte(0x99)])
             .expect("within capacity"),
         eth1_data: fixtures::eth1_data(8),
-        eth1_data_votes: SszList::try_from(vec![fixtures::eth1_data(9)]).expect("within capacity"),
+        eth1_data_votes: ethlambda_ssz_tree::List::try_from(vec![fixtures::eth1_data(9)])
+            .expect("within capacity"),
         eth1_deposit_index: 3,
         validators: shared::Validators::try_from(vec![fixtures::validator(10)])
             .expect("within capacity"),
         balances: shared::Balances::try_from(vec![32_000_000_001u64]).expect("within capacity"),
-        randao_mixes: fixtures::vector(H256::repeat_byte(0xaa)),
-        slashings: fixtures::vector(1_000_000_000u64),
+        randao_mixes: fixtures::tree_vector(H256::repeat_byte(0xaa)),
+        slashings: fixtures::tree_vector(1_000_000_000u64),
         previous_epoch_participation: SszList::try_from(vec![7u8]).expect("within capacity"),
         current_epoch_participation: SszList::try_from(vec![9u8]).expect("within capacity"),
         justification_bits: {
@@ -1244,13 +1261,13 @@ fn fulu_state() -> fulu::BeaconState {
         previous_justified_checkpoint: fixtures::checkpoint(13),
         current_justified_checkpoint: fixtures::checkpoint(14),
         finalized_checkpoint: fixtures::checkpoint(15),
-        inactivity_scores: SszList::try_from(vec![4u64]).expect("within capacity"),
+        inactivity_scores: vec![4u64].try_into().expect("within capacity"),
         current_sync_committee: sync_committee(16),
         next_sync_committee: sync_committee(17),
         latest_execution_payload_header: deneb_execution_payload_header(30),
         next_withdrawal_index: 40,
         next_withdrawal_validator_index: 41,
-        historical_summaries: SszList::try_from(vec![shared::HistoricalSummary {
+        historical_summaries: ethlambda_ssz_tree::List::try_from(vec![shared::HistoricalSummary {
             block_summary_root: H256::repeat_byte(0xbb),
             state_summary_root: H256::repeat_byte(0xcc),
         }])
