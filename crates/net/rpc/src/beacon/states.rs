@@ -45,6 +45,10 @@ pub(crate) fn routes() -> Router<Store> {
             "/eth/v1/beacon/states/{state_id}/validators",
             get(get_validators).post(post_validators),
         )
+        .route(
+            "/eth/v1/beacon/states/{state_id}/validators/{validator_id}",
+            get(get_validator),
+        )
 }
 
 /// Resolve a `state_id` to the block root its state is stored under.
@@ -256,6 +260,48 @@ async fn get_validators(
         }
     }
     validators_response(&store, &state_id, request)
+}
+
+/// `GET .../validators/{validator_id}`: one registry entry, by index or public
+/// key, in the shape of a list entry. Lighthouse's validator client resolves
+/// each of its keys to an index this way. An id naming no validator is a 404
+/// here, unlike the list form, which omits it.
+async fn get_validator(
+    Path((state_id, validator_id)): Path<(String, String)>,
+    State(store): State<Store>,
+) -> Response {
+    let id = match ValidatorId::parse(&validator_id) {
+        Ok(id) => id,
+        Err(err) => return err.into_response(),
+    };
+    let (root, state) = match load(&store, &state_id) {
+        Ok(found) => found,
+        Err(err) => return err.into_response(),
+    };
+
+    let found = match id {
+        ValidatorId::Index(index) => state
+            .validator(index)
+            .ok()
+            .zip(state.balance(index).ok())
+            .map(|found| (index, found)),
+        ValidatorId::Pubkey(pubkey) => state
+            .iter_validators()
+            .zip(state.iter_balances())
+            .enumerate()
+            .find(|(_, (validator, _))| validator.pubkey == pubkey)
+            .map(|(index, found)| (index as ValidatorIndex, found)),
+    };
+    let Some((index, (validator, balance))) = found else {
+        return ApiError::NotFound("validator not found").into_response();
+    };
+
+    let status = ValidatorStatus::of(validator, balance, compute_epoch_at_slot(state.slot()));
+    crate::json_response(serde_json::json!({
+        "execution_optimistic": crate::shared::optimistic::block_is_optimistic(&store, root),
+        "finalized": is_finalized(&store, state.slot()),
+        "data": ValidatorEntry { index, balance, status: status.name(), validator },
+    }))
 }
 
 /// `POST .../validators`, the form a validator client uses: a long list of
@@ -526,6 +572,41 @@ mod tests {
                 .map(|entry| entry["index"].as_str().unwrap())
                 .collect();
             assert_eq!(indices, ["1", "3", "4"]);
+        }
+
+        async fn get_one(id: &str) -> axum::response::Response {
+            let (app, _) = app();
+            let request = Request::get(format!("/eth/v1/beacon/states/head/validators/{id}"))
+                .body(Body::empty())
+                .unwrap();
+            app.oneshot(request).await.unwrap()
+        }
+
+        /// What lighthouse's validator client sends for each of its keys.
+        #[tokio::test]
+        async fn one_validator_resolves_by_pubkey_or_index() {
+            let (_, state) = app();
+            for id in [pubkey_hex(&state, 3), "3".to_owned()] {
+                let response = get_one(&id).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let json = body_json(response).await;
+                assert_eq!(json["execution_optimistic"], false);
+                assert!(json["finalized"].is_boolean());
+                // One object, not a list, in the shape of a list entry.
+                assert_eq!(json["data"]["index"], "3");
+                assert_eq!(json["data"]["status"], "active_ongoing");
+                assert!(json["data"]["balance"].is_string());
+                assert_eq!(json["data"]["validator"]["pubkey"], pubkey_hex(&state, 3));
+            }
+        }
+
+        #[tokio::test]
+        async fn an_unknown_single_validator_is_a_404_and_a_malformed_id_a_400() {
+            assert_eq!(get_one("999").await.status(), StatusCode::NOT_FOUND);
+            let unknown = format!("0x{}", "ab".repeat(48));
+            assert_eq!(get_one(&unknown).await.status(), StatusCode::NOT_FOUND);
+            assert_eq!(get_one("0x1234").await.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(get_one("nope").await.status(), StatusCode::BAD_REQUEST);
         }
 
         #[test]
