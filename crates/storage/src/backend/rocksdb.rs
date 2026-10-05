@@ -103,24 +103,24 @@ struct RocksDBReadView {
 }
 
 impl StorageReadView for RocksDBReadView {
-    fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn read(
+        &self,
+        table: Table,
+        key: &[u8],
+        read_fn: &mut dyn FnMut(&[u8]) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
         let cf = self
             .db
             .cf_handle(cf_name(table))
             .ok_or_else(|| format!("Column family {} not found", cf_name(table)))?;
 
-        Ok(self.db.get_cf(&cf, key)?)
-    }
-
-    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error> {
-        let cf = self
-            .db
-            .cf_handle(cf_name(table))
-            .ok_or_else(|| format!("Column family {} not found", cf_name(table)))?;
-
-        // Pinned: references the block-cache buffer instead of copying the
+        // Pinned: references RocksDB's own buffer instead of copying the
         // value into a `Vec`.
-        Ok(self.db.get_pinned_cf(&cf, key)?.is_some())
+        let Some(value) = self.db.get_pinned_cf(&cf, key)? else {
+            return Ok(false);
+        };
+        read_fn(&value)?;
+        Ok(true)
     }
 
     fn prefix_iterator(

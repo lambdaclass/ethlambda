@@ -66,21 +66,17 @@ struct InMemoryReadView<'a> {
 }
 
 impl StorageReadView for InMemoryReadView<'_> {
-    fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        Ok(self
-            .guard
-            .get(&table)
-            .expect("table exists")
-            .get(key)
-            .cloned())
-    }
-
-    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error> {
-        Ok(self
-            .guard
-            .get(&table)
-            .expect("table exists")
-            .contains_key(key))
+    fn read(
+        &self,
+        table: Table,
+        key: &[u8],
+        read_fn: &mut dyn FnMut(&[u8]) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
+        let Some(value) = self.guard.get(&table).expect("table exists").get(key) else {
+            return Ok(false);
+        };
+        read_fn(value)?;
+        Ok(true)
     }
 
     fn prefix_iterator(

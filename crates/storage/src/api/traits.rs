@@ -24,16 +24,40 @@ pub trait StorageBackend: Send + Sync {
 
 /// A read-only view of the storage.
 pub trait StorageReadView {
-    /// Get a value by key from a table.
-    fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    /// Calls `read_fn` with a borrow of the value stored under `key`, if any,
+    /// and returns whether the key was present.
+    ///
+    /// The value is never copied: `read_fn` sees the backend's own buffer, so
+    /// a caller that only decodes or inspects the bytes avoids allocating a
+    /// value-sized `Vec` (full state snapshots are 100+ MB on mainnet-sized
+    /// beacon chains). `read_fn` runs at most once, and its error is returned
+    /// as-is. A `&mut dyn FnMut` rather than a generic closure, so the trait
+    /// stays usable as `dyn StorageReadView`.
+    fn read(
+        &self,
+        table: Table,
+        key: &[u8],
+        read_fn: &mut dyn FnMut(&[u8]) -> Result<(), Error>,
+    ) -> Result<bool, Error>;
+
+    /// Get a value by key from a table, copied into an owned `Vec`.
+    fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let mut value = None;
+        self.read(table, key, &mut |bytes| {
+            value = Some(bytes.to_vec());
+            Ok(())
+        })?;
+        Ok(value)
+    }
 
     /// Whether `key` is present in a table.
     ///
     /// Same answer as `get(..)?.is_some()` but never materializes the value, so
     /// the cost does not scale with its size. Prefer it for pure existence
-    /// checks on large values (full state snapshots are 100+ MB on mainnet-sized
-    /// beacon chains).
-    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error>;
+    /// checks on large values.
+    fn contains(&self, table: Table, key: &[u8]) -> Result<bool, Error> {
+        self.read(table, key, &mut |_| Ok(()))
+    }
 
     /// Iterate over all entries with a given key prefix.
     fn prefix_iterator(

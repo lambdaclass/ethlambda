@@ -5307,6 +5307,17 @@ mod tests {
     }
 
     impl StorageReadView for CountingView<'_> {
+        fn read(
+            &self,
+            table: Table,
+            key: &[u8],
+            read_fn: &mut dyn FnMut(&[u8]) -> Result<(), BackendError>,
+        ) -> Result<bool, BackendError> {
+            self.inner.read(table, key, read_fn)
+        }
+
+        // `get` and `contains` are overridden, not left to their defaults, so
+        // the two can be counted apart.
         fn get(&self, table: Table, key: &[u8]) -> Result<Option<Vec<u8>>, BackendError> {
             *self.counts.gets.lock().unwrap().entry(table).or_default() += 1;
             self.inner.get(table, key)
