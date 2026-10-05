@@ -167,12 +167,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         "Validator client starting"
     );
 
-    let clock = SlotClock::new(
-        genesis.genesis_time,
-        spec.slot_duration_ms,
-        spec.attestation_due_bps,
-        spec.aggregate_due_bps,
-    );
+    let clock = SlotClock::from_config(genesis.genesis_time, &spec);
     let context = Arc::new(SigningContext {
         config: spec,
         genesis_validators_root: genesis.genesis_validators_root,
