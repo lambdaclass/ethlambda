@@ -231,8 +231,10 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/beacon/headers/{block_id}` | JSON | `SignedBeaconBlockHeader`, plus `canonical` |
 | `GET` | `/eth/v2/debug/beacon/states/{state_id}` | JSON or SSZ | `BeaconState` at `state_id` |
 | `GET` | `/eth/v1/beacon/states/{state_id}/finality_checkpoints` | JSON | That state's three checkpoints |
+| `GET` | `/eth/v1/beacon/states/{state_id}/fork` | JSON | That state's `Fork`: previous and current version, and the epoch it changed |
 | `GET` | `/eth/v1/beacon/genesis` | JSON | Genesis time, validators root, fork version |
 | `GET` | `/eth/v1/config/spec` | JSON | The store's `Config`, plus `PRESET_BASE`, `CONFIG_NAME`, the preset and the constants (see below) |
+| `GET` | `/eth/v1/config/deposit_contract` | JSON | The `Config`'s deposit chain id and contract address |
 | `GET` | `/eth/v1/node/syncing` | JSON | Head slot, sync distance, optimistic flag |
 | `GET` | `/eth/v1/node/health` | *(status only)* | `200` caught up, `206` syncing |
 | `GET` | `/eth/v1/node/version` | JSON | Client version string |
@@ -241,6 +243,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
+| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
@@ -271,6 +274,15 @@ the chain actor writes, so no request waits on the actor.
   epochs are served like fulu ones: gloas keeps fulu's `proposer_lookahead` and
   `upgrade_to_gloas` carries it over, so a fulu head already answers proposer
   duties for the first gloas epoch.
+- **Sync duties** read the head state's `current_sync_committee` for an epoch in
+  the head's own sync committee period and `next_sync_committee` for the one
+  after; any other period is a `400` (an earlier one would need a historical
+  state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
+  gets every seat it holds, since the committee is drawn with replacement; one
+  with no seat is left out. An unknown index is a `400`, and the endpoint is a
+  `503` while the node is syncing. This node serves no sync committee message
+  or contribution endpoint yet, so a validator client that gets duties here
+  cannot publish what they ask for.
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork

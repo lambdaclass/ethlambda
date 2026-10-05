@@ -37,6 +37,7 @@ use crate::{
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
         .route("/eth/v2/debug/beacon/states/{state_id}", get(get_state))
+        .route("/eth/v1/beacon/states/{state_id}/fork", get(get_fork))
         .route(
             "/eth/v1/beacon/states/{state_id}/finality_checkpoints",
             get(get_finality_checkpoints),
@@ -98,6 +99,20 @@ async fn get_state(
     };
 
     with_consensus_version(response, fork)
+}
+
+/// `GET /eth/v1/beacon/states/{state_id}/fork`: the `Fork` the state carries,
+/// which is what a validator client builds its signing domains from.
+async fn get_fork(Path(state_id): Path<String>, State(store): State<Store>) -> Response {
+    let (root, state) = match load(&store, &state_id) {
+        Ok(found) => found,
+        Err(err) => return err.into_response(),
+    };
+    crate::json_response(serde_json::json!({
+        "execution_optimistic": store.is_beacon_optimistic(root),
+        "finalized": is_finalized(&store, state.slot()),
+        "data": state.fork(),
+    }))
 }
 
 async fn get_finality_checkpoints(
@@ -436,6 +451,44 @@ mod tests {
                     .starts_with("0x")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_fork_is_the_one_the_state_carries() {
+        let fixture = beacon_fixture(ANCHOR_SLOT);
+        let head_state = fixture
+            .store
+            .get_state(&fixture.head_root)
+            .unwrap()
+            .unwrap();
+        let expected = serde_json::to_value(head_state.fork()).unwrap();
+
+        let response = get("/eth/v1/beacon/states/head/fork", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = body_json(response).await;
+        assert_eq!(json["data"], expected);
+        assert!(
+            json["data"]["epoch"].is_string(),
+            "the epoch must be quoted"
+        );
+        assert!(json["execution_optimistic"].is_boolean());
+        assert!(json["finalized"].is_boolean());
+    }
+
+    #[tokio::test]
+    async fn the_finalized_states_fork_is_marked_finalized() {
+        let response = get("/eth/v1/beacon/states/finalized/fork", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["finalized"], true);
+    }
+
+    /// The same refusal every other state endpoint gives: state roots are not
+    /// indexed, so a `0x` id is a 404 rather than a guess.
+    #[tokio::test]
+    async fn a_fork_by_state_root_is_a_404() {
+        let root = format!("0x{}", "ab".repeat(32));
+        let response = get(&format!("/eth/v1/beacon/states/{root}/fork"), None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     mod validators {
