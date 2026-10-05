@@ -1,3 +1,4 @@
+mod active_balance_cache;
 mod api;
 pub mod backend;
 mod beacon_state_delta;
@@ -9,6 +10,7 @@ mod state_diff;
 mod state_writer;
 mod store;
 
+pub use active_balance_cache::{ActiveBalanceCache, ActiveBalanceKey};
 pub use api::{ALL_TABLES, StorageBackend, StorageReadView, StorageWriteBatch, Table};
 pub use committee_cache::{CommitteeCache, Lookup, ShufflingKey};
 /// Error type returned by the fallible [`Store`] operations, exported so

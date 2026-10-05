@@ -4,6 +4,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use lru::LruCache;
 
+use crate::active_balance_cache::ActiveBalanceCache;
 use crate::api::{StorageBackend, StorageReadView, StorageWriteBatch, Table};
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
@@ -882,6 +883,13 @@ pub struct Store {
     ///
     /// Always empty on lean, which has no beacon committees.
     committee_cache: Arc<CommitteeCache>,
+    /// The total active balance per epoch, shared the way
+    /// [`Self::committee_cache`] is: by the chain actor's state transition
+    /// and anything else holding a `Store` clone. See
+    /// [`ActiveBalanceCache`], and `ethlambda-state-transition`'s
+    /// `beacon::helpers::accessors::ActiveBalanceCacheExt` for the
+    /// state-aware half. Always empty on lean.
+    active_balance_cache: Arc<ActiveBalanceCache>,
     /// Beacon fork-choice scratch. Empty and untouched on a lean chain.
     pub(crate) beacon: Arc<Mutex<BeaconScratch>>,
     /// The background writer, joined when the last clone of this `Store`
@@ -1512,6 +1520,7 @@ impl Store {
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
+            active_balance_cache: Arc::new(ActiveBalanceCache::default()),
             beacon: Default::default(),
             state_writer,
         }
@@ -2656,6 +2665,13 @@ impl Store {
     /// returned cache takes `&self` regardless of which handle reaches it.
     pub fn committee_cache(&self) -> Arc<CommitteeCache> {
         Arc::clone(&self.committee_cache)
+    }
+
+    /// The total-active-balance cache shared by every clone of this store.
+    ///
+    /// An owned `Arc` for the same reason as [`Self::committee_cache`].
+    pub fn active_balance_cache(&self) -> Arc<ActiveBalanceCache> {
+        Arc::clone(&self.active_balance_cache)
     }
 
     /// Returns whether a state is available for the given block root.
@@ -5502,6 +5518,24 @@ mod tests {
         assert_eq!(first_lookup, Lookup::Miss);
         assert_eq!(second_lookup, Lookup::Hit);
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn the_active_balance_cache_is_shared_across_store_clones() {
+        let store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let clone = store.clone();
+        let key = crate::ActiveBalanceKey {
+            epoch: 1,
+            decision_root: H256::from([1u8; 32]),
+        };
+
+        let (first, first_lookup) = clone.active_balance_cache().get_or_compute(key, || 42);
+        let (second, second_lookup) = store
+            .active_balance_cache()
+            .get_or_compute(key, || panic!("should not recompute"));
+
+        assert_eq!((first, first_lookup), (42, Lookup::Miss));
+        assert_eq!((second, second_lookup), (42, Lookup::Hit));
     }
 
     #[test]

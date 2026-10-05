@@ -51,7 +51,9 @@ use crate::beacon::containers::shared::{
 use crate::beacon::containers::{BeaconState, capella, phase0};
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::hash::hash;
-use crate::beacon::helpers::accessors::{CommitteeCache, get_current_epoch, get_randao_mix};
+use crate::beacon::helpers::accessors::{
+    ActiveBalanceCache, CommitteeCache, get_current_epoch, get_randao_mix,
+};
 use crate::beacon::helpers::capella::{
     is_fully_withdrawable_validator, is_partially_withdrawable_validator,
 };
@@ -79,6 +81,7 @@ pub fn process_block(
     config: &Config,
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -101,8 +104,9 @@ pub fn process_block(
         &block.body.bls_to_execution_changes,
         config,
         committees,
+        active_balances,
     )?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate)?;
+    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
     Ok(())
 }
 
@@ -374,6 +378,7 @@ pub fn process_operations(
     bls_to_execution_changes: &[capella::SignedBLSToExecutionChange],
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     super::operations::process_operations(
         state,
@@ -384,6 +389,7 @@ pub fn process_operations(
         voluntary_exits,
         config,
         committees,
+        active_balances,
     )?;
     for signed_change in bls_to_execution_changes {
         process_bls_to_execution_change(state, signed_change, config)?;

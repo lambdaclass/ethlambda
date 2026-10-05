@@ -23,8 +23,8 @@ use crate::beacon::containers::shared::{
 use crate::beacon::error::{Error, Result, verify};
 use crate::beacon::fork::ForkName;
 use crate::beacon::helpers::accessors::{
-    CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index, get_current_epoch, get_domain,
-    get_previous_epoch,
+    ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_beacon_proposer_index,
+    get_current_epoch, get_domain, get_previous_epoch,
 };
 use crate::beacon::helpers::attestation::{get_indexed_attestation, is_valid_indexed_attestation};
 use crate::beacon::helpers::misc::{
@@ -72,6 +72,7 @@ pub fn process_operations(
     voluntary_exits: &[SignedVoluntaryExit],
     config: &Config,
     committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
     // `eth1_deposit_index` only ever advances by one per processed deposit,
     // and `deposit_count` only ever grows, so in a correctly-derived state the
@@ -109,7 +110,12 @@ pub fn process_operations(
         if state.fork_name() == ForkName::Phase0 {
             process_attestation(state, attestation, config, committees)?;
         } else {
-            crate::beacon::stf::altair::process_attestation(state, attestation, committees)?;
+            crate::beacon::stf::altair::process_attestation(
+                state,
+                attestation,
+                committees,
+                active_balances,
+            )?;
         }
     }
     for deposit in deposits {
