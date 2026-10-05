@@ -660,4 +660,94 @@ mod tests {
             Some("altair")
         );
     }
+
+    fn gloas_context() -> Arc<SigningContext> {
+        Arc::new(SigningContext {
+            config: Config::mainnet()
+                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 10),
+            genesis_validators_root: Root::ZERO,
+        })
+    }
+
+    /// From gloas `data.index` is the payload signal, so a node answering 1
+    /// must see it submitted as 1 and signed as 1: resetting it to zero, as
+    /// the electra rule would suggest, signs a vote the node never made.
+    #[tokio::test]
+    async fn a_gloas_index_of_one_is_submitted_and_signed_unchanged() {
+        use blst::min_pk::{PublicKey, Signature};
+        use ethlambda_types::beacon::fork::ForkName;
+
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let pubkey_hex = encode_hex(&pubkey.0);
+        let store = RwLock::new(store);
+
+        let slot = 10 * preset::SLOTS_PER_EPOCH + 3;
+        let node = Arc::new(
+            MockBeaconNode::new()
+                .with_attestation_data(slot)
+                .with_attestation_index(1),
+        );
+        let attested = AttestationService::new(node.clone(), gloas_context())
+            .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
+            .await
+            .expect("attests");
+
+        assert_eq!(attested.data.expect("data").index, 1);
+        let submitted = node.submitted();
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0].data.index, 1, "the index must pass through");
+        assert_eq!(node.last_submitted_fork_name().as_deref(), Some("gloas"));
+        assert_eq!(node.attestation_data_forks(), vec![ForkName::Gloas]);
+
+        // The signature is over the data with index 1, not over a zeroed copy.
+        let mut signed_over = node.attestation_data.expect("set");
+        assert_eq!(signed_over.index, 1);
+        let root = gloas_context().attestation_signing_root(&signed_over);
+        let signature_bytes: [u8; 96] =
+            hex::decode(submitted[0].signature.trim_start_matches("0x"))
+                .expect("hex")
+                .try_into()
+                .expect("96 bytes");
+        let pk = PublicKey::from_bytes(&pubkey.0).expect("valid pubkey");
+        let sig = Signature::from_bytes(&signature_bytes).expect("valid signature");
+        let verify = |root: Root| {
+            sig.verify(
+                true,
+                root.as_slice(),
+                b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_",
+                &[],
+                &pk,
+                true,
+            )
+        };
+        assert_eq!(verify(root), blst::BLST_ERROR::BLST_SUCCESS);
+
+        signed_over.index = 0;
+        assert_ne!(
+            verify(gloas_context().attestation_signing_root(&signed_over)),
+            blst::BLST_ERROR::BLST_SUCCESS,
+            "a vote for index 0 is a different message"
+        );
+    }
+
+    /// Slots before gloas are asked about under their own fork, so the HTTP
+    /// client keeps sending `committee_index=0` there.
+    #[tokio::test]
+    async fn a_pre_gloas_slot_is_asked_about_under_its_own_fork() {
+        use ethlambda_types::beacon::fork::ForkName;
+
+        let mut store = ValidatorStore::new();
+        let pubkey = store.insert_secret("test", &secret()).expect("inserts");
+        let pubkey_hex = encode_hex(&pubkey.0);
+        let store = RwLock::new(store);
+
+        let slot = 9 * preset::SLOTS_PER_EPOCH + 3;
+        let node = Arc::new(MockBeaconNode::new().with_attestation_data(slot));
+        AttestationService::new(node.clone(), gloas_context())
+            .attest(slot, &[duty(&pubkey_hex, 1337, slot, 3)], &store)
+            .await
+            .expect("attests");
+        assert_eq!(node.attestation_data_forks(), vec![ForkName::Phase0]);
+    }
 }
