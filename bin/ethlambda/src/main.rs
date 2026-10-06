@@ -721,6 +721,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     // by block production and `GET .../pool/payload_attestations`.
     let payload_attestation_pool =
         ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool::default();
+    // Filled by gossip and the Beacon API's sync committee endpoints, read by
+    // block production and the contribution endpoint.
+    let sync_committee_pool =
+        ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
     let p2p = P2P::spawn(
         built,
         setup.store.clone(),
@@ -728,6 +732,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         discovery,
         attestation_pool.clone(),
         payload_attestation_pool.clone(),
+        sync_committee_pool.clone(),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;
@@ -769,6 +774,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     attestation_pool: attestation_pool.clone(),
                     payload_attestation_pool: payload_attestation_pool.clone(),
+                    sync_committee_pool: sync_committee_pool.clone(),
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                 },

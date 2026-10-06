@@ -46,7 +46,8 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
-        SubscribeAttestationSubnets,
+        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
+        SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
@@ -56,7 +57,9 @@ use ethlambda_state_transition::beacon::gossip::{
     payload_attestation::SeenPayloadAttestations,
 };
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool, payload_attestation_pool::SharedPayloadAttestationPool,
+    attestation_pool::SharedAttestationPool,
+    payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
@@ -1093,6 +1096,7 @@ impl P2P {
         discovery: Option<DiscoverySpawnConfig>,
         attestation_pool: SharedAttestationPool,
         payload_attestation_pool: SharedPayloadAttestationPool,
+        sync_committee_pool: SharedSyncCommitteePool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = match discovery {
             Some(config) => Some(spawn_discovery(config).await?),
@@ -1156,6 +1160,7 @@ impl P2P {
             )),
             attestation_pool,
             payload_attestation_pool,
+            sync_committee_pool,
             aggregator_subnets: HashMap::new(),
         };
         let discovery_enabled = server.discovery.is_some();
@@ -1295,6 +1300,14 @@ pub struct P2PServer {
     /// API that serves and fills the same pool. Filled by `verdict::forward`;
     /// lean never touches it.
     pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
+
+    /// Accepted sync committee messages and contributions, shared with the
+    /// Beacon API that serves and fills the same pool (block production reads
+    /// it). Filled by `verdict::forward`; lean never touches it.
+    // Read once the sync committee gossip verdicts land; see
+    // `beacon::sync_committee`.
+    #[allow(dead_code)]
+    pub(crate) sync_committee_pool: SharedSyncCommitteePool,
 
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
@@ -1615,6 +1628,24 @@ impl Handler<PublishPayloadAttestationMessage> for P2PServer {
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<PublishSyncCommitteeMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeMessage, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_message(self, msg.subnet_ids, msg.message);
+    }
+}
+
+impl Handler<PublishSyncCommitteeContribution> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeContribution, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_contribution(self, msg.contribution);
+    }
+}
+
+impl Handler<SubscribeSyncCommitteeSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeSyncCommitteeSubnets, _ctx: &Context<Self>) {
+        beacon::sync_committee::join_sync_committee_subnets(self, msg.subnets);
     }
 }
 
@@ -2783,6 +2814,7 @@ pub(crate) mod test_support {
             )),
             attestation_pool: Default::default(),
             payload_attestation_pool: Default::default(),
+            sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

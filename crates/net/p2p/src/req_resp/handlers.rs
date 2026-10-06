@@ -2790,6 +2790,7 @@ pub(crate) mod tests {
             )),
             attestation_pool: Default::default(),
             payload_attestation_pool: Default::default(),
+            sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }
