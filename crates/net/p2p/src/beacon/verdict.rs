@@ -1224,8 +1224,10 @@ mod tests {
             settle(&mut server, Outcome::Accept, &object),
             Outcome::Ignore(IgnoreReason::AlreadySeen)
         );
-        // Anything but an accept records nothing.
-        let other = bid_object(&server, bid(5, 4, 10));
+        // Anything but an accept records nothing. The value must beat the
+        // best one recorded for the same (slot, parent), or the spec's
+        // highest-bid rule would ignore it on its own account.
+        let other = bid_object(&server, bid(5, 4, 11));
         assert_eq!(
             settle(
                 &mut server,
