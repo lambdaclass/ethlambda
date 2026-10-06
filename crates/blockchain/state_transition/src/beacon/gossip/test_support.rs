@@ -116,6 +116,13 @@ pub(crate) mod builder_scene {
 
     pub(crate) const PARENT: Root = Root::repeat_byte(0x50);
     pub(crate) const BID_SLOT: Slot = 34;
+    /// The slot the scene's parent sits at: epoch 1, whose state can hold a
+    /// funded builder only with a finalized epoch that a real chain cannot have
+    /// there (a builder is active once the finalized epoch passes its deposit
+    /// epoch, and the finalized epoch never exceeds the previous one). Fine for
+    /// a rule that reads the state as it is; a test that advances it through
+    /// an epoch's end needs [`scene_at`] with a parent in epoch 2 or later.
+    pub(crate) const PARENT_SLOT: Slot = 32;
     pub(crate) const PARENT_GAS_LIMIT: u64 = 30_000_000;
 
     pub(crate) fn fee_recipient() -> ExecutionAddress {
@@ -147,7 +154,7 @@ pub(crate) mod builder_scene {
 
     /// An empty store, gloas from genesis, anchored (and headed) at `PARENT`,
     /// whose block the caller must store.
-    pub(crate) fn gloas_store() -> Store {
+    fn gloas_store_at(parent_slot: Slot) -> Store {
         Store::init_beacon(
             Arc::new(InMemoryBackend::new()),
             GENESIS_TIME,
@@ -155,9 +162,9 @@ pub(crate) mod builder_scene {
             PARENT,
             Checkpoint {
                 root: PARENT,
-                slot: 32,
+                slot: parent_slot,
             },
-            32,
+            parent_slot,
         )
     }
 
@@ -170,10 +177,35 @@ pub(crate) mod builder_scene {
         pub bid: gloas::SignedExecutionPayloadBid,
     }
 
+    /// `PARENT`'s post-state at `parent_slot`, with an active funded builder 0.
+    /// Reached by advancing the epoch-1 state while nothing is finalized, so
+    /// every epoch transition on the way is one a real chain takes, then
+    /// finalizing epoch 1: reachable once `parent_slot` is in epoch 2 or later.
+    fn parent_state_at(parent_slot: Slot) -> BeaconState {
+        let mut state = test_support::gloas_state_with_builder(0, 100_000_000_000, 0);
+        if parent_slot == PARENT_SLOT {
+            return state;
+        }
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        inner.finalized_checkpoint.epoch = 0;
+        let config = gloas_support::config();
+        let mut state =
+            crate::beacon::block_production::advance_to_slot(&state, parent_slot, &config)
+                .expect("advance to the parent's slot");
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        inner.finalized_checkpoint.epoch = 1;
+        inner.latest_block_header.slot = inner.slot;
+        state
+    }
+
     impl Scene {
         /// 100 ms into the bid's slot.
         pub(crate) fn now_ms(&self) -> u64 {
-            slot_start_ms(&self.store, BID_SLOT) + 100
+            slot_start_ms(&self.store, self.bid.message.slot) + 100
         }
 
         /// The scene's bid after `edit`, re-signed by its builder.
@@ -190,13 +222,20 @@ pub(crate) mod builder_scene {
     /// The scene with `edit` applied to the parent's state before it is stored,
     /// and the prerequisites of a passing bid recorded in the market.
     pub(crate) fn scene_with(edit: impl FnOnce(&mut gloas::BeaconState)) -> Scene {
-        let mut state = test_support::gloas_state_with_builder(0, 100_000_000_000, 0);
+        scene_at(PARENT_SLOT, edit)
+    }
+
+    /// [`scene_with`] for a parent at `parent_slot`, whose bid is for the slot
+    /// two after it.
+    pub(crate) fn scene_at(parent_slot: Slot, edit: impl FnOnce(&mut gloas::BeaconState)) -> Scene {
+        let bid_slot = parent_slot + (BID_SLOT - PARENT_SLOT);
+        let mut state = parent_state_at(parent_slot);
         let BeaconState::Gloas(inner) = &mut state else {
             unreachable!("built as gloas")
         };
         edit(inner);
         state.apply_pending_mutations();
-        let mut store = gloas_store();
+        let mut store = gloas_store_at(parent_slot);
         store
             .insert_pending_block(PARENT, block_at(state.slot()))
             .expect("insert the parent");
@@ -208,20 +247,20 @@ pub(crate) mod builder_scene {
             .expect("move the head");
         store.set_head_payload_status(PARENT, PayloadStatus::Full);
 
-        let dependent_root = dependent_root_at(&state, PARENT, BID_SLOT).expect("in the window");
-        let proposer = crate::beacon::precheck::fixed_proposer(&state, BID_SLOT).expect("window");
+        let dependent_root = dependent_root_at(&state, PARENT, bid_slot).expect("in the window");
+        let proposer = crate::beacon::precheck::fixed_proposer(&state, bid_slot).expect("window");
         let market = BuilderMarket::default();
         let preferences = test_support::sign_preferences(
             &state,
             gloas::ProposerPreferences {
                 dependent_root,
-                proposal_slot: BID_SLOT,
+                proposal_slot: bid_slot,
                 validator_index: proposer,
                 fee_recipient: fee_recipient(),
                 target_gas_limit: PARENT_GAS_LIMIT,
             },
         );
-        assert!(market.record_preferences(preferences, BID_SLOT - 1));
+        assert!(market.record_preferences(preferences, bid_slot - 1));
         market.record_execution_payload(&test_support::envelope_with_gas_limit(
             parent_block_hash(),
             PARENT_GAS_LIMIT,
@@ -238,7 +277,7 @@ pub(crate) mod builder_scene {
                 fee_recipient: fee_recipient(),
                 gas_limit: PARENT_GAS_LIMIT,
                 builder_index: 0,
-                slot: BID_SLOT,
+                slot: bid_slot,
                 value: 1,
                 ..Default::default()
             },
