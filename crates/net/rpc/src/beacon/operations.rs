@@ -73,13 +73,21 @@ async fn get_proposer_slashings(State(store): State<Store>) -> Response {
     crate::json_response(serde_json::json!({ "data": data }))
 }
 
+/// The pool's attester slashings, versioned by the fork of the wall clock's
+/// current epoch, as the Beacon API's "active consensus version" means. The
+/// head's fork lags the clock at a fork boundary whose block is late or
+/// missing, and a validator client would then decode the list as the wrong
+/// fork's container.
+///
+/// The pool holds electra-shaped slashings. Their JSON is the same for every
+/// fork (the containers differ only in the SSZ list bound of the attesting
+/// indices), so no conversion is needed for the version to be honest.
 async fn get_attester_slashings(State(store): State<Store>) -> Response {
-    let Some((head_slot, _root)) = store.beacon_head() else {
-        return ApiError::Internal("no head block").into_response();
-    };
     let fork = store
         .config()
-        .fork_at_epoch(compute_epoch_at_slot(head_slot));
+        .fork_at_epoch(compute_epoch_at_slot(crate::beacon::node::wall_slot(
+            &store,
+        )));
     let data = store.operation_pool().attester_slashings();
     let response = crate::json_response(serde_json::json!({
         "version": fork.as_str(),
@@ -532,6 +540,28 @@ mod tests {
         assert_eq!(headers["eth-consensus-version"], "fulu");
         assert_eq!(json["version"], "fulu");
         assert_eq!(json["data"], serde_json::to_value([&slashing]).unwrap());
+    }
+
+    /// The head is before the fork boundary and the wall clock after it: the
+    /// version is the clock's fork, not the head's.
+    #[tokio::test]
+    async fn the_attester_slashings_version_follows_the_wall_clock_not_the_head() {
+        let mut fixture = fixture();
+        let state = with_signing_validators_at(ForkName::Fulu, 64);
+        let config = fixture.store.config();
+        let head_fork = config.fork_at_epoch(compute_epoch_at_slot(state.slot()));
+        let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&fixture.store));
+        let wall_fork = config.fork_at_epoch(wall_epoch);
+        assert_ne!(
+            head_fork, wall_fork,
+            "the head must sit before a fork boundary the clock is past"
+        );
+        fixture.store = beacon_store_at(state).0;
+
+        let (status, headers, json) = get(&fixture, "/eth/v2/beacon/pool/attester_slashings").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["eth-consensus-version"], wall_fork.as_str());
+        assert_eq!(json["version"], wall_fork.as_str());
     }
 
     #[tokio::test]
