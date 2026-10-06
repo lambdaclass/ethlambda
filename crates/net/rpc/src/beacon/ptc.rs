@@ -25,7 +25,7 @@ use ethlambda_blockchain::metrics::SyncStatus;
 use ethlambda_engine::EngineClient;
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{get_current_slot, get_payload_due_ms},
+    fork_choice::get_payload_due_ms,
     gloas_block_production::aggregate_payload_attestations,
     gossip::{
         Outcome,
@@ -98,7 +98,8 @@ struct PtcDuty {
 /// seats still gets one duty per epoch, and one in no committee gets none, as
 /// does an unknown index.
 ///
-/// `epoch` may be at most one past the current one. A gloas epoch is answered
+/// `epoch` may be at most one past the wall clock's epoch (or the head's, if
+/// that is later). A gloas epoch is answered
 /// from the head state's `ptc_window`, which `get_ptc` can read for the
 /// state's epoch, the one before and the next one. Anything else (the first
 /// gloas epoch while the head is still fulu, or an epoch the head has not
@@ -156,11 +157,11 @@ fn ptc_duties(
     let config = store.config();
     let (head_root, head_state) = head(store)?;
     let state_epoch = compute_epoch_at_slot(head_state.slot());
-    // The wall clock can be ahead of the head (a node that missed slots) and,
-    // in a follower's store, behind it; either way an epoch more than one past
-    // the later of the two is not one a validator is asked about yet.
-    let clock_epoch = compute_epoch_at_slot(get_current_slot(store, &config));
-    if epoch > state_epoch.max(clock_epoch) + 1 {
+    // Bounded by the wall clock, as the other duties are (see
+    // `validator::epoch_upper_bound`): the store's tick-driven clock still reads
+    // the previous epoch until the boundary slot's tick runs, which is when a
+    // validator client asks for the next epoch.
+    if epoch > crate::beacon::validator::epoch_upper_bound(store, state_epoch) {
         return Err(ApiError::BadRequest(
             "epoch is more than one past the current",
         ));
@@ -591,6 +592,19 @@ mod tests {
     /// slot running now (the gossip checks only take the current slot).
     fn store_with_head(state: BeaconState, config: Config, commitments: usize) -> (Store, H256) {
         let slot = state.slot();
+        store_with_head_at_clock(state, config, commitments, slot)
+    }
+
+    /// [`store_with_head`] whose wall clock is at `clock_slot` while the store's
+    /// own tick-driven time stays at the head's slot, as it does until the
+    /// boundary slot's tick runs.
+    fn store_with_head_at_clock(
+        state: BeaconState,
+        config: Config,
+        commitments: usize,
+        clock_slot: u64,
+    ) -> (Store, H256) {
+        let slot = state.slot();
         let mut block = gloas_beacon_block(slot, H256::ZERO, H256::ZERO, H256::repeat_byte(1));
         let SignedBeaconBlock::Gloas(inner) = &mut block else {
             unreachable!("built as gloas")
@@ -605,7 +619,7 @@ mod tests {
             .expect("a few commitments fit");
         let root = block.message_hash_tree_root();
         let slot_secs = config.slot_duration_ms / 1000;
-        let genesis = now_secs() - slot * slot_secs - 1;
+        let genesis = now_secs() - clock_slot * slot_secs - 1;
         let mut store = Store::init_beacon(
             Arc::new(InMemoryBackend::default()),
             genesis,
@@ -614,6 +628,8 @@ mod tests {
             Checkpoint { root, slot },
             slot,
         );
+        let tick_ms = store.config().genesis_time_ms() + slot * store.config().slot_duration_ms;
+        store.set_time_ms(tick_ms).unwrap();
         store.insert_signed_block(root, block).unwrap();
         store.insert_state(root, state).unwrap();
         store
@@ -765,6 +781,30 @@ mod tests {
         let reply = request(store.clone(), duties_request(state_epoch + 2, r#"["1"]"#)).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
         let reply = request(store, duties_request(u64::MAX, r#"["1"]"#)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// The devnet case: the wall clock is in the epoch after the head's while
+    /// the store's own clock has not ticked past the head's, and the validator
+    /// client asks for the epoch after that.
+    #[tokio::test]
+    async fn the_bound_is_the_wall_clock_not_the_stores_tick() {
+        use ethlambda_state_transition::beacon::fork_choice::get_current_slot;
+
+        let state = gloas_state();
+        let head_epoch = compute_epoch_at_slot(state.slot());
+        let clock_slot = compute_start_slot_at_epoch(head_epoch + 1);
+        let (store, _) = store_with_head_at_clock(state, gloas_config(), 0, clock_slot);
+        let tick_epoch = compute_epoch_at_slot(get_current_slot(&store, &store.config()));
+        assert_eq!(
+            tick_epoch, head_epoch,
+            "the store's tick is behind the clock"
+        );
+
+        let reply = request(store.clone(), duties_request(head_epoch + 2, r#"["1"]"#)).await;
+        assert_eq!(reply.status, StatusCode::OK);
+
+        let reply = request(store, duties_request(head_epoch + 3, r#"["1"]"#)).await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     }
 
