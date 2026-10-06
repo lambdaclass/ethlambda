@@ -16,7 +16,7 @@ use std::sync::Arc;
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
-    BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+    BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, altair,
     electra, gloas, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
@@ -24,7 +24,8 @@ use ethlambda_state_transition::beacon::fork_choice::{
 };
 use ethlambda_state_transition::beacon::gossip::{
     self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
-    SeenColumns, SeenEnvelopes, SeenPayloadAttestations,
+    SeenColumns, SeenEnvelopes, SeenPayloadAttestations, SeenSyncCommitteeMessages,
+    SeenSyncContributions,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
@@ -43,6 +44,8 @@ const HANDLERS: &[&str] = &[
     "gossip_beacon_attestation",
     "gossip_execution_payload_envelope",
     "gossip_payload_attestation_message",
+    "gossip_sync_committee_message",
+    "gossip_sync_committee_contribution_and_proof",
 ];
 
 /// The forks each of [`HANDLERS`] validates. A case from any other fork is
@@ -63,6 +66,10 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         }
         "gossip_execution_payload_envelope" | "gossip_payload_attestation_message" => {
             &[ForkName::Gloas]
+        }
+        // Altair's rules, which neither fulu nor gloas changes.
+        "gossip_sync_committee_message" | "gossip_sync_committee_contribution_and_proof" => {
+            &[ForkName::Fulu, ForkName::Gloas]
         }
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
@@ -92,8 +99,6 @@ const IGNORED_HANDLERS: &[&str] = &[
     "gossip_partial_data_column_sidecar",
     "gossip_proposer_preferences",
     "gossip_proposer_slashing",
-    "gossip_sync_committee_contribution_and_proof",
-    "gossip_sync_committee_message",
     "gossip_voluntary_exit",
 ];
 
@@ -415,6 +420,8 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_attestations = SeenAttestations::new(capacity);
     let mut seen_envelopes = SeenEnvelopes::new(capacity);
     let mut seen_payload_attestations = SeenPayloadAttestations::new(capacity);
+    let mut seen_sync_messages = SeenSyncCommitteeMessages::new(capacity);
+    let mut seen_sync_contributions = SeenSyncContributions::new(capacity, capacity);
 
     for (index, message) in meta.messages.iter().enumerate() {
         let now_ms = config.genesis_time_ms()
@@ -531,6 +538,48 @@ fn run_case(case: &Case) -> Result<(), String> {
                 if outcome == Outcome::Accept {
                     seen_payload_attestations
                         .record(attestation.data.slot, attestation.validator_index);
+                }
+                outcome
+            }
+            "sync_committee" => {
+                let sync_message =
+                    altair::SyncCommitteeMessage::from_ssz_bytes(&case.ssz_bytes(&message.message))
+                        .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let subnet_id = message
+                    .subnet_id
+                    .ok_or("a sync_committee message names its subnet")?;
+                let outcome = match rules::sync_committee::validate_message(
+                    &seen_sync_messages,
+                    &store,
+                    &sync_message,
+                    subnet_id,
+                    now_ms,
+                ) {
+                    Ok(_) => Outcome::Accept,
+                    Err(outcome) => outcome,
+                };
+                if outcome == Outcome::Accept {
+                    seen_sync_messages.record(
+                        sync_message.slot,
+                        sync_message.validator_index,
+                        subnet_id,
+                    );
+                }
+                outcome
+            }
+            "sync_committee_contribution_and_proof" => {
+                let signed = altair::SignedContributionAndProof::from_ssz_bytes(
+                    &case.ssz_bytes(&message.message),
+                )
+                .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+                let outcome = rules::sync_committee::validate_contribution(
+                    &seen_sync_contributions,
+                    &store,
+                    &signed,
+                    now_ms,
+                );
+                if outcome == Outcome::Accept {
+                    seen_sync_contributions.record(&signed);
                 }
                 outcome
             }

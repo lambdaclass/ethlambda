@@ -12,6 +12,7 @@ pub mod block;
 pub mod column;
 pub mod envelope;
 pub mod payload_attestation;
+pub mod sync_committee;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -22,6 +23,7 @@ pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
 pub use envelope::SeenEnvelopes;
 pub use payload_attestation::SeenPayloadAttestations;
+pub use sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions};
 
 use std::num::NonZeroUsize;
 
@@ -155,6 +157,8 @@ pub enum IgnoreReason {
     /// The head state's payload timeliness committee window cannot answer for
     /// the attested slot.
     PtcUnavailable,
+    /// The head state's sync committees cannot answer for the message's period.
+    SyncCommitteeUnavailable,
 }
 
 impl IgnoreReason {
@@ -180,6 +184,7 @@ impl IgnoreReason {
             Self::NotCurrentSlot => "not_current_slot",
             Self::BlockNotAtSlot => "block_not_at_slot",
             Self::PtcUnavailable => "ptc_unavailable",
+            Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
         }
     }
 }
@@ -258,6 +263,9 @@ pub enum RejectReason {
     /// A payload attestation's validator is not in its slot's payload
     /// timeliness committee.
     NotInPtc,
+    /// A sync committee contribution's subcommittee index is not below
+    /// `SYNC_COMMITTEE_SUBNET_COUNT`.
+    SubcommitteeIndex,
 }
 
 impl RejectReason {
@@ -303,6 +311,7 @@ impl RejectReason {
             Self::TooManyWithdrawals => "too_many_withdrawals",
             Self::PreGloasSlot => "pre_gloas_slot",
             Self::NotInPtc => "not_in_ptc",
+            Self::SubcommitteeIndex => "subcommittee_index",
         }
     }
 }
