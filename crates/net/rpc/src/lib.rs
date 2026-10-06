@@ -420,7 +420,7 @@ pub(crate) mod test_utils {
     }
 
     /// A phase0 block at `slot`, with a trivial (default) body.
-    fn phase0_beacon_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+    pub(crate) fn phase0_beacon_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
         SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
             message: phase0::BeaconBlock {
                 slot,

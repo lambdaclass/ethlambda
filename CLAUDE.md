@@ -335,7 +335,13 @@ actual_slot = finalized_slot + 1 + relative_index
   - Beacon peer scoring: lighthouse's parameters ported in `p2p/src/beacon/scoring.rs` (block, aggregate, 64 attestation subnets, exits, slashings; columns and sync contributions unscored), refreshed every slot from the head's active validator count. Mesh-delivery scoring (P3) is gated off while the head lags more than 4 slots and for an epoch after, because a catching-up node `Ignore`s every aggregate and would otherwise graylist its own mesh. The swarm disconnects peers below the graylist (-16000) every 10 s. Lean runs unscored. See [`docs/beacon_wire.md`](docs/beacon_wire.md#peer-scoring)
   - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
-    columns and backbone attestation subnets. Gloas digests add two more topics,
+    columns and backbone attestation subnets. One of the seven is
+    `sync_committee_contribution_and_proof`; the four `sync_committee_{0..3}` subnets are
+    joined on demand only (a validator client's `sync_committee_subscriptions`, held
+    until its `until_epoch`, under every held digest) and advertised in MetaData
+    `syncnets`, never the ENR. Messages and contributions validate in p2p on their own
+    permit pool (`gossip::sync_committee`, `p2p/src/beacon/sync_committee.rs`), and
+    accepted ones go into the shared `SyncCommitteePool`. Gloas digests add two more topics,
     `execution_payload` and `payload_attestation_message` (`BeaconTopics::for_fork`; earlier
     digests never carry them). Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
@@ -819,7 +825,15 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   `Eth-Blob-Data-Included: true`, both inside the proposal's attester-offset
   budget; an envelope failure is logged and counted, not a failed proposal),
   attest at `ATTESTATION_DUE_BPS_GLOAS`, aggregate at `AGGREGATE_DUE_BPS_GLOAS`,
-  then the PTC vote at `PAYLOAD_ATTESTATION_DUE_BPS`. `SlotClock` picks the
+  then the PTC vote at `PAYLOAD_ATTESTATION_DUE_BPS`. Sync committee duties
+  (`SyncCommitteeService`, `crates/validator/src/sync_committee.rs`) run at every fork:
+  one message per validator over the head root at `SYNC_MESSAGE_DUE_BPS(_GLOAS)`
+  (refused while the head is optimistic), then contributions for each selected
+  (validator, subnet) pair at `CONTRIBUTION_DUE_BPS(_GLOAS)`, with subscriptions
+  re-sent every epoch for the current and next period. The node pools the messages
+  and a block at slot N packs only `(N-1, parent_root)`, replaced by the empty
+  aggregate when `verified_sync_aggregate` fails (see `docs/spec_deviations.md`).
+  `SlotClock` picks the
   offsets by each slot's own fork, and `/eth/v1/config/spec` supplies them. It
   still keeps no slashing-protection record; PTC votes have an in-memory
   `(validator, slot)` dedup only, and envelopes are unguarded.
