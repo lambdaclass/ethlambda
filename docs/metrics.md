@@ -516,20 +516,21 @@ checkpoint-synced follower.
 
 Beacon fork choice weighs every vote by the voter's effective balance at the
 justified checkpoint. `justified_balances` (in
-`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) flattens that
-state into one array, keyed by the justified checkpoint and rebuilt on the first
-`get_head` after the checkpoint moves. This is ethlambda-specific, not part of
-the leanMetrics spec.
+`crates/blockchain/state_transition/src/beacon/fork_choice.rs`) reads the
+store's per-checkpoint cache of flattened balances, which block import fills
+from the epoch-boundary state, so a head computation normally reads no justified
+state. This is ethlambda-specific, not part of the leanMetrics spec.
 
 | Name | Type | Usage | Sample collection event | Labels |
 |------|------|-------|-------------------------|--------|
-| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cached snapshot served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
-| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from the checkpoint state | On every miss, around the registry pass (the checkpoint state lookup is not included) | |
+| `lean_beacon_justified_balances_lookups_total` | Counter | Snapshot lookups, by whether the cache served them | On every `justified_balances` call: `get_head`'s weights, the proposer boost, and the reorg helpers | result=hit,miss |
+| `lean_beacon_justified_balances_build_seconds` | Histogram | Time to build one snapshot from a state's registry | On every build, whether at import (epoch-boundary state) or on a lookup miss (the checkpoint state lookup is not included) | |
 
-**Read the miss rate against the justified-checkpoint rate**: about one miss
-per justified checkpoint change, so a handful per hour on a healthy chain.
-Misses that track `get_head` calls mean the justified checkpoint is flapping
-between branches, or the snapshot is being replaced between two readers.
+**Read the miss rate against restarts**: import builds each epoch's snapshot, so
+a healthy node misses only after a restart or for a checkpoint whose boundary
+import it never saw. Misses that track `get_head` calls mean the justified
+checkpoint is moving to checkpoints import did not cover. Builds without misses
+are the import-time fills, about one per epoch.
 
 ### Beacon Epoch Precompute
 

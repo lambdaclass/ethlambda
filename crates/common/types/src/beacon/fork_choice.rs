@@ -230,16 +230,44 @@ pub struct JustifiedBalances {
     /// `get_total_active_balance` of the checkpoint state: unlike `balances`
     /// it counts slashed validators, and it is floored at one increment.
     total_active_balance: Gwei,
+    /// Every validator's raw effective balance in `EFFECTIVE_BALANCE_INCREMENT`
+    /// units, whether or not it is active or slashed. Exact, since an
+    /// effective balance is always a whole number of increments and the
+    /// largest (`MAX_EFFECTIVE_BALANCE_ELECTRA`) is far below `u16::MAX`
+    /// increments; two bytes a validator instead of eight.
+    ///
+    /// `balances` zeroes a slashed validator, so it cannot answer the one
+    /// question that needs the raw figure: `is_head_weak` adds back the
+    /// effective balance of every equivocating validator in the head slot's
+    /// committees, and an equivocator is often slashed.
+    effective_increments: Box<[u16]>,
 }
 
 impl JustifiedBalances {
     /// Wraps already-computed values; see the field docs for what they mean.
-    pub fn new(checkpoint: Checkpoint, balances: Box<[Gwei]>, total_active_balance: Gwei) -> Self {
+    pub fn new(
+        checkpoint: Checkpoint,
+        balances: Box<[Gwei]>,
+        total_active_balance: Gwei,
+        effective_increments: Box<[u16]>,
+    ) -> Self {
         Self {
             checkpoint,
             balances,
             total_active_balance,
+            effective_increments,
         }
+    }
+
+    /// `index`'s raw effective balance at the checkpoint, active and unslashed
+    /// or not; zero past the end, since that validator did not exist then.
+    pub fn effective_balance(&self, index: ValidatorIndex) -> Gwei {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.effective_increments.get(index))
+            .map_or(0, |&increments| {
+                Gwei::from(increments) * crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT
+            })
     }
 
     /// The checkpoint these balances were derived from.
@@ -272,13 +300,22 @@ mod tests {
 
     #[test]
     fn justified_balances_read_zero_past_the_registry() {
-        let balances = JustifiedBalances::new(Checkpoint::default(), vec![7, 0, 9].into(), 16);
+        let balances = JustifiedBalances::new(
+            Checkpoint::default(),
+            vec![7, 0, 9].into(),
+            16,
+            vec![1, 2, 3].into(),
+        );
         assert_eq!(balances.get(0), 7);
         assert_eq!(balances.get(1), 0);
         assert_eq!(balances.get(2), 9);
         assert_eq!(balances.get(3), 0);
         assert_eq!(balances.get(u64::MAX), 0);
         assert_eq!(balances.total_active_balance(), 16);
+        let increment = crate::beacon::preset::EFFECTIVE_BALANCE_INCREMENT;
+        assert_eq!(balances.effective_balance(1), 2 * increment);
+        assert_eq!(balances.effective_balance(3), 0);
+        assert_eq!(balances.effective_balance(u64::MAX), 0);
     }
 
     #[test]
