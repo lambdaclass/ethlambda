@@ -373,6 +373,8 @@ fn blobs_list(blobs: Vec<Vec<u8>>) -> Result<Blobs, ()> {
 }
 
 /// What `produceBlockV4` built for one block.
+// Short-lived (one per request), so boxing the larger variant buys nothing.
+#[allow(clippy::large_enum_variant)]
 enum Production {
     /// A block on this node's own payload, with the envelope that reveals it.
     Local(Produced),
