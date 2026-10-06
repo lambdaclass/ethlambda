@@ -165,7 +165,7 @@ pub(crate) fn head(store: &Store) -> Result<(H256, Arc<BeaconState>), ApiError> 
 /// slot's block arrives, and a validator client asks for the next epoch's
 /// duties right then. The head's epoch only matters when it is ahead of a
 /// lagging clock, where refusing it would be a regression.
-fn epoch_upper_bound(store: &Store, head_epoch: Epoch) -> Epoch {
+pub(crate) fn epoch_upper_bound(store: &Store, head_epoch: Epoch) -> Epoch {
     let clock_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(store));
     head_epoch.max(clock_epoch) + 1
 }
