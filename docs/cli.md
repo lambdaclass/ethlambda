@@ -346,9 +346,26 @@ this order: propose at the boundary, attest at `ATTESTATION_DUE_BPS_GLOAS`,
 aggregate at `AGGREGATE_DUE_BPS_GLOAS`, then the committee vote. The attestation
 and the committee vote are each bounded by the end of the slot.
 
+Sync committee duties run beside the attester and committee work, not after it.
+Each epoch the client fetches its sync duties for the current period and the
+next (`POST /eth/v1/validator/duties/sync/{epoch}`, asked at the period's first
+epoch) and posts `sync_committee_subscriptions` for the current period's seats,
+until the period's end, so the node joins the subnets. The next period's are
+added once its boundary is within four epochs. A member sleeps until
+`SYNC_MESSAGE_DUE_BPS` (`SYNC_MESSAGE_DUE_BPS_GLOAS` from gloas), reads
+`/eth/v1/beacon/blocks/head/root`, signs it and submits one message per
+validator. It refuses to sign when the node reports the head optimistic. A
+member selected by the selection-proof hash for a subnet then waits for
+`CONTRIBUTION_DUE_BPS` (`CONTRIBUTION_DUE_BPS_GLOAS`), fetches the node's
+contribution for that subnet and publishes it wrapped and signed. A subnet whose
+contribution cannot be fetched is skipped without stopping the others. Duties
+for wall slot `S` are those of the period containing `S + 1`, since members
+assigned to slot `S` sign for `S - 1`. Both halves are bounded by the end of the
+slot.
+
 Not implemented: the builder flow and blinded blocks (the client asks for an
-unblinded block and refuses a blinded one), sync-committee duties, voluntary
-exits, doppelganger protection and remote signing.
+unblinded block and refuses a blinded one), voluntary exits, doppelganger
+protection and remote signing.
 
 ### Duty offsets come from the network
 
@@ -359,7 +376,9 @@ specification states them as `SLOT_DURATION_MS` plus basis points of it,
 work out at 3999 ms and 8000 ms. Gloas moves both earlier
 (`ATTESTATION_DUE_BPS_GLOAS`, `AGGREGATE_DUE_BPS_GLOAS`) and adds
 `PAYLOAD_ATTESTATION_DUE_BPS` (and `PAYLOAD_DUE_BPS`, which the node uses), so
-the clock picks the pair by the fork of each slot's own epoch.
+the clock picks the pair by the fork of each slot's own epoch. The sync
+committee offsets (`SYNC_MESSAGE_DUE_BPS`, `CONTRIBUTION_DUE_BPS` and their
+`_GLOAS` variants) are read and picked the same way.
 
 `SECONDS_PER_SLOT` no longer exists in the specification and is accepted only as
 a fallback, since deployed nodes still send it. A node sending both is required

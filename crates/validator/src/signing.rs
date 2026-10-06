@@ -11,7 +11,9 @@ use ethlambda_types::beacon::constants::{
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
     DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
-use ethlambda_types::beacon::containers::altair::{ContributionAndProof, SyncAggregatorSelectionData};
+use ethlambda_types::beacon::containers::altair::{
+    ContributionAndProof, SyncAggregatorSelectionData,
+};
 use ethlambda_types::beacon::containers::gloas::{
     ExecutionPayloadEnvelope, PayloadAttestationData,
 };
