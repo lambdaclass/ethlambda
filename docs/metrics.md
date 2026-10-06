@@ -362,8 +362,9 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 | `lean_beacon_gossip_verdict_expired_total` | Counter | Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing | When `report_message_validation_result` returns `false` | kind | |
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
-label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
-`beacon_attestation`. The gloas topics `execution_payload` and
+label `data_column_sidecar`, every `beacon_attestation_{subnet_id}` sharing
+`beacon_attestation` and every `sync_committee_{subnet_id}` sharing
+`sync_committee`. The gloas topics `execution_payload` and
 `payload_attestation_message` are labelled by their own name. `queue` means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only `execution_payload` answers it, for an envelope
@@ -390,7 +391,13 @@ only), `not_aggregator` (aggregate only), `not_in_committee`,
 `aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
 only), `target_not_ancestor`, `wrong_subnet` (attestation only), and gloas's
 `data_index_out_of_range`, `same_slot_payload_flag` and `payload_invalid` on the
-reject side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+reject side. The sync committee topics add `sync_committee_unavailable` (the head
+state's committees cannot answer for the message's period) on the ignore side
+and `subcommittee_index` (contribution only) on the reject side; they reuse
+`not_current_slot`, `already_seen`, `covered_bits`, `no_participants`,
+`not_aggregator`, `not_in_committee`, `unknown_validator`, `selection_proof`,
+`aggregator_signature`, `aggregate_signature`, `wrong_subnet` and
+`bad_signature`. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
 other topics: `unsupported_fork` is an ignore reason for a message of a fork this
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations

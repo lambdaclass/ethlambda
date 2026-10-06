@@ -396,6 +396,8 @@ async fn produce(
         .block_candidates();
     let attestations = pack_attestations(&state, candidates);
     let inputs = |attestations| BlockInputs {
+        sync_aggregate: ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(
+        ),
         randao_reveal,
         graffiti,
         attestations,
