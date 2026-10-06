@@ -241,7 +241,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET`, `POST` | `/eth/v1/beacon/states/{state_id}/validators` | JSON | Registry entries by index or pubkey, with status |
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
-| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
+| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, up to the wall clock's current period plus one |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
@@ -265,8 +265,13 @@ the chain actor writes, so no request waits on the actor.
   every committee of the epoch, a full shuffle per request on mainnet.
 - **Sync duties** read the head state's `current_sync_committee` for an epoch in
   the head's own sync committee period and `next_sync_committee` for the one
-  after; any other period is a `400` (an earlier one would need a historical
-  state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
+  after. The upper bound is the wall clock's, as the Beacon API defines it: the
+  period after the clock's current one. When the head lags a period boundary
+  (its block is late or missing), the later period is read from a copy of the
+  head advanced to the first epoch of the period before it, through fork
+  choice's checkpoint-state cache on a blocking thread. A period past that
+  bound or before the head's is a `400` (an earlier one would need a
+  historical state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
   gets every seat it holds, since the committee is drawn with replacement; one
   with no seat is left out. An unknown index is a `400`, and the endpoint is a
   `503` while the node is syncing. This node serves no sync committee message
