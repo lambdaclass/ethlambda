@@ -14,7 +14,7 @@ use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::helpers::{
-    accessors::get_domain,
+    accessors::{get_domain, get_domain_from_schedule},
     fulu::initialize_proposer_lookahead,
     test_state::{sign_for, with_signing_validators_at},
 };
@@ -158,7 +158,7 @@ async fn the_validator_client_can_attest_through_this_node() {
 
     // The attestation data is checked by the client itself before it signs.
     let data = client.attestation_data(slot).await.unwrap();
-    let domain = get_domain(&state, DOMAIN_BEACON_ATTESTER, Some(data.target.epoch));
+    let domain = scheduled_domain(&state, DOMAIN_BEACON_ATTESTER, data.target.epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
     let data_dto = AttestationDataOutDto::from(&data);
     let attestations: Vec<SingleAttestationDto> = attesters
@@ -224,7 +224,7 @@ fn signed_aggregate(
     };
     let slot = aggregate.data.slot;
     let epoch = compute_epoch_at_slot(slot);
-    let selection_domain = get_domain(state, DOMAIN_SELECTION_PROOF, Some(epoch));
+    let selection_domain = scheduled_domain(state, DOMAIN_SELECTION_PROOF, epoch);
     let selection_proof = sign_for(
         aggregator as usize,
         compute_signing_root(slot.hash_tree_root(), selection_domain),
@@ -234,12 +234,24 @@ fn signed_aggregate(
         aggregate,
         selection_proof,
     };
-    let domain = get_domain(state, DOMAIN_AGGREGATE_AND_PROOF, Some(epoch));
+    let domain = scheduled_domain(state, DOMAIN_AGGREGATE_AND_PROOF, epoch);
     let signature = sign_for(
         aggregator as usize,
         compute_signing_root(message.hash_tree_root(), domain),
     );
     SignedAggregateAndProof { message, signature }
+}
+
+/// The domain a validator client signs `domain_type` under at `epoch`: its
+/// fork schedule's, which is the node's (`beacon_store_at` serves mainnet's),
+/// rather than the test state's placeholder `fork`.
+fn scheduled_domain(
+    state: &BeaconState,
+    domain_type: ethlambda_types::beacon::primitives::DomainType,
+    epoch: ethlambda_types::beacon::primitives::Epoch,
+) -> ethlambda_types::beacon::primitives::Domain {
+    let config = ethlambda_types::beacon::config::Config::mainnet();
+    get_domain_from_schedule(&config, state, domain_type, epoch)
 }
 
 /// Without an execution client to build a payload with, block production
