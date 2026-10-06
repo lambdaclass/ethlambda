@@ -253,6 +253,10 @@ fn handle_beacon_gossip(
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
+    } else if kind == beacon_topics::EXECUTION_PAYLOAD_BID {
+        crate::beacon::builder_market::triage_execution_payload_bid(server, payload)
+    } else if kind == beacon_topics::PROPOSER_PREFERENCES {
+        crate::beacon::builder_market::triage_proposer_preferences(server, payload)
     } else {
         triage_other(wire, kind, payload)
     };

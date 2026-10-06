@@ -15,12 +15,14 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Instant;
 
 use ethlambda_network_api::{AggregateArrival, BlockArrival, BlockSource};
+use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
 use ethlambda_types::beacon::containers::gloas::{
-    PayloadAttestationMessage, SignedExecutionPayloadEnvelope,
+    PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
+    SignedProposerPreferences,
 };
 use ethlambda_types::beacon::containers::{
     DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
@@ -32,7 +34,7 @@ use spawned_concurrency::message::Message;
 use spawned_concurrency::tasks::{Context, Handler};
 use tracing::{error, warn};
 
-use crate::beacon::column_checks;
+use crate::beacon::{builder_market, column_checks};
 use crate::{P2PServer, metrics};
 
 /// Which gossip message a verdict is for.
@@ -78,6 +80,16 @@ pub(crate) enum Validated {
     /// A gloas `execution_payload`. Boxed for the reason `Block` is: it
     /// carries a whole execution payload.
     Envelope(Box<SignedExecutionPayloadEnvelope>),
+    /// A gloas `execution_payload_bid`. Carries the market because
+    /// `stateful_checks` receives only the store.
+    #[allow(dead_code)] // constructed by Agent B's triage
+    ExecutionPayloadBid {
+        bid: Box<SignedExecutionPayloadBid>,
+        market: SharedBuilderMarket,
+    },
+    /// A gloas `proposer_preferences`.
+    #[allow(dead_code)] // constructed by Agent B's triage
+    ProposerPreferences(Box<SignedProposerPreferences>),
     /// A gloas `payload_attestation_message`.
     PayloadAttestation(PayloadAttestationMessage),
 }
@@ -115,6 +127,12 @@ impl Validated {
                 subnet_id,
             } => gossip::attestation::stateful_checks(store, attestation, *subnet_id),
             Self::Envelope(envelope) => gossip::envelope::stateful_checks(store, envelope),
+            Self::ExecutionPayloadBid { bid, market } => {
+                gossip::execution_payload_bid::stateful_checks(store, market, bid)
+            }
+            Self::ProposerPreferences(preferences) => {
+                gossip::proposer_preferences::stateful_checks(store, preferences)
+            }
             Self::PayloadAttestation(message) => {
                 gossip::payload_attestation::stateful_checks(store, message)
             }
@@ -147,6 +165,12 @@ impl Validated {
                 envelope.message.beacon_block_root,
                 envelope.message.builder_index,
             ),
+            Self::ExecutionPayloadBid { bid, .. } => {
+                server.builder_market.record_bid((**bid).clone())
+            }
+            Self::ProposerPreferences(preferences) => server
+                .builder_market
+                .record_preferences((**preferences).clone(), builder_market::wall_slot(server)),
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
@@ -267,6 +291,10 @@ impl Validated {
             Self::Aggregate { .. }
             | Self::Attestation { .. }
             | Self::Envelope(_)
+            // The SSE `execution_payload_bid` and `proposer_preferences` events
+            // hook in here once the events endpoint lands.
+            | Self::ExecutionPayloadBid { .. }
+            | Self::ProposerPreferences(_)
             | Self::PayloadAttestation(_) => {}
         }
     }
@@ -445,6 +473,9 @@ fn permits_for<'a>(
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_) => &server.attestation_validation_permits,
+        Validated::ExecutionPayloadBid { .. } | Validated::ProposerPreferences(_) => {
+            &server.builder_validation_permits
+        }
     }
 }
 

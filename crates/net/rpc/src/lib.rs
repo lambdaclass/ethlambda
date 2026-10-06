@@ -4,7 +4,8 @@ use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool, payload_attestation_pool::SharedPayloadAttestationPool,
+    attestation_pool::SharedAttestationPool, builder_market::SharedBuilderMarket,
+    payload_attestation_pool::SharedPayloadAttestationPool,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
@@ -202,6 +203,9 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// Bids, proposer preferences and known payloads: filled by the bid and
+    /// preferences endpoints and by gossip, read by block production.
+    pub builder_market: SharedBuilderMarket,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -231,6 +235,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.attestation_pool))
         .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.builder_market))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine));
@@ -443,6 +448,12 @@ pub(crate) mod test_utils {
         pub(crate) payload_attestations: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
         >,
+        pub(crate) bids: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadBid>,
+        >,
+        pub(crate) proposer_preferences: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::gloas::SignedProposerPreferences>,
+        >,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -490,6 +501,22 @@ pub(crate) mod test_utils {
             sidecars: Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.envelopes.lock().unwrap().push((*envelope, sidecars));
+            Ok(())
+        }
+
+        fn publish_execution_payload_bid(
+            &self,
+            bid: ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadBid,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.bids.lock().unwrap().push(bid);
+            Ok(())
+        }
+
+        fn publish_proposer_preferences(
+            &self,
+            preferences: ethlambda_types::beacon::containers::gloas::SignedProposerPreferences,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.proposer_preferences.lock().unwrap().push(preferences);
             Ok(())
         }
 

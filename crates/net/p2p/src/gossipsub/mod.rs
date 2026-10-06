@@ -2,6 +2,8 @@ mod encoding;
 mod handler;
 mod messages;
 
+#[allow(unused_imports)] // used by Agent B's publish functions
+pub(crate) use encoding::compress_message;
 pub use encoding::decompress_message;
 pub use handler::{
     handle_gossip_message, join_aggregator_subnets, leave_expired_aggregator_subnets,
