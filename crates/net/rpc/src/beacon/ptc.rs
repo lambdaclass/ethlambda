@@ -56,7 +56,7 @@ use tracing::{debug, warn};
 use crate::{
     CustodyColumns,
     beacon::{
-        ApiError,
+        ApiError, decode_list,
         validator::{head, require_execution_client, require_validated},
     },
     shared::content::{Encoding, ssz_response, with_consensus_version},
@@ -394,8 +394,9 @@ async fn post_pool_payload_attestations(
     if let Err(err) = require_gloas_or_absent(&headers) {
         return err.into_response();
     }
-    let Ok(messages) = serde_json::from_slice::<Vec<PayloadAttestationMessage>>(&body) else {
-        return ApiError::BadRequest("invalid request body").into_response();
+    let messages = match decode_list::<PayloadAttestationMessage>(&headers, &body) {
+        Ok(messages) => messages,
+        Err(err) => return err.into_response(),
     };
 
     let now_ms = std::time::SystemTime::now()
@@ -1121,6 +1122,46 @@ mod tests {
         )
         .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Lighthouse and prysm submit their payload votes as SSZ.
+    #[tokio::test]
+    async fn votes_are_accepted_as_ssz_and_other_content_types_are_a_415() {
+        use libssz::SszEncode as _;
+        let state = gloas_state();
+        let state_epoch = compute_epoch_at_slot(state.slot());
+        let member = window_index(state_epoch, state_epoch, 0);
+        let (store, root) = store_with_head(state.clone(), gloas_config(), 0);
+        let message = vote(&state, root, member, true);
+
+        let pool = SharedPayloadAttestationPool::default();
+        let network = Arc::new(RecordingNetwork::default());
+        let ssz_request = Request::post("/eth/v1/beacon/pool/payload_attestations")
+            .header("content-type", "application/octet-stream")
+            .header("eth-consensus-version", "gloas")
+            .body(Body::from(vec![message.clone()].to_ssz()))
+            .unwrap();
+        let reply = send(
+            store.clone(),
+            pool.clone(),
+            network.clone(),
+            Vec::new(),
+            Default::default(),
+            ssz_request,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(*network.payload_attestations.lock().unwrap(), vec![message]);
+
+        let reply = request(
+            store,
+            Request::post("/eth/v1/beacon/pool/payload_attestations")
+                .header("content-type", "text/plain")
+                .body(Body::from("[]"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
 
     #[tokio::test]
