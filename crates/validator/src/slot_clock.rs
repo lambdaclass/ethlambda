@@ -152,6 +152,29 @@ impl SlotClock {
         self.offset_into(slot, bps)
     }
 
+    /// When the sync committee message for `slot` is signed.
+    ///
+    /// The fork of `slot` picks the offset, as it does for attestations:
+    /// gloas moves it earlier.
+    pub fn sync_message_time(&self, slot: Slot) -> SystemTime {
+        let bps = if self.is_gloas(slot) {
+            self.config.sync_message_due_bps_gloas
+        } else {
+            self.config.sync_message_due_bps
+        };
+        self.offset_into(slot, bps)
+    }
+
+    /// When a sync committee aggregator publishes its contribution for `slot`.
+    pub fn contribution_time(&self, slot: Slot) -> SystemTime {
+        let bps = if self.is_gloas(slot) {
+            self.config.contribution_due_bps_gloas
+        } else {
+            self.config.contribution_due_bps
+        };
+        self.offset_into(slot, bps)
+    }
+
     /// `bps` basis points of the way into `slot`.
     ///
     /// The specification's own `get_slot_component_duration_ms`, which is
@@ -225,6 +248,33 @@ impl SlotClock {
         self.payload_attestation_time(slot)
             .duration_since(now)
             .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the sync committee message for `slot`, or zero
+    /// once that instant has passed.
+    pub fn until_sync_message(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.sync_message_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the contribution for `slot`, or zero once
+    /// that instant has passed.
+    pub fn until_contribution(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.contribution_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the first of `slot`'s duties that does not
+    /// wait on another: the attestation or the sync committee message.
+    ///
+    /// What the loop sleeps between a slot's proposal and the rest of its
+    /// duties. Sleeping on the attestation alone would hold a sync message
+    /// back when the network moves it earlier (gloas does).
+    pub fn until_first_slot_duty(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.until_attestation(slot, now)
+            .min(self.until_sync_message(slot, now))
     }
 
     /// The next slot to serve, given the last one served, and how long until
@@ -585,6 +635,68 @@ mod tests {
         assert_eq!(
             ms(clock.aggregation_time(first_gloas), first_gloas),
             Duration::from_millis(6_000)
+        );
+    }
+
+    #[test]
+    fn the_sync_offsets_follow_the_fork_of_the_slot() {
+        let config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 2);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let last_fulu = 2 * SLOTS_PER_EPOCH - 1;
+        let first_gloas = 2 * SLOTS_PER_EPOCH;
+        let ms =
+            |t: SystemTime, slot: u64| t.duration_since(clock.start_of(slot)).expect("after start");
+
+        assert_eq!(
+            ms(clock.sync_message_time(last_fulu), last_fulu),
+            Duration::from_millis(3_999)
+        );
+        assert_eq!(
+            ms(clock.contribution_time(last_fulu), last_fulu),
+            Duration::from_millis(8_000)
+        );
+        assert_eq!(
+            ms(clock.sync_message_time(first_gloas), first_gloas),
+            Duration::from_millis(3_000)
+        );
+        assert_eq!(
+            ms(clock.contribution_time(first_gloas), first_gloas),
+            Duration::from_millis(6_000)
+        );
+    }
+
+    #[test]
+    fn the_wait_until_the_sync_message_is_the_rest_of_the_offset() {
+        let clock = clock();
+        let now = at(5 * SECONDS_PER_SLOT + 1);
+        assert_eq!(
+            clock.until_sync_message(5, now),
+            Duration::from_millis(2_999)
+        );
+        assert_eq!(
+            clock.until_contribution(5, now),
+            Duration::from_millis(6_999)
+        );
+        assert_eq!(
+            clock.until_sync_message(5, at(5 * SECONDS_PER_SLOT + 9)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn the_first_slot_duty_is_the_earlier_of_attestation_and_sync_message() {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Gloas, 100);
+        config.sync_message_due_bps = 2_000;
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let start = clock.start_of(5);
+        assert_eq!(
+            clock.until_first_slot_duty(5, start),
+            Duration::from_millis(2_400),
+            "the sync message is due before the attestation"
+        );
+        assert_eq!(
+            clock.until_first_slot_duty(5, start + Duration::from_secs(10)),
+            Duration::ZERO
         );
     }
 
