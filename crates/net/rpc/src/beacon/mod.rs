@@ -26,6 +26,7 @@ pub(crate) mod pool;
 pub(crate) mod proposal;
 pub(crate) mod ptc;
 pub(crate) mod states;
+pub(crate) mod sync_committee;
 pub(crate) mod validator;
 #[cfg(test)]
 mod validator_client_tests;
@@ -118,6 +119,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(proposal::routes())
         .merge(gloas_proposal::routes())
         .merge(ptc::routes())
+        .merge(sync_committee::routes())
 }
 
 #[cfg(test)]

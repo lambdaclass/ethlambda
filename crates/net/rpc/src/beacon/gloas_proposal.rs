@@ -46,7 +46,7 @@ use ethlambda_engine::{
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool,
-    block_production::advance_to_slot,
+    block_production::{advance_to_slot, empty_sync_aggregate, verified_sync_aggregate},
     bls,
     fork_choice::{
         get_head_node, gloas_verify_data_column_sidecar,
@@ -63,6 +63,7 @@ use ethlambda_state_transition::beacon::{
     },
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::gloas::verify_execution_payload_envelope_signature,
+    sync_committee_pool::SharedSyncCommitteePool,
 };
 use ethlambda_storage::Store;
 use ethlambda_types::{
@@ -71,6 +72,7 @@ use ethlambda_types::{
         constants,
         containers::{
             self, BeaconState, DataColumnSidecar,
+            altair::SyncAggregate,
             deneb::Blob,
             gloas::{
                 BeaconBlock, ExecutionPayloadEnvelope, ExecutionRequests,
@@ -244,6 +246,7 @@ async fn post_produce_block(
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(pool): Extension<SharedAttestationPool>,
     Extension(ptc_pool): Extension<SharedPayloadAttestationPool>,
+    Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
@@ -291,6 +294,7 @@ async fn post_produce_block(
         &engine,
         &pool,
         &ptc_pool,
+        &sync_pool,
         &fee_recipients,
         &custody,
         slot,
@@ -405,6 +409,7 @@ async fn produce(
     engine: &EngineClient,
     pool: &SharedAttestationPool,
     ptc_pool: &SharedPayloadAttestationPool,
+    sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     custody: &NodeCustodyColumns,
     slot: Slot,
@@ -440,6 +445,12 @@ async fn produce(
         .lock()
         .expect("payload attestation pool lock poisoned")
         .messages_for(slot.saturating_sub(1), prepared.head_root);
+    // What the committee signed at the previous slot over this block's parent;
+    // `assemble` verifies it against the block's own pre-state.
+    let sync_candidate = sync_pool
+        .lock()
+        .expect("sync committee pool lock poisoned")
+        .sync_aggregate(slot.saturating_sub(1), prepared.head_root);
     let config = store.config();
     let assembled = {
         let built = built.clone();
@@ -451,6 +462,7 @@ async fn produce(
                 execution_requests,
                 candidates,
                 messages,
+                sync_candidate,
                 randao_reveal,
                 graffiti,
             )
@@ -631,6 +643,7 @@ fn assemble(
     execution_requests: ExecutionRequests,
     candidates: Vec<containers::electra::Attestation>,
     messages: Vec<containers::gloas::PayloadAttestationMessage>,
+    sync_candidate: Option<SyncAggregate>,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<GloasProduced, ApiError> {
@@ -645,9 +658,15 @@ fn assemble(
     let payload_attestations =
         pack_payload_attestations(&state, head_root, head_slot, messages, config);
     let commitments = built.blobs_bundle.commitments;
-    let inputs = |attestations, payload_attestations| GloasBlockInputs {
-        sync_aggregate: ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(
-        ),
+    // Verified exactly as `process_sync_aggregate` will check it, against the
+    // state the block is built on; a candidate that fails becomes the empty
+    // aggregate rather than a block the chain would refuse.
+    let sync_aggregate = sync_candidate.map_or_else(empty_sync_aggregate, |candidate| {
+        verified_sync_aggregate(&state, candidate)
+    });
+    let has_sync_aggregate = sync_aggregate != empty_sync_aggregate();
+    let inputs = |attestations, payload_attestations, sync_aggregate| GloasBlockInputs {
+        sync_aggregate,
         randao_reveal,
         graffiti,
         attestations,
@@ -658,14 +677,16 @@ fn assemble(
         execution_requests: execution_requests.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
-    match assemble_gloas_block(&state, inputs(attestations, payload_attestations), config) {
+    let attempt = inputs(attestations, payload_attestations, sync_aggregate);
+    match assemble_gloas_block(&state, attempt, config) {
         Ok(produced) => Ok(produced),
-        // The packers check every operation's signature against this state, so
-        // this should not happen; but a block without them still earns the
-        // proposal, and one that fails to build earns nothing.
-        Err(err) if operations > 0 => {
+        // The packers check every operation's signature against this state, and
+        // the sync aggregate was verified above, so this should not happen; but
+        // a block without them still earns the proposal, and one that fails to build earns nothing.
+        Err(err) if operations > 0 || has_sync_aggregate => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
-            assemble_gloas_block(&state, inputs(Vec::new(), Vec::new()), config)
+            let bare = inputs(Vec::new(), Vec::new(), empty_sync_aggregate());
+            assemble_gloas_block(&state, bare, config)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -924,6 +945,7 @@ mod tests {
             .with_state(store)
             .layer(Extension(engine))
             .layer(Extension(SharedAttestationPool::default()))
+            .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(NodeCustodyColumns::default()))
@@ -1120,6 +1142,89 @@ mod tests {
             &config(),
         )
         .unwrap()
+    }
+
+    /// A sync aggregate of committee `positions` signing `root` under the
+    /// state's own domain for slot `state.slot - 1`, the check
+    /// `process_sync_aggregate` holds a block's aggregate to.
+    fn sync_aggregate_over(state: &BeaconState, root: H256, positions: &[usize]) -> SyncAggregate {
+        use ethlambda_state_transition::beacon::helpers::test_state::sign_for;
+        let previous_slot = state.slot() - 1;
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_SYNC_COMMITTEE,
+            Some(compute_epoch_at_slot(previous_slot)),
+        );
+        let signing_root = compute_signing_root(root, domain);
+        let (committee, _) = state.sync_committees().unwrap();
+        let mut aggregate = empty_sync_aggregate();
+        let mut signatures = Vec::new();
+        for &position in positions {
+            let pubkey = committee.pubkeys[position];
+            let index = (0..64)
+                .find(|&index| state.validator(index).unwrap().pubkey == pubkey)
+                .expect("the committee is drawn from the registry");
+            signatures.push(sign_for(index as usize, signing_root));
+            aggregate.sync_committee_bits.set(position, true).unwrap();
+        }
+        aggregate.sync_committee_signature = bls::aggregate(&signatures).unwrap();
+        aggregate
+    }
+
+    /// `assemble` over the fixture's build state with `candidate` pooled.
+    fn assembled_with(state: &BeaconState, candidate: Option<SyncAggregate>) -> GloasProduced {
+        use ethlambda_state_transition::beacon::gloas_block_production::test_support::{
+            payload_for, randao_reveal,
+        };
+        let requests = ExecutionRequests::default();
+        let inputs = gloas_payload_inputs(state, true, &requests, &config()).unwrap();
+        let built = BuiltGloasPayload {
+            execution_payload: payload_for(&inputs),
+            block_value: Default::default(),
+            blobs_bundle: Default::default(),
+            execution_requests: Vec::new(),
+        };
+        let prepared = Prepared {
+            state: state.clone(),
+            inputs,
+            proposer: get_beacon_proposer_index(state).unwrap(),
+            head_root: H256::repeat_byte(5),
+            head_slot: state.slot() - 1,
+            parent_requests: requests.clone(),
+        };
+        assemble(
+            &config(),
+            prepared,
+            built,
+            requests,
+            Vec::new(),
+            Vec::new(),
+            candidate,
+            randao_reveal(state),
+            Bytes32::ZERO,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pooled_sync_aggregate_is_included_and_a_wrong_one_becomes_the_empty_aggregate() {
+        use ethlambda_state_transition::beacon::{
+            gloas_block_production::test_support::state_to_build_on,
+            helpers::accessors::get_block_root_at_slot,
+        };
+        let state = state_to_build_on();
+        let parent_root = get_block_root_at_slot(&state, state.slot() - 1).unwrap();
+
+        let good = sync_aggregate_over(&state, parent_root, &[0, 1, 2]);
+        let produced = assembled_with(&state, Some(good.clone()));
+        assert_eq!(produced.block.body.sync_aggregate, good);
+
+        let wrong = sync_aggregate_over(&state, H256::repeat_byte(1), &[0, 1, 2]);
+        let produced = assembled_with(&state, Some(wrong));
+        assert_eq!(produced.block.body.sync_aggregate, empty_sync_aggregate());
+
+        let produced = assembled_with(&state, None);
+        assert_eq!(produced.block.body.sync_aggregate, empty_sync_aggregate());
     }
 
     fn signed_envelope(

@@ -252,6 +252,10 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
 | `GET` | `/eth/v2/validator/aggregate_attestation` | JSON | The pooled votes for a data root and committee, aggregated |
 | `POST` | `/eth/v2/validator/aggregate_and_proofs` | *(status only)* | Validate and gossip `SignedAggregateAndProof`s |
+| `POST` | `/eth/v1/beacon/pool/sync_committees` | *(status only)* | Validate, pool and gossip `SyncCommitteeMessage`s |
+| `GET` | `/eth/v1/validator/sync_committee_contribution` | JSON | The pooled messages for `(slot, subcommittee_index, beacon_block_root)`, aggregated |
+| `POST` | `/eth/v1/validator/contribution_and_proofs` | *(status only)* | Validate, pool and gossip `SignedContributionAndProof`s |
+| `POST` | `/eth/v1/validator/sync_committee_subscriptions` | *(status only)* | Join sync committee subnets until an epoch |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned self-built gloas block, with its envelope and blobs when asked (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
@@ -280,9 +284,8 @@ the chain actor writes, so no request waits on the actor.
   state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
   gets every seat it holds, since the committee is drawn with replacement; one
   with no seat is left out. An unknown index is a `400`, and the endpoint is a
-  `503` while the node is syncing. This node serves no sync committee message
-  or contribution endpoint yet, so a validator client that gets duties here
-  cannot publish what they ask for.
+  `503` while the node is syncing. What a duty asks for is served by the four
+  sync committee endpoints in [Sync committee](#sync-committee) below.
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
@@ -348,8 +351,9 @@ the chain actor writes, so no request waits on the actor.
   is packed only if its target root is the advanced state's own block root for
   that epoch and its aggregate signature verifies against that state, so an
   aggregate made on another branch cannot fail the whole block. The body also
-  votes the state's own `eth1_data`, and carries an empty sync aggregate and no
-  slashings, exits or credential changes. The state root comes from running
+  votes the state's own `eth1_data`, and carries the sync aggregate described
+  under [Sync committee](#sync-committee) (empty when nothing verifiable is
+  pooled) and no slashings, exits or credential changes. The state root comes from running
   the block through `process_block`. The answer is fulu `BlockContents`, with
   `Eth-Execution-Payload-Blinded: false`; there is no builder flow. It is a
   **`503`** without a configured execution client, or when the payload carries
@@ -437,6 +441,58 @@ commitments and cell proofs; any failure is a `400`. A success is `200` once the
 envelope and all `NUMBER_OF_COLUMNS` gloas data column sidecars are handed to
 P2P, which gossips them together. A node that does not subscribe to a column's
 subnet publishes through gossipsub fanout.
+
+### Sync committee
+
+All four endpoints are JSON only (beacon-APIs lists no SSZ body for them), and
+read integers quoted or bare. All share one `SharedSyncCommitteePool`, which
+P2P fills from accepted gossip as well. None of it reaches the chain actor:
+sync committee votes have no fork-choice effect.
+
+- **`POST /eth/v1/beacon/pool/sync_committees`** takes a JSON array of
+  `SyncCommitteeMessage`s and needs no `Eth-Consensus-Version`. Each is
+  checked against the head state with the rules `sync_committee_{subnet_id}`
+  gossip applies (the current slot; the validator holds a seat in the
+  committee its slot names, which is the next committee at a period's last
+  slot; the signature), then pooled once per seat and published on every
+  distinct subnet its seats sit on. One BLS verification per message, on a
+  blocking thread. Not gated on syncing, like `pool/attestations`. A refused
+  message comes back in an `IndexedErrorMessage` (`400`) as
+  `{outcome}: {reason}` with its position, and the rest still go out. A body
+  that is not a list of messages is a `400` with no `failures`; a dead network
+  actor is a per-item failure.
+- **`GET /eth/v1/validator/sync_committee_contribution?slot=&subcommittee_index=&beacon_block_root=`**
+  answers `{data: SyncCommitteeContribution}` (no `version`): the best pooled
+  contribution for the key, extended by every pooled direct message at a
+  position it does not cover. `404` when the pool holds nothing for it, `400`
+  when `subcommittee_index` is not below `SYNC_COMMITTEE_SUBNET_COUNT`, and
+  `503` while the node is syncing or when the block is optimistic or unknown
+  (an aggregator must not sign over a root this node cannot vouch for).
+- **`POST /eth/v1/validator/contribution_and_proofs`** takes a JSON array of
+  `SignedContributionAndProof`s. Each passes the checks
+  `sync_committee_contribution_and_proof` gossip applies (current slot,
+  subcommittee in range, a participant, the selection proof selects the
+  aggregator, aggregator is in the subcommittee, and the selection proof,
+  envelope and aggregate signatures) against a fresh seen cache, since P2P's
+  holds what peers sent. A valid one is pooled and gossiped; the failure shape
+  is the same as above.
+- **`POST /eth/v1/validator/sync_committee_subscriptions`** takes
+  `[{validator_index, sync_committee_indices, until_epoch}]`. The subnet of a
+  position is `index / SYNC_SUBCOMMITTEE_SIZE`; entries are grouped by subnet
+  keeping the latest `until_epoch` (exclusive), clamped to the end of the next
+  sync committee period, and handed to P2P, which joins the subnets
+  immediately. A position at or above `SYNC_COMMITTEE_SIZE` is a `400` and
+  nothing is joined. A node forgets these on restart, so a client repeats them
+  every epoch. `sync_committee_selections` (distributed validators) is not
+  served; beacon-APIs lets a node leave it out.
+
+**Block production.** The block at slot `N` packs only what is pooled for
+`(N - 1, parent_root)`: per subcommittee the best contribution, extended by
+pooled direct messages at uncovered positions. The result is verified exactly
+as `process_sync_aggregate` will check it, against the state the block is built
+on; if it fails, or nothing is pooled, the block carries the empty aggregate.
+Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
+"retry without operations" fallback of each also drops the sync aggregate.
 
 ### Payload timeliness committee
 
