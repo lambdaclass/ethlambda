@@ -667,7 +667,8 @@ async fn a_failed_local_build_falls_back_to_a_viable_bid() {
 #[tokio::test]
 async fn bids_that_do_not_fit_the_slot_are_left_to_the_local_payload() {
     // Each would win on value (factor MAX against a 1 wei local build).
-    let mismatches: [(&str, fn(&mut ExecutionPayloadBid)); 3] = [
+    type Change = fn(&mut ExecutionPayloadBid);
+    let mismatches: [(&str, Change); 3] = [
         ("randao", |bid| bid.prev_randao = H256::repeat_byte(0x99)),
         ("parent hash", |bid| {
             bid.parent_block_hash = H256::repeat_byte(0x98)
@@ -1007,7 +1008,11 @@ async fn valid_preferences_are_cached_and_published_once() {
     let app = world.app(None);
     let signed = world.preferences(address(0xaa), 30_000_000);
 
-    let reply = send(&app, preferences_request(&[signed.clone()], Some("gloas"))).await;
+    let reply = send(
+        &app,
+        preferences_request(std::slice::from_ref(&signed), Some("gloas")),
+    )
+    .await;
 
     assert_eq!(
         reply.status,
@@ -1152,7 +1157,11 @@ async fn preferences_with_a_bad_header_type_body_or_count_are_refused() {
     let signed = world.preferences(address(0xaa), 30_000_000);
 
     for version in ["electra", "nonsense"] {
-        let reply = send(&app, preferences_request(&[signed.clone()], Some(version))).await;
+        let reply = send(
+            &app,
+            preferences_request(std::slice::from_ref(&signed), Some(version)),
+        )
+        .await;
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{version}");
     }
     let plain = Request::post("/eth/v1/validator/proposer_preferences")
