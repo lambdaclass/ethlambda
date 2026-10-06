@@ -50,7 +50,7 @@ use crate::beacon::constants::DOMAIN_BEACON_ATTESTER;
 use crate::beacon::containers::electra::SingleAttestation;
 use crate::beacon::fork_choice::Store;
 use crate::beacon::helpers::accessors::CommitteeCacheExt;
-use crate::beacon::helpers::accessors::get_domain;
+use crate::beacon::helpers::accessors::get_domain_from_schedule;
 use crate::beacon::helpers::misc::{
     compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
 };
@@ -172,12 +172,14 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
     };
 
     let target_epoch = data.target.epoch;
+    let config = store.config();
 
-    // The pubkey-only signature, before any committee derivation.
+    // The pubkey-only signature, before any committee derivation, under the
+    // schedule's domain: the voted block's state may predate the target's fork.
     let Ok(attester) = state.validator(attestation.attester_index) else {
         return Outcome::Reject(RejectReason::UnknownValidator);
     };
-    let domain = get_domain(&state, DOMAIN_BEACON_ATTESTER, Some(target_epoch));
+    let domain = get_domain_from_schedule(&config, &state, DOMAIN_BEACON_ATTESTER, target_epoch);
     let signing_root = compute_signing_root(data.hash_tree_root(), domain);
     if !bls::verify(&attester.pubkey, signing_root, &attestation.signature) {
         return Outcome::Reject(RejectReason::BadSignature);
@@ -191,7 +193,6 @@ pub fn stateful_checks(store: &Store, attestation: &SingleAttestation, subnet_id
         return Outcome::Reject(RejectReason::CommitteeIndex);
     }
     // [New in Electra:EIP7549] [REJECT] The correct subnet.
-    let config = store.config();
     let expected_subnet = compute_subnet_for_attestation(
         epoch_committees.committees_per_slot(),
         data.slot,
@@ -414,6 +415,92 @@ mod tests {
         assert_eq!(
             stateful_checks(&store, &attestation, 0),
             Outcome::Ignore(IgnoreReason::UnknownBlock)
+        );
+    }
+
+    /// A vote cast in a fork's first slot while that slot has no block: the
+    /// voted block, and so the state it is checked against, is still the
+    /// previous fork's, but the vote is signed under the new fork's version.
+    #[test]
+    fn a_vote_across_a_fork_boundary_verifies_under_the_new_forks_version() {
+        use crate::beacon::containers::shared::{AttestationData, Checkpoint, Fork};
+        use crate::beacon::containers::{SignedBeaconBlock, electra};
+        use crate::beacon::fork::ForkName;
+        use crate::beacon::gossip::test_support::store_with_config;
+        use crate::beacon::helpers::accessors::get_beacon_committee;
+        use crate::beacon::helpers::misc::compute_domain;
+        use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+
+        let fulu_epoch = 2;
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Electra, 0)
+            .with_fork_epoch(ForkName::Fulu, fulu_epoch);
+        let mut state = with_signing_validators_at(ForkName::Electra, 64);
+        let pre_fork_slot = compute_start_slot_at_epoch(fulu_epoch) - 1;
+        *state.slot_mut() = pre_fork_slot;
+        *state.fork_mut() = Fork {
+            previous_version: config.deneb_fork_version,
+            current_version: config.electra_fork_version,
+            epoch: 0,
+        };
+        state.apply_pending_mutations();
+
+        let mut store = store_with_config(0, config.clone());
+        let block_root = Root::repeat_byte(7);
+        let block = SignedBeaconBlock::Electra(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot: pre_fork_slot,
+                proposer_index: 0,
+                parent_root: Root::ZERO,
+                state_root: Root::ZERO,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        });
+        store
+            .insert_pending_block(block_root, block)
+            .expect("insert the voted block");
+        store.cache_state(
+            CacheKey::BlockState(block_root),
+            std::sync::Arc::new(state.clone()),
+        );
+
+        let slot = compute_start_slot_at_epoch(fulu_epoch);
+        let committee = get_beacon_committee(&state, slot, 0).expect("committee");
+        let attester_index = committee[0];
+        let data = AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: block_root,
+            source: Default::default(),
+            target: Checkpoint {
+                epoch: fulu_epoch,
+                root: block_root,
+            },
+        };
+        let domain = compute_domain(
+            DOMAIN_BEACON_ATTESTER,
+            config.fulu_fork_version,
+            state.genesis_validators_root(),
+        );
+        let attestation = SingleAttestation {
+            committee_index: 0,
+            attester_index,
+            signature: sign_for(
+                attester_index as usize,
+                compute_signing_root(data.hash_tree_root(), domain),
+            ),
+            data,
+        };
+        let committees_per_slot = store
+            .committee_cache()
+            .committees(&state, fulu_epoch)
+            .committees_per_slot();
+        let subnet_id = compute_subnet_for_attestation(committees_per_slot, slot, 0, &config);
+
+        assert_eq!(
+            stateful_checks(&store, &attestation, subnet_id),
+            Outcome::Accept
         );
     }
 }
