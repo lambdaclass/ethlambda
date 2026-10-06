@@ -91,9 +91,13 @@ struct SyncDuty {
 ///
 /// Answered from the head state: its `current_sync_committee` for an epoch in
 /// the head's own sync committee period, its `next_sync_committee` for the
-/// period after, which is as far ahead as the Beacon API allows. An earlier
-/// period is refused rather than answered from a historical state, since a
-/// validator client only ever asks about the current and next period.
+/// period after. The upper bound is the wall clock's, as the Beacon API
+/// defines it: the period after the current one. When the head lags the clock
+/// across a period boundary, the later period is read from a copy of the head
+/// advanced (through fork choice's checkpoint-state cache, on a blocking
+/// thread) to the first epoch of the period before it. An earlier period than
+/// the head's is refused rather than answered from a historical state, since
+/// a validator client only ever asks about the current and next period.
 ///
 /// A requested validator that holds no seat is left out of `data`. The
 /// answer is `503` while the node is syncing: the head state's committees are
@@ -107,10 +111,8 @@ async fn post_sync_duties(
     if sync_status.get() == SyncStatus::Syncing {
         return ApiError::ServiceUnavailable("the node is syncing").into_response();
     }
-    match sync_duties(&store, &epoch, &indices) {
-        Ok(body) => crate::json_response(body),
-        Err(err) => err.into_response(),
-    }
+    let computed = tokio::task::spawn_blocking(move || sync_duties(&store, &epoch, &indices)).await;
+    duties_response(computed)
 }
 
 fn sync_duties(
@@ -124,21 +126,40 @@ fn sync_duties(
         .map(|index| index.parse::<ValidatorIndex>())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
-    let (head_root, state) = head(store)?;
+    let (head_root, head_state) = head(store)?;
 
+    // Bounded by the wall clock, as the Beacon API defines it: up to the
+    // period after the current one. The head lags the clock at a period
+    // boundary whose block is late or missing, so the head's own period only
+    // sets the bound when it is ahead of the clock.
+    let head_period = compute_sync_committee_period(compute_epoch_at_slot(head_state.slot()));
+    let clock_period =
+        compute_sync_committee_period(compute_epoch_at_slot(crate::beacon::node::wall_slot(store)));
+    let requested_period = compute_sync_committee_period(epoch);
+    if requested_period < head_period || requested_period > head_period.max(clock_period) + 1 {
+        return Err(ApiError::BadRequest(
+            "epoch is outside the sync committee periods the node serves duties for",
+        ));
+    }
+
+    // The head state answers its own period and the next. A later one (the
+    // head is behind the clock) is read from a copy of the head advanced to
+    // the first epoch of the period before it, whose `next_sync_committee` is
+    // the requested one.
+    let state = if requested_period <= head_period + 1 {
+        head_state
+    } else {
+        let first_epoch = (requested_period - 1) * preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        state_for_epoch(store, head_root, first_epoch)?
+    };
+    let state_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
     let (current, next) = state
         .sync_committees()
         .map_err(|_| ApiError::BadRequest("sync committees start at altair"))?;
-    let head_period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
-    let requested_period = compute_sync_committee_period(epoch);
-    let committee = if requested_period == head_period {
+    let committee = if requested_period == state_period {
         current
-    } else if requested_period == head_period + 1 {
-        next
     } else {
-        return Err(ApiError::BadRequest(
-            "epoch is not in the head state's current or next sync committee period",
-        ));
+        next
     };
 
     // One pass over the committee rather than one per requested validator:
@@ -1769,13 +1790,125 @@ mod tests {
             );
         }
 
+        /// `post_sync` on a store whose wall clock is at `clock_slot`.
+        async fn post_sync_at_clock(
+            state: BeaconState,
+            clock_slot: u64,
+            epoch: u64,
+            indices: &[&str],
+        ) -> (StatusCode, serde_json::Value) {
+            let (store, _root) = crate::test_utils::beacon_store_at_clock(state, clock_slot);
+            let request = Request::post(format!("/eth/v1/validator/duties/sync/{epoch}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!(indices).to_string()))
+                .unwrap();
+            let app = routes()
+                .with_state(store)
+                .layer(Extension(SyncStatusController::default()));
+            let response = app.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or_default())
+        }
+
+        /// Adapted from a head-relative bound: the wall clock now decides how
+        /// far a request may reach, so the clock is pinned to the head's
+        /// period, where the period after next is past it.
         #[tokio::test]
         async fn the_period_after_next_is_a_400() {
             let state = state_with_committees();
             let period = compute_sync_committee_period(compute_epoch_at_slot(state.slot()));
             let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * (period + 2);
-            let (status, _) = post_sync(state, epoch, &["3"], Default::default()).await;
+            let clock_slot = state.slot();
+            let (status, _) = post_sync_at_clock(state, clock_slot, epoch, &["3"]).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        /// The head in the last epoch of period 0, the wall clock at the first
+        /// slot of period 1: a validator client asks for period 2, which only
+        /// a state advanced across the boundary knows.
+        fn lagging_head() -> (BeaconState, u64) {
+            let mut state = state_with_committees();
+            let BeaconState::Fulu(fulu) = &mut state else {
+                unreachable!("built as fulu")
+            };
+            fulu.slot = (preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD - 1) * preset::SLOTS_PER_EPOCH;
+            let boundary_slot =
+                compute_start_slot_at_epoch(preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD);
+            (state, boundary_slot)
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_serves_the_period_after_from_an_advanced_state() {
+            let (state, boundary_slot) = lagging_head();
+            let mut advanced = state.clone();
+            ethlambda_state_transition::beacon::stf::process_slots(
+                &mut advanced,
+                boundary_slot,
+                &ethlambda_types::beacon::config::Config::mainnet(),
+            )
+            .unwrap();
+            let (_, expected) = advanced.sync_committees().unwrap();
+            let (_, head_next) = state.sync_committees().unwrap();
+            assert_ne!(
+                expected.pubkeys, head_next.pubkeys,
+                "the boundary must rotate the committee, or the test proves nothing"
+            );
+
+            let period_after = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 2;
+            let indices: Vec<String> = (0..COUNT as u64).map(|i| i.to_string()).collect();
+            let refs: Vec<&str> = indices.iter().map(String::as_str).collect();
+            let (status, json) =
+                post_sync_at_clock(state.clone(), boundary_slot, period_after, &refs).await;
+            assert_eq!(status, StatusCode::OK);
+
+            let mut want = Vec::new();
+            for index in 0..COUNT as u64 {
+                let pubkey = advanced.validator(index).unwrap().pubkey;
+                let held: Vec<String> = expected
+                    .pubkeys
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, key)| **key == pubkey)
+                    .map(|(seat, _)| seat.to_string())
+                    .collect();
+                if !held.is_empty() {
+                    want.push((index.to_string(), held));
+                }
+            }
+            assert!(!want.is_empty());
+            let got: Vec<(String, Vec<String>)> = json["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|duty| {
+                    let seats = duty["validator_sync_committee_indices"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|seat| seat.as_str().unwrap().to_string())
+                        .collect();
+                    (duty["validator_index"].as_str().unwrap().to_string(), seats)
+                })
+                .collect();
+            assert_eq!(got, want);
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_still_refuses_two_periods_past_the_clock() {
+            let (state, boundary_slot) = lagging_head();
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD * 3;
+            let (status, _) = post_sync_at_clock(state, boundary_slot, epoch, &["3"]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        async fn a_head_lagging_a_period_boundary_serves_the_clocks_own_period_from_the_head() {
+            let (state, boundary_slot) = lagging_head();
+            let epoch = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+            let (status, json) = post_sync_at_clock(state, boundary_slot, epoch, &["9"]).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(json["data"][0]["validator_index"], "9");
         }
 
         /// An earlier period would need a historical state, which a validator
