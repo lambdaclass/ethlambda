@@ -463,12 +463,28 @@ pub(crate) mod test_utils {
     /// phase0 one whatever `state`'s fork: these endpoints read the state and
     /// the block's root and slot, never the block's body.
     pub(crate) fn beacon_store_at(state: BeaconState) -> (Store, H256) {
+        beacon_store_with_genesis(state, 1_606_824_023)
+    }
+
+    /// [`beacon_store_at`] on a wall clock whose slot `clock_slot` began a
+    /// second ago, for endpoints that bound a request by the current epoch.
+    pub(crate) fn beacon_store_at_clock(state: BeaconState, clock_slot: u64) -> (Store, H256) {
+        let slot_secs = Config::mainnet().slot_duration_ms / 1000;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_secs();
+        let genesis = now_secs - clock_slot * slot_secs - 1;
+        beacon_store_with_genesis(state, genesis)
+    }
+
+    fn beacon_store_with_genesis(state: BeaconState, genesis_time: u64) -> (Store, H256) {
         let slot = state.slot();
         let block = phase0_beacon_block(slot, H256::ZERO);
         let root = block.message_hash_tree_root();
         let mut store = Store::init_beacon(
             Arc::new(InMemoryBackend::default()),
-            1_606_824_023,
+            genesis_time,
             Config::mainnet(),
             root,
             Checkpoint { root, slot },
