@@ -82,13 +82,11 @@ pub(crate) enum Validated {
     Envelope(Box<SignedExecutionPayloadEnvelope>),
     /// A gloas `execution_payload_bid`. Carries the market because
     /// `stateful_checks` receives only the store.
-    #[allow(dead_code)] // constructed by Agent B's triage
     ExecutionPayloadBid {
         bid: Box<SignedExecutionPayloadBid>,
         market: SharedBuilderMarket,
     },
     /// A gloas `proposer_preferences`.
-    #[allow(dead_code)] // constructed by Agent B's triage
     ProposerPreferences(Box<SignedProposerPreferences>),
     /// A gloas `payload_attestation_message`.
     PayloadAttestation(PayloadAttestationMessage),
@@ -161,10 +159,20 @@ impl Validated {
             },
             Self::Aggregate { aggregate, .. } => server.seen_aggregates.record(aggregate),
             Self::Attestation { attestation, .. } => server.seen_attestations.record(attestation),
-            Self::Envelope(envelope) => server.seen_envelopes.record(
-                envelope.message.beacon_block_root,
-                envelope.message.builder_index,
-            ),
+            Self::Envelope(envelope) => {
+                let recorded = server.seen_envelopes.record(
+                    envelope.message.beacon_block_root,
+                    envelope.message.builder_index,
+                );
+                if recorded {
+                    // A bid's parent payload is known once its envelope passed
+                    // gossip; the builder market judges bids against this.
+                    server
+                        .builder_market
+                        .record_execution_payload(&envelope.message);
+                }
+                recorded
+            }
             Self::ExecutionPayloadBid { bid, .. } => {
                 server.builder_market.record_bid((**bid).clone())
             }
@@ -1178,6 +1186,201 @@ mod tests {
             attestation_permits_before
         );
         assert!(server.attestation_validation_permits.try_acquire().is_ok());
+    }
+
+    fn bid(slot: u64, builder_index: u64, value: u64) -> SignedExecutionPayloadBid {
+        let mut bid = SignedExecutionPayloadBid::default();
+        bid.message.slot = slot;
+        bid.message.builder_index = builder_index;
+        bid.message.value = value;
+        bid
+    }
+
+    fn preferences(proposal_slot: u64, validator: u64) -> SignedProposerPreferences {
+        let mut preferences = SignedProposerPreferences::default();
+        preferences.message.proposal_slot = proposal_slot;
+        preferences.message.validator_index = validator;
+        preferences
+    }
+
+    fn bid_object(server: &P2PServer, bid: SignedExecutionPayloadBid) -> Validated {
+        Validated::ExecutionPayloadBid {
+            bid: Box::new(bid),
+            market: server.builder_market.clone(),
+        }
+    }
+
+    /// Needs the real market (Agent A): its stub never records.
+    #[tokio::test]
+    async fn the_first_accept_for_a_bid_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = bid_object(&server, bid(5, 3, 10));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        // Anything but an accept records nothing.
+        let other = bid_object(&server, bid(5, 4, 10));
+        assert_eq!(
+            settle(
+                &mut server,
+                Outcome::Ignore(IgnoreReason::StateUnavailable),
+                &other
+            ),
+            Outcome::Ignore(IgnoreReason::StateUnavailable)
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &other),
+            Outcome::Accept
+        );
+    }
+
+    /// An accepted bid is pooled in the market the API and `produceBlockV4`
+    /// read. Needs the real market (Agent A).
+    #[tokio::test]
+    async fn an_accepted_bid_is_pooled_in_the_shared_market() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let signed = bid(5, 3, 10);
+        let object = bid_object(&server, signed.clone());
+        assert!(!server.builder_market.contains_bid(&signed));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert!(server.builder_market.contains_bid(&signed));
+        assert_eq!(
+            server.builder_market.bids_for(
+                5,
+                signed.message.parent_block_root,
+                signed.message.parent_block_hash
+            ),
+            vec![signed]
+        );
+    }
+
+    /// Needs the real market (Agent A).
+    #[tokio::test]
+    async fn the_first_accept_for_a_preferences_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::ProposerPreferences(Box::new(preferences(40, 5)));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        assert!(server.builder_market.preferences(40, Root::ZERO).is_some());
+    }
+
+    /// Neither builder market type has a consumer on the chain actor, on any
+    /// outcome.
+    #[tokio::test]
+    async fn bids_and_preferences_never_reach_the_chain_actor() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let chain = Arc::new(RecordingChain(AtomicBool::new(false)));
+        server.blockchain = Some(chain.clone());
+
+        for outcome in [
+            Outcome::Accept,
+            Outcome::Queue(QueueReason::BlockUnknown),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+        ] {
+            bid_object(&server, bid(5, 3, 10)).forward(&server, Instant::now(), outcome);
+            Validated::ProposerPreferences(Box::new(preferences(40, 5))).forward(
+                &server,
+                Instant::now(),
+                outcome,
+            );
+        }
+
+        assert!(!chain.0.load(Ordering::SeqCst));
+    }
+
+    /// Bids and preferences draw from a pool of their own, so a burst of them
+    /// cannot starve blocks, columns or attestations, and the reverse.
+    #[tokio::test]
+    async fn the_builder_permit_pool_is_independent_of_the_others() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let bid = bid_object(&server, bid(5, 3, 10));
+        let preferences = Validated::ProposerPreferences(Box::new(preferences(40, 5)));
+        for object in [&bid, &preferences] {
+            assert!(Arc::ptr_eq(
+                permits_for(&server, object),
+                &server.builder_validation_permits
+            ));
+        }
+
+        let gossip_before = server.gossip_validation_permits.available_permits();
+        let attestation_before = server.attestation_validation_permits.available_permits();
+        let mut held = Vec::new();
+        while let Ok(permit) = server
+            .builder_validation_permits
+            .clone()
+            .try_acquire_owned()
+        {
+            held.push(permit);
+        }
+        // Exhausted: a bid's stateful checks would answer `Ignore(Overloaded)`.
+        assert_eq!(server.builder_validation_permits.available_permits(), 0);
+        assert!(
+            permits_for(&server, &bid)
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        assert_eq!(
+            server.gossip_validation_permits.available_permits(),
+            gossip_before
+        );
+        assert_eq!(
+            server.attestation_validation_permits.available_permits(),
+            attestation_before
+        );
+    }
+
+    /// An accepted envelope is a known payload for bid validation. Needs the
+    /// real market (Agent A).
+    #[tokio::test]
+    async fn an_accepted_envelope_becomes_a_known_payload() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let signed = envelope(1, 3);
+        let hash = signed.message.payload.block_hash;
+        assert!(server.builder_market.known_payload(hash).is_none());
+        let object = Validated::Envelope(Box::new(signed));
+
+        // A queued envelope has not been judged, so it is not known.
+        settle(
+            &mut server,
+            Outcome::Queue(QueueReason::BlockUnknown),
+            &object,
+        );
+        assert!(server.builder_market.known_payload(hash).is_none());
+
+        settle(&mut server, Outcome::Accept, &object);
+        assert!(server.builder_market.known_payload(hash).is_some());
+    }
+
+    /// The node's own envelope is known too, since gossip never echoes it.
+    /// Needs the real market (Agent A).
+    #[tokio::test]
+    async fn a_published_envelope_becomes_a_known_payload() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let signed = envelope(2, 3);
+        let hash = signed.message.payload.block_hash;
+        assert!(server.builder_market.known_payload(hash).is_none());
+
+        crate::gossipsub::publish_execution_payload_envelope(&mut server, signed, Vec::new()).await;
+
+        assert!(server.builder_market.known_payload(hash).is_some());
     }
 
     #[test]

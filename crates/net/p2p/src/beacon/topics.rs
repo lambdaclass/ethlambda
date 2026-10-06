@@ -1,6 +1,8 @@
 //! The gossipsub topics `ethlambda beacon` subscribes to.
 //!
-//! Seven global topics, plus two families this node's own node id selects a
+//! Seven global topics (four more from gloas: the execution payload envelope,
+//! the payload attestation message, the builder bid and the proposer
+//! preferences), plus two families this node's own node id selects a
 //! narrow slice of: the data column subnets it custodies, and the
 //! `SUBNETS_PER_NODE` attestation subnets it backbones.
 //!
@@ -58,7 +60,12 @@ pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
 
 /// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
 /// the gloas digest on and never under an earlier one.
-pub const GLOAS_TOPIC_KINDS: [&str; 2] = [EXECUTION_PAYLOAD, PAYLOAD_ATTESTATION_MESSAGE];
+pub const GLOAS_TOPIC_KINDS: [&str; 4] = [
+    EXECUTION_PAYLOAD,
+    PAYLOAD_ATTESTATION_MESSAGE,
+    EXECUTION_PAYLOAD_BID,
+    PROPOSER_PREFERENCES,
+];
 
 /// Every topic kind this node subscribes to at every fork, in the order they
 /// are subscribed. [`GLOAS_TOPIC_KINDS`] follow from gloas.
@@ -348,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn gloas_adds_the_envelope_and_payload_attestation_topics() {
+    fn gloas_adds_the_envelope_vote_bid_and_preferences_topics() {
         let fork_topics = |fork| {
             BeaconTopics::for_fork(fork, MAINNET, &[], &[])
                 .topics
@@ -358,8 +365,17 @@ mod tests {
         };
         let gloas = fork_topics(ForkName::Gloas);
         let fulu = fork_topics(ForkName::Fulu);
-        assert_eq!(gloas.len(), SUBSCRIBED_TOPIC_KINDS.len() + 2);
+        assert_eq!(gloas.len(), SUBSCRIBED_TOPIC_KINDS.len() + 4);
         assert_eq!(fulu.len(), SUBSCRIBED_TOPIC_KINDS.len());
+        assert_eq!(
+            GLOAS_TOPIC_KINDS,
+            [
+                "execution_payload",
+                "payload_attestation_message",
+                "execution_payload_bid",
+                "proposer_preferences",
+            ]
+        );
         for kind in GLOAS_TOPIC_KINDS {
             let name = topic_name(MAINNET, kind);
             assert!(gloas.contains(&name), "gloas lacks {name}");
