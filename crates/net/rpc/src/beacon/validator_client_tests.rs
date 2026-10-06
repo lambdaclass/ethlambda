@@ -12,13 +12,15 @@ use std::sync::Arc;
 use axum::Extension;
 use ethlambda_blockchain::{SyncStatusController, metrics::SyncStatus};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_state_transition::beacon::helpers::{
     accessors::get_domain,
     fulu::initialize_proposer_lookahead,
     test_state::{sign_for, with_signing_validators_at},
 };
 use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
+use ethlambda_state_transition::beacon::{
+    attestation_pool::SharedAttestationPool, sync_committee_pool::SharedSyncCommitteePool,
+};
 use ethlambda_types::{
     beacon::{
         constants::DOMAIN_BEACON_ATTESTER,
@@ -108,6 +110,7 @@ async fn spawn_server(
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
         .layer(Extension(SharedAttestationPool::default()))
+        .layer(Extension(SharedSyncCommitteePool::default()))
         .layer(Extension(payload_pool.clone()))
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
