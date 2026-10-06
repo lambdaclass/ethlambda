@@ -28,9 +28,11 @@ pub mod topics;
 pub mod transition;
 pub mod verdict;
 
+use std::collections::BTreeMap;
+
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::fork::ForkName;
-use ethlambda_types::beacon::primitives::{ForkDigest, Root, Slot};
+use ethlambda_types::beacon::primitives::{Epoch, ForkDigest, Root, Slot};
 
 /// Everything the beacon wire needs after startup has computed it.
 ///
@@ -77,6 +79,13 @@ pub struct BeaconWire {
     /// Read by `build_metadata` for the `attnets` bitfield it advertises, so
     /// what this node claims to serve is what it actually subscribed to.
     pub attestation_subnets: Vec<u64>,
+    /// The sync committee subnets joined on a validator client's request, each
+    /// with the epoch (exclusive) it is needed until.
+    ///
+    /// Held here rather than on `P2PServer` because it is *advertised*:
+    /// `build_metadata` derives `syncnets` from its keys. Never in the ENR,
+    /// which cannot be replaced at runtime.
+    pub sync_committee_subnets: BTreeMap<u64, Epoch>,
 }
 
 impl BeaconWire {
@@ -108,6 +117,14 @@ impl BeaconWire {
     pub fn holds_digest(&self, digest: ForkDigest) -> bool {
         self.held_topics()
             .any(|topics| topics.fork_digest == digest)
+    }
+
+    /// The slot the wall clock is in, from this chain's genesis and slot
+    /// duration. Zero before genesis.
+    pub fn wall_slot(&self) -> Slot {
+        let genesis_ms = self.genesis_time.saturating_mul(1000);
+        ethlambda_types::time::unix_now_ms().saturating_sub(genesis_ms)
+            / self.config.slot_duration_ms.max(1)
     }
 
     /// The two values the codec needs to put a block chunk on or off the wire.

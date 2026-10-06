@@ -237,6 +237,22 @@ pub fn decode_payload_attestation_message(
     gloas::PayloadAttestationMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
+/// Decode a `sync_committee_{subnet_id}` payload. Altair on and the same
+/// container at every fork, so no fork lookup is needed.
+pub fn decode_sync_committee_message(
+    bytes: &[u8],
+) -> Result<altair::SyncCommitteeMessage, DecodeError> {
+    altair::SyncCommitteeMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
+/// Decode a `sync_committee_contribution_and_proof` payload. Fork-invariant,
+/// like [`decode_sync_committee_message`].
+pub fn decode_sync_committee_contribution(
+    bytes: &[u8],
+) -> Result<altair::SignedContributionAndProof, DecodeError> {
+    altair::SignedContributionAndProof::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
 /// Decode a `beacon_aggregate_and_proof` payload, at the fork its slot names.
 pub fn decode_aggregate_and_proof(
     config: &Config,
@@ -660,6 +676,56 @@ mod tests {
         assert_eq!(decode_execution_payload_envelope(&bytes), Ok(envelope));
         assert!(decode_execution_payload_envelope(&bytes[..bytes.len() - 1]).is_err());
         assert!(decode_execution_payload_envelope(&[0xff; 3]).is_err());
+    }
+
+    #[test]
+    fn a_sync_committee_message_round_trips() {
+        let message = altair::SyncCommitteeMessage {
+            slot: slot_of(10),
+            beacon_block_root: Root::repeat_byte(4),
+            validator_index: 321,
+            signature: Default::default(),
+        };
+        let bytes = message.to_ssz();
+        assert_eq!(decode_sync_committee_message(&bytes), Ok(message));
+        for length in 0..bytes.len() {
+            assert_eq!(
+                decode_sync_committee_message(&bytes[..length]),
+                Err(DecodeError::Ssz)
+            );
+        }
+        assert_eq!(
+            decode_sync_committee_message(&[0xff; 3]),
+            Err(DecodeError::Ssz)
+        );
+    }
+
+    #[test]
+    fn a_sync_committee_contribution_round_trips() {
+        let signed = altair::SignedContributionAndProof {
+            message: altair::ContributionAndProof {
+                aggregator_index: 7,
+                contribution: altair::SyncCommitteeContribution {
+                    slot: slot_of(10),
+                    beacon_block_root: Root::repeat_byte(5),
+                    subcommittee_index: 2,
+                    aggregation_bits: Default::default(),
+                    signature: Default::default(),
+                },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        };
+        let bytes = signed.to_ssz();
+        assert_eq!(decode_sync_committee_contribution(&bytes), Ok(signed));
+        assert_eq!(
+            decode_sync_committee_contribution(&bytes[..bytes.len() - 1]),
+            Err(DecodeError::Ssz)
+        );
+        assert_eq!(
+            decode_sync_committee_contribution(&[0xff; 3]),
+            Err(DecodeError::Ssz)
+        );
     }
 
     #[test]
