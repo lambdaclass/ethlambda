@@ -6,7 +6,10 @@ use ethlambda_types::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
-        gloas::{PayloadAttestationMessage, SignedExecutionPayloadEnvelope},
+        gloas::{
+            PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
+            SignedProposerPreferences,
+        },
     },
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
@@ -444,6 +447,19 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         envelope: Box<SignedExecutionPayloadEnvelope>,
         sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
+    /// Gossip a signed execution payload bid on `execution_payload_bid`. The
+    /// caller ran the gossip rules and recorded it in the shared
+    /// `BuilderMarket` (seen keys and pool), so the p2p actor only publishes.
+    fn publish_execution_payload_bid(
+        &self,
+        bid: SignedExecutionPayloadBid,
+    ) -> Result<(), ActorError>;
+    /// Gossip signed proposer preferences on `proposer_preferences`, under the
+    /// proposal slot's digest. Validated and cached by the caller.
+    fn publish_proposer_preferences(
+        &self,
+        preferences: SignedProposerPreferences,
     ) -> Result<(), ActorError>;
     /// Gossip a payload timeliness committee member's vote on
     /// `payload_attestation_message` and hand it to the chain actor. Checked by

@@ -266,12 +266,15 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `POST` | `/eth/v1/validator/contribution_and_proofs` | *(status only)* | Validate, pool and gossip `SignedContributionAndProof`s |
 | `POST` | `/eth/v1/validator/sync_committee_subscriptions` | *(status only)* | Join sync committee subnets until an epoch |
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned fulu block built on the head (`produceBlockV3`) |
-| `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned self-built gloas block, with its envelope and blobs when asked (`produceBlockV4`) |
+| `POST` | `/eth/v4/validator/blocks/{slot}` | SSZ or JSON | An unsigned gloas block: self-built, with its envelope and blobs when asked, or on a pooled builder bid (`produceBlockV4`) |
 | `GET` | `/eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}` | SSZ or JSON | The unsigned envelope `produceBlockV4` built (gloas) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed fulu or gloas block (`publishBlockV2`; JSON or SSZ body) |
 | `POST` | `/eth/v1/beacon/execution_payload_envelopes` | *(status only)* | Gossip a signed envelope and its data columns (gloas; JSON or SSZ body) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Record each validator's fee recipient for block production (see below) |
 | `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
+| `POST` | `/eth/v1/beacon/execution_payload_bids` | *(status only)* | Validate, pool and gossip a builder's `SignedExecutionPayloadBid` (gloas; JSON or SSZ body) |
+| `POST` | `/eth/v1/validator/proposer_preferences` | *(status only)* | Validate, cache and gossip `SignedProposerPreferences` (gloas; JSON or SSZ body) |
+| `POST` | `/eth/v1/beacon/states/{state_id}/builders` | JSON | The gloas builder registry, filtered by id and status |
 
 ### Validator endpoints
 
@@ -474,10 +477,12 @@ the chain actor writes, so no request waits on the actor.
 ### Gloas block production
 
 A gloas proposer signs two things on their own, the block and the envelope that
-reveals its payload, and this node serves both halves. It only builds for
-itself: no builder bid is taken from gossip or a builder API, and no
-`SignedProposerPreferences` is read (see
-[Spec Deviations](./spec_deviations.md#self-build-only)).
+reveals its payload, and this node serves both halves for a block it builds
+itself. It may instead build on a builder's bid it holds in the shared builder
+market (see [Builder market](#builder-market)); then the builder, not this node,
+reveals the payload. The builder-API path (a bid requested from a builder's URL
+through the `BuilderConfig`'s `builders` entries) is not implemented: those
+entries are decoded and not consulted.
 
 **`POST /eth/v4/validator/blocks/{slot}`** (`produceBlockV4`):
 
@@ -485,24 +490,43 @@ itself: no builder bid is taken from gossip or a builder API, and no
 |---|---|
 | Query | `randao_reveal` (required), `include_payload` (required, `true` or `false`), `graffiti` (optional, 32-byte hex), `skip_randao_verification` (accepted, ignored) |
 | Request headers | `Eth-Consensus-Version` is optional but must be `gloas` when present. `Accept: application/octet-stream` for SSZ, JSON otherwise |
-| Body | A `BuilderConfig` (`min_bid`, `builder_boost_factor`, `builders`), JSON, or SSZ with `Content-Type: application/octet-stream`. It is decoded and otherwise ignored; a missing or undecodable one is a `400` |
-| `200` SSZ | With `include_payload=true`, `BlockContents` (`block`, `execution_payload_envelope`, `kzg_proofs`, `blobs`); with `false`, the bare `gloas::BeaconBlock` |
+| Body | A `BuilderConfig`, JSON or SSZ with `Content-Type: application/octet-stream`: `min_bid` and `builder_boost_factor` (govern the bids seen over p2p) and `builders` (up to 64 entries, decoded and ignored). Integers are quoted strings, as everywhere in the Beacon API. A missing or undecodable one is a `400` |
+| `200` SSZ | Self-built with `include_payload=true`: `BlockContents` (`block`, `execution_payload_envelope`, `kzg_proofs`, `blobs`). Otherwise, and for every bid-won block, the bare `gloas::BeaconBlock` |
 | `200` JSON | `{version: "gloas", consensus_block_value, execution_payload_value, execution_payload_included, data}`, where `data` is the same container as the SSZ body |
-| Response headers | `Eth-Consensus-Version: gloas`, `Eth-Execution-Payload-Included` (`true` or `false`), `Eth-Execution-Payload-Value` (wei, decimal), `Eth-Consensus-Block-Value` (always `0`: no builder comparison happens on this node) |
+| Response headers | `Eth-Consensus-Version: gloas`, `Eth-Execution-Payload-Included` (`true` or `false`; always `false` for a bid-won block), `Eth-Execution-Payload-Value` (wei, decimal; a bid's value times `10^9` when it won), `Eth-Consensus-Block-Value` (always `0`: the comparison is of execution payload values only). No `Eth-Builder-Url`: that is for builder-API bids |
 | `400` | A slot the schedule does not place at gloas, a missing or malformed query, a wrong `Eth-Consensus-Version`, a bad body, a slot not after the head block, or a `randao_reveal` that does not verify against the slot's proposer. The slot check precedes the execution-client check, so it is a `400` on any node |
-| `503` | No execution client configured, the execution client did not start or return a build, or the node is building on a FULL parent whose envelope it does not hold |
+| `503` | No execution client and no viable pooled bid for the slot, the execution client did not start or return a build (and no bid took its place), the node is building on a FULL parent whose envelope it does not hold, or the winning bid failed to build and there is no local payload to fall back on |
 
 The node advances the head state to the slot, and decides which parent payload
 to build on with `should_build_on_full` over the payload status fork choice
 recorded for the head. It then asks its execution client to build
-(`forkchoiceUpdatedV4` with `PayloadAttributesV4`, then `getPayloadV6`) with the
-proposer's `prepare_beacon_proposer` fee recipient. The body packs the
+(`forkchoiceUpdatedV4` with `PayloadAttributesV4`, then `getPayloadV6`). The
+fee recipient and gas target of that build come from the proposer's signed
+`ProposerPreferences` for the slot when the market holds them under the slot's
+dependent root, else from `prepare_beacon_proposer` (fee recipient, or the zero
+address with a warning) and the parent bid's gas limit. The body packs the
 attestation pool's best aggregates and the payload attestation pool's votes for
 the parent block (an aggregate that does not verify against the advanced state
 is dropped, since one bad operation fails the block), and the state root comes
 from running the block through `process_block`. The bid is a zero-value
 self-build bid read off the built payload. What was built is cached by `(slot,
 block root)`, for the current and previous slot only.
+
+**Choosing between the local payload and a bid.** The bids considered are the
+market's for `(slot, head root, parent payload hash)` with this build's
+`prev_randao`, packable into a block on the advanced state, and paying the
+preferences' fee recipient when those are held. The best bid is the highest
+whose `value + execution_payment` is at least the config's `min_bid`. It wins iff
+`builder_boost_factor * bid_gwei > floor(local_value_wei / 10^7)` (the
+specification's weighting of the local value by 100, in integers), and the local
+payload wins a tie, so a factor of `0` prefers it and `2^64 - 1` prefers the bid.
+An engine that sets `shouldOverrideBuilder` keeps the local payload. Without a
+local payload (no engine, or the build failed) the best bid is taken whatever its
+weight. A bid-won block caches nothing, so the envelope `GET` below answers
+`404` for it, and `POST /eth/v1/beacon/execution_payload_envelopes` refuses a
+proposer-signed (self-build) envelope for it because the builder index differs
+from the bid's. The builder's own envelope goes through that endpoint as for any
+block.
 
 **`GET /eth/v1/validator/execution_payload_envelopes/{slot}/{beacon_block_root}`**
 serves the cached unsigned envelope, for a client that asked for the block with
@@ -588,6 +612,47 @@ as `process_sync_aggregate` will check it, against the state the block is built
 on; if it fails, or nothing is pooled, the block carries the empty aggregate.
 Fulu (`blocks/{slot}`) and gloas (`produceBlockV4`) do the same, and the
 "retry without operations" fallback of each also drops the sync aggregate.
+
+### Builder market
+
+Three endpoints serve the gloas builder market. Bids and preferences go through
+the same rules as the `execution_payload_bid` and `proposer_preferences` gossip
+topics and are held in one shared builder market that p2p also fills, so a
+message accepted from either side is seen by both.
+
+- **`POST /eth/v1/beacon/execution_payload_bids`** takes one
+  `SignedExecutionPayloadBid`, as JSON (or no `Content-Type`) or SSZ
+  (`application/octet-stream`, at most 196,932 bytes; any other type is `415`).
+  `Eth-Consensus-Version` is optional and must be `gloas` when present. An
+  identical bid already pooled is `200` and is not republished. Otherwise the
+  gossip rules run (a known parent, the preferences for the slot and their fee
+  recipient and gas limit, a known parent payload, an active funded builder, the
+  signature), and a bid that is anything but accepted is a `400` whose message is
+  `"{outcome}: {reason}"` (for instance `reject: bad_signature` or `ignore:
+  preferences_unseen`), because there is no status for a valid bid this node
+  would not relay. An accepted bid is pooled for block production and gossiped.
+  `500` when the network actor is down.
+- **`POST /eth/v1/validator/proposer_preferences`** takes a list of
+  `SignedProposerPreferences` (at most `(MIN_SEED_LOOKAHEAD + 1) *
+  SLOTS_PER_EPOCH`, 64 on mainnet), as a JSON array or an SSZ list.
+  `Eth-Consensus-Version` is optional and may be `fulu` or `gloas`, since a
+  validator client submits during the epoch before the fork. Each entry runs the
+  gossip rules in order; an entry already cached, identical, succeeds without a
+  republish. Accepted entries are cached (the first per `(proposal slot,
+  dependent root)` wins) and gossiped. If any entry fails the answer is `400`
+  `{code, message, failures: [{index, message}]}` and the others were still
+  published. The endpoint is not gated on the sync status. A node whose
+  dependent block is unknown answers `ignore: unknown_block` for that entry.
+- **`POST /eth/v1/beacon/states/{state_id}/builders`** takes an optional JSON
+  body `{ids?: [index | 0x pubkey], statuses?: [pending | active | exited]}`
+  (empty or absent selects everything) and answers `{execution_optimistic,
+  finalized, data: [{index, status, builder}]}` in registry order, integers
+  quoted. An id naming no builder is omitted. `exited` is a set
+  `withdrawable_epoch`, else `active` per `is_active_builder`, else `pending`.
+  `400` for a malformed body, id or status, or a pre-gloas state; `404` for an
+  unknown state. The Beacon API defines no `GET` form.
+
+`POST /eth/v1/validator/builder_preferences` is not served (`404`).
 
 ### Payload timeliness committee
 

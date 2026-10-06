@@ -2834,6 +2834,10 @@ pub(crate) mod tests {
             )),
             payload_attestation_pool: Default::default(),
             sync_committee_pool: Default::default(),
+            builder_market: Default::default(),
+            builder_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::BUILDER_VALIDATION_PERMITS,
+            )),
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }

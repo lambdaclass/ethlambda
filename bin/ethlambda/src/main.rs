@@ -698,6 +698,11 @@ async fn run_node(options: Options) -> eyre::Result<()> {
     let sync_committee_pool =
         ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool::default();
 
+    // Bids, proposer preferences and known payloads: filled by gossip and the
+    // Beacon API's bid and preferences endpoints, read by block production.
+    let builder_market =
+        ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default();
+
     // `P2P::spawn` starts the discv5 server from this and owns the resulting
     // handle.
     let p2p = P2P::spawn(
@@ -707,6 +712,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         discovery,
         payload_attestation_pool.clone(),
         sync_committee_pool.clone(),
+        builder_market.clone(),
     )
     .await
     .wrap_err("failed to start discv5 discovery")?;
@@ -748,6 +754,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     p2p: rpc_p2p,
                     payload_attestation_pool: payload_attestation_pool.clone(),
                     sync_committee_pool: sync_committee_pool.clone(),
+                    builder_market: builder_market.clone(),
                     custody_columns: rpc_custody_columns,
                     engine: rpc_engine,
                     events: rpc_events,

@@ -341,9 +341,12 @@ actual_slot = finalized_slot + 1 + relative_index
     until its `until_epoch`, under every held digest) and advertised in MetaData
     `syncnets`, never the ENR. Messages and contributions validate in p2p on their own
     permit pool (`gossip::sync_committee`, `p2p/src/beacon/sync_committee.rs`), and
-    accepted ones go into the shared `SyncCommitteePool`. Gloas digests add two more topics,
-    `execution_payload` and `payload_attestation_message` (`BeaconTopics::for_fork`; earlier
-    digests never carry them). Gloas has its own rules for `beacon_block`,
+    accepted ones go into the shared `SyncCommitteePool`. Gloas digests add four more topics,
+    `execution_payload`, `payload_attestation_message`, `execution_payload_bid` and
+    `proposer_preferences` (`BeaconTopics::for_fork`; earlier digests never carry them).
+    Bids and preferences are validated in p2p on their own permit pool against one shared
+    `BuilderMarket` (`state_transition::beacon::builder_market`) and never reach the chain
+    actor. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate
@@ -789,8 +792,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the parking of gloas column sidecars (they carry no signature). Fork-choice
   events are timed at arrival, not at the slot tick, and the head's payload
   status is kept with its root (`Store::head_payload_status`, recomputed after
-  a restart). The node also serves gloas validator duties, self-build only (no
-  bids, no proposer preferences; see `docs/spec_deviations.md`).
+  a restart). The node also serves gloas validator duties and the builder market:
+  it validates, pools and relays gossip bids and proposer preferences, serves
+  `POST /eth/v1/beacon/execution_payload_bids` and `/proposer_preferences` plus the
+  builder endpoints, and `produceBlockV4` weighs the best pooled p2p bid against
+  the local build per `BuilderConfig` (`min_bid`, `builder_boost_factor`; the local
+  build wins a tie). A winning bid returns the block only. The builder API (relay
+  or `builder_pubkeys` bids) is phase 2; see `docs/spec_deviations.md`.
   `state_transition/src/beacon/gloas_block_production.rs` assembles the block and
   its envelope (`gloas_payload_inputs`, `parse_gloas_execution_requests`,
   `pack_gloas_attestations`, `pack_payload_attestations`, `assemble_gloas_block`,

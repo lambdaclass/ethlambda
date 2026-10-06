@@ -11,8 +11,10 @@ pub mod attestation;
 pub mod block;
 pub mod column;
 pub mod envelope;
+pub mod execution_payload_bid;
 pub mod operations;
 pub mod payload_attestation;
+pub mod proposer_preferences;
 pub mod sync_committee;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -143,6 +145,32 @@ pub enum IgnoreReason {
     FinalizedNotAncestor,
     /// An ancestor lies outside what the state's `block_roots` can answer.
     AncestryUnknown,
+    /// A gloas bid or proposer preferences names a slot before the fork.
+    PreGloasSlot,
+    /// A bid's slot is neither the current nor the next slot.
+    NotCurrentOrNextSlot,
+    /// A bid's value does not beat the best already seen for its slot and parent.
+    NotHighestBid,
+    /// A bid or preferences name a slot beyond the proposer lookahead.
+    BeyondLookahead,
+    /// No proposer preferences are known for a bid's slot and dependent root.
+    PreferencesUnseen,
+    /// A bid's fee recipient is not the one in the proposer's preferences.
+    FeeRecipientMismatch,
+    /// A bid's parent block hash is not a known execution payload.
+    ParentPayloadUnknown,
+    /// A bid's gas limit cannot reach the preferences' target from the parent's.
+    GasLimitIncompatible,
+    /// A bid is not compatible with this node's head branch.
+    NotOnHeadBranch,
+    /// A bid's builder cannot cover its value.
+    BuilderCannotCover,
+    /// A bid's builder exits in the parent payload.
+    BuilderMayExit,
+    /// Proposer preferences arrived after their proposal slot began.
+    SlotStarted,
+    /// Proposer preferences name a dependent root no chain here can have.
+    ImpossibleDependentRoot,
     /// A gloas block builds on its parent's full payload branch, but the
     /// parent's envelope has not been seen and verified (the specification
     /// lets it be queued until it is).
@@ -186,6 +214,19 @@ impl IgnoreReason {
             Self::StateUnavailable => "state_unavailable",
             Self::FinalizedNotAncestor => "finalized_not_ancestor",
             Self::AncestryUnknown => "ancestry_unknown",
+            Self::PreGloasSlot => "pre_gloas_slot",
+            Self::NotCurrentOrNextSlot => "not_current_or_next_slot",
+            Self::NotHighestBid => "not_highest_bid",
+            Self::BeyondLookahead => "beyond_lookahead",
+            Self::PreferencesUnseen => "preferences_unseen",
+            Self::FeeRecipientMismatch => "fee_recipient_mismatch",
+            Self::ParentPayloadUnknown => "parent_payload_unknown",
+            Self::GasLimitIncompatible => "gas_limit_incompatible",
+            Self::NotOnHeadBranch => "not_on_head_branch",
+            Self::BuilderCannotCover => "builder_cannot_cover",
+            Self::BuilderMayExit => "builder_may_exit",
+            Self::SlotStarted => "slot_started",
+            Self::ImpossibleDependentRoot => "impossible_dependent_root",
             Self::ParentPayloadUnverified => "parent_payload_unverified",
             Self::PayloadEnvelopeUnseen => "payload_envelope_unseen",
             Self::PayloadOptimistic => "payload_optimistic",
@@ -246,6 +287,20 @@ pub enum RejectReason {
     AggregateSignature,
     /// The target is not the voted block's ancestor at the target epoch.
     TargetNotAncestor,
+    /// A bid promises a payment outside the bid value.
+    ExecutionPaymentNonZero,
+    /// A bid's block hash is its parent's.
+    BlockHashEqualsParent,
+    /// A bid's `prev_randao` is not the parent state's current mix.
+    PrevRandao,
+    /// A bid's builder index is not in the registry.
+    UnknownBuilder,
+    /// A bid's builder is not a payload builder.
+    NotPayloadBuilder,
+    /// A bid's builder is not active.
+    InactiveBuilder,
+    /// Preferences' dependent block is later than the shuffling's dependent slot.
+    DependentRootTooLate,
     /// A gloas block body (or its parent execution requests) carries more of
     /// an operation than its limit, or any deposit.
     OperationLimit,
@@ -312,6 +367,13 @@ impl RejectReason {
             Self::AggregatorSignature => "aggregator_signature",
             Self::AggregateSignature => "aggregate_signature",
             Self::TargetNotAncestor => "target_not_ancestor",
+            Self::ExecutionPaymentNonZero => "execution_payment_nonzero",
+            Self::BlockHashEqualsParent => "block_hash_equals_parent",
+            Self::PrevRandao => "prev_randao",
+            Self::UnknownBuilder => "unknown_builder",
+            Self::NotPayloadBuilder => "not_payload_builder",
+            Self::InactiveBuilder => "inactive_builder",
+            Self::DependentRootTooLate => "dependent_root_too_late",
             Self::OperationLimit => "operation_limit",
             Self::BidParentMismatch => "bid_parent_mismatch",
             Self::BidNotOnParentHead => "bid_not_on_parent_head",

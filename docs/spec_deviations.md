@@ -93,47 +93,154 @@ same keys, already signed.
   runs, and treat a restart as an event that needs the same care a manual key
   move would. The client warns about this at startup on every run.
 
-## Self-build only
+## Builder bids: gossip and API only (no builder API)
 
-The gloas validator duties are served for a proposer that builds its own
-payload, and for no one else.
+A gloas proposer served by this node can take a builder's bid from gossip or
+from the Beacon API, and no other way.
 
 - **The specification:** a gloas proposer may take a builder's signed bid
   (`SignedExecutionPayloadBid`, from gossip or a builder API) instead of building
-  its own payload, and publishes a `SignedProposerPreferences` so builders know
-  its fee recipient and gas limit target. `produceBlockV4` takes a
-  `BuilderConfig` (`min_bid`, `builder_boost_factor`, `builders`) to steer that
-  choice.
-- **ethlambda:** the beacon node never takes a bid, from gossip or otherwise, and
-  never builds or reads a `SignedProposerPreferences`. `produceBlockV4` decodes
-  the `BuilderConfig` body (a missing or undecodable one is a `400`, as the
-  specification requires) and ignores it, logging at debug when it names
-  builders. Every block commits to a zero-value self-build bid
-  (`BUILDER_INDEX_SELF_BUILD`, the G2 point at infinity as signature), and
-  `Eth-Consensus-Block-Value` is always `0` since there is nothing to compare.
-  The validator client signs the envelope with the proposer's own key under
-  `DOMAIN_BEACON_BUILDER`, and leaves a block that commits to anyone else's bid
-  alone.
-- **Why:** a scope decision for the first gloas duties: taking bids needs a bid
-  pool, builder payment handling and a builder-facing API, none of which this
-  node has.
-- **Consequence:** a validator run through this node never earns a builder's
-  payment, and an execution client's own block value is what
-  `Eth-Execution-Payload-Value` reports.
+  its own payload. `produceBlockV4` takes a `BuilderConfig` (`min_bid`,
+  `builder_boost_factor`, `builders`) to steer that choice.
+- **ethlambda:** bids seen on `execution_payload_bid` or posted to
+  `POST /eth/v1/beacon/execution_payload_bids` are pooled, and `produceBlockV4`
+  compares the best one with the local build under the top-level `min_bid` and
+  `builder_boost_factor`: the bid must reach `min_bid`, and wins when
+  `builder_boost_factor * bid_value > local_value / 10^7` (in Gwei against Wei,
+  so a factor of 100 is parity). The local build wins a tie, and
+  `shouldOverrideBuilder` from the execution client is honored. With no
+  execution client, or a failed local build, the best viable bid is taken.
+- **What it does not do:** the `builders` entries are decoded and ignored, so
+  no builder is asked for a bid over HTTP and no `Eth-Builder-Url` is returned.
+  Gossip bids are not filtered by `builder_pubkeys` either, since the Beacon API
+  puts that list on each entry and it governs only that entry's own bid.
+  `Eth-Consensus-Block-Value` stays `0`, because the consensus reward is not
+  computed.
+- **A bid win returns no envelope.** The block commits to the builder's bid, the
+  builder reveals the payload, and nothing is cached for
+  `GET .../execution_payload_envelopes`, so that endpoint answers `404` and
+  `Eth-Execution-Payload-Included` is `false`. The node never signs or
+  publishes an envelope for such a block, and the proposer-signed
+  self-build envelope is refused for it, since its `builder_index` differs from
+  the bid's.
+- **Why:** gossip and API bids need only a pool and the gossip rules. A builder
+  API client is a separate crate with its own failure modes and timeouts, and
+  is left for a later phase.
 
-## `target_gas_limit` is the parent bid's gas limit
+## Fee recipient and gas target come from proposer preferences, with fallbacks
 
 - **The specification:** the payload is built toward the `target_gas_limit` of
-  the proposer's `SignedProposerPreferences`, and `bid.gas_limit` must be
-  compatible with it (`is_gas_limit_target_compatible`).
-- **ethlambda:** with no preferences to read, `PayloadAttributesV4.targetGasLimit`
-  is the `gas_limit` of `latest_execution_payload_bid` of the state being built
-  on (`gloas_payload_inputs`), so the execution client holds the gas limit where
-  it is.
+  the proposer's `SignedProposerPreferences`, which also names the fee
+  recipient builders must pay, and `bid.gas_limit` must be compatible with the
+  target (`is_gas_limit_target_compatible`).
+- **ethlambda:** the self-build reads the signed preferences for
+  `(slot, dependent_root)` that name the proposer, from gossip or the Beacon API.
+  The fee recipient is theirs, else `prepare_beacon_proposer`'s, else zero with
+  a warning. The target gas limit is theirs, else the `gas_limit` of
+  `latest_execution_payload_bid` of the state being built on, so the execution
+  client holds the gas limit where it is.
 - **Equivalence:** the bid is built from the payload the execution client
   returns, so `bid.gas_limit` is whatever that payload carries and is always
-  consistent with the block. A validator that wants the limit to move cannot say
-  so through this node: it follows the previous block's.
+  consistent with the block. A proposer that wants the limit to move without
+  preferences cannot say so through this node: it follows the previous block's.
+
+## Bid and preference gossip never queues
+
+- **The specification:** several rules say the message "MAY be queued": an
+  unknown parent block, an unimported parent, an unseen dependent block.
+- **ethlambda:** every one of them is IGNORE. A bid or preferences message that
+  names a block or state this node lacks is dropped, never parked, so a burst
+  of them holds no memory and nothing is replayed later.
+- **Why:** both topics are only useful for the next slot or two, and a bid that
+  arrives after its parent was imported would be stale by the time a replay ran.
+  A proposer that missed a message builds locally.
+
+## Bid gossip judges against the recorded head and cached states
+
+- **The specification:** `validate_execution_payload_bid_gossip` reads
+  `get_head(store)`, `store.block_states[parent]` and the parent state advanced
+  with `process_slots` to the bid's slot.
+- **ethlambda:** the head node is the one the chain actor recorded
+  (`Store::head` and `head_payload_status`), with a fresh `get_head_node` walk
+  only when no status is recorded. The dependent root is read from the parent
+  state's `block_roots`, which the lookahead rule keeps in range. The parent
+  state stands in for the advanced one when the bid is in the parent's own
+  epoch, since gloas's `process_slot` touches none of `builders`,
+  `finalized_checkpoint`, `builder_pending_*`, `fork` or
+  `latest_execution_payload_bid`, which are all the later rules read. Across an
+  epoch the cached `CheckpointState` of the bid's epoch is used and filled, the
+  same entry attestation target states use. A state that is not cached is
+  IGNORE and is never rebuilt from disk.
+- **Why:** gossip verdicts are waited on by gossipsub, and the state cache holds
+  32 states, so a spec-literal read of a parent about an epoch old would miss
+  often. The head record and the equivalence above give the same verdict
+  without a replay.
+
+## Known execution payloads are gossip-accepted or self-published envelopes only
+
+- **The specification:** `seen.execution_payloads` holds a payload for every
+  envelope accepted from gossip.
+- **ethlambda:** the known payloads are the market's, a 256-entry LRU filled by
+  envelopes that passed gossip validation and by envelopes this node publishes
+  (gossip never echoes a node's own messages). They are not persisted, and an
+  envelope that was queued and verified later, or fetched by request and
+  response, does not count. After a restart bids on a pre-restart payload are
+  IGNORE until new envelopes arrive.
+- **Exception:** a pre-gloas parent's own payload counts as known, with its
+  execution payload header's gas limit, see the fork boundary entry below.
+
+## Proposer preferences are judged off cached states only
+
+- **The specification:** the lookahead is read from
+  `store.block_states[dependent_root]` advanced to the epoch before the
+  proposal's.
+- **ethlambda:** the cached head state is used when it shares the dependent root
+  and is in the epoch before the proposal's or the proposal's own (the whole
+  canonical case), else the cached `CheckpointState` of the epoch before the
+  proposal's, else IGNORE. Nothing is rebuilt from disk.
+- **Why:** a dependent block about an epoch old is usually out of the 32-state
+  cache, so reading it would IGNORE most honest preferences.
+
+## The fulu-to-gloas boundary for bids and preferences
+
+- **The specification:** says nothing about a parent that is not a gloas block.
+- **ethlambda:** a pre-gloas parent's payload counts as known, with its header's
+  `gas_limit`. A pre-gloas head's payload hashes come from its payload header,
+  and a bid is compatible with it when it builds on that head and its payload.
+  The builder-exit check is skipped for a pre-gloas parent, which carries no
+  envelope.
+- **Preference signatures** are accepted under the lookahead state's own
+  `DOMAIN_PROPOSER_PREFERENCES` domain (the specification's), the fork version of
+  the epoch before the proposal's, or the proposal epoch's. They coincide outside
+  the first epoch of a fork. Lighthouse signs with the proposal epoch's version
+  and the specification gives the earlier one, so accepting both avoids
+  rejecting an honest client's messages around the gloas upgrade.
+- **Consequence:** builders onboarded at the fork are inactive until their
+  deposit epoch is finalized, so gossip bids are rejected for the first epochs of
+  gloas and `produceBlockV4` self-builds.
+
+## Beacon API answers for bids and preferences
+
+- **An IGNORE verdict is a `400`,** the same as a REJECT, because the API has no
+  separate status for it. The message names the verdict and the reason, such as
+  `ignore: preferences_unseen`.
+- **An identical resubmission is a `200`** and is not published again.
+- **The prose and the rules disagree** on a mismatched fee recipient or gas
+  limit: the Beacon API text says the bid is rejected, while consensus-specs
+  IGNOREs it. ethlambda follows consensus-specs.
+- **`Eth-Consensus-Version` may be absent** on the bid and preferences posts. If
+  present it must name a gloas-compatible fork.
+
+## No minimum bid increment or rate limit
+
+- **The specification:** a note says implementations SHOULD guard against
+  builders spamming bids with minimal increments, for example with a minimum
+  threshold or by forwarding only the best bid at intervals.
+- **ethlambda:** neither is implemented. Spam is bounded by one bid per builder
+  per `(slot, parent_hash, parent_root)`, a strictly higher value than the best
+  seen, a funded active registered builder with a valid signature, a cap on keys
+  per slot and on bids pooled per parent, and a separate permit pool for
+  validating them. A configurable minimum increment is a follow-up.
 
 ## `skip_randao_verification` is ignored
 
