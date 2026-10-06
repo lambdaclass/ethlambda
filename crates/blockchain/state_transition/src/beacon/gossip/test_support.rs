@@ -97,3 +97,162 @@ pub(crate) fn fulu_parent(proposer: ValidatorIndex) -> BeaconState {
     state.apply_pending_mutations();
     state
 }
+
+/// The builder-market rules' shared scene: a gloas chain whose head `PARENT`
+/// (slot 32, epoch 1) is a FULL block with a funded active builder 0, the
+/// proposer preferences and parent payload gossip would have delivered, and a
+/// signed bid for slot 34 that passes every rule.
+pub(crate) mod builder_scene {
+    use ethlambda_storage::ForkCheckpoints;
+    use ethlambda_types::beacon::containers::{SignedBeaconBlock, electra, gloas};
+
+    use super::*;
+    use crate::beacon::builder_market::{BuilderMarket, test_support};
+    use crate::beacon::fork_choice::PayloadStatus;
+    use crate::beacon::gloas_block_production::test_support as gloas_support;
+    use crate::beacon::gossip::proposer_preferences::dependent_root_at;
+    use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
+    use crate::beacon::primitives::{ExecutionAddress, ExecutionBlockHash};
+
+    pub(crate) const PARENT: Root = Root::repeat_byte(0x50);
+    pub(crate) const BID_SLOT: Slot = 34;
+    pub(crate) const PARENT_GAS_LIMIT: u64 = 30_000_000;
+
+    pub(crate) fn fee_recipient() -> ExecutionAddress {
+        ExecutionAddress::repeat_byte(0x11)
+    }
+
+    /// The hash of the FULL parent's payload, which the bid builds on.
+    pub(crate) fn parent_block_hash() -> ExecutionBlockHash {
+        ExecutionBlockHash::repeat_byte(gloas_support::PARENT_BLOCK_HASH)
+    }
+
+    /// A fulu-shaped block at `slot`: the store only reads its slot and parent.
+    pub(crate) fn block_at(slot: Slot) -> SignedBeaconBlock {
+        block_with_parent(slot, Root::ZERO)
+    }
+
+    pub(crate) fn block_with_parent(slot: Slot, parent_root: Root) -> SignedBeaconBlock {
+        SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: electra::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: Root::ZERO,
+                body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// An empty store, gloas from genesis, anchored (and headed) at `PARENT`,
+    /// whose block the caller must store.
+    pub(crate) fn gloas_store() -> Store {
+        Store::init_beacon(
+            Arc::new(InMemoryBackend::new()),
+            GENESIS_TIME,
+            gloas_support::config(),
+            PARENT,
+            Checkpoint {
+                root: PARENT,
+                slot: 32,
+            },
+            32,
+        )
+    }
+
+    pub(crate) struct Scene {
+        pub store: Store,
+        pub market: BuilderMarket,
+        /// `PARENT`'s post-state.
+        pub state: BeaconState,
+        /// A signed bid that passes every rule at [`Scene::now_ms`].
+        pub bid: gloas::SignedExecutionPayloadBid,
+    }
+
+    impl Scene {
+        /// 100 ms into the bid's slot.
+        pub(crate) fn now_ms(&self) -> u64 {
+            slot_start_ms(&self.store, BID_SLOT) + 100
+        }
+
+        /// The scene's bid after `edit`, re-signed by its builder.
+        pub(crate) fn signed(
+            &self,
+            edit: impl FnOnce(&mut gloas::ExecutionPayloadBid),
+        ) -> gloas::SignedExecutionPayloadBid {
+            let mut bid = self.bid.message.clone();
+            edit(&mut bid);
+            test_support::sign_bid(&self.state, bid, self.bid.message.builder_index)
+        }
+    }
+
+    /// The scene with `edit` applied to the parent's state before it is stored,
+    /// and the prerequisites of a passing bid recorded in the market.
+    pub(crate) fn scene_with(edit: impl FnOnce(&mut gloas::BeaconState)) -> Scene {
+        let mut state = test_support::gloas_state_with_builder(0, 100_000_000_000, 0);
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("built as gloas")
+        };
+        edit(inner);
+        state.apply_pending_mutations();
+        let mut store = gloas_store();
+        store
+            .insert_pending_block(PARENT, block_at(state.slot()))
+            .expect("insert the parent");
+        store
+            .insert_state(PARENT, state.clone())
+            .expect("insert the parent state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(PARENT))
+            .expect("move the head");
+        store.set_head_payload_status(PARENT, PayloadStatus::Full);
+
+        let dependent_root = dependent_root_at(&state, PARENT, BID_SLOT).expect("in the window");
+        let proposer = crate::beacon::precheck::fixed_proposer(&state, BID_SLOT).expect("window");
+        let market = BuilderMarket::default();
+        let preferences = test_support::sign_preferences(
+            &state,
+            gloas::ProposerPreferences {
+                dependent_root,
+                proposal_slot: BID_SLOT,
+                validator_index: proposer,
+                fee_recipient: fee_recipient(),
+                target_gas_limit: PARENT_GAS_LIMIT,
+            },
+        );
+        assert!(market.record_preferences(preferences, BID_SLOT - 1));
+        market.record_execution_payload(&test_support::envelope_with_gas_limit(
+            parent_block_hash(),
+            PARENT_GAS_LIMIT,
+            PARENT,
+            vec![],
+        ));
+        let bid = test_support::sign_bid(
+            &state,
+            gloas::ExecutionPayloadBid {
+                parent_block_hash: parent_block_hash(),
+                parent_block_root: PARENT,
+                block_hash: ExecutionBlockHash::repeat_byte(0x33),
+                prev_randao: get_randao_mix(&state, get_current_epoch(&state)),
+                fee_recipient: fee_recipient(),
+                gas_limit: PARENT_GAS_LIMIT,
+                builder_index: 0,
+                slot: BID_SLOT,
+                value: 1,
+                ..Default::default()
+            },
+            0,
+        );
+        Scene {
+            store,
+            market,
+            state,
+            bid,
+        }
+    }
+
+    pub(crate) fn scene() -> Scene {
+        scene_with(|_| {})
+    }
+}
