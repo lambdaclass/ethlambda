@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    fork_choice::{checkpoint_state, get_current_store_epoch},
+    fork_choice::checkpoint_state,
     gossip::attestation::compute_subnet_for_attestation,
     helpers::accessors::{CommitteeCacheExt as _, get_block_root_at_slot},
     helpers::altair::compute_sync_committee_period,
@@ -211,7 +211,10 @@ fn liveness(store: &Store, epoch: &str, indices: &[String]) -> Result<serde_json
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ApiError::BadRequest("invalid validator index"))?;
 
-    let current = get_current_store_epoch(store, &store.config());
+    // The wall clock, not the store's tick-driven one: the latter still reads
+    // the previous epoch until the slot tick runs, so a client asking for the
+    // next epoch right after a boundary would be refused.
+    let current = compute_epoch_at_slot(crate::beacon::node::wall_slot(store));
     if epoch + 1 < current || epoch > current + 1 {
         return Err(ApiError::BadRequest(
             "epoch is not the previous, current or next epoch",
@@ -1147,18 +1150,26 @@ mod tests {
     mod liveness {
         use super::*;
 
-        /// The epoch every test's state and store clock sit in: far enough
-        /// from genesis that the epoch two before it exists.
-        const EPOCH: u64 = 5;
+        /// The wall clock's epoch. The store's mainnet genesis puts it far from
+        /// zero, so the epochs around it exist.
+        fn wall_epoch() -> u64 {
+            compute_epoch_at_slot(crate::beacon::node::wall_slot(
+                &beacon_store_at(fulu_state()).0,
+            ))
+        }
 
-        /// A fulu state at [`EPOCH`]'s first slot in which validator 2 is
+        /// A fulu state at the wall epoch's first slot in which validator 2 is
         /// credited for this epoch and validator 3 for the previous one.
         fn credited_state() -> BeaconState {
+            credited_state_at(wall_epoch())
+        }
+
+        fn credited_state_at(epoch: u64) -> BeaconState {
             let mut state = fulu_state();
             let BeaconState::Fulu(fulu) = &mut state else {
                 unreachable!("built as fulu")
             };
-            fulu.slot = compute_start_slot_at_epoch(EPOCH);
+            fulu.slot = compute_start_slot_at_epoch(epoch);
             fulu.current_epoch_participation[2] = 0b001;
             fulu.previous_epoch_participation[3] = 0b111;
             state
@@ -1211,7 +1222,7 @@ mod tests {
         async fn a_participation_flag_makes_a_validator_live() {
             let store = store_for(credited_state());
             let (status, json) =
-                post_liveness(store.clone(), EPOCH, &["2", "3"], Default::default()).await;
+                post_liveness(store.clone(), wall_epoch(), &["2", "3"], Default::default()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 answers(&json),
@@ -1219,7 +1230,8 @@ mod tests {
                 "2 is credited for this epoch, 3 only for the previous one"
             );
 
-            let (_, json) = post_liveness(store, EPOCH - 1, &["2", "3"], Default::default()).await;
+            let (_, json) =
+                post_liveness(store, wall_epoch() - 1, &["2", "3"], Default::default()).await;
             assert_eq!(answers(&json), [("2".into(), false), ("3".into(), true)]);
         }
 
@@ -1228,9 +1240,9 @@ mod tests {
         #[tokio::test]
         async fn an_observed_validator_is_live_without_a_flag() {
             let store = store_for(credited_state());
-            store.observed_liveness().record(EPOCH, 9);
+            store.observed_liveness().record(wall_epoch(), 9);
             let (status, json) =
-                post_liveness(store, EPOCH, &["9", "10"], Default::default()).await;
+                post_liveness(store, wall_epoch(), &["9", "10"], Default::default()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(answers(&json), [("9".into(), true), ("10".into(), false)]);
         }
@@ -1238,17 +1250,38 @@ mod tests {
         #[tokio::test]
         async fn the_next_epoch_is_answered_and_nobody_is_live_in_it() {
             let store = store_for(credited_state());
-            let (status, json) = post_liveness(store, EPOCH + 1, &["2"], Default::default()).await;
+            let (status, json) =
+                post_liveness(store, wall_epoch() + 1, &["2"], Default::default()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(answers(&json), [("2".into(), false)]);
         }
 
         #[tokio::test]
         async fn epochs_outside_the_window_are_a_400() {
-            for epoch in [EPOCH - 2, EPOCH + 2] {
+            for epoch in [wall_epoch() - 2, wall_epoch() + 2] {
                 let store = store_for(credited_state());
                 let (status, _) = post_liveness(store, epoch, &["2"], Default::default()).await;
                 assert_eq!(status, StatusCode::BAD_REQUEST, "epoch {epoch}");
+            }
+        }
+
+        /// The store's tick still reads epoch N while the wall clock has
+        /// entered N+1 (the slot tick has not run yet): the window follows the
+        /// wall clock, so a validator client asking for N+2 is answered.
+        #[tokio::test]
+        async fn the_window_follows_the_wall_clock_not_the_store_tick() {
+            let wall = wall_epoch();
+            let store = store_for(credited_state_at(wall - 1));
+            for (epoch, expected) in [
+                (wall - 2, StatusCode::BAD_REQUEST),
+                (wall - 1, StatusCode::OK),
+                (wall, StatusCode::OK),
+                (wall + 1, StatusCode::OK),
+                (wall + 2, StatusCode::BAD_REQUEST),
+            ] {
+                let (status, _) =
+                    post_liveness(store.clone(), epoch, &["2"], Default::default()).await;
+                assert_eq!(status, expected, "epoch {epoch}, wall epoch {wall}");
             }
         }
 
@@ -1256,7 +1289,8 @@ mod tests {
         async fn an_unknown_validator_is_a_400() {
             let store = store_for(credited_state());
             let unknown = (COUNT as u64).to_string();
-            let (status, _) = post_liveness(store, EPOCH, &[&unknown], Default::default()).await;
+            let (status, _) =
+                post_liveness(store, wall_epoch(), &[&unknown], Default::default()).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
         }
 
@@ -1264,7 +1298,7 @@ mod tests {
         async fn a_syncing_node_answers_503() {
             let store = store_for(credited_state());
             let syncing = SyncStatusController::new(SyncStatus::Syncing);
-            let (status, _) = post_liveness(store, EPOCH, &["2"], syncing).await;
+            let (status, _) = post_liveness(store, wall_epoch(), &["2"], syncing).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
