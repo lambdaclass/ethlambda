@@ -67,7 +67,10 @@ fn resolve_state_id(store: &Store, state_id: &str) -> Result<H256, ApiError> {
 }
 
 /// Load the state a `state_id` names, or the response explaining why not.
-fn load(store: &Store, state_id: &str) -> Result<(H256, std::sync::Arc<BeaconState>), ApiError> {
+pub(crate) fn load(
+    store: &Store,
+    state_id: &str,
+) -> Result<(H256, std::sync::Arc<BeaconState>), ApiError> {
     let root = resolve_state_id(store, state_id)?;
     let state = store
         .get_state(&root)
