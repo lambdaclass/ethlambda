@@ -3,10 +3,12 @@
 //! The rules live in `ethlambda_state_transition::beacon::gossip`; this module
 //! decides where each half runs and what happens to the result. Cheap checks
 //! run inline in the p2p actor. Stateful checks run on a `spawn_blocking`
-//! thread, bounded by one of two pools depending on the kind: a block or a
+//! thread, bounded by one of three pools depending on the kind: a block or a
 //! column draws from [`P2PServer::gossip_validation_permits`], an aggregate or
 //! a subnet attestation from [`P2PServer::attestation_validation_permits`] (see
-//! that field's own documentation for why they must not share one). Either way
+//! that field's own documentation for why they must not share one), a sync
+//! committee message or contribution from
+//! [`P2PServer::sync_validation_permits`]. Either way
 //! the blocking task sends a [`GossipVerdict`] back to the actor. Every beacon
 //! gossip message ends in exactly one [`report`]: gossipsub holds each one
 //! until then.
@@ -18,6 +20,9 @@ use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, B
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
 use ethlambda_storage::{CacheKey, Store};
+use ethlambda_types::beacon::containers::altair::{
+    SignedContributionAndProof, SyncCommitteeMessage,
+};
 use ethlambda_types::beacon::containers::electra::{self, SingleAttestation};
 use ethlambda_types::beacon::containers::gloas::{
     PayloadAttestationMessage, SignedExecutionPayloadEnvelope,
@@ -84,6 +89,17 @@ pub(crate) enum Validated {
     PayloadAttestation(PayloadAttestationMessage),
     /// One of the four operation topics. Boxed like the other wide payloads.
     Operation(Box<BeaconOperation>),
+    /// A `sync_committee_{subnet_id}` message.
+    SyncCommitteeMessage {
+        message: SyncCommitteeMessage,
+        subnet_id: u64,
+        /// The `(subcommittee, position)` seats its signature verified for.
+        /// Empty until [`Validated::stateful_checks`] fills it in on `Accept`,
+        /// like [`Self::Aggregate`]'s `attesting_indices`.
+        seats: Vec<(u64, usize)>,
+    },
+    /// A `sync_committee_contribution_and_proof`.
+    SyncContribution(Box<SignedContributionAndProof>),
 }
 
 impl Validated {
@@ -123,6 +139,22 @@ impl Validated {
                 gossip::payload_attestation::stateful_checks(store, message)
             }
             Self::Operation(operation) => gossip::operations::stateful_checks(store, operation),
+            Self::SyncCommitteeMessage {
+                message,
+                subnet_id,
+                seats,
+            } => {
+                match gossip::sync_committee::message_stateful_checks(store, message, *subnet_id) {
+                    Ok(resolved) => {
+                        *seats = resolved;
+                        Outcome::Accept
+                    }
+                    Err(outcome) => outcome,
+                }
+            }
+            Self::SyncContribution(signed) => {
+                gossip::sync_committee::contribution_stateful_checks(store, signed)
+            }
         }
     }
 
@@ -156,6 +188,14 @@ impl Validated {
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
             Self::Operation(operation) => server.seen_operations.record(operation),
+            Self::SyncCommitteeMessage {
+                message, subnet_id, ..
+            } => {
+                server
+                    .seen_sync_messages
+                    .record(message.slot, message.validator_index, *subnet_id)
+            }
+            Self::SyncContribution(signed) => server.seen_sync_contributions.record(signed),
         }
     }
 
@@ -233,6 +273,26 @@ impl Validated {
                 .expect("payload attestation pool lock")
                 .insert(message.clone());
         }
+        if let Self::SyncCommitteeMessage { message, seats, .. } = &self
+            && outcome == Outcome::Accept
+        {
+            // Block production packs these through the pool; nothing on the
+            // chain actor consumes a sync message, so it never goes further.
+            server
+                .sync_committee_pool
+                .lock()
+                .expect("sync committee pool lock poisoned")
+                .insert_message(message, seats);
+        }
+        if let Self::SyncContribution(signed) = &self
+            && outcome == Outcome::Accept
+        {
+            server
+                .sync_committee_pool
+                .lock()
+                .expect("sync committee pool lock poisoned")
+                .insert_contribution(signed.message.contribution.clone());
+        }
         let Some(blockchain) = &server.blockchain else {
             return;
         };
@@ -300,7 +360,9 @@ impl Validated {
             | Self::Attestation { .. }
             | Self::Envelope(_)
             | Self::PayloadAttestation(_)
-            | Self::Operation(_) => {}
+            | Self::Operation(_)
+            | Self::SyncCommitteeMessage { .. }
+            | Self::SyncContribution(_) => {}
         }
     }
 }
@@ -332,7 +394,9 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::Column(_)
         | Validated::Envelope(_)
         | Validated::PayloadAttestation(_)
-        | Validated::Operation(_) => {}
+        | Validated::Operation(_)
+        | Validated::SyncCommitteeMessage { .. }
+        | Validated::SyncContribution(_) => {}
     }
 }
 
@@ -492,8 +556,9 @@ pub(crate) fn report(server: &P2PServer, id: GossipId, outcome: Outcome) -> bool
 
 /// The permit pool `object`'s stateful checks draw from: blocks, columns and
 /// envelopes from the gossip pool, everything the attesters send (and the
-/// operation topics) from the attestation pool, so neither burst starves the
-/// other.
+/// operation topics) from the attestation pool, and the sync committee's
+/// messages and contributions from a pool of their own, so no burst starves
+/// another.
 fn permits_for<'a>(
     server: &'a P2PServer,
     object: &Validated,
@@ -506,6 +571,9 @@ fn permits_for<'a>(
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
         | Validated::Operation(_) => &server.attestation_validation_permits,
+        Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
+            &server.sync_validation_permits
+        }
     }
 }
 
@@ -1265,5 +1333,239 @@ mod tests {
             Outcome::Ignore(IgnoreReason::Internal)
         );
         assert_eq!(guarded(|| Outcome::Accept), Outcome::Accept);
+    }
+
+    /// The compressed BLS12-381 G2 generator: a signature that decodes and
+    /// combines, standing in for a verified one where the test is about
+    /// pooling and not about verification.
+    fn valid_looking_signature() -> ethlambda_types::beacon::primitives::BlsSignature {
+        let bytes = hex::decode(
+            "93e02b6052719f607dacd3a088274f65596bd0d09920b61ab5da61bbdc7f5049\
+             334cf11213945d57e5ac7d055d042b7e024aa2b2f08f0a91260805272dc51051\
+             c6e47ad4fa403b02b4510b647ae3d1770bac0326a805bbefd48056c8c121bdb8",
+        )
+        .expect("valid hex");
+        ethlambda_types::beacon::primitives::BlsSignature(bytes.try_into().expect("96 bytes"))
+    }
+
+    fn sync_message(slot: u64, validator: u64) -> SyncCommitteeMessage {
+        SyncCommitteeMessage {
+            slot,
+            beacon_block_root: Root::repeat_byte(7),
+            validator_index: validator,
+            signature: valid_looking_signature(),
+        }
+    }
+
+    fn sync_message_object(
+        slot: u64,
+        validator: u64,
+        subnet_id: u64,
+        seats: Vec<(u64, usize)>,
+    ) -> Validated {
+        Validated::SyncCommitteeMessage {
+            message: sync_message(slot, validator),
+            subnet_id,
+            seats,
+        }
+    }
+
+    fn sync_contribution(
+        slot: u64,
+        aggregator: u64,
+        subcommittee: u64,
+    ) -> SignedContributionAndProof {
+        let mut aggregation_bits =
+            ethlambda_types::beacon::containers::altair::SyncSubcommitteeBits::default();
+        aggregation_bits.set(0, true).expect("position 0 exists");
+        SignedContributionAndProof {
+            message: ethlambda_types::beacon::containers::altair::ContributionAndProof {
+                aggregator_index: aggregator,
+                contribution:
+                    ethlambda_types::beacon::containers::altair::SyncCommitteeContribution {
+                        slot,
+                        beacon_block_root: Root::repeat_byte(7),
+                        subcommittee_index: subcommittee,
+                        aggregation_bits,
+                        signature: valid_looking_signature(),
+                    },
+                selection_proof: Default::default(),
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_a_sync_message_key_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = sync_message_object(5, 11, 1, vec![(1, 0)]);
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        // The same validator on another subnet is another key.
+        let other_subnet = sync_message_object(5, 11, 2, vec![(2, 0)]);
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &other_subnet),
+            Outcome::Accept
+        );
+        // So is the same subnet in another slot.
+        let other_slot = sync_message_object(6, 11, 1, vec![(1, 0)]);
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &other_slot),
+            Outcome::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_accept_for_a_sync_contribution_stands_and_the_second_is_marked_seen() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let object = Validated::SyncContribution(Box::new(sync_contribution(5, 3, 1)));
+
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Accept
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &object),
+            Outcome::Ignore(IgnoreReason::AlreadySeen)
+        );
+        // Anything but an accept records nothing.
+        let other = Validated::SyncContribution(Box::new(sync_contribution(5, 4, 2)));
+        assert_eq!(
+            settle(
+                &mut server,
+                Outcome::Reject(RejectReason::BadSignature),
+                &other
+            ),
+            Outcome::Reject(RejectReason::BadSignature)
+        );
+        assert_eq!(
+            settle(&mut server, Outcome::Accept, &other),
+            Outcome::Accept
+        );
+    }
+
+    /// An accepted sync message lands in the pool at the seats its checks
+    /// resolved; any other outcome stays out, since one unverified signature
+    /// fails the aggregate it is packed into.
+    #[tokio::test]
+    async fn an_accepted_sync_message_is_pooled_and_others_are_not() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let root = Root::repeat_byte(7);
+        let pooled = || {
+            server
+                .sync_committee_pool
+                .lock()
+                .unwrap()
+                .contribution(5, root, 1)
+        };
+        let forward = |outcome| {
+            sync_message_object(5, 11, 1, vec![(1, 3)]).forward(&server, Instant::now(), outcome)
+        };
+        forward(Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(Outcome::Reject(RejectReason::BadSignature));
+        forward(Outcome::Queue(QueueReason::BlockUnknown));
+        assert!(pooled().is_none());
+        forward(Outcome::Accept);
+        let contribution = pooled().expect("pooled on accept");
+        assert!(contribution.aggregation_bits.get(3).unwrap());
+        assert!(!contribution.aggregation_bits.get(0).unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_accepted_sync_contribution_is_pooled_and_others_are_not() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let root = Root::repeat_byte(7);
+        let pooled = || {
+            server
+                .sync_committee_pool
+                .lock()
+                .unwrap()
+                .contribution(5, root, 2)
+        };
+        let forward = |outcome| {
+            Validated::SyncContribution(Box::new(sync_contribution(5, 3, 2))).forward(
+                &server,
+                Instant::now(),
+                outcome,
+            )
+        };
+        forward(Outcome::Ignore(IgnoreReason::Overloaded));
+        forward(Outcome::Reject(RejectReason::AggregateSignature));
+        assert!(pooled().is_none());
+        forward(Outcome::Accept);
+        assert_eq!(
+            pooled().expect("pooled on accept"),
+            sync_contribution(5, 3, 2).message.contribution
+        );
+    }
+
+    /// Sync messages and contributions have no fork-choice effect, so nothing
+    /// is handed to the chain actor on any outcome.
+    #[tokio::test]
+    async fn sync_committee_gossip_never_reaches_the_chain_actor() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let (sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        server.blockchain = Some(Arc::new(GloasRecorder(sender)));
+        for outcome in [
+            Outcome::Accept,
+            Outcome::Queue(QueueReason::BlockUnknown),
+            Outcome::Ignore(IgnoreReason::Overloaded),
+            Outcome::Reject(RejectReason::BadSignature),
+        ] {
+            sync_message_object(5, 11, 1, vec![(1, 3)]).forward(&server, Instant::now(), outcome);
+            Validated::SyncContribution(Box::new(sync_contribution(5, 3, 2))).forward(
+                &server,
+                Instant::now(),
+                outcome,
+            );
+        }
+        assert!(received.try_recv().is_err());
+    }
+
+    /// The sync pool is its own: exhausting it must not starve the block and
+    /// column pool or the attestation pool, nor the other way round.
+    #[tokio::test]
+    async fn the_sync_permit_pool_is_independent_of_the_others() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let message = sync_message_object(5, 11, 1, Vec::new());
+        let contribution = Validated::SyncContribution(Box::new(sync_contribution(5, 3, 1)));
+        let sync = &server.sync_validation_permits;
+        for object in [&message, &contribution] {
+            assert!(std::sync::Arc::ptr_eq(permits_for(&server, object), sync));
+        }
+        assert!(!std::sync::Arc::ptr_eq(
+            sync,
+            &server.gossip_validation_permits
+        ));
+        assert!(!std::sync::Arc::ptr_eq(
+            sync,
+            &server.attestation_validation_permits
+        ));
+
+        // Draining the sync pool leaves the other two untouched.
+        let gossip_before = server.gossip_validation_permits.available_permits();
+        let attestation_before = server.attestation_validation_permits.available_permits();
+        let held = sync
+            .clone()
+            .acquire_many_owned(sync.available_permits() as u32)
+            .await
+            .expect("the pool is open");
+        assert!(sync.clone().try_acquire_owned().is_err());
+        assert_eq!(
+            server.gossip_validation_permits.available_permits(),
+            gossip_before
+        );
+        assert_eq!(
+            server.attestation_validation_permits.available_permits(),
+            attestation_before
+        );
+        drop(held);
     }
 }

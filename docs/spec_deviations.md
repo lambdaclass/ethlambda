@@ -482,3 +482,69 @@ node, and a pre-gloas block's is its parent. Both walks stop at finality.
   blocks.
 - A hash of zero is "nothing to say" on either fork, so a payload whose hash is
   zero (the fixtures' placeholder) sends no `forkchoiceUpdated`.
+
+## Sync committee gossip resolves the committee by the message's slot and the domain by the fork schedule
+
+`sync_committee_{subnet_id}` and `sync_committee_contribution_and_proof`
+validate against the cached head state, choosing the committee from the
+message's slot and the signing domain from the config's fork schedule.
+
+- **Specification:** `p2p-interface.md`'s `get_sync_subcommittee_pubkeys` and
+  `validator.md`'s `compute_subnets_for_sync_committee` pick the committee by
+  `state.slot + 1`, and `get_domain(state, ..)` takes the fork version from
+  `state.fork`.
+- **ethlambda:** the committee is chosen by `message.slot + 1`
+  (`current_sync_committee` in the head's own period, `next_sync_committee` in
+  the one after), and the domain comes from `Config`'s schedule
+  (`helpers::sync_committee`). The validator client signs with the same
+  domain. When the head is in the message's period and fork the answer is the
+  specification's. When it lags across a period or fork boundary, the
+  specification would reject honest messages and this does not.
+- **Unanswerable cases are IGNORE:** a head state that is not cached is
+  `IGNORE` (`state_unavailable`), like every other topic, and a period the head
+  state's two committees cannot cover is `IGNORE sync_committee_unavailable`,
+  since neither is the sender's fault.
+
+## Sync committee subnets are joined on request, immediately, and advertised in MetaData only
+
+- **Specification:** `validator.md` ("Sync committee subnet stability") has a
+  validator join its subnets a random 1 to `SYNC_COMMITTEE_SUBNET_COUNT` epochs
+  before its period starts, and has the node advertise them in the ENR's
+  `syncnets`.
+- **ethlambda:** a subnet is joined only when a validator client posts
+  `POST /eth/v1/validator/sync_committee_subscriptions`, at once, until
+  `until_epoch` (exclusive) clamped to the end of the next period. The node
+  never subscribes without a request, because validating every subnet would
+  cost each follower up to `SYNC_COMMITTEE_SIZE` BLS verifications a slot.
+  `syncnets` appears in MetaData, never in the ENR: ethrex's `DiscoveryServer`
+  cannot replace the served record at runtime, the same known gap as the
+  `eth2` entry. Peers therefore find this node's sync subnets by chance, while
+  publishing still reaches the mesh, because a joined subnet is subscribed.
+- The `sync_committee_contribution_and_proof` topic is the exception: it is
+  subscribed under every digest and always validated, and accepted
+  contributions are relayed and pooled for block production.
+
+## Block production packs only the parent's sync committee votes
+
+`validator.md` ("Sync committee") describes block packing in terms of
+contributions only.
+
+- **ethlambda:** a block at slot `N` packs only what is pooled for
+  `(N - 1, parent_root)`. For each subcommittee it takes the best pooled
+  contribution and adds every pooled direct message at a position that
+  contribution does not cover. The result is verified exactly as
+  `process_sync_aggregate` will check it
+  (`block_production::verified_sync_aggregate`); a failure, or a proposer
+  whose parent is not the root the committee signed, gets the empty aggregate.
+  Every "retry without operations" fallback also drops it. That costs rewards,
+  never the block.
+- Messages from earlier slots over the same root are not packed.
+
+## The validator client signs a sync committee message at the deadline only
+
+`validator.md` ("Prepare sync committee message") has a member sign as soon as
+it sees the block for the slot, or at the sync-message deadline, whichever
+comes first. The validator client signs once, at the deadline
+(`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
+reads, and refuses to when that root is optimistic
+(`specs/bellatrix/optimistic-sync.md`).

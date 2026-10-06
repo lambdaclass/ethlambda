@@ -6,6 +6,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -19,11 +20,12 @@ use crate::beacon_node::block_contents::{
 };
 use crate::beacon_node::dto::{
     AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
-    SingleAttestationDto,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -112,6 +114,24 @@ pub struct MockBeaconNode {
     pub validator_indices_calls: Mutex<usize>,
     pub proposer_duties_calls: Mutex<usize>,
     pub attestation_data_calls: Mutex<usize>,
+    /// Sync duties by the epoch they are asked at. An epoch never set answers
+    /// no duties, so tests that do not care about sync committees are
+    /// unaffected.
+    pub sync_duties: Mutex<Vec<(Epoch, Vec<SyncDutyDto>)>>,
+    /// Every `sync_duties` request, as (epoch, indices).
+    pub sync_duty_requests: Mutex<Vec<(Epoch, Vec<ValidatorIndex>)>>,
+    /// What `head_block_root` answers with. `None` fails the call.
+    pub head_root: Option<Root>,
+    /// The head is one the execution client has not validated.
+    pub head_optimistic: bool,
+    pub submitted_sync_messages: Mutex<Vec<altair::SyncCommitteeMessage>>,
+    /// Contributions the mock holds; one is served by its `subcommittee_index`.
+    /// A subcommittee with none answers like a node's 404.
+    pub contributions: Vec<altair::SyncCommitteeContribution>,
+    /// Every `sync_committee_contribution` request, as (slot, subcommittee, root).
+    pub contribution_requests: Mutex<Vec<(Slot, u64, Root)>>,
+    pub published_contributions: Mutex<Vec<altair::SignedContributionAndProof>>,
+    pub sync_subscriptions: Mutex<Vec<SyncCommitteeSubscriptionDto>>,
 }
 
 impl MockBeaconNode {
@@ -347,6 +367,45 @@ impl MockBeaconNode {
             .lock()
             .expect("lock")
             .clone()
+    }
+
+    /// Answer `sync_duties` for the period containing `epoch` with `duties`.
+    pub fn with_sync_duties(self, epoch: Epoch, duties: Vec<SyncDutyDto>) -> Self {
+        self.sync_duties.lock().expect("lock").push((epoch, duties));
+        self
+    }
+
+    /// Answer `head_block_root` with `root`.
+    pub fn with_head_root(mut self, root: Root) -> Self {
+        self.head_root = Some(root);
+        self
+    }
+
+    /// Hold `contribution`, to be served for its subcommittee.
+    pub fn with_contribution(mut self, contribution: altair::SyncCommitteeContribution) -> Self {
+        self.contributions.push(contribution);
+        self
+    }
+
+    /// Every `sync_duties` request, as (epoch, indices).
+    pub fn sync_duty_requests(&self) -> Vec<(Epoch, Vec<ValidatorIndex>)> {
+        self.sync_duty_requests.lock().expect("lock").clone()
+    }
+
+    pub fn submitted_sync_messages(&self) -> Vec<altair::SyncCommitteeMessage> {
+        self.submitted_sync_messages.lock().expect("lock").clone()
+    }
+
+    pub fn contribution_requests(&self) -> Vec<(Slot, u64, Root)> {
+        self.contribution_requests.lock().expect("lock").clone()
+    }
+
+    pub fn published_contributions(&self) -> Vec<altair::SignedContributionAndProof> {
+        self.published_contributions.lock().expect("lock").clone()
+    }
+
+    pub fn sync_subscriptions(&self) -> Vec<SyncCommitteeSubscriptionDto> {
+        self.sync_subscriptions.lock().expect("lock").clone()
     }
 
     pub fn with_publish_outcome(mut self, outcome: Published) -> Self {
@@ -788,6 +847,98 @@ impl BeaconNodeApi for MockBeaconNode {
     async fn subscribe_committees(&self, subscriptions: &[CommitteeSubscriptionDto]) -> Result<()> {
         self.guard("subscribe_committees")?;
         self.subscriptions
+            .lock()
+            .expect("lock")
+            .extend_from_slice(subscriptions);
+        Ok(())
+    }
+
+    async fn sync_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<SyncDutyDto>> {
+        self.guard("sync_duties")?;
+        self.sync_duty_requests
+            .lock()
+            .expect("lock")
+            .push((epoch, indices.to_vec()));
+        Ok(self
+            .sync_duties
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .unwrap_or_default())
+    }
+
+    async fn head_block_root(&self) -> Result<Root> {
+        self.guard("head_block_root")?;
+        if self.head_optimistic {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        self.head_root.ok_or_else(|| Error::BeaconNode {
+            url: "mock".to_string(),
+            failure: BeaconNodeFailure::Request,
+            detail: "no head root".to_string(),
+        })
+    }
+
+    async fn submit_sync_committee_messages(
+        &self,
+        messages: &[altair::SyncCommitteeMessage],
+    ) -> Result<usize> {
+        self.guard("submit_sync_committee_messages")?;
+        self.submitted_sync_messages
+            .lock()
+            .expect("lock")
+            .extend_from_slice(messages);
+        Ok(messages.len())
+    }
+
+    async fn sync_committee_contribution(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        beacon_block_root: Root,
+    ) -> Result<altair::SyncCommitteeContribution> {
+        self.guard("sync_committee_contribution")?;
+        self.contribution_requests.lock().expect("lock").push((
+            slot,
+            subcommittee_index,
+            beacon_block_root,
+        ));
+        let contribution = self
+            .contributions
+            .iter()
+            .find(|held| held.subcommittee_index == subcommittee_index)
+            .ok_or(Error::BeaconNodeStatus {
+                status: 404,
+                body: "no contribution".to_string(),
+            })?;
+        validate_sync_contribution(slot, subcommittee_index, beacon_block_root, contribution)?;
+        Ok(contribution.clone())
+    }
+
+    async fn publish_contribution_and_proofs(
+        &self,
+        contributions: &[altair::SignedContributionAndProof],
+    ) -> Result<()> {
+        self.guard("publish_contribution_and_proofs")?;
+        self.published_contributions
+            .lock()
+            .expect("lock")
+            .extend_from_slice(contributions);
+        Ok(())
+    }
+
+    async fn subscribe_sync_committees(
+        &self,
+        subscriptions: &[SyncCommitteeSubscriptionDto],
+    ) -> Result<()> {
+        self.guard("subscribe_sync_committees")?;
+        self.sync_subscriptions
             .lock()
             .expect("lock")
             .extend_from_slice(subscriptions);

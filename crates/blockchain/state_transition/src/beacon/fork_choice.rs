@@ -9409,6 +9409,7 @@ mod tests {
             },
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
+            sync_aggregate: crate::beacon::block_production::empty_sync_aggregate(),
         };
         let message = assemble_block(&advanced, inputs, &config).expect("assemble");
         let state_root = message.state_root;

@@ -18,6 +18,7 @@ use ethlambda_state_transition::beacon::helpers::{
     test_state::{sign_for, with_signing_validators_at},
 };
 use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
+use ethlambda_state_transition::beacon::sync_committee_pool::SharedSyncCommitteePool;
 use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
@@ -153,6 +154,7 @@ async fn spawn_server(
     let router = crate::build_beacon_api_router(store, "ethlambda/test", "peer".into())
         .layer(Extension(SyncStatusController::new(SyncStatus::Synced)))
         .layer(Extension(p2p))
+        .layer(Extension(SharedSyncCommitteePool::default()))
         .layer(Extension(payload_pool.clone()))
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))

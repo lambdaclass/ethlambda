@@ -4,7 +4,10 @@ use std::sync::Arc;
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
 use ethlambda_network_api::RpcToP2PRef;
-use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
+use ethlambda_state_transition::beacon::{
+    payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
+};
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -198,6 +201,9 @@ pub struct BeaconApiHandles {
     /// Filled by gossip and the payload attestation pool endpoint, read by
     /// block production and the pool's GET.
     pub payload_attestation_pool: SharedPayloadAttestationPool,
+    /// Filled by gossip and the sync committee endpoints, read by block
+    /// production and the contribution endpoint.
+    pub sync_committee_pool: SharedSyncCommitteePool,
     /// The columns this node custodies: what `payload_attestation_data` checks
     /// a block's blob availability against, and what block production tells
     /// the execution client it samples for when asking it to build a gloas
@@ -234,6 +240,7 @@ pub async fn start_beacon_rpc_server(
         .layer(Extension(sync_status))
         .layer(Extension(handles.p2p))
         .layer(Extension(handles.payload_attestation_pool))
+        .layer(Extension(handles.sync_committee_pool))
         .layer(Extension(handles.custody_columns))
         .layer(Extension(beacon::validator::FeeRecipients::default()))
         .layer(Extension(handles.engine))
@@ -462,6 +469,18 @@ pub(crate) mod test_utils {
         pub(crate) payload_attestations: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
         >,
+        /// `(subnet ids, message)` per sync committee message published.
+        pub(crate) sync_messages: std::sync::Mutex<
+            Vec<(
+                Vec<u64>,
+                ethlambda_types::beacon::containers::altair::SyncCommitteeMessage,
+            )>,
+        >,
+        pub(crate) sync_contributions: std::sync::Mutex<
+            Vec<ethlambda_types::beacon::containers::altair::SignedContributionAndProof>,
+        >,
+        /// `(subnet id, until epoch)` pairs asked for.
+        pub(crate) sync_subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
     }
 
     impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
@@ -537,6 +556,34 @@ pub(crate) mod test_utils {
             message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.payload_attestations.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn publish_sync_committee_message(
+            &self,
+            subnet_ids: Vec<u64>,
+            message: ethlambda_types::beacon::containers::altair::SyncCommitteeMessage,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_messages
+                .lock()
+                .unwrap()
+                .push((subnet_ids, message));
+            Ok(())
+        }
+
+        fn publish_sync_committee_contribution(
+            &self,
+            contribution: ethlambda_types::beacon::containers::altair::SignedContributionAndProof,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_contributions.lock().unwrap().push(contribution);
+            Ok(())
+        }
+
+        fn subscribe_sync_committee_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.sync_subscriptions.lock().unwrap().extend(subnets);
             Ok(())
         }
     }

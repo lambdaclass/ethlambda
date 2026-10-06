@@ -47,6 +47,7 @@ pub(crate) mod secure_fs;
 pub mod signing;
 pub mod slot_clock;
 pub mod subscriptions;
+pub mod sync_committee;
 
 pub use error::{Error, Result};
 
@@ -71,6 +72,7 @@ use crate::proposal::ProposalService;
 use crate::proposer_settings::ProposerSettings;
 use crate::signing::SigningContext;
 use crate::slot_clock::SlotClock;
+use crate::sync_committee::SyncCommitteeService;
 
 /// Everything the client is configured with at startup.
 #[derive(Debug, Clone)]
@@ -188,6 +190,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
+    let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
     let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
 
     if let Some(address) = config.keymanager {
@@ -294,21 +297,26 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
             propose(&proposal, &clock, slot, &duty, &store).await;
         }
 
-        // The rest of the way to the attester offset, one third into the slot.
-        // Zero if the refresh or the proposal above already ran past it, in
-        // which case this slot's attestation is late rather than skipped.
-        tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
+        // The rest of the way to the first of the slot's remaining duties:
+        // the attester offset, or the sync committee offset when the network
+        // puts it earlier. Zero if the refresh or the proposal above already
+        // ran past it, in which case the duty is late rather than skipped.
+        // Each branch of `serve_slot_duties` waits for its own offset.
+        tokio::time::sleep(clock.until_first_slot_duty(slot, SystemTime::now())).await;
 
         let slot_duties = duties.at_slot(slot, epoch);
         let committee = duties.ptc_at_slot(slot, epoch);
+        let sync_duties = duties.sync_at_slot(slot);
         serve_slot_duties(
             &attestation,
             &aggregation,
             &payload_attestation,
+            &sync_committee,
             &clock,
             slot,
             &slot_duties,
             &committee,
+            &sync_duties,
             &store,
         )
         .await;
@@ -332,19 +340,91 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
     payload_attestation: &PayloadAttestationService<B>,
+    sync_committee: &SyncCommitteeService<B>,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
     committee: &[crate::beacon_node::dto::PtcDutyDto],
+    sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
     store: &RwLock<ValidatorStore>,
 ) {
-    if !slot_duties.is_empty() {
-        attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
-    }
+    // The sync committee work runs beside the attester and PTC work rather
+    // than after it: its deadline is not ordered against theirs (gloas moves
+    // it before the attestation) and each is bounded by the slot on its own.
+    let attest_then_ptc = async {
+        if !slot_duties.is_empty() {
+            tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
+            attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
+        }
 
-    if clock.is_gloas(slot) && !committee.is_empty() {
-        tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
-        payload_attest(payload_attestation, clock, slot, committee, store).await;
+        if clock.is_gloas(slot) && !committee.is_empty() {
+            tokio::time::sleep(clock.until_payload_attestation(slot, SystemTime::now())).await;
+            payload_attest(payload_attestation, clock, slot, committee, store).await;
+        }
+    };
+    tokio::join!(
+        attest_then_ptc,
+        sync_committee_duty(sync_committee, clock, slot, sync_duties, store)
+    );
+}
+
+/// Run one slot's sync committee duty: sign the head at the message deadline,
+/// then aggregate at the contribution deadline if a root was signed.
+///
+/// Each half is bounded by the end of the slot, like the other duties, and
+/// failures are logged and counted rather than propagated. Nothing here is
+/// slashable, so abandoning a half costs only that half.
+async fn sync_committee_duty<B: BeaconNodeApi>(
+    service: &SyncCommitteeService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    duties: &[crate::beacon_node::dto::SyncDutyDto],
+    store: &RwLock<ValidatorStore>,
+) {
+    if duties.is_empty() {
+        return;
+    }
+    tokio::time::sleep(clock.until_sync_message(slot, SystemTime::now())).await;
+    let budget = clock.remaining_in(slot, SystemTime::now());
+    let root =
+        match tokio::time::timeout(budget, service.publish_messages(slot, duties, store)).await {
+            Ok(Ok(root)) => root,
+            Ok(Err(err)) => {
+                error!(%slot, %err, "Failed to publish sync committee messages for this slot");
+                metrics::inc_sync_committee_failures();
+                metrics::set_beacon_node_available(false);
+                return;
+            }
+            Err(_) => {
+                warn!(
+                    %slot,
+                    budget_ms = budget.as_millis() as u64,
+                    "Sync committee messages ran past the end of their slot and were abandoned"
+                );
+                metrics::inc_sync_committee_failures();
+                return;
+            }
+        };
+    let Some(root) = root else {
+        return;
+    };
+
+    tokio::time::sleep(clock.until_contribution(slot, SystemTime::now())).await;
+    let budget = clock.remaining_in(slot, SystemTime::now());
+    match tokio::time::timeout(budget, service.aggregate(slot, root, duties, store)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to publish this slot's sync contributions");
+            metrics::inc_sync_contribution_failures();
+        }
+        Err(_) => {
+            warn!(
+                %slot,
+                budget_ms = budget.as_millis() as u64,
+                "Sync aggregation ran past the end of its slot and was abandoned"
+            );
+            metrics::inc_sync_contribution_failures();
+        }
     }
 }
 
@@ -647,6 +727,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
 
     let changed = duties.refresh_around(epoch).await?;
     refresh_ptc(duties, epoch, context).await;
+    refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
     if changed {
         subscriptions::subscribe(beacon_node, &duties.all(), store, context).await?;
@@ -681,6 +762,63 @@ async fn refresh_ptc<B: BeaconNodeApi>(
         }
     }
     duties.prune_ptc_before(epoch);
+}
+
+/// How many epochs before a period boundary the next period's subnets are
+/// joined: lighthouse's lookahead, at the specification's upper bound
+/// `SYNC_COMMITTEE_SUBNET_COUNT` for the random early-join window.
+const SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS: u64 =
+    ethlambda_types::beacon::constants::SYNC_COMMITTEE_SUBNET_COUNT as u64;
+
+/// Fetch the sync committee schedule for this period and the next, and ask the
+/// node to join the subnets involved.
+///
+/// Only from altair. Failures are logged and swallowed, like the payload
+/// committee's: they must not cost this epoch's attester schedule.
+///
+/// Subscriptions are sent every epoch because the node forgets them on
+/// restart. The current period's run to its end; the next period's are added
+/// once the boundary is within [`SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS`], so the
+/// subnets are already joined when the new committee starts signing.
+async fn refresh_sync<B: BeaconNodeApi>(
+    beacon_node: &Arc<B>,
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    context: &SigningContext,
+) {
+    use ethlambda_types::beacon::fork::ForkName;
+    use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD_EPOCHS;
+
+    if context.config.fork_at_epoch(epoch) < ForkName::Altair {
+        return;
+    }
+    let period = crate::duties::sync_committee_period(epoch);
+    for target in [period, period + 1] {
+        if let Err(err) = duties.refresh_sync(target).await {
+            warn!(
+                period = target,
+                %err,
+                "Sync committee duties fetch failed; this client may miss its messages"
+            );
+        }
+    }
+    duties.prune_sync_before(period);
+    metrics::set_sync_duties_held(duties.sync_for_period(period).len() as u64);
+
+    let current = duties.sync_for_period(period);
+    if let Err(err) =
+        subscriptions::subscribe_sync(beacon_node, &current, (period + 1) * PERIOD_EPOCHS).await
+    {
+        warn!(%err, "Failed to subscribe to sync committee subnets");
+    }
+    if epoch + SYNC_SUBSCRIPTION_LOOKAHEAD_EPOCHS >= (period + 1) * PERIOD_EPOCHS {
+        let next = duties.sync_for_period(period + 1);
+        if let Err(err) =
+            subscriptions::subscribe_sync(beacon_node, &next, (period + 2) * PERIOD_EPOCHS).await
+        {
+            warn!(%err, "Failed to subscribe to the next period's sync committee subnets");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1051,16 +1189,159 @@ mod tests {
             &AttestationService::new(node.clone(), context.clone()),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
             &clock,
             slot,
             &[],
             &committee,
+            &[],
             &store,
         )
         .await;
 
         assert_eq!(node.attestation_data_call_count(), 0, "no attester duty");
         assert_eq!(node.submitted_payload_attestations().len(), 1);
+    }
+
+    fn altair_context() -> SigningContext {
+        SigningContext {
+            config: ethlambda_types::beacon::config::Config::mainnet()
+                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0),
+            genesis_validators_root: Root::ZERO,
+        }
+    }
+
+    fn sync_duty(index: u64, seats: Vec<u64>) -> crate::beacon_node::dto::SyncDutyDto {
+        crate::beacon_node::dto::SyncDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&[0u8; 48]),
+            validator_index: index,
+            validator_sync_committee_indices: seats,
+        }
+    }
+
+    /// Both periods' duties are fetched, and the current period's subnets are
+    /// subscribed every refresh, to the period's end.
+    #[tokio::test]
+    async fn sync_duties_for_both_periods_are_fetched_and_subscribed() {
+        use ethlambda_types::beacon::preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD as PERIOD;
+
+        let node = Arc::new(
+            node()
+                .with_sync_duties(0, vec![sync_duty(11, vec![3, 130])])
+                .with_sync_duties(PERIOD, vec![sync_duty(11, vec![200])]),
+        );
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        for _ in 0..2 {
+            refresh_epoch(
+                &node,
+                &mut duties,
+                &keys,
+                3,
+                &settings(None),
+                &empty_store(),
+                &altair_context(),
+            )
+            .await
+            .expect("refreshes");
+        }
+
+        let requested: Vec<u64> = node
+            .sync_duty_requests()
+            .iter()
+            .map(|(epoch, _)| *epoch)
+            .collect();
+        assert_eq!(requested, vec![0, PERIOD, 0, PERIOD]);
+        assert_eq!(duties.sync_for_period(1).len(), 1);
+
+        let sent = node.sync_subscriptions();
+        assert_eq!(sent.len(), 2, "re-sent every epoch, current period only");
+        assert_eq!(sent[0].sync_committee_indices, vec![3, 130]);
+        assert_eq!(sent[0].until_epoch, PERIOD);
+    }
+
+    /// Not asked before altair.
+    #[tokio::test]
+    async fn no_sync_duties_are_fetched_before_altair() {
+        let node = Arc::new(node());
+        refresh(node.clone(), None).await;
+        assert!(node.sync_duty_requests().is_empty());
+    }
+
+    /// A failed sync fetch must not cost the epoch's attester schedule.
+    #[tokio::test]
+    async fn a_failed_sync_fetch_does_not_fail_the_refresh() {
+        let node = Arc::new(node().failing_call("sync_duties", "node is unhappy"));
+        let mut duties = DutiesService::new(node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+        refresh_epoch(
+            &node,
+            &mut duties,
+            &keys,
+            3,
+            &settings(None),
+            &empty_store(),
+            &altair_context(),
+        )
+        .await
+        .expect("the refresh survives it");
+        assert_eq!(duties.indices(), &[11, 22]);
+    }
+
+    /// A sync committee member with no other duty in the slot still signs.
+    #[tokio::test]
+    async fn a_sync_committee_member_with_no_other_duty_still_signs() {
+        use crate::beacon_node::mock::MockBeaconNode;
+
+        let mut config = ethlambda_types::beacon::config::Config::mainnet()
+            .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Altair, 0);
+        config.slot_duration_ms = 1_000;
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let clock = SlotClock::from_config(now_secs - 100, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = RwLock::new(store);
+
+        let node = Arc::new(MockBeaconNode::new().with_head_root(Root::repeat_byte(5)));
+        let duties = [crate::beacon_node::dto::SyncDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&key.0),
+            validator_index: 3,
+            validator_sync_committee_indices: vec![0],
+        }];
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
+            &clock,
+            slot,
+            &[],
+            &[],
+            &duties,
+            &store,
+        )
+        .await;
+
+        assert_eq!(node.attestation_data_call_count(), 0, "no attester duty");
+        let sent = node.submitted_sync_messages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].slot, slot);
+        assert_eq!(sent[0].beacon_block_root, Root::repeat_byte(5));
     }
 
     /// Before gloas there is no committee: even a stale schedule entry is not
@@ -1082,10 +1363,12 @@ mod tests {
             &AttestationService::new(node.clone(), context.clone()),
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
             &clock,
             5,
             &[],
             &[ptc_duty(3, 5)],
+            &[],
             &store,
         )
         .await;

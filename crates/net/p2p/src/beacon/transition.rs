@@ -159,6 +159,11 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             changes.subscribed.push(topic.to_string());
             server.swarm_handle.subscribe(topic);
         }
+        for &subnet_id in wire.sync_committee_subnets.keys() {
+            let topic = sync_committee_topic(entry.digest, subnet_id);
+            changes.subscribed.push(topic.to_string());
+            server.swarm_handle.subscribe(topic);
+        }
         info!(
             fork_digest = %hex::encode(entry.digest),
             fork = entry.fork.as_str(),
@@ -177,6 +182,11 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
         }
         for &subnet_id in server.aggregator_subnets.keys() {
             let topic = attestation_topic(left.fork_digest, subnet_id);
+            changes.unsubscribed.push(topic.to_string());
+            server.swarm_handle.unsubscribe(topic);
+        }
+        for &subnet_id in wire.sync_committee_subnets.keys() {
+            let topic = sync_committee_topic(left.fork_digest, subnet_id);
             changes.unsubscribed.push(topic.to_string());
             server.swarm_handle.unsubscribe(topic);
         }
@@ -231,6 +241,10 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
 
 fn attestation_topic(digest: ForkDigest, subnet_id: u64) -> IdentTopic {
     IdentTopic::new(topics::attestation_topic_name(digest, subnet_id))
+}
+
+fn sync_committee_topic(digest: ForkDigest, subnet_id: u64) -> IdentTopic {
+    IdentTopic::new(topics::sync_committee_topic_name(digest, subnet_id))
 }
 
 #[cfg(test)]
@@ -427,6 +441,35 @@ mod tests {
         apply(&mut server, GLOAS - 2);
 
         // Joining the next digest brings the aggregator subnet along.
+        let joined = apply(&mut server, GLOAS - 1);
+        assert!(joined.subscribed.contains(&name(gloas)));
+        assert!(joined.unsubscribed.is_empty());
+
+        // Leaving the old digest takes it away again.
+        let left = apply(&mut server, GLOAS + 2);
+        assert!(left.unsubscribed.contains(&name(fulu)));
+        assert!(left.subscribed.is_empty());
+
+        // Nothing to do the second time.
+        assert_eq!(apply(&mut server, GLOAS + 2), Changes::default());
+    }
+
+    #[tokio::test]
+    async fn sync_committee_subnets_follow_every_held_digest() {
+        let mut server = unconnected_beacon_server(config(), 0).await;
+        let schedule = server.wire.beacon().expect("beacon").schedule.clone();
+        let fulu = schedule.digest_at(GLOAS - 2);
+        let gloas = schedule.digest_at(GLOAS);
+        let Wire::Beacon(wire) = &mut server.wire else {
+            panic!("a beacon wire");
+        };
+        wire.sync_committee_subnets.insert(2, u64::MAX);
+        let name = |digest| topics::sync_committee_topic_name(digest, 2);
+
+        // Settle on the pre-window digest first.
+        apply(&mut server, GLOAS - 2);
+
+        // Joining the next digest brings the sync subnet along.
         let joined = apply(&mut server, GLOAS - 1);
         assert!(joined.subscribed.contains(&name(gloas)));
         assert!(joined.unsubscribed.is_empty());

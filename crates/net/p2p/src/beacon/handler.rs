@@ -116,7 +116,9 @@ impl StatusVersion {
 /// peer-score penalties for silence on them, and claiming none while serving
 /// two loses the peers looking for exactly that.
 ///
-/// `syncnets` stays all-zero: no sync-committee subnet is subscribed.
+/// `syncnets` names the sync committee subnets joined on a validator client's
+/// request (see [`BeaconWire::sync_committee_subnets`]), so it is all-zero
+/// until one asks.
 /// `custody_group_count` is `CUSTODY_REQUIREMENT`, the floor a peer may demand,
 /// not this node's actual custody: `sampling_size` raises what it stores and
 /// serves (`BeaconWire::custody_columns`) to cover at least `SAMPLES_PER_SLOT`
@@ -125,6 +127,7 @@ impl StatusVersion {
 pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaData> {
     let seq_number = wire.metadata_seq_number;
     let attnets = attnets(wire);
+    let syncnets = syncnets(wire);
     match protocol {
         protocols::METADATA_V1 => Some(BeaconMetaData::V1(MetaDataV1 {
             seq_number,
@@ -133,12 +136,12 @@ pub fn build_metadata(wire: &BeaconWire, protocol: &str) -> Option<BeaconMetaDat
         protocols::METADATA_V2 => Some(BeaconMetaData::V2(MetaDataV2 {
             seq_number,
             attnets,
-            syncnets: SyncnetsBits::default(),
+            syncnets,
         })),
         protocols::METADATA_V3 => Some(BeaconMetaData::V3(MetaDataV3 {
             seq_number,
             attnets,
-            syncnets: SyncnetsBits::default(),
+            syncnets,
             custody_group_count: constants::CUSTODY_REQUIREMENT,
         })),
         _ => None,
@@ -159,6 +162,16 @@ fn attnets(wire: &BeaconWire) -> AttnetsBits {
         let _ = attnets.set(subnet_id as usize, true);
     }
     attnets
+}
+
+/// The `syncnets` bitfield for the sync committee subnets currently joined.
+/// An id past the bitfield's width is dropped, as in [`attnets`].
+fn syncnets(wire: &BeaconWire) -> SyncnetsBits {
+    let mut syncnets = SyncnetsBits::default();
+    for &subnet_id in wire.sync_committee_subnets.keys() {
+        let _ = syncnets.set(subnet_id as usize, true);
+    }
+    syncnets
 }
 
 /// Open the handshake on a newly established connection.
@@ -243,6 +256,7 @@ mod tests {
             metadata_seq_number: 0,
             custody_columns: Vec::new(),
             attestation_subnets: Vec::new(),
+            sync_committee_subnets: Default::default(),
         }
     }
 
@@ -417,8 +431,34 @@ mod tests {
                 "subnet {subnet} advertised wrongly"
             );
         }
-        // Still nothing claimed on the sync-committee side.
+        // Nothing claimed on the sync-committee side until a subnet is joined.
         assert_eq!(v3.syncnets, SyncnetsBits::default());
+    }
+
+    /// `syncnets` names exactly the joined sync committee subnets, in every
+    /// version that carries the field.
+    #[test]
+    fn syncnets_advertises_the_joined_sync_committee_subnets() {
+        let mut wire = wire();
+        wire.sync_committee_subnets.insert(1, 10);
+        wire.sync_committee_subnets.insert(3, 10);
+        let Some(BeaconMetaData::V2(v2)) = build_metadata(&wire, protocols::METADATA_V2) else {
+            panic!("v2 requested");
+        };
+        let Some(BeaconMetaData::V3(v3)) = build_metadata(&wire, protocols::METADATA_V3) else {
+            panic!("v3 requested");
+        };
+        for syncnets in [&v2.syncnets, &v3.syncnets] {
+            for subnet in 0..4usize {
+                assert_eq!(
+                    syncnets.get(subnet).unwrap_or(false),
+                    subnet == 1 || subnet == 3,
+                    "sync subnet {subnet} advertised wrongly"
+                );
+            }
+        }
+        // attnets is untouched.
+        assert_eq!(v3.attnets, AttnetsBits::default());
     }
 
     /// A subnet id the compiled bitfield has no room for is dropped rather than

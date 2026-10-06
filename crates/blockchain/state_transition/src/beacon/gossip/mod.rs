@@ -13,6 +13,7 @@ pub mod column;
 pub mod envelope;
 pub mod operations;
 pub mod payload_attestation;
+pub mod sync_committee;
 #[cfg(test)]
 pub(crate) mod test_support;
 
@@ -23,6 +24,7 @@ pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
 pub use envelope::SeenEnvelopes;
 pub use payload_attestation::SeenPayloadAttestations;
+pub use sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions};
 
 use std::num::NonZeroUsize;
 
@@ -162,6 +164,8 @@ pub enum IgnoreReason {
     BeforeFork,
     /// A voluntary exit for a validator that has already initiated its exit.
     AlreadyExiting,
+    /// The head state's sync committees cannot answer for the message's period.
+    SyncCommitteeUnavailable,
 }
 
 impl IgnoreReason {
@@ -190,6 +194,7 @@ impl IgnoreReason {
             Self::PtcUnavailable => "ptc_unavailable",
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
+            Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
         }
     }
 }
@@ -271,6 +276,9 @@ pub enum RejectReason {
     /// A voluntary exit, slashing or credentials change that fails its gossip
     /// rule against the head state.
     InvalidOperation,
+    /// A sync committee contribution's subcommittee index is not below
+    /// `SYNC_COMMITTEE_SUBNET_COUNT`.
+    SubcommitteeIndex,
 }
 
 impl RejectReason {
@@ -317,6 +325,7 @@ impl RejectReason {
             Self::PreGloasSlot => "pre_gloas_slot",
             Self::NotInPtc => "not_in_ptc",
             Self::InvalidOperation => "invalid_operation",
+            Self::SubcommitteeIndex => "subcommittee_index",
         }
     }
 }

@@ -46,16 +46,24 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadEnvelope, PublishPayloadAttestationMessage,
-        SubscribeAttestationSubnets,
+        PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
+        SubscribeSyncCommitteeSubnets,
     },
 };
 use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
 use ethlambda_state_transition::beacon::gossip::{
-    SeenBlockColumns, SeenBlocks, SeenColumns, aggregate::SeenAggregates,
-    attestation::SeenAttestations, envelope::SeenEnvelopes, operations::SeenOperations,
+    SeenBlockColumns, SeenBlocks, SeenColumns,
+    aggregate::SeenAggregates,
+    attestation::SeenAttestations,
+    envelope::SeenEnvelopes,
+    operations::SeenOperations,
     payload_attestation::SeenPayloadAttestations,
+    sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
 };
-use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadAttestationPool;
+use ethlambda_state_transition::beacon::{
+    payload_attestation_pool::SharedPayloadAttestationPool,
+    sync_committee_pool::SharedSyncCommitteePool,
+};
 use ethlambda_storage::{Chain, Store};
 use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
 use ethlambda_types::primitives::H256;
@@ -241,6 +249,28 @@ const COLUMN_CHECK_PERMITS: usize = 16;
 /// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
 /// has data from a follower.
 const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
+/// How many `sync_committee_{subnet_id}` and
+/// `sync_committee_contribution_and_proof` stateful checks may run at once.
+///
+/// A pool of its own: the sync committee's burst comes a third of the way into
+/// the slot, where the attestations' does, so sharing
+/// [`ATTESTATION_VALIDATION_PERMITS`] would let each starve the other. A
+/// message arriving with none free is ignored, like every other kind.
+const SYNC_VALIDATION_PERMITS: usize = 64;
+
+/// Capacity of the first-valid-sync-message cache, keyed by `(slot, validator
+/// index, subnet)`. A subnet carries one message per member per slot, at most
+/// a subcommittee's worth, so this holds a few slots of every subnet.
+const SEEN_SYNC_MESSAGES_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the accepted-contribution cache by `(slot, aggregator index,
+/// subcommittee)`. The rule only asks about the current slot.
+const SEEN_SYNC_AGGREGATORS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// Capacity of the accepted-contribution cache by `(slot, root, subcommittee)`,
+/// which holds the participation bits seen for that key.
+const SEEN_SYNC_DATA_CAPACITY: NonZeroUsize = NonZeroUsize::new(256).expect("non-zero");
 
 /// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
 /// How often to leave aggregator subnets whose slot has passed. One slot's
@@ -1070,6 +1100,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 metadata_seq_number: 0,
                 custody_columns: beacon.custody_columns,
                 attestation_subnets: beacon.attestation_subnets,
+                sync_committee_subnets: std::collections::BTreeMap::new(),
             }))
         }
     };
@@ -1110,6 +1141,7 @@ impl P2P {
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
         payload_attestation_pool: SharedPayloadAttestationPool,
+        sync_committee_pool: SharedSyncCommitteePool,
     ) -> Result<P2P, DiscoveryError> {
         let discovery = match discovery {
             Some(config) => Some(spawn_discovery(config).await?),
@@ -1169,14 +1201,21 @@ impl P2P {
                 backbone_attestation_subnets,
             )),
             seen_operations: SeenOperations::default(),
+            seen_sync_messages: SeenSyncCommitteeMessages::new(SEEN_SYNC_MESSAGES_CAPACITY),
+            seen_sync_contributions: SeenSyncContributions::new(
+                SEEN_SYNC_AGGREGATORS_CAPACITY,
+                SEEN_SYNC_DATA_CAPACITY,
+            ),
             gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 GOSSIP_VALIDATION_PERMITS,
             )),
+            sync_validation_permits: Arc::new(tokio::sync::Semaphore::new(SYNC_VALIDATION_PERMITS)),
             column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
             attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
                 ATTESTATION_VALIDATION_PERMITS,
             )),
             payload_attestation_pool,
+            sync_committee_pool,
             aggregator_subnets: HashMap::new(),
             peer_scoring,
         };
@@ -1313,6 +1352,12 @@ pub struct P2PServer {
     /// entry needs a validator to really exit, be slashed or change
     /// credentials, so it is bounded by the registry.
     pub(crate) seen_operations: SeenOperations,
+    /// Accepted `sync_committee_{subnet_id}` messages, by `(slot, validator
+    /// index, subnet)`.
+    pub(crate) seen_sync_messages: SeenSyncCommitteeMessages,
+    /// Accepted `sync_committee_contribution_and_proof`s, by aggregator and by
+    /// the bits seen for `(slot, root, subcommittee)`.
+    pub(crate) seen_sync_contributions: SeenSyncContributions,
     /// Permits for block and column stateful gossip checks in flight on
     /// blocking threads.
     pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
@@ -1323,11 +1368,21 @@ pub struct P2PServer {
     /// [`Self::gossip_validation_permits`]; see
     /// [`ATTESTATION_VALIDATION_PERMITS`].
     pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for sync committee message and contribution stateful gossip
+    /// checks in flight on blocking threads. Separate from the other two
+    /// pools; see [`SYNC_VALIDATION_PERMITS`].
+    pub(crate) sync_validation_permits: Arc<tokio::sync::Semaphore>,
 
     /// Accepted `payload_attestation_message` votes, shared with the Beacon
     /// API that serves and fills the same pool. Filled by `verdict::forward`;
     /// lean never touches it.
     pub(crate) payload_attestation_pool: SharedPayloadAttestationPool,
+
+    /// Accepted sync committee messages and contributions, shared with the
+    /// Beacon API that serves and fills the same pool (block production reads
+    /// it). Filled by `verdict::forward`; lean never touches it.
+    pub(crate) sync_committee_pool: SharedSyncCommitteePool,
+
     /// The attestation subnets joined for a validator client's aggregators,
     /// each with the last slot it is needed for. Short-lived by design: never
     /// advertised in `attnets`, and left once the slot has passed. The
@@ -1544,6 +1599,8 @@ impl P2PServer {
         gossipsub::leave_expired_aggregator_subnets(self);
         gossipsub::prune_attestation_pool(self);
         gossipsub::prune_operation_pool(self);
+        beacon::sync_committee::leave_expired_sync_committee_subnets(self);
+        beacon::sync_committee::prune_sync_committee_pool(self);
     }
 
     #[send_handler]
@@ -1675,6 +1732,24 @@ impl Handler<PublishPayloadAttestationMessage> for P2PServer {
 impl Handler<SubscribeAttestationSubnets> for P2PServer {
     async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
         gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<PublishSyncCommitteeMessage> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeMessage, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_message(self, msg.subnet_ids, msg.message);
+    }
+}
+
+impl Handler<PublishSyncCommitteeContribution> for P2PServer {
+    async fn handle(&mut self, msg: PublishSyncCommitteeContribution, _ctx: &Context<Self>) {
+        beacon::sync_committee::publish_sync_committee_contribution(self, msg.contribution);
+    }
+}
+
+impl Handler<SubscribeSyncCommitteeSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeSyncCommitteeSubnets, _ctx: &Context<Self>) {
+        beacon::sync_committee::join_sync_committee_subnets(self, msg.subnets);
     }
 }
 
@@ -2921,7 +2996,20 @@ pub(crate) mod test_support {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
+            seen_sync_messages:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncCommitteeMessages::new(
+                    crate::SEEN_SYNC_MESSAGES_CAPACITY,
+                ),
+            seen_sync_contributions:
+                ethlambda_state_transition::beacon::gossip::sync_committee::SeenSyncContributions::new(
+                    crate::SEEN_SYNC_AGGREGATORS_CAPACITY,
+                    crate::SEEN_SYNC_DATA_CAPACITY,
+                ),
+            sync_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::SYNC_VALIDATION_PERMITS,
+            )),
             payload_attestation_pool: Default::default(),
+            sync_committee_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
             peer_scoring: None,
         }

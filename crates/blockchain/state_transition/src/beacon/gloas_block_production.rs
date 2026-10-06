@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use super::block_production::{empty_sync_aggregate, pack_attestations};
+use super::block_production::pack_attestations;
 use super::bls;
 use super::config::Config;
 use super::error::{Error, Result, verify};
@@ -38,6 +38,7 @@ use ethlambda_types::beacon::{
     constants,
     containers::{
         BeaconState,
+        altair::SyncAggregate,
         capella::Withdrawal,
         electra,
         gloas::{
@@ -346,6 +347,9 @@ pub struct GloasBlockInputs {
     /// The payload's own requests, which the bid commits to by root and the
     /// envelope carries.
     pub execution_requests: ExecutionRequests,
+    /// The block's sync aggregate: `empty_sync_aggregate`, or what
+    /// `verified_sync_aggregate` vouched for.
+    pub sync_aggregate: SyncAggregate,
 }
 
 /// A produced block and the unsigned envelope that reveals its payload.
@@ -394,7 +398,7 @@ pub fn assemble_gloas_block(
         eth1_data: state.eth1_data().clone(),
         graffiti: inputs.graffiti,
         attestations: inputs.attestations.into(),
-        sync_aggregate: empty_sync_aggregate(),
+        sync_aggregate: inputs.sync_aggregate,
         signed_execution_payload_bid: SignedExecutionPayloadBid {
             message: bid,
             signature: BlsSignature(bls::G2_POINT_AT_INFINITY),
@@ -509,7 +513,7 @@ fn check_envelope(
 pub mod test_support {
     use super::*;
     use crate::beacon::ForkName;
-    use crate::beacon::block_production::advance_to_slot;
+    use crate::beacon::block_production::{advance_to_slot, empty_sync_aggregate};
     use crate::beacon::helpers::accessors::get_domain;
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
     use crate::beacon::helpers::gloas::compute_ptc;
@@ -613,6 +617,7 @@ pub mod test_support {
         assemble_gloas_block(
             state,
             GloasBlockInputs {
+                sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(state),
                 graffiti: Bytes32::repeat_byte(7),
                 attestations: Vec::new(),
@@ -669,7 +674,8 @@ mod gloas_block_production_tests {
     use super::super::stf::ExecutionEngine;
     use super::test_support::*;
     use super::*;
-    use crate::beacon::helpers::accessors::get_domain;
+    use crate::beacon::block_production::empty_sync_aggregate;
+    use crate::beacon::helpers::accessors::{get_block_root_at_slot, get_domain};
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::sign_for;
 
@@ -703,6 +709,66 @@ mod gloas_block_production_tests {
             payload_present: present,
             blob_data_available: true,
         }
+    }
+
+    /// A sync aggregate of committee `positions` signing `root` under the
+    /// state's own domain for slot `state.slot - 1`.
+    fn sync_aggregate_over(state: &BeaconState, root: Root, positions: &[usize]) -> SyncAggregate {
+        let previous_slot = state.slot() - 1;
+        let domain = get_domain(
+            state,
+            constants::DOMAIN_SYNC_COMMITTEE,
+            Some(previous_slot / preset::SLOTS_PER_EPOCH),
+        );
+        let signing_root = compute_signing_root(root, domain);
+        let (committee, _) = state.sync_committees().unwrap();
+        let mut aggregate = empty_sync_aggregate();
+        let mut signatures = Vec::new();
+        for &position in positions {
+            let pubkey = committee.pubkeys[position];
+            let index = (0..64)
+                .find(|&index| state.validator(index).unwrap().pubkey == pubkey)
+                .expect("the committee is drawn from the registry");
+            signatures.push(sign_for(index as usize, signing_root));
+            aggregate.sync_committee_bits.set(position, true).unwrap();
+        }
+        aggregate.sync_committee_signature = bls::aggregate(&signatures).unwrap();
+        aggregate
+    }
+
+    #[test]
+    fn a_verified_sync_aggregate_is_packed_and_a_wrong_one_is_replaced() {
+        use crate::beacon::block_production::verified_sync_aggregate;
+
+        let state = state_to_build_on();
+        let parent_root = get_block_root_at_slot(&state, state.slot() - 1).unwrap();
+        let good = sync_aggregate_over(&state, parent_root, &[0, 1, 2]);
+        assert_eq!(verified_sync_aggregate(&state, good.clone()), good);
+        let wrong = sync_aggregate_over(&state, Root::repeat_byte(1), &[0, 1, 2]);
+        assert_eq!(
+            verified_sync_aggregate(&state, wrong),
+            empty_sync_aggregate()
+        );
+
+        let requests = ExecutionRequests::default();
+        let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+        let produced = assemble_gloas_block(
+            &state,
+            GloasBlockInputs {
+                sync_aggregate: good.clone(),
+                randao_reveal: randao_reveal(&state),
+                graffiti: Bytes32::repeat_byte(7),
+                attestations: Vec::new(),
+                payload_attestations: Vec::new(),
+                parent_execution_requests: requests,
+                execution_payload: payload_for(&inputs),
+                blob_kzg_commitments: Vec::new(),
+                execution_requests: ExecutionRequests::default(),
+            },
+            &config(),
+        )
+        .unwrap();
+        assert_eq!(produced.block.body.sync_aggregate, good);
     }
 
     #[test]
@@ -835,6 +901,7 @@ mod gloas_block_production_tests {
         let result = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
                 attestations: Vec::new(),
@@ -865,6 +932,7 @@ mod gloas_block_production_tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
                 attestations: Vec::new(),
@@ -1018,6 +1086,7 @@ mod gloas_block_production_tests {
         assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                sync_aggregate: empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
                 attestations: packed,
