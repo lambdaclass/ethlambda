@@ -72,6 +72,7 @@ pub mod aggregate;
 pub mod attestation_pool;
 pub mod block_production;
 pub mod bls;
+pub mod builder_market;
 pub mod das;
 pub mod fork_choice;
 pub mod genesis;

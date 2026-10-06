@@ -347,6 +347,42 @@ pub struct GloasBlockInputs {
     pub execution_requests: ExecutionRequests,
 }
 
+/// What a gloas block body carries when it commits to another builder's bid
+/// rather than to a payload this node built.
+#[derive(Debug, Clone)]
+pub struct GloasBidBlockInputs {
+    pub randao_reveal: BlsSignature,
+    pub graffiti: Bytes32,
+    pub attestations: Vec<gloas::Attestation>,
+    pub payload_attestations: Vec<PayloadAttestation>,
+    pub parent_execution_requests: ExecutionRequests,
+    pub signed_bid: SignedExecutionPayloadBid,
+}
+
+/// The unsigned block for `state.slot()` committing to `inputs.signed_bid`.
+/// `process_block` on a copy fills `state_root` and enforces
+/// `process_execution_payload_bid` (active, cover, signature, slot, parent
+/// hash and root, randao). No envelope: the builder reveals it.
+#[allow(dead_code)] // filled by Agent A
+pub fn assemble_gloas_block_on_bid(
+    _state: &BeaconState,
+    _inputs: GloasBidBlockInputs,
+    _config: &Config,
+) -> Result<BeaconBlock> {
+    Err(Error::SpecAssert("unimplemented"))
+}
+
+/// Cheap pre-filter on the state advanced to the slot: whether the bid could
+/// be packed into a block on `state`. The signature is not checked here.
+#[allow(dead_code)] // filled by Agent A
+pub fn bid_is_includable(
+    _state: &BeaconState,
+    _signed_bid: &SignedExecutionPayloadBid,
+    _parent_requests: &ExecutionRequests,
+) -> bool {
+    false
+}
+
 /// A produced block and the unsigned envelope that reveals its payload.
 #[derive(Debug, Clone)]
 pub struct GloasProduced {

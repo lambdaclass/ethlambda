@@ -51,6 +51,10 @@ pub const SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF: &str = "sync_committee_contribu
 pub const EXECUTION_PAYLOAD: &str = "execution_payload";
 /// Topic kind for gloas payload timeliness committee votes.
 pub const PAYLOAD_ATTESTATION_MESSAGE: &str = "payload_attestation_message";
+/// Topic kind for gloas builder bids.
+pub const EXECUTION_PAYLOAD_BID: &str = "execution_payload_bid";
+/// Topic kind for gloas proposer preferences.
+pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
 
 /// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
 /// the gloas digest on and never under an earlier one.
