@@ -192,6 +192,7 @@ impl BlockChain {
             pending_blocks: HashMap::new(),
             aggregator,
             pending_block_parents: HashMap::new(),
+            invalid_blocks: HashMap::new(),
             current_aggregation: None,
             last_tick_instant: None,
             attestation_committee_count,
@@ -273,6 +274,16 @@ pub struct BlockChainServer {
     // chain at lookup time, since a cached ancestor may itself have become pending with
     // a deeper missing parent after the entry was created.
     pending_block_parents: HashMap<H256, H256>,
+
+    /// Roots of blocks that failed the state transition, with their slots.
+    ///
+    /// A child of one of these can never import, so it is rejected instead of
+    /// stored as pending. Only state transition failures are recorded: they
+    /// depend on the block message alone, which the root commits to, and the
+    /// block already passed signature verification, so only a misbehaving
+    /// validator can add an entry. Entries at or below the finalized slot are
+    /// pruned, since blocks there are rejected by slot anyway.
+    invalid_blocks: HashMap<H256, u64>,
 
     /// Whether this node acts as a committee aggregator.
     ///
@@ -969,6 +980,13 @@ impl BlockChainServer {
         self.store
             .prune_old_data()
             .expect("DB pruning should succeed");
+
+        let finalized_slot = self
+            .store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists")
+            .slot;
+        self.prune_invalid_blocks(finalized_slot);
     }
 
     /// Try to process a single block. If its parent state is missing, store it
@@ -1025,6 +1043,34 @@ impl BlockChainServer {
             .has_state(&parent_root)
             .expect("DB read should succeed")
         {
+            // Pending blocks are persisted and served to peers, so check what
+            // can be checked without the parent state before storing. A
+            // rejected block can never import, and neither can any children
+            // that arrived ahead of it.
+            if self.invalid_blocks.contains_key(&parent_root) {
+                warn!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    "Rejecting block: parent failed the state transition"
+                );
+                self.discard_pending_subtree(block_root);
+                return;
+            }
+            if let Err(err) = store::validate_pending_block(&self.store, &signed_block) {
+                warn!(
+                    %slot,
+                    proposer,
+                    block_root = %ShortRoot(&block_root.0),
+                    parent_root = %ShortRoot(&parent_root.0),
+                    %err,
+                    "Rejecting block with missing parent"
+                );
+                self.discard_pending_subtree(block_root);
+                return;
+            }
+
             info!(%slot, %parent_root, %block_root, "Block parent missing, storing as pending");
 
             // Resolve the actual missing ancestor by walking the chain. A stale entry
@@ -1123,6 +1169,7 @@ impl BlockChainServer {
                     %err,
                     "Failed to process block"
                 );
+                self.on_import_failure(block_root, slot, &err);
             }
         }
     }
@@ -1195,11 +1242,43 @@ impl BlockChainServer {
         }
     }
 
+    /// React to a block whose import failed with `err`.
+    ///
+    /// Only a state transition failure condemns the root: it depends on the
+    /// block message alone, which the root commits to. The block is recorded
+    /// as invalid, and it and any children waiting on it are discarded along
+    /// with their rows.
+    ///
+    /// Every other failure is left alone. Some depend on the proof, which the
+    /// root does not cover, so a bad copy of a real block would otherwise
+    /// condemn the real one. Others depend on time, and may pass later.
+    fn on_import_failure(&mut self, block_root: H256, slot: u64, err: &StoreError) {
+        if !matches!(err, StoreError::StateTransitionFailed(_)) {
+            return;
+        }
+        self.invalid_blocks.insert(block_root, slot);
+        self.discard_pending_subtree(block_root);
+    }
+
+    /// Forget invalid blocks at or below `finalized_slot`. Blocks there are
+    /// rejected by slot before the invalid set is consulted.
+    fn prune_invalid_blocks(&mut self, finalized_slot: u64) {
+        self.invalid_blocks.retain(|_, slot| *slot > finalized_slot);
+    }
+
     /// Recursively discard a block and all its pending descendants.
     ///
     /// Used when a block is rejected (e.g., at/below finalized slot) to clean up
     /// children that would otherwise remain stuck in the pending maps indefinitely.
+    ///
+    /// Each discarded block's stored rows are deleted too, so peers stop being
+    /// served blocks we will never import. `delete_pending_block` leaves any
+    /// block with a state alone, which matters here: the root can be an
+    /// already-imported block at or below the finalized slot.
     fn discard_pending_subtree(&mut self, block_root: H256) {
+        self.store
+            .delete_pending_block(&block_root)
+            .expect("DB delete should succeed");
         let Some(child_roots) = self.pending_blocks.remove(&block_root) else {
             return;
         };
@@ -1620,6 +1699,319 @@ mod tests {
         assert_eq!(
             aggregation_deadline(config.milliseconds_per_interval()),
             Duration::from_millis(1_600)
+        );
+    }
+
+    // ============ Pending Block Tests ============
+
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::{
+        block::{Block, BlockBody, MultiMessageAggregate},
+        state::State,
+    };
+    use std::sync::Arc;
+
+    /// Actor with no validators, no P2P handle, and default policies around
+    /// `store`. Enough to drive block import and the pending-block maps.
+    fn test_server(store: Store) -> BlockChainServer {
+        BlockChainServer {
+            store,
+            p2p: None,
+            key_manager: key_manager::KeyManager::new(HashMap::new()),
+            pending_blocks: HashMap::new(),
+            pending_block_parents: HashMap::new(),
+            invalid_blocks: HashMap::new(),
+            aggregator: AggregatorController::new(false),
+            current_aggregation: None,
+            last_tick_instant: None,
+            attestation_committee_count: 1,
+            subscribed_subnets: HashSet::new(),
+            aggregation_duty_subnet: 0,
+            skip_redundant_aggregation: false,
+            proposer_config: ProposerConfig {
+                enable_proposer_aggregation: false,
+                max_attestations_per_block: MAX_ATTESTATIONS_DATA,
+            },
+            pre_merge_coverage: None,
+            sync_status: SyncStatusTracker::new(false),
+            sync_status_controller: SyncStatusController::default(),
+            events: EventBus::default(),
+        }
+    }
+
+    /// Registry size for the pending-block tests: the proposer for slot `s` is
+    /// `s % PENDING_VALIDATORS`.
+    const PENDING_VALIDATORS: u64 = 4;
+
+    /// A registry of `count` validators with placeholder keys, enough for the
+    /// proposer and index checks, which never decode a key.
+    fn make_validators(count: u64) -> Vec<ethlambda_types::state::Validator> {
+        (0..count)
+            .map(|index| ethlambda_types::state::Validator {
+                attestation_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                proposal_pubkey: ethlambda_types::state::ValidatorPubkeyBytes::default(),
+                index,
+            })
+            .collect()
+    }
+
+    /// Store anchored at a genesis of `PENDING_VALIDATORS` validators, with
+    /// the clock far enough ahead that the test blocks' slots have started.
+    fn pending_test_store() -> Store {
+        let backend = Arc::new(InMemoryBackend::new());
+        let validators = make_validators(PENDING_VALIDATORS);
+        let genesis_state = State::from_genesis(GENESIS_TIME, validators);
+        let mut store =
+            Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT);
+        store
+            .set_time(100 * INTERVALS_PER_SLOT)
+            .expect("set store time");
+        store
+    }
+
+    /// An empty-bodied block from the slot's proposer.
+    fn empty_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: slot % PENDING_VALIDATORS,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
+    /// Record `block` as pending the way the pending path does, with
+    /// `missing_root` as its deepest missing ancestor, and return its root.
+    ///
+    /// Bypasses validation on purpose: a block can only pass the signature
+    /// check with a real proof from the leanVM prover, so tests that need a
+    /// block already pending set the state up directly.
+    fn insert_pending(
+        server: &mut BlockChainServer,
+        block: SignedBlock,
+        missing_root: H256,
+    ) -> H256 {
+        let root = block.message.hash_tree_root();
+        let parent_root = block.message.parent_root;
+        server.store.insert_pending_block(root, block).unwrap();
+        server
+            .pending_blocks
+            .entry(parent_root)
+            .or_default()
+            .insert(root);
+        server.pending_block_parents.insert(root, missing_root);
+        root
+    }
+
+    /// Pend `a(5) <- b(6)` under a parent that is never stored, returning
+    /// `(missing_root, root_a, root_b)`.
+    fn pend_two_block_chain(server: &mut BlockChainServer) -> (H256, H256, H256) {
+        let missing_root = H256([0xAB; 32]);
+        let root_a = insert_pending(server, empty_block(5, missing_root), missing_root);
+        let root_b = insert_pending(server, empty_block(6, root_a), missing_root);
+        (missing_root, root_a, root_b)
+    }
+
+    /// Discarding a pending subtree drops its blocks from disk as well as from
+    /// the in-memory maps, so they stop being served over BlocksByRoot.
+    #[test]
+    fn discard_pending_subtree_deletes_descendant_rows() {
+        let mut server = test_server(pending_test_store());
+        let (missing_root, root_a, root_b) = pend_two_block_chain(&mut server);
+
+        server.discard_pending_subtree(missing_root);
+
+        assert!(server.store.get_block_header(&root_a).unwrap().is_none());
+        assert!(server.store.get_block_header(&root_b).unwrap().is_none());
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// A pending block whose slot finalization has passed is discarded when
+    /// its parent finally lands. Its own rows go too, not only its children's.
+    #[test]
+    fn discard_pending_subtree_deletes_pending_root_rows() {
+        let mut server = test_server(pending_test_store());
+        let (_missing_root, root_a, root_b) = pend_two_block_chain(&mut server);
+
+        server.discard_pending_subtree(root_a);
+
+        assert!(server.store.get_block_header(&root_a).unwrap().is_none());
+        assert!(server.store.get_block_header(&root_b).unwrap().is_none());
+    }
+
+    /// An orphan that fails pending validation is neither written to disk nor
+    /// tracked in the pending maps, and no parent fetch is started for it.
+    #[test]
+    fn invalid_orphan_is_neither_stored_nor_pended() {
+        let mut server = test_server(pending_test_store());
+        let mut block = empty_block(5, H256([0xAB; 32]));
+        // Slot 5's proposer is 1; validator 2 is out of turn.
+        block.message.proposer_index = 2;
+        let block_root = block.message.hash_tree_root();
+
+        server.on_block(block);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&block_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// Children can arrive before their parent. When the parent turns out to
+    /// be invalid, the children already waiting on it can never import, so
+    /// they are discarded along with their rows.
+    #[test]
+    fn invalid_orphan_discards_its_waiting_children() {
+        let mut server = test_server(pending_test_store());
+        let mut parent = empty_block(5, H256([0xAB; 32]));
+        parent.message.proposer_index = 2;
+        let parent_root = parent.message.hash_tree_root();
+        let child_root = insert_pending(&mut server, empty_block(6, parent_root), parent_root);
+
+        server.on_block(parent);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&parent_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// Pend `child(6)` under `parent_root`, which is never stored, and return
+    /// the child's root.
+    fn pend_child_of(server: &mut BlockChainServer, parent_root: H256) -> H256 {
+        insert_pending(server, empty_block(6, parent_root), parent_root)
+    }
+
+    /// A state transition failure that depends on the message alone.
+    fn state_transition_failure() -> StoreError {
+        StoreError::StateTransitionFailed(ethlambda_state_transition::Error::StateRootMismatch {
+            expected: H256::ZERO,
+            computed: H256([1; 32]),
+        })
+    }
+
+    /// A block whose parent already failed the state transition can never
+    /// import, so it is neither stored nor pended.
+    #[test]
+    fn child_of_invalid_block_is_rejected() {
+        let mut server = test_server(pending_test_store());
+        let invalid_root = H256([0xCD; 32]);
+        server.invalid_blocks.insert(invalid_root, 5);
+        let child = empty_block(6, invalid_root);
+        let child_root = child.message.hash_tree_root();
+
+        server.on_block(child);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// A state transition failure is bound to the root, so the block is
+    /// remembered as invalid and the children waiting on it are discarded.
+    #[test]
+    fn state_transition_failure_marks_block_invalid_and_discards_children() {
+        let mut server = test_server(pending_test_store());
+        let failed_root = H256([0xCD; 32]);
+        let child_root = pend_child_of(&mut server, failed_root);
+
+        server.on_import_failure(failed_root, 5, &state_transition_failure());
+
+        assert_eq!(server.invalid_blocks.get(&failed_root), Some(&5));
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_none()
+        );
+        assert!(server.pending_blocks.is_empty());
+        assert!(server.pending_block_parents.is_empty());
+    }
+
+    /// The root does not cover the proof, so a copy of a real block with a
+    /// bad proof fails verification under the real block's root. That
+    /// failure must not mark the root invalid or drop its children, or anyone
+    /// could kill a real block by racing a bad copy of it.
+    #[test]
+    fn signature_failure_neither_marks_invalid_nor_discards_children() {
+        let mut server = test_server(pending_test_store());
+        let failed_root = H256([0xCD; 32]);
+        let child_root = pend_child_of(&mut server, failed_root);
+
+        server.on_import_failure(failed_root, 5, &StoreError::SignatureVerificationFailed);
+
+        assert!(server.invalid_blocks.is_empty());
+        assert!(
+            server
+                .store
+                .get_block_header(&child_root)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            server.pending_block_parents.get(&child_root),
+            Some(&failed_root)
+        );
+    }
+
+    /// Entries at or below the finalized slot are dropped; later ones stay.
+    #[test]
+    fn invalid_blocks_are_pruned_at_finalization() {
+        let mut server = test_server(pending_test_store());
+        let at_finalized = H256([1; 32]);
+        let above_finalized = H256([2; 32]);
+        server.invalid_blocks.insert(at_finalized, 5);
+        server.invalid_blocks.insert(above_finalized, 6);
+
+        server.prune_invalid_blocks(5);
+
+        assert!(!server.invalid_blocks.contains_key(&at_finalized));
+        assert!(server.invalid_blocks.contains_key(&above_finalized));
+    }
+
+    /// The subtree root can be an imported block, such as one at or below the
+    /// finalized slot that arrives again. Its rows must survive the discard.
+    #[test]
+    fn discard_pending_subtree_keeps_imported_root() {
+        let mut server = test_server(pending_test_store());
+        let anchor_root = server.store.head().expect("head root");
+
+        server.discard_pending_subtree(anchor_root);
+
+        assert!(
+            server
+                .store
+                .get_block_header(&anchor_root)
+                .unwrap()
+                .is_some()
         );
     }
 }

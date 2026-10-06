@@ -1244,6 +1244,38 @@ impl Store {
         Ok(())
     }
 
+    /// Delete a block that was stored by [`insert_pending_block`](Self::insert_pending_block)
+    /// but never imported.
+    ///
+    /// Removes the `BlockHeaders`/`BlockBodies`/`BlockProof` rows so a
+    /// discarded or invalid pending block stops being served over
+    /// `BlocksByRoot`. A block with a state was imported and is part of the
+    /// chain, so it is left untouched; the same goes for a root with no stored
+    /// header. Returns whether anything was deleted.
+    pub fn delete_pending_block(&mut self, root: &H256) -> Result<bool, Error> {
+        if self.has_state(root)? {
+            return Ok(false);
+        }
+        let Some(header) = self.get_block_header(root)? else {
+            return Ok(false);
+        };
+
+        let root_key = root.to_ssz();
+        let proof_key = encode_slot_root_key(header.slot, root);
+        let mut batch = self.backend.begin_write().expect("write batch");
+        batch
+            .delete_batch(Table::BlockHeaders, vec![root_key.clone()])
+            .expect("delete pending block header");
+        batch
+            .delete_batch(Table::BlockBodies, vec![root_key])
+            .expect("delete pending block body");
+        batch
+            .delete_batch(Table::BlockProof, vec![proof_key])
+            .expect("delete pending block proof");
+        batch.commit().expect("commit");
+        Ok(true)
+    }
+
     /// Insert a signed block, storing the block and signatures separately.
     ///
     /// Blocks and signatures are stored in separate tables because the genesis
@@ -3653,5 +3685,79 @@ mod tests {
                 .expect("Failed to get store")
                 .is_none()
         );
+    }
+
+    // ============ Pending Block Deletion Tests ============
+
+    /// A pending block's header, body, and proof rows are all removed, so it
+    /// is no longer served over BlocksByRoot.
+    #[test]
+    fn delete_pending_block_removes_all_block_rows() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+
+        // A non-empty body, so the BlockBodies row is written too.
+        let data = make_att_data_for_target(1, root(1));
+        let block = signed_block_with_attestations(
+            5,
+            root(99),
+            vec![AggregatedAttestation {
+                aggregation_bits: make_proof_for_validators(&[0]).participants,
+                data,
+            }],
+        );
+        let block_root = block.message.hash_tree_root();
+        store
+            .insert_pending_block(block_root, block)
+            .expect("insert pending block");
+        assert!(has_key(backend.as_ref(), Table::BlockHeaders, &block_root));
+        assert!(has_key(backend.as_ref(), Table::BlockBodies, &block_root));
+        assert!(has_block_proof(backend.as_ref(), 5, &block_root));
+
+        let deleted = store
+            .delete_pending_block(&block_root)
+            .expect("delete pending block");
+
+        assert!(deleted);
+        assert!(!has_key(backend.as_ref(), Table::BlockHeaders, &block_root));
+        assert!(!has_key(backend.as_ref(), Table::BlockBodies, &block_root));
+        assert!(!has_block_proof(backend.as_ref(), 5, &block_root));
+        assert!(store.get_signed_block(&block_root).unwrap().is_none());
+    }
+
+    /// A block with a state was imported, so it must survive: discarding a
+    /// pending subtree can be triggered by a canonical block's root.
+    #[test]
+    fn delete_pending_block_keeps_imported_block() {
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(
+            backend.clone(),
+            State::from_genesis(0, vec![]),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let anchor_root = store.head().expect("head root");
+
+        let deleted = store
+            .delete_pending_block(&anchor_root)
+            .expect("delete call succeeds");
+
+        assert!(!deleted);
+        assert!(has_key(backend.as_ref(), Table::BlockHeaders, &anchor_root));
+    }
+
+    /// An unknown root is a no-op rather than an error.
+    #[test]
+    fn delete_pending_block_ignores_unknown_root() {
+        let mut store = Store::test_store();
+
+        let deleted = store
+            .delete_pending_block(&root(42))
+            .expect("delete call succeeds");
+
+        assert!(!deleted);
     }
 }

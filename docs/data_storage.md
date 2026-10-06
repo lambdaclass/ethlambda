@@ -251,6 +251,15 @@ while the block waits for its parent. When the block is later processed,
 `insert_signed_block` overwrites the same keys (idempotent) and adds the
 `LiveChain` entry.
 
+Pending rows are served to peers over BlocksByRoot like any other block, so
+a block is checked before it is written this way (`validate_pending_block`
+in `crates/blockchain/src/store.rs`). Every check that needs no parent state
+runs: body structure, proposer, validator indices, the parent's slot and
+fork when its header is stored, and finally the block signature. A pending
+block that is later discarded, or that fails its state transition, has its
+rows deleted by `delete_pending_block`, which never touches a block that has
+a state.
+
 ## State Storage: Snapshots + Diffs
 
 Storing a full `State` per block would be wasteful: most fields never change
@@ -388,10 +397,20 @@ processed):
   not needed for fork choice, reorg safety, or re-aggregation once outside
   the window.
 
+**When a pending block is discarded** (in the BlockChain actor):
+
+- `delete_pending_block`: deletes the `BlockHeaders`, `BlockBodies`, and
+  `BlockProof` rows of a block that was stored as pending but never
+  imported. This runs for a block rejected by slot or by validation, for one
+  that fails its state transition, and for every pending descendant of
+  either. A block with a state is left untouched.
+
 **Never pruned:** `BlockHeaders`, `BlockBodies`, `BlockRoots`, `States`,
 `StateDiffs`, and `Metadata`. Headers, bodies, the canonical slot index, and
 the snapshot+diff chain are the full historical record; only the proof blobs
-and the (non-finalized) fork choice index are disposable.
+and the (non-finalized) fork choice index are disposable. The one exception
+is the header and body of a pending block that never imports, which were
+never part of that record.
 
 ## In-Memory Only (Lost on Restart)
 

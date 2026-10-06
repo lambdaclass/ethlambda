@@ -176,6 +176,11 @@ walking back through already-stored pending blocks, in `pending_block_parents`. 
 is what it asks the `P2PServer` to fetch. Once the ancestor lands, the actor cascades down
 the parent index and re-imports every block that was waiting.
 
+Parked blocks are written to disk and served to peers, so the actor first runs every check
+that needs no parent state, ending with the signature, and rejects any block whose parent
+failed the state transition. A rejected block is discarded along with any children waiting on
+it, and their stored rows are deleted.
+
 ### Chain events
 
 The actor is the sole publisher on an `EventBus` (`crates/blockchain/src/events.rs`), which

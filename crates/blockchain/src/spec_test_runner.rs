@@ -95,6 +95,12 @@ pub fn rejection_reason(err: &StoreError) -> Option<RejectionReason> {
         | StoreError::SignatureAggregationFailed(_)
         | StoreError::MissingTargetState(_)
         | StoreError::SlotOutOfRange(_) => return None,
+
+        // Raised only before a parentless block is stored as pending, a step
+        // the spec does not have, so fixtures never reach them.
+        StoreError::InvalidParentRoot { .. }
+        | StoreError::ParentSlotNotBefore { .. }
+        | StoreError::ParentConflictsWithFinalized { .. } => return None,
     };
     Some(reason)
 }

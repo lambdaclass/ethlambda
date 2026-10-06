@@ -680,24 +680,7 @@ fn on_block_core(
         });
     }
 
-    // Each unique AttestationData must appear at most once per block.
-    let attestations = &signed_block.message.body.attestations;
-    let mut seen = HashSet::with_capacity(attestations.len());
-    for att in attestations {
-        if !seen.insert(&att.data) {
-            return Err(StoreError::DuplicateAttestationData {
-                count: attestations.len(),
-                unique: seen.len(),
-            });
-        }
-    }
-    // Reject blocks exceeding the per-block distinct-attestation-data cap (leanSpec #536).
-    if seen.len() > MAX_ATTESTATIONS_DATA {
-        return Err(StoreError::TooManyAttestationData {
-            count: seen.len(),
-            max: MAX_ATTESTATIONS_DATA,
-        });
-    }
+    validate_block_attestations(&signed_block.message)?;
 
     let sig_verification_start = std::time::Instant::now();
     if verify {
@@ -1166,6 +1149,157 @@ pub enum StoreError {
 
     #[error("Block slot {block_slot} is beyond the future horizon (current slot: {current_slot})")]
     BlockTooFarInFuture { block_slot: u64, current_slot: u64 },
+
+    /// A block names the zero root or its own root as parent, so its parent
+    /// can never be fetched.
+    #[error("Block parent root {parent_root} is the zero root or the block's own root")]
+    InvalidParentRoot { parent_root: H256 },
+
+    /// A block's slot does not come after its stored parent's slot, so the
+    /// header check in the state transition would reject it.
+    #[error("Block slot {block_slot} is not after its parent's slot {parent_slot}")]
+    ParentSlotNotBefore { block_slot: u64, parent_slot: u64 },
+
+    /// A block's parent sits at or below the finalized slot but is not the
+    /// finalized block, so it is on a fork finality already discarded.
+    #[error(
+        "Parent {parent_root} at slot {parent_slot} conflicts with finalized block {finalized_root} at slot {finalized_slot}"
+    )]
+    ParentConflictsWithFinalized {
+        parent_root: H256,
+        parent_slot: u64,
+        finalized_root: H256,
+        finalized_slot: u64,
+    },
+}
+
+/// Check a block whose parent state is missing before it is stored as pending.
+///
+/// Pending blocks are persisted and served to peers over BlocksByRoot, so a
+/// block that can never import is rejected here instead. Only checks that
+/// need no parent state can run, cheapest first.
+///
+/// The validator registry comes from the head state rather than the
+/// finalized one. The registry is fixed at genesis, so both give the same
+/// answer, and the head state is almost always in the state cache.
+pub fn validate_pending_block(store: &Store, signed_block: &SignedBlock) -> Result<(), StoreError> {
+    validate_pending_block_core(store, signed_block, true)
+}
+
+/// [`validate_pending_block`], with the signature check skipped when `verify`
+/// is false. Mirrors [`on_block_core`]: only tests skip verification, since a
+/// real proof needs the leanVM prover.
+fn validate_pending_block_core(
+    store: &Store,
+    signed_block: &SignedBlock,
+    verify: bool,
+) -> Result<(), StoreError> {
+    let block = &signed_block.message;
+    let parent_root = block.parent_root;
+
+    // A parent that is the zero root or the block itself can never be fetched.
+    if parent_root == H256::ZERO || parent_root == block.hash_tree_root() {
+        return Err(StoreError::InvalidParentRoot { parent_root });
+    }
+
+    validate_block_attestations(block)?;
+
+    let head_state = store.head_state();
+    let num_validators = head_state.validators.len() as u64;
+    if !is_proposer(block.proposer_index, block.slot, num_validators) {
+        return Err(StoreError::NotProposer {
+            validator_index: block.proposer_index,
+            slot: block.slot,
+        });
+    }
+    validate_validator_indices(block, num_validators)?;
+
+    // The parent's header is on disk when it is itself pending, which is how
+    // a deep gap is filled. Its slot and position relative to finality are
+    // then known even though its state is not.
+    if let Some(parent) = store
+        .get_block_header(&parent_root)
+        .expect("DB read should succeed")
+    {
+        if block.slot <= parent.slot {
+            return Err(StoreError::ParentSlotNotBefore {
+                block_slot: block.slot,
+                parent_slot: parent.slot,
+            });
+        }
+        let finalized = store
+            .latest_finalized()
+            .expect("latest finalized checkpoint exists");
+        if parent.slot <= finalized.slot && parent_root != finalized.root {
+            return Err(StoreError::ParentConflictsWithFinalized {
+                parent_root,
+                parent_slot: parent.slot,
+                finalized_root: finalized.root,
+                finalized_slot: finalized.slot,
+            });
+        }
+    }
+
+    // Last, since it is by far the most expensive check: a forged block is
+    // turned away by everything above without reaching the SNARK verifier.
+    // Signature verification reads only the registry, which the head state
+    // shares with any other. Import verifies again once the parent arrives.
+    if verify {
+        verify_block_signatures(&head_state, signed_block)?;
+    }
+
+    Ok(())
+}
+
+/// Reject a block body that repeats an `AttestationData` or carries more
+/// distinct ones than `MAX_ATTESTATIONS_DATA` (leanSpec #536).
+///
+/// A repeated entry would let one block count the same validators' votes more
+/// than once. Needs nothing but the block itself.
+fn validate_block_attestations(block: &Block) -> Result<(), StoreError> {
+    let attestations = &block.body.attestations;
+    let mut seen = HashSet::with_capacity(attestations.len());
+    for att in attestations {
+        if !seen.insert(&att.data) {
+            return Err(StoreError::DuplicateAttestationData {
+                count: attestations.len(),
+                unique: seen.len(),
+            });
+        }
+    }
+    if seen.len() > MAX_ATTESTATIONS_DATA {
+        return Err(StoreError::TooManyAttestationData {
+            count: seen.len(),
+            max: MAX_ATTESTATIONS_DATA,
+        });
+    }
+    Ok(())
+}
+
+/// Reject a block naming a validator outside a registry of `num_validators`:
+/// any participant bit in an attestation, or the proposer.
+///
+/// Attesters are checked first, then the proposer, and each gets its own
+/// error, since the spec names them distinctly (`VALIDATOR_INDEX_OUT_OF_RANGE`
+/// vs `PROPOSER_INDEX_OUT_OF_RANGE`).
+fn validate_validator_indices(block: &Block, num_validators: u64) -> Result<(), StoreError> {
+    for attestation in block.body.attestations.iter() {
+        for vid in validator_indices(&attestation.aggregation_bits) {
+            if vid >= num_validators {
+                return Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: vid,
+                    num_validators,
+                });
+            }
+        }
+    }
+    if block.proposer_index >= num_validators {
+        return Err(StoreError::ProposerIndexOutOfRange {
+            proposer_index: block.proposer_index,
+            num_validators,
+        });
+    }
+    Ok(())
 }
 
 /// Full verification of a signed block's merged multi-message aggregate proof.
@@ -1198,22 +1332,7 @@ pub fn verify_block_signatures(
     // Per-component pubkeys are resolved from the block body itself; the
     // wire proof carries no separate participant declaration to cross-check
     // against (leanSpec PR #717).
-    for attestation in attestations.iter() {
-        for vid in validator_indices(&attestation.aggregation_bits) {
-            if vid >= num_validators {
-                return Err(StoreError::AttesterIndexOutOfRange {
-                    validator_index: vid,
-                    num_validators,
-                });
-            }
-        }
-    }
-    if block.proposer_index >= num_validators {
-        return Err(StoreError::ProposerIndexOutOfRange {
-            proposer_index: block.proposer_index,
-            num_validators,
-        });
-    }
+    validate_validator_indices(block, num_validators)?;
 
     let block_root = block.hash_tree_root();
     let structural_elapsed = total_start.elapsed();
@@ -1477,6 +1596,49 @@ mod tests {
                 })
             ),
             "Expected DuplicateAttestationData, got: {result:?}"
+        );
+    }
+
+    /// One more distinct `AttestationData` than the cap is rejected before the
+    /// state transition runs.
+    #[test]
+    fn on_block_rejects_too_many_attestation_data() {
+        let mut store = new_test_store();
+        let head_root = store.head().expect("store head exists");
+
+        // Distinct entries: each names a different slot.
+        let entries: Vec<AggregatedAttestation> = (0..=MAX_ATTESTATIONS_DATA as u64)
+            .map(|slot| AggregatedAttestation {
+                aggregation_bits: make_bits(&[0]),
+                data: AttestationData {
+                    slot,
+                    head: Checkpoint::default(),
+                    target: Checkpoint::default(),
+                    source: Checkpoint::default(),
+                },
+            })
+            .collect();
+        let signed_block = SignedBlock {
+            message: Block {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: head_root,
+                state_root: H256::ZERO,
+                body: BlockBody {
+                    attestations: AggregatedAttestations::try_from(entries).unwrap(),
+                },
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let result = on_block_without_verification(&mut store, signed_block);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::TooManyAttestationData { count, max })
+                    if count == MAX_ATTESTATIONS_DATA + 1 && max == MAX_ATTESTATIONS_DATA
+            ),
+            "Expected TooManyAttestationData, got: {result:?}"
         );
     }
 
@@ -2158,6 +2320,257 @@ mod tests {
                 })
             ),
             "Expected ProposerIndexOutOfRange, got: {result:?}"
+        );
+    }
+
+    // ============ Pending Block Validation Tests ============
+
+    /// Registry size for the pending-block tests: the proposer for slot `s` is
+    /// `s % PENDING_VALIDATORS`.
+    const PENDING_VALIDATORS: u64 = 4;
+
+    /// A parent root no test ever stores.
+    const UNKNOWN_PARENT: H256 = H256([0xAB; 32]);
+
+    fn pending_test_store() -> Store {
+        use ethlambda_storage::backend::InMemoryBackend;
+        use std::sync::Arc;
+        let genesis_state = State::from_genesis(1000, make_validators(PENDING_VALIDATORS));
+        let backend = Arc::new(InMemoryBackend::new());
+        Store::from_anchor_state(backend, genesis_state, DEFAULT_MILLISECONDS_PER_SLOT)
+    }
+
+    /// A block that passes every pending check: the slot's proposer, an empty
+    /// body, and a parent we have never seen.
+    fn orphan_block(slot: u64, parent_root: H256) -> SignedBlock {
+        SignedBlock {
+            message: Block {
+                slot,
+                proposer_index: slot % PENDING_VALIDATORS,
+                parent_root,
+                state_root: H256::ZERO,
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        }
+    }
+
+    fn attestation_at(slot: u64, validators: &[usize]) -> AggregatedAttestation {
+        AggregatedAttestation {
+            aggregation_bits: make_bits(validators),
+            data: AttestationData {
+                slot,
+                head: Checkpoint::default(),
+                target: Checkpoint::default(),
+                source: Checkpoint::default(),
+            },
+        }
+    }
+
+    fn with_attestations(
+        mut block: SignedBlock,
+        entries: Vec<AggregatedAttestation>,
+    ) -> SignedBlock {
+        block.message.body.attestations = AggregatedAttestations::try_from(entries).unwrap();
+        block
+    }
+
+    /// Passes every check but the signature, which a placeholder proof cannot
+    /// satisfy, so verification is skipped here.
+    #[test]
+    fn validate_pending_block_accepts_well_formed_orphan() {
+        let store = pending_test_store();
+        let block = with_attestations(
+            orphan_block(5, UNKNOWN_PARENT),
+            vec![attestation_at(4, &[0, 3])],
+        );
+
+        let result = validate_pending_block_core(&store, &block, false);
+
+        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+    }
+
+    /// The normal deep-gap case: the parent is itself pending, stored but
+    /// without a state, at an earlier slot above finality. Verification is
+    /// skipped, as above.
+    #[test]
+    fn validate_pending_block_accepts_child_of_pending_parent() {
+        let mut store = pending_test_store();
+        let parent = orphan_block(5, UNKNOWN_PARENT);
+        let parent_root = parent.message.hash_tree_root();
+        store.insert_pending_block(parent_root, parent).unwrap();
+
+        let block = orphan_block(6, parent_root);
+        let result = validate_pending_block_core(&store, &block, false);
+
+        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
+    }
+
+    /// A block that passes every cheap check but carries no valid proof is a
+    /// forgery as far as we can tell, and must not be stored.
+    #[test]
+    fn validate_pending_block_rejects_invalid_proof() {
+        ethlambda_crypto::init_leanvm(false);
+        let store = pending_test_store();
+
+        let result = validate_pending_block(&store, &orphan_block(5, UNKNOWN_PARENT));
+
+        assert!(
+            matches!(result, Err(StoreError::BlockProofVerificationFailed(_))),
+            "Expected BlockProofVerificationFailed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_zero_parent_root() {
+        let store = pending_test_store();
+
+        let result = validate_pending_block(&store, &orphan_block(5, H256::ZERO));
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::InvalidParentRoot { parent_root }) if parent_root == H256::ZERO
+            ),
+            "Expected InvalidParentRoot, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_duplicate_attestation_data() {
+        let store = pending_test_store();
+        let block = with_attestations(
+            orphan_block(5, UNKNOWN_PARENT),
+            vec![attestation_at(4, &[0]), attestation_at(4, &[1])],
+        );
+
+        let result = validate_pending_block(&store, &block);
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::DuplicateAttestationData {
+                    count: 2,
+                    unique: 1
+                })
+            ),
+            "Expected DuplicateAttestationData, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_too_many_attestation_data() {
+        let store = pending_test_store();
+        let entries = (0..=MAX_ATTESTATIONS_DATA as u64)
+            .map(|slot| attestation_at(slot, &[0]))
+            .collect();
+        let block = with_attestations(orphan_block(20, UNKNOWN_PARENT), entries);
+
+        let result = validate_pending_block(&store, &block);
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::TooManyAttestationData { count, max })
+                    if count == MAX_ATTESTATIONS_DATA + 1 && max == MAX_ATTESTATIONS_DATA
+            ),
+            "Expected TooManyAttestationData, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_wrong_proposer() {
+        let store = pending_test_store();
+        let mut block = orphan_block(5, UNKNOWN_PARENT);
+        // Slot 5's proposer is 1, so 2 is a real validator out of turn.
+        block.message.proposer_index = 2;
+
+        let result = validate_pending_block(&store, &block);
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::NotProposer {
+                    validator_index: 2,
+                    slot: 5
+                })
+            ),
+            "Expected NotProposer, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_out_of_range_attester() {
+        let store = pending_test_store();
+        // Bit 4 is one past the last of the four registered validators.
+        let block = with_attestations(
+            orphan_block(5, UNKNOWN_PARENT),
+            vec![attestation_at(4, &[4])],
+        );
+
+        let result = validate_pending_block(&store, &block);
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::AttesterIndexOutOfRange {
+                    validator_index: 4,
+                    num_validators: 4
+                })
+            ),
+            "Expected AttesterIndexOutOfRange, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn validate_pending_block_rejects_slot_not_after_parent() {
+        let mut store = pending_test_store();
+        let parent = orphan_block(5, UNKNOWN_PARENT);
+        let parent_root = parent.message.hash_tree_root();
+        store.insert_pending_block(parent_root, parent).unwrap();
+
+        // Same slot as the stored parent.
+        let result = validate_pending_block(&store, &orphan_block(5, parent_root));
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::ParentSlotNotBefore {
+                    block_slot: 5,
+                    parent_slot: 5
+                })
+            ),
+            "Expected ParentSlotNotBefore, got: {result:?}"
+        );
+    }
+
+    /// A stored parent at the finalized slot that is not the finalized block
+    /// sits on a fork finality has discarded, so its child can never import.
+    #[test]
+    fn validate_pending_block_rejects_parent_conflicting_with_finalized() {
+        let mut store = pending_test_store();
+        let finalized = store.latest_finalized().unwrap();
+        // A slot-0 sibling of the genesis block, stored as pending.
+        let sibling = orphan_block(finalized.slot, UNKNOWN_PARENT);
+        let sibling_root = sibling.message.hash_tree_root();
+        store.insert_pending_block(sibling_root, sibling).unwrap();
+
+        let result = validate_pending_block(&store, &orphan_block(1, sibling_root));
+
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::ParentConflictsWithFinalized {
+                    parent_root,
+                    parent_slot,
+                    finalized_root,
+                    finalized_slot,
+                }) if parent_root == sibling_root
+                    && parent_slot == finalized.slot
+                    && finalized_root == finalized.root
+                    && finalized_slot == finalized.slot
+            ),
+            "Expected ParentConflictsWithFinalized, got: {result:?}"
         );
     }
 }
