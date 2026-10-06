@@ -246,14 +246,14 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for any epoch from the head's up to one past the wall clock's |
 | `GET` | `/eth/v2/validator/duties/proposer/{epoch}` | JSON | The same, with v2's `dependent_root` (what Lighthouse asks for) |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
-| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
+| `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, up to the wall clock's current period plus one |
 | `POST` | `/eth/v1/validator/liveness/{epoch}` | JSON | Whether this node saw each validator act in the epoch (doppelganger protection) |
 | `POST` | `/eth/v1/validator/duties/ptc/{epoch}` | JSON | Payload timeliness committee seats for the given indices (gloas) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `GET` | `/eth/v1/validator/payload_attestation_data` | JSON or SSZ | What a committee member signs for `slot` (gloas) |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s (JSON or SSZ body) |
 | `GET`, `POST` | `/eth/v1/beacon/pool/proposer_slashings` | JSON | The operation pool's `ProposerSlashing`s; validate, pool and gossip one |
-| `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`); validate, pool and gossip one |
+| `GET`, `POST` | `/eth/v2/beacon/pool/attester_slashings` | JSON | The pool's `AttesterSlashing`s (GET carries `Eth-Consensus-Version`, the fork of the wall clock's current epoch); validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/voluntary_exits` | JSON | The pool's `SignedVoluntaryExit`s; validate, pool and gossip one |
 | `GET`, `POST` | `/eth/v1/beacon/pool/bls_to_execution_changes` | JSON | The pool's `SignedBLSToExecutionChange`s; POST takes an array |
 | `POST` | `/eth/v1/beacon/pool/payload_attestations` | *(status only)* | Validate, pool and gossip `PayloadAttestationMessage`s (gloas; JSON or SSZ body) |
@@ -305,8 +305,13 @@ the chain actor writes, so no request waits on the actor.
   gloas head answers from its own lookahead.
 - **Sync duties** read the head state's `current_sync_committee` for an epoch in
   the head's own sync committee period and `next_sync_committee` for the one
-  after; any other period is a `400` (an earlier one would need a historical
-  state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
+  after. The upper bound is the wall clock's, as the Beacon API defines it: the
+  period after the clock's current one. When the head lags a period boundary
+  (its block is late or missing), the later period is read from a copy of the
+  head advanced to the first epoch of the period before it, through fork
+  choice's checkpoint-state cache on a blocking thread. A period past that
+  bound or before the head's is a `400` (an earlier one would need a
+  historical state; see `docs/spec_deviations.md`). A validator is matched by pubkey and
   gets every seat it holds, since the committee is drawn with replacement; one
   with no seat is left out. An unknown index is a `400`, and the endpoint is a
   `503` while the node is syncing. What a duty asks for is served by the four
