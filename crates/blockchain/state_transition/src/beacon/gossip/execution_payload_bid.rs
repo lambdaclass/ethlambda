@@ -962,8 +962,10 @@ mod tests {
 
     #[test]
     fn a_bid_across_an_epoch_uses_and_caches_the_checkpoint_state() {
-        let scene = scene();
-        let slot = 64;
+        // The parent is in epoch 2: a funded builder is active only after
+        // finality passes its deposit epoch, which an epoch-1 chain cannot have.
+        let scene = scene_at(64, |_| {});
+        let slot = 96;
         // Preferences for the later epoch's proposer.
         let dependent = dependent_root_at(&scene.state, PARENT, slot).expect("in the window");
         let proposer = fixed_proposer(&scene.state, slot).expect("in the lookahead window");
@@ -980,13 +982,13 @@ mod tests {
         assert!(scene.market.record_preferences(preferences, slot - 1));
         let bid = scene.signed(|bid| bid.slot = slot);
         let key = CacheKey::CheckpointState {
-            epoch: 2,
+            epoch: 3,
             root: PARENT,
         };
         assert!(scene.store.cached_state(key).is_none());
         assert_eq!(stateful(&scene, &bid), Outcome::Accept);
         let cached = scene.store.cached_state(key).expect("the advanced state");
-        assert_eq!(get_current_epoch(&cached), 2);
+        assert_eq!(get_current_epoch(&cached), 3);
         // A second bid finds it.
         assert_eq!(stateful(&scene, &bid), Outcome::Accept);
     }
