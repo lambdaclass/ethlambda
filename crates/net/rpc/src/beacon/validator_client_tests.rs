@@ -21,6 +21,7 @@ use ethlambda_state_transition::beacon::payload_attestation_pool::SharedPayloadA
 use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool, sync_committee_pool::SharedSyncCommitteePool,
 };
+use ethlambda_state_transition::beacon::{bls, helpers::test_state::secret_key_for};
 use ethlambda_types::{
     beacon::{
         constants::DOMAIN_BEACON_ATTESTER,
@@ -38,13 +39,17 @@ use ethlambda_validator::{
         AggregateKind, BeaconNodeApi, BlockRequest, SignedAggregates,
         dto::{
             AttestationDataOutDto, CommitteeSubscriptionDto, ProposerPreparationDto,
-            SingleAttestationDto, encode_hex,
+            SingleAttestationDto, SyncCommitteeSubscriptionDto, encode_hex,
         },
         http::HttpBeaconNode,
     },
+    keys::ValidatorStore,
+    signing::SigningContext,
+    sync_committee::{SyncCommitteeService, subnets_of},
 };
 
 use ethlambda_storage::Store;
+use tokio::sync::RwLock;
 
 use crate::test_utils::{RecordingNetwork, beacon_store_at};
 
@@ -122,6 +127,22 @@ async fn spawn_server(
 
     let client = HttpBeaconNode::new(format!("http://{address}")).unwrap();
     (client, network, payload_pool)
+}
+
+/// A key store holding the test registry's secret for each of `indices`.
+fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
+    let mut keys = ValidatorStore::new();
+    for &index in indices {
+        let pubkey = keys
+            .insert_secret("test", &secret_key_for(index as usize).to_bytes())
+            .expect("the test secret is a valid key");
+        assert_eq!(
+            pubkey,
+            state.validator(index).unwrap().pubkey,
+            "the test registry's key for validator {index}"
+        );
+    }
+    RwLock::new(keys)
 }
 
 /// One slot of an attester's work, in the order `ethlambda validator` does it.
@@ -439,22 +460,289 @@ async fn the_validator_client_can_propose_through_this_node() {
 }
 
 // ---------------------------------------------------------------------------
+// Sync committee
+// ---------------------------------------------------------------------------
+
+/// A fulu head state at the first slot of epoch 2, its header's root the one
+/// the store's head is under, served on a clock pinned to that slot.
+///
+/// Unlike [`serve`] the head root is the root a block built on this state
+/// names as its parent, which is the root `process_sync_aggregate` reads back
+/// out of the state's `block_roots`: a committee signs over the head, so the two
+/// must be the same root for the pooled aggregate to survive
+/// `verified_sync_aggregate`. The schedule has fulu from epoch 0 so the state's
+/// own `fork` and the client's schedule give one domain.
+async fn serve_fulu_pinned(
+    engine: Option<ethlambda_engine::EngineClient>,
+) -> (
+    Arc<HttpBeaconNode>,
+    BeaconState,
+    Arc<RecordingNetwork>,
+    Arc<SigningContext>,
+) {
+    use ethlambda_types::beacon::containers::shared::Fork;
+
+    let config = fulu_schedule();
+    let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
+    let slot = compute_start_slot_at_epoch(2);
+    {
+        let BeaconState::Fulu(fulu) = &mut state else {
+            unreachable!("built as fulu")
+        };
+        fulu.slot = slot;
+        fulu.latest_block_header.slot = slot;
+        fulu.fork = Fork {
+            previous_version: config.fork_version(ForkName::Electra),
+            current_version: config.fork_version(ForkName::Fulu),
+            epoch: config.fulu_fork_epoch,
+        };
+    }
+    let lookahead = initialize_proposer_lookahead(&state).unwrap();
+    let sync_committee =
+        ethlambda_state_transition::beacon::helpers::altair::get_next_sync_committee(&state)
+            .unwrap();
+    let BeaconState::Fulu(fulu) = &mut state else {
+        unreachable!("built as fulu")
+    };
+    fulu.proposer_lookahead = lookahead.try_into().unwrap();
+    fulu.current_sync_committee = sync_committee.clone();
+    fulu.next_sync_committee = sync_committee;
+
+    // The root slot processing gives the header: its state root filled in.
+    let mut header = state.latest_block_header().clone();
+    if header.state_root == Default::default() {
+        header.state_root = state.hash_tree_root();
+    }
+    let head_root = header.hash_tree_root();
+    let block = crate::test_utils::phase0_beacon_block(slot, Default::default());
+    let store = crate::test_utils::beacon_store_with_head_block(
+        state.clone(),
+        config,
+        block,
+        head_root,
+        slot,
+    );
+    let (client, network, _) = spawn_server(store, engine).await;
+    let genesis = client.genesis().await.expect("genesis");
+    let spec = client
+        .spec()
+        .await
+        .expect("the client reads this node's spec");
+    let context = Arc::new(SigningContext {
+        config: spec,
+        genesis_validators_root: genesis.genesis_validators_root,
+    });
+    (Arc::new(client), state, network, context)
+}
+
+fn fulu_schedule() -> ethlambda_types::beacon::config::Config {
+    ethlambda_types::beacon::config::Config::mainnet().with_fork_epoch(ForkName::Fulu, 0)
+}
+
+/// One slot of sync committee work for every validator of the test registry,
+/// through the client's own service against the node: duties, subscriptions,
+/// messages, then the contributions of whoever the slot selected. Checks what
+/// the node published and returns the root the committee signed over.
+async fn sync_committee_slot(
+    client: &Arc<HttpBeaconNode>,
+    state: &BeaconState,
+    network: &RecordingNetwork,
+    context: Arc<SigningContext>,
+    slot: u64,
+) -> ethlambda_types::primitives::H256 {
+    use ethlambda_types::beacon::constants::{DOMAIN_SYNC_COMMITTEE, SYNC_COMMITTEE_SUBNET_COUNT};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let epoch = compute_epoch_at_slot(slot);
+    let indices: Vec<u64> = (0..COUNT as u64).collect();
+    let duties = client.sync_duties(epoch, &indices).await.unwrap();
+    assert!(!duties.is_empty(), "the registry holds the committee");
+    let seats: BTreeSet<u64> = duties
+        .iter()
+        .flat_map(|duty| duty.validator_sync_committee_indices.iter().copied())
+        .collect();
+    assert_eq!(
+        seats,
+        (0..preset::SYNC_COMMITTEE_SIZE as u64).collect(),
+        "every seat belongs to a member of the registry"
+    );
+    let all_subnets: BTreeSet<u64> = (0..SYNC_COMMITTEE_SUBNET_COUNT as u64).collect();
+
+    let period = preset::EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+    let until_epoch = (epoch / period + 1) * period;
+    let subscriptions: Vec<SyncCommitteeSubscriptionDto> = duties
+        .iter()
+        .map(|duty| SyncCommitteeSubscriptionDto {
+            validator_index: duty.validator_index,
+            sync_committee_indices: duty.validator_sync_committee_indices.clone(),
+            until_epoch,
+        })
+        .collect();
+    client
+        .subscribe_sync_committees(&subscriptions)
+        .await
+        .unwrap();
+    let joined: BTreeSet<u64> = network
+        .sync_subscriptions
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(subnet, _)| *subnet)
+        .collect();
+    assert_eq!(
+        joined, all_subnets,
+        "the node joined every subnet asked for"
+    );
+
+    let keys = keys_for(state, &indices);
+    let service = SyncCommitteeService::new(client.clone(), context);
+    let root = service
+        .publish_messages(slot, &duties, &keys)
+        .await
+        .unwrap()
+        .expect("a synced node's head is signable");
+
+    // One message per validator, gossiped on exactly the subnets of its seats,
+    // and signed under the state's own domain over the head.
+    let domain = get_domain(state, DOMAIN_SYNC_COMMITTEE, Some(epoch));
+    let signing_root = compute_signing_root(root, domain);
+    let published = network.sync_messages.lock().unwrap().clone();
+    assert_eq!(published.len(), duties.len());
+    let expected: BTreeMap<u64, BTreeSet<u64>> = duties
+        .iter()
+        .map(|duty| (duty.validator_index, subnets_of(duty)))
+        .collect();
+    let mut gossiped = BTreeSet::new();
+    for (subnets, message) in &published {
+        assert_eq!(message.slot, slot);
+        assert_eq!(message.beacon_block_root, root);
+        let subnets: BTreeSet<u64> = subnets.iter().copied().collect();
+        assert_eq!(subnets, expected[&message.validator_index]);
+        gossiped.extend(subnets);
+        let pubkey = state.validator(message.validator_index).unwrap().pubkey;
+        assert!(bls::verify(&pubkey, signing_root, &message.signature));
+    }
+    assert_eq!(gossiped, all_subnets, "every subnet carried a message");
+
+    // The selected aggregators' contributions: each covers its whole
+    // subcommittee, since every member signed, and verifies against it.
+    let count = service.aggregate(slot, root, &duties, &keys).await.unwrap();
+    assert!(
+        count > 0,
+        "someone is selected among 64 validators on 4 subnets"
+    );
+    let contributions = network.sync_contributions.lock().unwrap().clone();
+    assert_eq!(contributions.len(), count);
+    let (committee, _) = state.sync_committees().unwrap();
+    let per_subnet = preset::SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
+    for signed in &contributions {
+        let contribution = &signed.message.contribution;
+        assert_eq!(contribution.slot, slot);
+        assert_eq!(contribution.beacon_block_root, root);
+        let first = contribution.subcommittee_index as usize * per_subnet;
+        let participants: Vec<BlsPubkey> = (0..per_subnet)
+            .filter(|&bit| contribution.aggregation_bits.get(bit).unwrap_or(false))
+            .map(|bit| committee.pubkeys[first + bit])
+            .collect();
+        assert_eq!(participants.len(), per_subnet, "every seat was pooled");
+        assert!(bls::eth_fast_aggregate_verify(
+            &participants,
+            signing_root,
+            &contribution.signature
+        ));
+    }
+    root
+}
+
+/// Every position set and the signature verifying, as `process_sync_aggregate`
+/// holds a block's aggregate to it: run on the state the block builds on.
+fn assert_full_sync_aggregate(
+    advanced: &BeaconState,
+    aggregate: &ethlambda_types::beacon::containers::altair::SyncAggregate,
+) {
+    let set = (0..preset::SYNC_COMMITTEE_SIZE)
+        .filter(|&position| aggregate.sync_committee_bits.get(position).unwrap_or(false))
+        .count();
+    assert_eq!(
+        set,
+        preset::SYNC_COMMITTEE_SIZE,
+        "every member signed the parent"
+    );
+    let mut state = advanced.clone();
+    ethlambda_state_transition::beacon::stf::altair::process_sync_aggregate(&mut state, aggregate)
+        .expect("the packed aggregate verifies as the state transition checks it");
+}
+
+/// A sync committee member's slot through this node: the duties and
+/// subscriptions, the messages gossiped and pooled, the contributions of the
+/// selected aggregators, and then the next slot's block carrying what the
+/// committee signed.
+#[tokio::test]
+async fn the_validator_client_can_serve_on_the_sync_committee() {
+    use ethlambda_state_transition::beacon::{
+        block_production::advance_to_slot, helpers::accessors::get_beacon_proposer_index,
+    };
+    use ethlambda_types::beacon::{
+        constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO},
+        containers::SignedBeaconBlock,
+    };
+
+    let (client, state, network, context) =
+        serve_fulu_pinned(Some(fake_execution_client().await)).await;
+    let slot = state.slot();
+    let root = sync_committee_slot(&client, &state, &network, context, slot).await;
+
+    // The next slot's block packs what was pooled over the head it builds on.
+    let next = slot + 1;
+    let advanced = advance_to_slot(&state, next, &fulu_schedule()).unwrap();
+    let proposer = get_beacon_proposer_index(&advanced).unwrap();
+    let epoch = compute_epoch_at_slot(next);
+    let randao_domain = get_domain(&advanced, DOMAIN_RANDAO, Some(epoch));
+    let randao_reveal = sign_for(
+        proposer as usize,
+        compute_signing_root(epoch.hash_tree_root(), randao_domain),
+    );
+    let request = BlockRequest {
+        slot: next,
+        fork: ForkName::Fulu,
+        proposer_index: proposer,
+        randao_reveal,
+        graffiti: Default::default(),
+    };
+    let produced = client.produce_block(&request).await.unwrap();
+    let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
+    let signature = sign_for(
+        proposer as usize,
+        compute_signing_root(produced.block_root(), block_domain),
+    );
+    let body = produced.into_signed_ssz(signature);
+    client.publish_block(ForkName::Fulu, &body).await.unwrap();
+
+    let blocks = network.blocks.lock().unwrap().clone();
+    let SignedBeaconBlock::Fulu(signed) = &blocks[0] else {
+        panic!("a fulu slot publishes a fulu block");
+    };
+    assert_eq!(signed.message.parent_root, root);
+    assert_full_sync_aggregate(&advanced, &signed.message.body.sync_aggregate);
+}
+
+// ---------------------------------------------------------------------------
 // Gloas
 // ---------------------------------------------------------------------------
 
 mod gloas {
     use std::time::Duration;
 
+    use super::*;
+    use crate::test_utils::{beacon_store_with_head_block, gloas_beacon_block};
     use ethlambda_state_transition::beacon::{
         block_production::advance_to_slot,
-        bls,
         constants::{DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_PTC_ATTESTER},
         fork_choice::PayloadStatus,
         gloas_block_production::test_support::{config, parent_state, post_state},
         helpers::{
             accessors::get_beacon_proposer_index,
             gloas::{compute_ptc, get_ptc},
-            test_state::secret_key_for,
         },
     };
     use ethlambda_types::beacon::{
@@ -464,15 +752,9 @@ mod gloas {
     };
     use ethlambda_validator::{
         beacon_node::dto::{ProposerDutyDto, PtcDutyDto},
-        keys::ValidatorStore,
         payload_attestation::PayloadAttestationService,
         proposal::ProposalService,
-        signing::SigningContext,
     };
-    use tokio::sync::RwLock;
-
-    use super::*;
-    use crate::test_utils::{beacon_store_with_head_block, gloas_beacon_block};
 
     /// A gloas head state at slot 32 under [`config`] (gloas from epoch 0),
     /// with the proposer lookahead and sync committee a real registry gives it
@@ -555,22 +837,6 @@ mod gloas {
             head_root,
             context,
         }
-    }
-
-    /// A key store holding the test registry's secret for each of `indices`.
-    fn keys_for(state: &BeaconState, indices: &[u64]) -> RwLock<ValidatorStore> {
-        let mut keys = ValidatorStore::new();
-        for &index in indices {
-            let pubkey = keys
-                .insert_secret("test", &secret_key_for(index as usize).to_bytes())
-                .expect("the test secret is a valid key");
-            assert_eq!(
-                pubkey,
-                state.validator(index).unwrap().pubkey,
-                "the test registry's key for validator {index}"
-            );
-        }
-        RwLock::new(keys)
     }
 
     /// One slot of a gloas attester's work: the data comes back without a
@@ -956,5 +1222,48 @@ mod gloas {
             element[31] = (i % 100) as u8;
         }
         propose_through_the_service(Some(blob)).await;
+    }
+
+    /// The gloas counterpart: the same slot of sync committee work, and the
+    /// gloas block of the next slot carrying the aggregate.
+    #[tokio::test]
+    async fn the_validator_client_can_serve_on_the_sync_committee_at_a_gloas_slot() {
+        let engine = fake_execution_client().await;
+        let Served {
+            client,
+            state,
+            network,
+            store,
+            context,
+            ..
+        } = serve_gloas(32, Some(engine)).await;
+        let client = Arc::new(client);
+        let slot = state.slot();
+        let root = sync_committee_slot(&client, &state, &network, context.clone(), slot).await;
+
+        let next = slot + 1;
+        let advanced = advance_to_slot(&state, next, &config()).unwrap();
+        let proposer = get_beacon_proposer_index(&advanced).unwrap();
+        let keys = keys_for(&state, &[proposer]);
+        let pubkey = state.validator(proposer).unwrap().pubkey;
+        import_published_block(store, network.clone(), advanced.clone());
+
+        let service = ProposalService::new(client, context, Bytes32::repeat_byte(0xab), None);
+        let duty = ProposerDutyDto {
+            pubkey: encode_hex(&pubkey.0),
+            validator_index: proposer,
+            slot: next,
+        };
+        service
+            .propose(next, &duty, &keys)
+            .await
+            .expect("the proposal goes through this node");
+
+        let blocks = network.blocks.lock().unwrap().clone();
+        let SignedBeaconBlock::Gloas(signed) = &blocks[0] else {
+            panic!("a gloas slot publishes a gloas block");
+        };
+        assert_eq!(signed.message.parent_root, root);
+        assert_full_sync_aggregate(&advanced, &signed.message.body.sync_aggregate);
     }
 }
