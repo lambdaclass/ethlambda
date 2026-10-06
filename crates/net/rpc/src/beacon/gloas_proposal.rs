@@ -1839,3 +1839,7 @@ mod tests {
         assert_eq!(rejected.envelopes.lock().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "builder_market_tests.rs"]
+mod builder_market_tests;
