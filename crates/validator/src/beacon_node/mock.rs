@@ -904,10 +904,11 @@ impl BeaconNodeApi for MockBeaconNode {
         beacon_block_root: Root,
     ) -> Result<altair::SyncCommitteeContribution> {
         self.guard("sync_committee_contribution")?;
-        self.contribution_requests
-            .lock()
-            .expect("lock")
-            .push((slot, subcommittee_index, beacon_block_root));
+        self.contribution_requests.lock().expect("lock").push((
+            slot,
+            subcommittee_index,
+            beacon_block_root,
+        ));
         let contribution = self
             .contributions
             .iter()

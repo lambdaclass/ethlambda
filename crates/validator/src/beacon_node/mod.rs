@@ -491,8 +491,11 @@ pub trait BeaconNodeApi: Send + Sync {
     /// The sync committee duties for `indices` in the period `epoch` falls in.
     /// `POST /eth/v1/validator/duties/sync/{epoch}`, whose answer carries no
     /// `dependent_root`: the committee is fixed a period ahead.
-    async fn sync_duties(&self, epoch: Epoch, indices: &[ValidatorIndex])
-    -> Result<Vec<SyncDutyDto>>;
+    async fn sync_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<SyncDutyDto>>;
 
     /// The root of the node's head block, which a sync committee message signs.
     ///

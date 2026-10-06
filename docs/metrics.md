@@ -611,6 +611,11 @@ and absent is not the same as zero.
 | `ethlambda_validator_envelope_failures_total` | Counter | Proposed gloas blocks whose self-built envelope was not published. The block is out and the proposal counts as made, but the slot's payload is withheld, so this is the failure that costs the payload. Should read zero |
 | `ethlambda_validator_payload_attestations_published_total` | Counter | Payload timeliness committee votes a beacon node accepted (gloas) |
 | `ethlambda_validator_payload_attestation_failures_total` | Counter | Slots whose payload timeliness committee duty did not result in published votes |
+| `ethlambda_validator_sync_committee_messages_published_total` | Counter | Sync committee messages a beacon node accepted |
+| `ethlambda_validator_sync_committee_failures_total` | Counter | Slots whose sync committee message duty ended in an error or ran past its slot. A head the node reports optimistic is not a failure: nothing is signed |
+| `ethlambda_validator_sync_contributions_published_total` | Counter | Sync committee contributions this client published as an aggregator. Bursty, like `aggregates_published_total` |
+| `ethlambda_validator_sync_contribution_failures_total` | Counter | Sync aggregation duties that ended in an error or ran past their slot. A subnet with no contribution to fetch is skipped and not counted |
+| `ethlambda_validator_sync_duties_held` | Gauge | Sync committee duties held for the current period |
 | `ethlambda_validator_aggregates_published_total` | Counter | Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment |
 | `ethlambda_validator_aggregation_failures_total` | Counter | Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot |
 | `ethlambda_validator_fee_recipient_mismatches_total` | Counter | Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else |

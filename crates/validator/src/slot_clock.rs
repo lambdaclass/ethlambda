@@ -675,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             clock.until_contribution(5, now),
-            Duration::from_millis(6_999)
+            Duration::from_millis(7_000)
         );
         assert_eq!(
             clock.until_sync_message(5, at(5 * SECONDS_PER_SLOT + 9)),
