@@ -179,6 +179,25 @@ pub mod quoted_u64_seq {
         }
         seq.end()
     }
+
+    /// The inverse: an array of quoted (or bare) integers, which is how
+    /// [`quoted_or_bare`](super::quoted_or_bare) reads one.
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<C, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        let texts = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let values = texts
+            .iter()
+            .map(|text| text.trim().parse().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<T>, _>>()?;
+        C::try_from(values)
+            .map_err(|err| serde::de::Error::custom(format!("invalid sequence: {err:?}")))
+    }
 }
 
 /// A sequence of sequences of integers, each innermost value written quoted.
@@ -351,6 +370,31 @@ pub mod ssz_hex_seq {
         }
         seq.end()
     }
+
+    /// The inverse: an array of hex strings, each decoded through the
+    /// element's `SszDecode`, so a byte list's bound is checked as on the wire.
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<C, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: libssz::SszDecode,
+    {
+        let texts = <Vec<String> as serde::Deserialize>::deserialize(deserializer)?;
+        let values = texts
+            .iter()
+            .map(|text| {
+                let digits = text.trim();
+                let bytes = hex::decode(digits.strip_prefix("0x").unwrap_or(digits))
+                    .map_err(serde::de::Error::custom)?;
+                T::from_ssz_bytes(&bytes).map_err(|err| {
+                    serde::de::Error::custom(format!("invalid SSZ encoding: {err:?}"))
+                })
+            })
+            .collect::<Result<Vec<T>, _>>()?;
+        C::try_from(values)
+            .map_err(|err| serde::de::Error::custom(format!("invalid sequence: {err:?}")))
+    }
 }
 
 /// A sequence of values that serialize themselves, from a foreign collection.
@@ -374,6 +418,21 @@ pub mod seq {
             seq.serialize_element(&item)?;
         }
         seq.end()
+    }
+
+    /// The inverse: a JSON array of elements, collected into the foreign
+    /// collection through its `TryFrom<Vec<T>>`, which is where a length bound
+    /// is checked (a progressive list's conversion cannot fail).
+    pub fn deserialize<'de, D, C, T>(deserializer: D) -> Result<C, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+        C: TryFrom<Vec<T>>,
+        C::Error: std::fmt::Debug,
+        T: serde::Deserialize<'de>,
+    {
+        let values = <Vec<T> as serde::Deserialize>::deserialize(deserializer)?;
+        C::try_from(values)
+            .map_err(|err| serde::de::Error::custom(format!("invalid sequence: {err:?}")))
     }
 }
 

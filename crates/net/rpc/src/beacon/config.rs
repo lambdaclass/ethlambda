@@ -33,7 +33,55 @@ use ethlambda_types::beacon::{config::Config, constants, preset, serde_helpers::
 use serde_json::{Map, Value};
 
 pub(crate) fn routes() -> Router<Store> {
-    Router::new().route("/eth/v1/config/spec", get(get_spec))
+    Router::new()
+        .route("/eth/v1/config/spec", get(get_spec))
+        .route("/eth/v1/config/fork_schedule", get(get_fork_schedule))
+}
+
+/// `GET /eth/v1/config/fork_schedule`: every fork of the node's `Config`
+/// that is scheduled, oldest first.
+///
+/// Validator clients compare this against their own schedule at startup (nimbus
+/// refuses a node that cannot answer it).
+async fn get_fork_schedule(State(store): State<Store>) -> Response {
+    crate::json_response(serde_json::json!({ "data": fork_schedule(store.config().as_ref()) }))
+}
+
+/// The `Fork` objects (`previous_version`, `current_version`, `epoch`) for
+/// phase0 and every later fork whose epoch is not `FAR_FUTURE_EPOCH`.
+///
+/// Phase0 is its own predecessor, as in the spec's genesis `Fork`. An
+/// unscheduled fork is skipped without breaking the chain: the next scheduled
+/// fork's `previous_version` is the last *scheduled* one's version.
+fn fork_schedule(config: &Config) -> Vec<Value> {
+    let forks = [
+        (config.altair_fork_version, config.altair_fork_epoch),
+        (config.bellatrix_fork_version, config.bellatrix_fork_epoch),
+        (config.capella_fork_version, config.capella_fork_epoch),
+        (config.deneb_fork_version, config.deneb_fork_epoch),
+        (config.electra_fork_version, config.electra_fork_epoch),
+        (config.fulu_fork_version, config.fulu_fork_epoch),
+        (config.gloas_fork_version, config.gloas_fork_epoch),
+    ];
+    let fork = |previous: [u8; 4], current: [u8; 4], epoch: u64| {
+        serde_json::json!({
+            "previous_version": hex_string(previous),
+            "current_version": hex_string(current),
+            "epoch": epoch.to_string(),
+        })
+    };
+
+    let genesis = config.genesis_fork_version;
+    let mut schedule = vec![fork(genesis, genesis, 0)];
+    let mut previous = genesis;
+    for (version, epoch) in forks {
+        if epoch == constants::FAR_FUTURE_EPOCH {
+            continue;
+        }
+        schedule.push(fork(previous, version, epoch));
+        previous = version;
+    }
+    schedule
 }
 
 async fn get_spec(State(store): State<Store>) -> Response {
@@ -287,6 +335,96 @@ mod tests {
         );
     }
 
+    /// What nimbus's validator client (`checkConfig` and
+    /// `getConsensusForkConfig`, v26.10.0) reads off the spec before it will
+    /// use a node: a missing or differing key marks the node incompatible.
+    #[tokio::test]
+    async fn the_spec_carries_every_key_nimbus_checks() {
+        let json = get_spec_json().await;
+        let data = &json["data"];
+
+        let checked = [
+            (
+                "MAX_VALIDATORS_PER_COMMITTEE",
+                preset::MAX_VALIDATORS_PER_COMMITTEE.to_string(),
+            ),
+            ("SLOTS_PER_EPOCH", preset::SLOTS_PER_EPOCH.to_string()),
+            (
+                "EPOCHS_PER_ETH1_VOTING_PERIOD",
+                preset::EPOCHS_PER_ETH1_VOTING_PERIOD.to_string(),
+            ),
+            (
+                "SLOTS_PER_HISTORICAL_ROOT",
+                preset::SLOTS_PER_HISTORICAL_ROOT.to_string(),
+            ),
+            (
+                "EPOCHS_PER_HISTORICAL_VECTOR",
+                preset::EPOCHS_PER_HISTORICAL_VECTOR.to_string(),
+            ),
+            (
+                "EPOCHS_PER_SLASHINGS_VECTOR",
+                preset::EPOCHS_PER_SLASHINGS_VECTOR.to_string(),
+            ),
+            (
+                "HISTORICAL_ROOTS_LIMIT",
+                preset::HISTORICAL_ROOTS_LIMIT.to_string(),
+            ),
+            (
+                "VALIDATOR_REGISTRY_LIMIT",
+                preset::VALIDATOR_REGISTRY_LIMIT.to_string(),
+            ),
+            (
+                "MAX_PROPOSER_SLASHINGS",
+                preset::MAX_PROPOSER_SLASHINGS.to_string(),
+            ),
+            (
+                "MAX_ATTESTER_SLASHINGS",
+                preset::MAX_ATTESTER_SLASHINGS.to_string(),
+            ),
+            ("MAX_ATTESTATIONS", preset::MAX_ATTESTATIONS.to_string()),
+            ("MAX_DEPOSITS", preset::MAX_DEPOSITS.to_string()),
+            (
+                "MAX_VOLUNTARY_EXITS",
+                preset::MAX_VOLUNTARY_EXITS.to_string(),
+            ),
+        ];
+        for (key, expected) in checked {
+            assert_eq!(data[key], expected, "{key}");
+        }
+        for domain in [
+            "DOMAIN_BEACON_PROPOSER",
+            "DOMAIN_BEACON_ATTESTER",
+            "DOMAIN_RANDAO",
+            "DOMAIN_DEPOSIT",
+            "DOMAIN_VOLUNTARY_EXIT",
+            "DOMAIN_SELECTION_PROOF",
+            "DOMAIN_AGGREGATE_AND_PROOF",
+        ] {
+            assert!(data[domain].as_str().unwrap().starts_with("0x"), "{domain}");
+        }
+        // One of the two keys that fix the slot time (it compares the one
+        // present with its own and refuses a node that has neither, unless
+        // it too runs the default).
+        assert!(data["SECONDS_PER_SLOT"].is_string());
+        // Each fork's version and epoch, altair's scheduled.
+        for fork in [
+            "ALTAIR",
+            "BELLATRIX",
+            "CAPELLA",
+            "DENEB",
+            "ELECTRA",
+            "FULU",
+            "GLOAS",
+        ] {
+            assert!(data[format!("{fork}_FORK_VERSION")].is_string(), "{fork}");
+            assert!(data[format!("{fork}_FORK_EPOCH")].is_string(), "{fork}");
+        }
+        assert_ne!(
+            data["ALTAIR_FORK_EPOCH"],
+            constants::FAR_FUTURE_EPOCH.to_string()
+        );
+    }
+
     #[tokio::test]
     async fn the_spec_carries_gloas_preset_and_constant_keys() {
         let json = get_spec_json().await;
@@ -318,6 +456,66 @@ mod tests {
         );
         // A `Config` field, so it comes from the config half of the object.
         assert!(data["MIN_BUILDER_WITHDRAWABILITY_DELAY"].is_string());
+    }
+
+    #[tokio::test]
+    async fn the_fork_schedule_lists_scheduled_forks_with_quoted_epochs() {
+        let fixture = beacon_fixture(64);
+        let config = fixture.store.config();
+        let app = routes().with_state(fixture.store);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/eth/v1/config/fork_schedule")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let data = json["data"].as_array().unwrap();
+
+        // Phase0 comes first and is its own predecessor.
+        assert_eq!(data[0]["epoch"], "0");
+        assert_eq!(data[0]["previous_version"], data[0]["current_version"]);
+        assert_eq!(
+            data[0]["current_version"],
+            hex_string(config.genesis_fork_version)
+        );
+        // Each fork's predecessor is the previous entry's version, and epochs
+        // never go down.
+        let epoch = |v: &serde_json::Value| v["epoch"].as_str().unwrap().parse::<u64>().unwrap();
+        for pair in data.windows(2) {
+            assert_eq!(pair[1]["previous_version"], pair[0]["current_version"]);
+            assert!(epoch(&pair[1]) >= epoch(&pair[0]));
+        }
+        for fork in data {
+            assert_ne!(fork["epoch"], constants::FAR_FUTURE_EPOCH.to_string());
+        }
+    }
+
+    #[test]
+    fn an_unscheduled_fork_is_left_out_of_the_schedule() {
+        let mut config = Config::mainnet();
+        config.gloas_fork_epoch = constants::FAR_FUTURE_EPOCH;
+        let schedule = fork_schedule(&config);
+        let last = schedule.last().unwrap();
+        assert_eq!(
+            last["current_version"],
+            hex_string(config.fulu_fork_version)
+        );
+
+        config.fulu_fork_epoch = constants::FAR_FUTURE_EPOCH;
+        config.gloas_fork_epoch = 100;
+        let schedule = fork_schedule(&config);
+        let last = schedule.last().unwrap();
+        // Gloas follows the last scheduled fork, electra.
+        assert_eq!(
+            last["previous_version"],
+            hex_string(config.electra_fork_version)
+        );
     }
 
     #[test]

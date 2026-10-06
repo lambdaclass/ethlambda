@@ -232,7 +232,16 @@ pub struct BuilderPendingWithdrawal {
 /// An execution-layer-triggered builder deposit (EIP-8282), the builder-side
 /// counterpart of [`super::electra::DepositRequest`].
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct BuilderDepositRequest {
     pub pubkey: BlsPubkey,
@@ -245,7 +254,16 @@ pub struct BuilderDepositRequest {
 /// An execution-layer-triggered builder exit (EIP-8282), the builder-side
 /// counterpart of [`super::electra::WithdrawalRequest`]'s full-exit case.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct BuilderExitRequest {
     pub source_address: ExecutionAddress,
@@ -280,10 +298,20 @@ pub struct PayloadAttestationData {
 }
 
 /// An aggregate payload timeliness attestation, as included in a block.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct PayloadAttestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub aggregation_bits: PayloadTimelinessCommitteeBits,
     pub data: PayloadAttestationData,
     pub signature: BlsSignature,
@@ -311,10 +339,20 @@ pub struct PayloadAttestationMessage {
 
 /// A [`PayloadAttestation`] with its attesters named rather than bit-encoded,
 /// the payload-attestation counterpart of [`IndexedAttestation`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct IndexedPayloadAttestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub attesting_indices: PayloadTimelinessCommitteeIndices,
     pub data: PayloadAttestationData,
     pub signature: BlsSignature,
@@ -328,7 +366,16 @@ pub struct IndexedPayloadAttestation {
 /// proposer chooses among, and signs over, in place of embedding a payload in
 /// the block directly.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 #[ssz(progressive_container)]
 pub struct ExecutionPayloadBid {
@@ -349,7 +396,7 @@ pub struct ExecutionPayloadBid {
     /// the payload is never revealed or attested to as available.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub execution_payment: Gwei,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub blob_kzg_commitments: BlobKzgCommitments,
     /// The root of the [`ExecutionRequests`] this payload's envelope will
     /// carry, committed to here so the bid is binding on the requests too,
@@ -358,7 +405,16 @@ pub struct ExecutionPayloadBid {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedExecutionPayloadBid {
     pub message: ExecutionPayloadBid,
@@ -372,19 +428,28 @@ pub struct SignedExecutionPayloadBid {
 /// and `builder_exits` (EIP-8282), the execution-layer path [`Builder`]s are
 /// onboarded and retired through from the fork onward.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 #[ssz(progressive_container)]
 pub struct ExecutionRequests {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: DepositRequests,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub withdrawals: WithdrawalRequests,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub consolidations: ConsolidationRequests,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builder_deposits: BuilderDepositRequests,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builder_exits: BuilderExitRequests,
 }
 
@@ -397,14 +462,24 @@ pub struct ExecutionRequests {
 /// (EIP-7928) and `slot_number` (EIP-8061) are appended. Not
 /// `#[derive(Default)]`: `logs_bloom` is an [`SszVector`], which, like every
 /// earlier fork's payload, has no meaningful empty value.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct ExecutionPayload {
     pub parent_hash: ExecutionBlockHash,
     pub fee_recipient: ExecutionAddress,
     pub state_root: Bytes32,
     pub receipts_root: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub logs_bloom: LogsBloom,
     pub prev_randao: Bytes32,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -415,13 +490,13 @@ pub struct ExecutionPayload {
     pub gas_used: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub timestamp: u64,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub extra_data: ExtraData,
     pub base_fee_per_gas: Uint256,
     pub block_hash: ExecutionBlockHash,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
     pub transactions: Transactions,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub withdrawals: Withdrawals,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub blob_gas_used: u64,
@@ -429,7 +504,7 @@ pub struct ExecutionPayload {
     pub excess_blob_gas: u64,
     /// The serialized block access list this payload's execution produced
     /// (EIP-7928).
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub block_access_list: BlockAccessList,
     /// The slot this payload was built for (EIP-8061's gas limit schedule
     /// reads it against the schedule rather than the enclosing block's own
@@ -441,7 +516,17 @@ pub struct ExecutionPayload {
 /// A builder-signed reveal of the payload it bid for: the payload itself,
 /// the execution-layer-triggered requests it carries, and enough to bind it
 /// to the block whose [`ExecutionPayloadBid`] it fulfills.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct ExecutionPayloadEnvelope {
     pub payload: ExecutionPayload,
@@ -452,7 +537,17 @@ pub struct ExecutionPayloadEnvelope {
     pub parent_beacon_block_root: Root,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct SignedExecutionPayloadEnvelope {
     pub message: ExecutionPayloadEnvelope,
     pub signature: BlsSignature,
@@ -469,7 +564,7 @@ pub struct SignedExecutionPayloadEnvelope {
 #[ssz(progressive_container)]
 pub struct NewPayloadRequest {
     pub execution_payload: ExecutionPayload,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub versioned_hashes: VersionedHashes,
     pub parent_beacon_block_root: Root,
     pub execution_requests: ExecutionRequests,
@@ -555,10 +650,20 @@ impl TryFrom<&Attestation> for super::electra::Attestation {
 /// An attestation with its attesters named rather than bit-encoded, the same
 /// role electra's plays, with `attesting_indices` now the unbounded
 /// [`AttestingIndices`].
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 #[ssz(progressive_container)]
 pub struct IndexedAttestation {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub attesting_indices: AttestingIndices,
     pub data: AttestationData,
     pub signature: BlsSignature,
@@ -567,7 +672,17 @@ pub struct IndexedAttestation {
 /// Evidence that a set of validators made two conflicting attestations.
 /// Unchanged in shape from electra; what changed is [`IndexedAttestation`]
 /// itself.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
+)]
 pub struct AttesterSlashing {
     pub attestation_1: IndexedAttestation,
     pub attestation_2: IndexedAttestation,
@@ -627,7 +742,16 @@ pub struct SignedAggregateAndProof {
 /// separate fetch). Every other field is electra's, now progressive
 /// (EIP-7688).
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 #[ssz(progressive_container)]
 pub struct BeaconBlockBody {
@@ -638,20 +762,20 @@ pub struct BeaconBlockBody {
     pub eth1_data: Eth1Data,
     /// Arbitrary proposer-chosen bytes, which consensus never reads.
     pub graffiti: Bytes32,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub proposer_slashings: ProposerSlashings,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attester_slashings: AttesterSlashings,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub attestations: Attestations,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub deposits: Deposits,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub voluntary_exits: VoluntaryExits,
     /// The aggregated sync committee signature over the previous slot's
     /// block root, plus which members contributed.
     pub sync_aggregate: SyncAggregate,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub bls_to_execution_changes: BlsToExecutionChanges,
     /// The proposer's binding commitment to the builder's bid for this
     /// slot's payload (EIP-7732); the payload itself is revealed afterward
@@ -659,7 +783,7 @@ pub struct BeaconBlockBody {
     pub signed_execution_payload_bid: SignedExecutionPayloadBid,
     /// The payload timeliness committee's votes on the *previous* slot's
     /// payload.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub payload_attestations: PayloadAttestations,
     /// The previous slot's execution-layer-triggered requests, carried
     /// forward so `process_payload_attestation` and friends do not need a
@@ -684,7 +808,16 @@ impl BeaconBlockBody {
 
 /// A block.
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct BeaconBlock {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -699,7 +832,16 @@ pub struct BeaconBlock {
 }
 
 #[derive(
-    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    SszEncode,
+    SszDecode,
+    HashTreeRoot,
 )]
 pub struct SignedBeaconBlock {
     pub message: BeaconBlock,
@@ -747,18 +889,18 @@ pub struct BeaconState {
     /// slot advances, since a block cannot commit to the root of the state
     /// containing it.
     pub latest_block_header: BeaconBlockHeader,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub block_roots: BlockRoots,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub state_roots: StateRoots,
     /// Frozen since capella: further history is committed to by
     /// `historical_summaries` instead.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_roots: HistoricalRoots,
 
     // -- Eth1 --
     pub eth1_data: Eth1Data,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub eth1_data_votes: Eth1DataVotes,
     /// How many deposits from the contract have been processed, which is
     /// where the next one will be read from.
@@ -768,34 +910,34 @@ pub struct BeaconState {
     // -- Registry (EIP-7688) --
     /// The validator registry, tree-backed and progressively merkleized. See
     /// [`ProgressiveValidators`].
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub validators: ProgressiveValidators,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub balances: ProgressiveBalances,
 
     // -- Randomness --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub randao_mixes: RandaoMixes,
 
     // -- Slashings --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub slashings: Slashings,
 
     // -- Participation (EIP-7688) --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub previous_epoch_participation: EpochParticipation,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub current_epoch_participation: EpochParticipation,
 
     // -- Finality --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub justification_bits: JustificationBits,
     pub previous_justified_checkpoint: Checkpoint,
     pub current_justified_checkpoint: Checkpoint,
     pub finalized_checkpoint: Checkpoint,
 
     // -- Inactivity (EIP-7688) --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub inactivity_scores: InactivityScores,
 
     // -- Sync committees --
@@ -815,7 +957,7 @@ pub struct BeaconState {
     pub next_withdrawal_validator_index: ValidatorIndex,
 
     // -- History (capella) --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub historical_summaries: HistoricalSummaries,
 
     // -- Deposits, exits, and consolidations (electra) --
@@ -831,20 +973,20 @@ pub struct BeaconState {
     pub consolidation_balance_to_consume: Gwei,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub earliest_consolidation_epoch: Epoch,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_deposits: PendingDeposits,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_partial_withdrawals: PendingPartialWithdrawals,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub pending_consolidations: PendingConsolidations,
 
     // -- Proposer lookahead (fulu) --
-    #[serde(serialize_with = "crate::beacon::serde_helpers::quoted_u64_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::quoted_u64_seq")]
     pub proposer_lookahead: ProposerLookahead,
 
     // -- Builders (EIP-7732) --
     /// The builder registry.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builders: Builders,
     /// Where the builder withdrawal sweep last stopped, the builder-side
     /// counterpart of `next_withdrawal_validator_index`.
@@ -852,13 +994,13 @@ pub struct BeaconState {
     pub next_withdrawal_builder_index: BuilderIndex,
     /// Bits tracking, for each of the last `SLOTS_PER_HISTORICAL_ROOT` slots,
     /// whether that slot's payload was made available.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub execution_payload_availability: ExecutionPayloadAvailability,
     /// Builder payments owed for the previous and current epoch, settled by
     /// `process_builder_pending_payments`.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builder_pending_payments: BuilderPendingPayments,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub builder_pending_withdrawals: BuilderPendingWithdrawals,
     /// The bid the payload currently expected for this slot, if any, was
     /// bought under.
@@ -866,7 +1008,7 @@ pub struct BeaconState {
     /// The withdrawals `get_expected_withdrawals` computed for the payload
     /// this slot expects, cached here so a late-revealed payload's
     /// `process_execution_payload` does not have to recompute the sweep.
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub payload_expected_withdrawals: Withdrawals,
     /// The cached window of payload timeliness committees for the previous,
     /// current, and lookahead epochs, refreshed each epoch by
@@ -896,9 +1038,9 @@ pub struct BeaconState {
 pub struct DataColumnSidecar {
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub index: ColumnIndex,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
     pub column: DataColumn,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_proofs: KzgProofs,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub slot: Slot,
@@ -931,11 +1073,11 @@ pub struct DataColumnSidecar {
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
 )]
 pub struct PartialDataColumnSidecar {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub cells_present_bitmap: CellsBitList,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex_seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex_seq")]
     pub partial_column: DataColumn,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::seq::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::seq")]
     pub kzg_proofs: KzgProofs,
 }
 
@@ -946,9 +1088,9 @@ pub struct PartialDataColumnSidecar {
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, SszEncode, SszDecode, HashTreeRoot,
 )]
 pub struct PartialDataColumnPartsMetadata {
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub available: CellsBitList,
-    #[serde(serialize_with = "crate::beacon::serde_helpers::ssz_hex::serialize")]
+    #[serde(with = "crate::beacon::serde_helpers::ssz_hex")]
     pub requests: CellsBitList,
 }
 
