@@ -818,6 +818,11 @@ pub async fn publish_execution_payload_envelope(
 ) {
     let slot = envelope.message.payload.slot_number;
     let block_root = envelope.message.beacon_block_root;
+    // Gossip never echoes a node's own message, so its own envelope is a
+    // known payload for bid validation only because it is recorded here.
+    server
+        .builder_market
+        .record_execution_payload(&envelope.message);
     let Some(beacon) = server.wire.beacon() else {
         error!(
             slot,
