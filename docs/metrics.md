@@ -363,15 +363,17 @@ own section. These are ethlambda-specific, not part of the leanMetrics spec.
 
 `kind` is the topic kind, with every `data_column_sidecar_{subnet}` sharing the
 label `data_column_sidecar` and every `beacon_attestation_{subnet_id}` sharing
-`beacon_attestation`. The gloas topics `execution_payload` and
-`payload_attestation_message` are labelled by their own name. `queue` means
+`beacon_attestation`. The gloas topics `execution_payload`,
+`payload_attestation_message`, `execution_payload_bid` and
+`proposer_preferences` are labelled by their own name. `queue` means
 IGNORE to gossipsub while the chain actor still receives the object and parks
 it; of the gloas topics only `execution_payload` answers it, for an envelope
 whose block is not known yet (`block_unknown`), has no post-state yet
 (`block_not_ready`), or has one that is not in the cache the checks read
 (`state_not_cached`, as when the block was imported moments ago; the actor
-verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation and
-`payload_attestation_message` topics never answer `queue`, since the vote
+verifies the signature itself, so the envelope is forwarded rather than dropped). The aggregate, attestation,
+`payload_attestation_message`, `execution_payload_bid` and `proposer_preferences`
+topics never answer `queue`, since the vote
 block's post-state is either cached or it is not
 (`IgnoreReason::UnknownBlock`/`StateUnavailable`), with nothing to hold the
 message for. **`verdict_expired_total` should stay at
@@ -390,16 +392,25 @@ only), `not_aggregator` (aggregate only), `not_in_committee`,
 `aggregator_signature` (aggregate only), `aggregate_signature` (aggregate
 only), `target_not_ancestor`, `wrong_subnet` (attestation only), and gloas's
 `data_index_out_of_range`, `same_slot_payload_flag` and `payload_invalid` on the
-reject side. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
+reject side. The builder market topics add, on the ignore side,
+`pre_gloas_slot`, `not_current_or_next_slot`, `not_highest_bid`,
+`beyond_lookahead`, `preferences_unseen`, `fee_recipient_mismatch`,
+`parent_payload_unknown`, `gas_limit_incompatible`, `not_on_head_branch`,
+`builder_cannot_cover`, `builder_may_exit`, `slot_started` and
+`impossible_dependent_root`, and on the reject side `execution_payment_nonzero`,
+`block_hash_equals_parent`, `prev_randao`, `unknown_builder`,
+`not_payload_builder`, `inactive_builder` and `dependent_root_too_late`; a bid
+over its size cap is `malformed`. `already_seen`, `overloaded` and `unsupported_fork` are shared with the
 other topics: `unsupported_fork` is an ignore reason for a message of a fork this
 build has no gossip rules for, so an honest peer past the fork epoch is not
 scored as a bad decoder. Gloas blocks, data columns, aggregates and attestations
 are validated, so they carry their own verdict reasons instead.
 
-Two permit pools bound the blocking-thread half of validation:
-`gossip_validation_permits` for blocks and columns,
-`attestation_validation_permits` for aggregates and subnet attestations. They
-are deliberately separate: a mainnet slot's worth of aggregates and backbone
+Three permit pools bound the blocking-thread half of validation:
+`gossip_validation_permits` for blocks, columns and envelopes,
+`attestation_validation_permits` for aggregates, subnet attestations and
+payload votes, and `builder_validation_permits` for bids and proposer
+preferences. They are deliberately separate: a mainnet slot's worth of aggregates and backbone
 attestations arrives every slot, not only during a range sync, and sharing one
 pool would let that burst answer `Ignore(Overloaded)` for a block or a column
 instead. Neither pool has a metric of its own yet; a permit exhausted on
