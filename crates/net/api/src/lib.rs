@@ -4,6 +4,7 @@ use ethlambda_types::{
     attestation::{SignedAggregatedAttestation, SignedAttestation},
     beacon::containers::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
+        altair::{SignedContributionAndProof, SyncCommitteeMessage},
         electra::SingleAttestation,
         gloas::{PayloadAttestationMessage, SignedExecutionPayloadEnvelope},
     },
@@ -350,6 +351,24 @@ pub trait RpcToP2P: Send + Sync {
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
     fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
+    /// Gossip one sync committee message on `sync_committee_{id}` for every id
+    /// in `subnet_ids` (every subnet its validator has a seat in, computed by
+    /// the caller from the head state), and mark it seen. Checked by the caller.
+    fn publish_sync_committee_message(
+        &self,
+        subnet_ids: Vec<u64>,
+        message: SyncCommitteeMessage,
+    ) -> Result<(), ActorError>;
+    /// Gossip one signed contribution on `sync_committee_contribution_and_proof`,
+    /// and mark it seen. Checked by the caller.
+    fn publish_sync_committee_contribution(
+        &self,
+        contribution: SignedContributionAndProof,
+    ) -> Result<(), ActorError>;
+    /// Join sync committee subnets until the paired epoch (exclusive), so a
+    /// validator client's committee members can publish on them and its
+    /// aggregators hear their subcommittee. `(subnet_id, until_epoch)` pairs.
+    fn subscribe_sync_committee_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
     /// Gossip a block a validator client signed, and import it: gossip never
     /// delivers a node its own messages, so without the second half this node
     /// would not follow its own proposal. Checked by the caller as above.

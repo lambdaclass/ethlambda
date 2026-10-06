@@ -23,6 +23,7 @@ pub mod messages;
 pub mod protocols;
 pub mod subnets;
 pub mod swarm;
+pub mod sync_committee;
 pub mod topics;
 pub mod transition;
 pub mod verdict;

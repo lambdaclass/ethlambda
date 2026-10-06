@@ -646,6 +646,8 @@ fn assemble(
         pack_payload_attestations(&state, head_root, head_slot, messages, config);
     let commitments = built.blobs_bundle.commitments;
     let inputs = |attestations, payload_attestations| GloasBlockInputs {
+        sync_aggregate: ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(
+        ),
         randao_reveal,
         graffiti,
         attestations,
@@ -1104,6 +1106,8 @@ mod tests {
         assemble_gloas_block(
             state,
             GloasBlockInputs {
+                sync_aggregate:
+                    ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(state),
                 graffiti: Bytes32::ZERO,
                 attestations: Vec::new(),
@@ -1346,6 +1350,8 @@ mod tests {
         let produced = assemble_gloas_block(
             &state,
             GloasBlockInputs {
+                sync_aggregate:
+                    ethlambda_state_transition::beacon::block_production::empty_sync_aggregate(),
                 randao_reveal: randao_reveal(&state),
                 graffiti: Bytes32::ZERO,
                 attestations: Vec::new(),
