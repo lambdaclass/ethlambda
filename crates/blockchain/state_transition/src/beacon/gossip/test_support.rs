@@ -99,9 +99,9 @@ pub(crate) fn fulu_parent(proposer: ValidatorIndex) -> BeaconState {
 }
 
 /// The builder-market rules' shared scene: a gloas chain whose head `PARENT`
-/// (slot 32, epoch 1) is a FULL block with a funded active builder 0, the
-/// proposer preferences and parent payload gossip would have delivered, and a
-/// signed bid for slot 34 that passes every rule.
+/// (`PARENT_SLOT`, epoch 1) is a FULL block with a funded active builder 0,
+/// the proposer preferences and parent payload gossip would have delivered,
+/// and a signed bid for `BID_SLOT` that passes every rule.
 pub(crate) mod builder_scene {
     use ethlambda_storage::ForkCheckpoints;
     use ethlambda_types::beacon::containers::{SignedBeaconBlock, electra, gloas};
@@ -112,17 +112,18 @@ pub(crate) mod builder_scene {
     use crate::beacon::gloas_block_production::test_support as gloas_support;
     use crate::beacon::gossip::proposer_preferences::dependent_root_at;
     use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
+    use crate::beacon::preset;
     use crate::beacon::primitives::{ExecutionAddress, ExecutionBlockHash};
 
     pub(crate) const PARENT: Root = Root::repeat_byte(0x50);
-    pub(crate) const BID_SLOT: Slot = 34;
-    /// The slot the scene's parent sits at: epoch 1, whose state can hold a
+    pub(crate) const BID_SLOT: Slot = PARENT_SLOT + 2;
+    /// The slot the scene's parent sits at: epoch 1's first, whose state can hold a
     /// funded builder only with a finalized epoch that a real chain cannot have
     /// there (a builder is active once the finalized epoch passes its deposit
     /// epoch, and the finalized epoch never exceeds the previous one). Fine for
     /// a rule that reads the state as it is; a test that advances it through
     /// an epoch's end needs [`scene_at`] with a parent in epoch 2 or later.
-    pub(crate) const PARENT_SLOT: Slot = 32;
+    pub(crate) const PARENT_SLOT: Slot = preset::SLOTS_PER_EPOCH;
     pub(crate) const PARENT_GAS_LIMIT: u64 = 30_000_000;
 
     pub(crate) fn fee_recipient() -> ExecutionAddress {
