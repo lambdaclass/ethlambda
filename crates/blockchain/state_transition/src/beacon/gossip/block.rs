@@ -297,7 +297,10 @@ mod tests {
         MAXIMUM_GOSSIP_CLOCK_DISPARITY as DISPARITY,
     };
     use crate::beacon::containers::{BeaconState, electra};
-    use crate::beacon::gossip::test_support::{fulu_parent, seen_blocks, slot_start_ms, store};
+    use crate::beacon::fork_choice;
+    use crate::beacon::gossip::test_support::{
+        PastAFork, fulu_parent, seen_blocks, slot_start_ms, store, store_finalized_past_a_fork,
+    };
     use crate::beacon::gossip::{IgnoreReason, Outcome, RejectReason};
     use crate::beacon::helpers::misc::{
         compute_domain, compute_epoch_at_slot, compute_signing_root, compute_start_slot_at_epoch,
@@ -358,6 +361,25 @@ mod tests {
         };
         inner.signature = BlsSignature(signature.to_bytes());
         block
+    }
+
+    /// A block one slot after `parent`, under `parent_root`, signed by
+    /// `proposer` and carrying the payload timestamp `parent` expects: every
+    /// rule [`stateful_checks`] runs passes, save finalized ancestry.
+    fn signed_child(
+        parent: &BeaconState,
+        parent_root: Root,
+        proposer: ValidatorIndex,
+        config: &Config,
+    ) -> SignedBeaconBlock {
+        let slot = parent.slot() + 1;
+        let SignedBeaconBlock::Fulu(mut inner) = fulu_block(slot, proposer, 0) else {
+            unreachable!("fulu_block builds a fulu block");
+        };
+        inner.message.parent_root = parent_root;
+        inner.message.body.execution_payload.timestamp =
+            compute_timestamp_at_slot(parent, slot, config);
+        sign_block(SignedBeaconBlock::Fulu(inner), parent, config, proposer)
     }
 
     #[test]
@@ -642,6 +664,58 @@ mod tests {
 
         assert_eq!(
             stateful_checks(&store, &block, block.message_hash_tree_root()),
+            Outcome::Queue(QueueReason::ParentNotReady)
+        );
+    }
+
+    /// A parent on a fork that split off below the finalized block, once
+    /// finality has pruned `LiveChain` below that block's own slot: the walk
+    /// from the parent falls off the pruned tree, and that must still be the
+    /// specification's REJECT rather than the IGNORE a missing row gets
+    /// above the finalized block.
+    #[test]
+    fn a_block_on_a_fork_from_below_the_finalized_block_is_rejected() {
+        let PastAFork {
+            store, fork_tip, ..
+        } = store_finalized_past_a_fork();
+        let config = store.config();
+        let proposer: ValidatorIndex = 3;
+        let (parent_slot, _) = store.block_entry(&fork_tip).expect("stored parent");
+        let parent = fulu_parent_at(proposer, parent_slot);
+        store.cache_state(CacheKey::BlockState(fork_tip), Arc::new(parent.clone()));
+
+        let block = signed_child(&parent, fork_tip, proposer, &config);
+        assert_eq!(
+            stateful_checks(&store, &block, block.message_hash_tree_root()),
+            Outcome::Reject(RejectReason::FinalizedNotAncestor)
+        );
+    }
+
+    /// The late-invalidation case the IGNORE exists for, on a store where
+    /// pruning has run too: the parent descends from the finalized block but
+    /// `invalidate_subtree` has since deleted its `LiveChain` row, above the
+    /// slot pruning reaches.
+    #[test]
+    fn a_child_of_a_parent_invalidated_above_the_finalized_block_is_queued() {
+        let PastAFork {
+            mut store,
+            descendant,
+            ..
+        } = store_finalized_past_a_fork();
+        let config = store.config();
+        let proposer: ValidatorIndex = 3;
+        let (parent_slot, _) = store.block_entry(&descendant).expect("stored parent");
+        let parent = fulu_parent_at(proposer, parent_slot);
+        store.cache_state(CacheKey::BlockState(descendant), Arc::new(parent.clone()));
+
+        let block = signed_child(&parent, descendant, proposer, &config);
+        let block_root = block.message_hash_tree_root();
+        // With the parent's row in place, the same block passes outright.
+        assert_eq!(stateful_checks(&store, &block, block_root), Outcome::Accept);
+
+        assert_eq!(fork_choice::invalidate_subtree(&mut store, descendant), 1);
+        assert_eq!(
+            stateful_checks(&store, &block, block_root),
             Outcome::Queue(QueueReason::ParentNotReady)
         );
     }

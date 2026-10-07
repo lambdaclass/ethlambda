@@ -502,10 +502,18 @@ node, and each call walks every latest message and every ancestor step.
   slot and the boosted block's parent's slot, which on a live node is the
   finalized block's. The other two terms make the bound safe without assuming
   that the justified block and the boosted block's parent are at or above the
-  finalized block. The block index of a beacon store is never pruned, so
-  without the bound each head computation would fold, and read the link of,
-  every block since the anchor. Links below the finalized block are pruned
-  because nothing reads them.
+  finalized block. Finality pruning drops the block index rows below the
+  finalized block's own slot, so on a live node the index already starts
+  there; the bound holds the walk to that window whatever the index still
+  keeps below it. Links below the finalized block are pruned because nothing
+  reads them.
+- **No boost outside the justified subtree:** the specification evaluates
+  `should_apply_proposer_boost` whenever a boost root is set. The walk skips
+  the boost, gate included, when the boosted block is not under the justified
+  root: the boost reaches only that block's ancestors, none of which the
+  descent compares, so the head is the same. It also keeps the gate from
+  reading a parent that finality pruning removed after the boost was set,
+  which would otherwise fail the head computation until the next slot.
 - **Cost:** work is proportional to the latest messages plus the indexed
   blocks at or above the finalized block, the unfinalized window. The
   spec-literal form is proportional to the messages times the
