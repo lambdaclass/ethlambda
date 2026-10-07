@@ -208,6 +208,23 @@ pub fn dependent_root_at(
     ancestor_at(state, state_block_root, dependent_slot)
 }
 
+/// The domain a proposer signs its preferences under, per consensus-specs
+/// #5665: `compute_domain(DOMAIN_PROPOSER_PREFERENCES,
+/// compute_fork_version(proposal_epoch), genesis_validators_root)`. It names
+/// the proposal epoch's own fork version, not the lookahead state's, so signer
+/// and verifier agree across the fork boundary.
+pub fn proposer_preferences_domain(
+    config: &Config,
+    genesis_validators_root: Root,
+    proposal_epoch: Epoch,
+) -> Domain {
+    compute_domain(
+        DOMAIN_PROPOSER_PREFERENCES,
+        config.fork_version(config.fork_at_epoch(proposal_epoch)),
+        genesis_validators_root,
+    )
+}
+
 /// The distinct candidate signing domains, tried in order: `get_domain(
 /// lookahead_state, DOMAIN_PROPOSER_PREFERENCES, Some(P))` (the specification's);
 /// the schedule's fork version at `P - MIN_SEED_LOOKAHEAD` (saturating); and the
@@ -223,13 +240,7 @@ pub fn proposer_preferences_domains(
     proposal_epoch: Epoch,
 ) -> Vec<Domain> {
     let genesis_validators_root = lookahead_state.genesis_validators_root();
-    let at = |epoch: Epoch| {
-        compute_domain(
-            DOMAIN_PROPOSER_PREFERENCES,
-            config.fork_version(config.fork_at_epoch(epoch)),
-            genesis_validators_root,
-        )
-    };
+    let at = |epoch: Epoch| proposer_preferences_domain(config, genesis_validators_root, epoch);
     let domains = [
         get_domain(
             lookahead_state,

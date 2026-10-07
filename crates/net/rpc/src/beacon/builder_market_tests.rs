@@ -22,7 +22,7 @@ use ethlambda_state_transition::beacon::{
     gloas_block_production::test_support::{
         config as chain_config, parent_state, post_state, randao_reveal,
     },
-    gossip::proposer_preferences::dependent_root_at,
+    gossip::proposer_preferences::{dependent_root_at, proposer_preferences_domain},
     helpers::{
         accessors::get_domain,
         misc::compute_signing_root,
@@ -35,8 +35,8 @@ use ethlambda_storage::Store;
 use ethlambda_types::{
     beacon::{
         constants::{
-            BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, DOMAIN_PROPOSER_PREFERENCES,
-            FAR_FUTURE_EPOCH, PAYLOAD_BUILDER_VERSION,
+            BUILDER_INDEX_SELF_BUILD, DOMAIN_BEACON_BUILDER, FAR_FUTURE_EPOCH,
+            PAYLOAD_BUILDER_VERSION,
         },
         containers::{
             BeaconState, SignedBeaconBlock,
@@ -344,10 +344,10 @@ impl World {
             fee_recipient,
             target_gas_limit: gas,
         };
-        let domain = get_domain(
-            &self.state,
-            DOMAIN_PROPOSER_PREFERENCES,
-            Some(compute_epoch_at_slot(SLOT)),
+        let domain = proposer_preferences_domain(
+            &chain_config(),
+            self.state.genesis_validators_root(),
+            compute_epoch_at_slot(SLOT),
         );
         let signing_root = compute_signing_root(message.hash_tree_root(), domain);
         SignedProposerPreferences {
