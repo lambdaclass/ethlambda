@@ -1,14 +1,18 @@
 name: Publish Docker Image
 
+# Manual publishing of devnet images (`devnetX`) and other ad-hoc tags from any
+# branch. Every tag the release pipeline maintains is refused here, so the two
+# never fight over one: `unstable` (release.yaml, on every push to main), version
+# tags (release.yaml for candidates, release_promote.yaml for final releases),
+# and `latest` (release_promote.yaml). `sha-*` is refused too, since this
+# workflow already adds `sha-<7>` for the commit it builds. See RELEASE.md.
+
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       tags:
-        description: "Docker image tags, comma-separated (e.g., latest,v0.1.0)"
-        required: false
-        default: "latest"
+        description: "Docker image tags, comma-separated (e.g., devnet5,devnet5-fix)"
+        required: true
 
 permissions:
   contents: read
@@ -21,13 +25,29 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  # On push to main, inputs.tags is empty, so fall back to "unstable" so it
-  # tracks main. Manual dispatch still honors custom tags.
-  TAGS_INPUT: ${{ inputs.tags || 'unstable' }}
+  TAGS_INPUT: ${{ inputs.tags }}
 
 jobs:
+  check-tags:
+    name: Refuse release-pipeline tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check tags
+        run: |
+          set -euo pipefail
+          status=0
+          IFS=',' read -ra TAG_ARRAY <<< "${TAGS_INPUT}"
+          for t in "${TAG_ARRAY[@]}"; do
+            if [[ "$t" =~ ^(latest|unstable|sha-.*|v?[0-9]+\.[0-9]+\.[0-9]+.*)$ ]]; then
+              echo "::error::'$t' is reserved for the release pipeline or added automatically; see RELEASE.md"
+              status=1
+            fi
+          done
+          exit "$status"
+
   build-image:
     name: Build Docker image (${{ matrix.arch.name }}, ${{ matrix.variant.name }})
+    needs: check-tags
     strategy:
       matrix:
         arch:
