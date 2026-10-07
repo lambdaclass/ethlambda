@@ -256,11 +256,8 @@ pub fn get_builders_sweep_withdrawals(
                     index: builder_index as usize,
                     len: inner.builders.len(),
                 })?;
-        let balance = get_builder_balance_after_withdrawals(
-            builder.balance,
-            builder_index,
-            &all_withdrawals,
-        );
+        let balance =
+            get_builder_balance_after_withdrawals(builder.balance, builder_index, &all_withdrawals);
         if builder.withdrawable_epoch <= epoch && balance > 0 {
             withdrawals.push(capella::Withdrawal {
                 index: withdrawal_index,
