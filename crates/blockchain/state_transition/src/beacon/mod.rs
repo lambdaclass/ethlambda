@@ -83,6 +83,7 @@ pub mod kzg;
 pub mod payload_attestation_pool;
 pub mod precheck;
 pub mod stf;
+pub mod sync_committee_pool;
 pub mod upgrade;
 
 mod lean_boundary;

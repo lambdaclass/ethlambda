@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
+use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
 use ethlambda_types::beacon::containers::shared::AttestationData;
@@ -37,15 +38,16 @@ use libssz::SszDecode as _;
 
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
-    AttestationDataDto, AttestationDto, AttesterDutyDto, CommitteeSubscriptionDto, DataResponse,
-    DutiesResponse, GenesisDto, IndexedErrorResponse, ProposerDutyDto, ProposerPreparationDto,
-    PtcDutyDto, SignedAggregateAndProofOutDto, SingleAttestationDto, SyncingDto, ValidatorEntryDto,
+    AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
+    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
+    ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
+    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorEntryDto,
     VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
     ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
-    validate_attestation_data, validate_produced_block,
+    validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
 
@@ -392,6 +394,21 @@ impl HttpBeaconNode {
             "/eth/v2/validator/aggregate_attestation?attestation_data_root={}&slot={slot}\
              &committee_index={committee_index}",
             encode_hex(&attestation_data_root.0),
+        )
+    }
+
+    /// The query string for one sync committee contribution.
+    ///
+    /// A pure function for the reason [`Self::aggregate_path`] is.
+    fn sync_contribution_path(
+        slot: Slot,
+        subcommittee_index: u64,
+        beacon_block_root: Root,
+    ) -> String {
+        format!(
+            "/eth/v1/validator/sync_committee_contribution?slot={slot}\
+             &subcommittee_index={subcommittee_index}&beacon_block_root={}",
+            encode_hex(&beacon_block_root.0),
         )
     }
 
@@ -942,6 +959,94 @@ impl BeaconNodeApi for HttpBeaconNode {
         )
         .await
     }
+
+    async fn sync_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<Vec<SyncDutyDto>> {
+        let body: Vec<String> = indices.iter().map(|index| index.to_string()).collect();
+        let response: DataResponse<Vec<SyncDutyDto>> = self
+            .post(
+                &format!("/eth/v1/validator/duties/sync/{epoch}"),
+                &body,
+                None,
+            )
+            .await?;
+        Ok(response.data)
+    }
+
+    async fn head_block_root(&self) -> Result<Root> {
+        let response: BlockRootResponse = self.get("/eth/v1/beacon/blocks/head/root").await?;
+        // The same error a 503 gets, so failover moves to the next node. See
+        // the contract on `BeaconNodeApi::head_block_root`.
+        if response.execution_optimistic.unwrap_or(false) {
+            return Err(Error::BeaconNodeSyncing);
+        }
+        parse_root(&response.data.root)
+    }
+
+    /// The same partial-success reading as attestations: see
+    /// [`Self::handle_pool_submission`].
+    async fn submit_sync_committee_messages(
+        &self,
+        messages: &[altair::SyncCommitteeMessage],
+    ) -> Result<usize> {
+        let url = format!("{}/eth/v1/beacon/pool/sync_committees", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .json(messages)
+            .send()
+            .await
+            .map_err(|err| Error::BeaconNode {
+                url: url.clone(),
+                failure: BeaconNodeFailure::classify(&err),
+                detail: err.to_string(),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(messages.len());
+        }
+        let body = response.text().await.unwrap_or_default();
+        Self::handle_pool_submission(status, body, messages.len())
+    }
+
+    async fn sync_committee_contribution(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        beacon_block_root: Root,
+    ) -> Result<altair::SyncCommitteeContribution> {
+        let path = Self::sync_contribution_path(slot, subcommittee_index, beacon_block_root);
+        let response: DataResponse<altair::SyncCommitteeContribution> = self.get(&path).await?;
+        validate_sync_contribution(slot, subcommittee_index, beacon_block_root, &response.data)?;
+        Ok(response.data)
+    }
+
+    async fn publish_contribution_and_proofs(
+        &self,
+        contributions: &[altair::SignedContributionAndProof],
+    ) -> Result<()> {
+        self.post_no_content(
+            "/eth/v1/validator/contribution_and_proofs",
+            &contributions,
+            None,
+        )
+        .await
+    }
+
+    async fn subscribe_sync_committees(
+        &self,
+        subscriptions: &[SyncCommitteeSubscriptionDto],
+    ) -> Result<()> {
+        self.post_no_content(
+            "/eth/v1/validator/sync_committee_subscriptions",
+            &subscriptions,
+            None,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1049,6 +1154,20 @@ mod tests {
 
     /// Before gloas the query still names committee 0, exactly as it always
     /// has; from gloas it is omitted.
+    #[test]
+    fn the_sync_contribution_query_carries_all_three_parameters_without_whitespace() {
+        let path = HttpBeaconNode::sync_contribution_path(7, 2, Root::repeat_byte(0xab));
+        assert_eq!(
+            path,
+            format!(
+                "/eth/v1/validator/sync_committee_contribution?slot=7&subcommittee_index=2\
+                 &beacon_block_root=0x{}",
+                "ab".repeat(32)
+            )
+        );
+        assert!(!path.contains(' '));
+    }
+
     #[test]
     fn the_committee_index_is_omitted_from_gloas_on() {
         assert_eq!(

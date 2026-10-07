@@ -245,9 +245,8 @@ pub const SAFE_SLOTS_TO_IMPORT_OPTIMISTICALLY: u64 = 128;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
 /// The sync committee counterpart of [`TARGET_AGGREGATORS_PER_COMMITTEE`]:
-/// how many aggregators the protocol aims for per sync subcommittee. Nothing
-/// in this build aggregates sync committee messages, so the spec endpoint is
-/// its only reader.
+/// how many aggregators the protocol aims for per sync subcommittee, which
+/// sets `is_sync_committee_aggregator`'s modulo.
 pub const TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE: u64 = 16;
 
 /// How many gossip subnets sync committee messages are split across, one

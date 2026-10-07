@@ -1,4 +1,4 @@
-//! `/eth/v1/config/spec`.
+//! `/eth/v1/config/spec` and `/eth/v1/config/deposit_contract`.
 //!
 //! The Beacon API asks for three things in one flat object: the network's
 //! configuration, the preset the node was built against, and the
@@ -33,7 +33,22 @@ use ethlambda_types::beacon::{config::Config, constants, preset, serde_helpers::
 use serde_json::{Map, Value};
 
 pub(crate) fn routes() -> Router<Store> {
-    Router::new().route("/eth/v1/config/spec", get(get_spec))
+    Router::new()
+        .route("/eth/v1/config/spec", get(get_spec))
+        .route("/eth/v1/config/deposit_contract", get(get_deposit_contract))
+}
+
+/// `GET /eth/v1/config/deposit_contract`: the network's deposit contract, off
+/// the same `Config` `/eth/v1/config/spec` reports it from (as
+/// `DEPOSIT_CHAIN_ID` and `DEPOSIT_CONTRACT_ADDRESS`).
+async fn get_deposit_contract(State(store): State<Store>) -> Response {
+    let config = store.config();
+    crate::json_response(serde_json::json!({
+        "data": {
+            "chain_id": config.deposit_chain_id.to_string(),
+            "address": HexPrefixed(&config.deposit_contract_address).to_string(),
+        }
+    }))
 }
 
 async fn get_spec(State(store): State<Store>) -> Response {
@@ -228,21 +243,32 @@ mod tests {
     use tower::ServiceExt as _;
 
     async fn get_spec_json() -> serde_json::Value {
+        get_json("/eth/v1/config/spec").await
+    }
+
+    async fn get_json(uri: &str) -> serde_json::Value {
         let fixture = beacon_fixture(64);
         let app = routes().with_state(fixture.store);
         let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/eth/v1/config/spec")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    /// The fixture's store is bootstrapped with `Config::mainnet()`, whose
+    /// deposit contract is the one on Ethereum mainnet.
+    #[tokio::test]
+    async fn the_deposit_contract_is_mainnets() {
+        let json = get_json("/eth/v1/config/deposit_contract").await;
+        assert_eq!(json["data"]["chain_id"], "1");
+        assert_eq!(
+            json["data"]["address"],
+            "0x00000000219ab540356cbb839cbe05303d7705fa"
+        );
     }
 
     #[tokio::test]

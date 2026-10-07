@@ -253,6 +253,10 @@ fn handle_beacon_gossip(
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
+    } else if let Some(subnet_id) = beacon_topics::sync_committee_subnet(kind) {
+        triage_sync_committee_message(server, payload, subnet_id)
+    } else if kind == beacon_topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF {
+        triage_sync_contribution(server, payload)
     } else {
         triage_other(wire, kind, payload)
     };
@@ -542,8 +546,80 @@ fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
     Dispatch::Validate(Validated::PayloadAttestation(message))
 }
 
-/// Decode one of the five beacon topics with nothing particular to report,
-/// and count it. Ignored rather than validated: none of the five has a
+/// Decode a `sync_committee_{subnet_id}` message and run its cheap gossip
+/// checks. Same shape as [`triage_block`]. The fork does not matter: the
+/// container is the same everywhere it exists, and the stateful half picks
+/// the signing domain from the message's own slot.
+fn triage_sync_committee_message(server: &P2PServer, payload: &[u8], subnet_id: u64) -> Dispatch {
+    const KIND: &str = beacon_topics::SYNC_COMMITTEE_KIND;
+    let message = match beacon_decode::decode_sync_committee_message(payload) {
+        Ok(message) => message,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    // `trace` rather than `debug`: a subcommittee votes in one burst per slot.
+    trace!(
+        slot = message.slot,
+        subnet_id,
+        validator = message.validator_index,
+        block_root = %ShortRoot(&message.beacon_block_root.0),
+        "Beacon sync committee message decoded"
+    );
+    if let Err(outcome) = gossip::sync_committee::message_cheap_checks(
+        &server.seen_sync_messages,
+        &server.store,
+        &message,
+        subnet_id,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::SyncCommitteeMessage {
+        message,
+        subnet_id,
+        seats: Vec::new(),
+    })
+}
+
+/// Decode a `sync_committee_contribution_and_proof` and run its cheap gossip
+/// checks. Same shape as [`triage_block`].
+fn triage_sync_contribution(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF;
+    let signed = match beacon_decode::decode_sync_committee_contribution(payload) {
+        Ok(signed) => signed,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    let contribution = &signed.message.contribution;
+    debug!(
+        slot = contribution.slot,
+        subcommittee_index = contribution.subcommittee_index,
+        aggregator = signed.message.aggregator_index,
+        block_root = %ShortRoot(&contribution.beacon_block_root.0),
+        bytes = payload.len(),
+        "Beacon sync committee contribution decoded"
+    );
+    if let Err(outcome) = gossip::sync_committee::contribution_cheap_checks(
+        &server.seen_sync_contributions,
+        &server.store,
+        &signed,
+        unix_now_ms(),
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::SyncContribution(Box::new(signed)))
+}
+
+/// Decode one of the four beacon topics with nothing particular to report,
+/// and count it. Ignored rather than validated: none of the four has a
 /// consumer, so this always answers `Dispatch::Report`.
 fn triage_other(wire: &BeaconWire, kind: &str, payload: &[u8]) -> Dispatch {
     let outcome = match beacon_decode::decode_gossip(&wire.config, kind, payload) {
@@ -931,8 +1007,7 @@ pub async fn publish_payload_attestation_message(
 
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.
 fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
-    let genesis_ms = wire.genesis_time.saturating_mul(1000);
-    unix_now_ms().saturating_sub(genesis_ms) / wire.config.slot_duration_ms.max(1)
+    wire.wall_slot()
 }
 
 /// Join the attestation subnets a validator client's aggregators need, per
@@ -1514,6 +1589,68 @@ mod tests {
         assert!(matches!(
             triage_payload_attestation(&server, &message.to_ssz()),
             Dispatch::Report(Outcome::Ignore(IgnoreReason::NotCurrentSlot))
+        ));
+    }
+
+    fn sync_message_bytes(slot: Slot) -> Vec<u8> {
+        ethlambda_types::beacon::containers::altair::SyncCommitteeMessage {
+            slot,
+            beacon_block_root: Default::default(),
+            validator_index: 3,
+            signature: Default::default(),
+        }
+        .to_ssz()
+    }
+
+    #[tokio::test]
+    async fn garbage_on_a_sync_committee_subnet_is_rejected_as_undecodable() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+
+        assert!(matches!(
+            triage_sync_committee_message(&server, &[0xff; 3], 1),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn garbage_on_the_contribution_topic_is_rejected_as_undecodable() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+
+        assert!(matches!(
+            triage_sync_contribution(&server, &[0xff; 3]),
+            Dispatch::Report(Outcome::Reject(RejectReason::Decode))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_past_slot_sync_message_is_ignored_and_a_current_one_is_validated() {
+        let server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let wall = server.wire.beacon().expect("beacon wire").wall_slot();
+
+        assert!(matches!(
+            triage_sync_committee_message(&server, &sync_message_bytes(wall - 5), 1),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::NotCurrentSlot))
+        ));
+        assert!(matches!(
+            triage_sync_committee_message(&server, &sync_message_bytes(wall), 1),
+            Dispatch::Validate(Validated::SyncCommitteeMessage { subnet_id: 1, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_sync_message_already_seen_on_its_subnet_is_ignored() {
+        let mut server = unconnected_beacon_server(Config::mainnet(), 0).await;
+        let wall = server.wire.beacon().expect("beacon wire").wall_slot();
+        server.seen_sync_messages.record(wall, 3, 1);
+
+        assert!(matches!(
+            triage_sync_committee_message(&server, &sync_message_bytes(wall), 1),
+            Dispatch::Report(Outcome::Ignore(IgnoreReason::AlreadySeen))
+        ));
+        // Another subnet is another key.
+        assert!(matches!(
+            triage_sync_committee_message(&server, &sync_message_bytes(wall), 2),
+            Dispatch::Validate(_)
         ));
     }
 }
