@@ -20,32 +20,28 @@
 //! which writes `store.proposer_boost_root` on [`on_block`]'s behalf:
 //! [`on_block`] is its only caller.
 //!
-//! # Units: one seconds-granularity clock, read out in milliseconds at the edges
+//! # Units: one millisecond clock
 //!
-//! This module's entry points speak the specification's unit: both [`on_tick`]
-//! and [`on_tick_per_slot`] take a `time: u64` in seconds, exactly like
-//! `BeaconState.genesis_time`. The store underneath keeps one clock in
-//! milliseconds,
-//! [`Store::time_ms`](ethlambda_storage::Store::time_ms), so those two convert
-//! on the way in and nothing else in this module reads the row directly:
-//! `get_slots_since_genesis` and `get_current_slot` reduce to
+//! [`on_tick_ms`] and [`on_tick_per_slot_ms`] take Unix milliseconds, the
+//! specification's `on_tick` unit since consensus-specs #5667/#5668, and the
+//! live chain actor feeds them real milliseconds, so the sub-second deadlines
+//! (`get_attestation_due_ms` and friends, fractions of
+//! `Config::slot_duration_ms`) are judged on the instant an event arrived.
+//! [`on_tick`] is the same with a `time: u64` in seconds, exactly like
+//! `BeaconState.genesis_time`, for the spec fixtures, whose tick steps are
+//! whole seconds ([`seconds_to_milliseconds`] converts on the way in).
+//!
+//! The store keeps that one clock,
+//! [`Store::time_ms`](ethlambda_storage::Store::time_ms), and nothing else in
+//! this module reads the row directly: `get_slots_since_genesis` and
+//! `get_current_slot` reduce to
 //! [`Store::current_slot`](ethlambda_storage::Store::current_slot), and the
-//! handlers that need to place a moment *within* the current slot against the
-//! basis-point deadlines (`get_attestation_due_ms` and friends) read
+//! handlers that place a moment *within* the current slot read
 //! [`Store::ms_since_genesis`](ethlambda_storage::Store::ms_since_genesis).
 //!
 //! The lean chain shares that row and those derivations, and reads it on a
 //! third grid of its own, `Store::intervals_since_genesis`, which nothing here
 //! touches.
-//!
-//! Milliseconds only appear where a handler needs to place a moment *within*
-//! the current slot against the basis-point deadlines
-//! (`get_attestation_due_ms` and friends, fractions of
-//! `Config::slot_duration_ms`): [`seconds_to_milliseconds`] converts the
-//! coarse seconds-since-genesis value at exactly that point, and nowhere else.
-//! So this is not two clocks running at different rates; it is one
-//! seconds-resolution clock with a millisecond-resolution read-out computed on
-//! demand, purely for comparing against the sub-slot deadlines.
 //!
 //! # Why `Store::block_index` never needs to be a `BTreeMap`
 //!
@@ -4607,19 +4603,17 @@ pub(crate) fn update_proposer_boost_root(
 // on_tick helpers
 // ---------------------------------------------------------------------------
 
-/// Advances `store` to `time`, one slot boundary at a time from where it was.
+/// Advances `store` to `time_ms` (Unix milliseconds), one slot boundary at a
+/// time from where it was.
 ///
-/// `on_tick` is what actually calls this in a loop to catch up more than one
-/// slot at once; called directly, `time` must already be at most one slot
+/// `on_tick_ms` is what actually calls this in a loop to catch up more than one
+/// slot at once; called directly, `time_ms` must already be at most one slot
 /// ahead of `store`'s current slot for the "new slot" resets below to fire at
 /// the right boundary.
-pub fn on_tick_per_slot(store: &mut Store, time: u64, config: &Config) {
+pub fn on_tick_per_slot_ms(store: &mut Store, time_ms: u64, config: &Config) {
     let previous_slot = get_current_slot(store, config);
 
-    // `time` is the specification's seconds; the store's row is milliseconds.
-    store
-        .set_time_ms(seconds_to_milliseconds(time))
-        .expect("set time");
+    store.set_time_ms(time_ms).expect("set time");
 
     let current_slot = get_current_slot(store, config);
 
@@ -4843,19 +4837,37 @@ pub fn update_latest_messages(
 // the same checks as [`on_payload_attestation_message`]; a failure partway
 // leaves the votes of the messages before it, which no valid block can cause.
 
-/// Advances `store` to `time` (Unix seconds), running [`on_tick_per_slot`]
-/// once per slot boundary crossed so that none of them are skipped even if
-/// `time` jumps forward by more than one slot since the last call.
-pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
-    let genesis_time = store.config().genesis_time;
-    let tick_slot = time.saturating_sub(genesis_time) / config.seconds_per_slot;
+/// Advances `store` to `time_ms` (Unix milliseconds), running
+/// [`on_tick_per_slot_ms`] once per slot boundary crossed so that none of them
+/// are skipped even if `time_ms` jumps forward by more than one slot since the
+/// last call.
+///
+/// The specification's `on_tick` since consensus-specs #5667/#5668. The live
+/// chain actor feeds it real milliseconds, so the sub-second deadlines
+/// (block and attestation timeliness, proposer boost) are judged on the
+/// instant an event arrived, not the second it fell in.
+pub fn on_tick_ms(store: &mut Store, time_ms: u64, config: &Config) {
+    // The specification calls `on_tick` only "whenever `time > store.time`".
+    // Events now move the clock inside a slot, so a tick can arrive behind it
+    // and must not rewind it.
+    if time_ms < store.time_ms().expect("store time exists") {
+        return;
+    }
+    let genesis_time_ms = config.genesis_time_ms();
+    let tick_slot = time_ms.saturating_sub(genesis_time_ms) / config.slot_duration_ms;
     while get_current_slot(store, config) < tick_slot {
         let next_slot = get_current_slot(store, config).saturating_add(1);
-        let previous_time =
-            genesis_time.saturating_add(next_slot.saturating_mul(config.seconds_per_slot));
-        on_tick_per_slot(store, previous_time, config);
+        let boundary_ms =
+            genesis_time_ms.saturating_add(next_slot.saturating_mul(config.slot_duration_ms));
+        on_tick_per_slot_ms(store, boundary_ms, config);
     }
-    on_tick_per_slot(store, time, config);
+    on_tick_per_slot_ms(store, time_ms, config);
+}
+
+/// [`on_tick_ms`] for a whole-second `time` (Unix seconds), the unit the spec
+/// fixtures' `on_tick` steps and `BeaconState.genesis_time` use.
+pub fn on_tick(store: &mut Store, time: u64, config: &Config) {
+    on_tick_ms(store, seconds_to_milliseconds(time), config);
 }
 
 /// Validates and applies `signed_block`, adding it and its resulting
@@ -5760,6 +5772,26 @@ mod tests {
     /// Tests populate only what the function under test actually reads.
     fn empty_store() -> Store {
         store_anchored_at(Root::ZERO)
+    }
+
+    #[test]
+    fn on_tick_ms_keeps_sub_second_precision_and_never_rewinds() {
+        let mut store = empty_store();
+        let config = Config::active();
+
+        on_tick_ms(&mut store, 1_750, &config);
+        assert_eq!(store.time_ms().unwrap(), 1_750);
+
+        on_tick_ms(&mut store, 1_200, &config);
+        assert_eq!(
+            store.time_ms().unwrap(),
+            1_750,
+            "a late tick must not rewind"
+        );
+
+        // The whole-second entry point (fixtures) agrees with the ms one.
+        on_tick(&mut store, 3, &config);
+        assert_eq!(store.time_ms().unwrap(), 3_000);
     }
 
     /// A fresh store whose head and both realized checkpoints name `root` in
