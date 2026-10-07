@@ -148,19 +148,19 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();
-    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::CLIENT_VERSION);
+    ethlambda_blockchain::metrics::set_node_info("ethlambda", version::client_version());
     ethlambda_blockchain::metrics::set_node_start_time();
 
     let rpc_config = RpcConfig {
         http_address: options.http_address,
         api_port: options.api_port,
         metrics_port: options.metrics_port,
-        version: version::CLIENT_VERSION,
+        version: version::client_version(),
     };
 
     println!("\n{}", banner::for_locale());
 
-    info!(version = version::CLIENT_VERSION, "Starting ethlambda");
+    info!(version = version::client_version(), "Starting ethlambda");
 
     // Raise the soft open-file-descriptor limit to the hard limit. RocksDB
     // keeps an unbounded table cache (`set_max_open_files(-1)`), so on

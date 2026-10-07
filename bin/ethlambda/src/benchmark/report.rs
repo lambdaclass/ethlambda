@@ -61,7 +61,7 @@ pub(crate) struct Environment {
 impl Environment {
     pub(crate) fn collect() -> Self {
         Self {
-            client_version: version::CLIENT_VERSION,
+            client_version: version::client_version(),
             leanvm_rev: env!("ETHLAMBDA_LEANVM_REV"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
