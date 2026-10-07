@@ -2,7 +2,7 @@
 
 This doc explains how ethlambda saves data. Especially,
 the split between the fork choice `Store` and the `StorageBackend` trait,
-what each of the twelve tables holds, and which data is in-memory only.
+what each of the thirteen tables holds, and which data is in-memory only.
 
 ## Overview
 
@@ -93,34 +93,34 @@ is built from it, and clones are handed to the BlockChain and P2P actors.
                         INSIDE THE STORE
                         ────────────────
 
-   ┌──────────────────────────── Store ────────────────────────────┐
-   │                                                               │
-   │   PERSISTED (via backend)         IN-MEMORY ONLY              │
-   │   ──────────────────────          ──────────────────────      │
-   │   ┌─────────────────────┐         ┌──────────────────────┐    │
-   │   │ BlockHeaders        │         │ new_payloads         │    │
-   │   │ BlockBodies         │         │  (pending aggregated │    │
-   │   │ BlockProof          │         │   attestations)      │    │
-   │   │ BlockRoots          │         │ known_payloads       │    │
-   │   │ States              │         │  (fork-choice-active │    │
-   │   │ StateDiffs          │         │   attestations)      │    │
-   │   │ Metadata            │         │ gossip_signatures    │    │
-   │   │ LiveChain           │         │  (raw XMSS sigs      │    │
-   │   │ DataColumns         │         │   awaiting           │    │
-   │   │ PendingDataColumns  │         │   aggregation)       │    │
-   │   │ ExecutionPayload-   │         │ state_cache (LRU)    │    │
-   │   │   Envelopes         │         └──────────────────────┘    │
-   │   │ BlockTimeliness     │                                     │
-   │   └─────────────────────┘                                     │
-   │   Survives restarts, except                                   │
-   │   PendingDataColumns, which       Lost on restart.            │
-   │   is cleared at startup.                                      │
-   └───────────────────────────────────────────────────────────────┘
+   ┌───────────────────────────────── Store ──────────────────────────────────┐
+   │                                                                          │
+   │   PERSISTED (via backend)                    IN-MEMORY ONLY              │
+   │   ───────────────────────                    ──────────────              │
+   │   ┌────────────────────────────────┐         ┌──────────────────────┐    │
+   │   │ BlockHeaders                   │         │ new_payloads         │    │
+   │   │ BlockBodies                    │         │ (pending aggregated  │    │
+   │   │ BlockProof                     │         │ attestations)        │    │
+   │   │ BlockRoots                     │         │ known_payloads       │    │
+   │   │ States                         │         │ (fork-choice-active  │    │
+   │   │ StateDiffs                     │         │ attestations)        │    │
+   │   │ Metadata                       │         │ gossip_signatures    │    │
+   │   │ LiveChain                      │         │ (raw XMSS sigs       │    │
+   │   │ DataColumns                    │         │ awaiting             │    │
+   │   │ PendingDataColumns             │         │ aggregation)         │    │
+   │   │ ExecutionPayloadEnvelopes      │         │ state_cache (LRU)    │    │
+   │   │ BlockTimeliness                │         └──────────────────────┘    │
+   │   │ BeaconUnrealizedJustifications │                                     │
+   │   └────────────────────────────────┘                                     │
+   │   Survives restarts, except                                              │
+   │   PendingDataColumns, which                  Lost on restart.            │
+   │   is cleared at startup.                                                 │
+   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## The Tables
 
-The twelve variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
+The thirteen variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 
 | Table              | Key                        | Value                                     | Pruned?                          |
 | ------------------ | --------------------------- | ----------------------------------------- | --------------------------------- |
@@ -136,6 +136,7 @@ The twelve variants of the `Table` enum (`crates/storage/src/api/tables.rs`):
 | `PendingDataColumns` | slot ‖ root ‖ column_index | `DataColumnSidecar` (SSZ-encoded), unverified | yes: on replay, below finalized, and wholly at startup |
 | `ExecutionPayloadEnvelopes` | slot ‖ root          | gloas `SignedExecutionPayloadEnvelope` (SSZ), verified only | no: beacon block rows are kept too |
 | `BlockTimeliness`  | root                        | one byte per timeliness deadline (0 or 1), gloas blocks only | no |
+| `BeaconUnrealizedJustifications` | root | `(slot, Checkpoint)` (beacon only) | yes: below the finalized block's own slot (see [below](#beaconunrealizedjustifications)) |
 
 ### Key encoding
 
@@ -159,6 +160,16 @@ Four key layouts are used:
   big-endian slot, since the value already holds the root. This table is
   never pruned, so the ordering buys nothing here; it is kept only for
   consistency with the other slot-prefixed keys.
+- **Root-keyed with the slot in the value** (`BeaconUnrealizedJustifications`)
+  is the inverse trade from the slot-prefixed tables above: both of this
+  table's readers (`get_voting_source`, `is_ffg_competitive`) look up a root
+  with no slot in hand, so keying by root alone keeps that lookup a single
+  point read, and the slot rides along in the value purely for the pruner
+  to read back. The cost is on the pruner's side instead: with no slot
+  prefix to stop early on, it decodes every row's value to compare its slot,
+  cheap here since the table only ever holds the unfinalized window's worth
+  of leaves between two finalizations. See
+  [BeaconUnrealizedJustifications](#beaconunrealizedjustifications) below.
 
 ### BlockHeaders
 
@@ -531,6 +542,52 @@ preserving, and the block it belongs to asks for its columns again. Without
 that, every crash would leave every row it had parked unreadable, kept until
 the directory was deleted.
 
+### BeaconUnrealizedJustifications
+
+`root → (slot, Checkpoint)`, **beacon only**. Persists the beacon fork
+choice's per-block unrealized justified checkpoint — consensus-specs'
+`store.unrealized_justifications[block_root]` — which used to live only in
+`BeaconScratch::unrealized_justifications`, an in-memory `HashMap` with no
+backing table. A restart emptied that map with nothing to refill it: once a
+pre-restart block was a leaf from an epoch older than the store's clock,
+`get_voting_source` (and, through it, `filter_block_tree`/`get_head`) hit a
+hard `SpecAssert("block_root in store.unrealized_justifications")` on every
+tick, freezing the head. This table is what makes the value survive a
+restart; `Store::unrealized_justification`/`Store::set_unrealized_justification`
+keep the in-memory map too, as a write-through cache in front of it, since
+`get_voting_source` reads this for every block from a prior epoch and a cache
+hit costs no backend round trip.
+
+Keyed by root alone rather than `slot ‖ root`, unlike `LiveChain`/`BlockProof`:
+see [Key encoding](#key-encoding) above for why. The slot travels in the value
+instead, written alongside the checkpoint by `Store::set_unrealized_justification`.
+
+Two writers: the anchor, at bootstrap (`get_forkchoice_store`), and
+`compute_pulled_up_tip`, called from `on_block` for every newly imported
+block. Both call `Store::set_unrealized_justification` after the block's own
+`insert_signed_block`/`insert_state` have already run — `compute_pulled_up_tip`
+needs the block's post-state, which does not exist until those have — so the
+write is not in the same atomic batch as the block's import. A crash between
+the two leaves that one block without an unrealized-justification entry;
+`has_state` then skips re-importing it on resume, so nothing ever fills the
+row in afterward either. `get_voting_source` no longer treats that miss as
+fatal: it falls back to `store.beacon_justified_checkpoint()`, the way Prysm
+seeds a rebuilt node's forkchoice store, and logs at `debug` rather than
+raising. That is safe because the fallback only affects whether the block
+counts as viable in `filter_block_tree` (`voting_source.epoch ==
+store.justified.epoch` is always true for it), never how much weight it
+casts once it does. `is_ffg_competitive` still raises on a miss: nothing in
+production calls it.
+
+Pruned on finalization, on the same horizon `LiveChain` is (the finalized
+block's own slot, read from `BlockHeaders` via `block_entry`, not the stored
+checkpoint's epoch-start slot — see [LiveChain](#livechain) above for why):
+`Store::prune_unrealized_justifications` deletes every entry below that slot
+and evicts the same roots from the in-memory cache, keeping the finalized
+block's own entry. That entry has to survive: after a restart with nothing
+yet imported past the anchor, the anchor itself is the only leaf `get_head`
+has to work with.
+
 ## State Storage: Snapshots + Diffs
 
 Storing a full `State` per block would be wasteful: most fields never change
@@ -676,6 +733,12 @@ a deferred heavy phase.
 - `prune_stale_aggregated_payloads`: drops in-memory aggregated payloads
   (both pending and known) whose target slot is at or below the finalized
   slot.
+- `prune_unrealized_justifications`: **beacon only**, and only alongside
+  `prune_live_chain` in the same `Chain::Beacon` arm, on the same horizon
+  (the finalized block's own slot) — see
+  [BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above.
+  Deletes entries below that slot from the table and evicts the same roots
+  from the in-memory cache, keeping the finalized block's own entry.
 
 **Deferred** (`prune_old_data`, called after a batch of blocks has been
 processed):
@@ -702,10 +765,10 @@ where a future pruner is meant to land
 
 ## In-Memory Only (Lost on Restart)
 
-Five `Store` fields never touch the backend (the gloas parts of `beacon`
-excepted, see above). All are bounded buffers (or, for
-`beacon`, bounded in practice by the validator set and the unfinalized window)
-shared across `Store` clones:
+Five `Store` fields never touch the backend directly, `beacon` with the
+exceptions its row below names. All are bounded buffers (or, for
+`beacon`, bounded in practice by the validator set and the unfinalized
+window) shared across `Store` clones:
 
 | Buffer              | Capacity        | Contents                                                                                 |
 | ------------------- | --------------- | ---------------------------------------------------------------------------------------- |
@@ -713,7 +776,7 @@ shared across `Store` clones:
 | `known_payloads`    | 512 messages    | Fork-choice-active aggregated proofs                                                     |
 | `gossip_signatures` | 2048 signatures | Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case) |
 | `state_cache`       | 32 states       | LRU memoization of block *and* checkpoint post-states (either chain), each held behind an `Arc` so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error |
-| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Apart from a gloas block's timeliness and verified payload (see [ExecutionPayloadEnvelopes and BlockTimeliness](#executionpayloadenvelopes-and-blocktimeliness)), none of it is persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, PoW blocks stand in for an execution-client call a restarted node would simply make again, and unrealized justifications are refilled as a node re-imports the unfinalized window from its anchor |
+| `beacon`            | unbounded       | Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. Most of it is not persisted: proposer boost resets every slot, pre-gloas timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, and PoW blocks stand in for an execution-client call a restarted node would simply make again. The exceptions are a gloas block's timeliness and verified payload (see [ExecutionPayloadEnvelopes and BlockTimeliness](#executionpayloadenvelopes-and-blocktimeliness)) and unrealized justifications: this map is a write-through cache in front of `BeaconUnrealizedJustifications` (see [that table](#beaconunrealizedjustifications) above), so it is not lost, only refilled lazily on the next miss |
 
 The payload buffers evict FIFO when full, and redundant proofs (whose
 participants are a subset of an existing proof for the same attestation data)
@@ -727,7 +790,7 @@ pools.
 
 After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the twelve tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
+network. Everything persisted in the thirteen tables survives, except `PendingDataColumns`, which is cleared outright: its only index is in memory.
 
 ## Startup and Restore
 
@@ -754,7 +817,10 @@ reading is zero there.
 `init_beacon`'s own atomic batch is the beacon-directory keys listed under
 [Metadata](#metadata) above; the anchor's `States`/`BlockHeaders`/`BlockBodies`
 entries are written by its caller instead, through the same `insert_state` and
-`insert_signed_block` an ordinary block import uses.
+`insert_signed_block` an ordinary block import uses, followed by the anchor's
+own `BeaconUnrealizedJustifications` row (`set_unrealized_justification`), the
+same order every later block's import follows too — see
+[BeaconUnrealizedJustifications](#beaconunrealizedjustifications) above.
 
 `from_db_state` is the restore path: it reads `db_version`, `preset`, `chain`,
 `config` and `anchor_slot` from `Metadata`, returning `None` for an empty DB. A format
