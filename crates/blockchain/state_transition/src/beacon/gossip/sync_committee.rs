@@ -714,16 +714,22 @@ mod tests {
             contribution_cheap_checks(&seen, &store, &bad, now),
             Err(Outcome::Reject(RejectReason::NoParticipants))
         );
-        // Not selected.
-        let mut bad = good.clone();
-        bad.message.selection_proof = (0u8..=255)
+        // Not selected. Minimal's subcommittee is smaller than
+        // `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`, so the modulo clamps to 1
+        // and every proof selects: the rule cannot fire there.
+        let unselected = (0u8..=255)
             .map(|byte| BlsSignature([byte; 96]))
-            .find(|proof| !is_sync_committee_aggregator(proof))
-            .expect("an unselected value exists");
-        assert_eq!(
-            contribution_cheap_checks(&seen, &store, &bad, now),
-            Err(Outcome::Reject(RejectReason::NotAggregator))
-        );
+            .find(|proof| !is_sync_committee_aggregator(proof));
+        if cfg!(feature = "preset-minimal") {
+            assert!(unselected.is_none());
+        } else {
+            let mut bad = good.clone();
+            bad.message.selection_proof = unselected.expect("an unselected value exists");
+            assert_eq!(
+                contribution_cheap_checks(&seen, &store, &bad, now),
+                Err(Outcome::Reject(RejectReason::NotAggregator))
+            );
+        }
 
         // Seen: the same aggregator, then a covered subset from another.
         assert!(seen.record(&good));
