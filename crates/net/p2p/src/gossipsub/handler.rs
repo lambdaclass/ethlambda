@@ -659,7 +659,7 @@ pub async fn publish_beacon_block(server: &mut P2PServer, block: SignedBeaconBlo
 }
 
 /// The beacon wall-clock slot, from the wire's genesis and slot duration.
-fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
+pub(crate) fn beacon_wall_slot(wire: &BeaconWire) -> u64 {
     let genesis_ms = wire.genesis_time.saturating_mul(1000);
     unix_now_ms().saturating_sub(genesis_ms) / wire.config.slot_duration_ms.max(1)
 }
