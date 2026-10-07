@@ -1,0 +1,215 @@
+name: Release promotion
+
+# Promotes a tested release candidate to its final version: the candidate's
+# images are re-published as `X.Y.Z` and `latest`. Nothing is recompiled. A
+# one-instruction `FROM <candidate>` / `ENV ETHLAMBDA_CHANNEL=stable` build keeps
+# the binary layers straight from the candidate, so the executable that ships is
+# byte-for-byte the one that was tested; only the image config gains the env var,
+# which the binary reads to report `-stable-` instead of its baked `-rc.N-`.
+#
+# The decision comes from the triggering event (or the manual inputs) and never
+# from GitHub's /releases/latest, which excludes pre-releases and lags a
+# just-saved edit; ethrex lost a `latest` move to that race.
+#
+#   release: edited    -> one edit that renames the tag vX.Y.Z-rc.N -> vX.Y.Z AND
+#                         unticks "pre-release" promotes automatically. An edit
+#                         that does only one of the two is ignored.
+#   workflow_dispatch  -> manual recovery: name the candidate and the version.
+#   release: released  -> tripwire: fails unless `latest` really moved to the
+#                         released version.
+#
+# See RELEASE.md for the procedure.
+
+on:
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release candidate to promote, e.g. v0.2.0-rc.1"
+        required: true
+        type: string
+      version:
+        description: "Final version to publish, e.g. v0.2.0"
+        required: true
+        type: string
+  release:
+    types: [edited, released]
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  resolve:
+    name: Resolve promotion tags
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.action == 'edited' &&
+       github.event.changes.tag_name.from != '' &&
+       github.event.release.prerelease == false)
+    outputs:
+      rc_tag: ${{ steps.tags.outputs.rc_tag }}
+      version: ${{ steps.tags.outputs.version }}
+    steps:
+      - name: Determine candidate and final tags
+        id: tags
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RC_TAG: ${{ inputs.rc_tag }}
+          INPUT_VERSION: ${{ inputs.version }}
+          EDIT_FROM: ${{ github.event.changes.tag_name.from }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            rc="$INPUT_RC_TAG"
+            final="$INPUT_VERSION"
+          else
+            rc="$EDIT_FROM"
+            final="$RELEASE_TAG"
+          fi
+          # Image tags carry no leading 'v' (v0.2.0-rc.1 -> 0.2.0-rc.1).
+          rc="${rc#v}"
+          final="${final#v}"
+
+          if ! [[ "$rc" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+            echo "::error::'$rc' is not a release-candidate tag (vX.Y.Z-rc.N)"
+            exit 1
+          fi
+          if ! [[ "$final" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$final' is not a final version (vX.Y.Z)"
+            exit 1
+          fi
+          # The binary reports the Cargo version it was built with, which is the
+          # candidate's X.Y.Z: promoting it under another version would publish
+          # an image whose --version disagrees with its tag.
+          if [ "${rc%%-*}" != "$final" ]; then
+            echo "::error::candidate $rc is not a candidate for $final"
+            exit 1
+          fi
+
+          echo "rc_tag=$rc" >> "$GITHUB_OUTPUT"
+          echo "version=$final" >> "$GITHUB_OUTPUT"
+          echo "Promoting $rc -> $final (+ latest)"
+
+  promote:
+    name: Promote candidate images
+    needs: resolve
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      RC_TAG: ${{ needs.resolve.outputs.rc_tag }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Check the candidate image exists
+        run: |
+          if ! docker buildx imagetools inspect "$IMAGE:$RC_TAG" > /dev/null; then
+            echo "::error::$IMAGE:$RC_TAG not found; was the candidate's release run green?"
+            exit 1
+          fi
+
+      # No RUN instruction, so the arm64 half needs no emulation.
+      - name: Re-stamp the candidate as stable
+        run: |
+          set -euo pipefail
+          printf 'FROM %s\nENV ETHLAMBDA_CHANNEL=stable\n' "$IMAGE:$RC_TAG" > Dockerfile.promote
+          docker buildx build -f Dockerfile.promote \
+            --platform linux/amd64,linux/arm64 \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            --push .
+
+  verify:
+    name: Verify promotion
+    needs: [resolve, promote]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assert latest resolves to the promoted version
+        run: |
+          set -euo pipefail
+          latest=$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{.Manifest.Digest}}')
+          pinned=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          echo "latest=$latest  $VERSION=$pinned"
+          if [ "$latest" != "$pinned" ]; then
+            echo "::error::':latest' ($latest) does not match ':$VERSION' ($pinned)"
+            exit 1
+          fi
+
+      - name: Assert the promoted image reports itself as stable
+        run: |
+          set -euo pipefail
+          reported=$(docker run --rm "$IMAGE:$VERSION" --version)
+          echo "$reported"
+          if [[ "$reported" != *"/v$VERSION-stable-"* ]]; then
+            echo "::error::expected '/v$VERSION-stable-' in the version string"
+            exit 1
+          fi
+
+  assert-latest-promoted:
+    name: Assert release was promoted to latest
+    # Tripwire: a release turned into a full release MUST end up on `latest`. The
+    # 'edited' run (or a manual dispatch) promotes concurrently, so poll until
+    # `latest` catches up. A persistent mismatch means the promotion never fired,
+    # typically because the tag rename and the pre-release untick were saved as
+    # two separate edits.
+    if: github.event.action == 'released'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for latest to match the released version
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          digest() {
+            docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' 2> /dev/null || true
+          }
+          for attempt in $(seq 1 10); do
+            target=$(digest "$IMAGE:$version")
+            current=$(digest "$IMAGE:latest")
+            echo "attempt $attempt: latest=${current:-<none>}  $version=${target:-<none>}"
+            if [ -n "$target" ] && [ "$current" = "$target" ]; then
+              echo "Confirmed :latest -> :$version"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::':latest' did not move to ':$version'. If the tag rename and the pre-release untick were saved as separate edits, nothing promoted it: run 'Release promotion' by hand with rc_tag (the tested candidate, e.g. v$version-rc.1) and version (v$version)."
+          exit 1

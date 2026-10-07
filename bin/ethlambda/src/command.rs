@@ -38,7 +38,7 @@ const KEYGEN: &str = "keygen";
 #[command(
     name = "ethlambda",
     author = "LambdaClass",
-    version = version::CLIENT_VERSION,
+    version = version::client_version(),
     about = "ethlambda consensus client",
     // `--version` used to sit on the node options, so it was accepted after
     // node flags; `ethereum/hive` builds its image that way. Propagating it to

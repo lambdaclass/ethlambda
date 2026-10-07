@@ -104,15 +104,19 @@ Additional features:
 - [leanMetrics](docs/metrics.md) support for monitoring and observability
 - [lean-quickstart](https://github.com/blockblaz/lean-quickstart) integration for easier devnet running
 
-### Container Releases
+### Releases
 
-Docker images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
+Binaries for Linux (x86_64, aarch64) and macOS (Apple silicon) are attached to
+[GitHub Releases](https://github.com/lambdaclass/ethlambda/releases). Docker
+images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
 
 | Tag | Description |
 |-----|-------------|
+| `latest` | The latest release |
+| `X.Y.Z` | A specific release |
+| `X.Y.Z-rc.N` | A release candidate, promoted to `X.Y.Z`/`latest` once tested |
 | `devnetX` | Stable image for a specific devnet (e.g. `devnet4`) |
-| `latest` | Alias for the latest stable image of the currently running devnet |
-| `unstable` | Built from the latest main commit; promoted to `devnetX`/`latest` once tested |
+| `unstable` | Built from the latest main commit |
 | `sha-XXXXXXX` | Specific commit |
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.

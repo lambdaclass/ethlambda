@@ -20,6 +20,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_instructions(&git2)?
         .emit()?;
 
+    // Release builds set this to the `rc.N` suffix of their tag, since a tag
+    // checkout has no branch; vergen honors it but does not watch it.
+    println!("cargo:rerun-if-env-changed=VERGEN_GIT_BRANCH");
+
     emit_crypto_revs();
 
     Ok(())

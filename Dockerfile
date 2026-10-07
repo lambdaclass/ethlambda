@@ -49,7 +49,13 @@ COPY --exclude=target . .
 ARG SHADOW=""
 RUN if [ -n "$SHADOW" ]; then cat shadow/cargo-patch.toml >> Cargo.toml; fi
 
-RUN cargo build --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" $LOCKED --bin ethlambda
+# Channel reported in the client version. vergen reads the branch from .git, but a
+# release-candidate tag is checked out detached (it would report "HEAD"), so CI
+# passes the tag's `rc.N` suffix here. Left empty, vergen reads .git as before.
+ARG GIT_BRANCH=""
+
+RUN if [ -n "$GIT_BRANCH" ]; then export VERGEN_GIT_BRANCH="$GIT_BRANCH"; fi; \
+    cargo build --profile $BUILD_PROFILE $NO_DEFAULT_FEATURES --features "$FEATURES" $LOCKED --bin ethlambda
 
 # ARG is not resolved in COPY so we have to hack around it by copying the
 # binary to a temporary location
@@ -65,9 +71,11 @@ LABEL org.opencontainers.image.licenses="MIT"
 
 ARG GIT_COMMIT=unknown
 ARG GIT_BRANCH=unknown
+ARG VERSION=dev
 
 LABEL org.opencontainers.image.revision=$GIT_COMMIT
 LABEL org.opencontainers.image.ref.name=$GIT_BRANCH
+LABEL org.opencontainers.image.version=$VERSION
 
 # Copy ethlambda over from the build stage
 COPY --from=builder /app/ethlambda /usr/local/bin
