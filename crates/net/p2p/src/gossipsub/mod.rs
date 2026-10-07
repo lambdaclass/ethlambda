@@ -2,6 +2,7 @@ mod encoding;
 mod handler;
 mod messages;
 
+pub(crate) use encoding::compress_message;
 pub use encoding::decompress_message;
 pub use handler::{
     handle_gossip_message, join_aggregator_subnets, leave_expired_aggregator_subnets,

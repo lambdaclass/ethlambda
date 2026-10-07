@@ -403,3 +403,84 @@ fn an_oversized_list_is_refused_rather_than_truncated() {
     ]);
     assert!(serde_json::from_value::<electra::SignedBeaconBlock>(json).is_err());
 }
+
+fn bid() -> gloas::SignedExecutionPayloadBid {
+    gloas::SignedExecutionPayloadBid {
+        message: gloas::ExecutionPayloadBid {
+            parent_block_hash: [1; 32].into(),
+            parent_block_root: [2; 32].into(),
+            block_hash: [3; 32].into(),
+            prev_randao: [4; 32].into(),
+            fee_recipient: [5; 20].into(),
+            gas_limit: 30_000_000,
+            builder_index: 7,
+            slot: 33,
+            value: 8,
+            execution_payment: 9,
+            execution_requests_root: [7; 32].into(),
+            blob_kzg_commitments: vec![KzgCommitment([6; 48])].try_into().unwrap(),
+        },
+        signature: signature(3),
+    }
+}
+
+#[test]
+fn a_bid_round_trips_through_json() {
+    round_trip(&bid());
+}
+
+#[test]
+fn proposer_preferences_round_trip_through_json() {
+    round_trip(&gloas::SignedProposerPreferences {
+        message: gloas::ProposerPreferences {
+            dependent_root: [1; 32].into(),
+            proposal_slot: 32,
+            validator_index: 123,
+            fee_recipient: [5; 20].into(),
+            target_gas_limit: 60_000_000,
+        },
+        signature: signature(4),
+    });
+}
+
+#[test]
+fn a_builder_round_trips_and_quotes_its_integers() {
+    let builder = gloas::Builder {
+        pubkey: pubkey(1),
+        version: 3,
+        execution_address: [5; 20].into(),
+        balance: 32_000_000_000,
+        deposit_epoch: 4,
+        withdrawable_epoch: u64::MAX,
+    };
+    round_trip(&builder);
+    let json = serde_json::to_value(&builder).unwrap();
+    for field in ["version", "balance", "deposit_epoch", "withdrawable_epoch"] {
+        assert!(json[field].is_string(), "{field} must be quoted: {json}");
+    }
+}
+
+/// The example `execution_payload_bid` and `proposer_preferences` events in
+/// beacon-APIs' event stream, byte for byte.
+#[test]
+fn the_beacon_apis_example_messages_parse() {
+    let bid = r#"{"message": {"parent_block_hash": "0x9a2fefd2fdb57f74993c7780ea5b9030d2897b615b89f808011ca5aebed54eaf", "parent_block_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "block_hash": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef", "prev_randao": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "fee_recipient": "0x0000000000000000000000000000000000000000", "gas_limit": "30000000", "builder_index": "42", "slot": "10", "value": "1000000000", "execution_payment": "0", "blob_kzg_commitments": ["0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2"], "execution_requests_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2"}, "signature": "0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"}"#;
+    let parsed: gloas::SignedExecutionPayloadBid = serde_json::from_str(bid).unwrap();
+    assert_eq!(parsed.message.builder_index, 42);
+    assert_eq!(parsed.message.slot, 10);
+    assert_eq!(parsed.message.value, 1_000_000_000);
+    assert_eq!(parsed.message.blob_kzg_commitments.len(), 1);
+
+    let preferences = r#"{"message": {"dependent_root": "0xcf8e0d4e9587369b2301d0790347320302cc0943d5a1884560367e8208d920f2", "proposal_slot": "32", "validator_index": "123", "fee_recipient": "0x0000000000000000000000000000000000000000", "target_gas_limit": "60000000"}, "signature": "0x1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505cc411d61252fb6cb3fa0017b679f8bb2305b26a285fa2737f175668d0dff91cc1b66ac1fb663c9bc59509846d6ec05345bd908eda73e670af888da41af171505"}"#;
+    let parsed: gloas::SignedProposerPreferences = serde_json::from_str(preferences).unwrap();
+    assert_eq!(parsed.message.proposal_slot, 32);
+    assert_eq!(parsed.message.validator_index, 123);
+    assert_eq!(parsed.message.target_gas_limit, 60_000_000);
+}
+
+#[test]
+fn signed_proposer_preferences_are_a_fixed_172_bytes() {
+    use libssz::SszEncode as _;
+    let bytes = gloas::SignedProposerPreferences::default().to_ssz();
+    assert_eq!(bytes.len(), 172);
+}

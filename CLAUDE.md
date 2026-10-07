@@ -334,9 +334,11 @@ actual_slot = finalized_slot + 1 + relative_index
   - Beacon wire: `validate_messages()` is on, so every beacon message waits for a verdict (~4.2s before gossipsub's cache evicts it). Rules in `state_transition::beacon::gossip` (cheap half inline, stateful half on a bounded `spawn_blocking` task); plumbing in `p2p/src/beacon/verdict.rs`. Lean gossip still auto-forwards
   - Data columns: every check runs in p2p. A column gossip did not accept (`Queue`/`Overloaded`), every fetched column, and parked columns replayed after their parent imports go through `column::chain_checks` in `p2p/src/beacon/column_checks.rs`. The chain actor stores what it gets unchecked; only debug builds re-run `chain_checks` there
   - Beacon subscribes seven global topics plus two node-id-derived subnet families: custody
-    columns and backbone attestation subnets. Gloas digests add two more topics,
-    `execution_payload` and `payload_attestation_message` (`BeaconTopics::for_fork`; earlier
-    digests never carry them). Gloas has its own rules for `beacon_block`,
+    columns and backbone attestation subnets. Gloas digests add four more topics,
+    `execution_payload`, `payload_attestation_message`, `execution_payload_bid` and
+    `proposer_preferences` (`BeaconTopics::for_fork`; earlier digests never carry them).
+    Bids and preferences are validated in p2p against one shared `BuilderMarket`
+    (`state_transition::beacon::builder_market`) and never reach the chain actor. Gloas has its own rules for `beacon_block`,
     `data_column_sidecar` (fork enum `DataColumnSidecar`, fork from the topic's digest),
     aggregates (`SignedAggregateAndProof::Gloas`, aggregation-bits length bounded before
     expansion) and attestations (`verify_attestation_payload_status`). Deliberate
@@ -767,8 +769,13 @@ transitions are in `ethlambda-types`, per the section above. Nothing above
   the parking of gloas column sidecars (they carry no signature). Fork-choice
   events are timed at arrival, not at the slot tick, and the head's payload
   status is kept with its root (`Store::head_payload_status`, recomputed after
-  a restart). The node also serves gloas validator duties, self-build only (no
-  bids, no proposer preferences; see `docs/spec_deviations.md`).
+  a restart). The node also serves gloas validator duties and the builder market:
+  it validates, pools and relays gossip bids and proposer preferences, serves
+  `POST /eth/v1/beacon/execution_payload_bids` and `/proposer_preferences` plus the
+  builder endpoints, and `produceBlockV4` weighs the best pooled p2p bid against
+  the local build per `BuilderConfig` (`min_bid`, `builder_boost_factor`; the local
+  build wins a tie). A winning bid returns the block only. The builder API (relay
+  or `builder_pubkeys` bids) is phase 2; see `docs/spec_deviations.md`.
   `state_transition/src/beacon/gloas_block_production.rs` assembles the block and
   its envelope (`gloas_payload_inputs`, `parse_gloas_execution_requests`,
   `pack_gloas_attestations`, `pack_payload_attestations`, `assemble_gloas_block`,

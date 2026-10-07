@@ -29,8 +29,8 @@ use super::helpers::accessors::{
     CommitteeCache, get_beacon_proposer_index, get_current_epoch, get_randao_mix,
 };
 use super::helpers::gloas::{
-    get_indexed_payload_attestation, get_ptc, gloas_state_ref, is_attestation_same_slot,
-    is_valid_indexed_payload_attestation,
+    can_builder_cover_bid, get_indexed_payload_attestation, get_ptc, gloas_state_ref,
+    is_active_builder, is_attestation_same_slot, is_valid_indexed_payload_attestation,
 };
 use super::stf;
 use ethlambda_types::beacon::{
@@ -345,6 +345,102 @@ pub struct GloasBlockInputs {
     /// The payload's own requests, which the bid commits to by root and the
     /// envelope carries.
     pub execution_requests: ExecutionRequests,
+}
+
+/// What a gloas block body carries when it commits to another builder's bid
+/// rather than to a payload this node built.
+#[derive(Debug, Clone)]
+pub struct GloasBidBlockInputs {
+    pub randao_reveal: BlsSignature,
+    pub graffiti: Bytes32,
+    pub attestations: Vec<gloas::Attestation>,
+    pub payload_attestations: Vec<PayloadAttestation>,
+    pub parent_execution_requests: ExecutionRequests,
+    pub signed_bid: SignedExecutionPayloadBid,
+}
+
+/// The unsigned block for `state.slot()` committing to `inputs.signed_bid`, a
+/// builder's bid rather than a payload this node built.
+///
+/// The body is [`assemble_gloas_block`]'s (empty sync aggregate, the state's own
+/// `eth1_data`), with the bid in place of the self-build one. `process_block` on
+/// a copy fills `state_root` and enforces `process_execution_payload_bid`:
+/// the builder is active, covers the bid and signed it, and the bid's slot,
+/// parent hash and root and randao are the state's. There is no envelope: the
+/// builder reveals the payload itself.
+pub fn assemble_gloas_block_on_bid(
+    state: &BeaconState,
+    inputs: GloasBidBlockInputs,
+    config: &Config,
+) -> Result<BeaconBlock> {
+    verify(
+        matches!(state, BeaconState::Gloas(_)),
+        "gloas block production runs on a gloas state",
+    )?;
+    let body = BeaconBlockBody {
+        randao_reveal: inputs.randao_reveal,
+        eth1_data: state.eth1_data().clone(),
+        graffiti: inputs.graffiti,
+        attestations: inputs.attestations.into(),
+        sync_aggregate: empty_sync_aggregate(),
+        signed_execution_payload_bid: inputs.signed_bid,
+        payload_attestations: inputs.payload_attestations.into(),
+        parent_execution_requests: inputs.parent_execution_requests,
+        ..BeaconBlockBody::empty()
+    };
+    let mut block = BeaconBlock {
+        slot: state.slot(),
+        proposer_index: get_beacon_proposer_index(state)?,
+        parent_root: state.latest_block_header().hash_tree_root(),
+        state_root: Root::ZERO,
+        body,
+    };
+    let mut post = state.clone();
+    stf::gloas::process_block(&mut post, &block, config, &CommitteeCache::default())?;
+    block.state_root = post.hash_tree_root();
+    Ok(block)
+}
+
+/// Cheap pre-filter on the state advanced to the slot: whether the bid could
+/// be packed into a block on `state`, so the producer skips a bid whose block
+/// would fail rather than learning it from a full `process_block`.
+///
+/// Checks the bid is for `state`'s slot, parent root, previous randao and
+/// parent payload (full: the parent bid's block hash; empty: the state's
+/// `latest_block_hash`), that the builder exists, is a payload builder, is
+/// active and covers the value, that the commitment count is within the preset
+/// bound, and that the parent payload does not exit the builder when the bid
+/// builds on it (`process_parent_execution_payload` runs before the bid, so a
+/// builder that exits there is no longer active). The signature is not checked
+/// here; `process_block` does.
+pub fn bid_is_includable(
+    state: &BeaconState,
+    signed_bid: &SignedExecutionPayloadBid,
+    parent_requests: &ExecutionRequests,
+) -> bool {
+    let BeaconState::Gloas(inner) = state else {
+        return false;
+    };
+    let bid = &signed_bid.message;
+    let parent_is_full = bid.parent_block_hash == inner.latest_execution_payload_bid.block_hash;
+    let builds_on_known_parent = parent_is_full || bid.parent_block_hash == inner.latest_block_hash;
+    let Some(builder) = inner.builders.get(bid.builder_index as usize) else {
+        return false;
+    };
+    let exited_by_parent = parent_is_full
+        && parent_requests.builder_exits.iter().any(|exit| {
+            exit.pubkey == builder.pubkey && exit.source_address == builder.execution_address
+        });
+    bid.slot == state.slot()
+        && bid.parent_block_root == state.latest_block_header().hash_tree_root()
+        && bid.prev_randao == get_randao_mix(state, get_current_epoch(state))
+        && builds_on_known_parent
+        && bid.block_hash != bid.parent_block_hash
+        && builder.version == constants::PAYLOAD_BUILDER_VERSION
+        && bid.blob_kzg_commitments.len() <= preset::MAX_BLOB_COMMITMENTS_PER_BLOCK
+        && !exited_by_parent
+        && is_active_builder(inner, bid.builder_index).unwrap_or(false)
+        && can_builder_cover_bid(inner, bid.builder_index, bid.value).unwrap_or(false)
 }
 
 /// A produced block and the unsigned envelope that reveals its payload.
@@ -1075,5 +1171,195 @@ mod gloas_block_production_tests {
                 .is_err()
         );
         assert!(parse_gloas_execution_requests(&[vec![0x7f, 0]]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod bid_assembly_tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::beacon::ForkName;
+    use crate::beacon::block_production::advance_to_slot;
+    use crate::beacon::builder_market::test_support::{
+        builder_secret, gloas_state_with_builder, sign_bid,
+    };
+    use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress};
+
+    /// A state at slot 33 with a funded, active builder 0, and a bid on its
+    /// full parent that a block can carry.
+    fn scene() -> (BeaconState, SignedExecutionPayloadBid) {
+        let parent = gloas_state_with_builder(0, 100_000_000_000, 0);
+        let state = advance_to_slot(&parent, parent.slot() + 1, &config()).unwrap();
+        let bid = bid_for(&state, |_| {});
+        (state, bid)
+    }
+
+    /// A bid on `state`'s full parent payload, signed by builder 0 after `edit`.
+    fn bid_for(
+        state: &BeaconState,
+        edit: impl FnOnce(&mut ExecutionPayloadBid),
+    ) -> SignedExecutionPayloadBid {
+        let mut bid = ExecutionPayloadBid {
+            parent_block_hash: ExecutionBlockHash::repeat_byte(PARENT_BLOCK_HASH),
+            parent_block_root: state.latest_block_header().hash_tree_root(),
+            block_hash: ExecutionBlockHash::repeat_byte(0x33),
+            prev_randao: get_randao_mix(state, get_current_epoch(state)),
+            gas_limit: 30_000_000,
+            builder_index: 0,
+            slot: state.slot(),
+            value: 7,
+            ..Default::default()
+        };
+        edit(&mut bid);
+        sign_bid(state, bid, 0)
+    }
+
+    fn inputs(state: &BeaconState, signed_bid: SignedExecutionPayloadBid) -> GloasBidBlockInputs {
+        GloasBidBlockInputs {
+            randao_reveal: randao_reveal(state),
+            graffiti: Bytes32::repeat_byte(7),
+            attestations: Vec::new(),
+            payload_attestations: Vec::new(),
+            parent_execution_requests: ExecutionRequests::default(),
+            signed_bid,
+        }
+    }
+
+    #[test]
+    fn a_funded_signed_bid_becomes_a_block_that_carries_it() {
+        let (state, bid) = scene();
+        assert!(bid_is_includable(
+            &state,
+            &bid,
+            &ExecutionRequests::default()
+        ));
+        let block =
+            assemble_gloas_block_on_bid(&state, inputs(&state, bid.clone()), &config()).unwrap();
+        assert_eq!(block.body.signed_execution_payload_bid, bid);
+        assert_eq!(block.slot, state.slot());
+        assert_ne!(block.state_root, Root::ZERO);
+        // The block goes through the state transition as the network would run it.
+        let post = post_state(&state, &block);
+        let BeaconState::Gloas(inner) = &post else {
+            unreachable!("gloas")
+        };
+        assert_eq!(inner.latest_execution_payload_bid, bid.message);
+        assert_eq!(block.state_root, post.hash_tree_root());
+    }
+
+    #[test]
+    fn an_inactive_builder_cannot_have_a_block_built() {
+        // Deposited at the finalized epoch itself: not yet active.
+        let parent = gloas_state_with_builder(0, 100_000_000_000, 0);
+        let mut state = advance_to_slot(&parent, parent.slot() + 1, &config()).unwrap();
+        let BeaconState::Gloas(inner) = &mut state else {
+            unreachable!("gloas")
+        };
+        inner.builders[0].deposit_epoch = inner.finalized_checkpoint.epoch;
+        let bid = bid_for(&state, |_| {});
+        assert!(!bid_is_includable(
+            &state,
+            &bid,
+            &ExecutionRequests::default()
+        ));
+        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+    }
+
+    #[test]
+    fn a_bid_on_the_wrong_parent_hash_is_refused() {
+        let (state, _) = scene();
+        let bid = bid_for(&state, |bid| {
+            bid.parent_block_hash = ExecutionBlockHash::repeat_byte(0x77)
+        });
+        assert!(!bid_is_includable(
+            &state,
+            &bid,
+            &ExecutionRequests::default()
+        ));
+        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+    }
+
+    #[test]
+    fn a_bid_with_the_wrong_randao_is_refused() {
+        let (state, _) = scene();
+        let bid = bid_for(&state, |bid| bid.prev_randao = Bytes32::repeat_byte(9));
+        assert!(!bid_is_includable(
+            &state,
+            &bid,
+            &ExecutionRequests::default()
+        ));
+        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+    }
+
+    #[test]
+    fn a_bid_with_a_bad_signature_is_built_into_nothing() {
+        let (state, mut bid) = scene();
+        bid.signature.0[3] ^= 1;
+        // The cheap filter does not verify signatures, `process_block` does.
+        assert!(bid_is_includable(
+            &state,
+            &bid,
+            &ExecutionRequests::default()
+        ));
+        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+    }
+
+    #[test]
+    fn a_bid_for_another_slot_or_parent_root_is_not_includable() {
+        let (state, _) = scene();
+        let requests = ExecutionRequests::default();
+        let later = bid_for(&state, |bid| bid.slot += 1);
+        assert!(!bid_is_includable(&state, &later, &requests));
+        let other_root = bid_for(&state, |bid| bid.parent_block_root = Root::repeat_byte(5));
+        assert!(!bid_is_includable(&state, &other_root, &requests));
+        let same_hash = bid_for(&state, |bid| bid.block_hash = bid.parent_block_hash);
+        assert!(!bid_is_includable(&state, &same_hash, &requests));
+    }
+
+    #[test]
+    fn an_unknown_or_overdrawn_builder_is_not_includable() {
+        let (state, _) = scene();
+        let requests = ExecutionRequests::default();
+        let unknown = bid_for(&state, |bid| bid.builder_index = 4);
+        assert!(!bid_is_includable(&state, &unknown, &requests));
+        let overdrawn = bid_for(&state, |bid| bid.value = 200_000_000_000);
+        assert!(!bid_is_includable(&state, &overdrawn, &requests));
+    }
+
+    #[test]
+    fn a_builder_exited_by_the_parents_requests_is_not_includable() {
+        let (state, bid) = scene();
+        let pubkey = BlsPubkey(builder_secret(0).sk_to_pk().to_bytes());
+        let exit = |source_address| ExecutionRequests {
+            builder_exits: vec![gloas::BuilderExitRequest {
+                source_address,
+                pubkey,
+            }]
+            .into(),
+            ..Default::default()
+        };
+        // The builder's execution address is `index + 1` repeated.
+        assert!(!bid_is_includable(
+            &state,
+            &bid,
+            &exit(ExecutionAddress::repeat_byte(1))
+        ));
+        // A request from another address does not exit it.
+        assert!(bid_is_includable(
+            &state,
+            &bid,
+            &exit(ExecutionAddress::repeat_byte(9))
+        ));
+    }
+
+    #[test]
+    fn a_non_gloas_state_has_no_includable_bid() {
+        let (_, bid) = scene();
+        let fulu = crate::beacon::helpers::test_state::with_validators_at(ForkName::Fulu, 8);
+        assert!(!bid_is_includable(
+            &fulu,
+            &bid,
+            &ExecutionRequests::default()
+        ));
     }
 }

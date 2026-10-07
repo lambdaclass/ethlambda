@@ -109,6 +109,9 @@ async fn spawn_server(
         .layer(Extension(p2p))
         .layer(Extension(SharedAttestationPool::default()))
         .layer(Extension(payload_pool.clone()))
+        .layer(Extension(
+            ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket::default(),
+        ))
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
         .layer(Extension(engine));

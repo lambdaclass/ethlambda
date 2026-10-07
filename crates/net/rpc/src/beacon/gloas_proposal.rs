@@ -15,9 +15,15 @@
 //! serves the envelope back for a validator client that asked for the block
 //! with `include_payload=false`.
 //!
-//! This node never takes a builder's bid: the `BuilderConfig` request body is
-//! decoded, as the specification requires of a body that cannot be, and
-//! otherwise ignored.
+//! The node always builds a local payload when it has an execution client, and
+//! may instead build on a bid it saw over p2p (`bid_selection` decides, from the
+//! request's `BuilderConfig`). A bid-won block comes back bare: the builder
+//! reveals the payload, so nothing is cached here and this node never signs or
+//! publishes an envelope for it. The `builders` entries of the config (bid
+//! requests to a builder's URL) are decoded and not consulted.
+//!
+//! A self-built payload's fee recipient and gas target come from the signed
+//! proposer preferences for the slot when this node holds them.
 //!
 //! What `produceBlockV4` builds is kept in a small cache, keyed by slot and
 //! block root and holding the current and the previous slot only, so the
@@ -48,15 +54,18 @@ use ethlambda_state_transition::beacon::{
     attestation_pool::SharedAttestationPool,
     block_production::advance_to_slot,
     bls,
+    builder_market::SharedBuilderMarket,
     fork_choice::{
         get_head_node, gloas_verify_data_column_sidecar,
         gloas_verify_data_column_sidecar_kzg_proofs, should_build_on_full,
     },
     gloas_block_production::{
-        GloasBlockInputs, GloasPayloadInputs, GloasProduced, assemble_gloas_block,
+        GloasBidBlockInputs, GloasBlockInputs, GloasPayloadInputs, GloasProduced,
+        assemble_gloas_block, assemble_gloas_block_on_bid, bid_is_includable,
         gloas_data_column_sidecars, gloas_payload_inputs, pack_gloas_attestations,
         pack_payload_attestations, parse_gloas_execution_requests,
     },
+    gossip::proposer_preferences::dependent_root_at,
     helpers::{
         accessors::{get_beacon_proposer_index, get_domain},
         misc::compute_signing_root,
@@ -74,7 +83,8 @@ use ethlambda_types::{
             deneb::Blob,
             gloas::{
                 BeaconBlock, ExecutionPayloadEnvelope, ExecutionRequests,
-                SignedExecutionPayloadEnvelope,
+                SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
+                SignedProposerPreferences,
             },
         },
         fork::ForkName,
@@ -91,6 +101,8 @@ use tracing::{debug, info, warn};
 
 use crate::beacon::{
     ApiError, BodyEncoding,
+    bid_selection::{LocalCandidate, PayloadChoice, bid_total_gwei, choose_payload, wei_u128},
+    builder_config::{BuilderConfig, decode_builder_config},
     proposal::{Blobs, CellKzgProofs, decimal, require_gloas_slot},
     validator::{FeeRecipients, head},
 };
@@ -175,53 +187,11 @@ pub(crate) fn routes() -> Router<Store> {
         .layer(Extension(PayloadCache::default()))
 }
 
-fn is_ssz(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with(crate::SSZ_CONTENT_TYPE))
-}
-
 fn consensus_version(headers: &HeaderMap) -> Option<ForkName> {
     headers
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse)
-}
-
-/// `BuilderConfig` as it arrives as JSON. Only decoded: this node takes no
-/// builder bids, so nothing past the shape is read.
-#[derive(Debug, Deserialize)]
-struct BuilderConfigJson {
-    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
-    #[allow(dead_code)]
-    min_bid: u64,
-    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
-    #[allow(dead_code)]
-    builder_boost_factor: u64,
-    builders: Vec<serde_json::Value>,
-}
-
-/// Decodes the request body as a `BuilderConfig`, returning how many builder
-/// entries it names. A body that does not decode is invalid per the
-/// specification.
-///
-/// The SSZ form is `min_bid`, `builder_boost_factor` and the offset of the
-/// `builders` list, so a decodable body is at least that long and the offset
-/// points just past those three fields; the entries themselves are not parsed.
-fn decode_builder_config(headers: &HeaderMap, body: &[u8]) -> Result<usize, ApiError> {
-    if is_ssz(headers) {
-        let offset = body
-            .get(16..20)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")));
-        return match offset {
-            Some(20) => Ok(usize::from(body.len() > 20)),
-            _ => Err(ApiError::BadRequest("the body is not a BuilderConfig")),
-        };
-    }
-    serde_json::from_slice::<BuilderConfigJson>(body)
-        .map(|config| config.builders.len())
-        .map_err(|_| ApiError::BadRequest("the body is not a BuilderConfig"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -246,6 +216,7 @@ async fn post_produce_block(
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(pool): Extension<SharedAttestationPool>,
     Extension(ptc_pool): Extension<SharedPayloadAttestationPool>,
+    Extension(market): Extension<SharedBuilderMarket>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(custody): Extension<NodeCustodyColumns>,
     Extension(cache): Extension<PayloadCache>,
@@ -273,24 +244,29 @@ async fn post_produce_block(
     ) {
         return err.into_response();
     }
-    let builders = match decode_builder_config(&headers, &body) {
-        Ok(builders) => builders,
+    let builder_config = match decode_builder_config(&headers, &body) {
+        Ok(config) => config,
         Err(err) => return err.into_response(),
     };
+    let builders = builder_config.usable_entries(slot);
     if builders > 0 {
-        debug!(%slot, builders, "Ignoring the builders of the block production request");
+        debug!(%slot, builders, "Not consulting the builder entries of the block production request");
     }
-    let Some(engine) = engine else {
+    // Without an execution client a block can only be built on a bid, so a node
+    // holding none for the slot has nothing to offer.
+    if engine.is_none() && !market.has_bids_for_slot(slot) {
         return ApiError::ServiceUnavailable(
             "no execution client configured to build a payload with",
         )
         .into_response();
-    };
+    }
 
     let graffiti = query.graffiti.unwrap_or(Bytes32::ZERO);
     let produced = produce(
         &store,
-        &engine,
+        engine.as_ref(),
+        &market,
+        &builder_config,
         &pool,
         &ptc_pool,
         &fee_recipients,
@@ -304,49 +280,59 @@ async fn post_produce_block(
         Ok(produced) => produced,
         Err(err) => return err.into_response(),
     };
-    let Produced {
-        built,
-        block,
-        envelope,
-        payload_value,
-    } = produced;
-
-    let block_root = block.hash_tree_root();
-    cache.insert(
-        slot,
-        block_root,
-        CachedPayload {
-            envelope: envelope.clone(),
-            blobs: built.blobs_bundle.blobs.clone(),
-            cell_proofs: built.blobs_bundle.proofs.clone(),
-        },
-    );
-
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let encoding = Encoding::from_accept(accept);
-    let included = query.include_payload;
-    let mut response = if included {
-        let (Ok(kzg_proofs), Ok(blobs)) = (
-            CellKzgProofs::try_from(built.blobs_bundle.proofs),
-            blobs_list(built.blobs_bundle.blobs),
-        ) else {
-            return ApiError::Internal("the blobs bundle exceeds the block's bounds")
-                .into_response();
-        };
-        let contents = GloasBlockContents {
-            block,
-            execution_payload_envelope: envelope,
-            kzg_proofs,
-            blobs,
-        };
-        match encoding {
-            Encoding::Ssz => ssz_response(contents.to_ssz()),
-            Encoding::Json => block_json(&payload_value, true, &contents),
+    let (mut response, included, payload_value) = match produced {
+        Production::Bid { block, bid } => {
+            let payload_value = bid_payload_value(&bid);
+            let response = match encoding {
+                Encoding::Ssz => ssz_response(block.to_ssz()),
+                Encoding::Json => block_json(&payload_value, false, &block),
+            };
+            (response, false, payload_value)
         }
-    } else {
-        match encoding {
-            Encoding::Ssz => ssz_response(block.to_ssz()),
-            Encoding::Json => block_json(&payload_value, false, &block),
+        Production::Local(Produced {
+            built,
+            block,
+            envelope,
+            payload_value,
+        }) => {
+            let block_root = block.hash_tree_root();
+            cache.insert(
+                slot,
+                block_root,
+                CachedPayload {
+                    envelope: envelope.clone(),
+                    blobs: built.blobs_bundle.blobs.clone(),
+                    cell_proofs: built.blobs_bundle.proofs.clone(),
+                },
+            );
+            let included = query.include_payload;
+            let response = if included {
+                let (Ok(kzg_proofs), Ok(blobs)) = (
+                    CellKzgProofs::try_from(built.blobs_bundle.proofs),
+                    blobs_list(built.blobs_bundle.blobs),
+                ) else {
+                    return ApiError::Internal("the blobs bundle exceeds the block's bounds")
+                        .into_response();
+                };
+                let contents = GloasBlockContents {
+                    block,
+                    execution_payload_envelope: envelope,
+                    kzg_proofs,
+                    blobs,
+                };
+                match encoding {
+                    Encoding::Ssz => ssz_response(contents.to_ssz()),
+                    Encoding::Json => block_json(&payload_value, true, &contents),
+                }
+            } else {
+                match encoding {
+                    Encoding::Ssz => ssz_response(block.to_ssz()),
+                    Encoding::Json => block_json(&payload_value, false, &block),
+                }
+            };
+            (response, included, payload_value)
         }
     };
     let response_headers = response.headers_mut();
@@ -357,10 +343,15 @@ async fn post_produce_block(
     if let Ok(value) = HeaderValue::from_str(&payload_value) {
         response_headers.insert("eth-execution-payload-value", value);
     }
-    // Not computed: nothing here reads it, and the builder comparison it
-    // exists for does not happen on this node.
+    // Not computed: nothing here reads it, and the bid comparison compares
+    // execution payload values only.
     response_headers.insert("eth-consensus-block-value", HeaderValue::from_static("0"));
     with_consensus_version(response, ForkName::Gloas)
+}
+
+/// A bid's total payment in Wei, the unit `Eth-Execution-Payload-Value` is in.
+fn bid_payload_value(bid: &SignedExecutionPayloadBid) -> String {
+    (u128::from(bid_total_gwei(&bid.message)) * 1_000_000_000).to_string()
 }
 
 fn block_json<T: serde::Serialize>(payload_value: &str, included: bool, data: &T) -> Response {
@@ -381,12 +372,32 @@ fn blobs_list(blobs: Vec<Vec<u8>>) -> Result<Blobs, ()> {
     Blobs::try_from(blobs).map_err(|_| ())
 }
 
-/// Everything `produceBlockV4` built.
+/// What `produceBlockV4` built for one block.
+// Short-lived (one per request), so boxing the larger variant buys nothing.
+#[allow(clippy::large_enum_variant)]
+enum Production {
+    /// A block on this node's own payload, with the envelope that reveals it.
+    Local(Produced),
+    /// A block committing to a builder's bid. The builder reveals the payload,
+    /// so there is no envelope and nothing to cache.
+    Bid {
+        block: BeaconBlock,
+        bid: SignedExecutionPayloadBid,
+    },
+}
+
+/// A self-built block.
 struct Produced {
     built: BuiltGloasPayload,
     block: BeaconBlock,
     envelope: ExecutionPayloadEnvelope,
     payload_value: String,
+}
+
+/// This node's own payload for the slot, checked and ready to assemble.
+struct LocalBuild {
+    built: BuiltGloasPayload,
+    execution_requests: ExecutionRequests,
 }
 
 /// What the build needs from the chain, read and advanced off the runtime.
@@ -399,12 +410,17 @@ struct Prepared {
     /// The parent envelope's requests when building on its full payload and
     /// the parent is gloas; empty otherwise.
     parent_requests: ExecutionRequests,
+    /// The proposer's signed preferences for the slot, when this node holds
+    /// them under the slot's dependent root.
+    preferences: Option<SignedProposerPreferences>,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
-    engine: &EngineClient,
+    engine: Option<&EngineClient>,
+    market: &SharedBuilderMarket,
+    builder_config: &BuilderConfig,
     pool: &SharedAttestationPool,
     ptc_pool: &SharedPayloadAttestationPool,
     fee_recipients: &FeeRecipients,
@@ -412,27 +428,39 @@ async fn produce(
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
-) -> Result<Produced, ApiError> {
+) -> Result<Production, ApiError> {
     let prepare_store = store.clone();
-    let prepared =
-        tokio::task::spawn_blocking(move || prepare(&prepare_store, slot, randao_reveal))
-            .await
-            .map_err(|_| ApiError::Internal("preparing the block failed"))??;
+    let prepare_market = market.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare(&prepare_store, &prepare_market, slot, randao_reveal)
+    })
+    .await
+    .map_err(|_| ApiError::Internal("preparing the block failed"))??;
 
-    let built = build_payload(store, engine, fee_recipients, custody, &prepared).await?;
-    let bundle = &built.blobs_bundle;
-    if bundle.commitments.len() != bundle.blobs.len()
-        || bundle.proofs.len()
-            != bundle.blobs.len() * ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB
-    {
-        warn!(%slot, "The execution client's blobs bundle is inconsistent");
-        return Err(ApiError::ServiceUnavailable(
-            "the execution client returned an inconsistent blobs bundle",
-        ));
-    }
-    let execution_requests = parse_gloas_execution_requests(&built.execution_requests)
-        .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
-    let payload_value = decimal(&built.block_value);
+    // The local build first: bids keep arriving while the engine works, and
+    // are read once it is done.
+    let local = match engine {
+        Some(engine) => {
+            Some(build_local(store, engine, fee_recipients, custody, &prepared, slot).await)
+        }
+        None => None,
+    };
+    let (local, local_error) = match local {
+        Some(Ok(local)) => (Some(local), None),
+        Some(Err(err)) => (None, Some(err)),
+        None => (None, None),
+    };
+    let bids = candidate_bids(market, &prepared);
+    let candidate = local.as_ref().map(|local| LocalCandidate {
+        value_wei: wei_u128(&local.built.block_value),
+        should_override_builder: local.built.should_override_builder,
+    });
+    let choice = choose_payload(
+        candidate.as_ref(),
+        &bids,
+        builder_config.min_bid,
+        builder_config.builder_boost_factor,
+    );
 
     let candidates = pool
         .lock()
@@ -443,12 +471,64 @@ async fn produce(
         .expect("payload attestation pool lock poisoned")
         .messages_for(slot.saturating_sub(1), prepared.head_root);
     let config = store.config();
+    let prepared = Arc::new(prepared);
+
+    if let Some(PayloadChoice::Bid(bid)) = choice {
+        let builder_index = bid.message.builder_index;
+        let value_gwei = bid_total_gwei(&bid.message);
+        let assembled = {
+            let (config, prepared, bid) = (config.clone(), prepared.clone(), bid.clone());
+            let (candidates, messages) = (candidates.clone(), messages.clone());
+            tokio::task::spawn_blocking(move || {
+                assemble_on_bid(
+                    &config,
+                    &prepared,
+                    bid,
+                    candidates,
+                    messages,
+                    randao_reveal,
+                    graffiti,
+                )
+            })
+            .await
+        };
+        match assembled {
+            Ok(Ok(block)) => {
+                info!(
+                    %slot,
+                    builder_index,
+                    value_gwei,
+                    "Produced gloas block on a builder bid"
+                );
+                return Ok(Production::Bid { block, bid });
+            }
+            Ok(Err(_)) | Err(_) if local.is_some() => {
+                warn!(%slot, builder_index, "The winning bid failed to build; using the local payload");
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Err(ApiError::ServiceUnavailable(
+                    "the winning bid failed to build",
+                ));
+            }
+        }
+    }
+
+    let Some(local) = local else {
+        return Err(local_error.unwrap_or(ApiError::ServiceUnavailable(
+            "no execution client and no viable builder bid for the slot",
+        )));
+    };
+    let LocalBuild {
+        built,
+        execution_requests,
+    } = local;
+    let payload_value = decimal(&built.block_value);
     let assembled = {
         let built = built.clone();
         tokio::task::spawn_blocking(move || {
             assemble(
                 &config,
-                prepared,
+                &prepared,
                 built,
                 execution_requests,
                 candidates,
@@ -469,17 +549,51 @@ async fn produce(
         blobs = built.blobs_bundle.blobs.len(),
         "Produced gloas block"
     );
-    Ok(Produced {
+    Ok(Production::Local(Produced {
         built,
         block,
         envelope,
         payload_value,
-    })
+    }))
+}
+
+/// The pooled bids this node could build on at the prepared slot: on the same
+/// parent payload the local build extends, with its `prev_randao`, packable
+/// into a block on the advanced state, and, when the proposer's preferences are
+/// held, paying the fee recipient they name. Value descending.
+///
+/// Bids on the head's parent (a proposer reorg) are not considered.
+fn candidate_bids(
+    market: &SharedBuilderMarket,
+    prepared: &Prepared,
+) -> Vec<SignedExecutionPayloadBid> {
+    market
+        .bids_for(
+            prepared.state.slot(),
+            prepared.head_root,
+            prepared.inputs.head_block_hash,
+        )
+        .into_iter()
+        .filter(|signed| {
+            let bid = &signed.message;
+            bid.prev_randao == prepared.inputs.prev_randao
+                && prepared
+                    .preferences
+                    .as_ref()
+                    .is_none_or(|prefs| prefs.message.fee_recipient == bid.fee_recipient)
+                && bid_is_includable(&prepared.state, signed, &prepared.parent_requests)
+        })
+        .collect()
 }
 
 /// The chain-side half of production: pick the parent payload branch, advance
 /// the head state to `slot` and derive the payload inputs from it.
-fn prepare(store: &Store, slot: Slot, randao_reveal: BlsSignature) -> Result<Prepared, ApiError> {
+fn prepare(
+    store: &Store,
+    market: &SharedBuilderMarket,
+    slot: Slot,
+    randao_reveal: BlsSignature,
+) -> Result<Prepared, ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
     let head_slot = head_state.slot();
@@ -527,8 +641,18 @@ fn prepare(store: &Store, slot: Slot, randao_reveal: BlsSignature) -> Result<Pre
     let proposer = get_beacon_proposer_index(&state)
         .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
     verify_randao_reveal(&state, proposer, randao_reveal)?;
-    let inputs = gloas_payload_inputs(&state, build_on_full, &parent_requests, &config)
+    let mut inputs = gloas_payload_inputs(&state, build_on_full, &parent_requests, &config)
         .map_err(|_| ApiError::Internal("computing the payload attributes failed"))?;
+
+    // The proposer's signed preferences for this slot, under the dependent root
+    // the head's chain gives it. They name the fee recipient and gas target the
+    // bids on the slot were judged against, so the self-build follows them too.
+    let preferences = dependent_root_at(&head_state, head_root, slot)
+        .and_then(|dependent_root| market.preferences(slot, dependent_root))
+        .filter(|signed| signed.message.validator_index == proposer);
+    if let Some(preferences) = &preferences {
+        inputs.target_gas_limit = preferences.message.target_gas_limit;
+    }
     Ok(Prepared {
         state,
         inputs,
@@ -536,6 +660,7 @@ fn prepare(store: &Store, slot: Slot, randao_reveal: BlsSignature) -> Result<Pre
         head_root,
         head_slot,
         parent_requests,
+        preferences,
     })
 }
 
@@ -561,6 +686,68 @@ fn verify_randao_reveal(
 }
 
 /// Ask the execution client to build on the chosen parent payload for the
+/// prepared slot, collect what it built and check it is consistent.
+async fn build_local(
+    store: &Store,
+    engine: &EngineClient,
+    fee_recipients: &FeeRecipients,
+    custody: &NodeCustodyColumns,
+    prepared: &Prepared,
+    slot: Slot,
+) -> Result<LocalBuild, ApiError> {
+    let built = build_payload(store, engine, fee_recipients, custody, prepared).await?;
+    let bundle = &built.blobs_bundle;
+    if bundle.commitments.len() != bundle.blobs.len()
+        || bundle.proofs.len()
+            != bundle.blobs.len() * ethlambda_types::beacon::preset::CELLS_PER_EXT_BLOB
+    {
+        warn!(%slot, "The execution client's blobs bundle is inconsistent");
+        return Err(ApiError::ServiceUnavailable(
+            "the execution client returned an inconsistent blobs bundle",
+        ));
+    }
+    let execution_requests = parse_gloas_execution_requests(&built.execution_requests)
+        .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
+    Ok(LocalBuild {
+        built,
+        execution_requests,
+    })
+}
+
+/// Where a self-built payload's fee recipient comes from: the proposer's signed
+/// preferences, else `prepare_beacon_proposer`'s, else the zero address.
+fn fee_recipient_for(fee_recipients: &FeeRecipients, prepared: &Prepared) -> ExecutionAddress {
+    if let Some(preferences) = &prepared.preferences {
+        debug!(
+            proposer = prepared.proposer,
+            "Using the signed proposer preferences' fee recipient"
+        );
+        return preferences.message.fee_recipient;
+    }
+    let prepared_recipient = fee_recipients
+        .lock()
+        .expect("fee recipient lock poisoned")
+        .get(&prepared.proposer)
+        .copied();
+    match prepared_recipient {
+        Some(recipient) => {
+            debug!(
+                proposer = prepared.proposer,
+                "Using the fee recipient from prepare_beacon_proposer"
+            );
+            recipient
+        }
+        None => {
+            warn!(
+                proposer = prepared.proposer,
+                "No fee recipient for the proposer; using the zero address"
+            );
+            ExecutionAddress::ZERO
+        }
+    }
+}
+
+/// Ask the execution client to build on the chosen parent payload for the
 /// prepared slot, then collect what it built.
 ///
 /// Collected straight away rather than after waiting, as the fulu path does: the
@@ -575,18 +762,7 @@ async fn build_payload(
     prepared: &Prepared,
 ) -> Result<BuiltGloasPayload, ApiError> {
     let inputs = &prepared.inputs;
-    let fee_recipient = fee_recipients
-        .lock()
-        .expect("fee recipient lock poisoned")
-        .get(&prepared.proposer)
-        .copied()
-        .unwrap_or_else(|| {
-            warn!(
-                proposer = prepared.proposer,
-                "No fee recipient prepared for the proposer; using the zero address"
-            );
-            ExecutionAddress::ZERO
-        });
+    let fee_recipient = fee_recipient_for(fee_recipients, prepared);
     let forkchoice = ForkchoiceStateV1 {
         head_block_hash: inputs.head_block_hash,
         safe_block_hash: checkpoint_hash(store, store.beacon_justified_checkpoint().root),
@@ -628,7 +804,7 @@ async fn build_payload(
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     config: &Config,
-    prepared: Prepared,
+    prepared: &Prepared,
     built: BuiltGloasPayload,
     execution_requests: ExecutionRequests,
     candidates: Vec<containers::electra::Attestation>,
@@ -643,9 +819,9 @@ fn assemble(
         parent_requests,
         ..
     } = prepared;
-    let attestations = pack_gloas_attestations(&state, candidates);
+    let attestations = pack_gloas_attestations(state, candidates);
     let payload_attestations =
-        pack_payload_attestations(&state, head_root, head_slot, messages, config);
+        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
     let commitments = built.blobs_bundle.commitments;
     let inputs = |attestations, payload_attestations| GloasBlockInputs {
         randao_reveal,
@@ -658,14 +834,55 @@ fn assemble(
         execution_requests: execution_requests.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
-    match assemble_gloas_block(&state, inputs(attestations, payload_attestations), config) {
+    match assemble_gloas_block(state, inputs(attestations, payload_attestations), config) {
         Ok(produced) => Ok(produced),
         // The packers check every operation's signature against this state, so
         // this should not happen; but a block without them still earns the
         // proposal, and one that fails to build earns nothing.
         Err(err) if operations > 0 => {
             warn!(slot = state.slot(), %err, "Block with operations failed to build; retrying without");
-            assemble_gloas_block(&state, inputs(Vec::new(), Vec::new()), config)
+            assemble_gloas_block(state, inputs(Vec::new(), Vec::new()), config)
+                .map_err(|_| ApiError::Internal("the block failed to build"))
+        }
+        Err(_) => Err(ApiError::Internal("the block failed to build")),
+    }
+}
+
+/// [`assemble`] for a block that commits to a builder's bid: no payload, no
+/// envelope. `process_block` on the block enforces the bid's own rules.
+fn assemble_on_bid(
+    config: &Config,
+    prepared: &Prepared,
+    signed_bid: SignedExecutionPayloadBid,
+    candidates: Vec<containers::electra::Attestation>,
+    messages: Vec<containers::gloas::PayloadAttestationMessage>,
+    randao_reveal: BlsSignature,
+    graffiti: Bytes32,
+) -> Result<BeaconBlock, ApiError> {
+    let Prepared {
+        state,
+        head_root,
+        head_slot,
+        parent_requests,
+        ..
+    } = prepared;
+    let attestations = pack_gloas_attestations(state, candidates);
+    let payload_attestations =
+        pack_payload_attestations(state, *head_root, *head_slot, messages, config);
+    let inputs = |attestations, payload_attestations| GloasBidBlockInputs {
+        randao_reveal,
+        graffiti,
+        attestations,
+        payload_attestations,
+        parent_execution_requests: parent_requests.clone(),
+        signed_bid: signed_bid.clone(),
+    };
+    let operations = attestations.len() + payload_attestations.len();
+    match assemble_gloas_block_on_bid(state, inputs(attestations, payload_attestations), config) {
+        Ok(block) => Ok(block),
+        Err(err) if operations > 0 => {
+            warn!(slot = state.slot(), %err, "Bid block with operations failed to build; retrying without");
+            assemble_gloas_block_on_bid(state, inputs(Vec::new(), Vec::new()), config)
                 .map_err(|_| ApiError::Internal("the block failed to build"))
         }
         Err(_) => Err(ApiError::Internal("the block failed to build")),
@@ -922,6 +1139,7 @@ mod tests {
             .layer(Extension(engine))
             .layer(Extension(SharedAttestationPool::default()))
             .layer(Extension(SharedPayloadAttestationPool::default()))
+            .layer(Extension(SharedBuilderMarket::default()))
             .layer(Extension(FeeRecipients::default()))
             .layer(Extension(NodeCustodyColumns::default()))
     }
@@ -1017,7 +1235,10 @@ mod tests {
     fn a_builder_config_decodes_as_json_or_ssz() {
         let mut headers = HeaderMap::new();
         assert_eq!(
-            decode_builder_config(&headers, EMPTY_CONFIG.as_bytes()).unwrap(),
+            decode_builder_config(&headers, EMPTY_CONFIG.as_bytes())
+                .unwrap()
+                .builders
+                .len(),
             0
         );
         assert!(decode_builder_config(&headers, b"{}").is_err());
@@ -1029,7 +1250,13 @@ mod tests {
         // min_bid, boost factor, then the offset of an empty builders list.
         let mut ssz = vec![0u8; 16];
         ssz.extend_from_slice(&20u32.to_le_bytes());
-        assert_eq!(decode_builder_config(&headers, &ssz).unwrap(), 0);
+        assert_eq!(
+            decode_builder_config(&headers, &ssz)
+                .unwrap()
+                .builders
+                .len(),
+            0
+        );
         assert!(decode_builder_config(&headers, &ssz[..19]).is_err());
     }
 
@@ -1614,3 +1841,7 @@ mod tests {
         assert_eq!(rejected.envelopes.lock().unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "builder_market_tests.rs"]
+mod builder_market_tests;
