@@ -75,7 +75,7 @@ COPY --from=builder /app/ethlambda /usr/local/bin
 # Copy licenses
 COPY LICENSE ./
 
-# 9000/tcp, 9000/udp - P2P networking (discv5 when --discovery.enable)
+# 9000/tcp, 9000/udp - P2P networking (discv5: always on for beacon, --discovery.enable for node; --discovery.port)
 # 9001/udp - libp2p QUIC connections
 # 9001/tcp - libp2p TCP (noise + yamux) connections, the fallback transport
 # 5052 - API RPC

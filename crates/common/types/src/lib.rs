@@ -1,12 +1,15 @@
 pub mod aggregator;
 pub mod attestation;
+pub mod beacon;
 pub mod block;
 pub mod chain_config;
 pub mod checkpoint;
 pub mod constants;
+pub mod enr;
 pub mod genesis;
 pub mod primitives;
 pub mod state;
+pub mod time;
 
 /// Display helper for truncated root hashes (8 hex chars)
 pub struct ShortRoot<'a>(pub &'a [u8; 32]);

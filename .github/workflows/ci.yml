@@ -16,11 +16,116 @@ concurrency:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
+  # Off in CI, on for local rebuilds, which is what the `release-fast` profile's
+  # `incremental = true` is for. An environment variable overrides the profile
+  # setting, so this turns it off here without touching the manifest.
+  #
+  # Incremental state is pure cost on a runner: `Swatinem/rust-cache` deletes
+  # `target/*/incremental` before saving, so it is never restored, and every job
+  # here starts from whatever the cache holds rather than from its own previous
+  # build. Nothing reads it, and it is comparable in size to the build output
+  # itself, on a filesystem that a cold workspace build has already outgrown.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
+  # `lint`, `presets` and `tooling` were one job. Split because serially they
+  # took 34 minutes and, between them, more disk than a runner has: a full disk
+  # reaches `rust-lld` through `mmap`, so it is reported as
+  # `ld terminated with signal 7 [Bus error]` rather than as ENOSPC.
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: rustfmt, clippy
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Cargo check
+        run: cargo check --locked --workspace --all-targets
+
+      # Seconds, not minutes: same fingerprints as `check` above.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # The leanSpec spectests are `test = false` while the released fixtures
+      # lag leanVM, and `--all-targets` leaves such targets out. Name them so
+      # they keep compiling until they run again.
+      - name: Clippy (skipped spectests)
+        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
+
+  # Two features gate code that no step in `lint` reaches, so both would rot
+  # silently between merges.
+  #
+  # `beacon-spec-tests` guards the beacon spec-test target, which declares it as
+  # a required feature so that `cargo test` skips a suite whose fixtures are a
+  # multi-gigabyte download. `--all-targets` in `lint` therefore never builds
+  # it. The `beacon-spec-tests` job below does download them and run the suite
+  # for real, so this job is not what proves the runners work; it is here
+  # because that job is by far the slowest in the workflow, and because this is
+  # the only place the runners are linted at `-D warnings`.
+  #
+  # `preset-minimal` is a whole second compilation, because the beacon
+  # containers' SSZ bounds are const-generic arguments and everything in `lint`
+  # builds the default (mainnet) preset only. The fixture-reading unit tests
+  # stay `ignore`d here, since `beacon-spec-tests` is off.
+  #
+  # `--lib`: this job downloads no fixtures, and the integration targets
+  # (`ssz_spectests`, `stf_spectests`) walk the leanSpec tree, which only `test`
+  # has. Both presets, not just the default: the spec suite's `genesis` runner
+  # is `#![cfg(feature = "preset-minimal")]`, so a mainnet build type-checks
+  # every runner except the sole coverage `beacon::genesis` has.
+  presets:
+    name: Test minimal preset
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+          components: clippy
+
+      # Its own entry, keyed on the job id by the action's default. These
+      # builds share almost no artifacts with `lint`'s, so on one key each run
+      # would evict the other's.
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check the beacon spec-test suite compiles
+        run: |
+          cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests -- -D warnings
+          cargo clippy -p ethlambda-state-transition --all-targets --features beacon-spec-tests,preset-minimal -- -D warnings
+
+      - name: Check the minimal preset
+        run: |
+          cargo test -p ethlambda-types --lib --features preset-minimal
+          cargo test -p ethlambda-state-transition --lib --features preset-minimal
+
+  # tooling/event-monitor declares its own [workspace] table, so both jobs above
+  # stop at the root members and never reach it. Hence its own job, and the
+  # `workspaces` input below pointing the cache at its target dir.
+  #
+  # `--locked` so the committed Cargo.lock is actually enforced: without it
+  # cargo silently resolves and rewrites the lockfile in CI, and a stale or
+  # missing entry never fails the build.
+  tooling:
+    name: Tooling
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v6
 
@@ -31,38 +136,10 @@ jobs:
           components: rustfmt, clippy
 
       - name: Setup cache
-        # Tools under tooling/ are separate Cargo workspaces with their own
-        # target dir and Cargo.lock, so they need listing explicitly or their
-        # builds are neither cached nor reflected in the cache key.
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            tooling/event-monitor
+          workspaces: tooling/event-monitor
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Cargo check
-        run: cargo check --locked --workspace --all-targets
-
-      - name: Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      # The leanSpec spectests are `test = false` while the released fixtures
-      # lag leanVM, and `--all-targets` leaves such targets out. Name them so
-      # they keep compiling until they run again.
-      - name: Clippy (skipped spectests)
-        run: cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
-
-      # tooling/event-monitor declares its own [workspace] table, so every step
-      # above stops at the root workspace members and never reaches it. Its
-      # tests run in this job rather than in `test` because clippy has already
-      # compiled the test targets, and because they need none of that job's
-      # leanSpec fixtures.
-      # `--locked` so the committed Cargo.lock is actually enforced: without it
-      # cargo silently resolves and rewrites the lockfile in CI, and a stale or
-      # missing entry never fails the build.
       - name: Lint tooling
         working-directory: tooling/event-monitor
         run: |
@@ -73,17 +150,53 @@ jobs:
         working-directory: tooling/event-monitor
         run: cargo test --locked
 
+  # The workspace suite in two halves; `CONSENSUS_CRATES` in the Makefile
+  # defines them and says why. Both need the leanSpec fixtures and share one
+  # cache entry for them, so only the first leg to arrive downloads anything.
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.half }})
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    strategy:
+      # Which half broke is most of the triage, so report both.
+      fail-fast: false
+      matrix:
+        half: [consensus, node]
     steps:
       - uses: actions/checkout@v6
 
+      - uses: ./.github/actions/free-disk
+
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
+        with:
+          make-target: test-${{ matrix.half }}
 
-      # Reuses the release build from the test step; validates the benchmark
-      # harness end-to-end and its JSON output contract in a few seconds.
+  # Validates the benchmark harness and its JSON contract. This used to be a
+  # step in `Test (node)`, on the theory that the binary was already built there.
+  # It was not: `cargo test` never links the plain binary, and it builds with the
+  # dev-dependencies' features unified in (`bin/ethlambda` enables tokio's
+  # `test-util`), which `cargo run` leaves out. So the step rebuilt tokio and
+  # everything above it (libp2p, hyper, axum, the ethrex crates) into a target
+  # dir the test build had already brought to the disk ceiling, and the job then
+  # failed at random in the cache save step with ENOSPC. Here it builds only the
+  # binary's own graph. No fixtures: with `--mock-crypto` the synthetic benchmark
+  # generates its chain and reads no files.
+  benchmark-smoke:
+    name: Benchmark smoke
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Benchmark smoke (mock crypto)
         run: |
           cargo run --locked --profile release-fast --bin ethlambda -- benchmark synthetic --mock-crypto \
@@ -127,3 +240,64 @@ jobs:
             fi
           done
           exit $status
+  beacon-spec-tests:
+    name: Beacon spec tests (${{ matrix.preset }})
+    runs-on: ${{ vars.ETHLAMBDA_RUNNER || 'ubuntu-latest' }}
+    # Far and away the longest job here: two full fixture trees to fetch and a
+    # release-grade build before the first case runs. Bounded well above what a
+    # healthy run takes, purely so a hang is reaped in tens of minutes rather
+    # than sitting on a runner for GitHub's six-hour default.
+    timeout-minutes: 120
+    strategy:
+      # Report both presets rather than cancelling the second the moment the
+      # first fails. They walk different fixture trees, and whether a failure is
+      # preset-specific or common to both is most of the triage.
+      fail-fast: false
+      matrix:
+        preset: [mainnet, minimal]
+    env:
+      # Read by the Makefile, which declares this `?=` and so defers to the
+      # environment. A run reads its own preset's tree plus `general` and nothing
+      # else, so fetching the other preset's would be the largest single download
+      # in the workflow spent on files no case opens.
+      CONSENSUS_SPEC_TESTS_CONFIGS: general ${{ matrix.preset }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/free-disk
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97.1"
+
+      # Keyed per preset. The preset fixes the beacon containers' SSZ bounds,
+      # which are const-generic arguments, so the two legs share no artifacts at
+      # all; on one key they would evict each other on every single run.
+      - name: Setup cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: beacon-${{ matrix.preset }}
+
+      # Deliberately not cached. The trees expand to several GiB, which against a
+      # repository-wide 10 GiB cache budget would evict the Rust build caches
+      # that actually save time here. The assets are pinned to a release and
+      # served from the same CDN as the runner, so re-fetching is the cheap half
+      # of that trade.
+      #
+      # Its own step rather than leaning on the make prerequisite, so the log
+      # separates download time from build-and-test time and a fixture outage is
+      # not reported as a test failure.
+      - name: Download the consensus spec test fixtures
+        run: make consensus-spec-tests
+
+      - name: Download the gossip validation test fixtures
+        run: make consensus-spec-gossip-tests
+
+      - name: Run the Beacon Chain spec tests
+        run: make test-beacon-${{ matrix.preset }}
+
+      # See the same step in the run-fixture-tests action.
+      - name: Report disk usage after the build
+        if: always()
+        run: df -h /

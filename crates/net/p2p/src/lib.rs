@@ -1,28 +1,71 @@
+pub mod muxers {
+    //! Why the TCP transport offers mplex as well as yamux.
+    //!
+    //! Measured against live mainnet peers on 2026-08-13, dialing with a
+    //! throwaway probe binary carrying nothing but `identify`, so that none of
+    //! this crate's own protocols can be the cause:
+    //!
+    //! ```text
+    //! yamux only      Proposed /yamux/1.0.0  ->  NotAvailable
+    //!                 connection dies ~250ms in, no Goodbye, yamux frame
+    //!                 decode error: multistream-select negotiates the muxer
+    //!                 optimistically, so we are already writing yamux frames
+    //!                 when the refusal arrives and we parse their reply as one
+    //!
+    //! yamux + mplex   Proposed /yamux/1.0.0, then /mplex/6.7.0
+    //!                 Negotiated /mplex/6.7.0, identify completes both ways
+    //! ```
+    //!
+    //! The same probe against a non-Ethereum libp2p node (an IPFS bootstrapper)
+    //! completes identify with yamux alone, which is what rules out this crate's
+    //! transport setup and points at the beacon network's own convention.
+    //!
+    //! mplex is deprecated in libp2p and the facade crate has already dropped
+    //! its re-export, so `libp2p-mplex` is depended on directly. When mainnet
+    //! peers accept yamux, this goes away; until then a yamux-only beacon node
+    //! peers with nothing over TCP.
+}
+
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
+    fmt, io,
     net::{IpAddr, SocketAddr},
+    num::{NonZeroU8, NonZeroUsize},
     ops::Range,
-    time::Duration,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
+use either::Either;
 use ethlambda_network_api::{
-    InitBlockChain, P2PToBlockChainRef,
+    FetchRequest, InitBlockChain, P2PToBlockChainRef,
     block_chain_to_p2p::{
-        FetchBlock, PublishAggregatedAttestation, PublishAttestation, PublishBlock,
+        CheckDataColumnSidecars, FetchBlock, PublishAggregatedAttestation, PublishAttestation,
+        PublishBlock,
+    },
+    rpc_to_p2p::{
+        PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
+        SubscribeAttestationSubnets,
     },
 };
-use ethlambda_storage::Store;
+use ethlambda_state_transition::beacon::aggregate::MAX_AGGREGATES_PER_SLOT;
+use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
+use ethlambda_state_transition::beacon::gossip::{
+    SeenBlocks, SeenColumns, aggregate::SeenAggregates, attestation::SeenAttestations,
+};
+use ethlambda_storage::{Chain, Store};
+use ethlambda_types::beacon::preset::{MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH};
 use ethlambda_types::primitives::H256;
 use ethrex_p2p::types::NodeRecord;
 use ethrex_rlp::decode::RLPDecode;
-use futures::{StreamExt, future::OptionFuture};
+use futures::StreamExt;
 use libp2p::{
-    Multiaddr, StreamProtocol,
+    Multiaddr,
     gossipsub::{MessageAuthenticity, ValidationMode},
     identity::{Keypair, PublicKey, secp256k1},
     multiaddr::Protocol,
-    request_response::{self, OutboundRequestId},
-    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+    request_response::OutboundRequestId,
+    swarm::{ConnectionError, NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
 };
 use sha2::Digest;
 use spawned_concurrency::actor;
@@ -36,46 +79,327 @@ use tracing::{debug, info, trace, warn};
 
 use crate::{
     discovery::{
-        DISCOVERY_DIAL_INTERVAL, DiscoveryError, DiscoverySpawnConfig,
-        dial::{DiscoveryState, dial_tick, forget_discovered_peer},
+        DIAL_INTERVAL_AT_TARGET, DIAL_INTERVAL_AT_ZERO_PEERS, DiscoveryError, DiscoverySpawnConfig,
+        dial::{DiscoveryState, dial_interval, dial_progress, dial_tick, forget_discovered_peer},
         enr::{dialable_port, read_ip, read_public_key, read_quic_port, read_tcp_port},
         spawn_discovery,
     },
     gossipsub::{
         aggregation_topic, attestation_subnet_topic, block_topic, publish_aggregated_attestation,
-        publish_attestation, publish_block,
+        publish_attestation, publish_beacon_aggregate, publish_beacon_attestation,
+        publish_beacon_block, publish_block,
     },
+    lean::protocols::MAX_REQUEST_BLOCKS,
     req_resp::{
-        BLOCKS_BY_RANGE_PROTOCOL_V1, BLOCKS_BY_ROOT_PROTOCOL_V1, Codec,
-        MAX_COMPRESSED_PAYLOAD_SIZE, MAX_REQUEST_BLOCKS, Request, STATUS_PROTOCOL_V1, build_status,
-        fetch_block_from_peer,
+        Codec, MAX_COMPRESSED_PAYLOAD_SIZE, ReqResp, ReqRespEvent, Request, build_status,
+        fetch_block_from_peer, fetch_data_columns_from_peer,
+        handlers::{columns_custodied_by, resume_range_batch_held_for_custody},
     },
     swarm_adapter::SwarmHandle,
 };
 
+pub mod beacon;
 pub mod discovery;
 mod gossipsub;
+pub mod lean;
 pub mod metrics;
 mod req_resp;
 pub(crate) mod swarm_adapter;
 
 pub use libp2p::PeerId;
 
+/// Asking a peer for beacon blocks, by range and by root.
+///
+/// Both are driven from inside this crate: `fetch_block_from_peer` sends the
+/// by-root one, and `request_next_beacon_range_batch` the by-range one, off a
+/// peer's `Status`. They stay public because the answer stops at this crate:
+/// this node has no beacon `BlockChain` actor to import into, so a fetched
+/// block is checked and dropped, and the importer that changes that is expected
+/// to drive its own fetches from outside rather than through the range session.
+pub use req_resp::{request_beacon_block_by_root, request_beacon_blocks_by_range};
+
+/// `MAX_PAYLOAD_SIZE`, the ceiling on an uncompressed gossip or req/resp
+/// payload. Public because a beacon `config.yaml` carries it too, and startup
+/// refuses a network whose value differs from this one.
+pub use req_resp::MAX_PAYLOAD_SIZE;
+
 // 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1280ms, 2560ms
+//
+// This ladder, not a separate wall-clock budget, is what actually bounds how
+// long a lookup persists: `MAX_FETCH_RETRIES` attempts, each capped by the
+// request-response layer's own per-request timeout, with a doubling backoff
+// between them. A held block is evicted by finality on its own schedule
+// regardless, so the ladder only needs to stay well inside that window, which
+// it comfortably does. A `COLUMN_LOOKUP_MAX_DURATION` used to sit alongside
+// this, copied from Lighthouse without checking it against these timings: it
+// was long enough that the attempts ladder above always ran out first, so it
+// could never fire, while its own doc claimed it was what stopped the asking.
 const MAX_FETCH_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 5;
 const BACKOFF_MULTIPLIER: u64 = 2;
+
+/// How long an entry in `pending_column_requests` may go without a new request
+/// before a fresh [`FetchRequest`] for that root starts its own lookup
+/// instead of folding into it.
+///
+/// The entry exists to deduplicate: while a lookup is running, a second ask
+/// for the same root merges its columns rather than opening a parallel ladder.
+/// That is only correct while the lookup it defers to is actually alive. An
+/// entry whose round never reported back leaves the root deduplicated against
+/// a lookup that will never ask anything again, and the chain actor's
+/// per-slot re-drive of a held block would then be swallowed silently, which
+/// is precisely the case the re-drive exists for.
+///
+/// Comfortably longer than a full ladder (`MAX_FETCH_RETRIES` attempts whose
+/// backoffs sum to a few seconds, plus each attempt's round trips) and shorter
+/// than a mainnet slot, so a re-drive arriving on the next tick finds either a
+/// live lookup or no entry at all.
+const STALE_COLUMN_LOOKUP: Duration = Duration::from_secs(8);
+
+/// How many peers of unknown custody one `DataColumnsByRange` prefetch may
+/// speculatively ask for the columns no known custodian covers.
+///
+/// A peer's custody is only known once its `metadata/3` answer or its ENR
+/// `cgc` has been recorded, and there is always a handful of connected peers
+/// that have supplied neither. Those are worth asking; peers that *have* told
+/// us what they keep, and do not keep this column, are not. Two rather than
+/// all of them, because a range answer is megabytes when it lands.
+const UNKNOWN_CUSTODY_RANGE_PEERS: usize = 2;
+
+/// How long a beacon range batch may be held back waiting for every one of
+/// this node's custody columns to have a known custodian among the connected
+/// peers.
+///
+/// A batch sends its blocks and its `DataColumnsByRange` together, and the
+/// column request can only be aimed at peers whose custody is already known.
+/// Right after startup that is almost nobody: a peer's custody arrives with its
+/// `metadata/3` answer, after it connects. A batch sent then aims its column
+/// request at peers that may not keep the columns, a short or empty answer is
+/// not retried, and every block it leaves uncovered is held and chased by root
+/// one at a time. The wait is what gives the one range request a custodian to
+/// go to.
+///
+/// Bounded rather than open-ended, unlike lighthouse's range sync, which waits
+/// for custody peers as long as it takes. Nothing here goes looking for a
+/// custodian of a specific column, so a column no connected peer keeps may stay
+/// uncovered for a long time; past this deadline the batch goes anyway, and the
+/// uncovered columns get the unknown-custody fallback and the by-root path, as
+/// they did before the wait existed.
+const RANGE_BATCH_CUSTODY_WAIT: Duration = Duration::from_secs(30);
+
 const PEER_REDIAL_INTERVAL_SECS: u64 = 12;
+
+/// How many of one peer's addresses a dial attempt starts at once.
+///
+/// One, so that libp2p walks [`dial_addrs`] in order rather than racing it, and
+/// the QUIC address that list puts first is genuinely tried first. Under
+/// libp2p's default factor both transports start together and TCP wins most of
+/// the races, which is not a free choice between two equal wires: a TCP
+/// connection to a mainnet beacon peer negotiates mplex (see [`muxers`]), and
+/// `libp2p_mplex`'s waker bookkeeping was the single largest symbol in a
+/// profile of the mainnet follower, ahead of the whole state transition. QUIC
+/// carries its own multiplexing and reaches none of that code.
+///
+/// The cost is the one the race existed to avoid, now bounded rather than
+/// removed: a peer advertising a `quic` port nothing answers waits out
+/// `libp2p_quic`'s handshake timeout before its `tcp` address is tried. A peer
+/// whose ENR carries no `quic` entry pays nothing, because TCP is then the only
+/// address in the list, and neither does lean, whose records advertise `quic`
+/// alone.
+const DIAL_ADDRESS_CONCURRENCY: NonZeroU8 = NonZeroU8::new(1).expect("1 > 0");
+
 const MAX_SYNC_RANGE: u64 = MAX_REQUEST_BLOCKS * 64; // 65,536 slots (~3 days)
+
+/// How many beacon gossip messages may be in stateful validation at once. A
+/// message arriving with none free is ignored rather than queued. Revisit once
+/// `lean_beacon_gossip_validation_seconds` has data from a follower.
+const GOSSIP_VALIDATION_PERMITS: usize = 128;
+
+/// How many data column sidecars may be in the chain checks at once (see
+/// [`beacon::column_checks`]). A separate pool from
+/// [`GOSSIP_VALIDATION_PERMITS`], so a range batch's hundreds of sidecars
+/// cannot take every permit and leave gossip reporting `Overloaded`. A sidecar
+/// arriving with none free waits for one. Revisit with data, as for gossip.
+const COLUMN_CHECK_PERMITS: usize = 16;
+
+/// How many `beacon_aggregate_and_proof` and `beacon_attestation_{subnet_id}`
+/// stateful checks may run at once.
+///
+/// A pool of its own, not [`GOSSIP_VALIDATION_PERMITS`]'s: a mainnet slot
+/// carries up to `MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE`
+/// aggregates plus whatever this node's backbone subnets add, a burst that
+/// arrives every slot rather than only during a range sync. Sharing the block
+/// and column pool with that burst would let it take every permit and answer
+/// `Ignore(Overloaded)` for a block or a column instead, which must never
+/// happen: neither topic gates anything the way this one gates fork choice's
+/// votes for the current head. Sized the same as [`GOSSIP_VALIDATION_PERMITS`]
+/// for now, since both do comparable per-item work (one state read, one to
+/// three BLS verifications); revisit once
+/// `lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}`
+/// has data from a follower.
+const ATTESTATION_VALIDATION_PERMITS: usize = 128;
+
+/// Capacity of the first-valid-block cache, keyed by `(slot, proposer)`.
+/// How often to leave aggregator subnets whose slot has passed. One slot's
+/// worth: a subnet outlives its need by at most this, which costs a little
+/// relayed traffic and nothing else.
+const AGGREGATOR_SUBNET_SWEEP_INTERVAL: Duration = Duration::from_secs(12);
+
+const SEEN_BLOCKS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
+
+/// Capacity of the first-valid-sidecar cache, keyed by `(slot, proposer, index)`.
+const SEEN_COLUMNS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
+
+/// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
+/// cache remembers, and how many `(hash_tree_root(data), committee_index)`
+/// bitfields alongside it (`SeenAggregates::new`'s two capacities, both sized
+/// the same here).
+///
+/// [`MAX_AGGREGATES_PER_SLOT`] bounds how many aggregators one slot can select
+/// at all, mainnet's largest number this topic ever has to hold coordinates
+/// for. `is_current_or_previous_epoch` is the only gossip condition either
+/// half of this cache backs, so a key from further back than two epochs is
+/// never asked about again; sizing for two epochs of that per-slot bound is
+/// generous headroom rather than a tight derivation, in the same spirit
+/// [`SEEN_BLOCKS_CAPACITY`] and [`SEEN_COLUMNS_CAPACITY`] are sized in.
+const SEEN_AGGREGATES_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new((MAX_AGGREGATES_PER_SLOT * SLOTS_PER_EPOCH * 2) as usize).expect("non-zero");
+
+/// Capacity of the accepted-attestation cache, keyed by `(target_epoch,
+/// attester_index)`, for a node relaying `backbone_subnets` attestation
+/// subnets.
+///
+/// Unlike [`SEEN_AGGREGATES_CAPACITY`], there is no per-slot cap on how many
+/// distinct attesters this topic can name: every validator attests once per
+/// epoch, and on mainnet a single backbone subnet can carry on the order of a
+/// thousand of them per slot. The real bound instead comes from
+/// `compute_subnet_for_attestation` (see
+/// `beacon::gossip::attestation::compute_subnet_for_attestation`), which is
+/// `(committees_per_slot * slot_in_epoch + committee_index) %
+/// attestation_subnet_count`. `committees_per_slot` never exceeds
+/// `MAX_COMMITTEES_PER_SLOT`, which itself never exceeds
+/// `attestation_subnet_count` (64 of 64 on both mainnet and minimal), so the
+/// `committees_per_slot` committee indices of one slot are consecutive
+/// integers spanning no more residues than there are subnets: they land on
+/// distinct subnets without wrapping into a collision. One subnet therefore
+/// carries at most one committee per slot, i.e. at most
+/// [`MAX_VALIDATORS_PER_COMMITTEE`] attesters.
+///
+/// The capacity is two epochs (the only window `is_current_or_previous_epoch`
+/// accepts) of `SLOTS_PER_EPOCH` slots, each contributing at most that many
+/// attesters per subnet this node backbones. `backbone_subnets` is runtime
+/// (`BeaconWire::attestation_subnets`), so this is computed at `P2PServer`
+/// construction rather than as a const, and floored to one subnet so a lean
+/// node, which backbones none, still gets a valid non-zero capacity. As with
+/// [`SEEN_AGGREGATES_CAPACITY`], the LRU only grows to what actually arrives,
+/// so this bound costs memory only under that load.
+fn seen_attestations_capacity(backbone_subnets: usize) -> NonZeroUsize {
+    let subnets = backbone_subnets.max(1);
+    let capacity = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE * subnets;
+    NonZeroUsize::new(capacity).expect("positive factors give a positive capacity")
+}
 
 pub(crate) struct PendingRequest {
     pub(crate) attempts: u32,
     pub(crate) failed_peers: HashSet<PeerId>,
 }
 
+/// A block-root fetch's counterpart for a column lookup: the same
+/// attempt/failed-peer bookkeeping [`PendingRequest`] carries, plus what
+/// [`PendingRequest`] never needed to. `columns` is the request body a retry
+/// resends, since (unlike a block-root fetch, whose body is the root already
+/// keying this map) a column request also names which columns.
+pub(crate) struct PendingColumnRequest {
+    pub(crate) columns: Vec<u64>,
+    pub(crate) attempts: u32,
+    pub(crate) failed_peers: HashSet<PeerId>,
+    /// Requests sent for this root and not yet answered or failed.
+    ///
+    /// One attempt now fans out across the peers that custody the columns, so
+    /// a single lookup can have several requests open at once. Without this
+    /// count each of their failures would schedule its own retry, and each
+    /// retry would fan out again: one unanswered lookup against eight
+    /// custodians becomes eight retries, then sixty-four. A retry is scheduled
+    /// only when the last outstanding request of the round reports back, so an
+    /// attempt still costs exactly one retry however wide it was.
+    pub(crate) in_flight: usize,
+    /// When this lookup last put requests on the wire, for
+    /// [`STALE_COLUMN_LOOKUP`] to measure against.
+    pub(crate) last_asked: Instant,
+}
+
 pub(crate) enum PendingRequestKind {
     Root(H256),
-    Range { start_slot: u64, end_slot: u64 },
+    Range {
+        start_slot: u64,
+        end_slot: u64,
+    },
+    /// A `DataColumnsByRoot` lookup for this block's missing columns. Carries
+    /// only the root: the columns, attempts and failed-peer set live in
+    /// `pending_column_requests`, keyed the same way, so this is enough to
+    /// route the response and nothing this map needs to duplicate.
+    Columns(H256),
+    /// A `DataColumnsByRange` sweep for a range sync batch, covering the same
+    /// slots the matching `BlocksByRange` asked for.
+    ///
+    /// Carries no per-root bookkeeping, unlike [`Self::Columns`]: this is not
+    /// a lookup for one block's missing columns but a bulk prefetch, so a
+    /// short or empty answer is not a failure to retry. The blocks it is
+    /// paired with arrive on their own request, and any column still missing
+    /// when a block is held still gets the by-root path.
+    ColumnRange {
+        start_slot: u64,
+        end_slot: u64,
+    },
+}
+
+/// Which single-protocol field of [`ReqResp`] an outbound request travels
+/// through.
+///
+/// Splitting one shared `request_response::Behaviour` into one per protocol
+/// (see [`ReqResp`]'s doc comment) gives each field its own
+/// `OutboundRequestId` sequence, starting at 1: two different protocols can
+/// now legitimately mint the same numeric id for two unrelated requests. A
+/// bare `OutboundRequestId` is therefore no longer a safe map key on its own,
+/// and every place that names one names this alongside it instead, forming
+/// [`ReqRespRequestId`].
+///
+/// One variant per field, sharing that field's name so the two stay easy to
+/// line up by eye; [`crate::swarm_adapter::execute_command`] matches
+/// exhaustively on this to choose which field actually sends, and
+/// [`handle_behaviour_event`] matches exhaustively on the derived
+/// `ReqRespEvent` to tag every inbound event with the variant that produced
+/// it. Public because [`request_beacon_block_by_root`] and
+/// [`request_beacon_blocks_by_range`] carry a [`ReqRespRequestId`] in their
+/// return type and are themselves public, for the reason their own doc
+/// comments give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReqRespProtocol {
+    LeanStatus,
+    LeanBlocksByRoot,
+    LeanBlocksByRange,
+    BeaconStatusV1,
+    BeaconStatusV2,
+    BeaconPing,
+    BeaconMetadataV1,
+    BeaconMetadataV2,
+    BeaconMetadataV3,
+    BeaconGoodbye,
+    BeaconBlocksByRange,
+    BeaconBlocksByRoot,
+    DataColumnSidecarsByRange,
+    DataColumnSidecarsByRoot,
+}
+
+/// An outbound request id, namespaced by the protocol it was sent on.
+///
+/// See [`ReqRespProtocol`] for why the protocol has to be carried alongside
+/// the id rather than trusted to be unique on its own now that each protocol
+/// has its own `Behaviour` field and so its own id sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReqRespRequestId {
+    pub protocol: ReqRespProtocol,
+    pub id: OutboundRequestId,
 }
 
 pub(crate) struct RangeSyncState {
@@ -84,6 +408,22 @@ pub(crate) struct RangeSyncState {
     /// Latest advertised head slot for each peer.
     pub(crate) peer_set: HashMap<PeerId, u64>,
     pub(crate) in_flight: bool,
+    /// When the next batch was first held back for custody, while it still is.
+    /// Beacon-only; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    pub(crate) custody_wait_since: Option<Instant>,
+}
+
+/// Where a beacon range batch held back for custody stands, as
+/// [`RangeSyncState::wait_for_custody`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustodyWait {
+    /// The batch has only now started waiting, so its deadline still needs
+    /// scheduling.
+    Started,
+    /// Still inside [`RANGE_BATCH_CUSTODY_WAIT`].
+    Waiting,
+    /// The deadline has passed: the batch goes with whatever custody is known.
+    Expired,
 }
 
 impl RangeSyncState {
@@ -92,7 +432,41 @@ impl RangeSyncState {
             current_range,
             peer_set: HashMap::from([(peer, peer_head)]),
             in_flight: false,
+            custody_wait_since: None,
         }
+    }
+
+    /// Hold the next batch back for custody, starting its wait on the first
+    /// call, and say whether it may keep waiting at `now`.
+    ///
+    /// The wait belongs to the batch rather than the session: sending clears
+    /// it (see [`Self::end_custody_wait`]), so a batch that finds custody
+    /// uncovered later on, after a custodian disconnected, gets a wait of its
+    /// own rather than inheriting an expired one.
+    pub(crate) fn wait_for_custody(&mut self, now: Instant) -> CustodyWait {
+        match self.custody_wait_since {
+            None => {
+                self.custody_wait_since = Some(now);
+                CustodyWait::Started
+            }
+            Some(since) if now.duration_since(since) < RANGE_BATCH_CUSTODY_WAIT => {
+                CustodyWait::Waiting
+            }
+            Some(_) => CustodyWait::Expired,
+        }
+    }
+
+    /// End the custody wait of the batch being sent, returning how long it
+    /// waited, or `None` if it never did.
+    pub(crate) fn end_custody_wait(&mut self, now: Instant) -> Option<Duration> {
+        self.custody_wait_since
+            .take()
+            .map(|since| now.duration_since(since))
+    }
+
+    /// Whether the next batch is currently held back for custody.
+    pub(crate) fn is_waiting_for_custody(&self) -> bool {
+        self.custody_wait_since.is_some()
     }
 
     pub(crate) fn merge_peer(&mut self, peer: PeerId, peer_head: u64, end_exclusive: u64) {
@@ -143,22 +517,87 @@ impl RangeSyncState {
 
 // --- Swarm construction ---
 
-/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify, Gossipsub
-/// and Request-Response Behaviours.
+/// [libp2p Behaviour](libp2p::swarm::NetworkBehaviour) combining identify,
+/// Gossipsub and the request/response protocols.
 ///
 /// `identify` is registered purely for interop: go-libp2p (gean) gates gossipsub
 /// GRAFT on the identify exchange completing, so a peer that doesn't respond to
 /// `/ipfs/id/1.0.0` is silently excluded from the mesh. Events from this
 /// behaviour are intentionally not handled: the registration alone is enough
 /// to satisfy probing peers. ream and zeam follow the same pattern.
+///
+/// Not handling its events is *not* the same as it having no effect, which is
+/// why it is built with the address cache off. See [`build_swarm`].
+///
+/// The request/response side is a nested [`ReqResp`]: one
+/// `request_response::Behaviour` per protocol id rather than one shared
+/// behaviour registering every id. Its doc comment has why, and
+/// [`ReqRespProtocol`] names its fields for anything that has to pick one
+/// at runtime.
 #[derive(NetworkBehaviour)]
 pub(crate) struct Behaviour {
+    /// Refuses connections past the configured ceiling. A deny from any member
+    /// behaviour denies the connection, so registering this is the whole
+    /// mechanism; see [`beacon::swarm::connection_limits`] for the numbers and why the
+    /// beacon network needs them while lean does not.
+    ///
+    /// First, and it has to stay first. The derive asks each field for a
+    /// handler in declaration order and stops at the first refusal, and a
+    /// refused connection never produces a `ConnectionClosed`. Every
+    /// `request_response::Behaviour` in [`ReqResp`] records a connection the
+    /// moment it is asked, so behind this field a refusal left them holding a
+    /// connection the swarm never had (libp2p/rust-libp2p#4773, #4870).
+    connection_limits: libp2p::connection_limits::Behaviour,
     identify: libp2p::identify::Behaviour,
     gossipsub: libp2p::gossipsub::Behaviour,
-    req_resp: request_response::Behaviour<Codec>,
+    req_resp: ReqResp,
+}
+
+/// No connection limits, which is what the lean network has always run with: a
+/// devnet's peer count is bounded by the size of the devnet itself, so a cap
+/// there would only ever cap the operator.
+pub(crate) fn unlimited_connections() -> libp2p::connection_limits::Behaviour {
+    libp2p::connection_limits::Behaviour::new(Default::default())
 }
 
 /// Configuration for building the libp2p swarm.
+///
+/// These are the parameters both networks take; [`WireConfig`] carries what only
+/// one of them does. One config and one [`build_swarm`] rather than a pair per
+/// network, because the transport, the two listeners and the static bootnode
+/// dialing are identical and were duplicated line for line while there were two
+/// builders.
+pub struct SwarmConfig {
+    pub node_key: Vec<u8>,
+    pub bootnodes: Vec<Bootnode>,
+    pub listening_socket: SocketAddr,
+    /// How many peers this node is asking for, from
+    /// `--discovery.target-peers`. The same number
+    /// [`DiscoverySpawnConfig::target_peers`] carries to the dial loop, because
+    /// the beacon connection limits are derived from it: what this node refuses
+    /// and what it goes looking for have to be two readings of one number, or a
+    /// reservation the swarm does not keep is one the dial loop chases forever.
+    /// Ignored on lean, which runs [`unlimited_connections`].
+    pub target_peers: usize,
+    /// Which network's wire to build. Decides the gossip topics, the req/resp
+    /// protocol set, the gossipsub `seen_ttl`, the identify protocol version and
+    /// the connection limits, and so decides the [`Wire`] the built swarm
+    /// carries.
+    pub wire: WireConfig,
+    /// The identify `agentVersion`, which crawlers read to name a peer's
+    /// client. Left unset, rust-libp2p reports its own crate version instead.
+    pub agent_version: &'static str,
+}
+
+/// The half of [`SwarmConfig`] the two networks disagree about.
+pub enum WireConfig {
+    Lean(LeanWireConfig),
+    /// Boxed for the reason [`Wire::Beacon`] is: it carries a whole `Config`,
+    /// and every lean node would otherwise pay for it in each config it moves.
+    Beacon(Box<beacon::swarm::BeaconWireConfig>),
+}
+
+/// The lean network's swarm parameters.
 ///
 /// INVARIANT: `subscription_subnets` is the fixed set of attestation subnets
 /// this node subscribes to. It is computed once by the caller via
@@ -170,10 +609,7 @@ pub(crate) struct Behaviour {
 /// resubscribe gossip subnets; this is the leanSpec PR #636 "hot-standby model"
 /// scope limitation. A node that may aggregate at runtime must include those
 /// subnets here at startup.
-pub struct SwarmConfig {
-    pub node_key: Vec<u8>,
-    pub bootnodes: Vec<Bootnode>,
-    pub listening_socket: SocketAddr,
+pub struct LeanWireConfig {
     pub validator_ids: Vec<u64>,
     pub attestation_committee_count: u64,
     /// Attestation subnets to subscribe to, precomputed via
@@ -216,16 +652,64 @@ pub fn attestation_subscription_subnets(
     subnets
 }
 
+/// Which network's wire this node speaks.
+///
+/// One `P2PServer` serves both, dispatching on this once at the top of each
+/// handler, exactly as `BlockChainServer` dispatches on the state variant.
+/// Nothing is shared below the match: the topic names, the req/resp protocol
+/// ids, the handshake and the decode are all different, and the parts that
+/// genuinely coincide (the discv5 stack, the `ssz_snappy` framing,
+/// `compute_message_id`) sit one layer down and are the beacon spec's anyway.
+pub enum Wire {
+    Lean(LeanWire),
+    /// Boxed because a `BeaconWire` carries a whole `Config` and so is four
+    /// times the size of a `LeanWire`; unboxed, every lean node would pay for
+    /// it in each `Wire` it moves.
+    Beacon(Box<beacon::BeaconWire>),
+}
+
+/// The lean network's gossip topics.
+pub struct LeanWire {
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+}
+
+impl Wire {
+    pub(crate) fn lean(&self) -> Option<&LeanWire> {
+        match self {
+            Wire::Lean(lean) => Some(lean),
+            Wire::Beacon(_) => None,
+        }
+    }
+
+    pub(crate) fn beacon(&self) -> Option<&beacon::BeaconWire> {
+        match self {
+            Wire::Beacon(beacon) => Some(beacon),
+            Wire::Lean(_) => None,
+        }
+    }
+
+    /// Which chain's handler a shared request belongs to.
+    ///
+    /// The two block requests are one `Request` variant for both wires, so the
+    /// dispatch reads this instead of a tag on the message. A node speaks one
+    /// wire for its whole life, so this is the same answer every time and is
+    /// already recorded here; carrying it on the message would be a second copy
+    /// of it.
+    pub(crate) fn is_beacon(&self) -> bool {
+        matches!(self, Wire::Beacon(_))
+    }
+}
+
 /// Result of building the swarm — contains all pieces needed to start the P2P actor.
 pub struct BuiltSwarm {
     /// This node's libp2p peer ID, derived from the node key. Exposed so the
     /// caller can report it (e.g. via the RPC `/lean/v0/node/identity` endpoint).
     pub local_peer_id: PeerId,
     pub(crate) swarm: libp2p::Swarm<Behaviour>,
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
     /// Every dial target per bootnode; see [`dial_addrs`]. Empty entries are never
     /// inserted; see [`bootnode_dial_addrs`].
     pub(crate) bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
@@ -251,9 +735,23 @@ pub enum SwarmBuildError {
     Subscription(#[from] libp2p::gossipsub::SubscriptionError),
 }
 
-/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
-pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
-    let gossipsub_config = libp2p::gossipsub::ConfigBuilder::default()
+/// The gossipsub parameters both wires share.
+///
+/// `mesh_n` 8, low 6, high 12, the 700ms heartbeat, and the 6/3 history already
+/// match the beacon spec, so `seen_ttl` is the only value that differs between
+/// the two networks: lean's is its slot duration times a 3-slot justification
+/// lookback times two, mainnet's epoch is 32 slots of 12s.
+///
+/// `validate_messages` holds every received message until the application
+/// reports a verdict for it. Beacon only: every beacon topic gets one from
+/// `beacon::verdict`, while lean handlers produce none, so turning it on there
+/// would stop lean gossip from propagating at all.
+pub(crate) fn gossipsub_config(
+    seen_ttl: Duration,
+    validate_messages: bool,
+) -> libp2p::gossipsub::Config {
+    let mut builder = libp2p::gossipsub::ConfigBuilder::default();
+    builder
         // d
         .mesh_n(8)
         // d_low
@@ -266,52 +764,81 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .fanout_ttl(Duration::from_secs(60))
         .history_length(6)
         .history_gossip(3)
-        .duplicate_cache_time(Duration::from_millis(
-            config.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS,
-        ))
+        .duplicate_cache_time(seen_ttl)
         .validation_mode(ValidationMode::Anonymous)
         .message_id_fn(compute_message_id)
         // Taken from ream
         .max_transmit_size(MAX_COMPRESSED_PAYLOAD_SIZE)
         .max_messages_per_rpc(Some(500))
         .allow_self_origin(true)
-        .idontwant_message_size_threshold(1000)
-        .build()
-        .expect("invalid gossipsub config");
+        .idontwant_message_size_threshold(1000);
+    if validate_messages {
+        builder.validate_messages();
+    }
+    builder.build().expect("invalid gossipsub config")
+}
 
-    let gossipsub =
-        libp2p::gossipsub::Behaviour::new(MessageAuthenticity::Anonymous, gossipsub_config)
-            .expect("failed to initiate behaviour");
+/// Build and configure the libp2p swarm, dial bootnodes, subscribe to topics.
+///
+/// One builder for both networks. Four things differ at the behaviour level and
+/// are resolved in the first match below; the topic set differs and is resolved
+/// in the last one. Everything in between, the transport, the QUIC and TCP
+/// listeners and the static bootnode dialing, is the same on either wire.
+pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
+    let SwarmConfig {
+        node_key,
+        bootnodes,
+        listening_socket,
+        target_peers,
+        wire,
+        agent_version,
+    } = config;
 
-    let req_resp = request_response::Behaviour::new(
-        vec![
-            (
-                StreamProtocol::new(STATUS_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-            (
-                StreamProtocol::new(BLOCKS_BY_ROOT_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-            (
-                StreamProtocol::new(BLOCKS_BY_RANGE_PROTOCOL_V1),
-                request_response::ProtocolSupport::Full,
-            ),
-        ],
-        Default::default(),
-    );
+    // The codec comes out of this match too, not from `Default`: the two beacon
+    // block protocols frame their chunks against the fork schedule and the
+    // chain, so whatever decides that the protocols are registered has to decide
+    // that the context is there. See [`Codec`].
+    let (seen_ttl, identify_version, connection_limits, codec) = match &wire {
+        WireConfig::Lean(lean) => (
+            Duration::from_millis(lean.milliseconds_per_slot * DUPLICATE_CACHE_SLOTS),
+            // Use the same `protocol_version` string as zeam
+            "/ipfs/0.1.0",
+            unlimited_connections(),
+            Codec::lean(),
+        ),
+        WireConfig::Beacon(beacon) => (
+            beacon::swarm::seen_ttl(&beacon.config),
+            beacon::swarm::IDENTIFY_PROTOCOL_VERSION,
+            beacon::swarm::connection_limits(target_peers),
+            Codec::beacon(beacon::BeaconContext {
+                config: beacon.config.clone(),
+                genesis_validators_root: beacon.genesis_validators_root,
+            }),
+        ),
+    };
 
-    let secret_key =
-        secp256k1::SecretKey::try_from_bytes(config.node_key).expect("invalid node key");
+    let validate_messages = matches!(wire, WireConfig::Beacon(_));
+    let gossipsub = libp2p::gossipsub::Behaviour::new(
+        MessageAuthenticity::Anonymous,
+        gossipsub_config(seen_ttl, validate_messages),
+    )
+    .expect("failed to initiate behaviour");
+
+    let req_resp = ReqResp::new(codec, &wire);
+
+    let secret_key = secp256k1::SecretKey::try_from_bytes(node_key).expect("invalid node key");
     let identity = libp2p::identity::Keypair::from(secp256k1::Keypair::from(secret_key));
 
-    // Use the same `protocol_version` string as zeam
-    let identify = libp2p::identify::Behaviour::new(libp2p::identify::Config::new(
-        "/ipfs/0.1.0".to_owned(),
-        identity.public(),
-    ));
+    // Cache off, as lighthouse does: with it, identify pushes every `listenAddrs` a
+    // peer reports into the address book, loopback included, and `req_resp` dials those.
+    let identify = libp2p::identify::Behaviour::new(
+        libp2p::identify::Config::new(identify_version.to_owned(), identity.public())
+            .with_agent_version(agent_version.to_owned())
+            .with_cache_size(0),
+    );
 
     let behavior = Behaviour {
+        connection_limits,
         identify,
         gossipsub,
         req_resp,
@@ -324,7 +851,15 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .with_tcp(
             libp2p::tcp::Config::default().nodelay(true),
             libp2p::noise::Config::new,
-            libp2p::yamux::Config::default,
+            // mplex is not decoration: mainnet beacon peers answer `na` to a
+            // yamux-only proposal. See [`muxers`] for the measurement. Lean
+            // peers all speak yamux, so offering both costs that wire nothing
+            // and keeps one transport stack rather than two.
+            #[allow(deprecated)]
+            (
+                libp2p::yamux::Config::default,
+                libp2p_mplex::MplexConfig::default,
+            ),
         )
         .expect("failed to add TCP transport to swarm")
         .with_quic()
@@ -333,11 +868,14 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         .with_swarm_config(|c| {
             // Disable idle connection timeout
             c.with_idle_connection_timeout(Duration::from_secs(u64::MAX))
+                // Address order is a preference, not a race. See
+                // `DIAL_ADDRESS_CONCURRENCY`.
+                .with_dial_concurrency_factor(DIAL_ADDRESS_CONCURRENCY)
         })
         .build();
     let local_peer_id = *swarm.local_peer_id();
     let (bootnode_addrs, undialable_bootnodes) =
-        merge_bootnode_dial_addrs(config.bootnodes, local_peer_id);
+        merge_bootnode_dial_addrs(bootnodes, local_peer_id);
     // The merged map is the dial input, so every address a duplicate entry
     // contributed is in the one attempt this peer gets. A refused dial is not
     // fatal: the entry stays in `bootnode_addrs`, so the redial path picks the
@@ -360,8 +898,8 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         );
     }
     let quic_addr = Multiaddr::empty()
-        .with(config.listening_socket.ip().into())
-        .with(Protocol::Udp(config.listening_socket.port()))
+        .with(listening_socket.ip().into())
+        .with(Protocol::Udp(listening_socket.port()))
         .with(Protocol::QuicV1);
     swarm
         .listen_on(quic_addr.clone())
@@ -373,8 +911,8 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     // Same port number as the QUIC listener above: TCP and UDP are separate
     // namespaces, so this cannot collide with it.
     let tcp_addr = Multiaddr::empty()
-        .with(config.listening_socket.ip().into())
-        .with(Protocol::Tcp(config.listening_socket.port()));
+        .with(listening_socket.ip().into())
+        .with(Protocol::Tcp(listening_socket.port()));
     swarm
         .listen_on(tcp_addr.clone())
         .map_err(|source| SwarmBuildError::Listen {
@@ -383,49 +921,101 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
             source,
         })?;
 
-    // Subscribe to block topic (all nodes)
-    let block_topic = block_topic();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&block_topic)
-        .unwrap();
+    let wire = match wire {
+        WireConfig::Lean(lean) => {
+            // Subscribe to block topic (all nodes)
+            let block_topic = block_topic();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&block_topic)
+                .unwrap();
 
-    // Subscribe to aggregation topic (all validators)
-    let aggregation_topic = aggregation_topic();
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&aggregation_topic)
-        .unwrap();
+            // Subscribe to aggregation topic (all validators)
+            let aggregation_topic = aggregation_topic();
+            swarm
+                .behaviour_mut()
+                .gossipsub
+                .subscribe(&aggregation_topic)
+                .unwrap();
 
-    // The committee metric should reflect validator membership only, not
-    // aggregator-only subscriptions.
-    let metric_subnet = config
-        .validator_ids
-        .iter()
-        .map(|vid| vid % config.attestation_committee_count)
-        .min()
-        .unwrap_or(0);
-    metrics::set_attestation_committee_subnet(metric_subnet);
+            // The committee metric should reflect validator membership only, not
+            // aggregator-only subscriptions.
+            let metric_subnet = lean
+                .validator_ids
+                .iter()
+                .map(|vid| vid % lean.attestation_committee_count)
+                .min()
+                .unwrap_or(0);
+            metrics::set_attestation_committee_subnet(metric_subnet);
 
-    let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> = HashMap::new();
-    for &subnet_id in &config.subscription_subnets {
-        let topic = attestation_subnet_topic(subnet_id);
-        swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
-        info!(subnet_id, "Subscribed to attestation subnet");
-        attestation_topics.insert(subnet_id, topic);
-    }
+            let mut attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic> =
+                HashMap::new();
+            for &subnet_id in &lean.subscription_subnets {
+                let topic = attestation_subnet_topic(subnet_id);
+                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                info!(subnet_id, "Subscribed to attestation subnet");
+                attestation_topics.insert(subnet_id, topic);
+            }
 
-    info!(socket=%config.listening_socket, "P2P node started");
+            info!(socket=%listening_socket, "P2P node started");
+
+            Wire::Lean(LeanWire {
+                attestation_topics,
+                attestation_committee_count: lean.attestation_committee_count,
+                block_topic,
+                aggregation_topic,
+            })
+        }
+        WireConfig::Beacon(beacon) => {
+            // The custody set is columns, not subnets: a column's subnet is
+            // `column % DATA_COLUMN_SIDECAR_SUBNET_COUNT`, computed rather than
+            // assumed so a network that ever separates the two counts still
+            // subscribes to the right topic.
+            let column_subnets: Vec<u64> = beacon
+                .custody_columns
+                .iter()
+                .map(|column| {
+                    column % ethlambda_types::beacon::constants::DATA_COLUMN_SIDECAR_SUBNET_COUNT
+                })
+                .collect();
+            let topics = beacon::topics::BeaconTopics::new(
+                beacon.fork_digest,
+                &column_subnets,
+                &beacon.attestation_subnets,
+            );
+            for topic in &topics.topics {
+                swarm.behaviour_mut().gossipsub.subscribe(topic)?;
+                info!(topic = %topic, "Subscribed to beacon topic");
+            }
+
+            info!(
+                socket = %listening_socket,
+                fork_digest = %hex::encode(beacon.fork_digest),
+                topics = topics.topics.len(),
+                columns = beacon.custody_columns.len(),
+                attestation_subnets = ?beacon.attestation_subnets,
+                "Beacon P2P node started"
+            );
+
+            Wire::Beacon(Box::new(beacon::BeaconWire {
+                fork_digest: beacon.fork_digest,
+                fork: beacon.fork,
+                topics,
+                config: beacon.config,
+                genesis_time: beacon.genesis_time,
+                genesis_validators_root: beacon.genesis_validators_root,
+                metadata_seq_number: 0,
+                custody_columns: beacon.custody_columns,
+                attestation_subnets: beacon.attestation_subnets,
+            }))
+        }
+    };
 
     Ok(BuiltSwarm {
         local_peer_id,
         swarm,
-        attestation_topics,
-        attestation_committee_count: config.attestation_committee_count,
-        block_topic,
-        aggregation_topic,
+        wire,
         bootnode_addrs,
     })
 }
@@ -441,52 +1031,93 @@ impl P2P {
     /// Start discovery, start the I/O adapter, spawn the actor, and wire the
     /// swarm event stream.
     ///
-    /// `discovery` is `Some` when discv5 discovery is enabled: the discv5
-    /// server is started here, and its handle seeds the dial loop's state and
-    /// schedules its first tick. `None` leaves the dial loop permanently
-    /// dormant, so peering relies solely on the static bootnode list dialed by
-    /// `build_swarm`.
+    /// `discovery` is `Some` when discv5 runs: the server is started here, and
+    /// its handle seeds the dial loop's state and schedules its first tick. It
+    /// is started before the swarm adapter so a fatal discovery failure (a busy
+    /// UDP port, say) surfaces before any actor is running. `None` leaves the
+    /// dial loop unscheduled, so peering relies solely on the static bootnode
+    /// list `build_swarm` dialed.
     ///
-    /// Discovery is started before the swarm adapter so a fatal discovery
-    /// failure (a busy UDP port, say) surfaces before any actor is running.
+    /// Always `Some` on beacon, which has no other way to find a peer:
+    /// published mainnet bootnode ENRs carry no `quic` entry, so none of them
+    /// is statically dialable. Opt-in on lean, where nothing else speaks discv5
+    /// and co-located devnet nodes would otherwise all claim one UDP port.
     pub async fn spawn(
         built: BuiltSwarm,
         store: Store,
         node_names: HashMap<PeerId, String>,
         discovery: Option<DiscoverySpawnConfig>,
+        attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
-        if discovery.is_none() {
-            info!("discv5 discovery disabled; peering from the static bootnode list only");
-        }
-        // `OptionFuture` awaits the spawn only when there is one to await, so the
-        // disabled case stays a plain `None` without a branch of its own.
-        let discovery = OptionFuture::from(discovery.map(spawn_discovery))
-            .await
-            .transpose()?;
+        let discovery = match discovery {
+            Some(config) => Some(spawn_discovery(config).await?),
+            None => {
+                info!("discv5 discovery disabled; peering from the static bootnode list only");
+                None
+            }
+        };
         let (swarm_stream, swarm_handle) =
             swarm_adapter::start_swarm_adapter(built.swarm, node_names.clone());
 
-        let discovery_enabled = discovery.is_some();
+        // Seeded from the anchor the store was bootstrapped at, so the first
+        // range request starts where the chain does rather than at slot 0.
+        let beacon_fetched_through = match store.chain() {
+            Chain::Beacon => store.beacon_head().map_or(0, |(slot, _)| slot),
+            Chain::Lean => 0,
+        };
+        // Read before `built.wire` moves into the server below; absent on a
+        // lean wire, which `seen_attestations_capacity` floors for.
+        let backbone_attestation_subnets = built
+            .wire
+            .beacon()
+            .map_or(0, |beacon| beacon.attestation_subnets.len());
+
         let server = P2PServer {
             swarm_handle,
             store,
             blockchain: None,
-            attestation_topics: built.attestation_topics,
-            attestation_committee_count: built.attestation_committee_count,
-            block_topic: built.block_topic,
-            aggregation_topic: built.aggregation_topic,
-            connected_peers: HashSet::new(),
+            wire: built.wire,
+            connected_peers: HashMap::new(),
+            peer_custody: HashMap::new(),
             pending_root_requests: HashMap::new(),
+            pending_column_requests: HashMap::new(),
             outbound_requests: HashMap::new(),
             range_sync_state: None,
+            beacon_fetched_through,
             bootnode_addrs: built.bootnode_addrs,
             node_names,
             discovery: discovery.map(|handle| DiscoveryState::new(handle, built.local_peer_id)),
+            seen_blocks: SeenBlocks::new(SEEN_BLOCKS_CAPACITY),
+            seen_columns: SeenColumns::new(SEEN_COLUMNS_CAPACITY),
+            seen_aggregates: SeenAggregates::new(
+                SEEN_AGGREGATES_CAPACITY,
+                SEEN_AGGREGATES_CAPACITY,
+            ),
+            seen_attestations: SeenAttestations::new(seen_attestations_capacity(
+                backbone_attestation_subnets,
+            )),
+            gossip_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                GOSSIP_VALIDATION_PERMITS,
+            )),
+            column_check_permits: Arc::new(tokio::sync::Semaphore::new(COLUMN_CHECK_PERMITS)),
+            attestation_validation_permits: Arc::new(tokio::sync::Semaphore::new(
+                ATTESTATION_VALIDATION_PERMITS,
+            )),
+            attestation_pool,
+            aggregator_subnets: HashMap::new(),
         };
+        let discovery_enabled = server.discovery.is_some();
         let handle = server.start();
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            handle.context(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        // The dial loop's first tick. Nothing else schedules one, so without
+        // discovery the loop never runs.
         if discovery_enabled {
             send_after(
-                DISCOVERY_DIAL_INTERVAL,
+                DIAL_INTERVAL_AT_ZERO_PEERS,
                 handle.context(),
                 p2p_protocol::DiscoverPeers,
             );
@@ -515,20 +1146,84 @@ pub struct P2PServer {
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
 
-    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
-    pub(crate) attestation_committee_count: u64,
-    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) wire: Wire,
 
-    pub(crate) connected_peers: HashSet<PeerId>,
+    /// Every peer holding at least one established connection, and which side
+    /// opened the first one.
+    ///
+    /// Keyed by peer rather than connection: a peer may hold up to
+    /// [`beacon::swarm::MAX_CONNECTIONS_PER_PEER`] of them, and every consumer
+    /// here asks "can I talk to this peer", not "over how many sockets". The
+    /// direction is the first connection's, which is the one that decides
+    /// whether this peer was our choice or the network's.
+    pub(crate) connected_peers: HashMap<PeerId, ConnectionDirection>,
+    /// The columns each peer custodies, as computed from its own node id and
+    /// its advertised custody group count.
+    ///
+    /// Deterministic on both sides, which is the whole point: the spec notes
+    /// that "due to the deterministic custody functions, a node knows exactly
+    /// what a peer should be able to respond to", so a column request can be
+    /// aimed at a peer that actually holds it instead of scattered at random.
+    /// At mainnet's `CUSTODY_REQUIREMENT` a peer holds 8 of 128 columns, so
+    /// asking an arbitrary one for a specific column nearly always comes back
+    /// empty.
+    ///
+    /// Absent for any peer that has not answered `metadata/3` and arrived with
+    /// no usable `cgc`; [`columns_custodied_by`] treats absent as "no opinion",
+    /// never as "custodies nothing".
+    pub(crate) peer_custody: HashMap<PeerId, Vec<u64>>,
     pub(crate) pending_root_requests: HashMap<H256, PendingRequest>,
-    pub(crate) outbound_requests: HashMap<OutboundRequestId, PendingRequestKind>,
+    /// One entry per block root with an in-flight or backed-off
+    /// `DataColumnsByRoot` lookup. Mirrors `pending_root_requests`'s role for
+    /// the block path: `fetch_missing_columns` dedupes against it, and
+    /// `handle_column_fetch_failure` is the only place an entry is retired.
+    pub(crate) pending_column_requests: HashMap<H256, PendingColumnRequest>,
+    pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
+
+    /// Highest beacon slot handed to the chain actor, whether or not it has
+    /// been imported yet.
+    pub(crate) beacon_fetched_through: u64,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
 
-    /// Set when discovery is enabled. `None` disables the dial loop entirely.
+    /// The dial loop's state. `None` when discv5 is off, which only a lean
+    /// node started without `--discovery.enable` is.
     pub(crate) discovery: Option<DiscoveryState>,
+
+    /// The first valid block per `(slot, proposer)` accepted from gossip.
+    pub(crate) seen_blocks: SeenBlocks,
+    /// The first valid sidecar per `(slot, proposer, index)` accepted from
+    /// gossip. Bounded by capacity, so a fabricated slot cannot grow it.
+    pub(crate) seen_columns: SeenColumns,
+    /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
+    /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
+    pub(crate) seen_aggregates: SeenAggregates,
+    /// Accepted `beacon_attestation_{subnet_id}`s, by `(target_epoch,
+    /// attester_index)`.
+    pub(crate) seen_attestations: SeenAttestations,
+    /// Permits for block and column stateful gossip checks in flight on
+    /// blocking threads.
+    pub(crate) gossip_validation_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for data column chain checks in flight on blocking threads.
+    pub(crate) column_check_permits: Arc<tokio::sync::Semaphore>,
+    /// Permits for aggregate and subnet-attestation stateful gossip checks in
+    /// flight on blocking threads. Separate from
+    /// [`Self::gossip_validation_permits`]; see
+    /// [`ATTESTATION_VALIDATION_PERMITS`].
+    pub(crate) attestation_validation_permits: Arc<tokio::sync::Semaphore>,
+
+    /// Unaggregated attestations for this node's validator clients'
+    /// aggregators, shared with the Beacon API that aggregates from it. Filled
+    /// by `verdict::forward` from the aggregator subnets below; lean never
+    /// touches it.
+    pub(crate) attestation_pool: SharedAttestationPool,
+
+    /// The attestation subnets joined for a validator client's aggregators,
+    /// each with the last slot it is needed for. Short-lived by design: never
+    /// advertised in `attnets`, and left once the slot has passed. The
+    /// backbone subnets are separate and never left.
+    pub(crate) aggregator_subnets: HashMap<u64, u64>,
 }
 
 impl P2PServer {
@@ -537,6 +1232,64 @@ impl P2PServer {
             .and_then(|p| self.node_names.get(p))
             .map(String::as_str)
             .unwrap_or("unknown")
+    }
+
+    /// Republish the peer gauges from the state that actually decides them.
+    ///
+    /// Set from a full re-count rather than incremented and decremented per
+    /// event, because a gauge kept by arithmetic is only ever as right as the
+    /// least reliable event that touches it: one missed decrement and it is
+    /// wrong until restart, in the direction that hides a problem. These are
+    /// the gauges used to tell whether connections leak, so they must not be
+    /// able to leak themselves.
+    ///
+    /// Cheap enough to call on every connect and disconnect: the work is
+    /// proportional to the peer count, which is bounded by
+    /// [`beacon::swarm::max_connections`]. The swarm's own connection counters
+    /// are the other half of the leak question, and the swarm lives in
+    /// [`swarm_adapter`]'s task rather than here, so those are published from
+    /// its metric tick instead.
+    pub(crate) fn refresh_peer_metrics(&self) {
+        let (mut inbound, mut outbound) = (0, 0);
+        for direction in self.connected_peers.values() {
+            match direction {
+                ConnectionDirection::Inbound => inbound += 1,
+                ConnectionDirection::Outbound => outbound += 1,
+            }
+        }
+        metrics::set_peers_by_direction(inbound, outbound);
+        self.refresh_custody_column_metrics();
+    }
+
+    /// Publish, per column this node samples, how many connected peers are
+    /// known to custody it.
+    ///
+    /// This is the supply side of the data-availability gate: a block is held
+    /// until every sampled column arrives, so a column sitting at zero peers is
+    /// a stall waiting to happen, and it is invisible in a total peer count.
+    ///
+    /// Only the columns this node samples get a series. Publishing all 128
+    /// would bury the eight that can actually block an import, and the custody
+    /// set is fixed for the life of the node, so the label set is stable.
+    ///
+    /// Counted through [`columns_custodied_by`], the same answer the fetch path
+    /// picks its peers with, so the gauge cannot say a column has custodians
+    /// that a lookup for it would not find.
+    ///
+    /// Called from every writer of either input, which is both ends of a
+    /// connection and [`req_resp::handlers::record_peer_custody`]. The last of
+    /// those is the one that matters: a peer's custody arrives with its
+    /// `metadata/3` answer, *after* it connects, so a gauge refreshed on
+    /// connection events alone would read every column at the zero it had
+    /// before the peer said anything — which is the exact reading this gauge
+    /// was added to mean "a stall waiting to happen".
+    pub(crate) fn refresh_custody_column_metrics(&self) {
+        let Some(wire) = self.wire.beacon() else {
+            return;
+        };
+        for column in wire.custody_columns.iter().copied() {
+            metrics::set_custody_column_peers(column, columns_custodied_by(self, column).len());
+        }
     }
 }
 
@@ -547,9 +1300,15 @@ pub(crate) trait P2PProtocol: Send + Sync {
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_block_fetch(&self, root: H256) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_data_column_fetch(&self, block_root: H256) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
     fn retry_peer_redial(&self, peer_id: PeerId) -> Result<(), ActorError>;
     #[allow(dead_code)] // invoked via send_after, not called directly
     fn discover_peers(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn leave_expired_aggregator_subnets(&self) -> Result<(), ActorError>;
+    #[allow(dead_code)] // invoked via send_after, not called directly
+    fn retry_beacon_range_batch(&self) -> Result<(), ActorError>;
 }
 
 #[actor(protocol = P2PProtocol)]
@@ -576,6 +1335,29 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_retry_data_column_fetch(
+        &mut self,
+        msg: p2p_protocol::RetryDataColumnFetch,
+        _ctx: &Context<Self>,
+    ) {
+        let block_root = msg.block_root;
+        // Same "might have completed during backoff" guard as
+        // `handle_retry_block_fetch`, and the same reason for it: the reissued
+        // request must ask for what is still missing, which
+        // `pending_column_requests` is the only place that remembers.
+        let Some(pending) = self.pending_column_requests.get(&block_root) else {
+            trace!(%block_root, "Data column fetch completed during backoff, skipping retry");
+            return;
+        };
+        let columns = pending.columns.clone();
+
+        if !fetch_data_columns_from_peer(self, block_root, columns).await {
+            tracing::error!(%block_root, "Failed to retry data column fetch, giving up");
+            self.pending_column_requests.remove(&block_root);
+        }
+    }
+
+    #[send_handler]
     async fn handle_retry_peer_redial(
         &mut self,
         msg: p2p_protocol::RetryPeerRedial,
@@ -584,7 +1366,7 @@ impl P2PServer {
         let peer_id = msg.peer_id;
 
         // Skip if already reconnected
-        if self.connected_peers.contains(&peer_id) {
+        if self.connected_peers.contains_key(&peer_id) {
             trace!(%peer_id, "Bootnode reconnected during redial delay, skipping");
             return;
         }
@@ -597,18 +1379,60 @@ impl P2PServer {
     }
 
     #[send_handler]
+    async fn handle_leave_expired_aggregator_subnets(
+        &mut self,
+        _msg: p2p_protocol::LeaveExpiredAggregatorSubnets,
+        ctx: &Context<Self>,
+    ) {
+        send_after(
+            AGGREGATOR_SUBNET_SWEEP_INTERVAL,
+            ctx.clone(),
+            p2p_protocol::LeaveExpiredAggregatorSubnets,
+        );
+        gossipsub::leave_expired_aggregator_subnets(self);
+        gossipsub::prune_attestation_pool(self);
+    }
+
+    #[send_handler]
     async fn handle_discover_peers(
         &mut self,
         _msg: p2p_protocol::DiscoverPeers,
         ctx: &Context<Self>,
     ) {
-        // Reschedule first, so an early return never stops the loop.
-        send_after(
-            DISCOVERY_DIAL_INTERVAL,
-            ctx.clone(),
-            p2p_protocol::DiscoverPeers,
-        );
-        dial_tick(self).await;
+        // `P2P::spawn` schedules the first tick only with discovery on, so this
+        // never returns. If it did, not rescheduling is what "off" means.
+        let Some(target_peers) = self.discovery.as_ref().map(DiscoveryState::target_peers) else {
+            return;
+        };
+        let dialed = dial_tick(self, target_peers).await;
+        // Rescheduled on every path out of the tick, so nothing above can stop
+        // the loop. The gap is a function of how full the peer table is rather
+        // than a flat heartbeat: near `MAX_DIAL_RATE_PER_SECOND` while short of
+        // peers, easing off as they arrive. See `dial::dial_interval`.
+        //
+        // Unless the tick dialed nothing, which the curve cannot tell on its
+        // own: it reads a shortfall against `target_peers`, and a network with
+        // fewer peers than that to offer leaves that shortfall open forever.
+        // Pacing on it alone would hold the loop at its floor for the life of
+        // the process, re-drawing a candidate pool of peers it is already
+        // connected to. One dial opened puts it straight back on the curve.
+        let interval = if dialed {
+            dial_interval(dial_progress(self, target_peers))
+        } else {
+            DIAL_INTERVAL_AT_TARGET
+        };
+        send_after(interval, ctx.clone(), p2p_protocol::DiscoverPeers);
+    }
+
+    /// The deadline of a range batch held back for custody. Scheduled once,
+    /// when the batch starts waiting; see [`RANGE_BATCH_CUSTODY_WAIT`].
+    #[send_handler]
+    async fn handle_retry_beacon_range_batch(
+        &mut self,
+        _msg: p2p_protocol::RetryBeaconRangeBatch,
+        ctx: &Context<Self>,
+    ) {
+        resume_range_batch_held_for_custody(self, ctx).await;
     }
 }
 
@@ -639,16 +1463,106 @@ impl Handler<PublishAggregatedAttestation> for P2PServer {
     }
 }
 
+impl Handler<PublishBeaconAggregate> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAggregate, _ctx: &Context<Self>) {
+        publish_beacon_aggregate(self, msg.aggregate).await;
+    }
+}
+
+impl Handler<PublishBeaconBlock> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconBlock, _ctx: &Context<Self>) {
+        publish_beacon_block(self, msg.block).await;
+    }
+}
+
+impl Handler<SubscribeAttestationSubnets> for P2PServer {
+    async fn handle(&mut self, msg: SubscribeAttestationSubnets, _ctx: &Context<Self>) {
+        gossipsub::join_aggregator_subnets(self, msg.subnets);
+    }
+}
+
+impl Handler<PublishBeaconAttestation> for P2PServer {
+    async fn handle(&mut self, msg: PublishBeaconAttestation, _ctx: &Context<Self>) {
+        publish_beacon_attestation(self, msg.subnet_id, msg.attestation).await;
+    }
+}
+
 impl Handler<FetchBlock> for P2PServer {
     async fn handle(&mut self, msg: FetchBlock, _ctx: &Context<Self>) {
-        let root = msg.root;
-        // Deduplicate - if already pending, ignore
-        if self.pending_root_requests.contains_key(&root) {
-            trace!(%root, "Block fetch already in progress, ignoring duplicate");
+        fetch_missing(self, msg.request).await;
+    }
+}
+
+impl Handler<CheckDataColumnSidecars> for P2PServer {
+    async fn handle(&mut self, msg: CheckDataColumnSidecars, _ctx: &Context<Self>) {
+        beacon::column_checks::check_and_forward(self, msg.sidecars);
+    }
+}
+
+/// Ask for whatever a [`FetchRequest`] says is missing.
+///
+/// Both halves are by-root lookups with their own dedup and retry ladder, and
+/// a request may name either or both. There is no by-range arm here: a caller
+/// on the chain side has a root, not a span, and the span worth asking for is
+/// the one this crate is already syncing, so
+/// [`req_resp::request_beacon_data_columns_by_range`] rides every
+/// `BeaconBlocksByRange` batch instead of waiting to be asked.
+async fn fetch_missing(server: &mut P2PServer, request: FetchRequest) {
+    let FetchRequest {
+        block_root,
+        needs_block,
+        columns,
+    } = request;
+    if needs_block {
+        fetch_missing_block(server, block_root).await;
+    }
+    if !columns.is_empty() {
+        fetch_missing_columns(server, block_root, columns).await;
+    }
+}
+
+/// The by-root block half of a [`FetchRequest`].
+async fn fetch_missing_block(server: &mut P2PServer, root: H256) {
+    // Deduplicate - if already pending, ignore
+    if server.pending_root_requests.contains_key(&root) {
+        trace!(%root, "Block fetch already in progress, ignoring duplicate");
+        return;
+    }
+    fetch_block_from_peer(server, root).await;
+}
+
+/// The by-root column half of a [`FetchRequest`].
+async fn fetch_missing_columns(server: &mut P2PServer, block_root: H256, columns: Vec<u64>) {
+    // Same one-lookup-per-root rule as the block half, but merged rather
+    // than dropped: the availability gate may re-ask for a root already
+    // in flight with a wider column set than the first ask named, as
+    // columns trickle in, and dropping the difference would rest on an
+    // unenforced invariant that a re-ask is always a subset of what is
+    // already pending. A column added this way misses the request
+    // already on the wire, which cannot be widened after it was sent;
+    // it rides the next event for this root instead — a retry of this
+    // lookup, which resends whatever `columns` now holds, or, once this
+    // lookup resolves and the entry is gone, a fresh `FetchRequest`
+    // from a caller that rechecks what is still missing.
+    //
+    // "In flight" has to mean it, though: an entry whose round never
+    // reported back would otherwise deduplicate this root against a lookup
+    // that will never ask anything again. Past `STALE_COLUMN_LOOKUP` the
+    // entry is dropped and this ask starts a lookup of its own.
+    if let Some(pending) = server.pending_column_requests.get_mut(&block_root) {
+        if pending.last_asked.elapsed() < STALE_COLUMN_LOOKUP {
+            for column in columns {
+                if !pending.columns.contains(&column) {
+                    trace!(%block_root, column, "Merging a new column into an in-flight data column fetch");
+                    pending.columns.push(column);
+                }
+            }
             return;
         }
-        fetch_block_from_peer(self, root).await;
+        debug!(%block_root, "Replacing a data column lookup that stopped asking");
+        server.pending_column_requests.remove(&block_root);
     }
+    fetch_data_columns_from_peer(server, block_root, columns).await;
 }
 
 // --- Manual Handler for swarm events ---
@@ -665,13 +1579,8 @@ async fn handle_swarm_event(
     ctx: &Context<P2PServer>,
 ) {
     match event {
-        SwarmEvent::Behaviour(BehaviourEvent::ReqResp(req_resp_event)) => {
-            req_resp::handle_req_resp_message(server, req_resp_event, ctx).await;
-        }
-        SwarmEvent::Behaviour(BehaviourEvent::Gossipsub(
-            message @ libp2p::gossipsub::Event::Message { .. },
-        )) => {
-            gossipsub::handle_gossipsub_message(server, message).await;
+        SwarmEvent::Behaviour(behaviour_event) => {
+            handle_behaviour_event(server, behaviour_event, ctx).await;
         }
         SwarmEvent::ConnectionEstablished {
             peer_id,
@@ -679,43 +1588,74 @@ async fn handle_swarm_event(
             num_established,
             ..
         } => {
-            let direction = connection_direction(&endpoint);
+            let direction = ConnectionDirection::from(&endpoint);
             // Read off the connection's own address rather than which one we
             // dialed: with both QUIC and TCP offered, libp2p races every
             // address in a dial and may connect over either. This is what
             // answers "did the TCP fallback actually help", as a metric because
             // the trace field alone is invisible at default verbosity.
             let transport = transport_label(endpoint.get_remote_address());
-            metrics::inc_peer_connection_transport(direction, transport);
+            metrics::inc_peer_connection_transport(direction.as_str(), transport);
             if num_established.get() == 1 {
-                server.connected_peers.insert(peer_id);
+                server.connected_peers.insert(peer_id, direction);
+                server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_connected(
                     server.resolve_node_name(Some(&peer_id)),
-                    direction,
+                    direction.as_str(),
                     "success",
                 );
-                // Send status request on first connection to this peer
-                let our_status = build_status(&server.store);
-                let our_finalized_slot = our_status.finalized.slot;
-                let our_head_slot = our_status.head.slot;
-                trace!(
-                    %peer_id,
-                    %direction,
-                    %transport,
-                    peer_count,
-                    our_finalized_slot,
-                    our_head_slot,
-                    "Peer connected"
-                );
-                server
-                    .swarm_handle
-                    .send_request(
-                        peer_id,
-                        Request::Status(our_status),
-                        libp2p::StreamProtocol::new(STATUS_PROTOCOL_V1),
+                // Compute the beacon status and its log fields first, so no
+                // borrow of `server.wire` is alive across the send.
+                let beacon_status = server.wire.beacon().map(|wire| {
+                    (
+                        beacon::handler::build_status(
+                            &server.store,
+                            wire,
+                            beacon::handler::StatusVersion::V1,
+                        ),
+                        hex::encode(wire.fork_digest),
                     )
-                    .await;
+                });
+                match beacon_status {
+                    Some((status, digest)) => {
+                        trace!(
+                            %peer_id,
+                            %direction,
+                            %transport,
+                            peer_count,
+                            fork_digest = %digest,
+                            "Peer connected"
+                        );
+                        beacon::handler::send_status(server, peer_id, status).await;
+                        // Behind the handshake rather than in place of it: this
+                        // is what tells us which columns the peer custodies, and
+                        // an inbound peer has no ENR here to read a `cgc` from.
+                        beacon::handler::request_metadata(server, peer_id).await;
+                    }
+                    None => {
+                        let our_status = build_status(&server.store);
+                        let our_finalized_slot = our_status.finalized.slot;
+                        let our_head_slot = our_status.head.slot;
+                        trace!(
+                            %peer_id,
+                            %direction,
+                            %transport,
+                            peer_count,
+                            our_finalized_slot,
+                            our_head_slot,
+                            "Peer connected"
+                        );
+                        server
+                            .swarm_handle
+                            .send_request(
+                                peer_id,
+                                Request::LeanStatus(our_status),
+                                ReqRespProtocol::LeanStatus,
+                            )
+                            .await;
+                    }
+                }
             } else {
                 trace!(%peer_id, %direction, %transport, "Added peer connection");
             }
@@ -727,8 +1667,8 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
-            let direction = connection_direction(&endpoint);
-            let reason = match cause {
+            let closed_direction = ConnectionDirection::from(&endpoint);
+            let reason = match &cause {
                 None => "remote_close",
                 Some(err) => {
                     // Categorize disconnection reasons
@@ -745,16 +1685,42 @@ async fn handle_swarm_event(
                     }
                 }
             };
+            let cause_label = disconnect_cause(cause.as_ref());
             if num_established == 0 {
-                server.connected_peers.remove(&peer_id);
+                // Report the direction this peer was *counted* under, not the
+                // one the last socket happened to carry. A peer may hold both
+                // an inbound and an outbound connection, and whichever closes
+                // last decides `closed_direction`; attributing the disconnect
+                // to that would let the per-direction connect and disconnect
+                // counters drift apart, and those counters are exactly what a
+                // "peers held" figure gets derived from.
+                let direction = server
+                    .connected_peers
+                    .remove(&peer_id)
+                    .unwrap_or(closed_direction);
                 forget_discovered_peer(server, &peer_id);
+                server.refresh_peer_metrics();
                 let peer_count = server.connected_peers.len();
                 metrics::notify_peer_disconnected(
                     server.resolve_node_name(Some(&peer_id)),
-                    direction,
+                    direction.as_str(),
                     reason,
                 );
+                // Charged here rather than on every closed connection, so this
+                // totals to the same count as the metric above and the two can
+                // be read against each other directly.
+                metrics::inc_peer_disconnect_cause(direction.as_str(), cause_label);
 
+                // `debug!` rather than the `trace!` below, and carrying the
+                // cause itself: `cause_label` deliberately cannot name what an
+                // `io_other` was, so this is the only place that answer exists.
+                debug!(
+                    %peer_id,
+                    %direction,
+                    %cause_label,
+                    cause = ?cause,
+                    "Peer connection closed"
+                );
                 trace!(
                     %peer_id,
                     %direction,
@@ -773,7 +1739,7 @@ async fn handle_swarm_event(
                     trace!(%peer_id, "Scheduled bootnode redial in {}s", PEER_REDIAL_INTERVAL_SECS);
                 }
             } else {
-                trace!(%peer_id, %direction, %reason, "Peer connection closed but other connections remain");
+                trace!(%peer_id, direction = %closed_direction, %reason, "Peer connection closed but other connections remain");
             }
         }
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -797,13 +1763,13 @@ async fn handle_swarm_event(
                 // fail here (the bootnode redial path is one way), and dropping
                 // a live peer's `attnets` would make `covered_subnets`
                 // under-count subnets we do in fact cover.
-                if !server.connected_peers.contains(&pid) {
+                if !server.connected_peers.contains_key(&pid) {
                     forget_discovered_peer(server, &pid);
                 }
 
                 // Schedule redial if this was a bootnode
                 if server.bootnode_addrs.contains_key(&pid)
-                    && !server.connected_peers.contains(&pid)
+                    && !server.connected_peers.contains_key(&pid)
                 {
                     send_after(
                         Duration::from_secs(PEER_REDIAL_INTERVAL_SECS),
@@ -815,17 +1781,104 @@ async fn handle_swarm_event(
             }
         }
         SwarmEvent::IncomingConnectionError { peer_id, error, .. } => {
-            metrics::notify_peer_connected(
-                server.resolve_node_name(peer_id.as_ref()),
-                "inbound",
-                "error",
+            // A connection our own limit refused is policy working, not a
+            // fault. Once the cap is reached every further dial arrives here,
+            // so counting these as errors would bury the real ones under the
+            // steady rate of peers we are deliberately turning away, and warn
+            // once per rejection while doing it. See `beacon::swarm::connection_limits`.
+            let refused_at_capacity = matches!(
+                &error,
+                libp2p::swarm::ListenError::Denied { cause }
+                    if cause
+                        .downcast_ref::<libp2p::connection_limits::Exceeded>()
+                        .is_some()
             );
-            debug!(%error, "Incoming connection error");
+            if refused_at_capacity {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "refused_at_capacity",
+                );
+                let peer_count = server.connected_peers.len();
+                debug!(peer_count, "Refused an inbound connection at capacity");
+            } else {
+                metrics::notify_peer_connected(
+                    server.resolve_node_name(peer_id.as_ref()),
+                    "inbound",
+                    "error",
+                );
+                debug!(%error, "Incoming connection error");
+            }
         }
         _ => {
             trace!(?event, "Ignored swarm event");
         }
     }
+}
+
+/// Dispatch one [`BehaviourEvent`], tagging every req/resp field's event with
+/// the [`ReqRespProtocol`] variant that names it.
+///
+/// The tag is the whole of what each req/resp arm decides, so the match yields
+/// it as a value and the one call that consumes it sits below, rather than
+/// each arm repeating the call with a different constant.
+///
+/// Deliberately exhaustive, with no wildcard arm: `handle_swarm_event`'s own
+/// catch-all would otherwise silently swallow a `BehaviourEvent` variant this
+/// function forgot to name, for the same reason the fork's own `DialError`
+/// conversion is matched exhaustively (see `DialOutcome`'s `From` impl in
+/// `swarm_adapter.rs`). Adding a fifteenth [`ReqResp`] field forces this to
+/// grow an arm rather than falling through unnoticed.
+async fn handle_behaviour_event(
+    server: &mut P2PServer,
+    event: BehaviourEvent,
+    ctx: &Context<P2PServer>,
+) {
+    let (protocol, event) = match event {
+        // Registered for interop only; see `Behaviour`'s doc comment for why
+        // its events are never read.
+        BehaviourEvent::Identify(_) => return,
+        // A deny from this behaviour already denied the connection at the
+        // swarm level; nothing here needs to react to it a second time.
+        BehaviourEvent::ConnectionLimits(_) => return,
+        BehaviourEvent::Gossipsub(libp2p::gossipsub::Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        }) => {
+            return gossipsub::handle_gossip_message(
+                server,
+                ctx,
+                propagation_source,
+                message_id,
+                message,
+            )
+            .await;
+        }
+        BehaviourEvent::Gossipsub(_) => return,
+        BehaviourEvent::ReqResp(event) => match event {
+            ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
+            ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
+            ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+            ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
+            ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+            ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
+            ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
+            ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
+            ReqRespEvent::BeaconMetadataV3(e) => (ReqRespProtocol::BeaconMetadataV3, e),
+            ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
+            ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
+            ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+            ReqRespEvent::DataColumnSidecarsByRange(e) => {
+                (ReqRespProtocol::DataColumnSidecarsByRange, e)
+            }
+            ReqRespEvent::DataColumnSidecarsByRoot(e) => {
+                (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+            }
+        },
+    };
+
+    req_resp::handle_req_resp_message(server, protocol, event, ctx).await;
 }
 
 // --- Node identity helpers ---
@@ -994,12 +2047,13 @@ fn parse_enr(enr_str: &str) -> Result<Bootnode, String> {
 /// Empty when neither is, which is a discv5-only seed: it can still answer
 /// FINDNODE, but there is nothing for the swarm to dial.
 ///
-/// The order is not a preference. libp2p pushes up to `dial_concurrency_factor`
-/// of these into one `FuturesUnordered` and takes whichever handshake finishes
-/// first; the default factor is larger than this list can ever be, so both
-/// transports are always attempted and the position here decides nothing. That
-/// race is the point: a peer advertising a `quic` port nothing answers still
-/// connects over `tcp` without waiting out a connect timeout first.
+/// The order *is* the preference, and `quic` leads it. libp2p starts
+/// `dial_concurrency_factor` of these at a time, which
+/// [`DIAL_ADDRESS_CONCURRENCY`] pins to one, so a peer's `tcp` address is
+/// reached only once the QUIC attempt ahead of it has failed. Under the default
+/// factor both went into one `FuturesUnordered` and the faster handshake won,
+/// which sounds neutral and is not: TCP won most of those races and every win
+/// was another mplex connection.
 ///
 /// Shared by both dial paths, so a change to what counts as dialable cannot
 /// apply to static bootnodes and discovered peers differently: static bootnodes
@@ -1106,11 +2160,50 @@ pub(crate) fn tcp_multiaddr(ip: IpAddr, tcp_port: u16, peer_id: PeerId) -> Multi
         .expect("a freshly built multiaddr carries no p2p component")
 }
 
-fn connection_direction(endpoint: &libp2p::core::ConnectedPoint) -> &'static str {
-    if endpoint.is_dialer() {
-        "outbound"
-    } else {
-        "inbound"
+/// Which side opened a connection.
+///
+/// Carried per peer rather than derived where needed, because the two are not
+/// interchangeable and only one of them is ours to choose. Inbound supply on
+/// mainnet is effectively unbounded and arrives with no say in who it is; an
+/// outbound peer is one this node picked, which is the only lever it has on its
+/// own custody-column coverage. Mixing the two into a single count is what lets
+/// inbound demand quietly crowd the dial loop out of its own reservation, so the
+/// direction is kept alongside the peer. See
+/// [`beacon::swarm::connection_limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ConnectionDirection {
+    /// The remote dialed us.
+    Inbound,
+    /// We dialed the remote.
+    Outbound,
+}
+
+impl ConnectionDirection {
+    /// The label this direction carries in metrics and logs.
+    ///
+    /// The two strings are leanMetrics-specified label values on
+    /// `lean_peer_connection_events_total`, so they are fixed, not cosmetic.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+impl fmt::Display for ConnectionDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<&libp2p::core::ConnectedPoint> for ConnectionDirection {
+    fn from(endpoint: &libp2p::core::ConnectedPoint) -> Self {
+        if endpoint.is_dialer() {
+            Self::Outbound
+        } else {
+            Self::Inbound
+        }
     }
 }
 
@@ -1130,10 +2223,173 @@ fn transport_label(addr: &Multiaddr) -> &'static str {
     "unknown"
 }
 
-fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
-    const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-    const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+/// What ended a connection, as the label
+/// [`metrics::inc_peer_disconnect_cause`] counts it under.
+///
+/// Read off the `ConnectionError` variant and the error types inside it,
+/// rather than sniffed out of the whole `Display` string the way the
+/// leanMetrics-specified `reason` beside it still has to be. That string test
+/// is why nine closes in ten on a mainnet follower read only `error`: it looks
+/// for "timeout" and "reset" and calls everything else a fault, and a peer
+/// hanging up on us produces neither word.
+///
+/// `clean_close` is `None`, which libp2p reports when a connection ended with
+/// no error at all. For a beacon peer that is the ordinary shape of a
+/// deliberate disconnect, so it should be read against `lean_peer_goodbye_total`
+/// rather than on its own.
+///
+/// An I/O close's kind is rarely the answer on its own. `StreamMuxerBox` wraps
+/// every muxer error in `io::Error::other`, so almost every close arrives as
+/// `ErrorKind::Other` with the muxer's own error behind it, and that inner
+/// error is read by downcasting to the two muxers this node runs; see
+/// [`io_disconnect_cause`].
+///
+/// `io_other` is the residue: an I/O error that is neither one of the kinds
+/// below nor one of those two muxers' errors. It should stay near empty; a
+/// rise means a close shape this function does not know yet, and the `debug!`
+/// at the call site prints the full cause for exactly that case.
+///
+/// Matched exhaustively on purpose. `ConnectionError` is not `#[non_exhaustive]`,
+/// so a new variant upstream should fail this build rather than quietly join
+/// the residue.
+fn disconnect_cause(cause: Option<&ConnectionError>) -> &'static str {
+    match cause {
+        None => "clean_close",
+        Some(ConnectionError::KeepAliveTimeout) => "keep_alive_timeout",
+        Some(ConnectionError::IO(err)) => io_disconnect_cause(err),
+    }
+}
 
+/// The label for an I/O close: its kind when that names something, otherwise
+/// whatever the muxer error inside it says.
+///
+/// Each transport is boxed on its own by the swarm builder, so the error
+/// behind an `Other` is exactly one of two types: `libp2p::quic::Error` for a
+/// QUIC connection, or the TCP stack's muxer selection,
+/// `Either<libp2p::yamux::Error, io::Error>` (mplex reports plain I/O errors).
+fn io_disconnect_cause(err: &io::Error) -> &'static str {
+    if let Some(label) = io_kind_label(err.kind()) {
+        return label;
+    }
+    let Some(inner) = err.get_ref() else {
+        return "io_other";
+    };
+    if let Some(err) = inner.downcast_ref::<libp2p::quic::Error>() {
+        return quic_disconnect_cause(err);
+    }
+    if let Some(err) = inner.downcast_ref::<Either<libp2p::yamux::Error, io::Error>>() {
+        return tcp_muxer_disconnect_cause(err);
+    }
+    "io_other"
+}
+
+/// The I/O kinds worth a label of their own. `None` for the rest, `Other`
+/// included, which is where the muxer's error has to be read instead.
+fn io_kind_label(kind: io::ErrorKind) -> Option<&'static str> {
+    match kind {
+        io::ErrorKind::ConnectionReset => Some("connection_reset"),
+        io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+        io::ErrorKind::BrokenPipe => Some("broken_pipe"),
+        io::ErrorKind::NotConnected => Some("not_connected"),
+        io::ErrorKind::TimedOut => Some("timed_out"),
+        io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
+        // `io::ErrorKind` *is* `#[non_exhaustive]`, so this arm is required
+        // rather than chosen.
+        _ => None,
+    }
+}
+
+/// A QUIC connection's close.
+///
+/// Matched exhaustively, like [`disconnect_cause`], so a new variant fails the
+/// build. Only `Connection` and `Io` can end an established connection; the
+/// rest are dial and listener errors, kept apart from the residue anyway so a
+/// surprise shows up under its own transport.
+fn quic_disconnect_cause(err: &libp2p::quic::Error) -> &'static str {
+    use libp2p::quic::Error;
+    match err {
+        Error::Connection(err) => quic_close_label(&err.to_string()),
+        Error::Io(err) => io_kind_label(err.kind()).unwrap_or("quic_other"),
+        Error::Reach(_)
+        | Error::HandshakeTimedOut
+        | Error::NoActiveListenerForDialAsListener
+        | Error::HolePunchInProgress(_) => "quic_other",
+    }
+}
+
+/// Which `quinn::ConnectionError` a QUIC close was, read off its `Display`.
+///
+/// Read off the text because it is the only way in: `libp2p::quic`'s
+/// `ConnectionError` keeps the quinn error in a private field and forwards
+/// nothing but `Display`. What makes this safe to match is that each of
+/// quinn-proto 0.11's messages opens with a fixed string of quinn's own, and
+/// anything the peer supplies (the close reason and code) only follows the
+/// colon. So the prefix is chosen by quinn, never by the remote.
+///
+/// `quic_application_close` is the peer's application closing the connection
+/// (libp2p's normal close, and go-libp2p's connection gater); the reason is
+/// in the `debug!` line, deliberately not in a label. `quic_transport_close`
+/// is a transport-level `CONNECTION_CLOSE`.
+fn quic_close_label(display: &str) -> &'static str {
+    if display.starts_with("closed by peer: ") {
+        "quic_application_close"
+    } else if display.starts_with("aborted by peer: ") {
+        "quic_transport_close"
+    } else if display == "reset by peer" {
+        "quic_reset"
+    } else if display == "timed out" {
+        "quic_timed_out"
+    } else if display == "closed" {
+        "quic_local_close"
+    } else {
+        // Version mismatch, a locally detected transport error, exhausted
+        // connection ids: none of them a peer leaving.
+        "quic_other"
+    }
+}
+
+/// A TCP connection's close, through whichever muxer it negotiated.
+///
+/// yamux hides its variants too, but forwards `source` down to the I/O error
+/// beneath an `Io` or a `Decode` failure, so the chain is walked for one
+/// before falling back to the one variant worth naming, a clean `Closed`.
+fn tcp_muxer_disconnect_cause(err: &Either<libp2p::yamux::Error, io::Error>) -> &'static str {
+    match err {
+        Either::Right(err) => io_kind_label(err.kind()).unwrap_or("mplex_other"),
+        Either::Left(err) => {
+            let mut source = std::error::Error::source(err);
+            while let Some(err) = source {
+                if let Some(label) = err
+                    .downcast_ref::<io::Error>()
+                    .and_then(|err| io_kind_label(err.kind()))
+                {
+                    return label;
+                }
+                source = err.source();
+            }
+            // yamux's own `Closed` message, in both versions libp2p carries.
+            if err.to_string() == "connection is closed" {
+                "yamux_closed"
+            } else {
+                "yamux_other"
+            }
+        }
+    }
+}
+
+/// `MESSAGE_DOMAIN_INVALID_SNAPPY`: what [`compute_message_id`] prefixes a
+/// message that does not decompress with.
+///
+/// Public, like [`MESSAGE_DOMAIN_VALID_SNAPPY`], because a beacon
+/// `config.yaml` carries both: startup refuses a network that sets either to
+/// something else, since this node would compute message ids its peers do not.
+pub const MESSAGE_DOMAIN_INVALID_SNAPPY: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
+/// `MESSAGE_DOMAIN_VALID_SNAPPY`: what [`compute_message_id`] prefixes a
+/// message that decompresses with.
+pub const MESSAGE_DOMAIN_VALID_SNAPPY: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
+
+fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub::MessageId {
     let mut hasher = sha2::Sha256::new();
     let decompressed = gossipsub::decompress_message(&message.data).ok();
 
@@ -1151,6 +2407,191 @@ fn compute_message_id(message: &libp2p::gossipsub::Message) -> libp2p::gossipsub
     libp2p::gossipsub::MessageId(hash[..20].to_vec())
 }
 
+/// Test scaffolding shared by the beacon gossip handler's `triage_*` tests
+/// (`gossipsub::handler`) and the verdict module's `settle` tests
+/// (`beacon::verdict`): a real, unconnected beacon `P2PServer`, and a sidecar
+/// shaped to clear structural validation. Lives here, rather than duplicated
+/// in each of those two test modules, because both need the identical
+/// beacon-shaped environment; `req_resp::handlers::tests::unconnected_server`
+/// keeps its own lean-flavored copy, since that one builds a different wire.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::{HashMap, HashSet};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
+
+    use ethlambda_storage::Store;
+    use ethlambda_storage::backend::InMemoryBackend;
+    use ethlambda_types::beacon::config::Config;
+    use ethlambda_types::beacon::containers::{fulu, shared};
+    use ethlambda_types::beacon::preset;
+    use ethlambda_types::beacon::primitives::{KzgCommitment, KzgProof, Root};
+    use ethlambda_types::checkpoint::Checkpoint;
+    use ethlambda_types::enr::EnrForkId;
+    use ethlambda_types::primitives::H256;
+    use libssz_types::SszVector;
+
+    use crate::beacon::swarm::BeaconWireConfig;
+    use crate::{P2PServer, SwarmConfig, WireConfig, build_swarm};
+
+    /// A real, unconnected beacon `P2PServer`, built the same way
+    /// `req_resp::handlers::tests::unconnected_server` builds a lean one:
+    /// port `0` throughout, so this cannot collide with a running node or a
+    /// sibling test, and no bootnodes or peers.
+    ///
+    /// Neither `triage_*` nor `settle` ever reads `swarm_handle` or
+    /// `discovery`, but both are required fields, and building the real thing
+    /// is no more expensive than faking one would be.
+    pub(crate) async fn unconnected_beacon_server(
+        config: Config,
+        finalized_slot: u64,
+    ) -> P2PServer {
+        let built = build_swarm(SwarmConfig {
+            node_key: vec![9u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
+            wire: WireConfig::Beacon(Box::new(BeaconWireConfig {
+                fork_digest: [0u8; 4],
+                fork: config.fork_at_epoch(0),
+                config: config.clone(),
+                genesis_time: config.genesis_time,
+                genesis_validators_root: Root::ZERO,
+                custody_columns: Vec::new(),
+                attestation_subnets: Vec::new(),
+            })),
+        })
+        .expect("swarm builds");
+
+        let (_swarm_stream, swarm_handle) =
+            crate::swarm_adapter::start_swarm_adapter(built.swarm, HashMap::new());
+
+        let discovery = crate::discovery::spawn_discovery(crate::discovery::DiscoverySpawnConfig {
+            node_key: secp256k1::SecretKey::new(&mut rand::rngs::OsRng)
+                .secret_bytes()
+                .to_vec(),
+            bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 0,
+            p2p_port: 0,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 1,
+            bootnodes: Vec::new(),
+            advertise_ip: None,
+            target_peers: 0,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        })
+        .await
+        .expect("discovery spawns");
+
+        let backend = Arc::new(InMemoryBackend::new());
+        let anchor_checkpoint = Checkpoint {
+            root: H256::ZERO,
+            slot: finalized_slot,
+        };
+        // The caller's own `config`, genesis time included, not a fresh
+        // `Config::mainnet()`: a caller that builds a clock-sensitive `config`
+        // (a recent `genesis_time`, say) needs the store's clock to agree with
+        // it, since `cheap_checks`/`stateful_checks` read the store's own
+        // config rather than the wire's.
+        let store = Store::init_beacon(
+            backend,
+            config.genesis_time,
+            config,
+            H256::ZERO,
+            anchor_checkpoint,
+            finalized_slot,
+        );
+        // Read before `built.wire` moves into the server below, mirroring
+        // `P2P::spawn`.
+        let backbone_attestation_subnets = built
+            .wire
+            .beacon()
+            .map_or(0, |beacon| beacon.attestation_subnets.len());
+
+        P2PServer {
+            swarm_handle,
+            store,
+            blockchain: None,
+            wire: built.wire,
+            connected_peers: HashMap::new(),
+            peer_custody: HashMap::new(),
+            pending_root_requests: HashMap::new(),
+            pending_column_requests: HashMap::new(),
+            outbound_requests: HashMap::new(),
+            range_sync_state: None,
+            beacon_fetched_through: 0,
+            bootnode_addrs: HashMap::new(),
+            node_names: HashMap::new(),
+            discovery: Some(crate::discovery::dial::DiscoveryState::new(
+                discovery,
+                built.local_peer_id,
+            )),
+            seen_blocks: ethlambda_state_transition::beacon::gossip::SeenBlocks::new(
+                crate::SEEN_BLOCKS_CAPACITY,
+            ),
+            seen_columns: ethlambda_state_transition::beacon::gossip::SeenColumns::new(
+                crate::SEEN_COLUMNS_CAPACITY,
+            ),
+            seen_aggregates:
+                ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                    crate::SEEN_AGGREGATES_CAPACITY,
+                ),
+            seen_attestations:
+                ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
+                    crate::seen_attestations_capacity(backbone_attestation_subnets),
+                ),
+            gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::GOSSIP_VALIDATION_PERMITS,
+            )),
+            column_check_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::COLUMN_CHECK_PERMITS,
+            )),
+            attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                crate::ATTESTATION_VALIDATION_PERMITS,
+            )),
+            attestation_pool: Default::default(),
+            aggregator_subnets: HashMap::new(),
+        }
+    }
+
+    /// A sidecar that clears `verify_data_column_sidecar`'s structural checks
+    /// (one commitment, one proof, one column cell, all the same length) but
+    /// carries no real KZG material: nothing in `triage_data_column`'s reject
+    /// path under test verifies the cryptography, only the shape and the
+    /// header's slot.
+    pub(crate) fn valid_shaped_sidecar(slot: u64, index: u64) -> fulu::DataColumnSidecar {
+        let cell: fulu::Cell =
+            SszVector::try_from(vec![0u8; preset::BYTES_PER_CELL]).expect("exact cell size");
+        fulu::DataColumnSidecar {
+            index,
+            column: vec![cell].try_into().expect("within the per-block limit"),
+            kzg_commitments: vec![KzgCommitment::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            kzg_proofs: vec![KzgProof::default()]
+                .try_into()
+                .expect("within the per-block limit"),
+            signed_block_header: shared::SignedBeaconBlockHeader {
+                message: shared::BeaconBlockHeader {
+                    slot,
+                    proposer_index: 7,
+                    ..Default::default()
+                },
+                signature: Default::default(),
+            },
+            kzg_commitments_inclusion_proof: vec![
+                H256::ZERO;
+                preset::KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH
+            ]
+            .try_into()
+            .expect("exactly the required depth"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1162,25 +2603,134 @@ mod tests {
         PeerId::from_public_key(&Keypair::generate_ed25519().public())
     }
 
+    /// Zero backbone subnets (a lean node, or a beacon node that backbones
+    /// none) must not shrink the cache to a useless zero capacity, and every
+    /// additional subnet scales it by the same per-subnet, per-epoch bound.
+    #[test]
+    fn seen_attestations_capacity_floors_at_one_subnet_and_scales_with_more() {
+        let per_subnet = 2 * SLOTS_PER_EPOCH as usize * MAX_VALIDATORS_PER_COMMITTEE;
+        assert_eq!(seen_attestations_capacity(0).get(), per_subnet);
+        assert_eq!(seen_attestations_capacity(1).get(), per_subnet);
+        assert_eq!(seen_attestations_capacity(3).get(), per_subnet * 3);
+    }
+
+    /// The split the specified `reason` label cannot make. Each of these is a
+    /// distinct answer to "who ended this and why", and all but the first two
+    /// collapse into `error` next door.
+    #[test]
+    fn a_close_is_labelled_by_the_cause_libp2p_reported() {
+        assert_eq!(disconnect_cause(None), "clean_close");
+        assert_eq!(
+            disconnect_cause(Some(&ConnectionError::KeepAliveTimeout)),
+            "keep_alive_timeout"
+        );
+        for (kind, label) in [
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::ConnectionAborted, "connection_aborted"),
+            (io::ErrorKind::BrokenPipe, "broken_pipe"),
+            (io::ErrorKind::NotConnected, "not_connected"),
+            (io::ErrorKind::TimedOut, "timed_out"),
+            (io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+        ] {
+            let err = ConnectionError::IO(io::Error::new(kind, "test"));
+            assert_eq!(disconnect_cause(Some(&err)), label, "{kind:?}");
+        }
+    }
+
+    /// `io::ErrorKind` is `#[non_exhaustive]`, and an error that is neither a
+    /// named kind nor one of the two muxers' errors has to land somewhere, so
+    /// the residue is a real bucket rather than an unreachable arm.
+    #[test]
+    fn an_unclassified_io_error_falls_to_the_residue() {
+        for kind in [io::ErrorKind::Other, io::ErrorKind::InvalidData] {
+            let err = ConnectionError::IO(io::Error::new(kind, "some other close"));
+            assert_eq!(disconnect_cause(Some(&err)), "io_other", "{kind:?}");
+        }
+    }
+
+    /// The shape nine closes in ten actually take on mainnet: the muxer's
+    /// error boxed inside an `io::Error` of kind `Other`, the way
+    /// `StreamMuxerBox` wraps it. Reading only the outer kind put every one of
+    /// these in `io_other`.
+    #[test]
+    fn a_muxer_error_inside_an_other_io_error_is_read_through() {
+        let boxed = |err: Either<libp2p::yamux::Error, io::Error>| {
+            ConnectionError::IO(io::Error::other(err))
+        };
+        for (kind, label) in [
+            (io::ErrorKind::UnexpectedEof, "unexpected_eof"),
+            (io::ErrorKind::ConnectionReset, "connection_reset"),
+            (io::ErrorKind::Other, "mplex_other"),
+        ] {
+            let err = boxed(Either::Right(io::Error::new(kind, "mplex")));
+            assert_eq!(disconnect_cause(Some(&err)), label, "mplex {kind:?}");
+        }
+
+        // `libp2p::quic::Error::Connection` cannot be built outside its crate
+        // (the quinn error is a private field), so its reading is pinned
+        // through `quic_close_label` below; these are the variants that can.
+        let quic = |err: libp2p::quic::Error| ConnectionError::IO(io::Error::other(err));
+        let reset = io::Error::new(io::ErrorKind::ConnectionReset, "quic socket");
+        assert_eq!(
+            disconnect_cause(Some(&quic(libp2p::quic::Error::Io(reset)))),
+            "connection_reset"
+        );
+        assert_eq!(
+            disconnect_cause(Some(&quic(libp2p::quic::Error::HandshakeTimedOut))),
+            "quic_other"
+        );
+    }
+
+    /// quinn-proto 0.11's `ConnectionError` messages, as a mainnet follower
+    /// logs them. The last case is the one the prefix match exists for: the
+    /// reason is the peer's to choose, so it must not be able to pass for
+    /// another variant.
+    #[test]
+    fn a_quic_close_is_labelled_by_quinns_prefix_not_the_peers_reason() {
+        for (display, label) in [
+            (
+                "closed by peer: connection gated (code 4103)",
+                "quic_application_close",
+            ),
+            ("closed by peer: 0", "quic_application_close"),
+            ("aborted by peer: NO_ERROR", "quic_transport_close"),
+            ("reset by peer", "quic_reset"),
+            ("timed out", "quic_timed_out"),
+            ("closed", "quic_local_close"),
+            ("CIDs exhausted", "quic_other"),
+            (
+                "closed by peer: reset by peer (code 1)",
+                "quic_application_close",
+            ),
+        ] {
+            assert_eq!(quic_close_label(display), label, "{display}");
+        }
+    }
+
     /// Proves the TCP transport `build_swarm` now adds actually completes a
     /// connection end to end, rather than only compiling. Builds two real
-    /// swarms via the production entry point (port `0`, so this cannot collide
-    /// with a running node or a sibling test), learns the first swarm's TCP
-    /// listen address off its own `NewListenAddr` event, dials it from the
-    /// second swarm, and polls both until each reports `ConnectionEstablished`.
-    /// A regression to QUIC-only, or a misconfigured TCP transport, hangs here
-    /// until the timeout rather than racing to a false positive.
+    /// swarms via the production entry point (port `0`, so this cannot
+    /// collide with a running node or a sibling test), learns the first
+    /// swarm's TCP listen address off its own `NewListenAddr` event, dials it
+    /// from the second swarm, and polls both until each reports
+    /// `ConnectionEstablished`. A regression to QUIC-only, or a
+    /// misconfigured TCP transport, hangs here until the timeout rather than
+    /// racing to a false positive.
     #[tokio::test]
-    async fn two_swarms_connect_over_tcp() {
+    async fn two_lean_swarms_connect_over_tcp() {
         fn build(node_key_byte: u8) -> BuiltSwarm {
             build_swarm(SwarmConfig {
                 node_key: vec![node_key_byte; 32],
                 bootnodes: Vec::new(),
                 listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
-                validator_ids: Vec::new(),
-                attestation_committee_count: 1,
-                subscription_subnets: HashSet::new(),
-                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
+                wire: WireConfig::Lean(LeanWireConfig {
+                    validator_ids: Vec::new(),
+                    attestation_committee_count: 1,
+                    subscription_subnets: HashSet::new(),
+                    milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                }),
             })
             .expect("swarm builds")
         }
@@ -1188,8 +2738,8 @@ mod tests {
         let mut dialer = build(1);
         let mut listener = build(2);
 
-        // Both a QUIC and a TCP `NewListenAddr` arrive for `listener`; only the
-        // TCP one is wanted here.
+        // Both a QUIC and a TCP `NewListenAddr` arrive for `listener`; only
+        // the TCP one is wanted here.
         let listener_tcp_addr = loop {
             if let SwarmEvent::NewListenAddr { address, .. } =
                 listener.swarm.select_next_some().await
@@ -1228,6 +2778,367 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    /// The identify reply carries `SwarmConfig::agent_version`, not
+    /// rust-libp2p's default `rust-libp2p/<version>`.
+    #[tokio::test]
+    async fn identify_reports_the_configured_agent_version() {
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
+                wire: WireConfig::Lean(LeanWireConfig {
+                    validator_ids: Vec::new(),
+                    attestation_committee_count: 1,
+                    subscription_subnets: HashSet::new(),
+                    milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                }),
+            })
+            .expect("swarm builds")
+        }
+
+        let mut dialer = build(1);
+        let mut listener = build(2);
+
+        let listener_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } =
+                listener.swarm.select_next_some().await
+            {
+                break address
+                    .with_p2p(listener.local_peer_id)
+                    .expect("failed to add peer ID to multiaddr");
+            }
+        };
+        dialer.swarm.dial(listener_addr).expect("dial is accepted");
+
+        let received = async {
+            loop {
+                tokio::select! {
+                    event = dialer.swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                            libp2p::identify::Event::Received { info, .. },
+                        )) = event
+                        {
+                            return info.agent_version;
+                        }
+                    }
+                    _ = listener.swarm.select_next_some() => {}
+                }
+            }
+        };
+        let agent_version = tokio::time::timeout(Duration::from_secs(10), received)
+            .await
+            .expect("identify must complete within the timeout");
+        assert_eq!(agent_version, "ethlambda/test");
+    }
+
+    #[test]
+    fn gossip_is_held_for_a_verdict_only_when_asked() {
+        let ttl = Duration::from_secs(1);
+        assert!(gossipsub_config(ttl, true).validate_messages());
+        assert!(!gossipsub_config(ttl, false).validate_messages());
+    }
+
+    /// How many times [`concurrent_beacon_requests_on_different_protocols_never_cross`]
+    /// repeats its connect-and-fire cycle.
+    ///
+    /// The crossing this proves against is timing-dependent: which of two
+    /// substreams negotiates first depends on scheduling, not on send order
+    /// (see `Behaviour`'s doc comment), so one repetition proves nothing on
+    /// its own. A fresh connection per repetition, rather than reusing one
+    /// connection for every pair, is what gives each repetition its own
+    /// independent chance at the race.
+    const CROSSING_TEST_REPETITIONS: usize = 64;
+
+    /// Regression test for the defect this branch exists to fix: two
+    /// outbound requests, on two different protocols, fired back to back on
+    /// one connection — exactly [`beacon::handler::send_status`] then
+    /// [`beacon::handler::request_metadata`]'s real call pattern from
+    /// `ConnectionEstablished` below — must each reach the wire under their
+    /// own protocol's framing, never swapped.
+    ///
+    /// Before the per-protocol split, both requests travelled through one
+    /// shared `req_resp: request_response::Behaviour<Codec>` field via the fork's
+    /// `send_request_with_protocol`, which only narrows the *offered*
+    /// protocol per call; the outbound `Handler` still pairs a negotiated
+    /// substream with the *next unpaired* queued request
+    /// (`requested_outbound.pop_front()` in the pinned fork's
+    /// `protocols/request-response/src/handler.rs`), which is the send
+    /// order only when negotiation happens to complete in send order too.
+    /// When it doesn't, `write_request` is handed the wrong (protocol,
+    /// request) pair: a `Status` value written under the `metadata/3`
+    /// protocol is refused by `beacon_encoding::encode_status` (wrong
+    /// version), which fails the write locally, and a `MetaData` value
+    /// written under `status/1` encodes to an empty payload regardless of
+    /// protocol and reaches the peer, which then fails to decode it as a
+    /// real `Status` body. Either way, this test's answering side never
+    /// manages to echo the right payload back, and the `Some(true)`
+    /// assertions below fail.
+    ///
+    /// Splitting the shared field into one per protocol (this branch's
+    /// change) makes this structurally unreachable rather than merely less
+    /// likely: each protocol's own `Handler` has its own queue, with never
+    /// more than the one request this test ever puts on it, so there is no
+    /// shared FIFO left to reorder.
+    #[tokio::test]
+    async fn concurrent_beacon_requests_on_different_protocols_never_cross() {
+        use crate::beacon::messages::{BeaconMetaData, BeaconStatus, MetaDataV3, StatusV1};
+        use crate::beacon::protocols;
+        use crate::req_resp::{Response, ResponsePayload};
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::fork::ForkName;
+        use ethlambda_types::beacon::primitives::Root;
+        use libp2p::request_response::{self, ResponseChannel};
+
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
+                wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
+                    fork_digest: [0x11, 0x22, 0x33, 0x44],
+                    fork: ForkName::Fulu,
+                    config: Config::mainnet(),
+                    genesis_time: 0,
+                    genesis_validators_root: Root::ZERO,
+                    custody_columns: Vec::new(),
+                    attestation_subnets: Vec::new(),
+                })),
+            })
+            .expect("swarm builds")
+        }
+
+        /// Every [`BehaviourEvent`] variant that carries a req/resp event,
+        /// tagged with the [`ReqRespProtocol`] that names it. A test-local
+        /// mirror of [`handle_behaviour_event`]'s own tagging match, kept
+        /// separate because that one needs a live `P2PServer` and this test
+        /// drives bare swarms.
+        fn tag_req_resp_event(
+            event: BehaviourEvent,
+        ) -> Option<(ReqRespProtocol, request_response::Event<Request, Response>)> {
+            let BehaviourEvent::ReqResp(event) = event else {
+                return None;
+            };
+            Some(match event {
+                ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
+                ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
+                ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+                ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
+                ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
+                ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
+                ReqRespEvent::BeaconMetadataV1(e) => (ReqRespProtocol::BeaconMetadataV1, e),
+                ReqRespEvent::BeaconMetadataV2(e) => (ReqRespProtocol::BeaconMetadataV2, e),
+                ReqRespEvent::BeaconMetadataV3(e) => (ReqRespProtocol::BeaconMetadataV3, e),
+                ReqRespEvent::BeaconGoodbye(e) => (ReqRespProtocol::BeaconGoodbye, e),
+                ReqRespEvent::BeaconBlocksByRange(e) => (ReqRespProtocol::BeaconBlocksByRange, e),
+                ReqRespEvent::BeaconBlocksByRoot(e) => (ReqRespProtocol::BeaconBlocksByRoot, e),
+                ReqRespEvent::DataColumnSidecarsByRange(e) => {
+                    (ReqRespProtocol::DataColumnSidecarsByRange, e)
+                }
+                ReqRespEvent::DataColumnSidecarsByRoot(e) => {
+                    (ReqRespProtocol::DataColumnSidecarsByRoot, e)
+                }
+            })
+        }
+
+        /// Answer whatever the listener actually decoded, so even a garbled,
+        /// crossed request gets *some* answer back rather than leaving the
+        /// dialer to time out. `send_response` is a passthrough to the
+        /// channel's own oneshot sender (see `execute_command`'s doc comment
+        /// on its `SendResponse` arm), so any field answers it identically.
+        fn answer(
+            swarm: &mut libp2p::Swarm<Behaviour>,
+            request: Request,
+            channel: ResponseChannel<Response>,
+        ) {
+            let response = match request {
+                Request::Status(status) => Response::success(ResponsePayload::Status(status)),
+                Request::MetaData(_) => {
+                    Response::success(ResponsePayload::MetaData(BeaconMetaData::V3(MetaDataV3 {
+                        seq_number: 0,
+                        attnets: Default::default(),
+                        syncnets: Default::default(),
+                        custody_group_count: 4,
+                    })))
+                }
+                // Neither protocol this test sends is ever requested by the
+                // peer here, so any other shape means the wire pairing has
+                // already scrambled the request into a third variant
+                // entirely; drop the channel rather than guess an answer.
+                _ => return,
+            };
+            let _ = swarm
+                .behaviour_mut()
+                .req_resp
+                .beacon_status_v1
+                .send_response(channel, response);
+        }
+
+        let mut crossings = 0usize;
+
+        for _ in 0..CROSSING_TEST_REPETITIONS {
+            let mut dialer = build(1);
+            let mut listener = build(2);
+
+            let listener_addr = loop {
+                if let SwarmEvent::NewListenAddr { address, .. } =
+                    listener.swarm.select_next_some().await
+                    && address.iter().any(|p| matches!(p, Protocol::Tcp(_)))
+                {
+                    break address
+                        .with_p2p(listener.local_peer_id)
+                        .expect("adds a peer id");
+                }
+            };
+            dialer.swarm.dial(listener_addr).expect("dial is accepted");
+
+            let (mut dialer_connected, mut listener_connected) = (false, false);
+            while !(dialer_connected && listener_connected) {
+                tokio::select! {
+                    event = dialer.swarm.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            dialer_connected = true;
+                        }
+                    }
+                    event = listener.swarm.select_next_some() => {
+                        if matches!(event, SwarmEvent::ConnectionEstablished { .. }) {
+                            listener_connected = true;
+                        }
+                    }
+                }
+            }
+
+            // Fired back to back, with no `.await` of anything but the send
+            // call itself in between: the same pattern `ConnectionEstablished`
+            // uses for `send_status` then `request_metadata` in production.
+            let status = Request::Status(BeaconStatus::V1(StatusV1 {
+                fork_digest: [0x11, 0x22, 0x33, 0x44],
+                finalized_root: Root::ZERO,
+                finalized_epoch: 0,
+                head_root: Root::ZERO,
+                head_slot: 0,
+            }));
+            let status_id = ReqRespRequestId {
+                protocol: ReqRespProtocol::BeaconStatusV1,
+                id: dialer
+                    .swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .beacon_status_v1
+                    .send_request(&listener.local_peer_id, status),
+            };
+            let metadata_id = ReqRespRequestId {
+                protocol: ReqRespProtocol::BeaconMetadataV3,
+                id: dialer
+                    .swarm
+                    .behaviour_mut()
+                    .req_resp
+                    .beacon_metadata_v3
+                    .send_request(
+                        &listener.local_peer_id,
+                        Request::MetaData(protocols::METADATA_V3),
+                    ),
+            };
+
+            let (mut status_correct, mut metadata_correct) = (None, None);
+            let drive = async {
+                loop {
+                    if status_correct.is_some() && metadata_correct.is_some() {
+                        return;
+                    }
+                    tokio::select! {
+                        event = dialer.swarm.select_next_some() => {
+                            let SwarmEvent::Behaviour(event) = event else { continue };
+                            let Some((protocol, event)) = tag_req_resp_event(event) else { continue };
+                            match event {
+                                request_response::Event::Message {
+                                    message: request_response::Message::Response { request_id, response },
+                                    ..
+                                } => {
+                                    let id = ReqRespRequestId { protocol, id: request_id };
+                                    // Correct means both "answered" and
+                                    // "answered with the payload shape this
+                                    // id's own request expects": a response
+                                    // that arrives but names the wrong
+                                    // payload is exactly what a crossed
+                                    // request looks like from here.
+                                    if id == status_id {
+                                        status_correct = Some(matches!(
+                                            response,
+                                            Response::Success {
+                                                payload: ResponsePayload::Status(_)
+                                            }
+                                        ));
+                                    } else if id == metadata_id {
+                                        metadata_correct = Some(matches!(
+                                            response,
+                                            Response::Success {
+                                                payload: ResponsePayload::MetaData(_)
+                                            }
+                                        ));
+                                    }
+                                }
+                                request_response::Event::OutboundFailure { request_id, .. } => {
+                                    let id = ReqRespRequestId { protocol, id: request_id };
+                                    if id == status_id {
+                                        status_correct = Some(false);
+                                    } else if id == metadata_id {
+                                        metadata_correct = Some(false);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        event = listener.swarm.select_next_some() => {
+                            if let SwarmEvent::Behaviour(event) = event
+                                && let Some((_, request_response::Event::Message {
+                                    message: request_response::Message::Request { request, channel, .. },
+                                    ..
+                                })) = tag_req_resp_event(event)
+                            {
+                                answer(&mut listener.swarm, request, channel);
+                            }
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), drive)
+                .await
+                .expect("both requests must resolve within the timeout");
+
+            if status_correct != Some(true) || metadata_correct != Some(true) {
+                crossings += 1;
+            }
+        }
+
+        assert_eq!(
+            crossings, 0,
+            "{crossings}/{CROSSING_TEST_REPETITIONS} repetitions crossed protocols"
+        );
+    }
+
+    #[test]
+    fn a_lean_wire_reports_its_topics_and_no_beacon_wire() {
+        // The enum is what makes "subscribed to lean topics and beacon topics
+        // at once" unrepresentable. `P2PServer` dispatches on it once per
+        // handler, the same way `BlockChainServer` dispatches on the state
+        // variant.
+        let wire = Wire::Lean(LeanWire {
+            attestation_topics: HashMap::new(),
+            attestation_committee_count: 4,
+            block_topic: block_topic(),
+            aggregation_topic: aggregation_topic(),
+        });
+        assert!(wire.beacon().is_none());
+        let lean = wire.lean().expect("a lean wire");
+        assert_eq!(lean.attestation_committee_count, 4);
+        assert!(lean.block_topic.to_string().starts_with("/leanconsensus/"));
     }
 
     /// A bootnode file naming one peer twice must not abort the node.
@@ -1277,10 +3188,14 @@ mod tests {
             node_key: vec![7u8; 32],
             bootnodes,
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
-            validator_ids: Vec::new(),
-            attestation_committee_count: 1,
-            subscription_subnets: HashSet::new(),
-            milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
+            wire: WireConfig::Lean(LeanWireConfig {
+                validator_ids: Vec::new(),
+                attestation_committee_count: 1,
+                subscription_subnets: HashSet::new(),
+                milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+            }),
         })
         .expect("a duplicated bootnode entry must not fail the build");
 
@@ -1429,6 +3344,42 @@ mod tests {
         assert!(!state.in_flight);
         assert!(!state.peer_set.contains_key(&stale_peer));
         assert_eq!(state.peer_set.get(&current_peer), Some(&2999));
+    }
+
+    #[test]
+    fn a_batch_held_for_custody_waits_until_its_deadline_and_no_longer() {
+        let mut state = RangeSyncState::new(10..3000, random_peer(), 500);
+        let start = Instant::now();
+
+        // Only the first hold starts the wait, which is what schedules the
+        // deadline once rather than on every re-check.
+        assert_eq!(state.wait_for_custody(start), CustodyWait::Started);
+        assert!(state.is_waiting_for_custody());
+        let halfway = start + RANGE_BATCH_CUSTODY_WAIT / 2;
+        assert_eq!(state.wait_for_custody(halfway), CustodyWait::Waiting);
+        let deadline = start + RANGE_BATCH_CUSTODY_WAIT;
+        assert_eq!(state.wait_for_custody(deadline), CustodyWait::Expired);
+
+        assert_eq!(
+            state.end_custody_wait(deadline),
+            Some(RANGE_BATCH_CUSTODY_WAIT)
+        );
+        assert!(!state.is_waiting_for_custody());
+        assert_eq!(state.end_custody_wait(deadline), None);
+    }
+
+    #[test]
+    fn each_batch_gets_a_custody_wait_of_its_own() {
+        let mut state = RangeSyncState::new(10..3000, random_peer(), 500);
+        let start = Instant::now();
+        state.wait_for_custody(start);
+        let sent_at = start + 2 * RANGE_BATCH_CUSTODY_WAIT;
+        assert_eq!(state.wait_for_custody(sent_at), CustodyWait::Expired);
+        state.end_custody_wait(sent_at);
+
+        // A later batch that finds custody uncovered again waits in full,
+        // rather than inheriting the expired wait of the batch before it.
+        assert_eq!(state.wait_for_custody(sent_at), CustodyWait::Started);
     }
 
     #[test]
@@ -1614,6 +3565,28 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_advertising_both_transports_is_dialed_over_quic_first() {
+        // Position in this list used to decide nothing, because libp2p raced
+        // every address at once. `DIAL_ADDRESS_CONCURRENCY` made it decide
+        // which transport the peer is reached over whenever it answers on
+        // both, so the order is asserted rather than left to read like
+        // incidental construction order.
+        let peer_id = random_peer();
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        let addrs = dial_addrs(ip, Some(9000), Some(9001), peer_id);
+
+        assert_eq!(
+            addrs,
+            vec![
+                quic_multiaddr(ip, 9000, peer_id),
+                tcp_multiaddr(ip, 9001, peer_id),
+            ],
+            "quic has to come first, or the reservation is the wrong way round"
+        );
+    }
+
+    #[test]
     fn parse_enrs_skips_malformed_records_but_keeps_the_valid_one() {
         // The rewrite's whole point is that one bad line in the bootnode file
         // must not take the others down with it. Feed it a mix of the ways an
@@ -1632,5 +3605,109 @@ mod tests {
         assert_eq!(bootnodes.len(), 1, "exactly the one valid ENR must survive");
         assert_eq!(bootnodes[0].ip, IpAddr::from(Ipv4Addr::LOCALHOST));
         assert_eq!(bootnodes[0].quic_port, Some(9001));
+    }
+
+    /// A connection the limits refuse must leave no trace in any
+    /// request/response field.
+    ///
+    /// `request_response::Behaviour` records a connection when its handler is
+    /// built and forgets it only on `ConnectionClosed`. A refused connection
+    /// never gets one: the swarm reports it with a `ListenFailure` and nothing
+    /// else. So a field asked before the limits keeps a connection the swarm
+    /// never had, and once the peer's real connections close it still counts
+    /// one. With debug assertions that trips request-response's own
+    /// `debug_assert` in `on_connection_closed` and kills the P2P task; without
+    /// them, requests to that peer can be routed to the phantom and vanish
+    /// without an `OutboundFailure`.
+    ///
+    /// Drives the composed [`Behaviour`] the way the swarm does: a peer
+    /// already holding [`beacon::swarm::MAX_CONNECTIONS_PER_PEER`] connections
+    /// opens one more, then the ones it held close.
+    #[tokio::test]
+    async fn a_connection_the_limits_refuse_leaves_no_request_response_state() {
+        use ethlambda_types::beacon::config::Config;
+        use ethlambda_types::beacon::fork::ForkName;
+        use ethlambda_types::beacon::primitives::Root;
+        use libp2p::core::ConnectedPoint;
+        use libp2p::swarm::{
+            ConnectionId, ListenError,
+            behaviour::{ConnectionClosed, ConnectionEstablished, FromSwarm, ListenFailure},
+        };
+
+        let mut built = build_swarm(SwarmConfig {
+            node_key: vec![7u8; 32],
+            bootnodes: Vec::new(),
+            listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+            target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
+            wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
+                fork_digest: [0x11, 0x22, 0x33, 0x44],
+                fork: ForkName::Fulu,
+                config: Config::mainnet(),
+                genesis_time: 0,
+                genesis_validators_root: Root::ZERO,
+                custody_columns: Vec::new(),
+                attestation_subnets: Vec::new(),
+            })),
+        })
+        .expect("swarm builds");
+        let behaviour = built.swarm.behaviour_mut();
+
+        let peer = random_peer();
+        let local_addr: Multiaddr = "/ip4/127.0.0.1/tcp/9001".parse().expect("valid multiaddr");
+        let send_back_addr: Multiaddr = "/ip4/192.0.2.1/tcp/9001".parse().expect("valid multiaddr");
+        let endpoint = ConnectedPoint::Listener {
+            local_addr: local_addr.clone(),
+            send_back_addr: send_back_addr.clone(),
+        };
+
+        let max_per_peer = beacon::swarm::MAX_CONNECTIONS_PER_PEER as usize;
+        let held: Vec<ConnectionId> = (0..max_per_peer).map(ConnectionId::new_unchecked).collect();
+        for (other_established, &connection_id) in held.iter().enumerate() {
+            let admitted = behaviour.handle_established_inbound_connection(
+                connection_id,
+                peer,
+                &local_addr,
+                &send_back_addr,
+            );
+            assert!(admitted.is_ok(), "within the per-peer limit");
+            behaviour.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                failed_addresses: &[],
+                other_established,
+            }));
+        }
+
+        let refused = ConnectionId::new_unchecked(max_per_peer);
+        let cause = behaviour
+            .handle_established_inbound_connection(refused, peer, &local_addr, &send_back_addr)
+            .err()
+            .expect("the per-peer limit refuses one connection too many");
+        let error = ListenError::Denied { cause };
+        behaviour.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &local_addr,
+            send_back_addr: &send_back_addr,
+            error: &error,
+            connection_id: refused,
+            peer_id: Some(peer),
+        }));
+
+        for (closed, &connection_id) in held.iter().enumerate() {
+            behaviour.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+                peer_id: peer,
+                connection_id,
+                endpoint: &endpoint,
+                cause: None,
+                remaining_established: held.len() - closed - 1,
+            }));
+        }
+
+        let blocks_by_range = &behaviour.req_resp.beacon_blocks_by_range;
+        assert!(
+            !blocks_by_range.is_connected(&peer),
+            "a request/response field still holds the connection the limits refused"
+        );
     }
 }

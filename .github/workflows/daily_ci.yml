@@ -26,19 +26,32 @@ permissions:
 env:
   CARGO_NET_GIT_FETCH_WITH_CLI: "true"
   CARGO_NET_RETRY: "10"
+  # See the same setting in ci.yml. This workflow runs the identical job, so it
+  # is under the identical disk pressure.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
+  # The same two halves ci.yml runs, and for the same reason.
   test:
-    name: Test
+    name: Test (${{ matrix.half }})
     runs-on: ubuntu-latest
+    strategy:
+      # A daily run exists to say what is broken, so report both halves.
+      fail-fast: false
+      matrix:
+        half: [consensus, node]
     steps:
       - uses: actions/checkout@v6
 
       - name: Run fixture-based tests
         uses: ./.github/actions/run-fixture-tests
+        with:
+          make-target: test-${{ matrix.half }}
 
   notify:
     name: Post result to Slack
+    # `result` is already the worst outcome across the matrix legs, so a green
+    # report means every half was green.
     needs: test
     # Run even when the test job fails or is cancelled, so we always report.
     if: always()

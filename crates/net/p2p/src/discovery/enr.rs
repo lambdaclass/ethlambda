@@ -22,11 +22,9 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use ethlambda_types::constants::FORK_DIGEST;
 use ethrex_p2p::types::{INITIAL_ENR_SEQ, Node, NodeRecord, NodeRecordPairs};
-use ethrex_p2p::utils::public_key_from_signing_key;
+use ethrex_p2p::utils::{node_id, public_key_from_signing_key};
 use libssz::SszEncode;
-use libssz_derive::{SszDecode, SszEncode};
 use secp256k1::SecretKey;
 
 use super::DiscoveryError;
@@ -34,41 +32,14 @@ use super::DiscoveryError;
 pub(crate) const QUIC_ENR_KEY: &[u8] = b"quic";
 pub(crate) const ETH2_ENR_KEY: &[u8] = b"eth2";
 pub(crate) const ATTNETS_ENR_KEY: &[u8] = b"attnets";
+pub(crate) const CGC_ENR_KEY: &[u8] = b"cgc";
 
-/// Fork version of the next planned hard fork. The spec says to set this to the
-/// current fork version when no fork is planned; lean has neither.
-pub(crate) const NEXT_FORK_VERSION: [u8; 4] = [0; 4];
-
-/// Sentinel for "no fork is scheduled", per the beacon spec.
-pub(crate) const FAR_FUTURE_EPOCH: u64 = u64::MAX;
-
-/// The `eth2` ENR entry: SSZ, 16 bytes, byte-identical to the beacon-chain
-/// `ENRForkID` container.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, SszEncode, SszDecode)]
-pub(crate) struct EnrForkId {
-    pub(crate) fork_digest: [u8; 4],
-    pub(crate) next_fork_version: [u8; 4],
-    pub(crate) next_fork_epoch: u64,
-}
-
-impl EnrForkId {
-    /// This node's fork id. Constant for the lifetime of the process.
-    pub(crate) fn local() -> Self {
-        Self {
-            fork_digest: fork_digest(),
-            next_fork_version: NEXT_FORK_VERSION,
-            next_fork_epoch: FAR_FUTURE_EPOCH,
-        }
-    }
-}
-
-/// [`FORK_DIGEST`] as raw bytes. The constant is the same hex string embedded in
-/// every gossipsub topic name, so the ENR and the topics cannot disagree.
-pub(crate) fn fork_digest() -> [u8; 4] {
-    u32::from_str_radix(FORK_DIGEST, 16)
-        .expect("FORK_DIGEST must be 8 hex digits")
-        .to_be_bytes()
-}
+// The `eth2` entry's container, its two "no fork is planned" constants, and the
+// lean fork digest. They live in `ethlambda-types` rather than here because the
+// binary has to name the type to hand one in, and because the beacon wire
+// computes its digest at startup from the fork schedule; re-exported at this
+// module's old paths so every use site inside the crate is unchanged.
+pub use ethlambda_types::enr::{EnrForkId, FAR_FUTURE_EPOCH, NEXT_FORK_VERSION, fork_digest};
 
 /// Encode subscribed attestation subnets as the `attnets` bitfield: bit `i` set
 /// means subnet `i` is subscribed.
@@ -95,7 +66,7 @@ pub(crate) fn encode_attnets(subnets: &HashSet<u64>, committee_count: u64) -> Ve
 /// as unsubscribed. A longer one cannot be believed either, because `attnets` is
 /// self-reported and unauthenticated, so a hostile ENR could otherwise pack an
 /// oversized field that decodes to thousands of subnets and dominate
-/// [`rank_by_uncovered_subnets`](super::admission::rank_by_uncovered_subnets)
+/// [`rank_candidates`](super::admission::rank_candidates)
 /// forever. A subnet we have no committee for cannot be useful to us regardless.
 pub(crate) fn subnets_from_attnets(bits: &[u8], committee_count: u64) -> Vec<u64> {
     (0..committee_count)
@@ -104,6 +75,53 @@ pub(crate) fn subnets_from_attnets(bits: &[u8], committee_count: u64) -> Vec<u64
                 .is_some_and(|byte| byte & (1 << (subnet % 8)) != 0)
         })
         .collect()
+}
+
+/// The discv5 node id `node_key` derives, independent of any address or port.
+///
+/// `keccak256` of the uncompressed public key: exactly what
+/// `LocalEnrParams::local_node`'s `Node::node_id()` computes for the same
+/// key, since a peer derives our id the same way off the `secp256k1` entry we
+/// publish. Exposed standalone so startup can learn what this node's own id
+/// selects (its column custody) before an ENR or a swarm exists; it must stay
+/// exactly the discovery server's own computation; a divergence here would
+/// leave this node custodying one set while every peer expects another.
+pub fn node_id_from_secret_key(node_key: &[u8]) -> Result<[u8; 32], DiscoveryError> {
+    let signer = SecretKey::from_slice(node_key).map_err(DiscoveryError::NodeKey)?;
+    Ok(node_id(&public_key_from_signing_key(&signer)).0)
+}
+
+/// The discv5 node id behind a libp2p [`PeerId`], or `None` when it cannot be
+/// recovered from the id alone.
+///
+/// A peer's custody set is a function of its node id and its advertised
+/// custody group count, and both sides have to compute the same one. The node
+/// id is available without asking anyone: libp2p stores a public key of 42
+/// bytes or fewer directly in the `PeerId`'s multihash rather than hashing it,
+/// and a secp256k1 key is well inside that, so the key can be read back out
+/// and put through the same `keccak256(uncompressed)` that
+/// [`node_id_from_secret_key`] applies to our own.
+///
+/// `None` covers the two cases where that does not hold: a `PeerId` carrying a
+/// real (hashed) multihash rather than an identity one, and a peer whose key
+/// is not secp256k1. Neither can appear on a mainnet beacon peer, whose
+/// identity the ENR's `secp256k1` entry defines, so a `None` here is a peer
+/// whose custody simply stays unknown rather than an error worth failing on.
+pub(crate) fn node_id_from_peer_id(peer_id: &libp2p::PeerId) -> Option<[u8; 32]> {
+    const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
+
+    let multihash = peer_id.as_ref();
+    if multihash.code() != IDENTITY_MULTIHASH_CODE {
+        return None;
+    }
+    let public_key = libp2p::identity::PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
+    let compressed = public_key.try_into_secp256k1().ok()?.to_bytes();
+    let uncompressed = secp256k1::PublicKey::from_slice(&compressed)
+        .ok()?
+        .serialize_uncompressed();
+    // `serialize_uncompressed` leads with SEC1's 0x04 tag; the node id is over
+    // the 64 coordinate bytes alone.
+    Some(node_id(&ethrex_common::H512::from_slice(&uncompressed[1..])).0)
 }
 
 /// Everything needed to build this node's ENR.
@@ -123,6 +141,20 @@ pub(crate) struct LocalEnrParams {
     pub(crate) p2p_port: u16,
     pub(crate) subscription_subnets: HashSet<u64>,
     pub(crate) attestation_committee_count: u64,
+    /// The `eth2` entry to publish.
+    ///
+    /// Lean's is a compile-time constant, but the beacon wire computes its
+    /// digest from the fork schedule and the anchor's genesis validators root
+    /// at startup, so this cannot be reached for internally.
+    pub(crate) fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    ///
+    /// `Some(CUSTODY_REQUIREMENT)` on the beacon wire: it is the floor a peer
+    /// may demand, and this node's actual custody only ever meets or exceeds
+    /// it (`sampling_size` never samples fewer groups than that), so
+    /// advertising it never overstates what this node stores and serves.
+    /// `None` on lean, which has no data-availability domain.
+    pub(crate) custody_group_count: Option<u64>,
 }
 
 impl LocalEnrParams {
@@ -164,9 +196,12 @@ impl LocalEnrParams {
         // in the built record, so the answers are not checked here.
         let attnets = encode_attnets(&self.subscription_subnets, self.attestation_committee_count);
         pairs.set_extra(ATTNETS_ENR_KEY, attnets);
-        pairs.set_extra(ETH2_ENR_KEY, EnrForkId::local().to_ssz());
+        pairs.set_extra(ETH2_ENR_KEY, self.fork_id.to_ssz());
         if let Some(quic_port) = dialable_port(self.p2p_port) {
             pairs.set_extra_int(QUIC_ENR_KEY, quic_port.into());
+        }
+        if let Some(count) = self.custody_group_count {
+            pairs.set_extra_int(CGC_ENR_KEY, count);
         }
         pairs
     }
@@ -258,29 +293,144 @@ mod tests {
             p2p_port: 9001,
             subscription_subnets: HashSet::from([1u64, 4]),
             attestation_committee_count: 8,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .expect("ENR builds")
     }
 
     #[test]
-    fn fork_digest_parses_the_constant() {
-        assert_eq!(fork_digest(), [0x12, 0x34, 0x56, 0x78]);
+    fn node_id_from_secret_key_matches_the_discovery_servers_own_computation() {
+        // If this function ever computed a different id than `local_node`'s
+        // `Node::node_id()`, a node would custody one set of columns while
+        // every peer, reading the ENR `local_node` feeds the discovery
+        // server, computed a different set for it. Nothing else would catch
+        // that: the columns would simply go unserved.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let params = LocalEnrParams {
+            signer,
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
+        };
+        let expected = params.local_node().node_id().0;
+        assert_eq!(
+            node_id_from_secret_key(&signer.secret_bytes()).expect("a valid key"),
+            expected
+        );
     }
 
     #[test]
-    fn enr_fork_id_is_sixteen_bytes_and_round_trips() {
-        let id = EnrForkId::local();
-        let bytes = id.to_ssz();
-        assert_eq!(bytes.len(), 16, "ENRForkID is 4 + 4 + 8 bytes");
-        assert_eq!(EnrForkId::from_ssz_bytes(&bytes).unwrap(), id);
+    fn node_id_from_peer_id_agrees_with_the_key_it_was_built_from() {
+        // The two derivations have to land on the same id: this node computes
+        // its own custody from the secret key, and computes a *peer's* from
+        // the PeerId that key produces. A divergence would mean asking peers
+        // for the columns they are not the ones custodying, silently, with
+        // every request simply coming back empty.
+        let signer = secp256k1::SecretKey::new(&mut rand::rngs::OsRng);
+        let keypair = libp2p::identity::secp256k1::SecretKey::try_from_bytes(
+            &mut signer.secret_bytes().clone(),
+        )
+        .map(libp2p::identity::secp256k1::Keypair::from)
+        .expect("a valid key");
+        let peer_id = libp2p::identity::Keypair::from(keypair)
+            .public()
+            .to_peer_id();
+
+        assert_eq!(
+            node_id_from_peer_id(&peer_id),
+            Some(node_id_from_secret_key(&signer.secret_bytes()).expect("a valid key"))
+        );
     }
 
     #[test]
-    fn local_fork_id_has_no_planned_fork() {
-        let id = EnrForkId::local();
-        assert_eq!(id.fork_digest, fork_digest());
-        assert_eq!(id.next_fork_version, NEXT_FORK_VERSION);
-        assert_eq!(id.next_fork_epoch, FAR_FUTURE_EPOCH);
+    fn node_id_from_peer_id_declines_a_key_it_cannot_read() {
+        // An ed25519 identity is not a secp256k1 one, so no node id can be
+        // computed for it. This must stay a `None` rather than a wrong answer:
+        // the caller treats unknown custody as "ask someone else", which is
+        // safe, where a fabricated id would send requests nobody can answer.
+        let peer_id = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+
+        assert_eq!(node_id_from_peer_id(&peer_id), None);
+    }
+
+    #[test]
+    fn the_published_fork_id_is_the_one_supplied() {
+        // Lean's is a compile-time constant, but the beacon wire computes its
+        // digest from the fork schedule at startup, so the ENR builder must not
+        // reach for EnrForkId::local() behind the caller's back.
+        let supplied = EnrForkId {
+            fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
+            next_fork_version: [0x06, 0x00, 0x00, 0x00],
+            next_fork_epoch: FAR_FUTURE_EPOCH,
+        };
+        let record = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: supplied,
+            custody_group_count: None,
+        })
+        .expect("ENR builds");
+
+        let raw = record
+            .pairs()
+            .extra(ETH2_ENR_KEY)
+            .expect("eth2 entry present");
+        assert_eq!(EnrForkId::from_ssz_bytes(&raw).unwrap(), supplied);
+    }
+
+    #[test]
+    fn the_custody_group_count_is_published_only_when_asked_for() {
+        // Lean has no data-availability domain, so publishing a cgc there would
+        // advertise a claim with no meaning behind it.
+        let record = build();
+        assert_eq!(record.pairs().extra(CGC_ENR_KEY), None);
+
+        let with_cgc = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(with_cgc.pairs().extra_int::<u64>(CGC_ENR_KEY), Some(4));
+    }
+
+    #[test]
+    fn a_sixty_four_wide_attnets_is_eight_bytes_of_zeroes() {
+        // What a node subscribing to no attestation subnet actually serves.
+        // Publishing a shorter bitfield would be a different claim: readers
+        // treat bits past the end as unset, but the beacon spec's attnets is a
+        // fixed-width Bitvector and a short one is malformed to a strict reader.
+        let record = build_local_enr(&LocalEnrParams {
+            signer: secp256k1::SecretKey::new(&mut rand::rngs::OsRng),
+            ip: IpAddr::from(Ipv4Addr::LOCALHOST),
+            discovery_port: 9010,
+            p2p_port: 9001,
+            subscription_subnets: HashSet::new(),
+            attestation_committee_count: 64,
+            fork_id: EnrForkId::local(),
+            custody_group_count: Some(4),
+        })
+        .expect("ENR builds");
+        assert_eq!(
+            record.pairs().extra(ATTNETS_ENR_KEY).as_deref(),
+            Some(&[0u8; 8][..])
+        );
     }
 
     #[test]
@@ -353,6 +503,8 @@ mod tests {
             p2p_port: 0,
             subscription_subnets: HashSet::from([1u64]),
             attestation_committee_count: 8,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         })
         .expect("ENR builds");
 

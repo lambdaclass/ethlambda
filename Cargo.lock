@@ -720,7 +720,9 @@ dependencies = [
  "bitflags 2.11.1",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.13.0",
+ "log",
+ "prettyplease",
  "proc-macro2",
  "quote",
  "regex",
@@ -1939,22 +1941,27 @@ dependencies = [
  "clap",
  "ethlambda-blockchain",
  "ethlambda-crypto",
+ "ethlambda-engine",
  "ethlambda-metrics",
  "ethlambda-network-api",
  "ethlambda-p2p",
  "ethlambda-rpc",
+ "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
+ "ethlambda-validator",
  "eyre",
  "hex",
  "libc",
- "libssz",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "rayon",
  "reqwest",
+ "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
@@ -1971,6 +1978,7 @@ version = "0.1.0"
 dependencies = [
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-engine",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
  "ethlambda-network-api",
@@ -1979,8 +1987,8 @@ dependencies = [
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
- "libssz",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "serde",
  "spawned-concurrency",
  "thiserror 2.0.18",
@@ -2000,6 +2008,23 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "zk_alloc",
+]
+
+[[package]]
+name = "ethlambda-engine"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "ethlambda-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2029,8 +2054,10 @@ dependencies = [
 name = "ethlambda-p2p"
 version = "0.1.0"
 dependencies = [
+ "either",
  "ethlambda-metrics",
  "ethlambda-network-api",
+ "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-types",
  "ethrex-common",
@@ -2039,10 +2066,11 @@ dependencies = [
  "futures",
  "hex",
  "libp2p",
- "libssz",
- "libssz-derive",
- "libssz-merkle",
- "libssz-types",
+ "libp2p-mplex",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "rand 0.8.6",
  "secp256k1 0.30.0",
  "sha2",
@@ -2060,19 +2088,25 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ethlambda-blockchain",
+ "ethlambda-engine",
  "ethlambda-fork-choice",
  "ethlambda-metrics",
+ "ethlambda-network-api",
  "ethlambda-state-transition",
  "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
+ "ethlambda-validator",
  "futures-util",
  "hex",
  "http-body-util",
  "jemalloc_pprof",
- "libssz",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "serde",
  "serde_json",
+ "spawned-concurrency",
  "tokio",
  "tokio-util",
  "tower",
@@ -2080,17 +2114,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "ethlambda-ssz-tree"
+version = "0.1.0"
+dependencies = [
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "proptest",
+ "rayon",
+]
+
+[[package]]
 name = "ethlambda-state-transition"
 version = "0.1.0"
 dependencies = [
+ "blst",
+ "c-kzg",
  "datatest-stable",
  "ethlambda-metrics",
+ "ethlambda-storage",
  "ethlambda-test-fixtures",
  "ethlambda-types",
  "hex",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libtest-mimic",
+ "lru",
+ "num-bigint",
+ "rayon",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "snap",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -2100,15 +2159,18 @@ name = "ethlambda-storage"
 version = "0.1.0"
 dependencies = [
  "ethlambda-crypto",
+ "ethlambda-metrics",
  "ethlambda-types",
- "libssz",
- "libssz-derive",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "lru",
+ "proptest",
  "rocksdb",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "xdelta3",
 ]
 
 [[package]]
@@ -2118,8 +2180,8 @@ dependencies = [
  "ethlambda-state-transition",
  "ethlambda-types",
  "hex",
- "libssz",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "serde",
  "serde_json",
 ]
@@ -2129,17 +2191,55 @@ name = "ethlambda-types"
 version = "0.1.0"
 dependencies = [
  "datatest-stable",
+ "ethlambda-ssz-tree",
  "ethlambda-test-fixtures",
  "hex",
- "libssz",
- "libssz-derive",
- "libssz-merkle",
- "libssz-types",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "serde_yaml_ng",
+ "sha2",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ethlambda-validator"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum",
+ "blst",
+ "ctr",
+ "ethlambda-metrics",
+ "ethlambda-types",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "libc",
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "pbkdf2",
+ "reqwest",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "unicode-normalization",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2157,8 +2257,8 @@ dependencies = [
  "ethrex-storage",
  "ethrex-trie",
  "ethrex-vm",
- "libssz",
- "libssz-merkle",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rayon",
  "rustc-hash",
  "thiserror 2.0.18",
@@ -2184,10 +2284,10 @@ dependencies = [
  "indexmap 2.14.0",
  "lazy_static",
  "libc",
- "libssz",
- "libssz-derive",
- "libssz-merkle",
- "libssz-types",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-derive 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-types 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "lru",
  "once_cell",
  "rayon",
@@ -2236,10 +2336,10 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-vm",
  "hex",
- "libssz",
- "libssz-derive",
- "libssz-merkle",
- "libssz-types",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-derive 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-types 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rkyv",
  "serde",
  "serde_with",
@@ -2274,7 +2374,7 @@ dependencies = [
  "ethrex-common",
  "ethrex-crypto",
  "ethrex-rlp",
- "libssz",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "malachite",
  "rustc-hash",
  "serde",
@@ -3497,15 +3597,6 @@ dependencies = [
 
 [[package]]
 name = "itertools"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
@@ -4129,6 +4220,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "libp2p-mplex"
+version = "0.44.0"
+source = "git+https://github.com/lambdaclass/rust-libp2p.git?rev=2f14d0ec9665a01cfb6a02326c90628c4bba521c#2f14d0ec9665a01cfb6a02326c90628c4bba521c"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+ "futures",
+ "libp2p-core",
+ "libp2p-identity",
+ "nohash-hasher",
+ "parking_lot",
+ "rand 0.8.6",
+ "smallvec",
+ "tracing",
+ "unsigned-varint",
+]
+
+[[package]]
 name = "libp2p-noise"
 version = "0.47.0"
 source = "git+https://github.com/lambdaclass/rust-libp2p.git?rev=2f14d0ec9665a01cfb6a02326c90628c4bba521c#2f14d0ec9665a01cfb6a02326c90628c4bba521c"
@@ -4504,10 +4613,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "libssz"
+version = "0.3.0"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "libssz-derive"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aeee1b9ac9200429f7e9830492765445989ea61c3fb9028ad5a96e1dd5f5e913"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "libssz-derive"
+version = "0.3.0"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4520,7 +4647,16 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "863eca32d1a43e5ec41106a515552efa8307768d37c68d26b7f21ff13cfee1a7"
 dependencies = [
- "libssz",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sha2",
+]
+
+[[package]]
+name = "libssz-merkle"
+version = "0.3.0"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+dependencies = [
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "sha2",
 ]
 
@@ -4530,8 +4666,18 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4231ac301726840a3fe111f11bd4619d3c97ed155cb94c88dbf92b70e04e017"
 dependencies = [
- "libssz",
- "libssz-merkle",
+ "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libssz-merkle 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "smallvec",
+]
+
+[[package]]
+name = "libssz-types"
+version = "0.3.0"
+source = "git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7#36802dd1d3e3a83d95d2ac552647539cbe3f7fd7"
+dependencies = [
+ "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
+ "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=36802dd1d3e3a83d95d2ac552647539cbe3f7fd7)",
  "smallvec",
 ]
 
@@ -5196,6 +5342,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest 0.10.7",
+ "hmac",
+]
+
+[[package]]
 name = "pcs"
 version = "0.1.0"
 source = "git+https://github.com/leanEthereum/leanVM.git?rev=48a904208d682848dac0e18ef8b01ebfc40df9ad#48a904208d682848dac0e18ef8b01ebfc40df9ad"
@@ -5537,7 +5693,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -6351,6 +6507,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "scrypt"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0516a385866c09368f0b5bcd1caff3366aace790fcd46e2bb032697bb172fd1f"
+dependencies = [
+ "pbkdf2",
+ "salsa20",
+ "sha2",
+]
+
+[[package]]
 name = "sec1"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6569,6 +6736,16 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+ "sha2-asm",
+]
+
+[[package]]
+name = "sha2-asm"
+version = "0.6.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b845214d6175804686b2bd482bcffe96651bb2d1200742b712003504a2dac1ab"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
@@ -7393,6 +7570,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "unicode-segmentation"
 version = "1.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7425,6 +7611,10 @@ name = "unsigned-varint"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eb066959b24b5196ae73cb057f45598450d2c5f71460e98c49b738086eff9c06"
+dependencies = [
+ "asynchronous-codec",
+ "bytes",
+]
 
 [[package]]
 name = "untrusted"
@@ -8240,6 +8430,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xdelta3"
+version = "0.1.5"
+source = "git+https://github.com/sigp/xdelta3-rs?rev=fe3906605c87#fe3906605c87b6c0515bd7c8fc671f47875e3ccc"
+dependencies = [
+ "bindgen",
+ "cc",
+ "libc",
+ "log",
+ "rand 0.9.4",
+]
+
+[[package]]
 name = "xml-rs"
 version = "0.8.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8376,6 +8578,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

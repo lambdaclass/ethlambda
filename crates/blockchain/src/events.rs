@@ -247,18 +247,18 @@ impl ChainEventSnapshot {
     pub(crate) fn diff_and_emit(&self, store: &Store, events: &EventBus, wall_clock_slot: u64) {
         let head = store.head().expect("head block exists");
         if head != self.head {
-            // Read the header once and reuse it for slot and state root so they
-            // stay consistent.
-            if let Some(header) = store
-                .get_block_header(&head)
-                .expect("block header read should succeed")
-            {
+            // Read the block once and reuse it for slot and state root so they
+            // stay consistent. Through `block_slot_and_state_root` rather than
+            // `Store::get_block_header`, which decodes a lean `BlockHeader`
+            // and so is lean-only: a beacon directory keeps the whole signed
+            // block in that table, and this diff runs on both chains.
+            if let Some((slot, state_root)) = store.block_slot_and_state_root(&head) {
                 // Skip stale heads (catch-up/backfill): see HEAD_EVENT_RECENCY_SLOTS.
-                if header.slot + HEAD_EVENT_RECENCY_SLOTS >= wall_clock_slot {
+                if slot + HEAD_EVENT_RECENCY_SLOTS >= wall_clock_slot {
                     events.emit(ChainEvent::Head {
-                        slot: header.slot,
+                        slot,
                         block: head,
-                        state: header.state_root,
+                        state: state_root,
                     });
                 }
             } else {
@@ -308,14 +308,16 @@ impl ChainEventSnapshot {
 }
 
 /// Look up the state root of a checkpoint's block for the `{block, state}`
-/// event shape. Returns `None` if the header is absent so the caller can skip
-/// emission; finalized/justified block headers are never pruned, so this only
-/// fails on genuine store inconsistency.
+/// event shape. Returns `None` if the block is absent so the caller can skip
+/// emission; finalized/justified blocks are never pruned from
+/// `Table::BlockHeaders`, so this only fails on genuine store inconsistency.
+///
+/// Chain-generic, for the reason [`ChainEventSnapshot::diff_and_emit`] gives
+/// where it reads the head's own pair.
 fn checkpoint_state_root(store: &Store, root: H256) -> Option<H256> {
     store
-        .get_block_header(&root)
-        .expect("block header read should succeed")
-        .map(|header| header.state_root)
+        .block_slot_and_state_root(&root)
+        .map(|(_, state_root)| state_root)
 }
 
 #[cfg(test)]
@@ -324,6 +326,7 @@ mod tests {
     use ethlambda_storage::{ForkCheckpoints, backend::InMemoryBackend};
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
+        beacon::containers::SignedBeaconBlock,
         block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
         state::State,
     };
@@ -463,7 +466,7 @@ mod tests {
             proof: MultiMessageAggregate::default(),
         };
         store
-            .insert_signed_block(root, signed_block)
+            .insert_signed_block(root, SignedBeaconBlock::Lean(signed_block))
             .expect("insert test block should succeed");
     }
 

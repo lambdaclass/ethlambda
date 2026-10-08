@@ -9,22 +9,107 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+# Compile the Beacon Chain half against the minimal preset instead of mainnet.
+#
+# Container shapes are compile-time constants (SSZ list and vector bounds), so
+# the preset cannot be selected at runtime. Mainnet is the implicit default;
+# enabling this feature switches every beacon constant to the minimal preset.
+# The beacon spec-test target builds the crate twice, once per preset, and each
+# build walks only its own fixture tree. Lean's own state transition reads none
+# of these constants, so the feature cannot change lean behavior.
+preset-minimal = ["ethlambda-types/preset-minimal"]
+
+# Builds the beacon spec-test target. Off by default, and it gates only that
+# target: the `beacon` module itself always compiles. What it stands for is the
+# fixture tree, a multi-gigabyte download the lean workflow has no use for, and
+# `beacon_spec::fixture_root` deliberately panics rather than reporting a green
+# suite that found nothing to run. So `cargo test --workspace` skips the target
+# instead of failing on the missing directory; `make test-beacon` turns it on
+# after downloading the fixtures.
+beacon-spec-tests = []
+
+# Exposes `beacon::helpers::test_state`, the state builder this crate's own
+# tests use, to other crates' tests (the Beacon API's duty endpoints need a
+# state with a real validator registry). Never enabled outside
+# `[dev-dependencies]`.
+test-utils = []
+
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
+ethlambda-storage.workspace = true
 
 thiserror.workspace = true
 tracing.workspace = true
+lru.workspace = true
+
+# -- The `beacon` module's own dependencies ---------------------------------
+
+hex.workspace = true
+
+# For `beacon::genesis`, which fills in an `SszList` of validators. The beacon
+# containers and their derives live in `ethlambda-types`, so the derive macros
+# and the merkleizer are reached through them rather than named here; the
+# spec-test harness declares its own for the containers it defines.
+libssz-types.workspace = true
+
+# For `SszEncode::to_ssz` on a bare `SszList`, which `get_execution_requests_list`
+# needs: the beacon containers' own `to_ssz` inherent methods cover whole states
+# and blocks, not one list field of a body.
+libssz.workspace = true
+
+# For `beacon::hash::hash`, that module's one SHA-256 entry point. The workspace
+# pins the `asm` feature; see the root manifest for what it buys and why
+# merkleization cares. `libssz-merkle` depends on `sha2` too and asks for no
+# features of its own, and Cargo unifies features across a version, so its copy
+# gets the same.
+sha2.workspace = true
+
+# BLS12-381. Assembly-optimized, and the canonical consensus-layer backend.
+blst = "0.3.16"
+
+# For `beacon::bls`'s `aggregate_verify` and `fast_aggregate_verify`, which
+# validate an aggregate's public keys (a subgroup check per signer) in
+# parallel: a mainnet Electra aggregate can carry thousands of signers behind
+# one pairing check, and the beacon state transition otherwise runs that loop
+# on a single actor thread while the rest of the host's cores sit idle.
+# `crates/blockchain` already depends on this for its own worker, so this
+# only adds it to a crate that did not need it before.
+rayon.workspace = true
+
+# KZG, including the EIP-7594 cell and column proofs that fulu needs. Same
+# version and feature set ethrex uses, plus the embedded mainnet trusted setup.
+c-kzg = { version = "2.1.8", features = ["ethereum_kzg_settings"] }
+
+# Reduction modulo the BLS field order, for the two Fiat-Shamir challenge
+# functions that c-kzg does not export.
+num-bigint = "0.4.6"
 
 [dev-dependencies]
 ethlambda-test-fixtures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 
 hex.workspace = true
 libssz-types.workspace = true
 
+# The beacon spec-test harness defines its own containers for the fixture-only
+# shapes (`meta.yaml` payloads, the rewards suite's delta files), so it needs the
+# encoder, the derives and the merkleizer the derives expand into.
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
+snap = "1.1.1"
+
 datatest-stable = "0.3.3"
+
+# Supplies the beacon spec-test binary's harness. A fixture case is only known
+# once the fixture tree is walked, which `#[test]` cannot express, so the tests
+# are built at run time instead. See `tests/beacon_spec_tests.rs` for the full
+# reasoning.
+libtest-mimic = "0.8.2"
 
 [[test]]
 name = "stf_spectests"
@@ -34,3 +119,9 @@ harness = false
 # leanVM key format and fail to decode. Run on demand with
 # `cargo test --profile release-fast --test <name>`.
 test = false
+
+[[test]]
+name = "beacon_spec_tests"
+path = "tests/beacon_spec_tests.rs"
+harness = false
+required-features = ["beacon-spec-tests"]

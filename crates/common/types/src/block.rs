@@ -22,7 +22,7 @@ use primitives::HashTreeRoot as _;
 /// of how the merged proof is serialised.
 ///
 /// </div>
-#[derive(Clone, SszEncode, SszDecode)]
+#[derive(Clone, PartialEq, Serialize, SszEncode, SszDecode)]
 pub struct SignedBlock {
     /// The block being signed.
     pub message: Block,
@@ -56,10 +56,26 @@ pub type ByteList512KiB = ByteList<524_288>;
 /// a verifier rebuilds each component's set from the surrounding block body
 /// before decoding. SSZ encoding this container adds the offset required for
 /// its variable-length field.
-#[derive(Debug, Default, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct MultiMessageAggregate {
     /// Serialized multi-message aggregate proof bytes.
+    #[serde(serialize_with = "serialize_proof_hex")]
     pub proof: ByteList512KiB,
+}
+
+/// Serialize a [`ByteList512KiB`] proof blob as a `0x`-prefixed hex string.
+///
+/// This is opaque binary data (a leanVM proof), not a fixed-length
+/// identity key, so it follows the `0x`-prefixed convention already used in
+/// this crate for that kind of value — block/state roots (`H256`) and the
+/// `AggregationBits` bitlist — rather than the un-prefixed convention
+/// `state.rs` uses for XMSS validator pubkeys.
+fn serialize_proof_hex<S>(proof: &ByteList512KiB, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let encoded = format!("0x{}", hex::encode(proof.iter().as_slice()));
+    serializer.serialize_str(&encoded)
 }
 
 impl MultiMessageAggregate {
@@ -199,7 +215,7 @@ pub struct BlockHeader {
 }
 
 /// A complete block including header and body.
-#[derive(Debug, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct Block {
     /// The slot in which the block was proposed.
     pub slot: u64,
@@ -249,7 +265,7 @@ impl Block {
 ///
 /// Currently, the main operation is voting. Validators submit attestations which are
 /// packaged into blocks.
-#[derive(Debug, Default, Clone, Serialize, SszEncode, SszDecode, HashTreeRoot)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, SszEncode, SszDecode, HashTreeRoot)]
 pub struct BlockBody {
     /// Plain validator attestations carried in the block body.
     ///
@@ -335,5 +351,40 @@ mod tests {
         assert_eq!(&encoded[..4], &4u32.to_le_bytes());
         assert_eq!(&encoded[4..], proof_bytes);
         assert_eq!(aggregate.proof_bytes(), proof_bytes);
+    }
+
+    #[test]
+    fn a_signed_block_serializes_with_bare_integers_and_a_hex_proof() {
+        let signed = SignedBlock {
+            message: Block {
+                slot: 9,
+                proposer_index: 3,
+                parent_root: H256([0x11; 32]),
+                state_root: H256([0x22; 32]),
+                body: BlockBody::default(),
+            },
+            proof: MultiMessageAggregate::default(),
+        };
+
+        let json = serde_json::to_value(&signed).unwrap();
+        // Bare, not quoted: this is lean's own encoding and predates the
+        // beacon surface. `/lean/v0` consumers parse numbers.
+        assert_eq!(json["message"]["slot"], 9);
+        assert_eq!(json["message"]["proposer_index"], 3);
+
+        // `MultiMessageAggregate` is a single-field `{ proof: ByteList512KiB }`
+        // struct wrapping raw leanVM proof bytes. It serializes as an
+        // object with one hex-encoded string field; the default (empty) proof
+        // round-trips to a bare "0x".
+        assert_eq!(json["proof"]["proof"], "0x");
+    }
+
+    #[test]
+    fn multi_message_aggregate_serializes_proof_as_0x_prefixed_hex() {
+        let aggregate = MultiMessageAggregate::from_bytes(&[0xde, 0xad, 0xbe, 0xef]).unwrap();
+
+        let json = serde_json::to_value(&aggregate).unwrap();
+
+        assert_eq!(json["proof"], "0xdeadbeef");
     }
 }

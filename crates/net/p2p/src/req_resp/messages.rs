@@ -1,17 +1,94 @@
-use ethlambda_types::{ShortRoot, block::SignedBlock, checkpoint::Checkpoint, primitives::H256};
-use libssz_derive::{SszDecode, SszEncode};
+use ethlambda_types::ShortRoot;
+use ethlambda_types::beacon::containers::SignedBeaconBlock;
+use ethlambda_types::beacon::containers::fulu::{DataColumnSidecar, DataColumnsByRootIdentifier};
 use libssz_types::SszList;
 
-pub const STATUS_PROTOCOL_V1: &str = "/leanconsensus/req/status/1/ssz_snappy";
-pub const BLOCKS_BY_ROOT_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_root/1/ssz_snappy";
-pub const BLOCKS_BY_RANGE_PROTOCOL_V1: &str = "/leanconsensus/req/blocks_by_range/1/ssz_snappy";
-pub const MAX_REQUEST_BLOCKS: u64 = 1024; // Maximum number of blocks in a single request (1024).
+use crate::beacon::messages::{
+    BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest, Goodbye, Ping,
+};
+use crate::lean::messages::{BlocksByRootRequest, Status};
 
+/// A contiguous slot window, as either chain's `blocks_by_range` asks for it.
+///
+/// Carries `step` even though only beacon's wire has the field, and only ever
+/// legally as 1. It is here rather than hidden in beacon's encoder so that a
+/// peer sending another value can be told so with an `INVALID_REQUEST`
+/// response: refusing it at decode would drop the stream instead, which says
+/// nothing about why. Lean's decoder fills it with 1, which is what lean's
+/// absence of the field means, and lean's encoder drops it again.
+///
+/// Deliberately **not** SSZ-derived, unlike the two chains' own containers.
+/// Neither wire carries these three fields in this shape: lean's body is two
+/// of them and beacon's is a different container that happens to agree. A
+/// derive here would put a `to_ssz` on the shared type that is correct for
+/// neither wire and wrong by 8 bytes on lean's, which is exactly the class of
+/// mistake the split exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlocksByRangeRequest {
+    pub start_slot: u64,
+    pub count: u64,
+    /// Deprecated by the beacon spec and absent from lean's wire; legal only
+    /// as 1. See the container's doc comment.
+    pub step: u64,
+}
+
+impl BlocksByRangeRequest {
+    /// The blocks in `[start_slot, start_slot + count)`.
+    pub fn new(start_slot: u64, count: u64) -> Self {
+        Self {
+            start_slot,
+            count,
+            step: 1,
+        }
+    }
+}
+
+/// Every request either chain can send, on one flat enum.
+///
+/// One variant per protocol. Flat rather than a `Lean(..)`/`Beacon(..)` pair of
+/// sub-enums, because a request is dispatched once, on its protocol: grouping
+/// them meant the codec built two enums to encode one request, and every
+/// dispatch re-discriminated what the protocol id had already settled.
+///
+/// Only the variants that mean *different things* on the two wires are
+/// prefixed, which is `Status` alone: lean's carries two checkpoints and
+/// beacon's a fork digest and a head/finalized pair. The beacon variants keep
+/// the name their protocol has in the beacon-chain spec, which is what a reader
+/// comparing this against that spec is looking for.
+///
+/// The two block requests are **shared**. What a peer is asking for is the same
+/// question on either chain, a slot window or a list of roots, and only the
+/// framing of that question differs: lean wraps the root list in a container
+/// where beacon sends it bare, and beacon's range body carries a deprecated
+/// `step` that lean's does not. Framing is the encoder's business, so the range
+/// request is a struct of this module's own, belonging to neither wire, the
+/// root request is lean's container on both, and each chain's encoder
+/// translates. Which chain a request arrived on is not recorded here either:
+/// a node speaks one wire for its whole life, so `P2PServer::wire` already
+/// answers it and a tag on the message would be a second copy of that.
 #[derive(Debug, Clone)]
 pub enum Request {
-    Status(Status),
+    LeanStatus(Status),
+    /// The roots asked for. Bounded at 1024 by `RequestedBlockRoots`, which is
+    /// both lean's cap and beacon's `MAX_REQUEST_BLOCKS`.
     BlocksByRoot(BlocksByRootRequest),
     BlocksByRange(BlocksByRangeRequest),
+    Status(BeaconStatus),
+    Ping(Ping),
+    /// The negotiated `metadata/N` protocol id.
+    ///
+    /// The request is empty on the wire, but the responder has to answer in the
+    /// version the peer asked for, and `request_response::Event::Message` does
+    /// not carry the protocol id. The codec does, so it records it here.
+    MetaData(&'static str),
+    Goodbye(Goodbye),
+    /// The identifiers asked for. A plain `Vec` here, unlike
+    /// [`crate::beacon::messages::DataColumnsByRootIdentifiers`], which is
+    /// what carries the wire's SSZ list bound; nothing above the codec needs
+    /// to re-check a bound the wire type already enforces on decode and the
+    /// codec already enforces on encode.
+    DataColumnsByRoot(Vec<DataColumnsByRootIdentifier>),
+    DataColumnsByRange(DataColumnsByRangeRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +118,7 @@ impl Response {
 /// Bounded summary for logs.
 ///
 /// Prefer this over `Debug` anywhere a `Response` reaches a log line. The derived
-/// `Debug` on a `Blocks` payload expands every block header and every attestation
+/// `Debug` on a `LeanBlocks` payload expands every block header and every attestation
 /// bitlist byte-by-byte, so a full `BlocksByRange` answer renders as hundreds of
 /// kilobytes on a single line — enough to be rejected outright by a log backend.
 /// `SignedBlock`'s own `Debug` already truncates the opaque proof bytes for the
@@ -50,10 +127,10 @@ impl std::fmt::Display for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Success {
-                payload: ResponsePayload::Status(status),
+                payload: ResponsePayload::LeanStatus(status),
             } => write!(
                 f,
-                "Success(Status head={}/{} finalized={}/{})",
+                "Success(LeanStatus head={}/{} finalized={}/{})",
                 status.head.slot,
                 ShortRoot(&status.head.root.0),
                 status.finalized.slot,
@@ -65,13 +142,49 @@ impl std::fmt::Display for Response {
                 write!(f, "Success(Blocks count={}", blocks.len())?;
                 // Reported as first/last rather than a range: a BlocksByRoot
                 // response follows the requested root order, so the slots are
-                // not necessarily contiguous or ascending.
+                // not necessarily contiguous or ascending. The fork names the
+                // chain too, since `ForkName::Lean` is one of its values.
                 if let (Some(first), Some(last)) = (blocks.first(), blocks.last()) {
-                    let first_slot = first.message.slot;
-                    let last_slot = last.message.slot;
-                    write!(f, " first_slot={first_slot} last_slot={last_slot}")?;
+                    write!(
+                        f,
+                        " first_slot={} last_slot={} fork={}",
+                        first.slot(),
+                        last.slot(),
+                        first.fork_name(),
+                    )?;
                 }
                 write!(f, ")")
+            }
+            Self::Success {
+                payload: ResponsePayload::Status(status),
+            } => write!(
+                f,
+                "Success(Status head_slot={} finalized_epoch={} fork_digest={})",
+                status.head_slot(),
+                status.finalized_epoch(),
+                hex::encode(status.fork_digest()),
+            ),
+            Self::Success {
+                payload: ResponsePayload::Pong(ping),
+            } => write!(f, "Success(Pong seq_number={})", ping.seq_number),
+            Self::Success {
+                payload: ResponsePayload::MetaData(metadata),
+            } => {
+                // The version is what a mismatch here would be about; the
+                // bitfields behind it are not worth a log line.
+                let (version, seq_number) = match metadata {
+                    BeaconMetaData::V1(metadata) => (1, metadata.seq_number),
+                    BeaconMetaData::V2(metadata) => (2, metadata.seq_number),
+                    BeaconMetaData::V3(metadata) => (3, metadata.seq_number),
+                };
+                write!(f, "Success(MetaData v{version} seq_number={seq_number})")
+            }
+            Self::Success {
+                payload: ResponsePayload::DataColumnSidecars(sidecars),
+            } => {
+                // Count only, never the sidecars themselves: one sidecar's
+                // `Debug` alone runs to tens of kilobytes of cell bytes.
+                write!(f, "Success(DataColumnSidecars count={})", sidecars.len())
             }
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
@@ -130,20 +243,36 @@ impl std::fmt::Debug for ResponseCode {
     }
 }
 
+/// Every success payload either chain can send, on one flat enum.
+///
+/// Mirrors [`Request`]: one variant per protocol, lean's prefixed. Not one
+/// variant per request variant, because [`Request::Goodbye`] is answered by
+/// closing the stream rather than by a payload.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum ResponsePayload {
-    Status(Status),
-    Blocks(Vec<SignedBlock>),
+    LeanStatus(Status),
+    /// The blocks answering any of the four block protocols, on either chain.
+    ///
+    /// One variant for all of them. `SignedBeaconBlock` already carries a
+    /// `Lean` variant, so it spans both chains without a wrapper, and the two
+    /// stores hand blocks back in exactly this type. Which protocol produced
+    /// the answer is known from the outbound request id, and which chain from
+    /// `P2PServer::wire`, so neither needs a variant of its own.
+    ///
+    /// Encoding still differs and still belongs to each chain's module: lean
+    /// writes a bare chunk per block, beacon prefixes each with a fork digest.
+    Blocks(Vec<SignedBeaconBlock>),
+    Status(BeaconStatus),
+    Pong(Ping),
+    MetaData(BeaconMetaData),
+    /// The sidecars answering either column protocol.
+    ///
+    /// One variant for both, mirroring how `Blocks` covers all four block
+    /// protocols: which one produced the answer is known from the outbound
+    /// request id, and the chunk framing is the same either way.
+    DataColumnSidecars(Vec<DataColumnSidecar>),
 }
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct Status {
-    pub finalized: Checkpoint,
-    pub head: Checkpoint,
-}
-
-pub type RequestedBlockRoots = SszList<H256, 1024>;
 
 /// Error message type for non-success responses.
 /// SSZ-encoded as List[byte, 256] per spec.
@@ -168,15 +297,4 @@ pub fn error_message(msg: impl AsRef<str>) -> ErrorMessage {
     };
 
     ErrorMessage::try_from(truncated.to_vec()).expect("error message fits in 256 bytes")
-}
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct BlocksByRootRequest {
-    pub roots: RequestedBlockRoots,
-}
-
-#[derive(Debug, Clone, SszEncode, SszDecode)]
-pub struct BlocksByRangeRequest {
-    pub start_slot: u64,
-    pub count: u64,
 }
