@@ -2456,6 +2456,7 @@ mod tests {
             bootnodes: Vec::new(),
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
             wire: crate::WireConfig::Lean(crate::LeanWireConfig {
                 validator_ids: Vec::new(),
                 attestation_committee_count: 1,
