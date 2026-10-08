@@ -300,20 +300,23 @@ async fn post_aggregate_and_proofs(
         let slot = aggregate.slot();
         let aggregator = aggregate.aggregator_index();
         let seen = aggregate::SeenAggregates::new(capacity, capacity);
+        // The stateful checks resolve the aggregate's bits to the validators
+        // behind them, which the chain actor applies to fork choice once the
+        // network actor hands it over.
         let checked = aggregate::cheap_checks(&seen, &store, &aggregate, now_ms)
-            .and_then(|()| aggregate::stateful_checks(&store, &aggregate).map(|_| ()));
+            .and_then(|()| aggregate::stateful_checks(&store, &aggregate));
         let published = checked
             .map_err(|outcome: Outcome| {
                 warn!(%slot, aggregator, ?outcome, "Refused a submitted aggregate");
                 "aggregate failed validation"
             })
-            .and_then(|()| {
+            .and_then(|attesting_indices| {
                 // Recorded for block production, which packs the aggregates
                 // this node has validated.
                 pool.lock()
                     .expect("attestation pool lock poisoned")
                     .insert_aggregate(inner);
-                p2p.publish_beacon_aggregate(aggregate)
+                p2p.publish_beacon_aggregate(aggregate, attesting_indices)
                     .map_err(|_| "the network actor is not running")
             });
         match published {
@@ -701,7 +704,14 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{json}");
         let published = fixture.network.aggregates.lock().unwrap();
         assert_eq!(published.len(), 1);
-        assert_eq!(published[0], SignedAggregateAndProof::Electra(signed));
+        assert_eq!(published[0].0, SignedAggregateAndProof::Electra(signed));
+        // Every member voted, so the indices handed on for the chain actor to
+        // apply are the whole committee.
+        let mut attesting = published[0].1.clone();
+        attesting.sort_unstable();
+        let mut members = committee.clone();
+        members.sort_unstable();
+        assert_eq!(attesting, members);
     }
 
     #[tokio::test]
