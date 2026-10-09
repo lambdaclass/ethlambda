@@ -20,6 +20,9 @@
 //! ignored-until-implemented gate, rather than being dropped here without a
 //! trace.
 //!
+//! Each case also requires the branch `data_columns` builds for the proposer
+//! side to equal the fixture's, byte for byte.
+//!
 //! Each case checks `is_valid_merkle_branch` directly against the fixture's
 //! own numbers first, then again through `verify_data_column_sidecar_inclusion_proof`
 //! itself with a sidecar built from the fixture: the first half proves the
@@ -31,6 +34,7 @@ use ethlambda_state_transition::beacon::containers::electra::BeaconBlockBody;
 use ethlambda_state_transition::beacon::containers::{
     BeaconBlockHeader, SignedBeaconBlockHeader, fulu,
 };
+use ethlambda_state_transition::beacon::data_columns::blob_kzg_commitments_inclusion_proof;
 use ethlambda_state_transition::beacon::fork_choice::verify_data_column_sidecar_inclusion_proof;
 use ethlambda_state_transition::beacon::helpers::misc::is_valid_merkle_branch;
 use ethlambda_state_transition::beacon::preset;
@@ -92,6 +96,14 @@ pub fn trials() -> Vec<Trial> {
 
             if !is_valid_merkle_branch(leaf, &branch, depth, subtree_index, body.hash_tree_root()) {
                 return Err("the fixture branch did not verify against the body root".to_string());
+            }
+
+            // The branch the proposer side builds must be the fixture's own.
+            let built = blob_kzg_commitments_inclusion_proof(&body);
+            if built.iter().copied().collect::<Vec<_>>() != branch {
+                return Err(format!(
+                    "built branch {built:?} differs from the fixture's {branch:?}"
+                ));
             }
 
             // The index is load-bearing, not decoration: the same branch at a

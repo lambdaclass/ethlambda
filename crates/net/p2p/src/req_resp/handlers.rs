@@ -2533,6 +2533,7 @@ mod tests {
                 ethlambda_state_transition::beacon::gossip::attestation::SeenAttestations::new(
                     crate::seen_attestations_capacity(backbone_attestation_subnets),
                 ),
+            seen_operations: Default::default(),
             gossip_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::GOSSIP_VALIDATION_PERMITS,
             )),
@@ -2542,7 +2543,6 @@ mod tests {
             attestation_validation_permits: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 crate::ATTESTATION_VALIDATION_PERMITS,
             )),
-            attestation_pool: Default::default(),
             aggregator_subnets: HashMap::new(),
         }
     }

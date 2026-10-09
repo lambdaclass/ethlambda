@@ -7,10 +7,12 @@
 //! `builder_boost_factor` is accepted and ignored, and every answer carries
 //! `Eth-Execution-Payload-Blinded: false`.
 //!
-//! Payloads carrying blobs are refused for now, with a 503 the validator client
-//! fails over on. Publishing such a block means computing and gossiping its
-//! data column sidecars, which this node does not do yet, and a block its peers
-//! cannot sample is a block they will not import.
+//! A payload's blobs travel with the block: production answers fulu's
+//! `BlockContents` (cell proofs and blobs beside the block), and publication
+//! turns the signed `SignedBlockContents` back into data column sidecars,
+//! checking every cell proof first, and gossips them with the block. A
+//! malformed bundle from the execution client is a 503 the validator client
+//! fails over on; a block whose blobs do not verify is a 400.
 
 use axum::{
     Extension, Router,
@@ -27,11 +29,12 @@ use ethlambda_engine::{
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
-    attestation_pool::SharedAttestationPool,
     block_production::{
-        BlockInputs, advance_to_slot, assemble_block, pack_attestations, parse_execution_requests,
-        payload_inputs,
+        BlockInputs, Operations, advance_to_slot, assemble_block, pack_attestations,
+        pack_operations, parse_execution_requests, payload_inputs,
     },
+    data_columns::{self, SidecarError},
+    helpers::accessors::get_beacon_proposer_index,
     stf::verify_block_signature,
 };
 use ethlambda_storage::Store;
@@ -52,7 +55,7 @@ use libssz::{SszDecode as _, SszEncode as _};
 use libssz_derive::{SszDecode, SszEncode};
 use libssz_types::SszList;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::beacon::{ApiError, validator::FeeRecipients, validator::head};
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
@@ -92,13 +95,14 @@ pub(crate) fn routes() -> Router<Store> {
 
 /// `POST /eth/v2/beacon/blocks`, SSZ-encoded `SignedBlockContents`.
 ///
-/// Checked before it goes anywhere: the fork is fulu, it carries no blobs
-/// (whose data columns this node cannot publish yet, see the module docs), it
-/// builds on this node's head, and the proposer's signature verifies against
-/// the head state advanced to its slot. Then handed to P2P, which gossips it
-/// and gives it to the chain actor to import. The full import runs there, so
-/// `200` here means validated and broadcast, the `gossip` level of
-/// `broadcast_validation`, which is the endpoint's default.
+/// Checked before it goes anywhere: the fork is fulu, its parent is a block
+/// this node holds (not necessarily the head), it is after that parent, its
+/// proposer is the one the parent's state advanced to its slot names, the
+/// proposer's signature verifies against that state, and its blobs and cell proofs match the block's commitments and
+/// verify. Then handed to P2P with the data column sidecars built from them,
+/// which gossips both and gives the block to the chain actor to import. The
+/// full import runs there, so `200` here means validated and broadcast, the
+/// `gossip` level of `broadcast_validation`, which is the endpoint's default.
 async fn post_block(
     State(store): State<Store>,
     Extension(p2p): Extension<RpcToP2PRef>,
@@ -126,36 +130,80 @@ async fn post_block(
     let Ok(contents) = FuluSignedBlockContents::from_ssz_bytes(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
     };
-    if !contents.blobs.is_empty()
-        || !contents.kzg_proofs.is_empty()
-        || !contents
-            .signed_block
-            .message
-            .body
-            .blob_kzg_commitments
-            .is_empty()
-    {
-        return ApiError::BadRequest(
-            "blocks with blobs are not accepted yet: their data columns cannot be published",
-        )
-        .into_response();
-    }
 
-    let block = containers::SignedBeaconBlock::Fulu(contents.signed_block);
-    let (_, head_state) = match head(&store) {
-        Ok(found) => found,
-        Err(err) => return err.into_response(),
+    let FuluSignedBlockContents {
+        signed_block,
+        kzg_proofs,
+        blobs,
+    } = contents;
+    let Some(parent_state) = store
+        .get_state(&signed_block.message.parent_root)
+        .ok()
+        .flatten()
+    else {
+        return ApiError::BadRequest("the block's parent is not known to this node")
+            .into_response();
     };
-    if block.slot() <= head_state.slot() {
-        return ApiError::BadRequest("the block is not after this node's head").into_response();
-    }
-    let Ok(state) = advance_to_slot(&head_state, block.slot(), &store.config()) else {
-        return ApiError::Internal("advancing the head state failed").into_response();
+    let config = store.config();
+    let checked = tokio::task::spawn_blocking(move || {
+        let slot = signed_block.message.slot;
+        if slot <= parent_state.slot() {
+            return Err(("the block is not after its parent", None));
+        }
+        let state = advance_to_slot(&parent_state, slot, &config)
+            .map_err(|_| ("advancing the parent state failed", None))?;
+        let proposer =
+            get_beacon_proposer_index(&state).map_err(|_| ("no proposer for the slot", None))?;
+        if signed_block.message.proposer_index != proposer {
+            return Err(("wrong proposer for the slot", None));
+        }
+        let block = containers::SignedBeaconBlock::Fulu(signed_block);
+        if !verify_block_signature(&state, &block) {
+            return Err(("invalid block signature", None));
+        }
+        let containers::SignedBeaconBlock::Fulu(signed_block) = block else {
+            unreachable!("the block was wrapped as fulu above");
+        };
+        // Without blobs there is no KZG work, and the metric would only be
+        // diluted by free samples.
+        if signed_block.message.body.blob_kzg_commitments.is_empty() && blobs.is_empty() {
+            return Ok((signed_block, Vec::new(), None));
+        }
+        let started = std::time::Instant::now();
+        let sidecars = data_columns::verified_sidecars(&signed_block, &blobs, &kzg_proofs)
+            .map_err(|err| {
+                let message = match err {
+                    SidecarError::Shape(_) => {
+                        "the block's blobs and cell proofs do not match its commitments"
+                    }
+                    SidecarError::InvalidBlob => "a blob is not a valid polynomial evaluation",
+                    SidecarError::InvalidProofs => "the cell proofs do not verify",
+                };
+                (message, Some((slot, err)))
+            })?;
+        Ok((signed_block, sidecars, Some(started.elapsed())))
+    })
+    .await;
+    let (signed_block, sidecars) = match checked {
+        Ok(Ok((signed_block, sidecars, elapsed))) => {
+            if let Some(elapsed) = elapsed {
+                crate::metrics::observe_publish_data_columns(elapsed);
+            }
+            (signed_block, sidecars)
+        }
+        Ok(Err((message, detail))) => {
+            if let Some((slot, err)) = detail {
+                warn!(slot, %err, "Refusing a published block's blobs");
+            }
+            return ApiError::BadRequest(message).into_response();
+        }
+        Err(err) => {
+            error!(%err, "Checking a published block failed");
+            return ApiError::Internal("building the data column sidecars failed").into_response();
+        }
     };
-    if !verify_block_signature(&state, &block) {
-        return ApiError::BadRequest("invalid block signature").into_response();
-    }
-    if p2p.publish_beacon_block(block).is_err() {
+    let block = containers::SignedBeaconBlock::Fulu(signed_block);
+    if p2p.publish_beacon_block(block, sidecars).is_err() {
         return ApiError::Internal("the network actor is not running").into_response();
     }
     StatusCode::OK.into_response()
@@ -173,7 +221,6 @@ async fn get_block(
     Query(query): Query<ProduceQuery>,
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
-    Extension(pool): Extension<SharedAttestationPool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     headers: HeaderMap,
 ) -> Response {
@@ -190,23 +237,17 @@ async fn get_block(
     let produced = produce(
         &store,
         &engine,
-        &pool,
         &fee_recipients,
         slot,
         query.randao_reveal,
         graffiti,
     )
     .await;
-    let (block, payload_value, fork) = match produced {
+    let (contents, payload_value, fork) = match produced {
         Ok(produced) => produced,
         Err(err) => return err.into_response(),
     };
 
-    let contents = FuluBlockContents {
-        block,
-        kzg_proofs: Default::default(),
-        blobs: Default::default(),
-    };
     let accept = headers.get(header::ACCEPT).and_then(|v| v.to_str().ok());
     let mut response = match Encoding::from_accept(accept) {
         Encoding::Ssz => ssz_response(contents.to_ssz()),
@@ -232,17 +273,16 @@ async fn get_block(
     with_consensus_version(response, fork)
 }
 
-/// The block for `slot`, the payload's value in wei as a decimal string, and
-/// the block's fork.
+/// The block for `slot` with its blobs and cell proofs, the payload's value in
+/// wei as a decimal string, and the block's fork.
 async fn produce(
     store: &Store,
     engine: &EngineClient,
-    pool: &SharedAttestationPool,
     fee_recipients: &FeeRecipients,
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
-) -> Result<(BeaconBlock, String, ForkName), ApiError> {
+) -> Result<(FuluBlockContents, String, ForkName), ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
     if slot <= head_state.slot() {
@@ -260,39 +300,74 @@ async fn produce(
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
             .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
 
-    let built = build_payload(store, engine, fee_recipients, &state, head_root, proposer).await?;
-    if !built.blobs_bundle.commitments.is_empty() {
-        warn!(%slot, blobs = built.blobs_bundle.commitments.len(), "Refusing a payload with blobs");
+    let mut built =
+        build_payload(store, engine, fee_recipients, &state, head_root, proposer).await?;
+    let bundle = &built.blobs_bundle;
+    let malformed = bundle.commitments.len() != bundle.blobs.len()
+        || bundle.proofs.len() != bundle.blobs.len() * preset::CELLS_PER_EXT_BLOB;
+    if malformed {
+        warn!(
+            %slot,
+            commitments = bundle.commitments.len(),
+            proofs = bundle.proofs.len(),
+            blobs = bundle.blobs.len(),
+            "The execution client's blobs bundle is malformed"
+        );
         return Err(ApiError::ServiceUnavailable(
-            "the payload carries blobs, whose data columns this node cannot publish yet",
+            "the execution client's blobs bundle is malformed",
         ));
     }
+    // The proofs are not verified here: the payload's blob transactions fix
+    // its commitments, so a bad proof has no other block to fall back to. The
+    // check at publication is the gate.
+    let blobs = std::mem::take(&mut built.blobs_bundle.blobs)
+        .into_iter()
+        .map(|blob| Blob::try_from(blob).ok())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|blobs| Blobs::try_from(blobs).ok());
+    let kzg_proofs = CellKzgProofs::try_from(std::mem::take(&mut built.blobs_bundle.proofs)).ok();
+    let (Some(blobs), Some(kzg_proofs)) = (blobs, kzg_proofs) else {
+        warn!(%slot, "The execution client's blobs do not fit their containers");
+        return Err(ApiError::ServiceUnavailable(
+            "the execution client's blobs bundle is malformed",
+        ));
+    };
     let execution_requests = parse_execution_requests(&built.execution_requests)
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     let payload_value = decimal(&built.block_value);
 
-    let candidates = pool
-        .lock()
-        .expect("attestation pool lock poisoned")
-        .block_candidates();
+    let candidates = store.attestation_pool().block_candidates();
     let attestations = pack_attestations(&state, candidates);
-    let inputs = |attestations| BlockInputs {
+    let operation_candidates = {
+        let pool = store.operation_pool();
+        Operations {
+            proposer_slashings: pool.proposer_slashings(),
+            attester_slashings: pool.attester_slashings(),
+            voluntary_exits: pool.voluntary_exits(),
+            bls_to_execution_changes: pool.bls_to_execution_changes(),
+        }
+    };
+    let operations = pack_operations(&state, operation_candidates, &config);
+    let inputs = |attestations, operations| BlockInputs {
         randao_reveal,
         graffiti,
         attestations,
+        operations,
         execution_payload: built.execution_payload.clone(),
-        blob_kzg_commitments: Vec::new(),
+        blob_kzg_commitments: built.blobs_bundle.commitments.clone(),
         execution_requests: execution_requests.clone(),
     };
     let attestation_count = attestations.len();
-    let block = match assemble_block(&state, inputs(attestations), &config) {
+    let has_operations = !operations.is_empty();
+    let block = match assemble_block(&state, inputs(attestations, operations), &config) {
         Ok(block) => block,
-        // `pack_attestations` checks every attestation's signature against this
-        // state, so this should not happen; but a block without them still
-        // earns the proposal, and one that fails to build earns nothing.
-        Err(err) if attestation_count > 0 => {
-            warn!(%slot, %err, "Block with attestations failed to build; retrying without");
-            assemble_block(&state, inputs(Vec::new()), &config)
+        // `pack_attestations` and `pack_operations` check every candidate
+        // against this state, so this should not happen; but a block without
+        // them still earns the proposal, and one that fails to build earns
+        // nothing.
+        Err(err) if attestation_count > 0 || has_operations => {
+            warn!(%slot, %err, "Block with attestations or operations failed to build; retrying without");
+            assemble_block(&state, inputs(Vec::new(), Operations::default()), &config)
                 .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
@@ -301,10 +376,19 @@ async fn produce(
         %slot,
         proposer,
         attestations = block.body.attestations.len(),
+        slashings = block.body.proposer_slashings.len() + block.body.attester_slashings.len(),
+        exits = block.body.voluntary_exits.len(),
+        bls_changes = block.body.bls_to_execution_changes.len(),
         transactions = block.body.execution_payload.transactions.len(),
+        blobs = block.body.blob_kzg_commitments.len(),
         "Produced block"
     );
-    Ok((block, payload_value, fork))
+    let contents = FuluBlockContents {
+        block,
+        kzg_proofs,
+        blobs,
+    };
+    Ok((contents, payload_value, fork))
 }
 
 /// Ask the execution client to build on the head for `state`'s slot, then

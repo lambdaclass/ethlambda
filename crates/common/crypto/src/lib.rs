@@ -43,6 +43,9 @@ use std::thread;
 use thiserror::Error;
 use tracing::error;
 
+/// Beacon Chain BLS12-381 signatures (the specification's `bls` module).
+pub mod bls;
+mod metrics;
 pub mod signature;
 
 #[cfg(feature = "shadow-integration")]

@@ -6,6 +6,7 @@ use ethlambda_types::{
         SignedAggregateAndProof, SignedBeaconBlock, electra::SingleAttestation,
         fulu::DataColumnSidecar,
     },
+    beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
     primitives::H256,
@@ -303,14 +304,23 @@ pub trait RpcToP2P: Send + Sync {
         &self,
         aggregate: SignedAggregateAndProof,
     ) -> Result<(), ActorError>;
+    /// Gossip one operation on its topic, already validated by the caller.
+    fn publish_beacon_operation(&self, operation: BeaconOperation) -> Result<(), ActorError>;
     /// Join attestation subnets a validator client's aggregators need, each
     /// until the end of the paired slot, so their committees' attestations
     /// reach this node's pool. `(subnet_id, slot)` pairs.
     fn subscribe_attestation_subnets(&self, subnets: Vec<(u64, u64)>) -> Result<(), ActorError>;
-    /// Gossip a block a validator client signed, and import it: gossip never
-    /// delivers a node its own messages, so without the second half this node
-    /// would not follow its own proposal. Checked by the caller as above.
-    fn publish_beacon_block(&self, block: SignedBeaconBlock) -> Result<(), ActorError>;
+    /// Gossip a block a validator client signed, then every one of its data
+    /// column sidecars, and import it with this node's custody columns: gossip
+    /// never delivers a node its own messages, so without the second half
+    /// this node would not follow its own proposal. Checked by the caller as
+    /// above, the sidecars included. `sidecars` is empty for a block without
+    /// blobs.
+    fn publish_beacon_block(
+        &self,
+        block: SignedBeaconBlock,
+        sidecars: Vec<DataColumnSidecar>,
+    ) -> Result<(), ActorError>;
 }
 
 // --- Init messages ---
