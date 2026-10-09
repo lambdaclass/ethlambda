@@ -1,0 +1,58 @@
+# focil-devnet-1's client set (EIP-7805 inclusion lists on heze) with
+# `ethlambda beacon` and the ethlambda validator client added, so ethlambda
+# builds and publishes inclusion lists and proposes heze blocks among the
+# clients the devnet runs. Images follow the devnet's spec sheet
+# (https://notes.ethereum.org/@ethpandaops/focil-devnet-1): lighthouse and
+# lodestar on `focil-devnet-1`, teku still on `focil-devnet-0`, every
+# execution client ethrex on `focil-devnet-1`. Run from the repository root,
+# after building the image as `ethlambda:focil-devnet-1`:
+#
+#   kurtosis run --enclave ethlambda-focil tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params_focil.yaml
+#
+# ethlambda beacon is paired with ethrex rather than geth, since heze needs
+# Bogota's Engine API (`engine_newPayloadV6`, `engine_forkchoiceUpdatedV5`,
+# `engine_getInclusionListV1`). Gloas from genesis and heze one epoch later,
+# so the run crosses the heze upgrade. spamoor keeps the mempools non-empty,
+# which is what gives the inclusion lists transactions to carry.
+participants:
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:focil-devnet-1
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:focil-devnet-1
+    validator_count: 64
+    supernode: true
+    cl_extra_params:
+      - --subscribe-all-subnets
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:focil-devnet-1
+    cl_type: lodestar
+    cl_image: ethpandaops/lodestar:focil-devnet-1
+    validator_count: 64
+    supernode: true
+  - el_type: ethrex
+    el_image: ethpandaops/ethrex:focil-devnet-1
+    cl_type: teku
+    cl_image: ethpandaops/teku:focil-devnet-0
+    validator_count: 64
+    supernode: true
+network_params:
+  preset: mainnet
+  gloas_fork_epoch: 0
+  heze_fork_epoch: 1
+  preregistered_validator_count: 256
+additional_services:
+  - dora
+  - spamoor
+global_log_level: info
+
+ethlambda_validator:
+  image: ethlambda:focil-devnet-1
+  name: ethlambda-vc
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"
+
+ethlambda_beacon:
+  enabled: true
+  fallback: false
+  el: ethrex
+  el_image: ethpandaops/ethrex:focil-devnet-1

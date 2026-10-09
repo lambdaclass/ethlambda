@@ -289,7 +289,12 @@ def label_in_dora(plan, first, last, name):
 
 
 def launch_ethlambda_beacon(plan, beacon, bootnode_enr, el_enodes, default_image):
-    """Run `ethlambda beacon` with a geth of its own, and return its API URL.
+    """Run `ethlambda beacon` with an execution client of its own, and return
+    its API URL.
+
+    geth by default; `ethlambda_beacon.el: ethrex` pairs it with ethrex
+    instead (`el_image`), which a fork geth has no build for needs, heze's
+    Bogota Engine API among them.
 
     The geth starts from the same genesis as the devnet's. It still syncs
     every block from ethlambda beacon, which hands it every payload in order
@@ -305,30 +310,43 @@ def launch_ethlambda_beacon(plan, beacon, bootnode_enr, el_enodes, default_image
     geth is started first because the Engine API client does not retry a block
     once its attempts are spent.
     """
+    if beacon.get("el", "geth") == "ethrex":
+        el_image = beacon.get("el_image", "ethpandaops/ethrex:latest")
+        el_cmd = [
+            "ethrex",
+            "--network={}/genesis.json".format(GENESIS_MOUNT),
+            "--datadir=/data/ethrex",
+            "--syncmode=full",
+            "--authrpc.addr=0.0.0.0",
+            "--authrpc.port={}".format(ENGINE_PORT),
+            "--authrpc.jwtsecret={}/jwtsecret".format(JWT_MOUNT),
+            "--p2p.discv4=false",
+            "--p2p.discv5=true",
+            "--bootnodes={}".format(el_enodes),
+        ]
+    else:
+        el_image = beacon.get("geth_image", "ethereum/client-go:latest")
+        el_cmd = [
+            "geth",
+            "--override.genesis={}/genesis.json".format(GENESIS_MOUNT),
+            "--datadir=/data/geth",
+            "--syncmode=full",
+            "--authrpc.addr=0.0.0.0",
+            "--authrpc.port={}".format(ENGINE_PORT),
+            "--authrpc.vhosts=*",
+            "--authrpc.jwtsecret={}/jwtsecret".format(JWT_MOUNT),
+            # The other ELs run discv5 only, so match them or the
+            # bootnode is never contacted.
+            "--discovery.v4=false",
+            "--discovery.v5=true",
+            "--bootnodes={}".format(el_enodes),
+        ]
     geth = plan.add_service(
         name="el-ethlambda",
         config=ServiceConfig(
-            image=beacon.get("geth_image", "ethereum/client-go:latest"),
+            image=el_image,
             entrypoint=["sh", "-c"],
-            cmd=[
-                " ".join(
-                    [
-                        "geth",
-                        "--override.genesis={}/genesis.json".format(GENESIS_MOUNT),
-                        "--datadir=/data/geth",
-                        "--syncmode=full",
-                        "--authrpc.addr=0.0.0.0",
-                        "--authrpc.port={}".format(ENGINE_PORT),
-                        "--authrpc.vhosts=*",
-                        "--authrpc.jwtsecret={}/jwtsecret".format(JWT_MOUNT),
-                        # The other ELs run discv5 only, so match them or the
-                        # bootnode is never contacted.
-                        "--discovery.v4=false",
-                        "--discovery.v5=true",
-                        "--bootnodes={}".format(el_enodes),
-                    ]
-                )
-            ],
+            cmd=[" ".join(el_cmd)],
             files={GENESIS_MOUNT: GENESIS_ARTIFACT, JWT_MOUNT: JWT_ARTIFACT},
             ports={
                 "engine": PortSpec(number=ENGINE_PORT, transport_protocol="TCP"),
