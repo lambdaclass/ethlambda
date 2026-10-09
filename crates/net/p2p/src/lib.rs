@@ -1025,6 +1025,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
 /// Public handle to the P2P actor.
 pub struct P2P {
     handle: ActorRef<P2PServer>,
+    /// This node's ENR as published at startup, for the Beacon API's
+    /// `/eth/v1/node/identity`. `None` when discovery is disabled.
+    local_enr: Option<String>,
 }
 
 impl P2P {
@@ -1049,11 +1052,15 @@ impl P2P {
         discovery: Option<DiscoverySpawnConfig>,
         attestation_pool: SharedAttestationPool,
     ) -> Result<P2P, DiscoveryError> {
-        let discovery = match discovery {
-            Some(config) => Some(spawn_discovery(config).await?),
+        let (discovery, local_enr) = match discovery {
+            Some(config) => {
+                let discovery = spawn_discovery(config).await?;
+                let local_enr = discovery.local_enr.clone();
+                (Some(discovery), Some(local_enr))
+            }
             None => {
                 info!("discv5 discovery disabled; peering from the static bootnode list only");
-                None
+                (None, None)
             }
         };
         let (swarm_stream, swarm_handle) =
@@ -1123,11 +1130,19 @@ impl P2P {
             );
         }
         spawn_listener(handle.context(), swarm_stream.map(WrappedSwarmEvent));
-        Ok(P2P { handle })
+        Ok(P2P { handle, local_enr })
     }
 
     pub fn actor_ref(&self) -> &ActorRef<P2PServer> {
         &self.handle
+    }
+
+    /// This node's ENR, `enr:`-prefixed, as published at startup. discv5 may
+    /// re-sign it later with a higher sequence number if IP voting changes the
+    /// external address; this is the startup record. `None` when discovery is
+    /// disabled, since then no ENR is published.
+    pub fn local_enr(&self) -> Option<&str> {
+        self.local_enr.as_deref()
     }
 }
 
