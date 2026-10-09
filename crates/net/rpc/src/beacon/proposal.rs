@@ -11,6 +11,9 @@
 //! fails over on. Publishing such a block means computing and gossiping its
 //! data column sidecars, which this node does not do yet, and a block its peers
 //! cannot sample is a block they will not import.
+//!
+//! The validator client's graffiti gets this node's and its execution client's
+//! versions appended, always; see [`super::graffiti`].
 
 use axum::{
     Extension, Router,
@@ -23,7 +26,7 @@ use axum::{
 use ethlambda_engine::{
     EngineClient, ForkchoiceStateV1,
     building::{BuiltPayload, PayloadAttributesV3},
-    types::uint256,
+    types::{ClientVersionV1, uint256},
 };
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
@@ -54,6 +57,7 @@ use libssz_types::SszList;
 use serde::Deserialize;
 use tracing::{info, warn};
 
+use crate::beacon::graffiti::{self, OwnVersion};
 use crate::beacon::{ApiError, validator::FeeRecipients, validator::head};
 use crate::shared::content::{Encoding, ssz_response, with_consensus_version};
 
@@ -168,6 +172,7 @@ struct ProduceQuery {
     graffiti: Option<H256>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_block(
     Path(slot): Path<String>,
     Query(query): Query<ProduceQuery>,
@@ -175,6 +180,7 @@ async fn get_block(
     Extension(engine): Extension<Option<EngineClient>>,
     Extension(pool): Extension<SharedAttestationPool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
+    Extension(OwnVersion(own_version)): Extension<OwnVersion>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -192,6 +198,7 @@ async fn get_block(
         &engine,
         &pool,
         &fee_recipients,
+        &own_version,
         slot,
         query.randao_reveal,
         graffiti,
@@ -234,11 +241,13 @@ async fn get_block(
 
 /// The block for `slot`, the payload's value in wei as a decimal string, and
 /// the block's fork.
+#[allow(clippy::too_many_arguments)]
 async fn produce(
     store: &Store,
     engine: &EngineClient,
     pool: &SharedAttestationPool,
     fee_recipients: &FeeRecipients,
+    own_version: &ClientVersionV1,
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
@@ -260,7 +269,15 @@ async fn produce(
         ethlambda_state_transition::beacon::helpers::accessors::get_beacon_proposer_index(&state)
             .map_err(|_| ApiError::Internal("no proposer for the slot"))?;
 
-    let built = build_payload(store, engine, fee_recipients, &state, head_root, proposer).await?;
+    // Asked alongside the build rather than before it, so a healthy execution
+    // client costs the block nothing for its version and a silent one costs it
+    // at most the version's own timeout.
+    let (built, el_version) = tokio::join!(
+        build_payload(store, engine, fee_recipients, &state, head_root, proposer),
+        graffiti::execution_client_version(engine, own_version),
+    );
+    let built = built?;
+    let graffiti = graffiti::with_client_versions(graffiti, el_version.as_ref(), own_version);
     if !built.blobs_bundle.commitments.is_empty() {
         warn!(%slot, blobs = built.blobs_bundle.commitments.len(), "Refusing a payload with blobs");
         return Err(ApiError::ServiceUnavailable(
@@ -302,6 +319,7 @@ async fn produce(
         proposer,
         attestations = block.body.attestations.len(),
         transactions = block.body.execution_payload.transactions.len(),
+        graffiti = %graffiti::display(&block.body.graffiti),
         "Produced block"
     );
     Ok((block, payload_value, fork))
