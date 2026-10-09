@@ -273,7 +273,7 @@ impl ForkRules {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => ForkRules::PreGloas,
-            ForkName::Gloas => ForkRules::Gloas,
+            ForkName::Gloas | ForkName::Heze => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
     }
@@ -3139,6 +3139,42 @@ fn is_pre_gloas(block: &SignedBeaconBlock) -> bool {
     }
 }
 
+/// `is_payload_inclusion_list_satisfied` (heze `fork-choice.md`): whether
+/// `root`'s payload satisfied the inclusion list constraints, and was locally
+/// determined to be available.
+///
+/// A verified payload with no recorded satisfaction reads as satisfied,
+/// where the specification asserts one is recorded: a payload verified
+/// before heze (whose lists were empty, so any payload satisfies them), one
+/// verified before a restart (nothing persists the map, as the
+/// specification's own store keeps it in memory), and an anchor's. Refusing
+/// to extend any of those would stall the chain over a record this node
+/// lost, not over a list the payload ignored.
+pub fn is_payload_inclusion_list_satisfied(store: &Store, root: Root) -> bool {
+    // If the payload is not locally available, the payload is not considered
+    // to satisfy the inclusion list constraints.
+    if !is_payload_verified(store, root) {
+        return false;
+    }
+    store
+        .payload_inclusion_list_satisfaction(&root)
+        .unwrap_or(true)
+}
+
+/// The recording half of heze's `record_payload_inclusion_list_satisfaction`:
+/// the execution engine's verdict on whether `root`'s payload satisfied the
+/// inclusion list constraints. The verdict itself is the caller's, since only
+/// the caller talks to the engine; see
+/// `inclusion_list::payload_inclusion_list_transactions` for the lists it is
+/// asked about. A `NOT_VALIDATED` payload is recorded as satisfying, and its
+/// later `VALID` verdict records the engine's real answer over it.
+pub fn record_payload_inclusion_list_satisfaction(store: &mut Store, root: Root, satisfied: bool) {
+    let Some((slot, _parent)) = store.block_entry(&root) else {
+        return;
+    };
+    store.set_payload_inclusion_list_satisfaction(root, slot, satisfied);
+}
+
 /// `is_payload_verified` (gloas `fork-choice.md`): whether `root`'s execution
 /// payload envelope has been locally delivered and verified via
 /// [`on_execution_payload_envelope`], the only caller of
@@ -3487,6 +3523,10 @@ fn should_extend_payload_with(
         "store.blocks[root].slot + 1 == get_current_slot(store)",
     )?;
     if !is_payload_verified(store, root) {
+        return Ok(false);
+    }
+    // [New in Heze:EIP7805]
+    if !is_payload_inclusion_list_satisfied(store, root) {
         return Ok(false);
     }
     let proposer_root = store.proposer_boost_root();

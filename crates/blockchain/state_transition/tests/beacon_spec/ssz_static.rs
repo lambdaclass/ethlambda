@@ -18,7 +18,7 @@
 
 use ethlambda_state_transition::beacon::ForkName;
 use ethlambda_state_transition::beacon::containers::{
-    altair, bellatrix, capella, deneb, electra, fulu, gloas, phase0, shared,
+    altair, bellatrix, capella, deneb, electra, fulu, gloas, heze, phase0, shared,
 };
 use ethlambda_state_transition::beacon::primitives::{HashTreeRoot, Root};
 use libssz::{SszDecode, SszEncode};
@@ -121,17 +121,17 @@ pub fn trials() -> Vec<Trial> {
                 // so these arms have to come before the `>= Electra` arms
                 // below, which would otherwise catch a gloas case first and
                 // check it against electra's bounded shape.
-                "Attestation" if fork == ForkName::Gloas => check::<gloas::Attestation>(case),
-                "IndexedAttestation" if fork == ForkName::Gloas => {
+                "Attestation" if fork.is_gloas_or_later() => check::<gloas::Attestation>(case),
+                "IndexedAttestation" if fork.is_gloas_or_later() => {
                     check::<gloas::IndexedAttestation>(case)
                 }
-                "AttesterSlashing" if fork == ForkName::Gloas => {
+                "AttesterSlashing" if fork.is_gloas_or_later() => {
                     check::<gloas::AttesterSlashing>(case)
                 }
-                "AggregateAndProof" if fork == ForkName::Gloas => {
+                "AggregateAndProof" if fork.is_gloas_or_later() => {
                     check::<gloas::AggregateAndProof>(case)
                 }
-                "SignedAggregateAndProof" if fork == ForkName::Gloas => {
+                "SignedAggregateAndProof" if fork.is_gloas_or_later() => {
                     check::<gloas::SignedAggregateAndProof>(case)
                 }
 
@@ -198,7 +198,7 @@ pub fn trials() -> Vec<Trial> {
                 // registry and several other lists become progressive, and
                 // the builder registry and payload-timeliness bookkeeping are
                 // new fields, so it needs its own type too.
-                "BeaconState" if fork == ForkName::Gloas => check::<gloas::BeaconState>(case),
+                "BeaconState" if fork.is_gloas_or_later() => check::<gloas::BeaconState>(case),
 
                 "BeaconBlock" if fork == ForkName::Phase0 => check::<phase0::BeaconBlock>(case),
                 "BeaconBlockBody" if fork == ForkName::Phase0 => {
@@ -247,11 +247,11 @@ pub fn trials() -> Vec<Trial> {
                 // attestations instead, so it needs its own block family
                 // rather than electra's. Ahead of the `>= Electra` arms below,
                 // which would otherwise catch a gloas case first.
-                "BeaconBlock" if fork == ForkName::Gloas => check::<gloas::BeaconBlock>(case),
-                "BeaconBlockBody" if fork == ForkName::Gloas => {
+                "BeaconBlock" if fork.is_gloas_or_later() => check::<gloas::BeaconBlock>(case),
+                "BeaconBlockBody" if fork.is_gloas_or_later() => {
                     check::<gloas::BeaconBlockBody>(case)
                 }
-                "SignedBeaconBlock" if fork == ForkName::Gloas => {
+                "SignedBeaconBlock" if fork.is_gloas_or_later() => {
                     check::<gloas::SignedBeaconBlock>(case)
                 }
 
@@ -315,7 +315,7 @@ pub fn trials() -> Vec<Trial> {
                 // (EIP-7928) and `slot_number` (EIP-8061). Ahead of the
                 // `>= Deneb` arm below, which would otherwise catch a gloas
                 // case first.
-                "ExecutionPayload" if fork == ForkName::Gloas => {
+                "ExecutionPayload" if fork.is_gloas_or_later() => {
                     check::<gloas::ExecutionPayload>(case)
                 }
                 "ExecutionPayload" if fork >= ForkName::Deneb => {
@@ -344,7 +344,7 @@ pub fn trials() -> Vec<Trial> {
                 // progressive, so the request built from them needs its own
                 // type too. Ahead of the `>= Electra` arm below, which would
                 // otherwise catch a gloas case first.
-                "NewPayloadRequest" if fork == ForkName::Gloas => {
+                "NewPayloadRequest" if fork.is_gloas_or_later() => {
                     check::<gloas::NewPayloadRequest>(case)
                 }
                 "NewPayloadRequest" if fork >= ForkName::Electra => {
@@ -389,7 +389,7 @@ pub fn trials() -> Vec<Trial> {
                 // progressive (EIP-7688), so it needs its own type. Ahead of
                 // the `>= Electra` arm below, which would otherwise catch a
                 // gloas case first.
-                "ExecutionRequests" if fork == ForkName::Gloas => {
+                "ExecutionRequests" if fork.is_gloas_or_later() => {
                     check::<gloas::ExecutionRequests>(case)
                 }
                 "ExecutionRequests" if fork >= ForkName::Electra => {
@@ -416,14 +416,16 @@ pub fn trials() -> Vec<Trial> {
                 "DataColumnSidecar" if fork == ForkName::Fulu => {
                     check::<fulu::DataColumnSidecar>(case)
                 }
-                "DataColumnSidecar" if fork == ForkName::Gloas => {
+                "DataColumnSidecar" if fork.is_gloas_or_later() => {
                     check::<gloas::DataColumnSidecar>(case)
                 }
-                "MatrixEntry" if matches!(fork, ForkName::Fulu | ForkName::Gloas) => {
+                "MatrixEntry"
+                    if matches!(fork, ForkName::Fulu | ForkName::Gloas | ForkName::Heze) =>
+                {
                     check::<fulu::MatrixEntry>(case)
                 }
                 "DataColumnsByRootIdentifier"
-                    if matches!(fork, ForkName::Fulu | ForkName::Gloas) =>
+                    if matches!(fork, ForkName::Fulu | ForkName::Gloas | ForkName::Heze) =>
                 {
                     check::<fulu::DataColumnsByRootIdentifier>(case)
                 }
@@ -442,13 +444,13 @@ pub fn trials() -> Vec<Trial> {
                 "PartialDataColumnSidecar" if fork == ForkName::Fulu => {
                     check::<fulu::PartialDataColumnSidecar>(case)
                 }
-                "PartialDataColumnSidecar" if fork == ForkName::Gloas => {
+                "PartialDataColumnSidecar" if fork.is_gloas_or_later() => {
                     check::<gloas::PartialDataColumnSidecar>(case)
                 }
                 "PartialDataColumnPartsMetadata" if fork == ForkName::Fulu => {
                     check::<fulu::PartialDataColumnPartsMetadata>(case)
                 }
-                "PartialDataColumnPartsMetadata" if fork == ForkName::Gloas => {
+                "PartialDataColumnPartsMetadata" if fork.is_gloas_or_later() => {
                     check::<gloas::PartialDataColumnPartsMetadata>(case)
                 }
                 "PartialDataColumnHeader" if fork == ForkName::Fulu => {
@@ -457,7 +459,7 @@ pub fn trials() -> Vec<Trial> {
                 "PartialDataColumnGroupID" if fork == ForkName::Fulu => {
                     check::<fulu::PartialDataColumnGroupID>(case)
                 }
-                "PartialDataColumnGroupID" if fork == ForkName::Gloas => {
+                "PartialDataColumnGroupID" if fork.is_gloas_or_later() => {
                     check::<gloas::PartialDataColumnGroupID>(case)
                 }
 
@@ -485,6 +487,12 @@ pub fn trials() -> Vec<Trial> {
                 }
                 "ProposerPreferences" => check::<gloas::ProposerPreferences>(case),
                 "SignedProposerPreferences" => check::<gloas::SignedProposerPreferences>(case),
+
+                // Heze (EIP-7805). The bid's new `inclusion_list_bits` is
+                // covered by the gloas arms above: heze's bid, block and state
+                // are gloas's containers with a heze-shaped bid.
+                "InclusionList" => check::<heze::InclusionList>(case),
+                "SignedInclusionList" => check::<heze::SignedInclusionList>(case),
 
                 // No arm matched, so this crate has no container for this
                 // handler/fork pair, and this is not `LightClient*` (that

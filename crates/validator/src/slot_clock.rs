@@ -88,6 +88,12 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
+    /// Whether `slot` is a heze slot, the fork inclusion list committees exist
+    /// from.
+    pub fn is_heze(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Heze
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -136,6 +142,28 @@ impl SlotClock {
     /// whatever the slot, and callers gate on [`Self::is_gloas`].
     pub fn payload_attestation_time(&self, slot: Slot) -> SystemTime {
         self.offset_into(slot, self.config.payload_attestation_due_bps)
+    }
+
+    /// When an inclusion list committee member builds and publishes its list
+    /// for `slot` (heze): at the attester offset.
+    ///
+    /// The specification only bounds it, by `get_inclusion_list_due_ms()`
+    /// ([`Self::inclusion_list_deadline`]), and asks that the list be built
+    /// against the slot's block once it is processed and the head. The
+    /// attester offset is the point this client already trusts that block to
+    /// be in, and it leaves the rest of the window, past two fifths of the
+    /// slot on mainnet, for the execution client's answer and for gossip to
+    /// carry the list to every node before it stops counting as timely. A
+    /// later point would list a fresher mempool at the cost of that margin,
+    /// and a list that misses the deadline is not counted at all.
+    pub fn inclusion_list_time(&self, slot: Slot) -> SystemTime {
+        self.attestation_time(slot)
+    }
+
+    /// The instant past which a list for `slot` no longer counts as timely:
+    /// `INCLUSION_LIST_DUE_BPS` into the slot.
+    pub fn inclusion_list_deadline(&self, slot: Slot) -> SystemTime {
+        self.offset_into(slot, self.config.inclusion_list_due_bps)
     }
 
     /// When the aggregation duty for `slot` should run.
@@ -246,6 +274,22 @@ impl SlotClock {
     /// it between aggregation and the committee vote.
     pub fn until_payload_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
         self.payload_attestation_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until the inclusion list duty for `slot`, or zero
+    /// once that instant has passed.
+    pub fn until_inclusion_list(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.inclusion_list_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How much of the inclusion list window for `slot` is left at `now`, or
+    /// zero once it has closed. The budget the duty gets.
+    pub fn remaining_inclusion_list_window(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.inclusion_list_deadline(slot)
             .duration_since(now)
             .unwrap_or(Duration::ZERO)
     }
@@ -696,6 +740,32 @@ mod tests {
         );
         assert_eq!(
             clock.until_first_slot_duty(5, start + Duration::from_secs(10)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn the_inclusion_list_goes_out_at_the_attester_offset_and_closes_at_its_deadline() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Gloas, 0)
+            .with_fork_epoch(ForkName::Heze, 1);
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let slot = SLOTS_PER_EPOCH + 5;
+        assert!(clock.is_heze(slot));
+        assert!(!clock.is_heze(slot - SLOTS_PER_EPOCH));
+        let start = clock.start_of(slot);
+        assert_eq!(
+            clock.until_inclusion_list(slot, start),
+            Duration::from_millis(3_000),
+            "the gloas attester offset, a quarter of the slot"
+        );
+        assert_eq!(
+            clock.remaining_inclusion_list_window(slot, start),
+            Duration::from_millis(8_000),
+            "6667 basis points of 12 seconds"
+        );
+        assert_eq!(
+            clock.remaining_inclusion_list_window(slot, start + Duration::from_secs(9)),
             Duration::ZERO
         );
     }

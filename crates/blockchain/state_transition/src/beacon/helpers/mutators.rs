@@ -180,7 +180,7 @@ fn initiate_validator_exit_for_fork(
         // `initiate_validator_exit` does on a gloas state: the churn it
         // draws through `compute_exit_epoch_and_update_churn` is already
         // gloas's own by the time it gets here.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
             crate::beacon::helpers::electra::initiate_validator_exit(state, index, config)
         }
         ForkName::Phase0

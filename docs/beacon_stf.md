@@ -716,11 +716,11 @@ ignored runs. The ignored cases are deliberate exclusions:
   through gloas. The light-client sync protocol is a different layer from the
   state transition and fork choice, and is not in this module's scope.
 - `networking/gossip_*` cases outside what the node validates: every fork's
-  cases for topics it has no validator for (`IGNORED_HANDLERS`), non-fulu cases
-  of the aggregate and attestation topics (block and data column validate fulu
-  and gloas), and the vectors in `SKIPPED`, which assume a bad-block cache.
-- The `heze` fixture tree, one ignored entry. See "Accounting for every fork
-  directory" below.
+  cases for topics it has no validator for (`IGNORED_HANDLERS`), cases from
+  forks a validated topic's rules do not cover (`validated_forks`), and the
+  vectors in `SKIPPED`, which assume a bad-block cache. Heze's
+  `gossip_inclusion_list` vectors are run, and the heze bid vectors exercise
+  the inclusive-bits rule.
 
 ## Accounting for every fork directory
 
@@ -729,12 +729,13 @@ a name that does not parse is skipped. That skip is silent in a way the
 `HIGHEST_IMPLEMENTED_FORK` gate is not: the cases never become tests, so they are
 not counted as ignored either, and nothing in the output says they exist.
 
-`gloas` does not take this silent path: `ForkName::parse("gloas")` succeeds, so
-its cases become ordinary tests, individually named and run. `heze`, the one
-fork after gloas, is still unparseable and would be silently skipped without
-this section's own accounting.
+`gloas` and `heze` do not take this silent path: both parse, so their cases
+become ordinary tests, individually named and run. Heze reuses gloas's
+containers (only the bid gains `inclusion_list_bits`, see `ForkName::Heze`'s
+doc), so the whole gloas machinery runs its fixtures, `upgrade_to_heze`
+included.
 
-So `UNMODELED_FORKS` names `heze` alone, it reports as one ignored test, and
+`UNMODELED_FORKS` is empty at the pinned release, and
 `fixture_forks/every_directory_is_accounted_for` fails if the tree holds a fork
 directory that is neither parseable nor listed. A release that adds a fork
 forces a decision instead of quietly widening the gap.

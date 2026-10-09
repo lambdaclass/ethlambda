@@ -36,7 +36,7 @@ use super::envelope_client::{
     handle_envelopes_by_root_response, request_beacon_envelopes_by_range,
 };
 use super::{
-    Request, Response, ResponsePayload, envelopes,
+    Request, Response, ResponsePayload, envelopes, inclusion_lists,
     messages::{ResponseCode, error_message},
 };
 use crate::beacon::BeaconWire;
@@ -192,6 +192,16 @@ pub async fn handle_req_resp_message(
                         )
                         .await;
                     }
+                    Request::InclusionListsByIndices(request) => {
+                        trace!(
+                            kind = "inclusion_lists_by_indices_request",
+                            peer_count, "P2P message received"
+                        );
+                        inclusion_lists::handle_inclusion_lists_by_indices_request(
+                            server, peer, request, channel,
+                        )
+                        .await;
+                    }
                 }
             }
             request_response::Message::Response {
@@ -295,6 +305,15 @@ pub async fn handle_req_resp_message(
                                     );
                                 }
                             }
+                        }
+                        // Not tied to an outbound request id: this node sends
+                        // no such request, so there is no entry to settle.
+                        ResponsePayload::InclusionLists(lists) => {
+                            trace!(
+                                kind = "inclusion_lists_response",
+                                peer_count, "P2P message received"
+                            );
+                            inclusion_lists::handle_inclusion_lists_response(server, peer, lists);
                         }
                         ResponsePayload::ExecutionPayloadEnvelopes(envelopes) => {
                             trace!(
@@ -1465,7 +1484,7 @@ fn range_needs_columns(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra => false,
-        ForkName::Fulu | ForkName::Gloas => true,
+        ForkName::Fulu | ForkName::Gloas | ForkName::Heze => true,
         ForkName::Lean => {
             unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
         }
@@ -2801,6 +2820,9 @@ pub(crate) mod tests {
                 ethlambda_state_transition::beacon::gossip::SeenPayloadAttestations::new(
                     crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
                 ),
+            seen_inclusion_lists: ethlambda_state_transition::beacon::gossip::SeenInclusionLists::new(
+                crate::SEEN_INCLUSION_LISTS_CAPACITY,
+            ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,

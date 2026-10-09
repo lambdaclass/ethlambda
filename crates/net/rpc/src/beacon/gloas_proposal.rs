@@ -47,7 +47,7 @@ use axum::{
 use ethlambda_blockchain::checkpoint_hash;
 use ethlambda_engine::{
     CustodyColumns, EngineClient, ForkchoiceStateV1,
-    building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4},
+    building::{BuiltGloasPayload, PayloadAttributesV3, PayloadAttributesV4, PayloadAttributesV5},
     types::ClientVersionV1,
 };
 use ethlambda_network_api::RpcToP2PRef;
@@ -70,6 +70,7 @@ use ethlambda_state_transition::beacon::{
         accessors::{get_beacon_proposer_index, get_domain},
         misc::compute_signing_root,
     },
+    inclusion_list::{get_inclusion_list_committee, inclusion_list_dependent_root},
     payload_attestation_pool::SharedPayloadAttestationPool,
     stf::gloas::verify_execution_payload_envelope_signature,
     sync_committee_pool::SharedSyncCommitteePool,
@@ -88,6 +89,7 @@ use ethlambda_types::{
                 SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
                 SignedProposerPreferences,
             },
+            heze::InclusionListBits,
         },
         fork::ForkName,
         fork_choice::{ForkChoiceNode, PayloadStatus},
@@ -236,8 +238,8 @@ async fn post_produce_block(
         )
         .into_response();
     };
-    if consensus_version(&headers).is_some_and(|fork| fork != ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+    if consensus_version(&headers).is_some_and(|fork| !fork.is_gloas_or_later()) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or heze").into_response();
     }
     // Ahead of the engine check: a slot this node cannot build is a 400 on any
     // node, not a 503 on one with no execution client.
@@ -418,6 +420,12 @@ struct Prepared {
     /// The proposer's signed preferences for the slot, when this node holds
     /// them under the slot's dependent root.
     preferences: Option<SignedProposerPreferences>,
+    /// Heze: the self-build bid's `inclusion_list_bits`. `None` at a gloas
+    /// slot.
+    inclusion_list_bits: Option<InclusionListBits>,
+    /// Heze: the previous slot's inclusion list transactions, which the built
+    /// payload must satisfy (`PayloadAttributesV5`). `None` at a gloas slot.
+    inclusion_list_transactions: Option<Vec<Vec<u8>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,9 +616,24 @@ fn candidate_bids(
                     .preferences
                     .as_ref()
                     .is_none_or(|prefs| prefs.message.fee_recipient == bid.fee_recipient)
+                && bid_is_inclusive(prepared, bid)
                 && bid_is_includable(&prepared.state, signed, &prepared.parent_requests)
         })
         .collect()
+}
+
+/// Heze: whether `bid`'s `inclusion_list_bits` cover every list in this node's
+/// own view of the previous slot (`is_inclusion_list_bits_inclusive` with
+/// `only_timely=False`, per heze `validator.md`), the bits the self-build would
+/// claim. A gloas slot has no such rule.
+fn bid_is_inclusive(prepared: &Prepared, bid: &containers::gloas::ExecutionPayloadBid) -> bool {
+    let Some(local) = &prepared.inclusion_list_bits else {
+        return true;
+    };
+    let Some(claimed) = &bid.inclusion_list_bits else {
+        return false;
+    };
+    (0..local.len()).all(|i| !local.get(i).unwrap_or(false) || claimed.get(i).unwrap_or(false))
 }
 
 /// The chain-side half of production: pick the parent payload branch, advance
@@ -680,6 +703,11 @@ fn prepare(
     if let Some(preferences) = &preferences {
         inputs.target_gas_limit = preferences.message.target_gas_limit;
     }
+    let (inclusion_list_bits, inclusion_list_transactions) =
+        match heze_inclusion_lists(store, &state, head_root, slot) {
+            Some((bits, transactions)) => (Some(bits), Some(transactions)),
+            None => (None, None),
+        };
     Ok(Prepared {
         state,
         inputs,
@@ -688,7 +716,54 @@ fn prepare(
         head_slot,
         parent_requests,
         preferences,
+        inclusion_list_bits,
+        inclusion_list_transactions,
     })
+}
+
+/// Heze's two inputs from the inclusion list store for a block at `slot`: the
+/// self-build bid's `inclusion_list_bits` and the transactions the payload is
+/// built to satisfy, both over every valid, non-equivocating list of the
+/// previous slot this node holds (`only_timely=False`, the proposer's whole
+/// view, per heze `validator.md`). `None` at a gloas slot.
+///
+/// Read once, here, so the bid claims exactly the lists whose transactions
+/// the execution client was asked to include.
+fn heze_inclusion_lists(
+    store: &Store,
+    state: &BeaconState,
+    head_root: H256,
+    slot: Slot,
+) -> Option<(InclusionListBits, Vec<Vec<u8>>)> {
+    if state.fork_name() != ForkName::Heze {
+        return None;
+    }
+    let Some(inclusion_list_slot) = slot.checked_sub(1) else {
+        return Some((InclusionListBits::new(), Vec::new()));
+    };
+    let dependent_root = inclusion_list_dependent_root(store, head_root, inclusion_list_slot);
+    let committee =
+        match get_inclusion_list_committee(state, inclusion_list_slot, &*store.committee_cache()) {
+            Ok(committee) => committee,
+            Err(err) => {
+                warn!(%slot, %err, "No inclusion list committee for the previous slot");
+                return Some((InclusionListBits::new(), Vec::new()));
+            }
+        };
+    let lists = store.inclusion_list_store();
+    let bits = lists.bits(&committee, inclusion_list_slot, dependent_root, false);
+    let transactions: Vec<Vec<u8>> = lists
+        .transactions(inclusion_list_slot, dependent_root, false)
+        .into_iter()
+        .map(|transaction| transaction.to_vec())
+        .collect();
+    info!(
+        %slot,
+        inclusion_lists = lists.count(inclusion_list_slot, dependent_root),
+        inclusion_list_transactions = transactions.len(),
+        "Building on the previous slot's inclusion lists"
+    );
+    Some((bits, transactions))
 }
 
 /// A reveal that does not verify would fail the block's own state transition
@@ -807,13 +882,29 @@ async fn build_payload(
         target_gas_limit: inputs.target_gas_limit,
     };
     let custody_columns = CustodyColumns::from_indices(custody.0.iter().copied());
-    let (status, payload_id) = engine
-        .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
-        .await
-        .map_err(|err| {
-            warn!(%err, "forkchoiceUpdatedV4 with payload attributes failed");
-            ApiError::ServiceUnavailable("the execution client did not start building")
-        })?;
+    // Heze (Bogota): V5, whose attributes carry the inclusion list
+    // transactions the payload must satisfy.
+    let started = match &prepared.inclusion_list_transactions {
+        Some(inclusion_list_transactions) => {
+            let attributes = PayloadAttributesV5 {
+                v4: attributes,
+                inclusion_list_transactions: inclusion_list_transactions.clone(),
+            };
+            engine
+                .forkchoice_updated_v5_with_attributes(&forkchoice, &attributes, custody_columns)
+                .await
+                .map(|(status, payload_id)| (status.status, payload_id))
+        }
+        None => {
+            engine
+                .forkchoice_updated_v4_with_attributes(&forkchoice, &attributes, custody_columns)
+                .await
+        }
+    };
+    let (status, payload_id) = started.map_err(|err| {
+        warn!(%err, "forkchoiceUpdated with payload attributes failed");
+        ApiError::ServiceUnavailable("the execution client did not start building")
+    })?;
     let Some(payload_id) = payload_id else {
         warn!(status = ?status.status, "The execution client declined to build a payload");
         return Err(ApiError::ServiceUnavailable(
@@ -868,6 +959,7 @@ fn assemble(
         execution_payload: built.execution_payload.clone(),
         blob_kzg_commitments: commitments.clone(),
         execution_requests: execution_requests.clone(),
+        inclusion_list_bits: prepared.inclusion_list_bits.clone(),
     };
     let operations = attestations.len() + payload_attestations.len();
     let attempt = inputs(attestations, payload_attestations, sync_aggregate);
@@ -1021,8 +1113,8 @@ async fn post_envelope_waiting(
     body: &[u8],
     block_wait: Duration,
 ) -> Response {
-    if consensus_version(headers) != Some(ForkName::Gloas) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be gloas").into_response();
+    if !consensus_version(headers).is_some_and(ForkName::is_gloas_or_later) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be gloas or heze").into_response();
     }
     let encoding = match BodyEncoding::from_headers(headers) {
         Ok(encoding) => encoding,
@@ -1471,6 +1563,7 @@ mod tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         )
@@ -1526,6 +1619,8 @@ mod tests {
             head_slot: state.slot() - 1,
             parent_requests: requests.clone(),
             preferences: None,
+            inclusion_list_bits: None,
+            inclusion_list_transactions: None,
         };
         assemble(
             &config(),
@@ -1599,6 +1694,8 @@ mod tests {
             head_slot: state.slot() - 1,
             parent_requests: requests,
             preferences: None,
+            inclusion_list_bits: None,
+            inclusion_list_transactions: None,
         };
         let build = |candidate| {
             assemble_on_bid(
@@ -1868,6 +1965,7 @@ mod tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: vec![commitment],
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         )

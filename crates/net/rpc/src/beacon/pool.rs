@@ -192,7 +192,7 @@ fn validate(
 
     // [REJECT] data.index == 0 (electra), or at a gloas slot 0 or 1, the
     // payload-present flag; the target epoch is the slot's.
-    let at_gloas = config.fork_at_epoch(attestation_epoch) == ForkName::Gloas;
+    let at_gloas = config.fork_at_epoch(attestation_epoch).is_gloas_or_later();
     if at_gloas {
         if data.index > 1 {
             return Err("data.index must be 0 or 1 from gloas on");
@@ -294,7 +294,9 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
     match fork {
-        Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas)) => Ok(fork),
+        Some(fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze)) => {
+            Ok(fork)
+        }
         // `ForkName::parse` never returns Lean: it is absent from `ALL`.
         Some(
             ForkName::Phase0
@@ -314,9 +316,11 @@ fn submission_fork(headers: &HeaderMap) -> Result<ForkName, ApiError> {
 /// the gloas header, and electra's and fulu's, whose containers are the same,
 /// accept either of theirs.
 fn header_matches_slot(store: &Store, header: ForkName, slot: Slot) -> bool {
-    let slot_is_gloas =
-        store.config().fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Gloas;
-    slot_is_gloas == (header == ForkName::Gloas)
+    let slot_is_gloas = store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(slot))
+        .is_gloas_or_later();
+    slot_is_gloas == header.is_gloas_or_later()
 }
 
 /// `200` when nothing failed, else the Beacon API's `IndexedErrorMessage`
@@ -353,7 +357,7 @@ async fn post_aggregate_and_proofs(
     };
     // Gloas's aggregate is its own container, so the header picks the decoder.
     let aggregates: Result<Vec<SignedAggregateAndProof>, ApiError> =
-        if header_fork == ForkName::Gloas {
+        if header_fork.is_gloas_or_later() {
             decode_list::<gloas::SignedAggregateAndProof>(&headers, &body).map(|signed| {
                 signed
                     .into_iter()
@@ -473,7 +477,7 @@ async fn get_aggregate_attestation(
     }
     // The pool holds electra-shaped votes; a gloas slot is served the same
     // vote in gloas's container, whose JSON is the same shape.
-    let data = if fork == ForkName::Gloas {
+    let data = if fork.is_gloas_or_later() {
         serde_json::json!(gloas::Attestation::from(&aggregate))
     } else {
         serde_json::json!(aggregate)

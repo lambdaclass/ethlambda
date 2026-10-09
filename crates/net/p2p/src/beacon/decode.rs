@@ -28,7 +28,7 @@
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::{
-    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, phase0, shared,
+    DataColumnSidecar, SignedBeaconBlock, altair, capella, electra, gloas, heze, phase0, shared,
 };
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
@@ -238,6 +238,18 @@ pub fn decode_payload_attestation_message(
     gloas::PayloadAttestationMessage::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
 }
 
+/// Heze p2p preset: the largest decompressed `SignedInclusionList`.
+pub const MAX_SIGNED_INCLUSION_LIST_SIZE: usize = 41_112;
+
+/// Decode an `inclusion_list` payload. Heze on; a payload past
+/// [`MAX_SIGNED_INCLUSION_LIST_SIZE`] is refused before decoding.
+pub fn decode_inclusion_list(bytes: &[u8]) -> Result<heze::SignedInclusionList, DecodeError> {
+    if bytes.len() > MAX_SIGNED_INCLUSION_LIST_SIZE {
+        return Err(DecodeError::Ssz);
+    }
+    heze::SignedInclusionList::from_ssz_bytes(bytes).map_err(|_| DecodeError::Ssz)
+}
+
 /// Decode a `sync_committee_{subnet_id}` payload. Altair on and the same
 /// container at every fork, so no fork lookup is needed.
 pub fn decode_sync_committee_message(
@@ -283,7 +295,7 @@ pub fn decode_aggregate_and_proof(
         }
         // Electra's bytes, but a progressive `Attestation` (EIP-7688), so the
         // root the aggregator signs differs; `data.index` is the payload flag.
-        ForkName::Gloas => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
+        ForkName::Gloas | ForkName::Heze => gloas::SignedAggregateAndProof::from_ssz_bytes(bytes)
             .map(SignedAggregateAndProof::Gloas),
         ForkName::Phase0
         | ForkName::Altair
@@ -336,7 +348,7 @@ pub fn decode_attestation(fork: ForkName, bytes: &[u8]) -> Result<Attestation, D
     match fork {
         // Gloas's `SingleAttestation` has electra's bytes; its `data.index`
         // carries the payload flag, which the gossip rules read.
-        ForkName::Electra | ForkName::Fulu | ForkName::Gloas => {
+        ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze => {
             electra::SingleAttestation::from_ssz_bytes(bytes).map(Attestation::Electra)
         }
         ForkName::Phase0
@@ -373,7 +385,7 @@ pub fn decode_gossip(
                 ForkName::Electra | ForkName::Fulu => {
                     electra::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Electra)
                 }
-                ForkName::Gloas => {
+                ForkName::Gloas | ForkName::Heze => {
                     gloas::AttesterSlashing::from_ssz_bytes(bytes).map(AttesterSlashing::Gloas)
                 }
                 ForkName::Phase0

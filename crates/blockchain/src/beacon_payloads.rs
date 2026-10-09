@@ -308,6 +308,7 @@ impl BlockChainServer {
         head_root: H256,
         head_hash: ExecutionBlockHash,
         status: &ethlambda_engine::PayloadStatusV1,
+        inclusion_list_satisfied: Option<bool>,
     ) {
         let verdict = crate::beacon_engine::verdict(status);
         let (PayloadValidity::Validated | PayloadValidity::Invalidated { .. }) = verdict else {
@@ -323,7 +324,33 @@ impl BlockChainServer {
             return;
         };
         match verdict {
-            PayloadValidity::Validated => mark_payloads_validated(&mut self.store, holder),
+            PayloadValidity::Validated => {
+                // Heze: a payload imported `NOT_VALIDATED` was recorded as
+                // satisfying its inclusion lists (`optimistic-sync.md`); its
+                // `VALID` verdict now says whether it did. A payload already
+                // `VALID` keeps what its own `newPayload` answer recorded,
+                // since the execution client may no longer hold its lists.
+                if let Some(satisfied) = inclusion_list_satisfied
+                    && self
+                        .store
+                        .beacon_block_payload_status(holder)
+                        .is_not_validated()
+                {
+                    if !satisfied {
+                        warn!(
+                            block_root = %ShortRoot(&holder.0),
+                            "Optimistic payload turned out not to satisfy its inclusion lists"
+                        );
+                        crate::metrics::inc_payload_inclusion_list_unsatisfied();
+                    }
+                    fork_choice::record_payload_inclusion_list_satisfaction(
+                        &mut self.store,
+                        holder,
+                        satisfied,
+                    );
+                }
+                mark_payloads_validated(&mut self.store, holder)
+            }
             PayloadValidity::Invalidated { latest_valid_hash } => {
                 if self.condemn_payload_chain(holder, latest_valid_hash) {
                     // Not `recompute_beacon_head`: this runs inside

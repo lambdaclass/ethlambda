@@ -9,6 +9,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::{Attestation, SignedAggregateAndProof};
 use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::heze;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::containers::shared::Checkpoint;
 use ethlambda_types::beacon::fork::ForkName;
@@ -19,12 +20,13 @@ use crate::beacon_node::block_contents::{
     empty_gloas_envelope_for,
 };
 use crate::beacon_node::dto::{
-    AttesterDutyDto, CommitteeSubscriptionDto, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    AttesterDutyDto, CommitteeSubscriptionDto, InclusionListDutyDto, ProposerDutyDto,
+    ProposerPreparationDto, PtcDutyDto, SingleAttestationDto, SyncCommitteeSubscriptionDto,
+    SyncDutyDto,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
     validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -108,6 +110,13 @@ pub struct MockBeaconNode {
     pub payload_attestation_data: Option<gloas::PayloadAttestationData>,
     pub payload_attestation_data_calls: Mutex<usize>,
     pub submitted_payload_attestations: Mutex<Vec<gloas::PayloadAttestationMessage>>,
+    pub inclusion_list_duties: Mutex<Vec<(Epoch, InclusionListDuties)>>,
+    pub inclusion_list_duties_calls: Mutex<usize>,
+    /// What `inclusion_list_transactions` answers with. `None` answers an
+    /// empty list, as an execution client with an empty mempool does.
+    pub inclusion_list_transactions: Option<Vec<Vec<u8>>>,
+    pub inclusion_list_transactions_calls: Mutex<usize>,
+    pub published_inclusion_lists: Mutex<Vec<heze::SignedInclusionList>>,
     /// The fork each `attestation_data` call named, in call order.
     pub attestation_data_forks: Mutex<Vec<ForkName>>,
     pub duties_calls: Mutex<usize>,
@@ -367,6 +376,54 @@ impl MockBeaconNode {
             .lock()
             .expect("lock")
             .clone()
+    }
+
+    pub fn with_inclusion_list_duties(
+        self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<InclusionListDutyDto>,
+    ) -> Self {
+        self.set_inclusion_list_duties(epoch, dependent_root, duties);
+        self
+    }
+
+    /// Replace the inclusion list duties stored for `epoch`, the way
+    /// `set_duties` does.
+    pub fn set_inclusion_list_duties(
+        &self,
+        epoch: Epoch,
+        dependent_root: Root,
+        duties: Vec<InclusionListDutyDto>,
+    ) {
+        let mut stored = self.inclusion_list_duties.lock().expect("lock");
+        let entry = InclusionListDuties {
+            dependent_root,
+            duties,
+        };
+        match stored.iter_mut().find(|(held, _)| *held == epoch) {
+            Some((_, existing)) => *existing = entry,
+            None => stored.push((epoch, entry)),
+        }
+    }
+
+    pub fn inclusion_list_duties_call_count(&self) -> usize {
+        *self.inclusion_list_duties_calls.lock().expect("lock")
+    }
+
+    /// Answer `inclusion_list_transactions` with `transactions`.
+    pub fn with_inclusion_list_transactions(mut self, transactions: Vec<Vec<u8>>) -> Self {
+        self.inclusion_list_transactions = Some(transactions);
+        self
+    }
+
+    pub fn inclusion_list_transactions_call_count(&self) -> usize {
+        *self.inclusion_list_transactions_calls.lock().expect("lock")
+    }
+
+    /// Every inclusion list published so far.
+    pub fn published_inclusion_lists(&self) -> Vec<heze::SignedInclusionList> {
+        self.published_inclusion_lists.lock().expect("lock").clone()
     }
 
     /// Answer `sync_duties` for the period containing `epoch` with `duties`.
@@ -748,6 +805,41 @@ impl BeaconNodeApi for MockBeaconNode {
             .expect("lock")
             .extend_from_slice(messages);
         Ok(messages.len())
+    }
+
+    async fn inclusion_list_duties(
+        &self,
+        epoch: Epoch,
+        _indices: &[ValidatorIndex],
+    ) -> Result<InclusionListDuties> {
+        self.guard("inclusion_list_duties")?;
+        *self.inclusion_list_duties_calls.lock().expect("lock") += 1;
+        self.inclusion_list_duties
+            .lock()
+            .expect("lock")
+            .iter()
+            .find(|(stored, _)| *stored == epoch)
+            .map(|(_, duties)| duties.clone())
+            .ok_or_else(|| Error::BeaconNode {
+                url: "mock".to_string(),
+                failure: BeaconNodeFailure::Request,
+                detail: format!("no inclusion list duties for epoch {epoch}"),
+            })
+    }
+
+    async fn inclusion_list_transactions(&self, _slot: Slot) -> Result<Vec<Vec<u8>>> {
+        self.guard("inclusion_list_transactions")?;
+        *self.inclusion_list_transactions_calls.lock().expect("lock") += 1;
+        Ok(self.inclusion_list_transactions.clone().unwrap_or_default())
+    }
+
+    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+        self.guard("publish_inclusion_list")?;
+        self.published_inclusion_lists
+            .lock()
+            .expect("lock")
+            .push(signed.clone());
+        Ok(())
     }
 
     async fn submit_attestations(

@@ -53,7 +53,7 @@ fn activation_churn_limit(state: &BeaconState, config: &Config) -> Result<u64> {
             Ok(churn_limit)
         }
         ForkName::Deneb => Ok(config.max_per_epoch_activation_churn_limit.min(churn_limit)),
-        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas) => {
+        fork @ (ForkName::Electra | ForkName::Fulu | ForkName::Gloas | ForkName::Heze) => {
             Err(Error::UnsupportedForFork {
                 function: "process_registry_updates",
                 fork,

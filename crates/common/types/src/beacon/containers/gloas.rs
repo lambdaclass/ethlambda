@@ -58,12 +58,14 @@ use super::electra::{
     PendingPartialWithdrawal, WithdrawalRequest,
 };
 use super::fulu::{Cell, ProposerLookahead};
+use super::heze::InclusionListBits;
 use super::shared::{
     AttestationData, BeaconBlockHeader, BlockRoots, Checkpoint, Deposit, Eth1Data, Eth1DataVotes,
     Fork, HistoricalRoots, HistoricalSummaries, JustificationBits, ProgressiveBalances,
     ProgressiveValidators, ProposerSlashing, RandaoMixes, SignedVoluntaryExit, Slashings,
     StateRoots,
 };
+use crate::beacon::fork::ForkName;
 use crate::beacon::preset;
 use crate::beacon::primitives::{
     BlsPubkey, BlsSignature, Bytes32, ColumnIndex, Epoch, ExecutionAddress, ExecutionBlockHash,
@@ -378,19 +380,26 @@ pub struct IndexedPayloadAttestation {
 /// A builder's commitment to reveal a payload for a slot (EIP-7732): what a
 /// proposer chooses among, and signs over, in place of embedding a payload in
 /// the block directly.
-#[derive(
-    Debug,
-    Clone,
-    Default,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
-)]
-#[ssz(progressive_container)]
+///
+/// One struct serves gloas and heze. Heze (EIP-7805) appends one field,
+/// `inclusion_list_bits`, and changes nothing else in any container: the
+/// block body, block and state are heze's only because they embed this bid.
+/// Carrying the field as an `Option` (`None` on a gloas bid, `Some` on a heze
+/// one) keeps every gloas container, and every function over one, serving
+/// both forks, instead of each being restated for a field only fork choice
+/// and the builder market read. [`Self::fork_name`] reads which one a bid is.
+///
+/// That is why SSZ is written out below rather than derived. The two shapes
+/// differ only in the fixed part's tail, so the offset to
+/// `blob_kzg_commitments` (the first variable field, and so the fixed part's
+/// length) says which one an encoding is: [`GLOAS_BID_FIXED_LEN`] or
+/// [`HEZE_BID_FIXED_LEN`]. Merkleization follows the progressive container
+/// the specification declares for each: twelve active fields, or thirteen.
+/// A decoder handed bytes for a known fork checks the shape it got against
+/// that fork (`SignedBeaconBlock::from_ssz`, `BeaconState::from_ssz`, the
+/// bid topic), since nothing at this level knows which fork the bytes were
+/// meant for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutionPayloadBid {
     pub parent_block_hash: ExecutionBlockHash,
     pub parent_block_root: Root,
@@ -415,6 +424,186 @@ pub struct ExecutionPayloadBid {
     /// carry, committed to here so the bid is binding on the requests too,
     /// not only the payload itself.
     pub execution_requests_root: Root,
+    /// Heze (EIP-7805): which members of the previous slot's inclusion list
+    /// committee the builder saw a list from, so the builder commits to
+    /// satisfying at least those. `None` on a gloas bid; see the type's doc.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::beacon::serde_helpers::optional_ssz_hex"
+    )]
+    pub inclusion_list_bits: Option<InclusionListBits>,
+}
+
+/// The fixed part of a gloas [`ExecutionPayloadBid`]: four 32-byte roots and
+/// hashes, a 20-byte address, five `u64`s, one offset, and the requests root.
+pub const GLOAS_BID_FIXED_LEN: usize = 4 * 32 + 20 + 5 * 8 + BYTES_PER_LENGTH_OFFSET + 32;
+
+/// The fixed part of a heze [`ExecutionPayloadBid`]: gloas's, plus
+/// `inclusion_list_bits`.
+pub const HEZE_BID_FIXED_LEN: usize =
+    GLOAS_BID_FIXED_LEN + preset::INCLUSION_LIST_COMMITTEE_SIZE.div_ceil(8);
+
+/// Where `blob_kzg_commitments`' offset sits in the fixed part, at either
+/// fork: after the ten fixed fields that precede it.
+const BLOB_KZG_COMMITMENTS_OFFSET_AT: usize = 4 * 32 + 20 + 5 * 8;
+
+const BYTES_PER_LENGTH_OFFSET: usize = 4;
+
+impl ExecutionPayloadBid {
+    /// The fork whose shape this bid has: heze when it carries
+    /// `inclusion_list_bits`, gloas otherwise.
+    pub fn fork_name(&self) -> ForkName {
+        if self.inclusion_list_bits.is_some() {
+            ForkName::Heze
+        } else {
+            ForkName::Gloas
+        }
+    }
+
+    fn fixed_len(&self) -> usize {
+        if self.inclusion_list_bits.is_some() {
+            HEZE_BID_FIXED_LEN
+        } else {
+            GLOAS_BID_FIXED_LEN
+        }
+    }
+}
+
+impl libssz::SszEncode for ExecutionPayloadBid {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    /// Unused for a variable-size container, whose parent writes an offset in
+    /// its place; answered the way the derive would, with the gloas fixed
+    /// part.
+    fn fixed_size() -> usize {
+        GLOAS_BID_FIXED_LEN
+    }
+
+    fn encoded_len(&self) -> usize {
+        self.fixed_len() + self.blob_kzg_commitments.encoded_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let mut encoder = libssz::ContainerEncoder::new(buf, self.fixed_len());
+        encoder.append_fixed(&self.parent_block_hash);
+        encoder.append_fixed(&self.parent_block_root);
+        encoder.append_fixed(&self.block_hash);
+        encoder.append_fixed(&self.prev_randao);
+        encoder.append_fixed(&self.fee_recipient);
+        encoder.append_fixed(&self.gas_limit);
+        encoder.append_fixed(&self.builder_index);
+        encoder.append_fixed(&self.slot);
+        encoder.append_fixed(&self.value);
+        encoder.append_fixed(&self.execution_payment);
+        encoder.append_variable(&self.blob_kzg_commitments);
+        encoder.append_fixed(&self.execution_requests_root);
+        if let Some(bits) = &self.inclusion_list_bits {
+            encoder.append_fixed(bits);
+        }
+        encoder.finalize();
+    }
+}
+
+impl libssz::SszDecode for ExecutionPayloadBid {
+    fn is_fixed_size() -> bool {
+        false
+    }
+
+    fn fixed_size() -> usize {
+        GLOAS_BID_FIXED_LEN
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, libssz::DecodeError> {
+        let offset_end = BLOB_KZG_COMMITMENTS_OFFSET_AT + BYTES_PER_LENGTH_OFFSET;
+        let offset_bytes = bytes
+            .get(BLOB_KZG_COMMITMENTS_OFFSET_AT..offset_end)
+            .ok_or(libssz::DecodeError::InvalidByteLength {
+                expected: GLOAS_BID_FIXED_LEN,
+                got: bytes.len(),
+            })?;
+        let first_offset = u32::from_le_bytes(
+            offset_bytes
+                .try_into()
+                .expect("slice of BYTES_PER_LENGTH_OFFSET bytes"),
+        ) as usize;
+        // The first offset is the fixed part's length, which is what tells
+        // the two shapes apart. Anything else is a malformed encoding of
+        // either; report it against gloas's, the shape a bid had first.
+        let carries_inclusion_list_bits = match first_offset {
+            GLOAS_BID_FIXED_LEN => false,
+            HEZE_BID_FIXED_LEN => true,
+            got => {
+                return Err(libssz::DecodeError::InvalidFirstOffset {
+                    expected: GLOAS_BID_FIXED_LEN,
+                    got,
+                });
+            }
+        };
+
+        let mut decoder = libssz::ContainerDecoder::new(bytes, first_offset)?;
+        let parent_block_hash = decoder.decode_fixed()?;
+        let parent_block_root = decoder.decode_fixed()?;
+        let block_hash = decoder.decode_fixed()?;
+        let prev_randao = decoder.decode_fixed()?;
+        let fee_recipient = decoder.decode_fixed()?;
+        let gas_limit = decoder.decode_fixed()?;
+        let builder_index = decoder.decode_fixed()?;
+        let slot = decoder.decode_fixed()?;
+        let value = decoder.decode_fixed()?;
+        let execution_payment = decoder.decode_fixed()?;
+        decoder.read_variable_offset()?;
+        let execution_requests_root = decoder.decode_fixed()?;
+        let inclusion_list_bits = if carries_inclusion_list_bits {
+            Some(decoder.decode_fixed()?)
+        } else {
+            None
+        };
+        let blob_kzg_commitments = decoder.decode_variable()?;
+        Ok(Self {
+            parent_block_hash,
+            parent_block_root,
+            block_hash,
+            prev_randao,
+            fee_recipient,
+            gas_limit,
+            builder_index,
+            slot,
+            value,
+            execution_payment,
+            blob_kzg_commitments,
+            execution_requests_root,
+            inclusion_list_bits,
+        })
+    }
+}
+
+impl libssz_merkle::HashTreeRoot for ExecutionPayloadBid {
+    fn hash_tree_root(&self, hasher: &impl libssz_merkle::Sha256Hasher) -> libssz_merkle::Node {
+        let mut chunks = Vec::with_capacity(13);
+        chunks.push(self.parent_block_hash.hash_tree_root(hasher));
+        chunks.push(self.parent_block_root.hash_tree_root(hasher));
+        chunks.push(self.block_hash.hash_tree_root(hasher));
+        chunks.push(self.prev_randao.hash_tree_root(hasher));
+        chunks.push(self.fee_recipient.hash_tree_root(hasher));
+        chunks.push(self.gas_limit.hash_tree_root(hasher));
+        chunks.push(self.builder_index.hash_tree_root(hasher));
+        chunks.push(self.slot.hash_tree_root(hasher));
+        chunks.push(self.value.hash_tree_root(hasher));
+        chunks.push(self.execution_payment.hash_tree_root(hasher));
+        chunks.push(self.blob_kzg_commitments.hash_tree_root(hasher));
+        chunks.push(self.execution_requests_root.hash_tree_root(hasher));
+        if let Some(bits) = &self.inclusion_list_bits {
+            chunks.push(bits.hash_tree_root(hasher));
+        }
+        // Every field is active in both shapes, so `active_fields` is as many
+        // ones as there are chunks.
+        let active_fields = vec![true; chunks.len()];
+        let root = libssz_merkle::merkleize_progressive(hasher, &chunks);
+        libssz_merkle::mix_in_active_fields(hasher, &root, &active_fields)
+    }
 }
 
 #[derive(
@@ -819,6 +1008,19 @@ impl BeaconBlockBody {
     /// already reach for by that name.
     pub fn empty() -> Self {
         Self::default()
+    }
+
+    /// [`Self::empty`] in `fork`'s shape: heze's default bid carries an
+    /// all-zero `inclusion_list_bits`, gloas's none (see
+    /// [`ExecutionPayloadBid`]).
+    pub fn empty_at(fork: ForkName) -> Self {
+        let mut body = Self::empty();
+        if fork == ForkName::Heze {
+            body.signed_execution_payload_bid
+                .message
+                .inclusion_list_bits = Some(InclusionListBits::new());
+        }
+        body
     }
 }
 

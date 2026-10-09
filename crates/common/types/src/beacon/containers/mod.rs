@@ -46,6 +46,7 @@ pub mod deneb;
 pub mod electra;
 pub mod fulu;
 pub mod gloas;
+pub mod heze;
 pub mod phase0;
 pub mod shared;
 
@@ -183,6 +184,21 @@ macro_rules! dispatch_block_including_lean {
     };
 }
 
+/// Refuses a gloas-family value decoded for `fork` whose bid has the other
+/// fork's shape. Gloas and heze share their containers (see
+/// [`gloas::ExecutionPayloadBid`]), so decoding accepts either shape and the
+/// fork the caller expected is checked here.
+fn expect_shape(fork: ForkName, shape: ForkName) -> Result<()> {
+    if fork == shape {
+        Ok(())
+    } else {
+        Err(Error::ForkShapeMismatch {
+            expected: fork,
+            found: shape,
+        })
+    }
+}
+
 /// The beacon state, in whichever fork's shape it currently has, plus the lean
 /// state.
 ///
@@ -203,6 +219,8 @@ pub enum BeaconState {
     Deneb(deneb::BeaconState),
     Electra(electra::BeaconState),
     Fulu(fulu::BeaconState),
+    /// Gloas's state, and heze's: see [`SignedBeaconBlock::Gloas`] for why
+    /// one variant serves both.
     Gloas(gloas::BeaconState),
     Lean(crate::state::State),
 }
@@ -288,7 +306,8 @@ impl BeaconState {
             BeaconState::Deneb(_) => ForkName::Deneb,
             BeaconState::Electra(_) => ForkName::Electra,
             BeaconState::Fulu(_) => ForkName::Fulu,
-            BeaconState::Gloas(_) => ForkName::Gloas,
+            // Heze's state is gloas's, told apart by its bid's shape.
+            BeaconState::Gloas(state) => state.latest_execution_payload_bid.fork_name(),
             BeaconState::Lean(_) => ForkName::Lean,
         }
     }
@@ -351,9 +370,11 @@ impl BeaconState {
                 bytes,
             )?)),
             ForkName::Fulu => Ok(BeaconState::Fulu(fulu::BeaconState::from_ssz_bytes(bytes)?)),
-            ForkName::Gloas => Ok(BeaconState::Gloas(gloas::BeaconState::from_ssz_bytes(
-                bytes,
-            )?)),
+            ForkName::Gloas | ForkName::Heze => {
+                let state = gloas::BeaconState::from_ssz_bytes(bytes)?;
+                expect_shape(fork, state.latest_execution_payload_bid.fork_name())?;
+                Ok(BeaconState::Gloas(state))
+            }
             ForkName::Lean => Ok(BeaconState::Lean(crate::state::State::from_ssz_bytes(
                 bytes,
             )?)),
@@ -1564,6 +1585,11 @@ pub enum SignedBeaconBlock {
     /// Fulu's block. See the enum doc for why this wraps
     /// [`electra::SignedBeaconBlock`] instead of a `fulu` type.
     Fulu(electra::SignedBeaconBlock),
+    /// Gloas's block, and heze's: heze changes no block field except the
+    /// bid's, which [`gloas::ExecutionPayloadBid`] carries for both forks, and
+    /// unlike fulu's against electra's the two shapes differ on the wire, so
+    /// [`Self::fork_name`] reads the fork off the bid rather than needing a
+    /// variant to remember it.
     Gloas(gloas::SignedBeaconBlock),
 
     /// The Lean consensus protocol's block.
@@ -1699,7 +1725,13 @@ impl SignedBeaconBlock {
             SignedBeaconBlock::Deneb(_) => ForkName::Deneb,
             SignedBeaconBlock::Electra(_) => ForkName::Electra,
             SignedBeaconBlock::Fulu(_) => ForkName::Fulu,
-            SignedBeaconBlock::Gloas(_) => ForkName::Gloas,
+            // Heze's block is gloas's, told apart by its bid's shape.
+            SignedBeaconBlock::Gloas(block) => block
+                .message
+                .body
+                .signed_execution_payload_bid
+                .message
+                .fork_name(),
             SignedBeaconBlock::Lean(_) => ForkName::Lean,
         }
     }
@@ -1733,9 +1765,12 @@ impl SignedBeaconBlock {
             ForkName::Fulu => Ok(SignedBeaconBlock::Fulu(
                 electra::SignedBeaconBlock::from_ssz_bytes(bytes)?,
             )),
-            ForkName::Gloas => Ok(SignedBeaconBlock::Gloas(
-                gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?,
-            )),
+            ForkName::Gloas | ForkName::Heze => {
+                let block = gloas::SignedBeaconBlock::from_ssz_bytes(bytes)?;
+                let bid = &block.message.body.signed_execution_payload_bid.message;
+                expect_shape(fork, bid.fork_name())?;
+                Ok(SignedBeaconBlock::Gloas(block))
+            }
             ForkName::Lean => Ok(SignedBeaconBlock::Lean(
                 crate::block::SignedBlock::from_ssz_bytes(bytes)?,
             )),
@@ -1895,9 +1930,10 @@ impl DataColumnSidecar {
     pub fn from_ssz(fork: ForkName, bytes: &[u8]) -> Result<Self> {
         match fork {
             ForkName::Fulu => Ok(Self::Fulu(fulu::DataColumnSidecar::from_ssz_bytes(bytes)?)),
-            ForkName::Gloas => Ok(Self::Gloas(gloas::DataColumnSidecar::from_ssz_bytes(
-                bytes,
-            )?)),
+            // Heze leaves the gloas sidecar unchanged.
+            ForkName::Gloas | ForkName::Heze => Ok(Self::Gloas(
+                gloas::DataColumnSidecar::from_ssz_bytes(bytes)?,
+            )),
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix

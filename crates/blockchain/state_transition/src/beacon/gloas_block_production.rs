@@ -34,6 +34,7 @@ use super::helpers::gloas::{
     is_active_builder, is_attestation_same_slot, is_valid_indexed_payload_attestation,
 };
 use super::stf;
+use ethlambda_types::beacon::containers::heze::InclusionListBits;
 use ethlambda_types::beacon::{
     constants,
     containers::{
@@ -350,6 +351,12 @@ pub struct GloasBlockInputs {
     /// The block's sync aggregate: `empty_sync_aggregate`, or what
     /// `verified_sync_aggregate` vouched for.
     pub sync_aggregate: SyncAggregate,
+    /// Heze (EIP-7805): the self-build bid's `inclusion_list_bits`, the
+    /// previous slot's inclusion list committee members this node holds a
+    /// list from (`get_inclusion_list_bits` with `only_timely=False`, so the
+    /// bid is inclusive of the proposer's whole view). `None` at a gloas slot,
+    /// whose bid has no such field; `Some` at a heze one.
+    pub inclusion_list_bits: Option<InclusionListBits>,
 }
 
 /// What a gloas block body carries when it commits to another builder's bid
@@ -497,6 +504,7 @@ pub fn assemble_gloas_block(
         execution_payment: 0,
         blob_kzg_commitments: inputs.blob_kzg_commitments.into(),
         execution_requests_root: inputs.execution_requests.hash_tree_root(),
+        inclusion_list_bits: inputs.inclusion_list_bits,
     };
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
@@ -731,6 +739,7 @@ pub mod test_support {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: vec![KzgCommitment([5; 48])],
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         )
@@ -869,6 +878,7 @@ mod gloas_block_production_tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         )
@@ -1015,6 +1025,7 @@ mod gloas_block_production_tests {
                 execution_payload: payload,
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         );
@@ -1046,6 +1057,7 @@ mod gloas_block_production_tests {
                 execution_payload: payload,
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         );
@@ -1200,6 +1212,7 @@ mod gloas_block_production_tests {
                 execution_payload: payload_for(&inputs),
                 blob_kzg_commitments: Vec::new(),
                 execution_requests: ExecutionRequests::default(),
+                inclusion_list_bits: None,
             },
             &config(),
         )

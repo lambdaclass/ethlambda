@@ -7,7 +7,7 @@
 //! recorded in the node's shared `BuilderMarket` by the verdict.
 
 use ethlambda_state_transition::beacon::gossip::{
-    self, Outcome, RejectReason, execution_payload_bid::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE,
+    self, Outcome, RejectReason, execution_payload_bid::MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE,
 };
 use ethlambda_types::beacon::containers::gloas::{
     SignedExecutionPayloadBid, SignedProposerPreferences,
@@ -32,7 +32,7 @@ use crate::{P2PServer, metrics};
 /// and the object carries the market on to its stateful checks.
 pub(crate) fn triage_execution_payload_bid(server: &P2PServer, payload: &[u8]) -> Dispatch {
     const KIND: &str = beacon_topics::EXECUTION_PAYLOAD_BID;
-    if payload.len() > MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE {
+    if payload.len() > MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE {
         metrics::inc_beacon_gossip(KIND, "decode_failed");
         debug!(
             kind = KIND,
@@ -241,7 +241,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversized_bid_is_malformed_before_it_is_decoded() {
         let server = unconnected_beacon_server(gloas_from_genesis(), 0).await;
-        let payload = vec![0xff; MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE + 1];
+        let payload = vec![0xff; MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE + 1];
         assert!(matches!(
             triage_execution_payload_bid(&server, &payload),
             Dispatch::Report(Outcome::Reject(RejectReason::Malformed))

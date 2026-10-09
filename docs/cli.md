@@ -165,7 +165,7 @@ of its own the way `node` does: those are read off the resolved network instead
 of being separate operator input. A `config.yaml` (a directory's, or a built-in
 network's embedded one) is read permissively: absent keys fall back to mainnet's values,
 numbers are accepted quoted or bare, and unrecognised keys (on a current
-config, the heze schedule this build does not claim) are dropped
+config, later forks' schedules this build does not claim) are dropped
 with one warning line naming each. Its `PRESET_BASE` is checked against the
 compiled preset; a mismatch is a hard startup error naming the cargo feature
 that would fix it. Sepolia's config schedules gloas, which this build follows, so

@@ -27,6 +27,7 @@ use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::electra::Attestation;
 use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::heze;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -39,14 +40,15 @@ use libssz::SszDecode as _;
 use crate::beacon_node::block_contents::ProducedBlock;
 use crate::beacon_node::dto::{
     AttestationDataDto, AttestationDto, AttesterDutyDto, BlockRootResponse,
-    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, IndexedErrorResponse,
-    ProposerDutyDto, ProposerPreparationDto, PtcDutyDto, SignedAggregateAndProofOutDto,
-    SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto, SyncingDto, ValidatorEntryDto,
-    VersionedResponse, config_from_spec_response, encode_hex, parse_pubkey, parse_root,
+    CommitteeSubscriptionDto, DataResponse, DutiesResponse, GenesisDto, InclusionListDutyDto,
+    IndexedErrorResponse, ProposerDutyDto, ProposerPreparationDto, PtcDutyDto,
+    SignedAggregateAndProofOutDto, SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
+    SyncingDto, ValidatorEntryDto, VersionedResponse, config_from_spec_response, encode_hex,
+    parse_pubkey, parse_root,
 };
 use crate::beacon_node::{
     AggregateAttestation, AggregateKind, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
-    ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
     validate_attestation_data, validate_produced_block, validate_sync_contribution,
 };
 use crate::error::{BeaconNodeFailure, Error, Result};
@@ -348,7 +350,7 @@ impl HttpBeaconNode {
         let response = self
             .post_json_for_ssz(&path, BUILDER_CONFIG, request.fork.as_str())
             .await?;
-        if response.fork != ForkName::Gloas {
+        if !response.fork.is_gloas_or_later() {
             return Err(Error::InconsistentResponse(format!(
                 "asked for a gloas block for slot {}, node answered with a {} one",
                 request.slot,
@@ -697,7 +699,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             encode_hex(&block_root.0)
         );
         let response = self.get_ssz(&path).await?;
-        if response.fork != ForkName::Gloas {
+        if !response.fork.is_gloas_or_later() {
             return Err(Error::InconsistentResponse(format!(
                 "node answered an envelope request with a {} body",
                 response.fork.as_str()
@@ -817,6 +819,51 @@ impl BeaconNodeApi for HttpBeaconNode {
         Self::handle_pool_submission(status, body, messages.len())
     }
 
+    async fn inclusion_list_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<InclusionListDuties> {
+        let body: Vec<String> = indices.iter().map(|index| index.to_string()).collect();
+        let response: DutiesResponse<Vec<InclusionListDutyDto>> = self
+            .post(
+                &format!("/eth/v1/validator/duties/inclusion_list/{epoch}"),
+                &body,
+                None,
+            )
+            .await?;
+        Ok(InclusionListDuties {
+            dependent_root: parse_root(&response.dependent_root)?,
+            duties: response.data,
+        })
+    }
+
+    async fn inclusion_list_transactions(&self, slot: Slot) -> Result<Vec<Vec<u8>>> {
+        let response: DataResponse<Vec<String>> = self
+            .get(&format!("/eth/v1/validator/inclusion_list?slot={slot}"))
+            .await?;
+        response
+            .data
+            .iter()
+            .map(|transaction| {
+                hex::decode(transaction.strip_prefix("0x").unwrap_or(transaction))
+                    .map_err(|err| Error::Decode(format!("bad inclusion list transaction: {err}")))
+            })
+            .collect()
+    }
+
+    /// The list goes under `data`, the body `publishInclusionList` takes,
+    /// with the fork named in the header the endpoint requires.
+    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+        let body = serde_json::json!({ "data": signed });
+        self.post_no_content(
+            "/eth/v1/validator/inclusion_list",
+            &body,
+            Some(ForkName::Heze.as_str()),
+        )
+        .await
+    }
+
     /// Distinct from `post_no_content`: this endpoint's 400s are not always
     /// total failures. See [`Self::handle_pool_submission`].
     async fn submit_attestations(
@@ -897,7 +944,7 @@ impl BeaconNodeApi for HttpBeaconNode {
             }
             // Gloas's attestation is its own container, with its own hash tree
             // root, so it is decoded as one and signed over as one.
-            ForkName::Gloas => {
+            ForkName::Gloas | ForkName::Heze => {
                 let attestation: gloas::Attestation = serde_json::from_value(response.data)
                     .map_err(|err| Error::Decode(format!("gloas aggregate: {err}")))?;
                 AggregateKind::Gloas(attestation)

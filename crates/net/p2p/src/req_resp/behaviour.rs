@@ -63,6 +63,7 @@ pub(crate) struct ReqResp {
     pub(crate) data_column_sidecars_by_root: request_response::Behaviour<Codec>,
     pub(crate) execution_payload_envelopes_by_range: request_response::Behaviour<Codec>,
     pub(crate) execution_payload_envelopes_by_root: request_response::Behaviour<Codec>,
+    pub(crate) inclusion_lists_by_indices: request_response::Behaviour<Codec>,
 }
 
 impl ReqResp {
@@ -217,11 +218,21 @@ impl ReqResp {
                 fetch_protocol_config(),
             ),
             execution_payload_envelopes_by_root: request_response::Behaviour::with_codec(
-                codec,
+                codec.clone(),
                 one_protocol(
                     is_beacon,
                     beacon::protocols::EXECUTION_PAYLOAD_ENVELOPES_BY_ROOT_V1,
                     request_response::ProtocolSupport::Full,
+                ),
+                fetch_protocol_config(),
+            ),
+            // Inbound only: this node answers the request but sends none.
+            inclusion_lists_by_indices: request_response::Behaviour::with_codec(
+                codec,
+                one_protocol(
+                    is_beacon,
+                    beacon::protocols::INCLUSION_LISTS_BY_INDICES_V1,
+                    request_response::ProtocolSupport::Inbound,
                 ),
                 fetch_protocol_config(),
             ),

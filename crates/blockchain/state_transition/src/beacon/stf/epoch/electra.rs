@@ -122,7 +122,8 @@ pub(super) fn process_unfused_steps(
         | ForkName::Bellatrix
         | ForkName::Capella
         | ForkName::Deneb
-        | ForkName::Gloas) => {
+        | ForkName::Gloas
+        | ForkName::Heze) => {
             return Err(Error::UnsupportedForFork {
                 function: "process_unfused_steps",
                 fork,

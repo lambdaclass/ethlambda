@@ -90,6 +90,32 @@ impl Serialize for PayloadAttributesV4 {
     }
 }
 
+/// `PayloadAttributesV5` (Bogota): `PayloadAttributesV4` plus the inclusion
+/// list transactions (EIP-7805) the built payload must satisfy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadAttributesV5 {
+    /// V4's seven fields, serialized flat alongside the one below.
+    pub v4: PayloadAttributesV4,
+    /// Each an EIP-2718 transaction's bytes, sent as `DATA`.
+    pub inclusion_list_transactions: Vec<Vec<u8>>,
+}
+
+impl Serialize for PayloadAttributesV5 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut value = serde_json::to_value(&self.v4).map_err(serde::ser::Error::custom)?;
+        let object = value
+            .as_object_mut()
+            .expect("PayloadAttributesV4 serializes as an object");
+        let transactions: Vec<String> = self
+            .inclusion_list_transactions
+            .iter()
+            .map(|transaction| data(transaction))
+            .collect();
+        object.insert("inclusionListTransactions".into(), transactions.into());
+        value.serialize(serializer)
+    }
+}
+
 /// The execution client's name for one build process, `DATA` of eight bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PayloadId(pub [u8; 8]);
@@ -362,7 +388,7 @@ fn decode(message: &str) -> EngineError {
 }
 
 /// A `DATA` of any length.
-fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
+pub(crate) fn parse_data(text: &str) -> Result<Vec<u8>, EngineError> {
     let digits = text
         .strip_prefix("0x")
         .ok_or_else(|| decode("DATA must be 0x-prefixed"))?;

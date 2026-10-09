@@ -2024,6 +2024,7 @@ mod tests {
             execution_payment: 0,
             blob_kzg_commitments: Default::default(),
             execution_requests_root: execution_requests.hash_tree_root(),
+            inclusion_list_bits: None,
         };
         tweak_bid(&mut bid);
 

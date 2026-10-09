@@ -129,15 +129,19 @@ async fn post_block(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
+    if !matches!(
+        fork,
+        Some(ForkName::Fulu | ForkName::Gloas | ForkName::Heze)
+    ) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, gloas or heze")
+            .into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
         Err(err) => return err.into_response(),
     };
-    if fork == Some(ForkName::Gloas) {
-        return post_gloas_block(&store, &p2p, encoding, &body).await;
+    if let Some(fork @ (ForkName::Gloas | ForkName::Heze)) = fork {
+        return post_gloas_block(&store, &p2p, fork, encoding, &body).await;
     }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
@@ -246,6 +250,7 @@ async fn post_block(
 async fn post_gloas_block(
     store: &Store,
     p2p: &RpcToP2PRef,
+    fork: ForkName,
     encoding: BodyEncoding,
     body: &[u8],
 ) -> Response {
@@ -260,6 +265,15 @@ async fn post_gloas_block(
         "blocks are accepted for gloas slots only",
     ) {
         return err.into_response();
+    }
+    // Gloas and heze share the container, so the body's own bid says which
+    // fork it is; it must be the one the header and the slot both name.
+    let slot_fork = config.fork_at_epoch(compute_epoch_at_slot(block.slot()));
+    if block.fork_name() != fork || slot_fork != fork {
+        return ApiError::BadRequest(
+            "Eth-Consensus-Version, the block's shape and its slot's fork disagree",
+        )
+        .into_response();
     }
     let parent_state = match store.get_state(&block.parent_root()) {
         Ok(Some(state)) => state,
@@ -312,7 +326,7 @@ pub(crate) fn require_gloas_slot(
     message: &'static str,
 ) -> Result<(), ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas => Ok(()),
+        ForkName::Gloas | ForkName::Heze => Ok(()),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -345,6 +359,7 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Gloas
+        | ForkName::Heze
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }

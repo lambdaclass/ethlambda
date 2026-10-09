@@ -258,6 +258,8 @@ fn handle_beacon_gossip(
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
         triage_payload_attestation(server, payload)
+    } else if kind == beacon_topics::INCLUSION_LIST {
+        triage_inclusion_list(server, payload)
     } else if matches!(
         kind,
         beacon_topics::VOLUNTARY_EXIT
@@ -561,6 +563,42 @@ fn triage_payload_attestation(server: &P2PServer, payload: &[u8]) -> Dispatch {
         return Dispatch::Report(outcome);
     }
     Dispatch::Validate(Validated::PayloadAttestation(message))
+}
+
+/// Decode a heze inclusion list and run its cheap gossip checks. Same shape
+/// as [`triage_payload_attestation`]. The receipt time travels with the list:
+/// it decides the list's timeliness once the stateful checks accept it.
+fn triage_inclusion_list(server: &P2PServer, payload: &[u8]) -> Dispatch {
+    const KIND: &str = beacon_topics::INCLUSION_LIST;
+    let signed = match beacon_decode::decode_inclusion_list(payload) {
+        Ok(signed) => signed,
+        Err(err) => {
+            metrics::inc_beacon_gossip(KIND, "decode_failed");
+            debug!(kind = KIND, %err, bytes = payload.len(), "Beacon gossip decode failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        }
+    };
+    metrics::inc_beacon_gossip(KIND, "decoded");
+    let received_ms = unix_now_ms();
+    debug!(
+        slot = signed.message.slot,
+        validator = signed.message.validator_index,
+        dependent_root = %ShortRoot(&signed.message.dependent_root.0),
+        transactions = signed.message.transactions.len(),
+        "Beacon inclusion list decoded"
+    );
+    if let Err(outcome) = gossip::inclusion_list::cheap_checks(
+        &server.seen_inclusion_lists,
+        &server.store,
+        &signed,
+        received_ms,
+    ) {
+        return Dispatch::Report(outcome);
+    }
+    Dispatch::Validate(Validated::InclusionList {
+        signed: Box::new(signed),
+        received_ms,
+    })
 }
 
 /// Decode one of the four operation topics (`voluntary_exit`,
@@ -1095,6 +1133,42 @@ pub async fn publish_execution_payload_envelope(
 /// is handed it here to count the vote in its fork choice. The seen cache is
 /// marked as well: a peer that echoes the vote back would otherwise pass
 /// triage and be validated and forwarded a second time.
+/// Gossip a heze inclusion list on `inclusion_list` under its slot's digest.
+/// The caller validated and stored it; counting it as seen here keeps a copy
+/// relayed back by a peer from being judged a second time as a new list.
+pub fn publish_inclusion_list(
+    server: &mut P2PServer,
+    signed: ethlambda_types::beacon::containers::heze::SignedInclusionList,
+) {
+    let slot = signed.message.slot;
+    let validator = signed.message.validator_index;
+    let Some(beacon) = server.wire.beacon() else {
+        error!(slot, "An inclusion list reached a lean node; dropping it");
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            "No held fork digest covers this inclusion list's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(
+        digest,
+        beacon_topics::INCLUSION_LIST,
+    ));
+    server
+        .swarm_handle
+        .publish(topic, compress_message(&signed.to_ssz()));
+    server.seen_inclusion_lists.record(&signed);
+    info!(
+        slot,
+        validator,
+        transactions = signed.message.transactions.len(),
+        "Published inclusion list to gossipsub"
+    );
+}
+
 pub async fn publish_payload_attestation_message(
     server: &mut P2PServer,
     message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,

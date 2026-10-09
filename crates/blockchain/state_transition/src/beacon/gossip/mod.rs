@@ -12,6 +12,7 @@ pub mod block;
 pub mod column;
 pub mod envelope;
 pub mod execution_payload_bid;
+pub mod inclusion_list;
 pub mod operations;
 pub mod payload_attestation;
 pub mod proposer_preferences;
@@ -25,6 +26,7 @@ pub(crate) mod test_support;
 pub use aggregate::SeenAggregates;
 pub use attestation::SeenAttestations;
 pub use envelope::SeenEnvelopes;
+pub use inclusion_list::SeenInclusionLists;
 pub use payload_attestation::SeenPayloadAttestations;
 pub use sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions};
 
@@ -196,6 +198,11 @@ pub enum IgnoreReason {
     AlreadyExiting,
     /// The head state's sync committees cannot answer for the message's period.
     SyncCommitteeUnavailable,
+    /// An inclusion list carries no transaction bytes at all.
+    EmptyInclusionList,
+    /// A heze bid's `inclusion_list_bits` leaves out a committee member whose
+    /// timely list this node holds.
+    InclusionListBitsNotInclusive,
 }
 
 impl IgnoreReason {
@@ -238,6 +245,8 @@ impl IgnoreReason {
             Self::BeforeFork => "before_fork",
             Self::AlreadyExiting => "already_exiting",
             Self::SyncCommitteeUnavailable => "sync_committee_unavailable",
+            Self::EmptyInclusionList => "empty_inclusion_list",
+            Self::InclusionListBitsNotInclusive => "inclusion_list_bits_not_inclusive",
         }
     }
 }
@@ -336,6 +345,17 @@ pub enum RejectReason {
     /// A sync committee contribution's subcommittee index is not below
     /// `SYNC_COMMITTEE_SUBNET_COUNT`.
     SubcommitteeIndex,
+    /// An inclusion list's transactions exceed
+    /// `MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST`.
+    InclusionListTooLarge,
+    /// An inclusion list carries a zero-length transaction.
+    EmptyTransaction,
+    /// An inclusion list's validator is not in its slot's inclusion list
+    /// committee.
+    NotInInclusionListCommittee,
+    /// A message's shape belongs to a different fork than the one its slot
+    /// is in: a gloas-shaped bid at a heze slot, or the reverse.
+    WrongForkShape,
 }
 
 impl RejectReason {
@@ -390,6 +410,10 @@ impl RejectReason {
             Self::NotInPtc => "not_in_ptc",
             Self::InvalidOperation => "invalid_operation",
             Self::SubcommitteeIndex => "subcommittee_index",
+            Self::InclusionListTooLarge => "inclusion_list_too_large",
+            Self::EmptyTransaction => "empty_transaction",
+            Self::NotInInclusionListCommittee => "not_in_inclusion_list_committee",
+            Self::WrongForkShape => "wrong_fork_shape",
         }
     }
 }
@@ -576,7 +600,7 @@ pub(crate) fn is_current_or_previous_epoch(config: &Config, epoch: Epoch, now_ms
 /// (A gloas aggregate has its own container, which says so itself.)
 pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Gloas => true,
+        ForkName::Gloas | ForkName::Heze => true,
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

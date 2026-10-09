@@ -314,6 +314,7 @@ impl World {
             execution_payment: 0,
             blob_kzg_commitments: Default::default(),
             execution_requests_root: ExecutionRequests::default().hash_tree_root(),
+            inclusion_list_bits: None,
         };
         let domain = get_domain(&prepared.state, DOMAIN_BEACON_BUILDER, None);
         let signing_root = compute_signing_root(message.hash_tree_root(), domain);

@@ -23,7 +23,6 @@ use ethlambda_types::{
             BeaconState,
             shared::{AttestationData, Checkpoint},
         },
-        fork::ForkName,
         fork_choice::PayloadStatus,
         preset,
         primitives::{BlsPubkey, CommitteeIndex, Epoch, ExecutionAddress, Slot, ValidatorIndex},
@@ -817,7 +816,7 @@ fn attestation_data(store: &Store, slot: Slot) -> Result<AttestationData, ApiErr
         root: block_root_at_or_before(&state, head_root, epoch_start)?,
     };
 
-    let index = if store.config().fork_at_epoch(epoch) == ForkName::Gloas {
+    let index = if store.config().fork_at_epoch(epoch).is_gloas_or_later() {
         payload_present_index(store, &state, slot)?
     } else {
         0

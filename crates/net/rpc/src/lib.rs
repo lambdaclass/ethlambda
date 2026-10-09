@@ -470,6 +470,8 @@ pub(crate) mod test_utils {
                 Vec<ethlambda_types::beacon::containers::DataColumnSidecar>,
             )>,
         >,
+        pub(crate) inclusion_lists:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::heze::SignedInclusionList>>,
         pub(crate) payload_attestations: std::sync::Mutex<
             Vec<ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage>,
         >,
@@ -582,6 +584,14 @@ pub(crate) mod test_utils {
             message: ethlambda_types::beacon::containers::gloas::PayloadAttestationMessage,
         ) -> Result<(), spawned_concurrency::error::ActorError> {
             self.payload_attestations.lock().unwrap().push(message);
+            Ok(())
+        }
+
+        fn publish_inclusion_list(
+            &self,
+            signed: ethlambda_types::beacon::containers::heze::SignedInclusionList,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.inclusion_lists.lock().unwrap().push(signed);
             Ok(())
         }
 

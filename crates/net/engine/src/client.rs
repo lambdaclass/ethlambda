@@ -11,7 +11,7 @@ use crate::auth::JwtSecret;
 use crate::error::EngineError;
 use crate::types::{
     ClientVersionV1, CustodyColumns, ExecutionPayloadV3, ExecutionPayloadV4, ForkchoiceStateV1,
-    ForkchoiceUpdatedResponse, PayloadStatusV1, data,
+    ForkchoiceUpdatedResponse, ForkchoiceUpdatedV5Response, PayloadStatusV1, PayloadStatusV2, data,
 };
 
 /// Per-attempt timeout.
@@ -25,6 +25,11 @@ pub const ENGINE_TIMEOUT: Duration = Duration::from_secs(8);
 /// gives that method. Tighter than [`ENGINE_TIMEOUT`], which stays the default
 /// for the older methods.
 pub const ENGINE_NEW_PAYLOAD_V5_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Per-attempt timeout for `engine_getInclusionListV1`, the value `bogota.md`
+/// gives that method: the list is due well inside the slot, so a slow answer
+/// is no answer.
+pub const ENGINE_GET_INCLUSION_LIST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How many times one call is attempted before it is given up on.
 ///
@@ -249,6 +254,86 @@ impl EngineClient {
             .await
     }
 
+    /// `engine_newPayloadV6`: Bogota's `newPayload`, which heze asks about a
+    /// revealed execution payload envelope (EIP-7805).
+    ///
+    /// V5's four parameters plus the inclusion list transactions the payload
+    /// is judged against; the answer adds whether a `VALID` payload satisfied
+    /// them. Same timeout as V5.
+    pub async fn new_payload_v6(
+        &self,
+        payload: &gloas::ExecutionPayload,
+        versioned_hashes: &[Bytes32],
+        parent_beacon_block_root: Root,
+        execution_requests: &[Vec<u8>],
+        inclusion_list_transactions: &[Vec<u8>],
+    ) -> Result<PayloadStatusV2, EngineError> {
+        let hashes: Vec<String> = versioned_hashes.iter().map(|hash| data(&hash.0)).collect();
+        let requests: Vec<String> = execution_requests
+            .iter()
+            .map(|request| data(request))
+            .collect();
+        let transactions: Vec<String> = inclusion_list_transactions
+            .iter()
+            .map(|transaction| data(transaction))
+            .collect();
+        let params = json!([
+            ExecutionPayloadV4(payload),
+            hashes,
+            data(&parent_beacon_block_root.0),
+            requests,
+            transactions,
+        ]);
+        self.call_with_timeout("engine_newPayloadV6", params, ENGINE_NEW_PAYLOAD_V5_TIMEOUT)
+            .await
+    }
+
+    /// `engine_forkchoiceUpdatedV5`: Bogota's fork choice notification, with a
+    /// `null` `payloadAttributes` and the custody set, answering with a
+    /// [`PayloadStatusV2`] that says whether a `VALID` head satisfied its
+    /// inclusion lists.
+    pub async fn forkchoice_updated_v5(
+        &self,
+        state: &ForkchoiceStateV1,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<PayloadStatusV2, EngineError> {
+        let params = forkchoice_updated_v4_params(state, custody_columns);
+        let response: ForkchoiceUpdatedV5Response =
+            self.call("engine_forkchoiceUpdatedV5", params).await?;
+        Ok(response.payload_status)
+    }
+
+    /// `engine_forkchoiceUpdatedV5` with `PayloadAttributesV5`: a build request
+    /// whose payload must satisfy the attributes' inclusion list transactions.
+    pub async fn forkchoice_updated_v5_with_attributes(
+        &self,
+        state: &ForkchoiceStateV1,
+        attributes: &crate::building::PayloadAttributesV5,
+        custody_columns: Option<CustodyColumns>,
+    ) -> Result<(PayloadStatusV2, Option<crate::building::PayloadId>), EngineError> {
+        let params = json!([state, attributes, custody_columns]);
+        let response: ForkchoiceUpdatedV5Response =
+            self.call("engine_forkchoiceUpdatedV5", params).await?;
+        Ok((response.payload_status, response.payload_id))
+    }
+
+    /// `engine_getInclusionListV1`: the transactions the execution client would
+    /// put in an inclusion list now, from its view of the mempool. Each is an
+    /// EIP-2718 transaction's bytes.
+    pub async fn get_inclusion_list_v1(&self) -> Result<Vec<Vec<u8>>, EngineError> {
+        let transactions: Vec<String> = self
+            .call_with_timeout(
+                "engine_getInclusionListV1",
+                json!([]),
+                ENGINE_GET_INCLUSION_LIST_TIMEOUT,
+            )
+            .await?;
+        transactions
+            .iter()
+            .map(|transaction| crate::building::parse_data(transaction))
+            .collect()
+    }
+
     /// `engine_forkchoiceUpdatedV3`, always with a `null` `payloadAttributes`.
     ///
     /// A follower never proposes, so it never asks an execution client to start
@@ -360,7 +445,8 @@ impl EngineClient {
     /// warning about any method this client needs that it does not advertise.
     ///
     /// `gloas_scheduled` says whether the network's fork schedule includes
-    /// gloas, which is what makes `engine_newPayloadV5` a needed method.
+    /// gloas, which is what makes `engine_newPayloadV5` a needed method;
+    /// `heze_scheduled` does the same for heze's three Bogota methods.
     ///
     /// Warns rather than refuses: an execution client that under-reports its
     /// capabilities still works, and refusing to start over a handshake would
@@ -369,6 +455,7 @@ impl EngineClient {
         &self,
         ours: &ClientVersionV1,
         gloas_scheduled: bool,
+        heze_scheduled: bool,
     ) -> Result<(), EngineError> {
         let theirs = self
             .exchange_capabilities(crate::ETHLAMBDA_ENGINE_CAPABILITIES)
@@ -394,6 +481,20 @@ impl EngineClient {
                     warn!(
                         method = required,
                         "The execution client does not advertise a method this node needs from gloas on"
+                    );
+                }
+            }
+        }
+        if heze_scheduled {
+            for required in [
+                "engine_newPayloadV6",
+                "engine_forkchoiceUpdatedV5",
+                "engine_getInclusionListV1",
+            ] {
+                if !theirs.iter().any(|method| method == required) {
+                    warn!(
+                        method = required,
+                        "The execution client does not advertise a method this node needs from heze on"
                     );
                 }
             }

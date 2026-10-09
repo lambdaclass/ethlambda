@@ -52,10 +52,11 @@ impl ConfigFile {
 
     /// Log what was ignored, as one line naming each key.
     ///
-    /// One line rather than one per key: a current `config.yaml` carries the
-    /// heze schedule, which this build does not claim, so per-key lines
-    /// would flood every valid startup with one warning per ignored key and
-    /// bury a real typo among them.
+    /// One line rather than one per key: a current `config.yaml` carries
+    /// schedules this build does not claim (later forks' and
+    /// `GAS_LIMIT_SCHEDULE`), so per-key lines would flood every valid
+    /// startup with one warning per ignored key and bury a real typo among
+    /// them.
     pub(crate) fn warn_about_ignored_keys(&self) {
         if self.ignored.is_empty() {
             return;
@@ -139,19 +140,30 @@ mod tests {
     }
 
     #[test]
-    fn the_forks_this_build_cannot_process_are_reported_as_ignored() {
+    fn the_keys_this_build_does_not_read_are_reported_as_ignored() {
+        let parsed = ConfigFile::parse(DEVNET).unwrap();
+        assert!(
+            parsed.ignored.contains(&"GAS_LIMIT_SCHEDULE".to_string()),
+            "GAS_LIMIT_SCHEDULE not reported"
+        );
+    }
+
+    #[test]
+    fn the_heze_keys_are_claimed_rather_than_ignored() {
+        // HEZE_* and the inclusion list keys used to be reported as ignored;
+        // now that `Config` has fields for them, they must not be.
         let parsed = ConfigFile::parse(DEVNET).unwrap();
         for key in [
             "HEZE_FORK_VERSION",
             "HEZE_FORK_EPOCH",
-            "GAS_LIMIT_SCHEDULE",
             "INCLUSION_LIST_DUE_BPS",
         ] {
             assert!(
-                parsed.ignored.contains(&key.to_string()),
-                "{key} not reported"
+                !parsed.ignored.contains(&key.to_string()),
+                "{key} reported as ignored"
             );
         }
+        assert_eq!(parsed.config.heze_fork_version, [0x08, 0, 0, 0]);
     }
 
     #[test]

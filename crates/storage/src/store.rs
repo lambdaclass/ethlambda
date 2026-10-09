@@ -10,7 +10,7 @@ use crate::api::{StorageBackend, StorageReadView, StorageReadViewExt, StorageWri
 use crate::committee_cache::CommitteeCache;
 use crate::error::Error;
 use crate::liveness::ObservedLiveness;
-use crate::pools::{AttestationPool, OperationPool};
+use crate::pools::{AttestationPool, InclusionListStore, OperationPool};
 
 use ethlambda_crypto::signature::ValidatorSignature;
 use ethlambda_types::{
@@ -880,6 +880,12 @@ pub(crate) struct BeaconScratch {
     /// specification's `block_payload_statuses`; an absent root reads as
     /// `NOT_VALIDATED`.
     pub(crate) block_payload_statuses: HashMap<H256, (u64, PayloadStatusEnum)>,
+    /// Heze (EIP-7805): whether each beacon block's payload satisfied the
+    /// inclusion list constraints, against the block's slot for pruning: the
+    /// specification's `payload_inclusion_list_satisfaction`. Recorded when
+    /// the envelope is verified, and again when an optimistic payload's
+    /// execution verdict arrives. Pruned with `block_payload_statuses`.
+    pub(crate) payload_inclusion_list_satisfaction: HashMap<H256, (u64, bool)>,
     /// Gloas: beacon root to `(slot, milliseconds past genesis the block's
     /// envelope reached this node)`. What the payload timeliness committee's
     /// `payload_present` is decided from: the specification's vote is "an
@@ -1082,6 +1088,8 @@ pub struct Store {
     attestation_pool: Arc<Mutex<AttestationPool>>,
     /// Beacon operation pool. See [`Store::operation_pool`].
     operation_pool: Arc<Mutex<OperationPool>>,
+    /// Heze's inclusion list store. See [`Store::inclusion_list_store`].
+    inclusion_list_store: Arc<Mutex<InclusionListStore>>,
     /// LRU memoization of states by block root, shared across `Store` clones.
     ///
     /// Holds the same fork-ladder enum the `States` table stores, so a lean
@@ -1774,6 +1782,7 @@ impl Store {
             ))),
             attestation_pool: Default::default(),
             operation_pool: Default::default(),
+            inclusion_list_store: Default::default(),
             state_cache,
             pending_states,
             committee_cache: Arc::new(CommitteeCache::default()),
@@ -1803,6 +1812,19 @@ impl Store {
         self.operation_pool
             .lock()
             .expect("operation pool lock poisoned")
+    }
+
+    /// Heze's inclusion list store (EIP-7805): the valid lists this node has
+    /// seen, from gossip, req/resp and its own Beacon API. Written by P2P and
+    /// the RPC, read by fork choice's payload satisfaction check, the bid
+    /// rules, block production and the req/resp server, which is why it lives
+    /// on the `Store` all of them share. Same sharing and locking rules as
+    /// [`Store::attestation_pool`]; in memory only, like the specification's
+    /// own, so a restart starts it empty.
+    pub fn inclusion_list_store(&self) -> MutexGuard<'_, InclusionListStore> {
+        self.inclusion_list_store
+            .lock()
+            .expect("inclusion list store lock poisoned")
     }
 
     // ============ Metadata Helpers ============
@@ -3886,7 +3908,7 @@ impl Store {
                 .and_then(|bytes| bytes.first().copied())
                 .and_then(ForkName::from_selector);
             let is_gloas = match fork {
-                Some(ForkName::Gloas) => true,
+                Some(ForkName::Gloas | ForkName::Heze) => true,
                 Some(
                     ForkName::Phase0
                     | ForkName::Altair
@@ -4188,13 +4210,44 @@ impl Store {
     }
 
     /// Drops payload verdicts strictly below `finalized_slot`, which no
-    /// attestation rule can ask about any more.
+    /// attestation rule can ask about any more, and the inclusion list
+    /// satisfaction recorded alongside them.
     pub fn prune_beacon_block_payload_statuses(&mut self, finalized_slot: u64) {
+        let mut beacon = self.beacon.lock().unwrap();
+        beacon
+            .block_payload_statuses
+            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
+        beacon
+            .payload_inclusion_list_satisfaction
+            .retain(|_root, (slot, _satisfied)| *slot >= finalized_slot);
+    }
+
+    /// Heze: whether `root`'s payload was recorded as satisfying the
+    /// inclusion list constraints. `None` when nothing was recorded: a block
+    /// whose envelope has not been verified, one verified before a restart,
+    /// or one from before heze.
+    pub fn payload_inclusion_list_satisfaction(&self, root: &H256) -> Option<bool> {
         self.beacon
             .lock()
             .unwrap()
-            .block_payload_statuses
-            .retain(|_root, (slot, _status)| *slot >= finalized_slot);
+            .payload_inclusion_list_satisfaction
+            .get(root)
+            .map(|(_slot, satisfied)| *satisfied)
+    }
+
+    /// Records whether `root`'s payload satisfied the inclusion list
+    /// constraints, replacing any earlier answer.
+    pub fn set_payload_inclusion_list_satisfaction(
+        &mut self,
+        root: H256,
+        slot: u64,
+        satisfied: bool,
+    ) {
+        self.beacon
+            .lock()
+            .unwrap()
+            .payload_inclusion_list_satisfaction
+            .insert(root, (slot, satisfied));
     }
 
     /// Records an execution client's answer for a payload. The fixture format

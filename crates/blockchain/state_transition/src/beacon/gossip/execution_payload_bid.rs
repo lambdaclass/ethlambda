@@ -39,6 +39,7 @@ use crate::beacon::fork_choice::{self, ForkChoiceNode, PayloadStatus, Store};
 use crate::beacon::helpers::accessors::{get_current_epoch, get_randao_mix};
 use crate::beacon::helpers::gloas::{can_builder_cover_bid, is_active_builder};
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_start_slot_at_epoch};
+use crate::beacon::inclusion_list::get_inclusion_list_committee;
 use crate::beacon::lean_boundary::lean_state_unreachable;
 use crate::beacon::preset;
 use crate::beacon::primitives::{Epoch, ExecutionBlockHash, Root, Slot};
@@ -47,6 +48,12 @@ use crate::beacon::stf::gloas::verify_execution_payload_bid_signature;
 
 /// Gloas p2p preset: the largest decompressed `SignedExecutionPayloadBid`.
 pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE: usize = 196_932;
+
+/// Heze p2p preset: the largest decompressed heze `SignedExecutionPayloadBid`,
+/// two bytes of `inclusion_list_bits` past gloas's. The bound a bid topic
+/// checks, since one container carries both shapes and [`cheap_checks`]
+/// rejects the one the bid's slot does not take.
+pub const MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE: usize = 196_934;
 
 /// The spec's `is_gas_limit_target_compatible`: whether `gas_limit` is what
 /// the EIP-1559 transition rule from `parent_gas_limit` allows when steering
@@ -110,6 +117,12 @@ pub fn cheap_checks(
     // a malformed message is still penalized, whichever fork it names.
     if !is_gloas_slot(&config, bid.slot) {
         return Err(Outcome::Ignore(IgnoreReason::PreGloasSlot));
+    }
+    // Ours: gloas and heze bids share one container, so a decode accepts
+    // either shape (see `gloas::ExecutionPayloadBid`); the specification's
+    // typed decoder rejects the shape the bid's slot does not take.
+    if bid.fork_name() != config.fork_at_epoch(proposal_epoch) {
+        return Err(Outcome::Reject(RejectReason::WrongForkShape));
     }
     Ok(())
 }
@@ -435,6 +448,27 @@ fn stateful_rules(
             *pubkey == builder.pubkey && *source == builder.execution_address
         }) {
             return Err(ignore(IgnoreReason::BuilderMayExit));
+        }
+    }
+    // [IGNORE] The bid's inclusion list bits are inclusive of every timely
+    // list this node holds for the previous slot (heze). A gloas bid has
+    // none to check.
+    if let Some(inclusion_list_bits) = &bid.inclusion_list_bits {
+        let inclusion_list_slot = bid.slot - 1;
+        let dependent_root =
+            dependent_root_at(&parent_state, bid.parent_block_root, inclusion_list_slot)
+                .ok_or(ignore(IgnoreReason::AncestryUnknown))?;
+        let committee =
+            get_inclusion_list_committee(&state, inclusion_list_slot, &*store.committee_cache())
+                .map_err(|_| ignore(IgnoreReason::StateUnavailable))?;
+        if !store.inclusion_list_store().is_bits_inclusive(
+            &committee,
+            inclusion_list_slot,
+            dependent_root,
+            inclusion_list_bits,
+            true,
+        ) {
+            return Err(ignore(IgnoreReason::InclusionListBitsNotInclusive));
         }
     }
     // [REJECT] The signature is valid. An error (an index the state lacks)

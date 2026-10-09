@@ -422,6 +422,11 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 ReqRespProtocol::ExecutionPayloadEnvelopesByRoot => behaviour
                     .execution_payload_envelopes_by_root
                     .send_request(&peer, request),
+                // Registered inbound only, so a request sent here fails at
+                // once with `UnsupportedProtocols`; nothing sends one yet.
+                ReqRespProtocol::InclusionListsByIndices => behaviour
+                    .inclusion_lists_by_indices
+                    .send_request(&peer, request),
             };
             if let Some(tx) = request_id_tx {
                 let _ = tx.send(ReqRespRequestId { protocol, id });

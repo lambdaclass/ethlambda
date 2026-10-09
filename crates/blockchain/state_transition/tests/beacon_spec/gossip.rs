@@ -18,7 +18,7 @@ use ethlambda_state_transition::beacon::builder_market::BuilderMarket;
 use ethlambda_state_transition::beacon::config::Config;
 use ethlambda_state_transition::beacon::containers::{
     BeaconState, Checkpoint, DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock, altair,
-    electra, gloas, phase0,
+    electra, gloas, heze, phase0,
 };
 use ethlambda_state_transition::beacon::fork_choice::{
     self, DataAvailability, PayloadStatusEnum, PayloadValidity, Store,
@@ -26,10 +26,11 @@ use ethlambda_state_transition::beacon::fork_choice::{
 use ethlambda_state_transition::beacon::gossip::operations::SeenOperations;
 use ethlambda_state_transition::beacon::gossip::{
     self as rules, Outcome, SeenAggregates, SeenAttestations, SeenBlockColumns, SeenBlocks,
-    SeenColumns, SeenEnvelopes, SeenPayloadAttestations, SeenSyncCommitteeMessages,
-    SeenSyncContributions,
+    SeenColumns, SeenEnvelopes, SeenInclusionLists, SeenPayloadAttestations,
+    SeenSyncCommitteeMessages, SeenSyncContributions,
 };
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
+use ethlambda_state_transition::beacon::inclusion_list::is_inclusion_list_timely;
 use ethlambda_state_transition::beacon::primitives::Root;
 use ethlambda_state_transition::beacon::stf::ExecutionEngine;
 use ethlambda_storage::ForkCheckpoints;
@@ -56,6 +57,7 @@ const HANDLERS: &[&str] = &[
     "gossip_sync_committee_contribution_and_proof",
     "gossip_execution_payload_bid",
     "gossip_proposer_preferences",
+    "gossip_inclusion_list",
 ];
 
 /// The forks each of [`HANDLERS`] validates. A case from any other fork is
@@ -70,14 +72,17 @@ const HANDLERS: &[&str] = &[
 /// keeps, and gloas's payload-flag modification of them.
 fn validated_forks(handler: &str) -> &'static [ForkName] {
     match handler {
-        "gossip_data_column_sidecar" | "gossip_beacon_block" => &[ForkName::Fulu, ForkName::Gloas],
+        "gossip_data_column_sidecar" | "gossip_beacon_block" => {
+            &[ForkName::Fulu, ForkName::Gloas, ForkName::Heze]
+        }
         "gossip_beacon_aggregate_and_proof" | "gossip_beacon_attestation" => {
-            &[ForkName::Fulu, ForkName::Gloas]
+            &[ForkName::Fulu, ForkName::Gloas, ForkName::Heze]
         }
         "gossip_execution_payload_envelope"
         | "gossip_payload_attestation_message"
         | "gossip_execution_payload_bid"
-        | "gossip_proposer_preferences" => &[ForkName::Gloas],
+        | "gossip_proposer_preferences" => &[ForkName::Gloas, ForkName::Heze],
+        "gossip_inclusion_list" => &[ForkName::Heze],
         // `gossip::operations` validates electra-shaped operations against an
         // electra or fulu head state and ignores every other one, so gloas's
         // vectors (builder exits included) are a known gap rather than a run.
@@ -87,7 +92,7 @@ fn validated_forks(handler: &str) -> &'static [ForkName] {
         | "gossip_bls_to_execution_change" => &[ForkName::Fulu],
         // Altair's rules, which neither fulu nor gloas changes.
         "gossip_sync_committee_message" | "gossip_sync_committee_contribution_and_proof" => {
-            &[ForkName::Fulu, ForkName::Gloas]
+            &[ForkName::Fulu, ForkName::Gloas, ForkName::Heze]
         }
         other => panic!("{other} is not in HANDLERS, so it has no validated forks"),
     }
@@ -280,7 +285,7 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Gloas => Ok(SignedAggregateAndProof::Gloas(
+        ForkName::Gloas | ForkName::Heze => Ok(SignedAggregateAndProof::Gloas(
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
@@ -436,7 +441,7 @@ fn build_store(
         // Gloas's `payload_status` is the verdict on the block's envelope, not
         // on the block, which is imported regardless; it feeds the attestation
         // rules' `block_payload_statuses` instead.
-        let gloas = case.fork == ForkName::Gloas;
+        let gloas = case.fork.is_gloas_or_later();
         // Seen without a post-state. A pre-gloas `INVALIDATED` payload lands
         // here too: this store never keeps a post-state for one, since
         // `on_block` fails it and invalidates the branch.
@@ -476,6 +481,20 @@ fn build_store(
             };
             store.insert_beacon_block_payload_status(root, block_slot, status);
         }
+    }
+
+    // The inclusion list rules read it too, through `is_valid_dependent_root`.
+    if builder_market || meta.topic == "inclusion_list" {
+        // `on_block` records no head, and the bid and preference rules read
+        // the recorded one. Computed before the finalized override below:
+        // raising finality prunes the live chain below the finalized block,
+        // which takes the anchor (still the store's justified root) out of
+        // the index `get_head` starts its walk from. The specification's
+        // store never prunes, so its `get_head` starts from the anchor too,
+        // and every listed block descends from the finalized one, so the
+        // head is the same either way.
+        fork_choice::get_head(&mut store, config)
+            .map_err(|err| format!("computing the head: {err:?}"))?;
     }
 
     if let Some(finalized) = &meta.finalized_checkpoint {
@@ -559,13 +578,7 @@ fn run_case(case: &Case) -> Result<(), String> {
     let state = BeaconState::from_ssz(case.fork, &case.ssz_bytes("state"))
         .map_err(|err| format!("decoding state: {err:?}"))?;
     let config = case_config(case, &state);
-    let mut store = build_store(case, &meta, state, &config)?;
-    if is_builder_market_topic(&meta.topic) {
-        // `on_block` records no head, and the bid and preference rules read
-        // the recorded one.
-        fork_choice::get_head(&mut store, &config)
-            .map_err(|err| format!("computing the head: {err:?}"))?;
-    }
+    let store = build_store(case, &meta, state, &config)?;
     let market = BuilderMarket::default();
     let capacity = NonZeroUsize::new(SEEN_CAPACITY).expect("non-zero");
     let mut seen_blocks = SeenBlocks::new(capacity);
@@ -575,6 +588,7 @@ fn run_case(case: &Case) -> Result<(), String> {
     let mut seen_attestations = SeenAttestations::new(capacity);
     let mut seen_envelopes = SeenEnvelopes::new(capacity);
     let mut seen_payload_attestations = SeenPayloadAttestations::new(capacity);
+    let mut seen_inclusion_lists = SeenInclusionLists::new(capacity);
     let mut seen_operations = SeenOperations::default();
     let mut seen_sync_messages = SeenSyncCommitteeMessages::new(capacity);
     let mut seen_sync_contributions = SeenSyncContributions::new(capacity, capacity);
@@ -787,11 +801,20 @@ fn run_case(case: &Case) -> Result<(), String> {
             // preferences and envelope a bid depends on arrive in order, and
             // share the case's seen state), so the message's own name says
             // which rule judges it.
+            "inclusion_list" => run_inclusion_list_message(
+                case,
+                &store,
+                &mut seen_inclusion_lists,
+                message,
+                now_ms,
+                &config,
+            )?,
             "execution_payload_bid" | "proposer_preferences" => run_builder_market_message(
                 case,
                 &store,
                 &market,
                 &mut seen_envelopes,
+                &mut seen_inclusion_lists,
                 message,
                 now_ms,
                 &config,
@@ -803,12 +826,39 @@ fn run_case(case: &Case) -> Result<(), String> {
     Ok(())
 }
 
+/// One `inclusion_list` message: the gossip rules, then, on `Accept`, the
+/// seen count and the inclusion list store the p2p handler records it in.
+fn run_inclusion_list_message(
+    case: &Case,
+    store: &Store,
+    seen: &mut SeenInclusionLists,
+    message: &GossipMessage,
+    now_ms: u64,
+    config: &Config,
+) -> Result<Outcome, String> {
+    let signed = heze::SignedInclusionList::from_ssz_bytes(&case.ssz_bytes(&message.message))
+        .map_err(|err| format!("decoding {}: {err:?}", message.message))?;
+    let outcome = rules::inclusion_list::validate(seen, store, &signed, now_ms);
+    if outcome == Outcome::Accept {
+        seen.record(&signed);
+        let timely = is_inclusion_list_timely(config, signed.message.slot, now_ms);
+        store
+            .inclusion_list_store()
+            .process_inclusion_list(signed, timely);
+    }
+    Ok(outcome)
+}
+
 /// One message of a `execution_payload_bid` or `proposer_preferences` case.
+/// A heze bid case also carries the inclusion list its bid's bits are judged
+/// against.
+#[allow(clippy::too_many_arguments)]
 fn run_builder_market_message(
     case: &Case,
     store: &Store,
     market: &BuilderMarket,
     seen_envelopes: &mut SeenEnvelopes,
+    seen_inclusion_lists: &mut SeenInclusionLists,
     message: &GossipMessage,
     now_ms: u64,
     config: &Config,
@@ -837,6 +887,8 @@ fn run_builder_market_message(
             market.record_execution_payload(&envelope.message);
         }
         Ok(outcome)
+    } else if message.message.starts_with("inclusion_list_") {
+        run_inclusion_list_message(case, store, seen_inclusion_lists, message, now_ms, config)
     } else if message.message.starts_with("execution_payload_bid_") {
         let bid = gloas::SignedExecutionPayloadBid::from_ssz_bytes(&bytes).map_err(decode_err)?;
         let outcome = rules::execution_payload_bid::validate(market, store, &bid, now_ms);

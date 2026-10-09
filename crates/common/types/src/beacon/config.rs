@@ -11,19 +11,14 @@
 //!
 //! # What is left out
 //!
-//! - **Forks this build cannot process.** `HEZE_FORK_VERSION`/`HEZE_FORK_EPOCH`
-//!   and `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH` (its own later fork
-//!   schedule) stay out for the same reason `GLOAS_*` used to: a fork version
-//!   stored here would give [`Config::fork_at_epoch`] a fork
-//!   [`crate::beacon::fork::ForkName`] has no variant for, so each is
-//!   reported as an unknown key instead. `GAS_LIMIT_SCHEDULE` (gloas-era)
-//!   stays out too, since it is a list rather than a scalar. The rest are
-//!   heze-era data keys, not gloas's, with no reader in this build at all:
-//!   `INCLUSION_LIST_DUE_BPS`, `MAX_REQUEST_INCLUSION_LIST`,
-//!   `MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS`, and
-//!   `MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST` (EIP-7805's fork-choice-enforced
-//!   inclusion lists), and `CONFIRMATION_BYZANTINE_THRESHOLD` (the Fast
-//!   Confirmation Rule).
+//! - **Forks this build cannot process.** `EIP8321_FORK_VERSION`/`EIP8321_FORK_EPOCH`
+//!   (its own later fork schedule) stay out for the same reason `GLOAS_*` and
+//!   `HEZE_*` used to: a fork version stored here would give
+//!   [`Config::fork_at_epoch`] a fork [`crate::beacon::fork::ForkName`] has no
+//!   variant for, so each is reported as an unknown key instead.
+//!   `GAS_LIMIT_SCHEDULE` (gloas-era) stays out too, since it is a list rather
+//!   than a scalar, and so does `CONFIRMATION_BYZANTINE_THRESHOLD` (the Fast
+//!   Confirmation Rule), which nothing in this build reads.
 //!
 //! `PRESET_BASE` and `CONFIG_NAME` used to be left out as well, because they
 //! are strings and this struct is SSZ-encoded into the database. They are here
@@ -324,6 +319,13 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub gloas_fork_epoch: Epoch,
+    /// The `Fork.current_version` a heze block or attestation signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub heze_fork_version: Version,
+    /// The epoch heze activates at, or [`constants::FAR_FUTURE_EPOCH`] if it
+    /// is not scheduled.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub heze_fork_epoch: Epoch,
 
     // -- Time parameters ---------------------------------------------------
     /// Wall-clock seconds per slot. Deprecated in favor of
@@ -411,6 +413,11 @@ pub struct Config {
     /// to [`Self::min_validator_withdrawability_delay`].
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_builder_withdrawability_delay: Epoch,
+    /// Heze (EIP-7805): basis points of [`Self::slot_duration_ms`] by which
+    /// an inclusion list must arrive to count as timely, and by which a
+    /// committee member publishes its own.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub inclusion_list_due_bps: u64,
 
     // -- Validator cycle -----------------------------------------------------
     /// Score points added to a validator's inactivity score for each epoch it
@@ -621,6 +628,20 @@ pub struct Config {
     pub max_request_data_column_sidecars: u64,
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub min_epochs_for_block_requests: u64,
+
+    // -- Inclusion lists (heze, EIP-7805) ------------------------------------
+    /// The most inclusion lists one `InclusionListsByIndices` request may ask
+    /// for.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub max_request_inclusion_list: u64,
+    /// How many slots past its own an inclusion list is still accepted by
+    /// `on_inclusion_list` and must still be served over req/resp.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub min_slots_for_inclusion_lists_requests: u64,
+    /// The cap on the summed byte length of one inclusion list's
+    /// transactions.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub max_transactions_bytes_per_inclusion_list: u64,
 }
 
 /// Mainnet's values, which is what an absent key in a `config.yaml` falls back
@@ -721,6 +742,8 @@ impl Config {
             fulu_fork_epoch: 411_392,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_version: [0x08, 0x00, 0x00, 0x00],
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 12,
             slot_duration_ms: 12_000,
@@ -740,6 +763,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 64,
+            inclusion_list_due_bps: 6_667,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -818,6 +842,10 @@ impl Config {
             max_request_blob_sidecars_electra: 1_152,
             max_request_data_column_sidecars: 16_384,
             min_epochs_for_block_requests: 33_024,
+
+            max_request_inclusion_list: 16,
+            min_slots_for_inclusion_lists_requests: 1,
+            max_transactions_bytes_per_inclusion_list: 8_192,
         }
     }
 
@@ -855,6 +883,8 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_version: [0x08, 0x00, 0x00, 0x01],
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
             seconds_per_slot: 6,
             slot_duration_ms: 6_000,
@@ -874,6 +904,7 @@ impl Config {
             payload_due_bps: 5_000,
             payload_attestation_due_bps: 7_500,
             min_builder_withdrawability_delay: 2,
+            inclusion_list_due_bps: 6_667,
 
             inactivity_score_bias: 4,
             inactivity_score_recovery_rate: 16,
@@ -942,6 +973,10 @@ impl Config {
             max_request_blob_sidecars_electra: 1_152,
             max_request_data_column_sidecars: 16_384,
             min_epochs_for_block_requests: 33_024,
+
+            max_request_inclusion_list: 16,
+            min_slots_for_inclusion_lists_requests: 1,
+            max_transactions_bytes_per_inclusion_list: 8_192,
         }
     }
 
@@ -977,6 +1012,7 @@ impl Config {
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            heze_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
     }
@@ -1060,6 +1096,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
+            ForkName::Heze => self.heze_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
     }
@@ -1078,6 +1115,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
+            ForkName::Heze => self.heze_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
     }
@@ -1103,6 +1141,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
+            ForkName::Heze => self.heze_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
         self
@@ -1120,6 +1159,7 @@ impl Config {
             ForkName::Electra => self.electra_fork_version = version,
             ForkName::Fulu => self.fulu_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
+            ForkName::Heze => self.heze_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_version"),
@@ -1247,6 +1287,22 @@ mod tests {
         assert_eq!(config.fork_epoch(ForkName::Gloas), 12);
         assert_eq!(config.fork_at_epoch(12), ForkName::Gloas);
         assert_eq!(config.max_request_payloads, 128);
+    }
+
+    #[test]
+    fn heze_keys_are_claimed_and_parse() {
+        let yaml = "GLOAS_FORK_EPOCH: 0\nHEZE_FORK_VERSION: 0x90684879\nHEZE_FORK_EPOCH: 5\n\
+                    INCLUSION_LIST_DUE_BPS: 6667\nMAX_REQUEST_INCLUSION_LIST: 16\n\
+                    MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS: 1\n\
+                    MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST: 8192\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.heze_fork_version, [0x90, 0x68, 0x48, 0x79]);
+        assert_eq!(config.fork_at_epoch(4), ForkName::Gloas);
+        assert_eq!(config.fork_at_epoch(5), ForkName::Heze);
+        assert_eq!(config.inclusion_list_due_bps, 6_667);
+        assert_eq!(config.max_request_inclusion_list, 16);
+        assert_eq!(config.min_slots_for_inclusion_lists_requests, 1);
+        assert_eq!(config.max_transactions_bytes_per_inclusion_list, 8_192);
     }
 
     #[test]

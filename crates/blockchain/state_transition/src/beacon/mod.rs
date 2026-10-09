@@ -84,6 +84,7 @@ pub mod gloas_block_production;
 pub mod gossip;
 pub mod hash;
 pub mod helpers;
+pub mod inclusion_list;
 pub mod kzg;
 pub mod payload_attestation_pool;
 pub mod precheck;

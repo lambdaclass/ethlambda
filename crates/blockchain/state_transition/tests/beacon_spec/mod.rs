@@ -138,7 +138,7 @@ pub fn case_config(case: &Case) -> Config {
 /// still need its own edit to *map* a fork's new or changed handlers to the
 /// right function, since that mapping is specific to each runner; only the gate
 /// is one line.
-pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Gloas;
+pub const HIGHEST_IMPLEMENTED_FORK: ForkName = ForkName::Heze;
 
 /// The root of the extracted fixture tree.
 ///
@@ -398,16 +398,13 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 
 /// Fixture fork directories this crate deliberately does not model.
 ///
-/// `heze` is the one fork after fulu that [`ForkName::parse`] still does not
-/// know: `gloas` moved out of this list once [`ForkName`] gained that variant,
-/// since its directory now parses and its cases fall under
-/// [`HIGHEST_IMPLEMENTED_FORK`]'s ordinary out-of-scope handling
-/// ([`Case::in_scope`]) instead of this one. At `v1.7.0-beta.2` the release
-/// ships no other directory under either preset tree that `ForkName::parse`
-/// does not know: no in-flight-EIP directory (`eipNNNN`) remains, unlike at
-/// `v1.6.1`, where `eip7805` was one.
+/// Empty at `v1.7.0-beta.2`: `heze` moved out once [`ForkName`] gained that
+/// variant, the way `gloas` did before it, so every fork directory the
+/// release ships under either preset tree now parses. No in-flight-EIP
+/// directory (`eipNNNN`) remains either, unlike at `v1.6.1`, where `eip7805`
+/// was one.
 ///
-/// Naming it is not bookkeeping for its own sake. A directory [`ForkName::parse`]
+/// Naming one here is not bookkeeping for its own sake. A directory [`ForkName::parse`]
 /// does not recognize is how [`collect`] skips a fork, and that skip is *silent*
 /// in a way [`Case::in_scope`] is not: the cases never become tests at all, so
 /// they are not counted as ignored either, and nothing in the output says they
@@ -415,7 +412,7 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// matching fails rather than reporting green, and an unparsed fork slips past
 /// [`HIGHEST_IMPLEMENTED_FORK`] entirely because the gate never sees the case.
 /// So [`fixture_fork_trials`] checks this list against the tree instead.
-pub const UNMODELED_FORKS: &[&str] = &["heze"];
+pub const UNMODELED_FORKS: &[&str] = &[];
 
 /// Panics: a fixture case cannot be a lean case.
 ///

@@ -22,7 +22,7 @@ use crate::beacon::config::Config;
 use crate::beacon::constants;
 use crate::beacon::containers::{
     BeaconState, EpochParticipation, Fork, InactivityScores, altair, bellatrix, capella, deneb,
-    electra, fulu, gloas, phase0,
+    electra, fulu, gloas, heze, phase0,
 };
 use crate::beacon::error::{Error, Result};
 use crate::beacon::fork::ForkName;
@@ -1143,6 +1143,7 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
         execution_payment: 0,
         blob_kzg_commitments: Default::default(),
         execution_requests_root: gloas::ExecutionRequests::default().hash_tree_root(),
+        inclusion_list_bits: None,
     };
 
     // Every slot starts "available"; see this function's own doc.
@@ -1249,6 +1250,35 @@ pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconStat
     Ok(post)
 }
 
+/// `upgrade_to_heze`: the gloas state with the heze fork version and an
+/// empty `inclusion_list_bits` on `latest_execution_payload_bid`.
+///
+/// Heze (EIP-7805) modifies no state field but that bid, whose container
+/// gains `inclusion_list_bits`; every other field carries over as is. The
+/// result stays a [`BeaconState::Gloas`]: one container serves both forks,
+/// and the bid's new field is what makes this state heze's (see
+/// `containers::gloas::ExecutionPayloadBid`).
+pub fn upgrade_to_heze(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    let pre_fork = pre.fork_name();
+    if pre_fork != ForkName::Gloas {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_heze",
+            fork: pre_fork,
+        });
+    }
+    let mut post = pre.clone();
+    let state = crate::beacon::helpers::gloas::gloas_state(&mut post, "upgrade_to_heze")?;
+    state.fork = Fork {
+        previous_version: state.fork.current_version,
+        // [Modified in Heze]
+        current_version: config.heze_fork_version,
+        epoch: compute_epoch_at_slot(state.slot),
+    };
+    // [New in Heze:EIP7805]
+    state.latest_execution_payload_bid.inclusion_list_bits = Some(heze::InclusionListBits::new());
+    Ok(post)
+}
+
 /// Applies the fork upgrade that produces `to`'s state shape from `state`.
 ///
 /// Dispatches over the per-fork upgrade functions by [`ForkName`] so a caller
@@ -1280,6 +1310,7 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
         ForkName::Gloas => upgrade_to_gloas(state, config),
+        ForkName::Heze => upgrade_to_heze(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
         ForkName::Lean => lean_fork_unreachable("upgrade_state"),

@@ -26,6 +26,10 @@
 //! client's indices on arrival, and are not part of subnet subscriptions
 //! either. Whether an epoch is a gloas one is the caller's to decide, since
 //! this service holds no fork schedule.
+//!
+//! Inclusion list committee duties, which exist from heze, are held the same
+//! way in a fourth map, with their `dependent_root` kept beside them: a
+//! member's list names that root, so it is handed out with the duties.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,7 +40,9 @@ use ethlambda_types::beacon::primitives::{Epoch, Root, Slot, ValidatorIndex};
 use tracing::{info, warn};
 
 use crate::beacon_node::BeaconNodeApi;
-use crate::beacon_node::dto::{AttesterDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto};
+use crate::beacon_node::dto::{
+    AttesterDutyDto, InclusionListDutyDto, ProposerDutyDto, PtcDutyDto, SyncDutyDto,
+};
 use crate::error::Result;
 
 /// The sync committee period `epoch` belongs to.
@@ -61,6 +67,8 @@ pub struct DutiesService<B> {
     proposers: HashMap<Epoch, EpochDuties<ProposerDutyDto>>,
     /// Payload timeliness committee duties, already narrowed to `indices`.
     ptc: HashMap<Epoch, EpochDuties<PtcDutyDto>>,
+    /// Inclusion list committee duties, already narrowed to `indices`.
+    inclusion_lists: HashMap<Epoch, EpochDuties<InclusionListDutyDto>>,
     /// Sync committee duties by period, already narrowed to `indices`. Keyed
     /// by period, not epoch, because a committee serves a whole period; and
     /// with no `dependent_root` because the endpoint sends none: the committee
@@ -81,6 +89,7 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             by_epoch: HashMap::new(),
             proposers: HashMap::new(),
             ptc: HashMap::new(),
+            inclusion_lists: HashMap::new(),
             sync: HashMap::new(),
             warned_no_indices: false,
         }
@@ -264,6 +273,76 @@ impl<B: BeaconNodeApi> DutiesService<B> {
             },
         );
         Ok(())
+    }
+
+    /// Fetch `epoch`'s inclusion list committee duties for this client's
+    /// indices, replacing anything held for it if the `dependent_root` has
+    /// changed.
+    ///
+    /// Only to be called for a heze epoch, for the reason [`Self::refresh_ptc`]
+    /// is only called for a gloas one.
+    pub async fn refresh_inclusion_lists(&mut self, epoch: Epoch) -> Result<()> {
+        if self.indices.is_empty() {
+            return Ok(());
+        }
+
+        let fetched = self
+            .beacon_node
+            .inclusion_list_duties(epoch, &self.indices)
+            .await?;
+
+        let held = self.inclusion_lists.get(&epoch);
+        if held.is_some_and(|held| held.dependent_root == fetched.dependent_root) {
+            return Ok(());
+        }
+        if held.is_some() {
+            warn!(
+                %epoch,
+                "Inclusion list committee duties invalidated by a reorg; replacing the schedule"
+            );
+        }
+
+        // Narrowed for the reason the PTC duties are.
+        let mine: Vec<InclusionListDutyDto> = fetched
+            .duties
+            .into_iter()
+            .filter(|duty| self.indices.contains(&duty.validator_index))
+            .collect();
+        if mine.is_empty() {
+            tracing::debug!(%epoch, "No inclusion list committee duties this epoch");
+        } else {
+            info!(%epoch, count = mine.len(), "Inclusion list committee duties updated");
+        }
+        self.inclusion_lists.insert(
+            epoch,
+            EpochDuties {
+                dependent_root: fetched.dependent_root,
+                duties: mine,
+            },
+        );
+        Ok(())
+    }
+
+    /// Forget inclusion list committee duties for epochs before `epoch`.
+    pub fn prune_inclusion_lists_before(&mut self, epoch: Epoch) {
+        self.inclusion_lists.retain(|held, _| *held >= epoch);
+    }
+
+    /// This client's inclusion list committee duties at `slot`, with the
+    /// `dependent_root` their lists name. `None` when it has none.
+    pub fn inclusion_lists_at_slot(
+        &self,
+        slot: Slot,
+        epoch: Epoch,
+    ) -> Option<(Root, Vec<InclusionListDutyDto>)> {
+        let held = self.inclusion_lists.get(&epoch)?;
+        let duties: Vec<InclusionListDutyDto> = held
+            .duties
+            .iter()
+            .filter(|duty| duty.slot == slot)
+            .cloned()
+            .collect();
+        (!duties.is_empty()).then_some((held.dependent_root, duties))
     }
 
     /// Fetch the sync committee duties of `period` for this client's indices,
@@ -813,6 +892,66 @@ mod tests {
         service.prune_ptc_before(13);
         assert!(service.ptc_at_slot(390, 12).is_empty());
         assert_eq!(service.ptc_at_slot(420, 13).len(), 1);
+    }
+
+    fn inclusion_list_duty(validator_index: ValidatorIndex, slot: Slot) -> InclusionListDutyDto {
+        InclusionListDutyDto {
+            pubkey: "0x00".to_string(),
+            validator_index,
+            slot,
+        }
+    }
+
+    /// Fetched, narrowed to this client's indices, indexed by slot, and handed
+    /// out with the dependent root the lists name.
+    #[tokio::test]
+    async fn inclusion_list_duties_carry_their_dependent_root() {
+        let node = Arc::new(MockBeaconNode::new().with_inclusion_list_duties(
+            12,
+            Root::repeat_byte(3),
+            // Validator 99 is not ours and must be dropped on arrival.
+            vec![inclusion_list_duty(7, 390), inclusion_list_duty(99, 390)],
+        ));
+        let mut service = DutiesService::new(node.clone(), vec![7]);
+
+        service
+            .refresh_inclusion_lists(12)
+            .await
+            .expect("refreshes");
+
+        let (dependent_root, duties) = service
+            .inclusion_lists_at_slot(390, 12)
+            .expect("a duty at 390");
+        assert_eq!(dependent_root, Root::repeat_byte(3));
+        assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].validator_index, 7);
+        assert!(service.inclusion_lists_at_slot(391, 12).is_none());
+        assert!(
+            service.inclusion_lists_at_slot(390, 13).is_none(),
+            "scoped to the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_inclusion_list_dependent_root_replaces_the_schedule() {
+        let node = Arc::new(MockBeaconNode::new().with_inclusion_list_duties(
+            12,
+            Root::repeat_byte(1),
+            vec![inclusion_list_duty(7, 390)],
+        ));
+        let mut service = DutiesService::new(node.clone(), vec![7]);
+        service.refresh_inclusion_lists(12).await.expect("first");
+
+        node.set_inclusion_list_duties(12, Root::repeat_byte(2), vec![inclusion_list_duty(7, 391)]);
+        service.refresh_inclusion_lists(12).await.expect("new root");
+        assert!(service.inclusion_lists_at_slot(390, 12).is_none());
+        let (dependent_root, _) = service
+            .inclusion_lists_at_slot(391, 12)
+            .expect("the replaced schedule");
+        assert_eq!(dependent_root, Root::repeat_byte(2));
+
+        service.prune_inclusion_lists_before(13);
+        assert!(service.inclusion_lists_at_slot(391, 12).is_none());
     }
 
     fn sync_duty(validator_index: ValidatorIndex, seats: Vec<u64>) -> SyncDutyDto {

@@ -462,9 +462,9 @@ fn require_gloas_or_absent(headers: &HeaderMap) -> Result<(), ApiError> {
         return Ok(());
     };
     match value.to_str().ok().and_then(ForkName::parse) {
-        Some(ForkName::Gloas) => Ok(()),
+        Some(ForkName::Gloas | ForkName::Heze) => Ok(()),
         _ => Err(ApiError::BadRequest(
-            "Eth-Consensus-Version must name gloas",
+            "Eth-Consensus-Version must name gloas or heze",
         )),
     }
 }

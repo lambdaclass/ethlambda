@@ -664,7 +664,9 @@ pub fn compute_exit_epoch_and_update_churn(
     let current_epoch = get_current_epoch(state);
     let per_epoch_churn = match state.fork_name() {
         ForkName::Electra | ForkName::Fulu => get_activation_exit_churn_limit(state, config)?,
-        ForkName::Gloas => crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?,
+        ForkName::Gloas | ForkName::Heze => {
+            crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?
+        }
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -800,7 +802,7 @@ pub fn get_consolidation_churn_limit_for_fork(
 ) -> Result<Gwei> {
     match state.fork_name() {
         ForkName::Electra | ForkName::Fulu => get_consolidation_churn_limit(state, config),
-        ForkName::Gloas => {
+        ForkName::Gloas | ForkName::Heze => {
             crate::beacon::helpers::gloas::get_consolidation_churn_limit(state, config)
         }
         fork @ (ForkName::Phase0

@@ -27,6 +27,7 @@ pub(crate) mod genesis;
 pub(crate) mod gloas_proposal;
 pub(crate) mod graffiti;
 pub(crate) mod headers;
+pub(crate) mod inclusion_list;
 pub(crate) mod node;
 pub(crate) mod operations;
 pub(crate) mod pool;
@@ -195,6 +196,7 @@ pub(crate) fn routes(version: &'static str, peer_id: String) -> Router<Store> {
         .merge(proposal::routes())
         .merge(gloas_proposal::routes())
         .merge(ptc::routes())
+        .merge(inclusion_list::routes())
         .merge(sync_committee::routes())
         .merge(bids::routes())
         .merge(proposer_preferences::routes())

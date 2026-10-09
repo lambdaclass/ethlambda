@@ -612,10 +612,15 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     // A handshake failure is not a reason to refuse to run: the
                     // execution client may simply be starting up, and every
                     // call that matters has its own retry ladder.
-                    let gloas_scheduled = store.config().gloas_fork_epoch
-                        != ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                    let far_future = ethlambda_types::beacon::constants::FAR_FUTURE_EPOCH;
+                    let gloas_scheduled = store.config().gloas_fork_epoch != far_future;
+                    let heze_scheduled = store.config().heze_fork_epoch != far_future;
                     let _ = client
-                        .handshake(&version::engine_client_version(), gloas_scheduled)
+                        .handshake(
+                            &version::engine_client_version(),
+                            gloas_scheduled,
+                            heze_scheduled,
+                        )
                         .await
                         .inspect_err(|err| warn!(%err, "Engine API handshake failed"));
 
@@ -1580,6 +1585,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         fulu_fork_epoch: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
+        heze_fork_version: _,
+        heze_fork_epoch: _,
 
         // Time parameters: `seconds_per_slot`/`slot_duration_ms` (compared
         // below) move every slot boundary. The rest are operator-visible
@@ -1608,6 +1615,9 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         // Compared below, alongside `min_validator_withdrawability_delay`:
         // the builder-registry counterpart, also a state-transition rule.
         min_builder_withdrawability_delay: _,
+        // A timeliness deadline like the `*_due_bps` above: it changes which
+        // inclusion lists count as timely, not which block is valid.
+        inclusion_list_due_bps: _,
 
         // Validator cycle: compared below. Churn and inactivity-leak
         // parameters change which exits, activations and inactivity scores a
@@ -1694,6 +1704,12 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         max_request_blob_sidecars_electra: _,
         max_request_data_column_sidecars: _,
         min_epochs_for_block_requests: _,
+
+        // Inclusion lists (heze): request bounds and the gossip size cap, the
+        // same wire-description reasoning as the networking groups above.
+        max_request_inclusion_list: _,
+        min_slots_for_inclusion_lists_requests: _,
+        max_transactions_bytes_per_inclusion_list: _,
     } = persisted;
 
     compare!(
@@ -1713,6 +1729,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         fulu_fork_epoch,
         gloas_fork_version,
         gloas_fork_epoch,
+        heze_fork_version,
+        heze_fork_epoch,
         seconds_per_slot,
         slot_duration_ms,
         min_validator_withdrawability_delay,
@@ -1975,6 +1993,33 @@ async fn fetch_initial_beacon_state(
 /// rebuilding it here and letting `get_forkchoice_store` check the header
 /// hash is what proves this reconstruction matches what the state actually
 /// describes, rather than assuming it.
+/// The body a gloas or heze genesis header commits to.
+///
+/// The specification's genesis commits to the empty body. ethpandaops'
+/// genesis generator (`eth-beacon-genesis`), which builds the devnets, commits
+/// to one whose bid is the state's own `latest_execution_payload_bid` (the
+/// execution genesis hash as parent, the empty requests' root) instead. The
+/// header names whichever of the two the network was built with, so that one
+/// is the anchor's; when it names neither, the empty body is returned and
+/// `get_forkchoice_store`'s header check reports the mismatch.
+fn gloas_genesis_body(state: &BeaconState, fork: ForkName) -> gloas::BeaconBlockBody {
+    let empty = gloas::BeaconBlockBody::empty_at(fork);
+    let body_root = state.latest_block_header().body_root;
+    if empty.hash_tree_root() == body_root {
+        return empty;
+    }
+    let BeaconState::Gloas(inner) = state else {
+        return empty;
+    };
+    let mut mirrored = empty.clone();
+    mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+    if mirrored.hash_tree_root() == body_root {
+        mirrored
+    } else {
+        empty
+    }
+}
+
 fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
     let header = state.latest_block_header();
     let slot = header.slot;
@@ -2056,16 +2101,18 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
             },
             signature: Default::default(),
         }),
-        ForkName::Gloas => SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
-            message: gloas::BeaconBlock {
-                slot,
-                proposer_index,
-                parent_root,
-                state_root,
-                body: gloas::BeaconBlockBody::empty(),
-            },
-            signature: Default::default(),
-        }),
+        fork @ (ForkName::Gloas | ForkName::Heze) => {
+            SignedBeaconBlock::Gloas(gloas::SignedBeaconBlock {
+                message: gloas::BeaconBlock {
+                    slot,
+                    proposer_index,
+                    parent_root,
+                    state_root,
+                    body: gloas_genesis_body(state, fork),
+                },
+                signature: Default::default(),
+            })
+        }
         // Never reached: this is only called on a network's own genesis
         // state, and every `NetworkSource` decodes a beacon fork there
         // (`NetworkDir::load` resolves the fork from `Config::fork_at_epoch`,
@@ -2966,7 +3013,9 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
-                ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
+                ForkName::Gloas | ForkName::Heze => {
+                    gloas::BeaconBlockBody::empty_at(fork).hash_tree_root()
+                }
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
             state.latest_block_header_mut().body_root = empty_body_root;
@@ -2981,6 +3030,38 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
+    }
+
+    /// A gloas genesis built by ethpandaops' `eth-beacon-genesis` commits to a
+    /// body whose bid is the state's own `latest_execution_payload_bid`, not
+    /// the empty body; the anchor block must hash to that header too.
+    #[test]
+    fn a_gloas_genesis_anchor_matches_the_generators_mirrored_bid_body() {
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in ForkName::ALL
+            .into_iter()
+            .skip(1)
+            .take_while(|fork| *fork <= ForkName::Gloas)
+        {
+            config = config.with_fork_epoch(fork, 0);
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("the upgrade chain ends at gloas");
+        };
+        inner.latest_execution_payload_bid.parent_block_hash =
+            ethlambda_types::beacon::primitives::ExecutionBlockHash::repeat_byte(0xfd);
+        let mut mirrored = gloas::BeaconBlockBody::empty_at(ForkName::Gloas);
+        mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+        state.latest_block_header_mut().body_root = mirrored.hash_tree_root();
+
+        let block = genesis_anchor_block(&state);
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot

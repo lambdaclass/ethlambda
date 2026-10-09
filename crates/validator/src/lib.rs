@@ -37,6 +37,7 @@ pub mod beacon_node;
 pub mod duties;
 pub mod error;
 pub mod http_api;
+pub mod inclusion_list;
 pub mod keys;
 pub mod metrics;
 pub mod payload_attestation;
@@ -55,7 +56,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use ethlambda_types::beacon::primitives::{BlsPubkey, Bytes32, ExecutionAddress, ValidatorIndex};
+use ethlambda_types::beacon::primitives::{
+    BlsPubkey, Bytes32, ExecutionAddress, Root, ValidatorIndex,
+};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
@@ -66,6 +69,7 @@ use crate::beacon_node::dto::ProposerPreparationDto;
 use crate::beacon_node::fallback::FallbackBeaconNode;
 use crate::beacon_node::http::HttpBeaconNode;
 use crate::duties::DutiesService;
+use crate::inclusion_list::InclusionListService;
 use crate::keys::ValidatorStore;
 use crate::payload_attestation::PayloadAttestationService;
 use crate::proposal::ProposalService;
@@ -190,6 +194,7 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
     let attestation = AttestationService::new(beacon_node.clone(), context.clone());
     let aggregation = AggregationService::new(beacon_node.clone(), context.clone());
     let payload_attestation = PayloadAttestationService::new(beacon_node.clone(), context.clone());
+    let inclusion_list = InclusionListService::new(beacon_node.clone(), context.clone());
     let sync_committee = SyncCommitteeService::new(beacon_node.clone(), context.clone());
     let proposal = ProposalService::new(beacon_node.clone(), context.clone(), settings.clone());
 
@@ -307,16 +312,19 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
         let slot_duties = duties.at_slot(slot, epoch);
         let committee = duties.ptc_at_slot(slot, epoch);
         let sync_duties = duties.sync_at_slot(slot);
+        let inclusion_lists = duties.inclusion_lists_at_slot(slot, epoch);
         serve_slot_duties(
             &attestation,
             &aggregation,
             &payload_attestation,
             &sync_committee,
+            &inclusion_list,
             &clock,
             slot,
             &slot_duties,
             &committee,
             &sync_duties,
+            inclusion_lists.as_ref(),
             &store,
         )
         .await;
@@ -335,17 +343,23 @@ pub async fn run(config: ValidatorConfig) -> Result<()> {
 ///
 /// Three quarters into the slot the committee sleeps until its own deadline,
 /// then runs bounded by the end of the slot like the other duties.
+///
+/// The inclusion list duty (heze) runs beside both, for the reason the sync
+/// committee's does: its window closes at its own deadline, not ordered
+/// against theirs.
 #[allow(clippy::too_many_arguments)]
 async fn serve_slot_duties<B: BeaconNodeApi>(
     attestation: &AttestationService<B>,
     aggregation: &AggregationService<B>,
     payload_attestation: &PayloadAttestationService<B>,
     sync_committee: &SyncCommitteeService<B>,
+    inclusion_list: &InclusionListService<B>,
     clock: &SlotClock,
     slot: u64,
     slot_duties: &[crate::beacon_node::dto::AttesterDutyDto],
     committee: &[crate::beacon_node::dto::PtcDutyDto],
     sync_duties: &[crate::beacon_node::dto::SyncDutyDto],
+    inclusion_lists: Option<&(Root, Vec<crate::beacon_node::dto::InclusionListDutyDto>)>,
     store: &RwLock<ValidatorStore>,
 ) {
     // The sync committee work runs beside the attester and PTC work rather
@@ -364,8 +378,53 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     };
     tokio::join!(
         attest_then_ptc,
-        sync_committee_duty(sync_committee, clock, slot, sync_duties, store)
+        sync_committee_duty(sync_committee, clock, slot, sync_duties, store),
+        inclusion_list_duty(inclusion_list, clock, slot, inclusion_lists, store),
     );
+}
+
+/// Run one slot's inclusion list committee duty (heze), bounded by the
+/// inclusion list deadline.
+///
+/// The budget is that deadline rather than the end of the slot: a list that
+/// arrives later is stored by the network but no longer counts towards the
+/// next payload's constraints, so work past it is wasted. Abandoning it is
+/// safe for the reason the PTC duty's is: the service records per validator
+/// at signing time. Failures are logged and counted, like every other duty's.
+async fn inclusion_list_duty<B: BeaconNodeApi>(
+    service: &InclusionListService<B>,
+    clock: &SlotClock,
+    slot: u64,
+    assignment: Option<&(Root, Vec<crate::beacon_node::dto::InclusionListDutyDto>)>,
+    store: &RwLock<ValidatorStore>,
+) {
+    let Some((dependent_root, duties)) = assignment else {
+        return;
+    };
+    if !clock.is_heze(slot) || duties.is_empty() {
+        return;
+    }
+    tokio::time::sleep(clock.until_inclusion_list(slot, SystemTime::now())).await;
+    let budget = clock.remaining_inclusion_list_window(slot, SystemTime::now());
+    let attempt = tokio::time::timeout(
+        budget,
+        service.publish(slot, *dependent_root, duties, store),
+    );
+    match attempt.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(err)) => {
+            error!(%slot, %err, "Failed to publish this slot's inclusion lists");
+            metrics::inc_inclusion_list_failures();
+        }
+        Err(_) => {
+            warn!(
+                %slot,
+                budget_ms = budget.as_millis() as u64,
+                "Inclusion list duty ran past its deadline and was abandoned"
+            );
+            metrics::inc_inclusion_list_failures();
+        }
+    }
 }
 
 /// Run one slot's sync committee duty: sign the head at the message deadline,
@@ -727,6 +786,7 @@ async fn refresh_epoch<B: BeaconNodeApi>(
 
     let changed = duties.refresh_around(epoch).await?;
     refresh_ptc(duties, epoch, context).await;
+    refresh_inclusion_lists(duties, epoch, context).await;
     refresh_sync(beacon_node, duties, epoch, context).await;
     metrics::set_duties_held(duties.all().len() as u64);
     if changed {
@@ -762,6 +822,31 @@ async fn refresh_ptc<B: BeaconNodeApi>(
         }
     }
     duties.prune_ptc_before(epoch);
+}
+
+/// Fetch the inclusion list committee schedule for this epoch and the next,
+/// each only if it is a heze epoch.
+///
+/// Gated per epoch, and its failures shrugged off, for the reasons
+/// [`refresh_ptc`] gives.
+async fn refresh_inclusion_lists<B: BeaconNodeApi>(
+    duties: &mut DutiesService<B>,
+    epoch: u64,
+    context: &SigningContext,
+) {
+    for target in [epoch, epoch + 1] {
+        if context.config.fork_at_epoch(target) != ethlambda_types::beacon::fork::ForkName::Heze {
+            continue;
+        }
+        if let Err(err) = duties.refresh_inclusion_lists(target).await {
+            warn!(
+                epoch = target,
+                %err,
+                "Inclusion list duties fetch failed; this client may miss its lists"
+            );
+        }
+    }
+    duties.prune_inclusion_lists_before(epoch);
 }
 
 /// How many epochs before a period boundary the next period's subnets are
@@ -1190,17 +1275,180 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
             &clock,
             slot,
             &[],
             &committee,
             &[],
+            None,
             &store,
         )
         .await;
 
         assert_eq!(node.attestation_data_call_count(), 0, "no attester duty");
         assert_eq!(node.submitted_payload_attestations().len(), 1);
+    }
+
+    // ---- heze -----------------------------------------------------------
+
+    fn heze_context(epoch: u64) -> SigningContext {
+        SigningContext {
+            config: ethlambda_types::beacon::config::Config::mainnet()
+                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Gloas, 0)
+                .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Heze, epoch),
+            genesis_validators_root: Root::ZERO,
+        }
+    }
+
+    fn inclusion_list_duty(index: u64, slot: u64) -> crate::beacon_node::dto::InclusionListDutyDto {
+        crate::beacon_node::dto::InclusionListDutyDto {
+            pubkey: crate::beacon_node::dto::encode_hex(&[0u8; 48]),
+            validator_index: index,
+            slot,
+        }
+    }
+
+    /// The inclusion list schedule is fetched for heze epochs only: the last
+    /// gloas epoch looks ahead into the first heze one, and a chain with no
+    /// heze scheduled is never asked.
+    #[tokio::test]
+    async fn the_inclusion_list_schedule_is_fetched_for_heze_epochs_only() {
+        let heze_node = Arc::new(node().with_inclusion_list_duties(
+            4,
+            Root::repeat_byte(1),
+            vec![inclusion_list_duty(11, 130)],
+        ));
+        let mut duties = DutiesService::new(heze_node.clone(), Vec::new());
+        let keys = [pubkey(1), pubkey(2)];
+
+        refresh_epoch(
+            &heze_node,
+            &mut duties,
+            &keys,
+            3,
+            &settings(None),
+            &empty_store(),
+            &heze_context(4),
+        )
+        .await
+        .expect("refreshes");
+        assert_eq!(
+            heze_node.inclusion_list_duties_call_count(),
+            1,
+            "only epoch 4, the first heze one"
+        );
+        assert!(duties.inclusion_lists_at_slot(130, 4).is_some());
+
+        let gloas_node = Arc::new(node());
+        let mut duties = DutiesService::new(gloas_node.clone(), Vec::new());
+        refresh_epoch(
+            &gloas_node,
+            &mut duties,
+            &keys,
+            3,
+            &settings(None),
+            &empty_store(),
+            &gloas_context(0),
+        )
+        .await
+        .expect("refreshes");
+        assert_eq!(gloas_node.inclusion_list_duties_call_count(), 0);
+    }
+
+    /// A committee member with no other duty in the slot still publishes its
+    /// list, naming the schedule's dependent root.
+    #[tokio::test]
+    async fn an_inclusion_list_member_with_no_other_duty_publishes() {
+        use crate::beacon_node::mock::MockBeaconNode;
+
+        let mut config = heze_context(0).config;
+        config.slot_duration_ms = 1_000;
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let now_secs = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs();
+        let clock = SlotClock::from_config(now_secs - 100, &config);
+        let slot = clock.now().expect("after genesis") + 1;
+
+        let mut store = ValidatorStore::new();
+        let secret: [u8; 32] =
+            hex::decode("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
+                .expect("hex")
+                .try_into()
+                .expect("32 bytes");
+        let key = store.insert_secret("test", &secret).expect("inserts");
+        let store = RwLock::new(store);
+
+        let node =
+            Arc::new(MockBeaconNode::new().with_inclusion_list_transactions(vec![vec![0x01]]));
+        let assignment = (
+            Root::repeat_byte(9),
+            vec![crate::beacon_node::dto::InclusionListDutyDto {
+                pubkey: crate::beacon_node::dto::encode_hex(&key.0),
+                validator_index: 3,
+                slot,
+            }],
+        );
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
+            &clock,
+            slot,
+            &[],
+            &[],
+            &[],
+            Some(&assignment),
+            &store,
+        )
+        .await;
+
+        let published = node.published_inclusion_lists();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].message.dependent_root, Root::repeat_byte(9));
+        assert_eq!(published[0].message.slot, slot);
+    }
+
+    /// Before heze there is no committee: even a stale schedule entry is not
+    /// acted on.
+    #[tokio::test]
+    async fn no_inclusion_list_is_published_before_heze() {
+        use crate::beacon_node::mock::MockBeaconNode;
+
+        let config = ethlambda_types::beacon::config::Config::mainnet();
+        let context = Arc::new(SigningContext {
+            config: config.clone(),
+            genesis_validators_root: Root::ZERO,
+        });
+        let clock = SlotClock::from_config(0, &config);
+        let node =
+            Arc::new(MockBeaconNode::new().with_inclusion_list_transactions(vec![vec![0x01]]));
+        let assignment = (Root::ZERO, vec![inclusion_list_duty(3, 5)]);
+
+        serve_slot_duties(
+            &AttestationService::new(node.clone(), context.clone()),
+            &AggregationService::new(node.clone(), context.clone()),
+            &PayloadAttestationService::new(node.clone(), context.clone()),
+            &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
+            &clock,
+            5,
+            &[],
+            &[],
+            &[],
+            Some(&assignment),
+            &empty_store(),
+        )
+        .await;
+        assert_eq!(node.inclusion_list_transactions_call_count(), 0);
     }
 
     fn altair_context() -> SigningContext {
@@ -1328,11 +1576,13 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
             &clock,
             slot,
             &[],
             &[],
             &duties,
+            None,
             &store,
         )
         .await;
@@ -1364,11 +1614,13 @@ mod tests {
             &AggregationService::new(node.clone(), context.clone()),
             &PayloadAttestationService::new(node.clone(), context.clone()),
             &SyncCommitteeService::new(node.clone(), context.clone()),
+            &InclusionListService::new(node.clone(), context.clone()),
             &clock,
             5,
             &[],
             &[ptc_duty(3, 5)],
             &[],
+            None,
             &store,
         )
         .await;

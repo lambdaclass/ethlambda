@@ -2547,7 +2547,7 @@ impl BlockChainServer {
     /// to be `INVALID`.
     async fn notify_forkchoice_updated(&mut self) -> Option<(Instant, Instant)> {
         let client = self.engine.clone()?;
-        let (_head_slot, head_root) = self.store.beacon_head()?;
+        let (head_slot, head_root) = self.store.beacon_head()?;
 
         // A gloas head is ambiguous without its payload status (FULL names the
         // revealed payload, EMPTY the one before), and a head whose status has
@@ -2568,17 +2568,38 @@ impl BlockChainServer {
         // leaving it to the next tick.
         let start = Instant::now();
         // V4 from gloas on: it carries the custody columns the execution
-        // client must keep. The follower sends `null` attributes either way.
-        let response = if gloas {
+        // client must keep. V5 from heze on (Bogota), which answers whether a
+        // VALID head satisfied its inclusion lists. The follower sends `null`
+        // attributes either way.
+        let config = self.store.config();
+        let heze = config.fork_at_epoch(compute_epoch_at_slot(head_slot))
+            == ethlambda_state_transition::beacon::ForkName::Heze;
+        let response = if heze {
             let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
-            client.forkchoice_updated_v4(&state, custody).await
+            client
+                .forkchoice_updated_v5(&state, custody)
+                .await
+                .map(|status| (status.status, status.inclusion_list_satisfied))
+        } else if gloas {
+            let custody = CustodyColumns::from_indices(self.custody_columns.iter().copied());
+            client
+                .forkchoice_updated_v4(&state, custody)
+                .await
+                .map(|status| (status, None))
         } else {
-            client.forkchoice_updated(&state).await
+            client
+                .forkchoice_updated(&state)
+                .await
+                .map(|status| (status, None))
         };
         match response {
-            Ok(status) => {
-                self.apply_forkchoice_verdict(head_root, state.head_block_hash, gloas, &status)
-            }
+            Ok((status, inclusion_list_satisfied)) => self.apply_forkchoice_verdict(
+                head_root,
+                state.head_block_hash,
+                gloas,
+                &status,
+                inclusion_list_satisfied,
+            ),
             Err(err) => warn!(%err, "forkchoiceUpdated failed"),
         }
         Some((start, Instant::now()))
@@ -2601,9 +2622,15 @@ impl BlockChainServer {
         head_hash: H256,
         gloas: bool,
         status: &EnginePayloadStatus,
+        inclusion_list_satisfied: Option<bool>,
     ) {
         if gloas {
-            self.apply_gloas_forkchoice_verdict(head_root, head_hash, status);
+            self.apply_gloas_forkchoice_verdict(
+                head_root,
+                head_hash,
+                status,
+                inclusion_list_satisfied,
+            );
             return;
         }
         match beacon_engine::verdict(status) {

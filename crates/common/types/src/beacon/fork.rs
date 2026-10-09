@@ -40,7 +40,7 @@ const BEACON_SNAPSHOT_INTERVAL: u64 = preset::SLOTS_PER_EPOCH;
 /// a target of the beacon STF's `upgrade`-style traversal. See
 /// [`ForkName::ALL`].
 ///
-/// Forks after gloas exist upstream but are out of scope for this crate.
+/// Forks after heze exist upstream but are out of scope for this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,
@@ -51,6 +51,10 @@ pub enum ForkName {
     Electra,
     Fulu,
     Gloas,
+    /// EIP-7805, fork-choice enforced inclusion lists (FOCIL). Its containers
+    /// are gloas's, except that the execution payload bid gains
+    /// `inclusion_list_bits`; see `containers::gloas::ExecutionPayloadBid`.
+    Heze,
     /// The Lean consensus protocol, which this repository implements alongside
     /// the Beacon Chain. Not a Beacon Chain fork, and not in [`ForkName::ALL`].
     Lean,
@@ -62,9 +66,9 @@ impl ForkName {
     /// [`ForkName::Lean`] is not here: it is not a Beacon Chain fork. Because
     /// `parse`, `previous`, `next`, and the spec-fixture harness all search this
     /// array, its absence is what makes `parse("lean")` return `None`, keeps
-    /// `Gloas.next()` at `None`, and stops any fixture directory from resolving
+    /// `Heze.next()` at `None`, and stops any fixture directory from resolving
     /// to a lean case.
-    pub const ALL: [ForkName; 8] = [
+    pub const ALL: [ForkName; 9] = [
         ForkName::Phase0,
         ForkName::Altair,
         ForkName::Bellatrix,
@@ -73,6 +77,7 @@ impl ForkName {
         ForkName::Electra,
         ForkName::Fulu,
         ForkName::Gloas,
+        ForkName::Heze,
     ];
 
     /// The lowercase name the specification and its fixture paths use.
@@ -86,6 +91,7 @@ impl ForkName {
             ForkName::Electra => "electra",
             ForkName::Fulu => "fulu",
             ForkName::Gloas => "gloas",
+            ForkName::Heze => "heze",
             ForkName::Lean => "lean",
         }
     }
@@ -133,7 +139,8 @@ impl ForkName {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => true,
+            | ForkName::Gloas
+            | ForkName::Heze => true,
             ForkName::Lean => super::lean_fork_unreachable("ForkName::is_followed"),
         }
     }
@@ -147,7 +154,28 @@ impl ForkName {
     /// gloas must be listed here, so the compiler forces the decision.
     pub const fn has_payload_envelopes(self) -> bool {
         match self {
-            ForkName::Gloas => true,
+            ForkName::Gloas | ForkName::Heze => true,
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb
+            | ForkName::Electra
+            | ForkName::Fulu
+            | ForkName::Lean => false,
+        }
+    }
+
+    /// Whether this is gloas or a later beacon fork.
+    ///
+    /// Heze keeps gloas's containers and every gloas rule, adding inclusion
+    /// lists on top, so a rule the specification states "from gloas on" asks
+    /// this rather than comparing with [`ForkName::Gloas`], which would leave
+    /// heze out. An explicit match for the reason
+    /// [`Self::has_payload_envelopes`] gives.
+    pub const fn is_gloas_or_later(self) -> bool {
+        match self {
+            ForkName::Gloas | ForkName::Heze => true,
             ForkName::Phase0
             | ForkName::Altair
             | ForkName::Bellatrix
@@ -178,6 +206,7 @@ impl ForkName {
             ForkName::Electra => 5,
             ForkName::Fulu => 6,
             ForkName::Gloas => 7,
+            ForkName::Heze => 8,
             ForkName::Lean => 255,
         }
     }
@@ -202,7 +231,8 @@ impl ForkName {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu
-            | ForkName::Gloas => BEACON_SNAPSHOT_INTERVAL,
+            | ForkName::Gloas
+            | ForkName::Heze => BEACON_SNAPSHOT_INTERVAL,
         }
     }
 
@@ -220,6 +250,7 @@ impl ForkName {
             5 => Some(ForkName::Electra),
             6 => Some(ForkName::Fulu),
             7 => Some(ForkName::Gloas),
+            8 => Some(ForkName::Heze),
             255 => Some(ForkName::Lean),
             _ => None,
         }
@@ -257,22 +288,23 @@ mod tests {
             assert_eq!(ForkName::parse(fork.as_str()), Some(fork));
         }
         assert_eq!(ForkName::parse("gloas"), Some(ForkName::Gloas));
-        assert_eq!(ForkName::parse("heze"), None);
+        assert_eq!(ForkName::parse("heze"), Some(ForkName::Heze));
+        assert_eq!(ForkName::parse("eip8321"), None);
     }
 
     #[test]
-    fn gloas_is_the_last_beacon_fork() {
-        assert_eq!(ForkName::Fulu.next(), Some(ForkName::Gloas));
+    fn heze_is_the_last_beacon_fork() {
+        assert_eq!(ForkName::Gloas.next(), Some(ForkName::Heze));
         // Also guards the reason Lean is kept out of ALL: adding it there
         // would make this None into Some(Lean) and let `upgrade` walk off
         // the end.
-        assert_eq!(ForkName::Gloas.next(), None);
+        assert_eq!(ForkName::Heze.next(), None);
     }
 
     #[test]
     fn neighbours_terminate_at_the_ends() {
         assert_eq!(ForkName::Phase0.previous(), None);
-        assert_eq!(ForkName::Gloas.next(), None);
+        assert_eq!(ForkName::Heze.next(), None);
         assert_eq!(ForkName::Altair.previous(), Some(ForkName::Phase0));
         assert_eq!(ForkName::Altair.next(), Some(ForkName::Bellatrix));
     }
@@ -330,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn every_beacon_fork_through_gloas_is_followed() {
+    fn every_beacon_fork_through_heze_is_followed() {
         for fork in ForkName::ALL {
             assert!(fork.is_followed(), "{fork:?}");
         }
@@ -350,9 +382,10 @@ mod tests {
         assert_eq!(ForkName::Phase0.selector(), 0);
         assert_eq!(ForkName::Fulu.selector(), 6);
         assert_eq!(ForkName::Gloas.selector(), 7);
-        // Lean sits at the top of the byte range so heze can keep taking the
-        // next free value after gloas.
+        assert_eq!(ForkName::Heze.selector(), 8);
+        // Lean sits at the top of the byte range so the forks after heze can
+        // keep taking the next free value.
         assert_eq!(ForkName::Lean.selector(), 255);
-        assert_eq!(ForkName::from_selector(8), None);
+        assert_eq!(ForkName::from_selector(9), None);
     }
 }

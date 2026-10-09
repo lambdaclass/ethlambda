@@ -46,7 +46,7 @@ use ethlambda_network_api::{
     rpc_to_p2p::{
         PublishBeaconAggregate, PublishBeaconAttestation, PublishBeaconBlock,
         PublishBeaconOperation, PublishExecutionPayloadBid, PublishExecutionPayloadEnvelope,
-        PublishPayloadAttestationMessage, PublishProposerPreferences,
+        PublishInclusionList, PublishPayloadAttestationMessage, PublishProposerPreferences,
         PublishSyncCommitteeContribution, PublishSyncCommitteeMessage, SubscribeAttestationSubnets,
         SubscribeSyncCommitteeSubnets,
     },
@@ -57,6 +57,7 @@ use ethlambda_state_transition::beacon::gossip::{
     aggregate::SeenAggregates,
     attestation::SeenAttestations,
     envelope::SeenEnvelopes,
+    inclusion_list::SeenInclusionLists,
     operations::SeenOperations,
     payload_attestation::SeenPayloadAttestations,
     sync_committee::{SeenSyncCommitteeMessages, SeenSyncContributions},
@@ -300,6 +301,12 @@ const SEEN_ENVELOPES_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("no
 /// spirit of [`SEEN_COLUMNS_CAPACITY`].
 const SEEN_PAYLOAD_ATTESTATIONS_CAPACITY: NonZeroUsize = NonZeroUsize::new(4096).expect("non-zero");
 
+/// How many `(slot, dependent_root, validator)` keys the inclusion list count
+/// cache remembers. A slot's committee is sixteen members, and the rule only
+/// asks about the current slot, so this is headroom for many slots and the
+/// odd dependent root a reorg adds.
+const SEEN_INCLUSION_LISTS_CAPACITY: NonZeroUsize = NonZeroUsize::new(1024).expect("non-zero");
+
 /// How many `(target_epoch, aggregator_index)` pairs the accepted-aggregate
 /// cache remembers, and how many `(hash_tree_root(data), committee_index)`
 /// bitfields alongside it (`SeenAggregates::new`'s two capacities, both sized
@@ -457,6 +464,7 @@ pub enum ReqRespProtocol {
     DataColumnSidecarsByRoot,
     ExecutionPayloadEnvelopesByRange,
     ExecutionPayloadEnvelopesByRoot,
+    InclusionListsByIndices,
 }
 
 /// An outbound request id, namespaced by the protocol it was sent on.
@@ -1200,6 +1208,7 @@ impl P2P {
             seen_payload_attestations: SeenPayloadAttestations::new(
                 SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
             ),
+            seen_inclusion_lists: SeenInclusionLists::new(SEEN_INCLUSION_LISTS_CAPACITY),
             seen_aggregates: SeenAggregates::new(
                 SEEN_AGGREGATES_CAPACITY,
                 SEEN_AGGREGATES_CAPACITY,
@@ -1351,6 +1360,9 @@ pub struct P2PServer {
     /// The first valid `payload_attestation_message` per `(slot, validator
     /// index)` accepted from gossip.
     pub(crate) seen_payload_attestations: SeenPayloadAttestations,
+    /// How many valid `inclusion_list`s each `(slot, dependent_root,
+    /// validator)` sent: the topic forwards two per key.
+    pub(crate) seen_inclusion_lists: SeenInclusionLists,
     /// Accepted `beacon_aggregate_and_proof`s, by `(target_epoch,
     /// aggregator_index)` and by `(hash_tree_root(data), committee_index)`.
     pub(crate) seen_aggregates: SeenAggregates,
@@ -1752,6 +1764,12 @@ impl Handler<PublishExecutionPayloadBid> for P2PServer {
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
         beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
+    }
+}
+
+impl Handler<PublishInclusionList> for P2PServer {
+    async fn handle(&mut self, msg: PublishInclusionList, _ctx: &Context<Self>) {
+        gossipsub::publish_inclusion_list(self, msg.signed);
     }
 }
 
@@ -2199,6 +2217,9 @@ async fn handle_behaviour_event(
             }
             ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
                 (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
+            }
+            ReqRespEvent::InclusionListsByIndices(e) => {
+                (ReqRespProtocol::InclusionListsByIndices, e)
             }
         },
     };
@@ -3009,6 +3030,10 @@ pub(crate) mod test_support {
                 ethlambda_state_transition::beacon::gossip::payload_attestation::SeenPayloadAttestations::new(
                     crate::SEEN_PAYLOAD_ATTESTATIONS_CAPACITY,
                 ),
+            seen_inclusion_lists:
+                ethlambda_state_transition::beacon::gossip::inclusion_list::SeenInclusionLists::new(
+                    crate::SEEN_INCLUSION_LISTS_CAPACITY,
+                ),
             seen_aggregates:
                 ethlambda_state_transition::beacon::gossip::aggregate::SeenAggregates::new(
                     crate::SEEN_AGGREGATES_CAPACITY,
@@ -3385,6 +3410,9 @@ mod tests {
                 }
                 ReqRespEvent::ExecutionPayloadEnvelopesByRoot(e) => {
                     (ReqRespProtocol::ExecutionPayloadEnvelopesByRoot, e)
+                }
+                ReqRespEvent::InclusionListsByIndices(e) => {
+                    (ReqRespProtocol::InclusionListsByIndices, e)
                 }
             })
         }

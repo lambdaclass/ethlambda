@@ -105,7 +105,7 @@ pub fn process_epoch(state: &mut BeaconState, config: &Config) -> Result<()> {
         // EIP-7688's progressive participation, inactivity, and pending-queue
         // lists need their own copies of several more (see `gloas`'s own
         // module doc for which), so gloas gets its own driver too.
-        ForkName::Gloas => gloas::process_epoch(state, config),
+        ForkName::Gloas | ForkName::Heze => gloas::process_epoch(state, config),
         ForkName::Lean => lean_state_unreachable("process_epoch"),
     }
 }
@@ -140,7 +140,8 @@ pub fn process_justification_and_finalization(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
-        | ForkName::Gloas => altair::process_justification_and_finalization(state),
+        | ForkName::Gloas
+        | ForkName::Heze => altair::process_justification_and_finalization(state),
         ForkName::Lean => lean_state_unreachable("process_justification_and_finalization"),
     }
 }

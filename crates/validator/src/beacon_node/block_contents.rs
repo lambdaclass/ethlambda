@@ -309,7 +309,7 @@ impl ProducedBlock {
             // Gloas needs one more fact than the fork: whether the node
             // included the payload, which only the response header says. See
             // `Self::from_gloas_ssz`.
-            ForkName::Gloas => Err(Error::InconsistentResponse(
+            ForkName::Gloas | ForkName::Heze => Err(Error::InconsistentResponse(
                 "a gloas block cannot be decoded without Eth-Execution-Payload-Included"
                     .to_string(),
             )),
@@ -352,8 +352,11 @@ impl ProducedBlock {
                 .map_err(|err| decode("bare block", err))?;
             (block, None)
         };
+        // Heze's block is gloas's container with a heze-shaped bid, so the
+        // bid says which of the two forks this is.
+        let fork = block.body.signed_execution_payload_bid.message.fork_name();
         Ok(Self {
-            fork: ForkName::Gloas,
+            fork,
             contents: Contents::Gloas { block, payload },
         })
     }

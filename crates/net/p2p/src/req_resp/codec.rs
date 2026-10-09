@@ -12,7 +12,8 @@ use super::{
 
 use crate::beacon::messages::{
     BeaconBlocksByRangeRequest, DataColumnsByRangeRequest, DataColumnsByRootIdentifiers,
-    ExecutionPayloadEnvelopeRoots, ExecutionPayloadEnvelopesByRangeRequest, Goodbye, Ping,
+    ExecutionPayloadEnvelopeRoots, ExecutionPayloadEnvelopesByRangeRequest, Goodbye,
+    InclusionListsByIndicesRequest, Ping,
 };
 use crate::beacon::{BeaconContext, encoding as beacon_encoding, protocols};
 use crate::lean::messages::{BlocksByRootRequest, RequestedBlockRoots};
@@ -21,7 +22,8 @@ use crate::metrics;
 
 /// Protocols whose response payload has one shape forever write no context
 /// bytes, which is every protocol here except the two beacon block ones, the
-/// two beacon data column sidecar ones and the two gloas envelope ones.
+/// two beacon data column sidecar ones, the two gloas envelope ones and heze's
+/// inclusion list one.
 const NO_CONTEXT: &[u8] = &[];
 
 /// Short label extracted from a libp2p protocol id, used as the `protocol`
@@ -208,6 +210,10 @@ impl libp2p::request_response::Codec for Codec {
                     .map_err(|err| invalid(format!("{err:?}")))?;
                 Ok(Request::ExecutionPayloadEnvelopesByRoot(roots.into_inner()))
             }
+            protocols::INCLUSION_LISTS_BY_INDICES_V1 => Ok(Request::InclusionListsByIndices(
+                InclusionListsByIndicesRequest::from_ssz_bytes(&payload)
+                    .map_err(|err| invalid(format!("{err:?}")))?,
+            )),
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -291,6 +297,17 @@ impl libp2p::request_response::Codec for Codec {
                     ResponsePayload::ExecutionPayloadEnvelopes(envelopes),
                 ))
             }
+            protocols::INCLUSION_LISTS_BY_INDICES_V1 => {
+                let context = self.beacon_context(protocol.as_ref())?;
+                let lists = beacon_encoding::decode_inclusion_lists_response(
+                    io,
+                    label,
+                    &context.config,
+                    context.genesis_validators_root,
+                )
+                .await?;
+                Ok(Response::success(ResponsePayload::InclusionLists(lists)))
+            }
             _ => Err(invalid(format!("unknown protocol: {}", protocol.as_ref()))),
         }
     }
@@ -364,6 +381,7 @@ impl libp2p::request_response::Codec for Codec {
                     .map_err(|err| invalid(format!("{err:?}")))?
                     .to_ssz()
             }
+            Request::InclusionListsByIndices(request) => request.to_ssz(),
         };
 
         let compressed_size = write_payload(io, &encoded).await?;
@@ -440,6 +458,17 @@ impl libp2p::request_response::Codec for Codec {
                     )
                     .await
                 }
+                ResponsePayload::InclusionLists(lists) => {
+                    let context = self.beacon_context(protocol.as_ref())?;
+                    beacon_encoding::write_inclusion_lists_response(
+                        io,
+                        label,
+                        &context.config,
+                        context.genesis_validators_root,
+                        lists,
+                    )
+                    .await
+                }
             },
             Response::Error { code, message } => {
                 // Send error code
@@ -512,7 +541,7 @@ mod tests {
         self, ColumnIndices, DataColumnsByRootIdentifier,
     };
     use ethlambda_types::beacon::containers::shared;
-    use ethlambda_types::beacon::containers::{DataColumnSidecar, gloas};
+    use ethlambda_types::beacon::containers::{DataColumnSidecar, gloas, heze};
     use ethlambda_types::beacon::fork_digest::compute_fork_digest;
     use ethlambda_types::beacon::preset;
     use ethlambda_types::beacon::primitives::Root;
@@ -1074,6 +1103,109 @@ mod tests {
             .await
             .expect("writes");
         let result = codec_for(gloas_config())
+            .read_response(&stream_protocol, &mut Cursor::new(buffer.into_inner()))
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    fn heze_config() -> Config {
+        let base = gloas_config();
+        Config {
+            heze_fork_epoch: base.gloas_fork_epoch + 64,
+            ..base
+        }
+    }
+
+    fn heze_slot() -> u64 {
+        heze_config().heze_fork_epoch * preset::SLOTS_PER_EPOCH + 1
+    }
+
+    fn inclusion_list_at(slot: u64, validator_index: u64) -> heze::SignedInclusionList {
+        let transaction: gloas::Transaction = vec![0x02, 0xf8, validator_index as u8].into();
+        heze::SignedInclusionList {
+            message: heze::InclusionList {
+                slot,
+                validator_index,
+                dependent_root: Root::repeat_byte(9),
+                transactions: vec![transaction].into(),
+            },
+            signature: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_inclusion_lists_by_indices_request_round_trips() {
+        let mut indices = heze::InclusionListBits::new();
+        indices.set(0, true).unwrap();
+        indices.set(15, true).unwrap();
+        let request = InclusionListsByIndicesRequest {
+            slot: heze_slot(),
+            dependent_root: Root::repeat_byte(3),
+            indices,
+        };
+        let decoded = request_round_trip(
+            protocols::INCLUSION_LISTS_BY_INDICES_V1,
+            Request::InclusionListsByIndices(request.clone()),
+        )
+        .await;
+        match decoded {
+            Request::InclusionListsByIndices(decoded) => assert_eq!(decoded, request),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    /// Each chunk's context is the digest of its own list's epoch, the heze
+    /// digest for a heze slot.
+    #[tokio::test]
+    async fn an_inclusion_lists_response_round_trips_under_the_heze_digest() {
+        let lists = vec![
+            inclusion_list_at(heze_slot(), 1),
+            inclusion_list_at(heze_slot(), 2),
+        ];
+        let stream_protocol = StreamProtocol::new(protocols::INCLUSION_LISTS_BY_INDICES_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        codec_for(heze_config())
+            .write_response(
+                &stream_protocol,
+                &mut buffer,
+                Response::success(ResponsePayload::InclusionLists(lists.clone())),
+            )
+            .await
+            .expect("writes");
+        let bytes = buffer.into_inner();
+        let config = heze_config();
+        let expected = compute_fork_digest(&config, mainnet_gvr(), config.heze_fork_epoch);
+        assert_eq!(bytes[0], 0);
+        assert_eq!(bytes[1..5], expected);
+
+        let decoded = codec_for(heze_config())
+            .read_response(&stream_protocol, &mut Cursor::new(bytes))
+            .await
+            .expect("reads");
+        match decoded {
+            Response::Success {
+                payload: ResponsePayload::InclusionLists(decoded),
+            } => assert_eq!(decoded, lists),
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    /// Inclusion lists exist from heze on, so a gloas digest is refused even
+    /// though the chunk itself decodes.
+    #[tokio::test]
+    async fn an_inclusion_list_chunk_under_a_gloas_digest_aborts_the_stream() {
+        let config = heze_config();
+        let gloas_digest = compute_fork_digest(&config, mainnet_gvr(), config.gloas_fork_epoch);
+        let payload = inclusion_list_at(heze_slot(), 1).to_ssz();
+        let stream_protocol = StreamProtocol::new(protocols::INCLUSION_LISTS_BY_INDICES_V1);
+
+        let mut buffer = Cursor::new(Vec::new());
+        write_success_chunk(&mut buffer, "test", &gloas_digest, payload)
+            .await
+            .expect("writes");
+        let result = codec_for(config)
             .read_response(&stream_protocol, &mut Cursor::new(buffer.into_inner()))
             .await;
 

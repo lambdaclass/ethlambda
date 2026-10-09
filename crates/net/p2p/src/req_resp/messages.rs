@@ -3,12 +3,13 @@ use ethlambda_types::beacon::containers::DataColumnSidecar;
 use ethlambda_types::beacon::containers::SignedBeaconBlock;
 use ethlambda_types::beacon::containers::fulu::DataColumnsByRootIdentifier;
 use ethlambda_types::beacon::containers::gloas::SignedExecutionPayloadEnvelope;
+use ethlambda_types::beacon::containers::heze::SignedInclusionList;
 use ethlambda_types::beacon::primitives::Root;
 use libssz_types::SszList;
 
 use crate::beacon::messages::{
     BeaconMetaData, BeaconStatus, DataColumnsByRangeRequest,
-    ExecutionPayloadEnvelopesByRangeRequest, Goodbye, Ping,
+    ExecutionPayloadEnvelopesByRangeRequest, Goodbye, InclusionListsByIndicesRequest, Ping,
 };
 use crate::lean::messages::{BlocksByRootRequest, Status};
 
@@ -100,6 +101,8 @@ pub enum Request {
     /// ([`crate::beacon::messages::ExecutionPayloadEnvelopeRoots`]) carries the
     /// bound on decode and the codec re-applies it on encode.
     ExecutionPayloadEnvelopesByRoot(Vec<Root>),
+    /// Heze inclusion lists by committee position. Beacon-only.
+    InclusionListsByIndices(InclusionListsByIndicesRequest),
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +207,9 @@ impl std::fmt::Display for Response {
                 "Success(ExecutionPayloadEnvelopes count={})",
                 envelopes.len()
             ),
+            Self::Success {
+                payload: ResponsePayload::InclusionLists(lists),
+            } => write!(f, "Success(InclusionLists count={})", lists.len()),
             Self::Error { code, message } => {
                 let message = String::from_utf8_lossy(message);
                 write!(f, "Error({code:?}: {message})")
@@ -292,6 +298,8 @@ pub enum ResponsePayload {
     DataColumnSidecars(Vec<DataColumnSidecar>),
     /// The envelopes answering either gloas envelope protocol.
     ExecutionPayloadEnvelopes(Vec<SignedExecutionPayloadEnvelope>),
+    /// The heze inclusion lists answering `inclusion_lists_by_indices`.
+    InclusionLists(Vec<SignedInclusionList>),
 }
 
 /// Error message type for non-success responses.

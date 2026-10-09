@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::containers::altair;
 use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::heze;
 use ethlambda_types::beacon::containers::shared::AttestationData;
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::primitives::{BlsPubkey, Epoch, Root, Slot, ValidatorIndex};
@@ -22,8 +23,8 @@ use crate::beacon_node::dto::{
     SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::beacon_node::{
-    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis, ProposerDuties,
-    PtcDuties, Published, SignedAggregates, ValidatorEntry,
+    AggregateAttestation, AttesterDuties, BeaconNodeApi, BlockRequest, Genesis,
+    InclusionListDuties, ProposerDuties, PtcDuties, Published, SignedAggregates, ValidatorEntry,
 };
 use crate::error::{Error, Result};
 
@@ -304,6 +305,33 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
     ) -> Result<usize> {
         self.try_each("submit_payload_attestations", |node| {
             node.submit_payload_attestations(messages)
+        })
+        .await
+    }
+
+    async fn inclusion_list_duties(
+        &self,
+        epoch: Epoch,
+        indices: &[ValidatorIndex],
+    ) -> Result<InclusionListDuties> {
+        self.try_each("inclusion_list_duties", |node| {
+            node.inclusion_list_duties(epoch, indices)
+        })
+        .await
+    }
+
+    /// The first node with an execution client that answers wins: any node's
+    /// view of the mempool serves, and the list is due well inside the slot.
+    async fn inclusion_list_transactions(&self, slot: Slot) -> Result<Vec<Vec<u8>>> {
+        self.try_each("inclusion_list_transactions", |node| {
+            node.inclusion_list_transactions(slot)
+        })
+        .await
+    }
+
+    async fn publish_inclusion_list(&self, signed: &heze::SignedInclusionList) -> Result<()> {
+        self.try_each("publish_inclusion_list", |node| {
+            node.publish_inclusion_list(signed)
         })
         .await
     }

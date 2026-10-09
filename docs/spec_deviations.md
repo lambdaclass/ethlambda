@@ -664,3 +664,68 @@ comes first. The validator client signs once, at the deadline
 (`SYNC_MESSAGE_DUE_BPS`, or its gloas variant), over the head root it then
 reads, and refuses to when that root is optimistic
 (`specs/bellatrix/optimistic-sync.md`).
+
+## Heze inclusion list gossip never queues and reads cached states only
+
+- **The specification:** `validate_inclusion_list_gossip` says an unseen
+  dependent block "MAY be queued", and builds the committee from
+  `store.block_states[dependent_root]` advanced with `process_slots` to
+  `compute_shuffling_lookahead_start_slot(epoch)`.
+- **ethlambda:** an unseen dependent block is IGNORE, never parked. The
+  committee is read from the cached head state when the head shares the
+  dependent root and is in the list's epoch or the one before (the canonical
+  case), else from the cached `CheckpointState` at the lookahead epoch, else
+  IGNORE (`inclusion_list::committee_state`). Nothing is rebuilt from disk.
+- **Why:** the same as for proposer preferences, which this mirrors: a list is
+  only useful within its own slot, and a dependent block about an epoch old is
+  usually out of the 32-state cache. On focil-devnet-1 the only IGNOREs seen
+  were the first slots after a checkpoint sync, before the caches filled.
+
+## Heze inclusion list timeliness is judged by the arrival time
+
+- **The specification:** `on_inclusion_list` marks a list timely from
+  `store.time` when the handler runs.
+- **ethlambda:** from the wall clock at which the gossip message arrived (or
+  the Beacon API submission was received), carried with the list through the
+  stateful checks, which run on a blocking thread and may finish later.
+- **Why:** a verdict that waited for a permit would otherwise turn a list that
+  arrived in time into an untimely one.
+
+## A verified payload with no recorded inclusion list satisfaction counts as satisfying
+
+- **The specification:** `is_payload_inclusion_list_satisfied` asserts
+  `root in store.payload_inclusion_list_satisfaction`.
+- **ethlambda:** a verified payload with no record reads as satisfying the
+  inclusion lists. That covers a payload verified before heze (whose lists were
+  empty), one verified before a restart (the map is in memory only, as the
+  specification's store is), and an anchor's.
+- **Why:** refusing to extend those would stall the chain over a record this
+  node lost, not over a list the payload ignored. A payload this node judged
+  itself is recorded from the execution client's `inclusionListSatisfied`
+  (`engine_newPayloadV6`), or as satisfying while `NOT_VALIDATED` and corrected
+  by the `VALID` verdict `engine_forkchoiceUpdatedV5` returns.
+
+## `InclusionListsByIndices` is served, never requested
+
+- **The specification:** clients fetch inclusion lists they missed on gossip
+  with `InclusionListsByIndices`, mainly when producing a payload.
+- **ethlambda:** the protocol is registered inbound only. Requests are answered
+  from the inclusion list store (non-equivocating lists, at most
+  `MAX_REQUEST_INCLUSION_LIST`), and a response that ever arrives is run through
+  `on_inclusion_list`, but this node never sends a request.
+- **Why:** a node that misses a list on gossip builds with fewer lists, which
+  the bid rules still accept (the bits only have to cover the proposer's own
+  view), so the fetch is an optimization left for later.
+
+## A gloas genesis may commit to the generator's body
+
+- **The specification:** a genesis header commits to `BeaconBlockBody()`, the
+  empty body.
+- **ethlambda:** a gloas or heze genesis header that names neither the empty
+  body nor anything else is checked against one more body: the one
+  ethpandaops' `eth-beacon-genesis` builds, whose bid is the state's own
+  `latest_execution_payload_bid` (the execution genesis hash as parent, the
+  empty requests' root). Whichever the header names is the anchor block's body.
+- **Why:** every devnet ethpandaops runs, focil-devnet-1 included, is generated
+  that way, and anchoring at its `genesis.ssz` otherwise fails the anchor
+  check.

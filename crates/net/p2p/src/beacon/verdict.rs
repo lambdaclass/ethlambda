@@ -20,6 +20,7 @@ use ethlambda_network_api::{AggregateArrival, BlockAnnouncement, BlockArrival, B
 use ethlambda_state_transition::beacon::builder_market::SharedBuilderMarket;
 use ethlambda_state_transition::beacon::gossip::{self, IgnoreReason, Outcome};
 use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCacheExt as _;
+use ethlambda_state_transition::beacon::inclusion_list;
 use ethlambda_storage::{CacheKey, Store};
 use ethlambda_types::beacon::containers::altair::{
     SignedContributionAndProof, SyncCommitteeMessage,
@@ -29,6 +30,7 @@ use ethlambda_types::beacon::containers::gloas::{
     PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
     SignedProposerPreferences,
 };
+use ethlambda_types::beacon::containers::heze::SignedInclusionList;
 use ethlambda_types::beacon::containers::{
     DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
 };
@@ -97,6 +99,12 @@ pub(crate) enum Validated {
     ProposerPreferences(Box<SignedProposerPreferences>),
     /// A gloas `payload_attestation_message`.
     PayloadAttestation(PayloadAttestationMessage),
+    /// A heze `inclusion_list`, with the wall-clock milliseconds it arrived
+    /// at, which decide whether it counts as timely.
+    InclusionList {
+        signed: Box<SignedInclusionList>,
+        received_ms: u64,
+    },
     /// One of the four operation topics. Boxed like the other wide payloads.
     Operation(Box<BeaconOperation>),
     /// A `sync_committee_{subnet_id}` message.
@@ -153,6 +161,9 @@ impl Validated {
             }
             Self::PayloadAttestation(message) => {
                 gossip::payload_attestation::stateful_checks(store, message)
+            }
+            Self::InclusionList { signed, .. } => {
+                gossip::inclusion_list::stateful_checks(store, signed)
             }
             Self::Operation(operation) => gossip::operations::stateful_checks(store, operation),
             Self::SyncCommitteeMessage {
@@ -219,6 +230,21 @@ impl Validated {
             Self::PayloadAttestation(message) => server
                 .seen_payload_attestations
                 .record(message.data.slot, message.validator_index),
+            Self::InclusionList { signed, .. } => {
+                // A member may send two valid lists, the second being what
+                // reveals an equivocation; a third is the duplicate.
+                let message = &signed.message;
+                let count = server.seen_inclusion_lists.count(
+                    message.slot,
+                    message.dependent_root,
+                    message.validator_index,
+                );
+                if count >= 2 {
+                    return false;
+                }
+                server.seen_inclusion_lists.record(signed);
+                true
+            }
             Self::Operation(operation) => server.seen_operations.record(operation),
             Self::SyncCommitteeMessage {
                 message, subnet_id, ..
@@ -304,6 +330,34 @@ impl Validated {
                 .lock()
                 .expect("payload attestation pool lock")
                 .insert(message.clone());
+        }
+        if let Self::InclusionList {
+            signed,
+            received_ms,
+        } = &self
+            && outcome == Outcome::Accept
+        {
+            // Fork choice, the bid rules and block production read the store;
+            // nothing on the chain actor consumes a list, so it goes no
+            // further.
+            let config = server.store.config();
+            let timely = inclusion_list::is_inclusion_list_timely(
+                &config,
+                signed.message.slot,
+                *received_ms,
+            );
+            let stored = server
+                .store
+                .inclusion_list_store()
+                .process_inclusion_list((**signed).clone(), timely);
+            debug!(
+                slot = signed.message.slot,
+                validator = signed.message.validator_index,
+                timely,
+                stored,
+                "Inclusion list accepted"
+            );
+            return;
         }
         if let Self::SyncCommitteeMessage { message, seats, .. } = &self
             && outcome == Outcome::Accept
@@ -392,6 +446,7 @@ impl Validated {
             | Self::Attestation { .. }
             | Self::Envelope(_)
             | Self::PayloadAttestation(_)
+            | Self::InclusionList { .. }
             | Self::Operation(_)
             | Self::SyncCommitteeMessage { .. }
             | Self::SyncContribution(_)
@@ -430,6 +485,7 @@ fn record_liveness(server: &P2PServer, object: &Validated) {
         | Validated::Column(_)
         | Validated::Envelope(_)
         | Validated::PayloadAttestation(_)
+        | Validated::InclusionList { .. }
         | Validated::Operation(_)
         | Validated::SyncCommitteeMessage { .. }
         | Validated::SyncContribution(_)
@@ -608,6 +664,7 @@ fn permits_for<'a>(
         Validated::Aggregate { .. }
         | Validated::Attestation { .. }
         | Validated::PayloadAttestation(_)
+        | Validated::InclusionList { .. }
         | Validated::Operation(_) => &server.attestation_validation_permits,
         Validated::SyncCommitteeMessage { .. } | Validated::SyncContribution(_) => {
             &server.sync_validation_permits
