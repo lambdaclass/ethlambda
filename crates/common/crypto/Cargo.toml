@@ -23,4 +23,3 @@ shadow-integration = []
 
 [dev-dependencies]
 hex.workspace = true
-zk_alloc.workspace = true

@@ -199,12 +199,12 @@ impl ValidatorSecretKey {
     /// The range is fixed at key generation; a slot outside it can never be
     /// signed, however long the node waits.
     pub fn can_sign_at(&self, slot: u32) -> bool {
-        self.inner.epoch_range().contains(&slot)
+        self.inner.leaf_index_range().contains(&slot)
     }
 
     /// The inclusive slot range this key can sign for.
     pub fn signable_slots(&self) -> RangeInclusive<u32> {
-        self.inner.epoch_range()
+        self.inner.leaf_index_range()
     }
 
     /// Warm the signing cache for `slot`, so [`Self::sign`] there does not pay

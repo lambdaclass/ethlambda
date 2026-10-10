@@ -137,13 +137,13 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     #[cfg(feature = "shadow-integration")]
     init_shadow_cost(&options.shadow);
 
-    // Compiles the aggregation bytecode and fixes the prover's allocator. Ahead of the
-    // test-driver branch below, which verifies signatures, and of every consensus path.
-    info!(
-        arena = options.prover_arena,
-        "Initializing leanVM prover and verifier"
-    );
-    ethlambda_crypto::init_leanvm(options.prover_arena);
+    // Compiles the aggregation bytecode. Ahead of the test-driver branch below, which
+    // verifies signatures, and of every consensus path.
+    if options.prover_arena {
+        warn!("--prover-arena is ignored: leanVM no longer has a prover arena");
+    }
+    info!("Initializing leanVM prover and verifier");
+    ethlambda_crypto::init_leanvm();
 
     // Initialize metrics
     ethlambda_blockchain::metrics::init();

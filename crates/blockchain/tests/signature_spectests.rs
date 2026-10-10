@@ -25,7 +25,7 @@ const SKIP_TESTS: &[&str] = &[];
 fn run(path: &Path) -> datatest_stable::Result<()> {
     // These fixtures verify real signatures, so they need the backend a binary would set
     // up at startup. Idempotent, so calling it per fixture costs nothing after the first.
-    ethlambda_crypto::init_leanvm(false);
+    ethlambda_crypto::init_leanvm();
 
     let tests = VerifySignaturesTestVector::from_file(path)?;
 

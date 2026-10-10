@@ -337,16 +337,17 @@ actual_slot = finalized_slot + 1 + relative_index
   XMSS in its own `xmss` crate; there is no external leanSig dependency
 - BLAKE2s over binary fields, not Poseidon over KoalaBear: a leanVM `main` bump
   across that rewrite invalidates every genesis key and every stored proof, even
-  when the wire sizes happen to match
-- `ethlambda_crypto::init_leanvm(use_arena)` must run once at startup, before any
-  proving or proof decoding. `--prover-arena` opts into leanVM's bump arena,
-  which recycles the prover's large buffers across proofs instead of re-faulting
-  them, so its pages stay resident for the node's lifetime
+  when the wire sizes happen to match. leanVM `1f9e4c4f` changed the XMSS tweak
+  constants too, so keys generated before it do not verify after it
+- `ethlambda_crypto::init_leanvm()` must run once at startup, before any
+  proving or proof decoding. leanVM removed its prover arena (`zk_alloc`) at
+  `9c7d7830`: proof buffers are plain heap allocations, and the global jemalloc's
+  retained dirty pages serve the next proof. `--prover-arena` is still accepted,
+  hidden, and only logs that it is ignored
 - Every proof runs on one dedicated `leanvm-prover` thread (`prove` in
-  `ethlambda-crypto`). The arena pins a slab to each thread that ever drives a
-  proof, so proving from the calling thread (tokio's blocking pool, the actors)
-  grew RSS one proof peak per new thread until aggregators were OOM-killed.
-  `tests/arena_slabs.rs` guards this
+  `ethlambda-crypto`), so proofs never contend for cores and the memory peak is
+  one proof's. It was introduced for the old arena, which pinned a slab to each
+  thread that ever drove a proof and grew aggregators until they were OOM-killed
 - `ethlambda keygen` generates genesis validator keys through the same
   `ValidatorSecretKey` the node loads them with, so a key set cannot be built
   against a different leanVM than the client reading it. Keys are only usable by

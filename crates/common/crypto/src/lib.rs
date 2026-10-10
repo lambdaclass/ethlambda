@@ -1,7 +1,7 @@
 //! XMSS signature aggregation and verification, wrapping leanVM.
 //!
 //! [`init_leanvm`] must be called once at startup, before anything else here: it compiles
-//! the aggregation bytecode and fixes the prover's allocator. Proving panics without it,
+//! the aggregation bytecode. Proving panics without it,
 //! and decoding a stored proof misreports as a corrupt proof. Binaries call it straight
 //! after argument parsing; tests that touch a proof call it themselves.
 //!
@@ -55,7 +55,7 @@ const LOG_INV_RATE: usize = 2;
 /// the message, and the signature.
 type RawXmss = Vec<(
     xmss::XmssPublicKey,
-    xmss::Epoch,
+    xmss::LeafIndex,
     xmss::Message,
     xmss::XmssSignature,
 )>;
@@ -67,18 +67,13 @@ type RawXmss = Vec<(
 /// bytecode claim and fails without it, which surfaces as a bogus
 /// `DeserializationFailed`. Doing it up front keeps the cost off the first duty.
 ///
-/// `use_arena` picks the prover's allocator. leanVM's arena recycles the prover's large
-/// transient buffers across proofs instead of re-faulting them, so its pages stay
-/// resident for the lifetime of the node; the system allocator trades throughput for
-/// memory that comes back.
+/// leanVM no longer ships an arena: a proof's buffers are ordinary heap allocations,
+/// so proving speed depends on the global allocator keeping freed pages mapped for the
+/// next proof. The node's jemalloc does, for its dirty-page decay window.
 ///
 /// Idempotent: every step is `Once`/`OnceLock` guarded.
-pub fn init_leanvm(use_arena: bool) {
-    if use_arena {
-        leanvm::setup_prover();
-    } else {
-        leanvm::setup_prover_without_arena();
-    }
+pub fn init_leanvm() {
+    leanvm::setup_prover();
 }
 
 /// A proving job queued for the prover thread.
@@ -86,12 +81,10 @@ type ProverJob = Box<dyn FnOnce() + Send>;
 
 /// Runs `job` on the process's one prover thread and blocks until it returns.
 ///
-/// leanVM allows one proof at a time per process; a second concurrent one panics.
-/// The single thread serializes them, and it is also what bounds the arena:
-/// leanVM's arena hands each thread that proves its own slab and never takes it
-/// back, and the thread driving a proof is the one whose slab fills. Proving from
-/// whichever thread asked would pin one proof's peak per thread ever used, which
-/// is how aggregators running `--prover-arena` grew until they were OOM-killed.
+/// The single thread serializes proofs, so two callers never contend for the
+/// prover's cores and its memory peak is one proof's, not one per asking thread.
+/// It was introduced for leanVM's old per-thread arena, which pinned one proof's
+/// peak to every thread that ever proved and OOM-killed aggregators.
 ///
 /// Wrap only the prove call: decoding and argument conversion run fine on the
 /// caller. A job must not call back into this function, since the prover thread
@@ -223,13 +216,12 @@ fn wire_keys(components: &[SignerSet]) -> SignatureClaims {
     let mut groups: Vec<XmssClaimGroup> = Vec::with_capacity(components.len());
     for component in components {
         let keys = component.public_keys.iter().map(|pk| pk.as_inner().clone());
-        match groups
-            .iter_mut()
-            .find(|group| group.epoch == component.slot && group.message == component.message.0)
-        {
+        match groups.iter_mut().find(|group| {
+            group.leaf_index == component.slot && group.message == component.message.0
+        }) {
             Some(group) => group.keys.extend(keys),
             None => groups.push(XmssClaimGroup {
-                epoch: component.slot,
+                leaf_index: component.slot,
                 message: component.message.0,
                 keys: keys.collect(),
             }),
@@ -243,7 +235,7 @@ fn wire_keys(components: &[SignerSet]) -> SignatureClaims {
     // ordering on the epoch alone leaves such a pair in the caller's order, and
     // leanVM turns that away at decode as a malformed signer set, on a proof
     // that is perfectly valid.
-    groups.sort_unstable_by_key(|group| (group.epoch, group.message));
+    groups.sort_unstable_by_key(|group| (group.leaf_index, group.message));
     SignatureClaims {
         xmss: groups,
         sphincs: Vec::new(),
@@ -256,7 +248,7 @@ fn one_group(message: &H256, slot: u32, public_keys: &[ValidatorPublicKey]) -> S
     sort_dedup(&mut keys);
     SignatureClaims {
         xmss: vec![XmssClaimGroup {
-            epoch: slot,
+            leaf_index: slot,
             message: message.0,
             keys,
         }],
@@ -658,7 +650,7 @@ mod tests {
     /// Stands in for the startup call every binary makes. Without it the prover panics
     /// on the missing aggregation bytecode.
     fn init() {
-        init_leanvm(false);
+        init_leanvm();
     }
 
     /// A claim over one validator, the shape every Type-2 component takes here.
@@ -672,12 +664,12 @@ mod tests {
         // Should not panic when called multiple times. The first call compiles
         // the self-referential aggregation bytecode; subsequent calls are cheap
         // (`OnceLock::get_or_init`).
-        init_leanvm(false);
-        init_leanvm(false);
+        init_leanvm();
+        init_leanvm();
     }
 
-    /// The arena bound rests on this: however many threads ask for a proof, one
-    /// thread runs them all, and it is none of the askers.
+    /// However many threads ask for a proof, one thread runs them all, and it is
+    /// none of the askers.
     #[test]
     fn prove_runs_every_job_on_one_thread() {
         let askers: Vec<_> = (0..4)
@@ -733,7 +725,7 @@ mod tests {
         let groups = &claims.xmss;
 
         assert!(claims.sphincs.is_empty(), "ethlambda signs XMSS only");
-        let slots: Vec<u32> = groups.iter().map(|group| group.epoch).collect();
+        let slots: Vec<u32> = groups.iter().map(|group| group.leaf_index).collect();
         assert_eq!(slots, vec![4, 9], "groups sorted by slot");
         assert_eq!(groups[0].message, msg_a.0);
         assert_eq!(groups[1].message, msg_b.0);
@@ -771,7 +763,7 @@ mod tests {
 
         let shape: Vec<(u32, [u8; 32])> = groups
             .iter()
-            .map(|group| (group.epoch, group.message))
+            .map(|group| (group.leaf_index, group.message))
             .collect();
         assert_eq!(
             shape,
