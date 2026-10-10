@@ -12,7 +12,7 @@ default = ["jemalloc"]
 # `unprefixed_malloc` overrides the system allocator symbols, conflicting with
 # the Shadow simulator's preload shim. Cargo features are additive, so a feature
 # cannot subtract a default-on dependency; hence the `--no-default-features`.
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Shadow simulator compatibility: single-threaded tokio runtime and no jemalloc.
 # The quinn-udp UDP fallback is a Cargo `[patch]` (which cannot be feature-gated),
 # injected at build time by `shadow/build.sh` / `make shadow-build`.
@@ -51,6 +51,7 @@ thiserror.workspace = true
 eyre.workspace = true
 
 tikv-jemallocator = { workspace = true, optional = true }
+tikv-jemalloc-ctl = { workspace = true, optional = true }
 
 libc.workspace = true
 

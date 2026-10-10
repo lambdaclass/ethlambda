@@ -147,11 +147,14 @@ pub(crate) struct NodeOptions {
     /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
-    /// Accepted for compatibility and ignored: leanVM removed its prover arena.
+    /// Keep the prover's freed memory mapped so the next proof reuses it.
     ///
-    /// Proofs now allocate on the global allocator, whose retained pages serve
-    /// the next proof. Kept so existing launch commands still parse.
-    #[arg(long, default_value = "false", hide = true)]
+    /// A leanVM proof allocates gigabytes of short-lived buffers. Without this
+    /// flag the allocator returns them to the kernel as soon as they are freed,
+    /// so every proof faults its pages in again, roughly doubling proving time.
+    /// With it, the process holds its peak memory until it exits. Meant for
+    /// aggregators, which prove every slot.
+    #[arg(long, default_value = "false")]
     pub(crate) prover_arena: bool,
     /// Maximum number of distinct attestations to pack when building a block.
     ///

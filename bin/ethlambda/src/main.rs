@@ -26,6 +26,50 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[unsafe(export_name = "malloc_conf")]
 static malloc_conf: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
 
+/// Keep freed prover memory mapped for the next proof (`--prover-arena`).
+///
+/// A leanVM proof allocates gigabytes of short-lived buffers and frees them
+/// before it returns. jemalloc serves every allocation past
+/// `opt.oversize_threshold` from a dedicated arena, and purges that arena
+/// eagerly whenever the default dirty decay is positive (`arena_choose_huge`).
+/// Each freed buffer then goes straight back to the kernel and the next proof
+/// faults all of it in again, which about doubles proving time. A decay of -1
+/// never purges dirty pages, so the next proof reuses them, and the process
+/// holds its peak memory until it exits. leanVM's own CLI makes the same choice
+/// (see `leanvm::setup_prover`), replacing the arena it used to ship.
+///
+/// `malloc_conf` is read before `main`, so a flag cannot reach it; this goes
+/// through `mallctl` instead. `arenas.dirty_decay_ms` is the default for every
+/// arena created from now on, including the oversize one, which jemalloc only
+/// creates on the first oversize allocation. Arenas that already exist keep the
+/// decay they were created with, so each is updated too.
+#[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+fn retain_prover_pages() {
+    const NEVER_PURGE: isize = -1;
+
+    // SAFETY: `arenas.dirty_decay_ms` is a jemalloc `ssize_t` control, written
+    // with an `isize` of the same width.
+    let set_default =
+        unsafe { tikv_jemalloc_ctl::raw::write(b"arenas.dirty_decay_ms\0", NEVER_PURGE) };
+    if let Err(err) = set_default {
+        warn!(%err, "--prover-arena: could not keep freed prover memory mapped");
+        return;
+    }
+    let narenas = tikv_jemalloc_ctl::arenas::narenas::read().unwrap_or(0);
+    for index in 0..narenas {
+        let name = format!("arena.{index}.dirty_decay_ms\0");
+        // SAFETY: as above. An index whose arena does not exist yet answers
+        // EFAULT, which is fine: it takes the default set above when created.
+        let _ = unsafe { tikv_jemalloc_ctl::raw::write(name.as_bytes(), NEVER_PURGE) };
+    }
+    info!("Prover arena on: freed prover memory stays mapped for the next proof");
+}
+
+#[cfg(not(all(not(target_env = "msvc"), feature = "jemalloc")))]
+fn retain_prover_pages() {
+    warn!("--prover-arena is ignored: this binary is built without jemalloc");
+}
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::{IpAddr, SocketAddr},
@@ -140,7 +184,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
     // Compiles the aggregation bytecode. Ahead of the test-driver branch below, which
     // verifies signatures, and of every consensus path.
     if options.prover_arena {
-        warn!("--prover-arena is ignored: leanVM no longer has a prover arena");
+        retain_prover_pages();
     }
     info!("Initializing leanVM prover and verifier");
     ethlambda_crypto::init_leanvm();
@@ -919,6 +963,30 @@ mod tests {
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::genesis::GenesisValidatorEntry;
     use ethlambda_types::state::PUBLIC_KEY_SIZE;
+
+    /// `--prover-arena` has to reach the arena that serves the prover's
+    /// buffers: the oversize one, which jemalloc otherwise purges on every free.
+    /// It also changes the default for arenas created later, which is what the
+    /// node relies on, since the flag is applied before anything proves.
+    #[cfg(all(not(target_env = "msvc"), feature = "jemalloc"))]
+    #[test]
+    fn prover_arena_stops_the_oversize_arena_from_purging() {
+        // Past `opt.oversize_threshold`, so the oversize arena exists before the
+        // flag is applied, whatever order the tests run in.
+        drop(std::hint::black_box(vec![1u8; 64 << 20]));
+
+        retain_prover_pages();
+
+        let decay = |name: String| -> isize {
+            let name = format!("{name}\0");
+            // SAFETY: every name read here is a jemalloc `ssize_t` control.
+            unsafe { tikv_jemalloc_ctl::raw::read(name.as_bytes()) }.expect("mallctl read")
+        };
+        assert_eq!(decay("arenas.dirty_decay_ms".into()), -1);
+        // jemalloc reserves the oversize arena's index after the automatic ones.
+        let oversize = tikv_jemalloc_ctl::arenas::narenas::read().expect("narenas") - 1;
+        assert_eq!(decay(format!("arena.{oversize}.dirty_decay_ms")), -1);
+    }
 
     /// The duty subnet is the first explicitly assigned subnet, so an operator
     /// can place co-located aggregators on different subnets deliberately.

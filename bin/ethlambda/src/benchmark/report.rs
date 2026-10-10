@@ -83,6 +83,7 @@ pub(crate) struct Params {
     pub iterations: u64,
     pub enable_proposer_aggregation: bool,
     pub max_attestations_per_block: usize,
+    pub prover_arena: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,8 +184,10 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "  enable_proposer_aggregation={} max_attestations_per_block={}",
-            params.enable_proposer_aggregation, params.max_attestations_per_block
+            "  enable_proposer_aggregation={} max_attestations_per_block={} prover_arena={}",
+            params.enable_proposer_aggregation,
+            params.max_attestations_per_block,
+            params.prover_arena
         );
         let _ = writeln!(
             out,

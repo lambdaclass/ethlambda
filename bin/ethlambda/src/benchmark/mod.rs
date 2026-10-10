@@ -101,6 +101,7 @@ impl From<&SyntheticOptions> for Params {
             iterations: options.common.iterations,
             enable_proposer_aggregation: options.common.enable_proposer_aggregation,
             max_attestations_per_block: options.common.max_attestations_per_block,
+            prover_arena: options.common.prover_arena,
         }
     }
 }
@@ -124,6 +125,11 @@ struct CommonOptions {
     /// Mirrors the node flag: distinct AttestationData cap per built block.
     #[arg(long, default_value = "3")]
     max_attestations_per_block: usize,
+    /// Mirrors the node flag: keep freed prover memory mapped for the next
+    /// proof, as an aggregator runs. Without it every proof faults its buffers
+    /// in again.
+    #[arg(long, conflicts_with = "mock_crypto")]
+    prover_arena: bool,
     /// Report format printed to stdout. Logs go to stderr, so JSON output can
     /// be piped directly (e.g. into jq).
     #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
@@ -164,6 +170,9 @@ fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
     } else {
         // Compile the aggregation bytecode before anything proves, exactly as
         // the node does at startup.
+        if common.prover_arena {
+            crate::retain_prover_pages();
+        }
         ethlambda_crypto::init_leanvm();
         let keys = keys::KeySet::generate(
             options.seed,

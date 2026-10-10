@@ -341,9 +341,14 @@ actual_slot = finalized_slot + 1 + relative_index
   constants too, so keys generated before it do not verify after it
 - `ethlambda_crypto::init_leanvm()` must run once at startup, before any
   proving or proof decoding. leanVM removed its prover arena (`zk_alloc`) at
-  `9c7d7830`: proof buffers are plain heap allocations, and the global jemalloc's
-  retained dirty pages serve the next proof. `--prover-arena` is still accepted,
-  hidden, and only logs that it is ignored
+  `9c7d7830`: proof buffers are plain heap allocations, so proving speed now
+  depends on the global allocator keeping freed pages. jemalloc purges its
+  oversize arena (allocations of 8 MiB and up) eagerly by default, so every proof
+  faults its buffers in again, about twice the proving time. `--prover-arena`
+  (node and `benchmark`) sets jemalloc's dirty decay to -1 through `mallctl` at
+  startup (`retain_prover_pages` in `main.rs`; `malloc_conf` is read before
+  `main`, so a flag cannot reach it), and the process then holds its peak memory.
+  Aggregators run it
 - Every proof runs on one dedicated `leanvm-prover` thread (`prove` in
   `ethlambda-crypto`), so proofs never contend for cores and the memory peak is
   one proof's. It was introduced for the old arena, which pinned a slab to each
