@@ -77,6 +77,9 @@ pub struct BlockChainConfig {
     /// Most existing proofs one aggregation job folds in as children. See
     /// [`aggregation::AggregationWindowConfig::max_children`].
     pub max_aggregation_children: usize,
+    /// How long after the interval-4 boundary the aggregation worker builds the
+    /// next slot's candidate body proof.
+    pub body_proof_delay_ms: u64,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -265,6 +268,7 @@ impl BlockChain {
             aggregation_duty_subnet,
             skip_redundant_aggregation,
             max_aggregation_children,
+            body_proof_delay_ms,
             proposer_config,
         } = config;
 
@@ -291,6 +295,7 @@ impl BlockChain {
             aggregation_duty_subnet,
             skip_redundant_aggregation,
             max_aggregation_children,
+            body_proof_delay_ms,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
@@ -437,6 +442,9 @@ pub struct BlockChainServer {
 
     /// Most existing proofs one aggregation job folds in as children.
     max_aggregation_children: usize,
+
+    /// How long after the interval-4 boundary to build the candidate body proof.
+    body_proof_delay_ms: u64,
 
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
@@ -1569,6 +1577,7 @@ impl BlockChainServer {
                 aggregation_duty_subnet: self.aggregation_duty_subnet,
                 skip_redundant_aggregation: self.skip_redundant_aggregation,
                 max_aggregation_children: self.max_aggregation_children,
+                body_proof_delay_ms: self.body_proof_delay_ms,
                 proposer_config: self.proposer_config,
             },
         ));

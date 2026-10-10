@@ -1695,6 +1695,27 @@ impl Store {
             .collect()
     }
 
+    /// Snapshot of the known payloads plus the new (pending) ones, merged per
+    /// data root: everything this node holds, not only what fork choice counts.
+    ///
+    /// For a reader that runs after the promotion it would otherwise wait for,
+    /// such as a block body built late in the slot: anything arriving after the
+    /// interval-4 promotion stays in the new buffer until the next one.
+    pub fn known_and_new_aggregated_payloads(
+        &self,
+    ) -> HashMap<H256, (AttestationData, Vec<SingleMessageAggregate>)> {
+        let mut payloads = self.known_aggregated_payloads();
+        let new = self.new_payloads.lock().unwrap();
+        for (root, entry) in &new.data {
+            payloads
+                .entry(*root)
+                .or_insert_with(|| (entry.data.clone(), Vec::new()))
+                .1
+                .extend(entry.proofs.iter().cloned());
+        }
+        payloads
+    }
+
     /// Combined proof count for a data_root across new and known buffers.
     ///
     /// Cheap check (no cloning) to short-circuit before calling the more
@@ -2454,6 +2475,38 @@ mod tests {
         assert!(
             store.extract_head_vote_window(head, 3).votes.is_empty(),
             "no block on this branch has carried this vote"
+        );
+    }
+
+    /// A body built after the interval-4 promotion has to see what arrived
+    /// since, which still sits in the new buffer: the merged snapshot holds
+    /// both buffers' proofs, per data root.
+    #[test]
+    fn known_and_new_payloads_merge_per_data_root() {
+        let mut store = anchored_store();
+        let early = HashedAttestationData::new(make_att_data(1));
+        let late = HashedAttestationData::new(make_att_data(2));
+
+        store.insert_new_aggregated_payload(early.clone(), make_proof_for_validator(0));
+        store.promote_new_aggregated_payloads();
+        store.insert_new_aggregated_payload(early.clone(), make_proof_for_validator(1));
+        store.insert_new_aggregated_payload(late.clone(), make_proof_for_validator(2));
+
+        assert_eq!(
+            store.known_aggregated_payloads().len(),
+            1,
+            "only the promoted root is known"
+        );
+        let all = store.known_and_new_aggregated_payloads();
+        assert_eq!(
+            all[&early.root()].1.len(),
+            2,
+            "known and new proofs for one root"
+        );
+        assert_eq!(
+            all[&late.root()].1.len(),
+            1,
+            "a root seen only after the promotion"
         );
     }
 

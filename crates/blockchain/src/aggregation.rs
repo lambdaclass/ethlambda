@@ -165,6 +165,12 @@ fn head_update_offset_ms(config: &ChainConfig) -> u64 {
     SlotInterval::EndOfSlot.to_ms_since_genesis(0, config)
 }
 
+/// Whether the next slot's candidate body proof is due, `ms_into_slot` into the
+/// current slot: from the start of the slot's last interval plus `delay_ms`.
+fn body_proof_due(ms_into_slot: u64, config: &ChainConfig, delay_ms: u64) -> bool {
+    ms_into_slot >= head_update_offset_ms(config) + delay_ms
+}
+
 /// A single pre-prepared aggregation group.
 ///
 /// Built by [`select_best_job`] from the worker's own store reads; everything
@@ -340,6 +346,10 @@ pub(crate) struct WorkerConfig {
     pub(crate) skip_redundant_aggregation: bool,
     /// See [`AggregationWindowConfig::max_children`].
     pub(crate) max_aggregation_children: usize,
+    /// How long after the interval-4 boundary to build the next slot's
+    /// candidate body proof. Aggregation keeps running meanwhile, so a later
+    /// build packs aggregates that finished after the boundary.
+    pub(crate) body_proof_delay_ms: u64,
     /// Body-packing policy, shared with the proposer path.
     pub(crate) proposer_config: ProposerConfig,
 }
@@ -1692,7 +1702,10 @@ fn run_body_proof_job(
     actor: &ActorRef<crate::BlockChainServer>,
 ) -> bool {
     let job_start = Instant::now();
-    let Some(body_proof) = body_proof::build_body_proof(store, slot, config.proposer_config) else {
+    let include_pending = config.body_proof_delay_ms > 0;
+    let Some(body_proof) =
+        body_proof::build_body_proof(store, slot, config.proposer_config, include_pending)
+    else {
         return true;
     };
     let elapsed = job_start.elapsed();
@@ -1759,7 +1772,9 @@ fn next_job(
     let slot = store.current_slot();
     let ms_into_slot = ms_into_slot(now_ms, slot, time_config);
 
-    if ms_into_slot >= head_update_offset_ms(time_config) && body_proof_slot != Some(slot + 1) {
+    if body_proof_due(ms_into_slot, time_config, config.body_proof_delay_ms)
+        && body_proof_slot != Some(slot + 1)
+    {
         return Some(WorkerJob::BodyProof { slot: slot + 1 });
     }
 
@@ -3856,6 +3871,7 @@ mod tests {
             aggregation_duty_subnet: 0,
             skip_redundant_aggregation: false,
             max_aggregation_children: DEFAULT_MAX_AGGREGATION_CHILDREN,
+            body_proof_delay_ms: 0,
             proposer_config: ProposerConfig {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: 1,
@@ -3933,6 +3949,25 @@ mod tests {
         }
 
         assert_eq!(paused.load(Ordering::Acquire), PauseReason::Syncing as u8);
+    }
+
+    #[test]
+    fn body_proof_is_due_from_the_last_interval_plus_the_delay() {
+        let config = ChainConfig::new(1_000, 8_000);
+        let last_interval_ms = head_update_offset_ms(&config);
+        assert_eq!(last_interval_ms, 6_400);
+
+        assert!(!body_proof_due(last_interval_ms - 1, &config, 0));
+        assert!(
+            body_proof_due(last_interval_ms, &config, 0),
+            "no delay: at the boundary"
+        );
+        assert!(
+            !body_proof_due(last_interval_ms, &config, 600),
+            "a delay holds it back"
+        );
+        assert!(!body_proof_due(last_interval_ms + 599, &config, 600));
+        assert!(body_proof_due(last_interval_ms + 600, &config, 600));
     }
 
     /// The store clock owns which slot the worker is in, so the wall-clock

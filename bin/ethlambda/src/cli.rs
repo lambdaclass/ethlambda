@@ -138,6 +138,16 @@ pub(crate) struct NodeOptions {
         requires = "is_aggregator"
     )]
     pub(crate) max_aggregation_children: usize,
+    /// Milliseconds after the last interval of a slot starts before building
+    /// the next slot's candidate block body proof. Requires --is-aggregator.
+    ///
+    /// Aggregation keeps running meanwhile, so a later build packs aggregates
+    /// that finished after the boundary, read from the pending pool as well as
+    /// the known one. The cost is less time for the build and its gossip
+    /// before the next proposer chooses a body at the slot boundary. Must be
+    /// shorter than one interval.
+    #[arg(long, default_value = "0", requires = "is_aggregator")]
+    pub(crate) body_proof_delay_ms: u64,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

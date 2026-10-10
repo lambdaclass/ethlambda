@@ -266,6 +266,17 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         "Loaded genesis configuration"
     );
 
+    // The candidate body proof is built in the slot's last interval. A delay
+    // reaching the slot's end would carry the build into the next slot, which
+    // builds for the slot after, so this one's candidate would never be built.
+    let interval_ms =
+        genesis_config.milliseconds_per_slot / ethlambda_types::constants::INTERVALS_PER_SLOT;
+    eyre::ensure!(
+        options.body_proof_delay_ms < interval_ms,
+        "--body-proof-delay-ms {} must be shorter than one {interval_ms} ms interval",
+        options.body_proof_delay_ms
+    );
+
     let validator_config_file = read_validator_config_file(&validator_config)?;
     let node_names = load_node_names(&validator_config_file);
 
@@ -381,6 +392,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         aggregation_duty_subnet,
         skip_redundant_aggregation: options.skip_redundant_aggregation,
         max_aggregation_children: options.max_aggregation_children,
+        body_proof_delay_ms: options.body_proof_delay_ms,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,

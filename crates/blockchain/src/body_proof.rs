@@ -54,16 +54,26 @@ pub(crate) const MAX_BODY_PROOF_CANDIDATES: usize = 8;
 ///
 /// Returns `None` when the pool yields no attestations: an empty body needs no
 /// proof, and the proposer's empty-block fallback covers that case for free.
+///
+/// `include_pending` also reads the new (pending) payloads. A build delayed
+/// past the interval-4 promotion needs it, since anything arriving after that
+/// promotion waits in the new buffer until the next slot; an undelayed build
+/// runs right after the promotion and reads the known pool alone.
 pub(crate) fn build_body_proof(
     store: &Store,
     slot: u64,
     config: ProposerConfig,
+    include_pending: bool,
 ) -> Option<BlockBodyProof> {
     let parent_root = store.head().expect("head read works");
     let head_state = store
         .get_state(&parent_root)
         .expect("head state read works")?;
-    let aggregated_payloads = store.known_aggregated_payloads();
+    let aggregated_payloads = if include_pending {
+        store.known_and_new_aggregated_payloads()
+    } else {
+        store.known_aggregated_payloads()
+    };
     let known_block_roots = store.get_block_roots().expect("block roots read works");
 
     let inputs = block_builder::ProposalInputs {
