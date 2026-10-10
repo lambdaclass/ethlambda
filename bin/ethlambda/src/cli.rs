@@ -122,6 +122,22 @@ pub(crate) struct NodeOptions {
     /// node that is down or late.
     #[arg(long, default_value = "false", requires = "is_aggregator")]
     pub(crate) skip_redundant_aggregation: bool,
+    /// Most existing aggregates one aggregation job merges as children.
+    /// Requires --is-aggregator.
+    ///
+    /// Each child adds a roughly fixed recursion cost to the job, so a wider
+    /// merge takes longer, but reaching a given coverage takes fewer levels of
+    /// merging, each of which also waits on gossip. The subnet window widens
+    /// by the same factor per level, so a merge can find this many proofs at
+    /// the level below. At most leanVM's recursion limit.
+    #[arg(
+        long,
+        default_value_t = ethlambda_blockchain::aggregation::DEFAULT_MAX_AGGREGATION_CHILDREN,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(2..=ethlambda_crypto::MAX_CHILD_PROOFS as u64),
+        requires = "is_aggregator"
+    )]
+    pub(crate) max_aggregation_children: usize,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,

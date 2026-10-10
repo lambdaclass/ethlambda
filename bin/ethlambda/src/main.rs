@@ -380,6 +380,7 @@ async fn run_node(options: NodeOptions) -> eyre::Result<()> {
         subscribed_subnets: subscribed_subnets.clone(),
         aggregation_duty_subnet,
         skip_redundant_aggregation: options.skip_redundant_aggregation,
+        max_aggregation_children: options.max_aggregation_children,
         proposer_config: ProposerConfig {
             enable_proposer_aggregation: options.enable_proposer_aggregation,
             max_attestations_per_block: options.max_attestations_per_block,

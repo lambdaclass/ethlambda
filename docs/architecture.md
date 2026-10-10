@@ -149,8 +149,8 @@ whole path while the node is catching up.
 
 ### Subnet-windowed aggregation
 
-Two aggregators handed the same pool of existing proofs would otherwise pick the same two
-children every round, since the greedy selection in `aggregation.rs` is deterministic: all
+Two aggregators handed the same pool of existing proofs would otherwise pick the same
+children every round (at most `--max-aggregation-children` of them, two by default), since the greedy selection in `aggregation.rs` is deterministic: all
 that duplicated leanVM proving buys nothing once one of them publishes. Each aggregator instead
 scores that pool through a window: a contiguous run of subnets starting at its duty subnet, the
 first value of `--aggregate-subnet-ids` (or the lowest subnet it subscribes to, if that flag is
@@ -158,8 +158,8 @@ unset). A proof outside the window still counts if it partly overlaps, but earns
 for its in-window share, so aggregators with different windows tend to land on different
 children without anyone being excluded from merging.
 
-The width is derived, not chosen: wide enough to hold two proofs at the reach of the
-aggregator's *anchor*, capped at the committee count, so it only widens once a data root's
+The width is derived, not chosen: wide enough to hold as many proofs as one job may merge
+(`--max-aggregation-children`) at the reach of the aggregator's *anchor*, capped at the committee count, so it only widens once a data root's
 proof has actually climbed. The anchor is the largest-coverage proof in the candidate's pool
 that touches the aggregator's own duty subnet. Picking it by coverage rather than by reach
 keeps a sparse proof, one validator in each of many subnets, from setting the width for

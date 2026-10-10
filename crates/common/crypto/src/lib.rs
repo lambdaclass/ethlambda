@@ -51,6 +51,10 @@ pub mod shadow_cost;
 /// log(1/rate) for the WHIR commitment scheme used inside the aggregation prover.
 const LOG_INV_RATE: usize = 2;
 
+/// The most child proofs one aggregation can fold in: leanVM's recursion
+/// limit. An aggregation given more fails as a whole.
+pub const MAX_CHILD_PROOFS: usize = leanvm::MAX_RECURSIONS;
+
 /// Raw XMSS input as [`aggregate`] takes it: the key, the epoch it signed at,
 /// the message, and the signature.
 type RawXmss = Vec<(
