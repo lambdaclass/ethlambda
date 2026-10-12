@@ -254,6 +254,11 @@ fn handle_beacon_gossip(
         triage_aggregate(server, wire, payload, id.received_at)
     } else if let Some(subnet_id) = beacon_topics::attestation_subnet(kind) {
         triage_attestation(server, topic_fork, payload, subnet_id)
+    } else if matches!(
+        kind,
+        beacon_topics::GOLDFISH_VOTE | beacon_topics::COMBINED_ATTESTATION
+    ) {
+        triage_decoupled_vote(kind)
     } else if kind == beacon_topics::EXECUTION_PAYLOAD {
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
@@ -287,6 +292,16 @@ fn handle_beacon_gossip(
         }
         Dispatch::Validate(object) => verdict::spawn_stateful_checks(server, ctx, id, object),
     }
+}
+
+/// The decoupled fork's `goldfish_vote` and `combined_attestation` topics.
+///
+/// Decode, validation and dispatch to the chain are not built yet: every
+/// message is reported `Ignore`, which keeps the mesh healthy (no peer is
+/// penalized) without forwarding what this node cannot yet judge.
+fn triage_decoupled_vote(kind: &str) -> Dispatch {
+    metrics::inc_beacon_gossip(kind, "no_consumer");
+    Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
 }
 
 /// Decode a beacon block and run its cheap gossip checks: a verdict already,
@@ -364,13 +379,15 @@ fn triage_data_column(
     metrics::inc_beacon_gossip(KIND, "decoded");
     let now_ms = unix_now_ms();
     let cheap = match &sidecar {
-        DataColumnSidecar::Fulu(sidecar) => gossip::column::cheap_checks(
-            &server.seen_columns,
-            &server.store,
-            sidecar,
-            subnet_id,
-            now_ms,
-        ),
+        DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
+            gossip::column::cheap_checks(
+                &server.seen_columns,
+                &server.store,
+                sidecar,
+                subnet_id,
+                now_ms,
+            )
+        }
         DataColumnSidecar::Gloas(sidecar) => gossip::column::cheap_checks_gloas(
             &server.seen_block_columns,
             &server.store,
@@ -1154,6 +1171,10 @@ pub fn join_aggregator_subnets(server: &mut P2PServer, subnets: Vec<(u64, u64)>)
     let Some(wire) = server.wire.beacon() else {
         return;
     };
+    // The decoupled fork has no attestation subnets to aggregate on.
+    if wire.fork == ForkName::Decoupled {
+        return;
+    }
     let mut joined = Vec::new();
     for (subnet_id, slot) in subnets {
         if subnet_id >= ATTESTATION_SUBNET_COUNT

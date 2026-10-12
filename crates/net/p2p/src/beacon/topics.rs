@@ -61,6 +61,16 @@ pub const EXECUTION_PAYLOAD_BID: &str = "execution_payload_bid";
 /// Topic kind for gloas proposer preferences.
 pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
 
+/// Topic kind for the decoupled fork's Goldfish votes.
+pub const GOLDFISH_VOTE: &str = "goldfish_vote";
+/// Topic kind for the decoupled fork's combined attestations.
+pub const COMBINED_ATTESTATION: &str = "combined_attestation";
+
+/// The topic kinds the decoupled fork adds, subscribed from its digest on. The
+/// fork also drops `beacon_aggregate_and_proof` and the attestation subnets:
+/// it has no LMD attestations.
+pub const DECOUPLED_TOPIC_KINDS: [&str; 2] = [GOLDFISH_VOTE, COMBINED_ATTESTATION];
+
 /// The topic kinds gloas adds to [`SUBSCRIBED_TOPIC_KINDS`], subscribed from
 /// the gloas digest on and never under an earlier one.
 pub const GLOAS_TOPIC_KINDS: [&str; 4] = [
@@ -105,6 +115,7 @@ pub fn metric_kind(kind: &str) -> Option<&'static str> {
     if let Some(&global) = SUBSCRIBED_TOPIC_KINDS
         .iter()
         .chain(GLOAS_TOPIC_KINDS.iter())
+        .chain(DECOUPLED_TOPIC_KINDS.iter())
         .find(|&&known| known == kind)
     {
         return Some(global);
@@ -289,6 +300,18 @@ impl BeaconTopics {
             | ForkName::Deneb
             | ForkName::Electra
             | ForkName::Fulu => Self::new(fork_digest, column_subnets, attestation_subnets),
+            // No LMD aggregates or attestation subnets (so `attestation_subnets`
+            // is not subscribed), and the two protocol topics instead.
+            ForkName::Decoupled => Self::build(
+                fork_digest,
+                SUBSCRIBED_TOPIC_KINDS
+                    .iter()
+                    .copied()
+                    .filter(|kind| *kind != BEACON_AGGREGATE_AND_PROOF)
+                    .chain(DECOUPLED_TOPIC_KINDS),
+                column_subnets,
+                &[],
+            ),
             // Gloas adds the payload envelope and the payload attestation
             // topics, which the follower consumes.
             ForkName::Gloas => Self::with_extra_kinds(
@@ -319,6 +342,25 @@ impl BeaconTopics {
         column_subnets: &[u64],
         attestation_subnets: &[u64],
     ) -> Self {
+        Self::build(
+            fork_digest,
+            SUBSCRIBED_TOPIC_KINDS
+                .iter()
+                .copied()
+                .chain(extra_kinds.iter().copied()),
+            column_subnets,
+            attestation_subnets,
+        )
+    }
+
+    /// The topics for exactly the global `kinds` given, plus the column and
+    /// attestation subnet families.
+    fn build<'a>(
+        fork_digest: ForkDigest,
+        kinds: impl IntoIterator<Item = &'a str>,
+        column_subnets: &[u64],
+        attestation_subnets: &[u64],
+    ) -> Self {
         // Built first so the map's own key semantics do the deduplication;
         // `topics` below only ever sees what survived that.
         let mut column_topics = BTreeMap::new();
@@ -335,9 +377,8 @@ impl BeaconTopics {
                 .or_insert_with(|| IdentTopic::new(attestation_topic_name(fork_digest, subnet_id)));
         }
 
-        let mut topics: Vec<IdentTopic> = SUBSCRIBED_TOPIC_KINDS
-            .iter()
-            .chain(extra_kinds)
+        let mut topics: Vec<IdentTopic> = kinds
+            .into_iter()
             .map(|kind| IdentTopic::new(topic_name(fork_digest, kind)))
             .collect();
         topics.extend(column_topics.values().cloned());
@@ -388,6 +429,31 @@ mod tests {
     fn subscriptions_are_exactly_the_seven_global_topics() {
         let topics = BeaconTopics::new(MAINNET, &[], &[]);
         assert_eq!(topics.topics.len(), 7);
+    }
+
+    #[test]
+    fn decoupled_swaps_lmd_topics_for_the_protocol_ones() {
+        let names = |topics: &BeaconTopics| {
+            topics
+                .topics
+                .iter()
+                .map(|topic| topic.to_string())
+                .collect::<Vec<_>>()
+        };
+        let decoupled = BeaconTopics::for_fork(ForkName::Decoupled, MAINNET, &[3], &[1, 2]);
+        let fulu = BeaconTopics::for_fork(ForkName::Fulu, MAINNET, &[3], &[1, 2]);
+        let decoupled_names = names(&decoupled);
+        for kind in DECOUPLED_TOPIC_KINDS {
+            assert!(decoupled_names.contains(&topic_name(MAINNET, kind)));
+            assert_eq!(metric_kind(kind), Some(kind));
+        }
+        assert!(!decoupled_names.contains(&topic_name(MAINNET, BEACON_AGGREGATE_AND_PROOF)));
+        assert!(decoupled.attestation_topics.is_empty());
+        assert!(!fulu.attestation_topics.is_empty());
+        // Fulu's seven globals, minus the aggregate, plus the two new ones,
+        // plus the custodied column subnet.
+        assert_eq!(decoupled_names.len(), 7 - 1 + 2 + 1);
+        assert!(decoupled_names.contains(&topic_name(MAINNET, BEACON_BLOCK)));
     }
 
     #[test]

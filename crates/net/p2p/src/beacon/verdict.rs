@@ -125,7 +125,9 @@ impl Validated {
                 gossip::block::stateful_checks(store, block, *block_root)
             }
             Self::Column(sidecar) => match &**sidecar {
-                DataColumnSidecar::Fulu(sidecar) => gossip::column::stateful_checks(store, sidecar),
+                DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
+                    gossip::column::stateful_checks(store, sidecar)
+                }
                 DataColumnSidecar::Gloas(sidecar) => {
                     gossip::column::stateful_checks_gloas(store, sidecar)
                 }
@@ -184,7 +186,7 @@ impl Validated {
                     .record(block.slot(), block.proposer_index(), *block_root)
             }
             Self::Column(sidecar) => match &**sidecar {
-                DataColumnSidecar::Fulu(sidecar) => {
+                DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
                     let header = &sidecar.signed_block_header.message;
                     server
                         .seen_columns

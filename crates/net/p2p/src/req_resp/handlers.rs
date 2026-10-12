@@ -1465,7 +1465,7 @@ fn range_needs_columns(
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra => false,
-        ForkName::Fulu | ForkName::Gloas => true,
+        ForkName::Fulu | ForkName::Decoupled | ForkName::Gloas => true,
         ForkName::Lean => {
             unreachable!("fork_at_slot never returns Lean: it is absent from ForkName::ALL")
         }
