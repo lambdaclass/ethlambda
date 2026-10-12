@@ -1,10 +1,11 @@
-//! An in-process network of honest nodes on the public time grid.
+//! An in-process network of nodes on the public time grid.
 //!
 //! Every object sent at tick `t` reaches every node at `t` (after that tick's
-//! duties), or later when a node is cut off; that is synchrony with delay
-//! below `Δ`. The checks are the bundle's observable claims: the three tips
-//! nest, finalized reads agree and only extend, the chains grow, and no
-//! honest pair of attestations is slashable.
+//! duties), or later when a node is cut off or a Byzantine sender splits its
+//! audience; that is synchrony with delay below `Δ`. The checks are the
+//! bundle's observable claims, read at the honest nodes: the three tips nest,
+//! finalized reads agree and only extend, the chains grow, and no honest pair
+//! of attestations is slashable.
 
 use std::collections::{HashMap, HashSet};
 
@@ -17,9 +18,24 @@ use crate::validator_client::{Record, slashable};
 
 #[derive(Debug, Clone)]
 enum Message {
-    Block(BlockInput),
+    /// A block, and whether an honest proposer made it.
+    Block(BlockInput, bool),
     Vote(GoldfishVote),
     Attestation(Attestation),
+}
+
+/// How a Byzantine validator departs from the protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Byzantine {
+    /// Two Goldfish votes every slot: the head and its parent.
+    EquivocateVotes,
+    /// Two blocks in each of its slots, one to each half of the network,
+    /// each relayed to the other half a tick later.
+    EquivocateProposals,
+    /// Besides its honest attestation, two more each round: an empty safe
+    /// value with a timeout and a finality pair naming a block that does not
+    /// exist, and a target vote for that block one height up.
+    JunkAttestations,
 }
 
 struct Node {
@@ -28,14 +44,20 @@ struct Node {
     record: Record,
     pending_blocks: Vec<BlockInput>,
     online: bool,
+    byzantine: Option<Byzantine>,
     finalized_history: Vec<BlockRef>,
 }
+
+/// (sender, recipients or everyone, message)
+type Outbox = Vec<(u64, Option<Vec<u64>>, Message)>;
 
 struct Network {
     nodes: Vec<Node>,
     emitted: Vec<Attestation>,
     /// Messages a cut-off node missed, delivered when it comes back.
     backlog: HashMap<u64, Vec<Message>>,
+    /// Messages to deliver at the next step, by recipient.
+    delayed: Vec<(u64, Message)>,
 }
 
 fn block_root(slot: u64, proposer: u64) -> H256 {
@@ -59,6 +81,7 @@ impl Network {
                 record: Record::default(),
                 pending_blocks: Vec::new(),
                 online: true,
+                byzantine: None,
                 finalized_history: Vec::new(),
             })
             .collect();
@@ -66,7 +89,12 @@ impl Network {
             nodes,
             emitted: Vec::new(),
             backlog: HashMap::new(),
+            delayed: Vec::new(),
         }
+    }
+
+    fn honest(&self) -> impl Iterator<Item = &Node> {
+        self.nodes.iter().filter(|node| node.byzantine.is_none())
     }
 
     fn proposer(&self, slot: u64) -> u64 {
@@ -75,9 +103,9 @@ impl Network {
 
     fn deliver(node: &mut Node, message: Message) {
         match message {
-            Message::Block(block) => {
+            Message::Block(block, honest) => {
                 node.pending_blocks.push(block);
-                Self::drain_pending(node);
+                Self::drain_pending(node, honest);
             }
             Message::Vote(vote) => {
                 node.store.on_goldfish_vote(vote);
@@ -88,7 +116,7 @@ impl Network {
         }
     }
 
-    fn drain_pending(node: &mut Node) {
+    fn drain_pending(node: &mut Node, honest: bool) {
         loop {
             let mut progressed = false;
             let pending = std::mem::take(&mut node.pending_blocks);
@@ -98,7 +126,8 @@ impl Network {
                     Err(BlockError::UnknownParent(_)) | Err(BlockError::FutureSlot { .. }) => {
                         node.pending_blocks.push(block)
                     }
-                    Err(other) => panic!("honest block refused: {other}"),
+                    Err(other) if honest => panic!("honest block refused: {other}"),
+                    Err(_) => {}
                 }
             }
             if !progressed {
@@ -108,12 +137,13 @@ impl Network {
     }
 
     fn step(&mut self, t: Tick) {
-        let mut outbox: Vec<(u64, Message)> = Vec::new();
+        let mut outbox: Outbox = Vec::new();
+        let n = self.nodes.len() as u64;
         for i in 0..self.nodes.len() {
             let proposer = self.proposer(slot_of(t));
             let node = &mut self.nodes[i];
             let events = node.store.advance_to(t);
-            Self::drain_pending(node);
+            Self::drain_pending(node, true);
             for event in events {
                 if !node.online || event.tick != t {
                     continue;
@@ -130,29 +160,85 @@ impl Network {
                         attestations: proposal.attestations,
                     };
                     node.store.on_block(&block).expect("own proposal admitted");
-                    outbox.push((node.index, Message::Block(block)));
+                    if node.byzantine == Some(Byzantine::EquivocateProposals) {
+                        // A twin with the same parent and no content.
+                        let twin = BlockInput {
+                            root: block_root(proposal.slot, node.index + 1000),
+                            votes: Vec::new(),
+                            support_votes: Vec::new(),
+                            attestations: Vec::new(),
+                            ..block.clone()
+                        };
+                        let (first, second): (Vec<u64>, Vec<u64>) = (0..n)
+                            .filter(|v| *v != node.index)
+                            .partition(|v| v % 2 == 0);
+                        for v in &first {
+                            self.delayed.push((*v, Message::Block(twin.clone(), false)));
+                        }
+                        for v in &second {
+                            self.delayed
+                                .push((*v, Message::Block(block.clone(), false)));
+                        }
+                        outbox.push((node.index, Some(first), Message::Block(block, false)));
+                        outbox.push((node.index, Some(second), Message::Block(twin, false)));
+                    } else {
+                        let honest = node.byzantine.is_none();
+                        outbox.push((node.index, None, Message::Block(block, honest)));
+                    }
                 }
                 if event.vote {
+                    let head = node.store.goldfish_vote_head();
                     let vote = GoldfishVote {
                         validator: node.index,
                         slot: event.slot,
-                        head: node.store.goldfish_vote_head(),
+                        head,
                     };
                     node.store.on_goldfish_vote(vote);
-                    outbox.push((node.index, Message::Vote(vote)));
+                    outbox.push((node.index, None, Message::Vote(vote)));
+                    if node.byzantine == Some(Byzantine::EquivocateVotes)
+                        && let Some(parent) = node.store.node(&head).and_then(|b| b.parent)
+                    {
+                        let second = GoldfishVote {
+                            head: parent,
+                            ..vote
+                        };
+                        outbox.push((node.index, None, Message::Vote(second)));
+                    }
                 }
                 if event.attest.is_some() {
                     let input = node.store.attestation_input();
                     let attestation = node.record.create_attestation(node.index, &input);
                     node.store.on_sg_vote(attestation.clone());
-                    self.emitted.push(attestation.clone());
-                    outbox.push((node.index, Message::Attestation(attestation)));
+                    if node.byzantine.is_none() {
+                        self.emitted.push(attestation.clone());
+                    }
+                    outbox.push((node.index, None, Message::Attestation(attestation)));
+                    if node.byzantine == Some(Byzantine::JunkAttestations) {
+                        for data in junk_attestations(&input) {
+                            let message = Attestation {
+                                validator: node.index,
+                                data,
+                            };
+                            outbox.push((node.index, None, Message::Attestation(message)));
+                        }
+                    }
                 }
             }
         }
-        for (from, message) in outbox {
+        for (to, message) in std::mem::take(&mut self.delayed) {
+            if let Some(node) = self.nodes.iter_mut().find(|node| node.index == to) {
+                Self::deliver(node, message);
+            }
+        }
+        for (from, recipients, message) in outbox {
             for node in &mut self.nodes {
                 if node.index == from {
+                    continue;
+                }
+                if recipients
+                    .as_ref()
+                    .is_some_and(|to| !to.contains(&node.index))
+                {
                     continue;
                 }
                 if node.online {
@@ -200,11 +286,10 @@ fn check_agreement(network: &Network) {
     // Honest finalized reads agree: every node's finalized block is on the
     // chain of the deepest one.
     let deepest = network
-        .nodes
-        .iter()
+        .honest()
         .max_by_key(|node| node.store.finalized().slot)
         .expect("nodes");
-    for node in &network.nodes {
+    for node in network.honest() {
         let f = node.store.finalized().root;
         assert!(
             deepest
@@ -214,7 +299,7 @@ fn check_agreement(network: &Network) {
         );
     }
     // Each node's finalized reads only extend.
-    for node in &network.nodes {
+    for node in network.honest() {
         for pair in node.finalized_history.windows(2) {
             assert!(pair[0].slot <= pair[1].slot, "finality reverted");
             assert!(node.store.is_ancestor(&pair[0].root, &pair[1].root) || pair[0] == pair[1]);
@@ -340,4 +425,76 @@ fn trace() {
     for a in network.emitted.iter().rev().take(4) {
         println!("{a:?}");
     }
+}
+
+/// Two attestations nobody honest would send, for this round.
+fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::AttestationData; 2] {
+    use crate::types::{AttestationData, FinalityVote, HeightVote};
+    let bogus = H256([0xee; 32]);
+    let height = input.source.map_or(1, |source| source.height);
+    [
+        AttestationData::new(
+            input.round,
+            None,
+            Some(HeightVote {
+                height,
+                entry: bogus,
+                timeout: true,
+            }),
+            Some(FinalityVote {
+                height: input.justified_height + 1,
+                target: bogus,
+            }),
+        ),
+        AttestationData::new(
+            input.round,
+            Some(bogus),
+            Some(HeightVote {
+                height: height + 1,
+                entry: bogus,
+                timeout: false,
+            }),
+            None,
+        ),
+    ]
+}
+
+/// One Byzantine validator of four, with `behavior`, over 50 slots.
+fn byzantine_run(behavior: Byzantine) -> Network {
+    let params = Params::with_round_length(3);
+    let mut network = Network::new(4, params);
+    network.nodes[3].byzantine = Some(behavior);
+    network.run(0..200);
+    check_agreement(&network);
+    network
+}
+
+fn assert_honest_progress(network: &Network) {
+    for node in network.honest() {
+        assert!(
+            node.store.finalized().slot >= 30,
+            "node {} finalized only up to {:?}",
+            node.index,
+            node.store.finalized()
+        );
+        assert!(node.store.confirmed().slot >= 45);
+    }
+}
+
+#[test]
+fn an_equivocating_voter_cannot_stop_the_honest_majority() {
+    let network = byzantine_run(Byzantine::EquivocateVotes);
+    assert_honest_progress(&network);
+}
+
+#[test]
+fn an_equivocating_proposer_cannot_stop_the_honest_majority() {
+    let network = byzantine_run(Byzantine::EquivocateProposals);
+    assert_honest_progress(&network);
+}
+
+#[test]
+fn junk_attestations_cannot_stop_the_honest_majority() {
+    let network = byzantine_run(Byzantine::JunkAttestations);
+    assert_honest_progress(&network);
 }
