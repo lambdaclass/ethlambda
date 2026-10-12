@@ -69,19 +69,47 @@ pub fn process_block(
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
 ) -> Result<()> {
-    super::block::process_block_header(
+    process_block_with_body_root(
         state,
         block.slot,
         block.proposer_index,
         block.parent_root,
         block.body.hash_tree_root(),
-    )?;
-    super::electra::process_withdrawals(state, &block.body.execution_payload)?;
-    process_execution_payload(state, &block.body, config, engine)?;
-    super::block::process_randao(state, &block.body.randao_reveal)?;
-    super::block::process_eth1_data(state, &block.body.eth1_data)?;
-    process_operations(state, &block.body, config, committees, active_balances)?;
-    super::altair::process_sync_aggregate(state, &block.body.sync_aggregate, active_balances)?;
+        &block.body,
+        config,
+        engine,
+        committees,
+        active_balances,
+    )
+}
+
+/// [`process_block`] with the header's `body_root` supplied rather than
+/// computed from `body`.
+///
+/// The decoupled fork reuses fulu's block processing unchanged on the thirteen
+/// fields its body shares with electra's, but its body's own tree root (three
+/// more fields) is what the header must commit to, so the caller passes the
+/// root of the body it actually has next to an electra-shaped view of it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn process_block_with_body_root(
+    state: &mut BeaconState,
+    slot: crate::beacon::primitives::Slot,
+    proposer_index: crate::beacon::primitives::ValidatorIndex,
+    parent_root: crate::beacon::primitives::Root,
+    body_root: crate::beacon::primitives::Root,
+    body: &electra::BeaconBlockBody,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+    active_balances: &ActiveBalanceCache,
+) -> Result<()> {
+    super::block::process_block_header(state, slot, proposer_index, parent_root, body_root)?;
+    super::electra::process_withdrawals(state, &body.execution_payload)?;
+    process_execution_payload(state, body, config, engine)?;
+    super::block::process_randao(state, &body.randao_reveal)?;
+    super::block::process_eth1_data(state, &body.eth1_data)?;
+    process_operations(state, body, config, committees, active_balances)?;
+    super::altair::process_sync_aggregate(state, &body.sync_aggregate, active_balances)?;
     Ok(())
 }
 

@@ -140,6 +140,7 @@ pub fn with_validators_at(fork: ForkName, count: usize) -> BeaconState {
         ForkName::Deneb => BeaconState::Deneb(deneb_state(count)),
         ForkName::Electra => BeaconState::Electra(electra_state(count)),
         ForkName::Fulu => BeaconState::Fulu(fulu_state(count)),
+        ForkName::Decoupled => BeaconState::Decoupled(fulu_state(count)),
         ForkName::Gloas => BeaconState::Gloas(gloas_state(count)),
         // A test asking for a lean state from a beacon builder, which no fixture
         // fork name can produce; the `fork:` form, since the argument is the
@@ -168,7 +169,9 @@ pub fn replace_balances(state: &mut BeaconState, balances: Vec<Gwei>) {
         BeaconState::Capella(state) => state.balances = bounded(balances),
         BeaconState::Deneb(state) => state.balances = bounded(balances),
         BeaconState::Electra(state) => state.balances = bounded(balances),
-        BeaconState::Fulu(state) => state.balances = bounded(balances),
+        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+            state.balances = bounded(balances)
+        }
         BeaconState::Gloas(state) => state.balances = balances.into(),
         BeaconState::Lean(_) => lean_state_unreachable("replace_balances"),
     }

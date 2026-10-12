@@ -50,9 +50,7 @@ use super::{Case, PRESET, collect};
 /// functions have an assertion that can fail on a wellformed pre-state, so
 /// there is no rejection case to model.
 fn fork_case(case: &Case, config: &Config) -> Result<(), String> {
-    let source = case
-        .fork
-        .previous()
+    let source = super::previous_fixture_fork(case.fork)
         .ok_or_else(|| format!("fork `{}` has no previous fork to upgrade from", case.fork))?;
     let pre = BeaconState::from_ssz(source, &case.ssz_bytes("pre"))
         .map_err(|err| format!("decoding the fixture's pre-state: {err:?}"))?;

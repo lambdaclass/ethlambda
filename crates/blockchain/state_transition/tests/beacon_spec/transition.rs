@@ -210,8 +210,7 @@ pub fn trials() -> Vec<Trial> {
                 "{}: meta.yaml's post_fork does not match the case's own directory",
                 case.id()
             );
-            let pre_fork = post_fork
-                .previous()
+            let pre_fork = super::previous_fixture_fork(post_fork)
                 .unwrap_or_else(|| panic!("{}: post_fork can never be phase0", case.id()));
 
             let mut state = BeaconState::from_ssz(pre_fork, &case.ssz_bytes("pre"))

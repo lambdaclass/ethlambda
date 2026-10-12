@@ -89,7 +89,9 @@ pub fn fork_active_from_genesis(case: &Case) -> Config {
     ForkName::ALL
         .into_iter()
         .take_while(|fork| *fork <= case.fork)
-        .filter(|fork| *fork != ForkName::Phase0)
+        // Decoupled has no fixtures and, scheduled beside gloas, would be an
+        // unsupported schedule.
+        .filter(|fork| *fork != ForkName::Phase0 && *fork != ForkName::Decoupled)
         .fold(Config::active(), |config, fork| {
             config.with_fork_epoch(fork, 0)
         })
@@ -417,7 +419,22 @@ fn read_dir_sorted(path: &Path) -> Vec<fs::DirEntry> {
 /// So [`fixture_fork_trials`] checks this list against the tree instead.
 pub const UNMODELED_FORKS: &[&str] = &["heze"];
 
-/// Panics: a fixture case cannot be a lean case.
+/// The fork before `fork` among those the fixture release covers.
+///
+/// [`ForkName::previous`] would answer `Decoupled` for gloas, but the
+/// decoupled fork has no fixtures and a fixture upgrade into gloas starts from
+/// fulu.
+pub fn previous_fixture_fork(fork: ForkName) -> Option<ForkName> {
+    ForkName::ALL
+        .into_iter()
+        .filter(|candidate| *candidate != ForkName::Decoupled)
+        .take_while(|candidate| *candidate < fork)
+        .last()
+}
+
+/// Panics: a fixture case cannot be a lean case, nor a decoupled one: the
+/// decoupled fork is this client's own and the fixture release has no
+/// `decoupled` directory.
 ///
 /// [`ForkName`] carries a `Lean` variant, because `ethlambda-types` holds one
 /// fork name for both chains, so every match on a case's own fork needs an arm
@@ -434,8 +451,9 @@ pub const UNMODELED_FORKS: &[&str] = &["heze"];
 #[track_caller]
 pub fn lean_is_not_a_fixture_fork(handler: &str) -> ! {
     unreachable!(
-        "ForkName::Lean reached the {handler} fixture handler; \
-         a case's fork is parsed from a directory name, and lean is not one"
+        "ForkName::Lean or ForkName::Decoupled reached the {handler} fixture handler; \
+         a case's fork is parsed from a directory name, and neither is one: lean is \
+         not a beacon fork and the decoupled fork has no consensus-spec fixtures"
     )
 }
 

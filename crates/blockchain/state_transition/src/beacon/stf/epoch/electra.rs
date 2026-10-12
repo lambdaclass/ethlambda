@@ -116,7 +116,9 @@ pub(super) fn process_unfused_steps(
     // the eth1-bridge gate (see `super::fulu::process_pending_deposits`).
     match state.fork_name() {
         ForkName::Electra => process_pending_deposits(state, config)?,
-        ForkName::Fulu => super::fulu::process_pending_deposits(state, config)?,
+        ForkName::Fulu | ForkName::Decoupled => {
+            super::fulu::process_pending_deposits(state, config)?
+        }
         fork @ (ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix

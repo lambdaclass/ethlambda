@@ -191,6 +191,7 @@ pub fn apply_block(
         engine,
         committees,
         active_balances,
+        validate_result,
     )?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.
@@ -265,6 +266,9 @@ pub fn process_slots(state: &mut BeaconState, slot: Slot, config: &Config) -> Re
 /// first activation epoch, because the state would keep the old fork's shape while
 /// blocks arrived in the new one.
 ///
+/// Forks left at `FAR_FUTURE_EPOCH` are skipped, so a state upgrades from fulu
+/// straight to gloas when decoupled is unscheduled.
+///
 /// The loop, rather than a single check, is for a configuration that activates
 /// two forks at the same epoch. The fixture suites do exactly that: a `transition`
 /// case moves one fork's activation epoch, and nothing stops it landing on
@@ -276,7 +280,10 @@ fn upgrade_at_fork_boundary(state: &mut BeaconState, config: &Config) -> Result<
     }
     let epoch = state.slot() / preset::SLOTS_PER_EPOCH;
 
-    while let Some(next) = state.fork_name().next() {
+    // The next *scheduled* fork, not the next in the enum: a fork declared but
+    // left unscheduled (decoupled, on a network that goes fulu -> gloas) must
+    // not stop the walk short of the fork that is.
+    while let Some(next) = config.next_scheduled_fork(state.fork_name()) {
         if config.fork_epoch(next) != epoch {
             break;
         }
@@ -330,7 +337,8 @@ pub fn process_slot(state: &mut BeaconState) -> Result<()> {
         | BeaconState::Capella(_)
         | BeaconState::Deneb(_)
         | BeaconState::Electra(_)
-        | BeaconState::Fulu(_) => {}
+        | BeaconState::Fulu(_)
+        | BeaconState::Decoupled(_) => {}
         BeaconState::Gloas(inner) => {
             let next_slot = inner
                 .slot
@@ -385,6 +393,50 @@ mod tests {
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::test_state;
     use crate::beacon::primitives::Root;
+
+    /// A fulu state at the first slot of `epoch`, for fork-boundary tests.
+    fn fulu_state_at_epoch_start(epoch: u64) -> BeaconState {
+        // Enough validators for gloas's payload committee to find members.
+        let mut state = test_state::with_validators_at(ForkName::Fulu, 256);
+        *state.slot_mut() = epoch * preset::SLOTS_PER_EPOCH;
+        state
+    }
+
+    #[test]
+    fn an_unscheduled_decoupled_fork_does_not_stop_fulu_reaching_gloas() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Gloas, 2);
+        let mut state = fulu_state_at_epoch_start(2);
+        upgrade_at_fork_boundary(&mut state, &config).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Gloas);
+    }
+
+    #[test]
+    fn fulu_upgrades_to_decoupled_when_that_is_scheduled() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Decoupled, 2);
+        let mut before = fulu_state_at_epoch_start(1);
+        upgrade_at_fork_boundary(&mut before, &config).unwrap();
+        assert_eq!(before.fork_name(), ForkName::Fulu, "not at its epoch yet");
+
+        let mut state = fulu_state_at_epoch_start(2);
+        upgrade_at_fork_boundary(&mut state, &config).unwrap();
+        assert_eq!(state.fork_name(), ForkName::Decoupled);
+        assert_eq!(state.fork().current_version, config.decoupled_fork_version);
+    }
+
+    #[test]
+    fn a_decoupled_state_cannot_be_upgraded_to_gloas() {
+        let config = Config::mainnet()
+            .with_fork_epoch(ForkName::Decoupled, 0)
+            .with_fork_epoch(ForkName::Gloas, 2);
+        let mut state = test_state::with_validators_at(ForkName::Decoupled, 4);
+        *state.slot_mut() = 2 * preset::SLOTS_PER_EPOCH;
+        assert!(upgrade_at_fork_boundary(&mut state, &config).is_err());
+        assert!(config.validate_fork_schedule().is_err());
+    }
 
     #[test]
     fn process_slot_unsets_next_slots_payload_availability_on_gloas() {
@@ -518,7 +570,9 @@ mod tests {
             BeaconState::Capella(s) => s.historical_summaries.push(summary).unwrap(),
             BeaconState::Deneb(s) => s.historical_summaries.push(summary).unwrap(),
             BeaconState::Electra(s) => s.historical_summaries.push(summary).unwrap(),
-            BeaconState::Fulu(s) => s.historical_summaries.push(summary).unwrap(),
+            BeaconState::Fulu(s) | BeaconState::Decoupled(s) => {
+                s.historical_summaries.push(summary).unwrap()
+            }
             BeaconState::Gloas(s) => s.historical_summaries.push(summary).unwrap(),
             _ => return false,
         }

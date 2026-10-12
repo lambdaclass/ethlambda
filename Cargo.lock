@@ -2021,10 +2021,6 @@ name = "ethlambda-decoupled"
 version = "0.1.0"
 dependencies = [
  "ethlambda-types",
- "libssz 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
- "libssz-derive 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
- "libssz-merkle 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
- "libssz-types 0.3.0 (git+https://github.com/lambdaclass/libssz?rev=5cb14378ffdadcb51b387c003567e2630d0c7073)",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -2152,6 +2148,7 @@ dependencies = [
  "c-kzg",
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-decoupled",
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-test-fixtures",

@@ -663,7 +663,9 @@ pub fn compute_exit_epoch_and_update_churn(
 ) -> Result<Epoch> {
     let current_epoch = get_current_epoch(state);
     let per_epoch_churn = match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => get_activation_exit_churn_limit(state, config)?,
+        ForkName::Electra | ForkName::Fulu | ForkName::Decoupled => {
+            get_activation_exit_churn_limit(state, config)?
+        }
         ForkName::Gloas => crate::beacon::helpers::gloas::get_exit_churn_limit(state, config)?,
         fork @ (ForkName::Phase0
         | ForkName::Altair
@@ -799,7 +801,9 @@ pub fn get_consolidation_churn_limit_for_fork(
     config: &Config,
 ) -> Result<Gwei> {
     match state.fork_name() {
-        ForkName::Electra | ForkName::Fulu => get_consolidation_churn_limit(state, config),
+        ForkName::Electra | ForkName::Fulu | ForkName::Decoupled => {
+            get_consolidation_churn_limit(state, config)
+        }
         ForkName::Gloas => {
             crate::beacon::helpers::gloas::get_consolidation_churn_limit(state, config)
         }
@@ -1273,7 +1277,9 @@ pub(crate) fn pending_queue_fields<'a>(
 ) -> Result<PendingQueueFields<'a>> {
     match state {
         BeaconState::Electra(state) => Ok(PendingQueueFields::Electra(state)),
-        BeaconState::Fulu(state) => Ok(PendingQueueFields::Fulu(state)),
+        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+            Ok(PendingQueueFields::Fulu(state))
+        }
         BeaconState::Gloas(state) => Ok(PendingQueueFields::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
@@ -1308,7 +1314,9 @@ pub(crate) fn pending_queue_fields_ref<'a>(
 ) -> Result<PendingQueueFieldsRef<'a>> {
     match state {
         BeaconState::Electra(state) => Ok(PendingQueueFieldsRef::Electra(state)),
-        BeaconState::Fulu(state) => Ok(PendingQueueFieldsRef::Fulu(state)),
+        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+            Ok(PendingQueueFieldsRef::Fulu(state))
+        }
         BeaconState::Gloas(state) => Ok(PendingQueueFieldsRef::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,
@@ -1410,7 +1418,9 @@ pub(crate) fn churn_cursors_mut<'a>(
 ) -> Result<ChurnCursorsMut<'a>> {
     match state {
         BeaconState::Electra(state) => Ok(ChurnCursorsMut::Electra(state)),
-        BeaconState::Fulu(state) => Ok(ChurnCursorsMut::Fulu(state)),
+        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+            Ok(ChurnCursorsMut::Fulu(state))
+        }
         BeaconState::Gloas(state) => Ok(ChurnCursorsMut::Gloas(state)),
         other => Err(Error::UnsupportedForFork {
             function,

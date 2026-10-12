@@ -268,7 +268,7 @@ fn apply(
             // there is, so a catch-all here would be dead code rather than a
             // safety net. `Lean` is covered by name for the same reason, rather
             // than swept into one; see `lean_is_not_a_fixture_fork`.
-            ForkName::Lean => lean_is_not_a_fixture_fork("block_header"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("block_header"),
         },
         "attestation" => match case.fork {
             // Phase0 defers every attestation's reward to the epoch boundary.
@@ -313,7 +313,7 @@ fn apply(
                     &active_balances,
                 )
             }
-            ForkName::Lean => lean_is_not_a_fixture_fork("attestation"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("attestation"),
         },
         "attester_slashing" => match case.fork {
             // Unchanged from phase0 through deneb, container included.
@@ -340,7 +340,7 @@ fn apply(
                 let slashing: gloas::AttesterSlashing = case.ssz("attester_slashing");
                 gloas_stf::process_attester_slashing(state, &slashing, config)
             }
-            ForkName::Lean => lean_is_not_a_fixture_fork("attester_slashing"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("attester_slashing"),
         },
         // `ProposerSlashing` never changes shape, container included, gloas's
         // own not excepted. What changes at gloas is the function: it clears
@@ -359,7 +359,9 @@ fn apply(
                 | ForkName::Electra
                 | ForkName::Fulu => operations::process_proposer_slashing(state, &slashing, config),
                 ForkName::Gloas => gloas_stf::process_proposer_slashing(state, &slashing, config),
-                ForkName::Lean => lean_is_not_a_fixture_fork("proposer_slashing"),
+                ForkName::Lean | ForkName::Decoupled => {
+                    lean_is_not_a_fixture_fork("proposer_slashing")
+                }
             }
         }
         "deposit" => match case.fork {
@@ -394,7 +396,7 @@ fn apply(
                     fork: ForkName::Gloas,
                 },
             ),
-            ForkName::Lean => lean_is_not_a_fixture_fork("deposit"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("deposit"),
         },
         // `voluntary_exit_churn` is a second gloas-only fixture handler
         // exercising exit-queue churn scenarios specifically; its own
@@ -424,7 +426,7 @@ fn apply(
                 let exit: shared::SignedVoluntaryExit = case.ssz("voluntary_exit");
                 electra_stf::process_voluntary_exit(state, &exit, config)
             }
-            ForkName::Lean => lean_is_not_a_fixture_fork("voluntary_exit"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("voluntary_exit"),
         },
         // New in altair, and never listed as modified again, so this needs no
         // further fork match.
@@ -505,7 +507,9 @@ fn apply(
                         fork: ForkName::Gloas,
                     },
                 ),
-                ForkName::Lean => lean_is_not_a_fixture_fork("execution_payload"),
+                ForkName::Lean | ForkName::Decoupled => {
+                    lean_is_not_a_fixture_fork("execution_payload")
+                }
             }
         }
         // New in capella, named `address_change` in the fixture tree even
@@ -550,7 +554,7 @@ fn apply(
             // deterministic from the state alone. This is the one fork whose
             // arm reads no operation file at all.
             ForkName::Gloas => gloas_stf::process_withdrawals(state),
-            ForkName::Lean => lean_is_not_a_fixture_fork("withdrawals"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("withdrawals"),
         },
         // New in gloas (EIP-7732): the block's binding commitment to a
         // builder's payload.
@@ -605,7 +609,7 @@ fn apply(
                 let request: electra::DepositRequest = case.ssz("deposit_request");
                 electra_stf::process_deposit_request(state, &request)
             }
-            ForkName::Lean => lean_is_not_a_fixture_fork("deposit_request"),
+            ForkName::Lean | ForkName::Decoupled => lean_is_not_a_fixture_fork("deposit_request"),
         },
         "withdrawal_request" => {
             let request: electra::WithdrawalRequest = case.ssz("withdrawal_request");

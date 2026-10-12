@@ -1118,6 +1118,14 @@ fn onboard_builders_from_pending_deposits(
 /// [`onboard_builders_from_pending_deposits`] runs last, after `ptc_window`,
 /// matching the specification's own ordering.
 pub fn upgrade_to_gloas(pre: &BeaconState, config: &Config) -> Result<BeaconState> {
+    // A decoupled state shares fulu's container, so the projection below would
+    // accept it; the fork has no way into gloas.
+    if matches!(pre, BeaconState::Decoupled(_)) {
+        return Err(Error::UnsupportedForFork {
+            function: "upgrade_to_gloas",
+            fork: ForkName::Decoupled,
+        });
+    }
     let pre = crate::beacon::helpers::fulu::fulu_state_ref(pre, "upgrade_to_gloas")?;
     let epoch = compute_epoch_at_slot(pre.slot);
 
@@ -1279,6 +1287,15 @@ pub fn upgrade_state(state: &BeaconState, to: ForkName, config: &Config) -> Resu
         ForkName::Deneb => upgrade_to_deneb(state, config),
         ForkName::Electra => upgrade_to_electra(state, config),
         ForkName::Fulu => upgrade_to_fulu(state, config),
+        ForkName::Decoupled => match state {
+            BeaconState::Fulu(pre) => Ok(BeaconState::Decoupled(
+                crate::beacon::decoupled::upgrade_to_decoupled(pre.clone(), config),
+            )),
+            other => Err(Error::UnsupportedForFork {
+                function: "upgrade_state",
+                fork: other.fork_name(),
+            }),
+        },
         ForkName::Gloas => upgrade_to_gloas(state, config),
         // The `fork:` form, not `state:`: this dispatches on the requested
         // target, so it is the argument that is wrong, not what `state` holds.
@@ -1340,7 +1357,13 @@ mod tests {
     fn advance_to(to: ForkName, count: usize) -> (BeaconState, Config) {
         let config = Config::mainnet();
         let mut state = crate::beacon::helpers::test_state::with_validators(count);
-        for fork in ForkName::ALL.into_iter().skip(1) {
+        // Decoupled is a sibling of gloas, not a step before it: only walk
+        // through it when it is the target.
+        for fork in ForkName::ALL
+            .into_iter()
+            .skip(1)
+            .filter(|fork| *fork != ForkName::Decoupled || to == ForkName::Decoupled)
+        {
             state = upgrade_state(&state, fork, &config).expect("upgrade succeeds");
             if fork == to {
                 break;

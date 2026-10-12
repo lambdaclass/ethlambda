@@ -133,6 +133,10 @@ pub enum IgnoreReason {
     /// node's own clock crosses that fork's activation, which would punish
     /// the whole mesh for a gap in this build rather than in the message.
     UnsupportedFork,
+    /// A subnet attestation or aggregate for a slot of the decoupled fork,
+    /// which has no LMD attestations: nothing to validate, and a peer still
+    /// sending them is not malformed, only stale.
+    NoAttestationsInDecoupled,
     /// An attestation's slot is in neither the current nor the previous epoch.
     OutsideEpochWindow,
     /// An aggregate adds no bit that one already accepted for the same data
@@ -210,6 +214,7 @@ impl IgnoreReason {
             Self::Overloaded => "overloaded",
             Self::Internal => "internal",
             Self::UnsupportedFork => "unsupported_fork",
+            Self::NoAttestationsInDecoupled => "no_attestations_in_decoupled",
             Self::OutsideEpochWindow => "outside_epoch_window",
             Self::CoveredBits => "covered_bits",
             Self::UnknownBlock => "unknown_block",
@@ -583,9 +588,16 @@ pub(crate) fn is_gloas_slot(config: &Config, slot: Slot) -> bool {
         | ForkName::Capella
         | ForkName::Deneb
         | ForkName::Electra
-        | ForkName::Fulu => false,
+        | ForkName::Fulu
+        | ForkName::Decoupled => false,
         ForkName::Lean => lean_fork_unreachable("gossip::is_gloas_slot"),
     }
+}
+
+/// Whether `slot` falls in the decoupled fork, which has no LMD attestations,
+/// aggregates or attestation subnets.
+pub(crate) fn is_decoupled_slot(config: &Config, slot: Slot) -> bool {
+    config.fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Decoupled
 }
 
 /// Gloas's `verify_attestation_payload_status` (`specs/gloas/p2p-interface.md`):

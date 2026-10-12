@@ -33,6 +33,7 @@ use crate::beacon::preset;
 use crate::beacon::primitives::{BlsSignature, HashTreeRoot as _, Root, Slot, ValidatorIndex};
 
 use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
+use crate::beacon::decoupled::process_block as decoupled_process_block;
 
 /// Dispatches on the block's fork and runs that fork's own block processing.
 ///
@@ -41,6 +42,11 @@ use super::{ExecutionEngine, bellatrix, capella, deneb, electra, fulu, gloas};
 /// after [`super::process_slots`] has already advanced the state to the block's
 /// slot, so every arm validates and mutates a state already positioned at
 /// `signed_block`'s slot.
+///
+/// `verify_signatures` reaches only the checks a body's own contents carry that
+/// the specification's forks verify inside `process_block` unconditionally; the
+/// decoupled fork's vote aggregates are the one place it matters, and every
+/// other fork ignores it (their operations always verify, as fixtures expect).
 pub fn process_block(
     state: &mut BeaconState,
     signed_block: &containers::SignedBeaconBlock,
@@ -48,6 +54,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    verify_signatures: bool,
 ) -> Result<()> {
     match signed_block {
         containers::SignedBeaconBlock::Phase0(signed) => {
@@ -95,6 +102,15 @@ pub fn process_block(
             engine,
             committees,
             active_balances,
+        ),
+        containers::SignedBeaconBlock::Decoupled(signed) => decoupled_process_block(
+            state,
+            &signed.message,
+            config,
+            engine,
+            committees,
+            active_balances,
+            verify_signatures,
         ),
         // ePBS (EIP-7732) restructures block processing around a builder's
         // bid rather than an embedded payload: a gloas block carries no
