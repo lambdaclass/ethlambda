@@ -753,8 +753,9 @@ pub struct LeanWire {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
-    /// Present on a node running the decoupled consensus protocol.
-    pub(crate) decoupled: Option<DecoupledWire>,
+    /// Present on a node running the decoupled consensus protocol. Boxed so
+    /// a 3SF-mini node does not carry its size in every `Wire`.
+    pub(crate) decoupled: Option<Box<DecoupledWire>>,
 }
 
 /// A lean decoupled node's wire state: its three topics, its chain actor,
@@ -780,12 +781,12 @@ impl Wire {
     }
 
     pub(crate) fn decoupled(&self) -> Option<&DecoupledWire> {
-        self.lean().and_then(|lean| lean.decoupled.as_ref())
+        self.lean().and_then(|lean| lean.decoupled.as_deref())
     }
 
     pub(crate) fn decoupled_mut(&mut self) -> Option<&mut DecoupledWire> {
         match self {
-            Wire::Lean(lean) => lean.decoupled.as_mut(),
+            Wire::Lean(lean) => lean.decoupled.as_deref_mut(),
             Wire::Beacon(_) => None,
         }
     }
@@ -1063,7 +1064,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 attestation_committee_count: lean.attestation_committee_count,
                 block_topic: gossipsub::block_topic(),
                 aggregation_topic: gossipsub::aggregation_topic(),
-                decoupled: Some(DecoupledWire {
+                decoupled: Some(Box::new(DecoupledWire {
                     block_topic,
                     vote_topic,
                     attestation_topic,
@@ -1071,7 +1072,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                     blocks: lean.decoupled.clone().expect("guarded above"),
                     outbound: HashMap::new(),
                     attempts: HashMap::new(),
-                }),
+                })),
             })
         }
         WireConfig::Lean(lean) => {

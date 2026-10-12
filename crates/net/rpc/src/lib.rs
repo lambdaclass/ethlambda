@@ -68,6 +68,9 @@ pub async fn start_test_driver_rpc_server(
     Ok(())
 }
 
+// One handle per shared surface the lean API serves; bundling them would only
+// move the list into a struct every caller builds field by field anyway.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_rpc_server(
     config: RpcConfig,
     store: Store,
