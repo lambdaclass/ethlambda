@@ -66,7 +66,7 @@ start() {
   launch 0
   local enr=""
   for _ in $(seq 1 50); do
-    enr=$(grep -o 'enr=enr:[A-Za-z0-9_-]*' "$DIR/node_0.log" | head -1 | sed 's/^enr=//' || true)
+    enr=$(grep -o 'enr:-[A-Za-z0-9_-]*' "$DIR/node_0.log" | head -1 || true)
     [ -n "$enr" ] && break
     sleep 0.2
   done
@@ -96,7 +96,7 @@ launch() {
     --discovery.enable \
     --discovery.port "$(discovery_port "$i")" \
     --discovery.advertise-ip 127.0.0.1 \
-    "${bootnodes[@]}" \
+    ${bootnodes[@]+"${bootnodes[@]}"} \
     >"$DIR/node_$i.log" 2>&1 &
   echo $! >"$DIR/node_$i.pid"
 }
@@ -121,5 +121,10 @@ case "${1:-}" in
   start) start ;;
   status) status ;;
   stop) stop ;;
-  *) echo "usage: $0 start|status|stop" >&2; exit 2 ;;
+  # Restart one node on its existing data directory, appending to its log.
+  restart)
+    mv "$DIR/node_$2.log" "$DIR/node_$2.log.$(date +%s)"
+    launch "$2"
+    ;;
+  *) echo "usage: $0 start|status|stop|restart <i>" >&2; exit 2 ;;
 esac
