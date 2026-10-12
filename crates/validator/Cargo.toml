@@ -12,6 +12,10 @@ version.workspace = true
 [dependencies]
 ethlambda-types.workspace = true
 ethlambda-metrics.workspace = true
+# The anti-slashing `Record` and the `AttestationInput` the node serves: the
+# decoupled protocol's validator-client half. Chain-agnostic, so this pulls in
+# no consensus state.
+ethlambda-decoupled.workspace = true
 
 # A produced block is decoded and re-published as SSZ, not JSON: signing it
 # needs its `hash_tree_root`, which only the typed container can give. See

@@ -610,6 +610,23 @@ pub fn empty_block_for(
     }
 }
 
+/// The smallest well-formed decoupled block: [`empty_block_for`]'s body with the
+/// protocol's three lists empty.
+#[cfg(test)]
+pub fn empty_decoupled_block_for(
+    slot: ethlambda_types::beacon::primitives::Slot,
+    proposer_index: ethlambda_types::beacon::primitives::ValidatorIndex,
+) -> decoupled::BeaconBlock {
+    let electra = empty_block_for(slot, proposer_index);
+    decoupled::BeaconBlock {
+        slot,
+        proposer_index,
+        parent_root: electra.parent_root,
+        state_root: electra.state_root,
+        body: decoupled::BeaconBlockBody::from_electra(electra.body),
+    }
+}
+
 /// The smallest gloas block for `slot` and `proposer_index`, whose bid names
 /// `builder_index`.
 #[cfg(test)]
