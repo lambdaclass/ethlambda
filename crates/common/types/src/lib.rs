@@ -3,6 +3,7 @@ pub mod attestation;
 pub mod beacon;
 pub mod block;
 pub mod chain_config;
+pub mod decoupled;
 pub mod checkpoint;
 pub mod constants;
 pub mod enr;

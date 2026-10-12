@@ -4,73 +4,10 @@
 //! Every block's post-state is a pure function of its parent's post-state and
 //! the block's carried attestations: `σ[B] = state_transition(σ[B.parent], B)`.
 
-use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
-use libssz_types::SszBitlist;
-use serde::{Deserialize, Serialize};
+pub use ethlambda_types::decoupled::{ChainState, ValidatorBits};
 
 use crate::params::Params;
-use crate::types::{Attestation, BlockRef, Electorate, Height, Slot, VALIDATOR_LIMIT};
-
-/// One bit per validator, sized to the electorate.
-pub type ValidatorBits = SszBitlist<VALIDATOR_LIMIT>;
-
-/// The chain state σ (§1.3).
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
-)]
-pub struct ChainState {
-    /// `L`: the latest block.
-    pub latest: BlockRef,
-    /// `s = L.slot`.
-    pub slot: Slot,
-    /// `h`: the current height.
-    pub height: Height,
-    /// `T_h`: the block that brought the chain into height `h`.
-    pub entry: BlockRef,
-    /// `nj`: computed on entry into `h`, fixed until the height changes.
-    pub nonjustifiable: bool,
-    /// `target_participation`, `Q_target`.
-    #[serde(skip)]
-    pub target_participation: ValidatorBits,
-    /// `progress`, `Q_prog`.
-    #[serde(skip)]
-    pub progress: ValidatorBits,
-    /// `finalize`, `Q_finality`.
-    #[serde(skip)]
-    pub finalize: ValidatorBits,
-    /// `J`: the latest justification on the chain.
-    pub justified: BlockRef,
-    /// `h_j`: its height.
-    pub justified_height: Height,
-    /// `F`: the latest finalization on the chain.
-    pub finalized: BlockRef,
-    /// `h_F`: its height.
-    pub finalized_height: Height,
-}
-
-impl ChainState {
-    /// The initial state: `L = T_h = J = F = B_gen`, `s = 0`, `h = 1`,
-    /// `h_j = h_F = 0`, `nj = false`, every bit clear (§1.3).
-    ///
-    /// `anchor` is genesis on a chain that runs the protocol from slot 0.
-    pub fn initial(anchor: BlockRef, validator_count: usize) -> Self {
-        let empty = empty_bits(validator_count);
-        Self {
-            latest: anchor,
-            slot: anchor.slot,
-            height: 1,
-            entry: anchor,
-            nonjustifiable: false,
-            target_participation: empty.clone(),
-            progress: empty.clone(),
-            finalize: empty,
-            justified: anchor,
-            justified_height: 0,
-            finalized: anchor,
-            finalized_height: 0,
-        }
-    }
-}
+use crate::types::{Attestation, BlockRef, Electorate, Height};
 
 fn empty_bits(validator_count: usize) -> ValidatorBits {
     ValidatorBits::with_length(validator_count).expect("validator count within the registry limit")
@@ -190,7 +127,7 @@ pub fn nonjustifiable(params: &Params, height: Height, finalized_height: Height)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{AttestationData, FinalityVote, HeightVote};
+    use crate::types::{AttestationData, FinalityVote, HeightVote, Slot};
     use ethlambda_types::primitives::H256;
 
     fn block(byte: u8, slot: Slot) -> BlockRef {
