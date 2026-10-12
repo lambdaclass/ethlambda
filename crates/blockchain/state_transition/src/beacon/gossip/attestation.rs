@@ -44,8 +44,8 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 
 use super::{
-    IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch, is_future_slot,
-    is_gloas_slot, verify_attestation_payload_status,
+    IgnoreReason, Outcome, RejectReason, ancestor_at, is_current_or_previous_epoch,
+    is_decoupled_slot, is_future_slot, is_gloas_slot, verify_attestation_payload_status,
 };
 use crate::beacon::bls;
 use crate::beacon::config::Config;
@@ -136,6 +136,10 @@ pub fn cheap_checks(
     // for this target epoch and validator.
     if seen.contains(target_epoch, attestation.attester_index) {
         return Err(Outcome::Ignore(IgnoreReason::AlreadySeen));
+    }
+    // The decoupled fork has no attestations at all.
+    if is_decoupled_slot(&config, data.slot) {
+        return Err(Outcome::Ignore(IgnoreReason::NoAttestationsInDecoupled));
     }
     if is_gloas_slot(&config, data.slot) {
         // [New in Gloas:EIP7732] [REJECT] `data.index` is 0 or 1: it is the

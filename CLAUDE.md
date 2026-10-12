@@ -607,6 +607,33 @@ existing once per chain.
   cannot walk off the end into lean. Lean is not a point on the Beacon Chain's
   fork timeline. `Lean` is declared *last* so the derived `Ord` puts it after
   every beacon fork, which is what `fork >= ForkName::X` gating reads.
+- **`ForkName::Decoupled` sits between `Fulu` and `Gloas`** (storage selector
+  8; selectors are never renumbered) so `>= Fulu` gates include it and
+  `>= Gloas` gates exclude it. It is the decoupled consensus protocol
+  (`crates/blockchain/decoupled`): state is **fulu's container**
+  (`BeaconState::Decoupled(fulu::BeaconState)`, so match
+  `Fulu(s) | Decoupled(s)`), the block is its own
+  (`SignedBeaconBlock::Decoupled`, electra's body plus the three protocol
+  fields; `attestations` and `attester_slashings` must be empty), and the FFG
+  fields stay at their fork-boundary values (nothing updates them, so the
+  store's finalization and pruning do not advance on such a chain). The
+  protocol's chain state is node-derived, never stored.
+  - `ForkName::next`/`previous` walk the *enum*; a fork declared but left at
+    `FAR_FUTURE_EPOCH` must not stop a walk, so the upgrade loop and any
+    code that means "the neighbour on this network's schedule" uses
+    `Config::{next,previous}_scheduled_fork`. A network never schedules both
+    decoupled and gloas (`Config::validate_fork_schedule`, run when a network
+    is resolved); `upgrade_to_gloas` refuses a decoupled state as well.
+  - `ethlambda beacon --decoupled-fork-epoch N [--decoupled-slots-per-round R]`
+    override the loaded network's config before anything reads it. A fulu
+    genesis at decoupled epoch 0 is decoded as fulu and upgraded at load
+    (`beacon::genesis_at_decoupled`, which also re-stamps the header's body
+    root with the decoupled empty body's).
+  - The fork has no LMD attestations: the `beacon_aggregate_and_proof` topic
+    and attestation subnets are not subscribed, attestation/aggregate gossip
+    and API calls for a decoupled slot are ignored or answered 400, and the VC
+    skips attestation and aggregation there. `goldfish_vote` and
+    `combined_attestation` topics are routed to a stub that ignores them.
 - Preset is a **compile-time** choice (`preset-minimal` feature on this crate)
   because SSZ container bounds are const-generic arguments; fork scheduling is
   runtime (`beacon::config`) instead. Every lean crate depends on
@@ -979,11 +1006,14 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 6: the unrealized-justifications table means a directory
+- `DB_VERSION` is 7: the decoupled fork's `Config` keys (version, epoch and
+  the five protocol parameters) widen the SSZ-encoded `Config`, and fork
+  selector 8 tags decoupled blocks and states. (6 was the
+  unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized
   justification computed yet" rather than "this directory predates the
-  table". (5 was the gloas schedule, timing and churn keys in `Config`, which
+  table"; 5 was the gloas schedule, timing and churn keys in `Config`, which
   is SSZ-encoded under `KEY_CONFIG`; 4 was `PRESET_BASE`/`CONFIG_NAME` at the
   front of `Config`; 3 was the runtime keys a `config.yaml` supplies.)
   `Store::from_db_state` refuses any other version outright; there is no

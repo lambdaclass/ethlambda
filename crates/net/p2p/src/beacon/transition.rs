@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use ethlambda_types::beacon::config::Config;
 use ethlambda_types::beacon::constants::MAXIMUM_GOSSIP_CLOCK_DISPARITY;
+use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{Epoch, ForkDigest};
 use ethlambda_types::time::unix_now_ms;
@@ -154,7 +155,11 @@ pub(crate) fn apply(server: &mut P2PServer, epoch: Epoch) -> Changes {
             server.swarm_handle.subscribe(topic.clone());
             changes.subscribed.push(topic.to_string());
         }
+        // The decoupled fork has no attestation subnets, aggregator ones included.
         for &subnet_id in server.aggregator_subnets.keys() {
+            if entry.fork == ForkName::Decoupled {
+                break;
+            }
             let topic = attestation_topic(entry.digest, subnet_id);
             changes.subscribed.push(topic.to_string());
             server.swarm_handle.subscribe(topic);

@@ -268,6 +268,11 @@ pub fn cheap_checks(
     let config = store.config();
     let data = aggregate.data();
 
+    // The decoupled fork has no aggregates.
+    if super::is_decoupled_slot(&config, data.slot) {
+        return Err(Outcome::Ignore(IgnoreReason::NoAttestationsInDecoupled));
+    }
+
     // [REJECT] The bitfield fits the type bound electra gave it. Gloas's
     // `AggregationBits` is a progressive bitlist with no bound of its own, and
     // everything below (the seen-set verdict first) expands the bits, so an

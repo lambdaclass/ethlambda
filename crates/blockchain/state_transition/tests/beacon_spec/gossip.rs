@@ -284,7 +284,10 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             gloas::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        ForkName::Lean => Err(format!("no aggregate shape for fork {:?}", case.fork)),
+        // No aggregates exist in the decoupled fork, and it has no fixtures.
+        ForkName::Lean | ForkName::Decoupled => {
+            Err(format!("no aggregate shape for fork {:?}", case.fork))
+        }
     }
 }
 
@@ -602,7 +605,7 @@ fn run_case(case: &Case) -> Result<(), String> {
                     .subnet_id
                     .ok_or("a data_column_sidecar message names its subnet")?;
                 match sidecar {
-                    DataColumnSidecar::Fulu(sidecar) => {
+                    DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
                         let outcome = rules::column::validate(
                             &seen_columns,
                             &store,

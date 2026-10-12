@@ -88,6 +88,12 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) >= ForkName::Gloas
     }
 
+    /// Whether `slot` is a decoupled slot, which has no attestations and no
+    /// aggregation: this client skips both there.
+    pub fn is_decoupled(&self, slot: Slot) -> bool {
+        self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Decoupled
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a

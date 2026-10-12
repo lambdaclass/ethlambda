@@ -2150,6 +2150,7 @@ dependencies = [
  "c-kzg",
  "datatest-stable",
  "ethlambda-crypto",
+ "ethlambda-decoupled",
  "ethlambda-metrics",
  "ethlambda-storage",
  "ethlambda-test-fixtures",

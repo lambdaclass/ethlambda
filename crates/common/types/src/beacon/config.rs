@@ -317,6 +317,30 @@ pub struct Config {
     /// is not scheduled.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub fulu_fork_epoch: Epoch,
+    /// The `Fork.current_version` a decoupled block signs under.
+    #[serde(with = "crate::beacon::serde_helpers::hex_array")]
+    pub decoupled_fork_version: Version,
+    /// The epoch the decoupled fork activates at, or
+    /// [`constants::FAR_FUTURE_EPOCH`] if it is not scheduled. A network
+    /// never schedules both this and gloas (`decoupled -> gloas` is not
+    /// supported); [`Config::validate_fork_schedule`] refuses it.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_fork_epoch: Epoch,
+    /// Slots per round of the decoupled protocol.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_slots_per_round: u64,
+    /// The decoupled protocol's stabilization window, in rounds.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_sg_window: u64,
+    /// The decoupled finality gadget's non-justifiable period, in heights.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_nonjustifiable_period: u64,
+    /// How many heights the decoupled chain may run ahead of finality.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_finality_debt: u64,
+    /// Rounds without progress after which the decoupled protocol times out.
+    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
+    pub decoupled_timeout_delay: u64,
     /// The `Fork.current_version` a gloas block or attestation signs under.
     #[serde(with = "crate::beacon::serde_helpers::hex_array")]
     pub gloas_fork_version: Version,
@@ -719,6 +743,13 @@ impl Config {
             electra_fork_epoch: 364_032,
             fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
             fulu_fork_epoch: 411_392,
+            decoupled_fork_version: [0x0d, 0x00, 0x00, 0x00],
+            decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            decoupled_slots_per_round: 4,
+            decoupled_sg_window: 2,
+            decoupled_nonjustifiable_period: 5,
+            decoupled_finality_debt: 2,
+            decoupled_timeout_delay: 8,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
@@ -853,6 +884,13 @@ impl Config {
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_version: [0x06, 0x00, 0x00, 0x01],
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            decoupled_fork_version: [0x0d, 0x00, 0x00, 0x01],
+            decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            decoupled_slots_per_round: 4,
+            decoupled_sg_window: 2,
+            decoupled_nonjustifiable_period: 5,
+            decoupled_finality_debt: 2,
+            decoupled_timeout_delay: 8,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
 
@@ -976,6 +1014,7 @@ impl Config {
             deneb_fork_epoch: constants::FAR_FUTURE_EPOCH,
             electra_fork_epoch: constants::FAR_FUTURE_EPOCH,
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
+            decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
             ..Config::mainnet()
         }
@@ -1048,6 +1087,80 @@ impl Config {
             .unwrap_or(ForkName::Phase0)
     }
 
+    /// The fork this network's schedule puts immediately before `fork`: the
+    /// nearest earlier fork that is scheduled (not
+    /// [`constants::FAR_FUTURE_EPOCH`]), or `None` for the first.
+    ///
+    /// [`ForkName::previous`] is the previous fork *in the enum*, which is
+    /// not what a network's upgrade chain follows once a fork such as
+    /// [`ForkName::Decoupled`] is declared but left unscheduled: gloas's
+    /// predecessor on such a network is fulu.
+    pub fn previous_scheduled_fork(&self, fork: ForkName) -> Option<ForkName> {
+        ForkName::ALL
+            .into_iter()
+            .rev()
+            .skip_while(|&candidate| candidate != fork)
+            .skip(1)
+            .find(|&candidate| {
+                candidate == ForkName::Phase0
+                    || self.fork_epoch(candidate) != constants::FAR_FUTURE_EPOCH
+            })
+    }
+
+    /// The fork this network's schedule puts immediately after `fork`: the
+    /// nearest later fork that is scheduled, or `None` for the last. See
+    /// [`Self::previous_scheduled_fork`].
+    pub fn next_scheduled_fork(&self, fork: ForkName) -> Option<ForkName> {
+        ForkName::ALL
+            .into_iter()
+            .skip_while(|&candidate| candidate != fork)
+            .skip(1)
+            .find(|&candidate| self.fork_epoch(candidate) != constants::FAR_FUTURE_EPOCH)
+    }
+
+    /// Refuses a fork schedule this build cannot follow.
+    ///
+    /// * Decoupled and gloas must not both be scheduled: `decoupled -> gloas`
+    ///   has no upgrade.
+    /// * A scheduled decoupled fork must not precede fulu, whose state it
+    ///   reuses.
+    /// * Its protocol parameters must be usable: the slot duration a
+    ///   multiple of four milliseconds (the protocol's delta is a quarter
+    ///   slot) and at least three slots per round.
+    pub fn validate_fork_schedule(&self) -> Result<(), String> {
+        if self.decoupled_fork_epoch == constants::FAR_FUTURE_EPOCH {
+            return Ok(());
+        }
+        if self.gloas_fork_epoch != constants::FAR_FUTURE_EPOCH {
+            return Err(format!(
+                "DECOUPLED_FORK_EPOCH ({}) and GLOAS_FORK_EPOCH ({}) are both scheduled, \
+                 but the decoupled fork has no upgrade to gloas",
+                self.decoupled_fork_epoch, self.gloas_fork_epoch,
+            ));
+        }
+        if self.fulu_fork_epoch > self.decoupled_fork_epoch {
+            return Err(format!(
+                "DECOUPLED_FORK_EPOCH ({}) precedes FULU_FORK_EPOCH ({}); the decoupled \
+                 fork builds on fulu's state",
+                self.decoupled_fork_epoch, self.fulu_fork_epoch,
+            ));
+        }
+        if !self.slot_duration_ms.is_multiple_of(4) {
+            return Err(format!(
+                "the decoupled fork needs a slot duration divisible by 4 ms (delta = slot / 4), \
+                 got {} ms",
+                self.slot_duration_ms,
+            ));
+        }
+        if self.decoupled_slots_per_round < 3 {
+            return Err(format!(
+                "DECOUPLED_SLOTS_PER_ROUND must be at least 3, got {}",
+                self.decoupled_slots_per_round,
+            ));
+        }
+        Ok(())
+    }
+
     /// The `Fork.current_version` value blocks and attestations of `fork`
     /// sign under.
     pub fn fork_version(&self, fork: ForkName) -> Version {
@@ -1059,6 +1172,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version,
             ForkName::Electra => self.electra_fork_version,
             ForkName::Fulu => self.fulu_fork_version,
+            ForkName::Decoupled => self.decoupled_fork_version,
             ForkName::Gloas => self.gloas_fork_version,
             ForkName::Lean => lean_fork_unreachable("Config::fork_version"),
         }
@@ -1077,6 +1191,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch,
             ForkName::Electra => self.electra_fork_epoch,
             ForkName::Fulu => self.fulu_fork_epoch,
+            ForkName::Decoupled => self.decoupled_fork_epoch,
             ForkName::Gloas => self.gloas_fork_epoch,
             ForkName::Lean => lean_fork_unreachable("Config::fork_epoch"),
         }
@@ -1102,6 +1217,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_epoch = epoch,
             ForkName::Electra => self.electra_fork_epoch = epoch,
             ForkName::Fulu => self.fulu_fork_epoch = epoch,
+            ForkName::Decoupled => self.decoupled_fork_epoch = epoch,
             ForkName::Gloas => self.gloas_fork_epoch = epoch,
             ForkName::Lean => lean_fork_unreachable("Config::with_fork_epoch"),
         }
@@ -1119,6 +1235,7 @@ impl Config {
             ForkName::Deneb => self.deneb_fork_version = version,
             ForkName::Electra => self.electra_fork_version = version,
             ForkName::Fulu => self.fulu_fork_version = version,
+            ForkName::Decoupled => self.decoupled_fork_version = version,
             ForkName::Gloas => self.gloas_fork_version = version,
             // Matches `fork_version`'s own arm: reaching this means a caller
             // dispatched on the wrong chain, which is a bug in the caller.
@@ -1235,6 +1352,63 @@ mod tests {
         // Every later fork is still unscheduled, so a far-future epoch still
         // resolves to the one fork that was actually overridden.
         assert_eq!(config.fork_at_epoch(1_000_000), ForkName::Altair);
+    }
+
+    #[test]
+    fn decoupled_keys_parse_and_default() {
+        let yaml = "DECOUPLED_FORK_VERSION: 0x0d000000\nDECOUPLED_FORK_EPOCH: 3\n\
+                    DECOUPLED_SLOTS_PER_ROUND: 6\n";
+        let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(config.fork_epoch(ForkName::Decoupled), 3);
+        assert_eq!(config.fork_at_epoch(3), ForkName::Decoupled);
+        assert_eq!(config.decoupled_slots_per_round, 6);
+        assert_eq!(config.decoupled_sg_window, 2);
+        let absent: Config = serde_yaml_ng::from_str("").unwrap();
+        assert_eq!(absent.decoupled_fork_epoch, constants::FAR_FUTURE_EPOCH);
+    }
+
+    #[test]
+    fn scheduled_neighbours_skip_unscheduled_forks() {
+        let config = Config::minimal()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Gloas, 5);
+        assert_eq!(
+            config.previous_scheduled_fork(ForkName::Gloas),
+            Some(ForkName::Fulu)
+        );
+        assert_eq!(
+            config.next_scheduled_fork(ForkName::Fulu),
+            Some(ForkName::Gloas)
+        );
+        let decoupled = Config::minimal()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Decoupled, 5);
+        assert_eq!(
+            decoupled.next_scheduled_fork(ForkName::Fulu),
+            Some(ForkName::Decoupled)
+        );
+        assert_eq!(decoupled.next_scheduled_fork(ForkName::Decoupled), None);
+    }
+
+    #[test]
+    fn decoupled_and_gloas_together_are_refused() {
+        let config = Config::minimal()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Decoupled, 1)
+            .with_fork_epoch(ForkName::Gloas, 2);
+        assert!(
+            config
+                .validate_fork_schedule()
+                .unwrap_err()
+                .contains("GLOAS")
+        );
+        let ok = Config::minimal()
+            .with_fork_epoch(ForkName::Fulu, 0)
+            .with_fork_epoch(ForkName::Decoupled, 1);
+        assert!(ok.validate_fork_schedule().is_ok());
+        let mut bad_round = ok.clone();
+        bad_round.decoupled_slots_per_round = 2;
+        assert!(bad_round.validate_fork_schedule().is_err());
     }
 
     #[test]

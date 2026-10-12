@@ -87,7 +87,7 @@
 
 use ethlambda_types::beacon::containers::deneb::Blob;
 use ethlambda_types::beacon::containers::electra::{BeaconBlock, SignedBeaconBlock};
-use ethlambda_types::beacon::containers::gloas;
+use ethlambda_types::beacon::containers::{decoupled, gloas};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::beacon::preset;
 use ethlambda_types::beacon::primitives::{BlsSignature, KzgProof};
@@ -150,6 +150,23 @@ pub struct FuluBlockContents {
 #[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
 pub struct FuluSignedBlockContents {
     pub signed_block: SignedBeaconBlock,
+    pub kzg_proofs: CellKzgProofs,
+    pub blobs: Blobs,
+}
+
+/// `produceBlockV3`'s body for the decoupled fork: fulu's envelope (one proof
+/// per cell) around the fork's own block.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+pub struct DecoupledBlockContents {
+    pub block: decoupled::BeaconBlock,
+    pub kzg_proofs: CellKzgProofs,
+    pub blobs: Blobs,
+}
+
+/// `publishBlockV2`'s body for the decoupled fork.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode)]
+pub struct DecoupledSignedBlockContents {
+    pub signed_block: decoupled::SignedBeaconBlock,
     pub kzg_proofs: CellKzgProofs,
     pub blobs: Blobs,
 }
@@ -250,6 +267,12 @@ pub enum Contents {
         kzg_proofs: CellKzgProofs,
         blobs: Blobs,
     },
+    /// Decoupled: one proof per cell, around the fork's own block.
+    Decoupled {
+        block: decoupled::BeaconBlock,
+        kzg_proofs: CellKzgProofs,
+        blobs: Blobs,
+    },
     /// Gloas: a bare block, and the self-built payload's envelope when the
     /// node included it.
     Gloas {
@@ -300,6 +323,18 @@ impl ProducedBlock {
                 Ok(Self {
                     fork,
                     contents: Contents::WithCellProofs {
+                        block: contents.block,
+                        kzg_proofs: contents.kzg_proofs,
+                        blobs: contents.blobs,
+                    },
+                })
+            }
+            ForkName::Decoupled => {
+                let contents = DecoupledBlockContents::from_ssz_bytes(bytes)
+                    .map_err(|err| decode("decoupled block contents", err))?;
+                Ok(Self {
+                    fork,
+                    contents: Contents::Decoupled {
                         block: contents.block,
                         kzg_proofs: contents.kzg_proofs,
                         blobs: contents.blobs,
@@ -364,6 +399,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.slot
             }
+            Contents::Decoupled { block, .. } => block.slot,
             Contents::Gloas { block, .. } => block.slot,
         }
     }
@@ -374,6 +410,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.proposer_index
             }
+            Contents::Decoupled { block, .. } => block.proposer_index,
             Contents::Gloas { block, .. } => block.proposer_index,
         }
     }
@@ -386,6 +423,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.hash_tree_root()
             }
+            Contents::Decoupled { block, .. } => block.hash_tree_root(),
             Contents::Gloas { block, .. } => block.hash_tree_root(),
         }
     }
@@ -397,6 +435,7 @@ impl ProducedBlock {
             Contents::WithBlobProofs { block, .. } | Contents::WithCellProofs { block, .. } => {
                 block.body.execution_payload.fee_recipient
             }
+            Contents::Decoupled { block, .. } => block.body.execution_payload.fee_recipient,
             Contents::Gloas { block, .. } => {
                 block
                     .body
@@ -435,9 +474,9 @@ impl ProducedBlock {
     /// How many blobs came with the block. For logging.
     pub fn blob_count(&self) -> usize {
         match &self.contents {
-            Contents::WithBlobProofs { blobs, .. } | Contents::WithCellProofs { blobs, .. } => {
-                blobs.len()
-            }
+            Contents::WithBlobProofs { blobs, .. }
+            | Contents::WithCellProofs { blobs, .. }
+            | Contents::Decoupled { blobs, .. } => blobs.len(),
             Contents::Gloas { payload, .. } => {
                 payload.as_ref().map_or(0, |payload| payload.blobs.len())
             }
@@ -470,6 +509,19 @@ impl ProducedBlock {
                 blobs,
             } => FuluSignedBlockContents {
                 signed_block: SignedBeaconBlock {
+                    message: block,
+                    signature,
+                },
+                kzg_proofs,
+                blobs,
+            }
+            .to_ssz(),
+            Contents::Decoupled {
+                block,
+                kzg_proofs,
+                blobs,
+            } => DecoupledSignedBlockContents {
+                signed_block: decoupled::SignedBeaconBlock {
                     message: block,
                     signature,
                 },

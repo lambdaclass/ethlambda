@@ -56,6 +56,7 @@ pub(crate) fn bid_of(block: &SignedBeaconBlock) -> Option<&gloas::ExecutionPaylo
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
         | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_)
         | SignedBeaconBlock::Lean(_) => None,
     }
 }

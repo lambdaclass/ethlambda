@@ -15,6 +15,45 @@ use ethlambda_types::beacon::config::Config;
 
 pub(crate) use built_in::BuiltInNetwork;
 
+/// Command-line overrides of a resolved network's configuration, for values a
+/// devnet's generated `config.yaml` cannot carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfigOverrides {
+    pub(crate) decoupled_fork_epoch: Option<u64>,
+    pub(crate) decoupled_slots_per_round: Option<u64>,
+}
+
+impl ConfigOverrides {
+    /// Write the overrides into `config`. Run before anything reads the
+    /// config, `fork_at_epoch(0)` (which picks the genesis state's decoding)
+    /// included.
+    pub(crate) fn apply(&self, config: &mut Config) {
+        if let Some(epoch) = self.decoupled_fork_epoch {
+            config.decoupled_fork_epoch = epoch;
+        }
+        if let Some(slots) = self.decoupled_slots_per_round {
+            config.decoupled_slots_per_round = slots;
+        }
+    }
+}
+
+impl From<&crate::cli::MainnetOptions> for ConfigOverrides {
+    fn from(options: &crate::cli::MainnetOptions) -> Self {
+        Self {
+            decoupled_fork_epoch: options.decoupled_fork_epoch,
+            decoupled_slots_per_round: options.decoupled_slots_per_round,
+        }
+    }
+}
+
+/// Refuse a fork schedule this build cannot follow, with the reason: see
+/// [`Config::validate_fork_schedule`].
+pub(crate) fn validate_schedule(config: &Config) -> eyre::Result<()> {
+    config
+        .validate_fork_schedule()
+        .map_err(|reason| eyre::eyre!("this network's fork schedule is unsupported: {reason}"))
+}
+
 /// The default when `--network` is absent.
 pub(crate) const DEFAULT_NETWORK: &str = BuiltInNetwork::Mainnet.name();
 
@@ -287,15 +326,27 @@ pub(crate) enum NetworkSource {
 impl NetworkSource {
     /// Resolve a classified `--network` value.
     pub(crate) fn resolve(spec: &NetworkSpec) -> eyre::Result<Self> {
+        Self::resolve_with(spec, &ConfigOverrides::default())
+    }
+
+    /// [`Self::resolve`], with `overrides` written into the configuration
+    /// before anything reads it.
+    pub(crate) fn resolve_with(
+        spec: &NetworkSpec,
+        overrides: &ConfigOverrides,
+    ) -> eyre::Result<Self> {
         match spec {
             NetworkSpec::BuiltIn(network) => {
                 tracing::info!(network = network.name(), "Using the built-in network");
-                Ok(Self::BuiltIn(Box::new(network.resolve()?)))
+                let mut built_in = network.resolve()?;
+                overrides.apply(&mut built_in.config);
+                validate_schedule(&built_in.config)?;
+                Ok(Self::BuiltIn(Box::new(built_in)))
             }
             NetworkSpec::Directory(path) => {
                 // `load` checks the preset and the constants itself, before it
                 // decodes `genesis.ssz`, whose container bounds the preset sets.
-                let loaded = dir::NetworkDir::load(path)?;
+                let loaded = dir::NetworkDir::load_with(path, overrides)?;
                 tracing::info!(
                     network = %loaded.config.config_name,
                     path = %path.display(),

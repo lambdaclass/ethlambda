@@ -134,7 +134,8 @@ pub fn stateful_checks(store: &Store, envelope: &gloas::SignedExecutionPayloadEn
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("envelope::stateful_checks"),
     };
     let bid = &block.body.signed_execution_payload_bid.message;

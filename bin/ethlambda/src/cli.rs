@@ -307,6 +307,22 @@ pub(crate) struct MainnetOptions {
     /// `eth-clients` publishes and kurtosis mounts at `/network-configs`.
     #[arg(long, default_value = crate::network::DEFAULT_NETWORK)]
     pub(crate) network: String,
+
+    /// Schedule the decoupled fork at this epoch, overriding the loaded
+    /// network's `DECOUPLED_FORK_EPOCH`.
+    ///
+    /// For devnets: tooling that generates `config.yaml` cannot add custom
+    /// keys, and the fork's genesis state is the fulu one it knows, upgraded at
+    /// load when the fork is scheduled at epoch 0. Applied before anything else
+    /// reads the configuration, and refused when the network also schedules
+    /// gloas (the decoupled fork has no upgrade to it).
+    #[arg(long)]
+    pub(crate) decoupled_fork_epoch: Option<u64>,
+
+    /// Slots per round of the decoupled protocol, overriding the loaded
+    /// network's `DECOUPLED_SLOTS_PER_ROUND`. At least 3.
+    #[arg(long)]
+    pub(crate) decoupled_slots_per_round: Option<u64>,
 }
 
 /// Flags only the lean chain takes.

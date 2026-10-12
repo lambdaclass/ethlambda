@@ -185,7 +185,9 @@ pub fn chain_checks_for(
     now_ms: u64,
 ) -> ChainVerdict {
     match sidecar {
-        AnyDataColumnSidecar::Fulu(sidecar) => chain_checks(store, sidecar, now_ms),
+        AnyDataColumnSidecar::Fulu(sidecar) | AnyDataColumnSidecar::Decoupled(sidecar) => {
+            chain_checks(store, sidecar, now_ms)
+        }
         AnyDataColumnSidecar::Gloas(sidecar) => chain_checks_gloas(store, sidecar, now_ms),
     }
 }
@@ -450,7 +452,8 @@ pub fn stateful_checks_gloas(store: &Store, sidecar: &gloas::DataColumnSidecar) 
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => return Outcome::Reject(RejectReason::BlockNotGloas),
         SignedBeaconBlock::Lean(_) => lean_block_unreachable("column::stateful_checks_gloas"),
     };
     // [REJECT] The sidecar passes structural validation.

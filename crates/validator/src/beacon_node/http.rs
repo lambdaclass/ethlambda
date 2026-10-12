@@ -890,6 +890,13 @@ impl BeaconNodeApi for HttpBeaconNode {
                     fork.as_str()
                 )));
             }
+            // The decoupled fork has no attestations, so no aggregate either.
+            ForkName::Decoupled => {
+                return Err(Error::InconsistentResponse(
+                    "node produced a decoupled aggregate, but that fork has no attestations"
+                        .to_string(),
+                ));
+            }
             ForkName::Electra | ForkName::Fulu => {
                 let dto: AttestationDto = serde_json::from_value(response.data)
                     .map_err(|err| Error::Decode(format!("electra aggregate: {err}")))?;

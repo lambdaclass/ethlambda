@@ -194,7 +194,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// would otherwise look identical to "no unrealized justification computed
 /// yet" rather than "this directory predates the table", the same silent
 /// wrong answer every prior bump exists to rule out.
-pub const DB_VERSION: u64 = 6;
+///
+/// 7 widened `Config` with the decoupled fork's version, epoch and protocol
+/// parameters, so a directory written by version 6 decodes into the wrong
+/// fields, and added fork selector 8 for decoupled blocks and states.
+pub const DB_VERSION: u64 = 7;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -997,7 +1001,8 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => false,
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => false,
         SignedBeaconBlock::Lean(_) => Store::lean_only("builds_on_payload"),
     }
 }
@@ -3894,7 +3899,8 @@ impl Store {
                     | ForkName::Capella
                     | ForkName::Deneb
                     | ForkName::Electra
-                    | ForkName::Fulu,
+                    | ForkName::Fulu
+                    | ForkName::Decoupled,
                 ) => false,
                 // A beacon directory never holds a lean block row.
                 Some(ForkName::Lean) => unreachable!("lean block row in a beacon directory"),
@@ -5094,6 +5100,36 @@ mod tests {
 
         assert_eq!(store.block_entry(&root), Some((5, H256::from([1u8; 32]))));
         assert!(store.has_block(&root));
+    }
+
+    #[test]
+    fn a_decoupled_block_round_trips_under_its_own_selector() {
+        use ethlambda_types::beacon::containers::decoupled;
+
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let body = decoupled::BeaconBlockBody::empty();
+        let block = SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: decoupled::BeaconBlock {
+                slot: 9,
+                proposer_index: 3,
+                parent_root: H256::from([2u8; 32]),
+                state_root: H256::from([3u8; 32]),
+                body,
+            },
+            signature: Default::default(),
+        });
+        let root = block.message_hash_tree_root();
+
+        store
+            .insert_signed_block(root, block.clone())
+            .expect("insert decoupled block");
+
+        assert_eq!(store.block_entry(&root), Some((9, H256::from([2u8; 32]))));
+        assert_eq!(
+            store.get_signed_block(&root).expect("read"),
+            Some(block.clone())
+        );
+        assert_eq!(encode_beacon_block_value(&block)[0], 8);
     }
 
     #[test]

@@ -18,6 +18,7 @@ use ethlambda_types::beacon::{
         BeaconState, SignedBeaconBlock,
         altair::SyncAggregate,
         capella::{self, Withdrawal},
+        decoupled,
         deneb::ExecutionPayload,
         electra::{
             self, AggregationBits, Attestation, BeaconBlock, BeaconBlockBody, CommitteeBits,
@@ -36,6 +37,7 @@ use libssz_types::SszList;
 
 use super::bls;
 use super::config::Config;
+use super::decoupled::DecoupledBodyFields;
 use super::error::{Error, Result, verify};
 use super::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, get_beacon_proposer_index, get_block_root,
@@ -78,7 +80,9 @@ pub struct PayloadInputs {
 pub fn payload_inputs(state: &BeaconState, config: &Config) -> Result<PayloadInputs> {
     let parent_hash = match state {
         BeaconState::Electra(state) => state.latest_execution_payload_header.block_hash,
-        BeaconState::Fulu(state) => state.latest_execution_payload_header.block_hash,
+        BeaconState::Fulu(state) | BeaconState::Decoupled(state) => {
+            state.latest_execution_payload_header.block_hash
+        }
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
@@ -506,11 +510,23 @@ pub struct BlockInputs {
 /// `state` with an execution engine that accepts the payload, which is the
 /// node's own execution client's payload; that run is also what rejects a body
 /// the network would, before anything is signed.
+///
+/// For a decoupled state the body is the electra one lifted with
+/// [`decoupled::BeaconBlockBody::from_electra`], carrying the protocol fields in
+/// `decoupled` (empty when `None`); `inputs.attestations` and the attester
+/// slashings must be empty there, since the fork has neither. For any other
+/// state `decoupled` must be `None`.
 pub fn assemble_block(
     state: &BeaconState,
     inputs: BlockInputs,
+    decoupled: Option<DecoupledBodyFields>,
     config: &Config,
-) -> Result<BeaconBlock> {
+) -> Result<UnsignedBlock> {
+    let is_decoupled = matches!(state, BeaconState::Decoupled(_));
+    verify(
+        is_decoupled || decoupled.is_none(),
+        "protocol fields are only supplied for a decoupled block",
+    )?;
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
         eth1_data: state.eth1_data().clone(),
@@ -552,12 +568,43 @@ pub fn assemble_block(
         execution_requests: inputs.execution_requests,
         ..BeaconBlockBody::empty()
     };
+    let slot = state.slot();
+    let proposer_index = get_beacon_proposer_index(state)?;
+    // `process_slots` filled the header's state root on the way out of the
+    // parent's slot, so this is the parent block's root.
+    let parent_root = state.latest_block_header().hash_tree_root();
+
+    if is_decoupled {
+        if !body.attestations.is_empty() {
+            return Err(Error::DecoupledLegacyOperations("attestations"));
+        }
+        if !body.attester_slashings.is_empty() {
+            return Err(Error::DecoupledLegacyOperations("attester_slashings"));
+        }
+        let fields = decoupled.unwrap_or_default();
+        let mut body = decoupled::BeaconBlockBody::from_electra(body);
+        body.goldfish_votes = fields.goldfish_votes;
+        body.goldfish_support = fields.goldfish_support;
+        body.combined_attestations = fields.combined_attestations;
+        let mut block = decoupled::BeaconBlock {
+            slot,
+            proposer_index,
+            parent_root,
+            state_root: Root::ZERO,
+            body,
+        };
+        let wrapped = SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: block.clone(),
+            signature: BlsSignature::default(),
+        });
+        block.state_root = post_state_root(state, &wrapped, config)?;
+        return Ok(UnsignedBlock::Decoupled(block));
+    }
+
     let mut block = BeaconBlock {
-        slot: state.slot(),
-        proposer_index: get_beacon_proposer_index(state)?,
-        // `process_slots` filled the header's state root on the way out of
-        // the parent's slot, so this is the parent block's root.
-        parent_root: state.latest_block_header().hash_tree_root(),
+        slot,
+        proposer_index,
+        parent_root,
         state_root: Root::ZERO,
         body,
     };
@@ -569,6 +616,8 @@ pub fn assemble_block(
     let wrapped = match state {
         BeaconState::Electra(_) => SignedBeaconBlock::Electra(signed),
         BeaconState::Fulu(_) => SignedBeaconBlock::Fulu(signed),
+        // Handled above.
+        BeaconState::Decoupled(_) => unreachable!("a decoupled state returned above"),
         BeaconState::Phase0(_)
         | BeaconState::Altair(_)
         | BeaconState::Bellatrix(_)
@@ -581,21 +630,64 @@ pub fn assemble_block(
         }
         BeaconState::Lean(_) => lean_state_unreachable("assemble_block"),
     };
+    block.state_root = post_state_root(state, &wrapped, config)?;
+    Ok(UnsignedBlock::Electra(block))
+}
+
+/// The root of `state` after applying `block`, which is the block's own
+/// `state_root`: `block` is run through `process_block` on a copy.
+///
+/// Signatures are not verified: the proposer has not signed yet, and the votes
+/// in a decoupled body were verified when they entered the pool.
+fn post_state_root(
+    state: &BeaconState,
+    block: &SignedBeaconBlock,
+    config: &Config,
+) -> Result<Root> {
     let mut post = state.clone();
     stf::block::process_block(
         &mut post,
-        &wrapped,
+        block,
         config,
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
         &ActiveBalanceCache::default(),
+        false,
     )?;
     // Fold the block's writes into their trees first, so the root is computed
     // on (and cached in) the state's own nodes rather than a throwaway copy,
     // as `state_transition` does before it checks a block's state root.
     post.apply_pending_mutations();
-    block.state_root = post.hash_tree_root();
-    Ok(block)
+    Ok(post.hash_tree_root())
+}
+
+/// An unsigned block from [`assemble_block`], in the shape of the fork it was
+/// built for.
+#[derive(Debug, Clone)]
+pub enum UnsignedBlock {
+    /// Electra's or fulu's block (fulu wraps electra's container).
+    Electra(BeaconBlock),
+    Decoupled(decoupled::BeaconBlock),
+}
+
+impl UnsignedBlock {
+    pub fn slot(&self) -> Slot {
+        match self {
+            Self::Electra(block) => block.slot,
+            Self::Decoupled(block) => block.slot,
+        }
+    }
+
+    /// The electra-shaped block, or an error for any other fork.
+    pub fn into_electra(self) -> Result<BeaconBlock> {
+        match self {
+            Self::Electra(block) => Ok(block),
+            Self::Decoupled(_) => Err(Error::UnsupportedForFork {
+                function: "UnsignedBlock::into_electra",
+                fork: crate::beacon::ForkName::Decoupled,
+            }),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -670,7 +762,10 @@ mod tests {
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        let block = assemble_block(&state, inputs, &Config::mainnet()).unwrap();
+        let block = assemble_block(&state, inputs, None, &Config::mainnet())
+            .unwrap()
+            .into_electra()
+            .unwrap();
 
         assert_eq!(block.slot, state.slot());
         assert_eq!(
@@ -691,9 +786,65 @@ mod tests {
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            true,
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());
+    }
+
+    #[test]
+    fn a_decoupled_block_is_assembled_with_the_protocol_fields() {
+        let fulu = state_to_build_on();
+        let BeaconState::Fulu(inner) = &fulu else {
+            unreachable!("built as fulu")
+        };
+        let state = BeaconState::Decoupled(inner.clone());
+        let inputs = || BlockInputs {
+            sync_aggregate: empty_sync_aggregate(),
+            randao_reveal: randao_reveal(&state),
+            graffiti: Bytes32::ZERO,
+            attestations: Vec::new(),
+            operations: Operations::default(),
+            execution_payload: payload_for(&state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+        };
+        let config = Config::mainnet();
+
+        let UnsignedBlock::Decoupled(block) =
+            assemble_block(&state, inputs(), None, &config).unwrap()
+        else {
+            panic!("a decoupled state assembles a decoupled block");
+        };
+        assert!(block.body.goldfish_votes.is_empty());
+        let mut post = state.clone();
+        let signed = SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: block.clone(),
+            signature: BlsSignature::default(),
+        });
+        stf::block::process_block(
+            &mut post,
+            &signed,
+            &config,
+            &ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+            &ActiveBalanceCache::default(),
+            true,
+        )
+        .unwrap();
+        post.apply_pending_mutations();
+        assert_eq!(block.state_root, post.hash_tree_root());
+
+        // Protocol fields belong to the decoupled fork alone.
+        assert!(
+            assemble_block(
+                &fulu,
+                inputs(),
+                Some(DecoupledBodyFields::default()),
+                &config
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -711,7 +862,7 @@ mod tests {
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        assert!(assemble_block(&state, inputs, &Config::mainnet()).is_err());
+        assert!(assemble_block(&state, inputs, None, &Config::mainnet()).is_err());
     }
 
     /// An attestation at `slot` voting for this state's own chain: sourced from
@@ -1077,7 +1228,10 @@ mod tests {
             sync_aggregate: empty_sync_aggregate(),
             execution_requests: ExecutionRequests::default(),
         };
-        let block = assemble_block(&state, inputs, &config).unwrap();
+        let block = assemble_block(&state, inputs, None, &config)
+            .unwrap()
+            .into_electra()
+            .unwrap();
         assert_eq!(block.body.voluntary_exits.len(), 1);
         assert_eq!(block.body.voluntary_exits[0].message.validator_index, 4);
     }
@@ -1147,7 +1301,10 @@ mod tests {
             execution_requests: ExecutionRequests::default(),
             sync_aggregate: verified.clone(),
         };
-        let block = assemble_block(&state, inputs, &Config::mainnet()).unwrap();
+        let block = assemble_block(&state, inputs, None, &Config::mainnet())
+            .unwrap()
+            .into_electra()
+            .unwrap();
         assert_eq!(block.body.sync_aggregate, verified);
     }
 

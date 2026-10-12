@@ -906,6 +906,7 @@ mod gloas_block_production_tests {
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
             &ActiveBalanceCache::default(),
+            true,
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());

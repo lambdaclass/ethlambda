@@ -272,7 +272,10 @@ impl ForkRules {
             | ForkName::Capella
             | ForkName::Deneb
             | ForkName::Electra
-            | ForkName::Fulu => ForkRules::PreGloas,
+            | ForkName::Fulu
+            // Until the decoupled head rule lands, its blocks are followed by
+            // the pre-gloas LMD-GHOST machinery.
+            | ForkName::Decoupled => ForkRules::PreGloas,
             ForkName::Gloas => ForkRules::Gloas,
             ForkName::Lean => lean_fork_unreachable("ForkRules::of"),
         }
@@ -564,6 +567,14 @@ pub fn block_operations(block: &SignedBeaconBlock) -> (Vec<Attestation>, Vec<Att
             AttesterSlashing::Electra,
         ),
         SignedBeaconBlock::Fulu(block) => wrap_operations(
+            block.message.body.attestations.iter(),
+            block.message.body.attester_slashings.iter(),
+            Attestation::Electra,
+            AttesterSlashing::Electra,
+        ),
+        // Both lists are empty by the fork's rules (the STF refuses a block
+        // carrying either), and share electra's types.
+        SignedBeaconBlock::Decoupled(block) => wrap_operations(
             block.message.body.attestations.iter(),
             block.message.body.attester_slashings.iter(),
             Attestation::Electra,
@@ -4869,7 +4880,7 @@ pub fn on_block(
             )?;
             None
         }
-        SignedBeaconBlock::Fulu(_) => {
+        SignedBeaconBlock::Fulu(_) | SignedBeaconBlock::Decoupled(_) => {
             verify(
                 is_data_available_columns(blob_evidence, config)?,
                 "is_data_available(hash_tree_root(block))",
@@ -10224,7 +10235,10 @@ mod tests {
             execution_requests: ExecutionRequests::default(),
             sync_aggregate: crate::beacon::block_production::empty_sync_aggregate(),
         };
-        let message = assemble_block(&advanced, inputs, &config).expect("assemble");
+        let message = assemble_block(&advanced, inputs, None, &config)
+            .expect("assemble")
+            .into_electra()
+            .expect("a fulu state assembles an electra-shaped block");
         let state_root = message.state_root;
         let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
             message,
