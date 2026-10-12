@@ -234,7 +234,7 @@ impl BeaconBlockBody {
     /// those.
     pub fn to_electra(&self) -> super::electra::BeaconBlockBody {
         super::electra::BeaconBlockBody {
-            randao_reveal: self.randao_reveal.clone(),
+            randao_reveal: self.randao_reveal,
             eth1_data: self.eth1_data.clone(),
             graffiti: self.graffiti,
             proposer_slashings: self.proposer_slashings.clone(),

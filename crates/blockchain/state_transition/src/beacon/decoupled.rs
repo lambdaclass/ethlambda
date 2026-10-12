@@ -574,7 +574,7 @@ mod tests {
         assert_eq!(after.fork.previous_version, before.fork.current_version);
         assert_eq!(after.fork.epoch, compute_epoch_at_slot(before.slot));
         let mut restored = after;
-        restored.fork = before.fork.clone();
+        restored.fork = before.fork;
         assert_eq!(restored, before);
     }
 
