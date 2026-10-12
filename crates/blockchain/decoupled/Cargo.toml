@@ -1,0 +1,20 @@
+[package]
+name = "ethlambda-decoupled"
+description = "Chain-agnostic decoupled consensus protocol: Goldfish, graded stabilization gadget, height-based finality gadget"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ethlambda-types.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
+libssz-types.workspace = true
