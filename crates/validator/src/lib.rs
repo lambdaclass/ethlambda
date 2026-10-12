@@ -352,7 +352,9 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     // than after it: its deadline is not ordered against theirs (gloas moves
     // it before the attestation) and each is bounded by the slot on its own.
     let attest_then_ptc = async {
-        if !slot_duties.is_empty() {
+        // The decoupled fork has no attestations or aggregates, so there is
+        // nothing to sign here at its slots.
+        if !slot_duties.is_empty() && !clock.is_decoupled(slot) {
             tokio::time::sleep(clock.until_attestation(slot, SystemTime::now())).await;
             attest_and_aggregate(attestation, aggregation, clock, slot, slot_duties, store).await;
         }

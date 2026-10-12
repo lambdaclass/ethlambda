@@ -33,11 +33,11 @@ use ethlambda_engine::{
 use ethlambda_network_api::RpcToP2PRef;
 use ethlambda_state_transition::beacon::{
     block_production::{
-        BlockInputs, Operations, advance_to_slot, assemble_block, empty_sync_aggregate,
-        pack_attestations, pack_operations, parse_execution_requests, payload_inputs,
-        verified_sync_aggregate,
+        BlockInputs, Operations, UnsignedBlock, advance_to_slot, assemble_block,
+        empty_sync_aggregate, pack_attestations, pack_operations, parse_execution_requests,
+        payload_inputs, verified_sync_aggregate,
     },
-    data_columns::{self, SidecarError},
+    data_columns::{self, SidecarBlock, SidecarError},
     helpers::accessors::get_beacon_proposer_index,
     stf::verify_block_signature,
     sync_committee_pool::SharedSyncCommitteePool,
@@ -47,9 +47,10 @@ use ethlambda_types::{
     beacon::{
         config::Config,
         containers::{
-            self, BeaconState,
+            self, BeaconState, decoupled,
             deneb::Blob,
             electra::{BeaconBlock, SignedBeaconBlock},
+            fulu,
         },
         fork::ForkName,
         preset,
@@ -97,6 +98,106 @@ pub(crate) struct FuluSignedBlockContents {
     pub(crate) blobs: Blobs,
 }
 
+/// The decoupled fork's `BlockContents`: fulu's envelope around the fork's own
+/// block. Its body keeps fulu's commitments field, so the blobs and cell proofs
+/// travel exactly as fulu's do.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DecoupledBlockContents {
+    pub(crate) block: decoupled::BeaconBlock,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
+    pub(crate) kzg_proofs: CellKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
+    pub(crate) blobs: Blobs,
+}
+
+/// The decoupled fork's `SignedBlockContents`, what `publishBlockV2` receives.
+#[derive(Debug, Clone, PartialEq, SszEncode, SszDecode, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DecoupledSignedBlockContents {
+    pub(crate) signed_block: decoupled::SignedBeaconBlock,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::seq")]
+    pub(crate) kzg_proofs: CellKzgProofs,
+    #[serde(with = "ethlambda_types::beacon::serde_helpers::ssz_hex_seq")]
+    pub(crate) blobs: Blobs,
+}
+
+/// What `produceBlockV3` answers, in the shape of the slot's fork.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(untagged)]
+pub(crate) enum BlockContents {
+    Fulu(FuluBlockContents),
+    Decoupled(DecoupledBlockContents),
+}
+
+impl BlockContents {
+    fn to_ssz(&self) -> Vec<u8> {
+        match self {
+            Self::Fulu(contents) => contents.to_ssz(),
+            Self::Decoupled(contents) => contents.to_ssz(),
+        }
+    }
+}
+
+/// A signed block that carries blobs and is published with its data columns:
+/// fulu's (electra's container) and the decoupled fork's.
+trait ProposedBlock: SidecarBlock + Send + 'static {
+    fn slot(&self) -> Slot;
+    fn parent_root(&self) -> H256;
+    fn proposer_index(&self) -> u64;
+    fn into_beacon_block(self) -> containers::SignedBeaconBlock;
+    /// The inverse of [`Self::into_beacon_block`], for a block this trait just
+    /// wrapped.
+    fn from_beacon_block(block: containers::SignedBeaconBlock) -> Self;
+    fn wrap_sidecar(sidecar: fulu::DataColumnSidecar) -> containers::DataColumnSidecar;
+}
+
+impl ProposedBlock for SignedBeaconBlock {
+    fn slot(&self) -> Slot {
+        self.message.slot
+    }
+    fn parent_root(&self) -> H256 {
+        self.message.parent_root
+    }
+    fn proposer_index(&self) -> u64 {
+        self.message.proposer_index
+    }
+    fn into_beacon_block(self) -> containers::SignedBeaconBlock {
+        containers::SignedBeaconBlock::Fulu(self)
+    }
+    fn from_beacon_block(block: containers::SignedBeaconBlock) -> Self {
+        let containers::SignedBeaconBlock::Fulu(block) = block else {
+            unreachable!("the block was wrapped as fulu");
+        };
+        block
+    }
+    fn wrap_sidecar(sidecar: fulu::DataColumnSidecar) -> containers::DataColumnSidecar {
+        containers::DataColumnSidecar::Fulu(sidecar)
+    }
+}
+
+impl ProposedBlock for decoupled::SignedBeaconBlock {
+    fn slot(&self) -> Slot {
+        self.message.slot
+    }
+    fn parent_root(&self) -> H256 {
+        self.message.parent_root
+    }
+    fn proposer_index(&self) -> u64 {
+        self.message.proposer_index
+    }
+    fn into_beacon_block(self) -> containers::SignedBeaconBlock {
+        containers::SignedBeaconBlock::Decoupled(self)
+    }
+    fn from_beacon_block(block: containers::SignedBeaconBlock) -> Self {
+        let containers::SignedBeaconBlock::Decoupled(block) = block else {
+            unreachable!("the block was wrapped as decoupled");
+        };
+        block
+    }
+    fn wrap_sidecar(sidecar: fulu::DataColumnSidecar) -> containers::DataColumnSidecar {
+        containers::DataColumnSidecar::Decoupled(sidecar)
+    }
+}
+
 pub(crate) fn routes() -> Router<Store> {
     Router::new()
         .route("/eth/v3/validator/blocks/{slot}", get(get_block))
@@ -129,8 +230,12 @@ async fn post_block(
         .get("eth-consensus-version")
         .and_then(|value| value.to_str().ok())
         .and_then(ForkName::parse);
-    if !matches!(fork, Some(ForkName::Fulu | ForkName::Gloas)) {
-        return ApiError::BadRequest("Eth-Consensus-Version must be fulu or gloas").into_response();
+    if !matches!(
+        fork,
+        Some(ForkName::Fulu | ForkName::Decoupled | ForkName::Gloas)
+    ) {
+        return ApiError::BadRequest("Eth-Consensus-Version must be fulu, decoupled or gloas")
+            .into_response();
     }
     let encoding = match BodyEncoding::from_headers(&headers) {
         Ok(encoding) => encoding,
@@ -139,35 +244,66 @@ async fn post_block(
     if fork == Some(ForkName::Gloas) {
         return post_gloas_block(&store, &p2p, encoding, &body).await;
     }
+    if fork == Some(ForkName::Decoupled) {
+        let Some(contents) = encoding.decode::<DecoupledSignedBlockContents>(&body) else {
+            return ApiError::BadRequest("the body is not decoupled SignedBlockContents")
+                .into_response();
+        };
+        if let Err(err) = require_slot_fork(
+            &store.config(),
+            contents.signed_block.message.slot,
+            ForkName::Decoupled,
+            "decoupled blocks are accepted for decoupled slots only",
+        ) {
+            return err.into_response();
+        }
+        let DecoupledSignedBlockContents {
+            signed_block,
+            kzg_proofs,
+            blobs,
+        } = contents;
+        return publish_blob_block(&store, &p2p, signed_block, blobs, kzg_proofs).await;
+    }
     let Some(contents) = encoding.decode::<FuluSignedBlockContents>(&body) else {
         return ApiError::BadRequest("the body is not fulu SignedBlockContents").into_response();
     };
     // Before the parent's state is advanced: a fulu body at a gloas slot would
     // run `upgrade_to_gloas` only to be refused afterwards.
-    if let Err(err) = require_fulu_slot(
+    if let Err(err) = require_slot_fork(
         &store.config(),
         contents.signed_block.message.slot,
+        ForkName::Fulu,
         "blocks are accepted for fulu slots only",
     ) {
         return err.into_response();
     }
-
     let FuluSignedBlockContents {
         signed_block,
         kzg_proofs,
         blobs,
     } = contents;
-    let Some(parent_state) = store
-        .get_state(&signed_block.message.parent_root)
-        .ok()
-        .flatten()
-    else {
+    publish_blob_block(&store, &p2p, signed_block, blobs, kzg_proofs).await
+}
+
+/// The blob-carrying half of `publishBlockV2`, for the forks whose blocks come
+/// with data columns (fulu and decoupled): the parent is held, the block is
+/// after it, the proposer is the slot's, the signature verifies against the
+/// parent's state advanced to the slot, and the blobs and cell proofs match
+/// the block's commitments. Then block and sidecars go to P2P.
+async fn publish_blob_block<B: ProposedBlock>(
+    store: &Store,
+    p2p: &RpcToP2PRef,
+    signed_block: B,
+    blobs: Blobs,
+    kzg_proofs: CellKzgProofs,
+) -> Response {
+    let Some(parent_state) = store.get_state(&signed_block.parent_root()).ok().flatten() else {
         return ApiError::BadRequest("the block's parent is not known to this node")
             .into_response();
     };
     let config = store.config();
     let checked = tokio::task::spawn_blocking(move || {
-        let slot = signed_block.message.slot;
+        let slot = signed_block.slot();
         if slot <= parent_state.slot() {
             return Err(("the block is not after its parent", None));
         }
@@ -175,19 +311,17 @@ async fn post_block(
             .map_err(|_| ("advancing the parent state failed", None))?;
         let proposer =
             get_beacon_proposer_index(&state).map_err(|_| ("no proposer for the slot", None))?;
-        if signed_block.message.proposer_index != proposer {
+        if signed_block.proposer_index() != proposer {
             return Err(("wrong proposer for the slot", None));
         }
-        let block = containers::SignedBeaconBlock::Fulu(signed_block);
+        let block = signed_block.into_beacon_block();
         if !verify_block_signature(&state, &block) {
             return Err(("invalid block signature", None));
         }
-        let containers::SignedBeaconBlock::Fulu(signed_block) = block else {
-            unreachable!("the block was wrapped as fulu above");
-        };
+        let signed_block = B::from_beacon_block(block);
         // Without blobs there is no KZG work, and the metric would only be
         // diluted by free samples.
-        if signed_block.message.body.blob_kzg_commitments.is_empty() && blobs.is_empty() {
+        if signed_block.commitments().is_empty() && blobs.is_empty() {
             return Ok((signed_block, Vec::new(), None));
         }
         let started = std::time::Instant::now();
@@ -223,11 +357,8 @@ async fn post_block(
             return ApiError::Internal("building the data column sidecars failed").into_response();
         }
     };
-    let block = containers::SignedBeaconBlock::Fulu(signed_block);
-    let sidecars = sidecars
-        .into_iter()
-        .map(containers::DataColumnSidecar::Fulu)
-        .collect();
+    let block = signed_block.into_beacon_block();
+    let sidecars = sidecars.into_iter().map(B::wrap_sidecar).collect();
     if p2p.publish_beacon_block(block, sidecars).is_err() {
         return ApiError::Internal("the network actor is not running").into_response();
     }
@@ -320,6 +451,7 @@ pub(crate) fn require_gloas_slot(
         | ForkName::Deneb
         | ForkName::Electra
         | ForkName::Fulu
+        | ForkName::Decoupled
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
     }
 }
@@ -331,13 +463,18 @@ struct ProduceQuery {
     graffiti: Option<H256>,
 }
 
-/// Refuses a slot the schedule does not place at fulu, before anything
-/// advances a state to it: advancing a fulu head into a gloas slot would run
-/// `upgrade_to_gloas` only to refuse the result. Every other fork is refused
-/// too, since the containers here are fulu's.
-fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Result<(), ApiError> {
+/// Refuses a slot the schedule does not place at fulu or decoupled (whose
+/// containers share fulu's blob handling), before anything advances a state to
+/// it: advancing a fulu head into a gloas slot would run `upgrade_to_gloas`
+/// only to refuse the result. Every other fork is refused too. Answers the
+/// slot's fork.
+fn require_blob_block_slot(
+    config: &Config,
+    slot: Slot,
+    message: &'static str,
+) -> Result<ForkName, ApiError> {
     match config.fork_at_epoch(compute_epoch_at_slot(slot)) {
-        ForkName::Fulu => Ok(()),
+        fork @ (ForkName::Fulu | ForkName::Decoupled) => Ok(fork),
         ForkName::Phase0
         | ForkName::Altair
         | ForkName::Bellatrix
@@ -346,6 +483,20 @@ fn require_fulu_slot(config: &Config, slot: Slot, message: &'static str) -> Resu
         | ForkName::Electra
         | ForkName::Gloas
         | ForkName::Lean => Err(ApiError::BadRequest(message)),
+    }
+}
+
+/// [`require_blob_block_slot`] for one particular fork, as publication needs:
+/// the `Eth-Consensus-Version` header must agree with the slot's fork.
+fn require_slot_fork(
+    config: &Config,
+    slot: Slot,
+    expected: ForkName,
+    message: &'static str,
+) -> Result<(), ApiError> {
+    match require_blob_block_slot(config, slot, message)? {
+        fork if fork == expected => Ok(()),
+        _ => Err(ApiError::BadRequest(message)),
     }
 }
 
@@ -365,10 +516,10 @@ async fn get_block(
     };
     // Ahead of the engine check: a slot this node cannot build is a 400 on
     // any node, not a 503 on one with no execution client.
-    if let Err(err) = require_fulu_slot(
+    if let Err(err) = require_blob_block_slot(
         &store.config(),
         slot,
-        "block production is served for fulu only",
+        "block production is served for fulu and decoupled only",
     ) {
         return err.into_response();
     }
@@ -432,7 +583,7 @@ async fn produce(
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
-) -> Result<(FuluBlockContents, String, ForkName), ApiError> {
+) -> Result<(BlockContents, String, ForkName), ApiError> {
     let config = store.config();
     let (head_root, head_state) = head(store)?;
     if slot <= head_state.slot() {
@@ -488,8 +639,14 @@ async fn produce(
         .map_err(|_| ApiError::Internal("the execution client's request list is malformed"))?;
     let payload_value = decimal(&built.block_value);
 
+    // The decoupled fork has no LMD attestations or attester slashings.
+    let is_decoupled = fork == ForkName::Decoupled;
     let candidates = store.attestation_pool().block_candidates();
-    let attestations = pack_attestations(&state, candidates);
+    let attestations = if is_decoupled {
+        Vec::new()
+    } else {
+        pack_attestations(&state, candidates)
+    };
     let operation_candidates = {
         let pool = store.operation_pool();
         Operations {
@@ -499,7 +656,10 @@ async fn produce(
             bls_to_execution_changes: pool.bls_to_execution_changes(),
         }
     };
-    let operations = pack_operations(&state, operation_candidates, &config);
+    let mut operations = pack_operations(&state, operation_candidates, &config);
+    if is_decoupled {
+        operations.attester_slashings.clear();
+    }
     // What the committee signed at the previous slot over this block's parent,
     // verified exactly as `process_sync_aggregate` will check it against the
     // state the block is built on; a candidate that fails becomes the empty
@@ -524,9 +684,12 @@ async fn produce(
     };
     let attestation_count = attestations.len();
     let has_operations = !operations.is_empty();
+    // The protocol fields (Goldfish votes and combined attestations) are not
+    // produced here yet: a decoupled block carries empty ones.
     let block = match assemble_block(
         &state,
         inputs(attestations, operations, sync_aggregate),
+        None,
         &config,
     ) {
         Ok(block) => block,
@@ -539,28 +702,48 @@ async fn produce(
             assemble_block(
                 &state,
                 inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
+                None,
                 &config,
             )
             .map_err(|_| ApiError::Internal("the block failed to build"))?
         }
         Err(_) => return Err(ApiError::Internal("the block failed to build")),
     };
-    info!(
-        %slot,
-        proposer,
-        attestations = block.body.attestations.len(),
-        slashings = block.body.proposer_slashings.len() + block.body.attester_slashings.len(),
-        exits = block.body.voluntary_exits.len(),
-        bls_changes = block.body.bls_to_execution_changes.len(),
-        transactions = block.body.execution_payload.transactions.len(),
-        graffiti = %graffiti::display(&block.body.graffiti),
-        blobs = block.body.blob_kzg_commitments.len(),
-        "Produced block"
-    );
-    let contents = FuluBlockContents {
-        block,
-        kzg_proofs,
-        blobs,
+    // The shared body fields read the same on both shapes.
+    macro_rules! log_produced {
+        ($block:expr) => {
+            info!(
+                %slot,
+                proposer,
+                fork = fork.as_str(),
+                attestations = $block.body.attestations.len(),
+                slashings = $block.body.proposer_slashings.len() + $block.body.attester_slashings.len(),
+                exits = $block.body.voluntary_exits.len(),
+                bls_changes = $block.body.bls_to_execution_changes.len(),
+                transactions = $block.body.execution_payload.transactions.len(),
+                graffiti = %graffiti::display(&$block.body.graffiti),
+                blobs = $block.body.blob_kzg_commitments.len(),
+                "Produced block"
+            )
+        };
+    }
+    let contents = match block {
+        UnsignedBlock::Electra(block) => {
+            log_produced!(block);
+            BlockContents::Fulu(FuluBlockContents {
+                block,
+                kzg_proofs,
+                blobs,
+            })
+        }
+        UnsignedBlock::Decoupled(block) => {
+            log_produced!(block);
+            BlockContents::Decoupled(DecoupledBlockContents {
+                block,
+                kzg_proofs,
+                blobs,
+            })
+        }
     };
     Ok((contents, payload_value, fork))
 }
@@ -694,7 +877,10 @@ mod tests {
         );
         let (status, json) = respond(app, Request::get(uri).body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(json["message"], "block production is served for fulu only");
+        assert_eq!(
+            json["message"],
+            "block production is served for fulu and decoupled only"
+        );
     }
 
     #[tokio::test]

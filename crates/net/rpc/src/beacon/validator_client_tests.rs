@@ -49,7 +49,7 @@ use ethlambda_validator::{
 
 use tokio::sync::RwLock;
 
-use crate::test_utils::{RecordingNetwork, beacon_store_at, idle_engine};
+use crate::test_utils::{RecordingNetwork, beacon_store_with_config, idle_engine};
 
 const COUNT: usize = 64;
 
@@ -97,12 +97,32 @@ async fn serve_at(
     std::net::SocketAddr,
     Store,
 ) {
-    let mut state = with_signing_validators_at(ForkName::Fulu, COUNT);
-    let (probe, _) = beacon_store_at(state.clone());
+    serve_at_fork(engine, ForkName::Fulu).await
+}
+
+/// [`serve_at`] with the wall clock's epoch in `fork`: fulu, or decoupled
+/// (scheduled from fulu's own epoch, on a state of fulu's container).
+async fn serve_at_fork(
+    engine: Option<ethlambda_engine::EngineClient>,
+    fork: ForkName,
+) -> (
+    HttpBeaconNode,
+    BeaconState,
+    Arc<RecordingNetwork>,
+    std::net::SocketAddr,
+    Store,
+) {
+    let mut config = ethlambda_types::beacon::config::Config::mainnet();
+    if fork == ForkName::Decoupled {
+        let fulu_epoch = config.fulu_fork_epoch;
+        config = config.with_fork_epoch(ForkName::Decoupled, fulu_epoch);
+    }
+    let mut state = with_signing_validators_at(fork, COUNT);
+    let (probe, _) = beacon_store_with_config(state.clone(), config.clone());
     let wall_epoch = compute_epoch_at_slot(crate::beacon::node::wall_slot(&probe));
     let lookahead = {
-        let BeaconState::Fulu(fulu) = &mut state else {
-            unreachable!("built as fulu")
+        let (BeaconState::Fulu(fulu) | BeaconState::Decoupled(fulu)) = &mut state else {
+            unreachable!("built as fulu or decoupled")
         };
         fulu.slot = compute_start_slot_at_epoch(wall_epoch);
         initialize_proposer_lookahead(&state).unwrap()
@@ -112,21 +132,21 @@ async fn serve_at(
     let sync_committee =
         ethlambda_state_transition::beacon::helpers::altair::get_next_sync_committee(&state)
             .unwrap();
-    let BeaconState::Fulu(fulu) = &mut state else {
-        unreachable!("built as fulu")
+    let (BeaconState::Fulu(fulu) | BeaconState::Decoupled(fulu)) = &mut state else {
+        unreachable!("built as fulu or decoupled")
     };
     fulu.proposer_lookahead = lookahead.try_into().unwrap();
     fulu.current_sync_committee = sync_committee.clone();
     fulu.next_sync_committee = sync_committee;
 
-    let (mut store, _root) = beacon_store_at(state.clone());
+    let (mut store, _root) = beacon_store_with_config(state.clone(), config.clone());
     // A block built on this head names the head block's real root as its
     // parent, which the fixture's placeholder anchor block does not have:
     // keep the state under that root too, as a real anchor would be.
     let advanced = ethlambda_state_transition::beacon::block_production::advance_to_slot(
         &state,
         state.slot() + 1,
-        &ethlambda_types::beacon::config::Config::mainnet(),
+        &config,
     )
     .unwrap();
     let parent_root = advanced.latest_block_header().hash_tree_root();
@@ -568,21 +588,25 @@ async fn produce_with_pool(
     blob_count: usize,
     fill_pool: impl FnOnce(&ethlambda_storage::Store, &BeaconState),
 ) -> Proposal {
+    produce_with_pool_at(blob_count, ForkName::Fulu, fill_pool).await
+}
+
+/// [`produce_with_pool`] at a slot of `fork` (fulu or decoupled).
+async fn produce_with_pool_at(
+    blob_count: usize,
+    fork: ForkName,
+    fill_pool: impl FnOnce(&ethlambda_storage::Store, &BeaconState),
+) -> Proposal {
     use ethlambda_state_transition::beacon::{
         block_production::advance_to_slot, helpers::accessors::get_beacon_proposer_index,
     };
     use ethlambda_types::beacon::constants::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 
     let (client, state, network, address, store) =
-        serve_at(Some(fake_execution_client(blob_count).await)).await;
+        serve_at_fork(Some(fake_execution_client(blob_count).await), fork).await;
     fill_pool(&store, &state);
     let slot = state.slot() + 1;
-    let advanced = advance_to_slot(
-        &state,
-        slot,
-        &ethlambda_types::beacon::config::Config::mainnet(),
-    )
-    .unwrap();
+    let advanced = advance_to_slot(&state, slot, store.config().as_ref()).unwrap();
     let proposer = get_beacon_proposer_index(&advanced).unwrap();
     let epoch = compute_epoch_at_slot(slot);
     let randao_domain = get_domain(&advanced, DOMAIN_RANDAO, Some(epoch));
@@ -595,7 +619,7 @@ async fn produce_with_pool(
     graffiti[..5].copy_from_slice(b"hello");
     let request = BlockRequest {
         slot,
-        fork: ForkName::Fulu,
+        fork,
         proposer_index: proposer,
         randao_reveal,
         graffiti: ethlambda_types::primitives::H256(graffiti),
@@ -607,7 +631,13 @@ async fn produce_with_pool(
     // execution client's from `engine_getClientVersionV1`, this node's own.
     let mut expected = [0u8; 32];
     expected[..18].copy_from_slice(b"hello RH1a2bLA3c4d");
-    assert_eq!(fulu_block(&produced).body.graffiti.0, expected);
+    let graffiti_of_block = match &produced.contents {
+        ethlambda_validator::beacon_node::block_contents::Contents::Decoupled { block, .. } => {
+            block.body.graffiti
+        }
+        _ => fulu_block(&produced).body.graffiti,
+    };
+    assert_eq!(graffiti_of_block.0, expected);
 
     let block_domain = get_domain(&advanced, DOMAIN_BEACON_PROPOSER, Some(epoch));
     let signature = sign_for(
@@ -632,7 +662,7 @@ fn fulu_block(
     use ethlambda_validator::beacon_node::block_contents::Contents;
     match &produced.contents {
         Contents::WithCellProofs { block, .. } | Contents::WithBlobProofs { block, .. } => block,
-        Contents::Gloas { .. } => unreachable!("a fulu proposal"),
+        Contents::Gloas { .. } | Contents::Decoupled { .. } => unreachable!("a fulu proposal"),
     }
 }
 
@@ -711,7 +741,39 @@ async fn the_validator_client_can_propose_a_blob_block_through_this_node() {
         ethlambda_types::beacon::containers::DataColumnSidecar::Fulu(sidecar) => {
             verify_data_column_sidecar_inclusion_proof(sidecar)
         }
-        ethlambda_types::beacon::containers::DataColumnSidecar::Gloas(_) => false,
+        ethlambda_types::beacon::containers::DataColumnSidecar::Gloas(_)
+        | ethlambda_types::beacon::containers::DataColumnSidecar::Decoupled(_) => false,
+    }));
+}
+
+/// The decoupled fork end to end: the validator client takes a block this node
+/// produced at a decoupled slot (the fork's own container, blobs and cell
+/// proofs beside it), signs it, publishes it, and the node gossips it with
+/// data column sidecars whose inclusion proofs open the decoupled body.
+#[tokio::test]
+async fn the_validator_client_can_propose_a_decoupled_blob_block_through_this_node() {
+    use ethlambda_state_transition::beacon::fork_choice::verify_data_column_sidecar_inclusion_proof;
+    use ethlambda_validator::beacon_node::block_contents::Contents;
+
+    let p = produce_with_pool_at(2, ForkName::Decoupled, |_store, _state| {}).await;
+    assert_eq!(p.produced.fork, ForkName::Decoupled);
+    assert!(matches!(p.produced.contents, Contents::Decoupled { .. }));
+    assert_eq!(p.produced.blob_count(), 2);
+    let body = p.produced.into_signed_ssz(p.signature);
+    p.client
+        .publish_block(ForkName::Decoupled, &body)
+        .await
+        .unwrap();
+    let blocks = p.network.blocks.lock().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].fork_name(), ForkName::Decoupled);
+    let sidecars = p.network.sidecars.lock().unwrap();
+    assert_eq!(sidecars.len(), preset::NUMBER_OF_COLUMNS);
+    assert!(sidecars.iter().all(|sidecar| match sidecar {
+        ethlambda_types::beacon::containers::DataColumnSidecar::Decoupled(sidecar) => {
+            verify_data_column_sidecar_inclusion_proof(sidecar)
+        }
+        _ => false,
     }));
 }
 

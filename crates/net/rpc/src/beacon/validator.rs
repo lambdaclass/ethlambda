@@ -583,7 +583,7 @@ fn proposer_duties(
     // Gloas keeps fulu's lookahead as it is, and `upgrade_to_gloas` carries it
     // over, so a fulu head already holds the first gloas epoch's proposers.
     let proposer_lookahead = match state.as_ref() {
-        BeaconState::Fulu(fulu) => &fulu.proposer_lookahead,
+        BeaconState::Fulu(fulu) | BeaconState::Decoupled(fulu) => &fulu.proposer_lookahead,
         BeaconState::Gloas(gloas) => &gloas.proposer_lookahead,
         _ => {
             return Err(ApiError::BadRequest(
@@ -780,6 +780,15 @@ async fn get_attestation_data(
     State(store): State<Store>,
     Extension(engine): Extension<Option<EngineClient>>,
 ) -> Response {
+    // A slot of the decoupled fork has no attestations: a 400 on any node.
+    if store
+        .config()
+        .fork_at_epoch(compute_epoch_at_slot(query.slot))
+        == ForkName::Decoupled
+    {
+        return ApiError::BadRequest("attestation data is not available in the decoupled fork")
+            .into_response();
+    }
     if let Err(err) = require_execution_client(&engine) {
         return err.into_response();
     }
