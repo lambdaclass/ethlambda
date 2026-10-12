@@ -144,6 +144,8 @@ something specific here.
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--decoupled-fork-epoch` | unset | Schedule the decoupled fork at this epoch, overriding the network's `DECOUPLED_FORK_EPOCH`. Refused when the network also schedules gloas, or when the slot duration is not divisible by 4 ms |
+| `--decoupled-slots-per-round` | unset | Slots per round of the decoupled protocol, overriding `DECOUPLED_SLOTS_PER_ROUND` (at least 3) |
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys

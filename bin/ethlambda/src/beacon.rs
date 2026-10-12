@@ -83,6 +83,34 @@ impl Genesis {
     }
 }
 
+/// A genesis state written in fulu's shape, as the state of a network that
+/// schedules the decoupled fork at epoch 0.
+///
+/// The container is shared, so the only changes are the ones `upgrade_to_decoupled`
+/// makes (the state's `fork`) and one the fork boundary needs at genesis: the
+/// genesis `latest_block_header` commits to fulu's empty block body, and the
+/// anchor block of a decoupled chain has the decoupled one, so the header is
+/// re-stamped with its root (the same step a generator targeting the fork would
+/// take). A state whose `fork` already names the decoupled version came from
+/// such a generator, so it is only retagged.
+pub fn genesis_at_decoupled(state: BeaconState, config: &Config) -> BeaconState {
+    use ethlambda_types::beacon::containers::decoupled;
+    use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+
+    let BeaconState::Fulu(inner) = state else {
+        return state;
+    };
+    if inner.fork.current_version == config.decoupled_fork_version {
+        return BeaconState::Decoupled(inner);
+    }
+    let mut upgraded = BeaconState::Decoupled(
+        ethlambda_state_transition::beacon::decoupled::upgrade_to_decoupled(inner, config),
+    );
+    upgraded.latest_block_header_mut().body_root =
+        decoupled::BeaconBlockBody::empty().hash_tree_root();
+    upgraded
+}
+
 /// Decode the mainnet genesis fixture.
 ///
 /// The fork is `Phase0` because this is *genesis*, not the current head: the

@@ -59,7 +59,8 @@ use ethlambda_types::{
     aggregator::AggregatorController,
     beacon::config::Config,
     beacon::containers::{
-        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, deneb, electra, gloas, phase0,
+        BeaconState, SignedBeaconBlock, altair, bellatrix, capella, decoupled, deneb, electra,
+        gloas, phase0,
     },
     beacon::fork::ForkName,
     genesis::{GenesisConfig, verify_state_genesis},
@@ -351,7 +352,10 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         Network::Lean(_) => None,
         Network::Mainnet { mainnet, .. } => {
             let spec = network::NetworkSpec::parse(&mainnet.network)?;
-            Some(network::NetworkSource::resolve(&spec)?)
+            Some(network::NetworkSource::resolve_with(
+                &spec,
+                &network::ConfigOverrides::from(mainnet),
+            )?)
         }
     };
 
@@ -1578,6 +1582,15 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch: _,
         fulu_fork_version: _,
         fulu_fork_epoch: _,
+        // The decoupled fork's schedule and protocol parameters are consensus
+        // rules, so they are compared below too.
+        decoupled_fork_version: _,
+        decoupled_fork_epoch: _,
+        decoupled_slots_per_round: _,
+        decoupled_sg_window: _,
+        decoupled_nonjustifiable_period: _,
+        decoupled_finality_debt: _,
+        decoupled_timeout_delay: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
 
@@ -1711,6 +1724,13 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         electra_fork_epoch,
         fulu_fork_version,
         fulu_fork_epoch,
+        decoupled_fork_version,
+        decoupled_fork_epoch,
+        decoupled_slots_per_round,
+        decoupled_sg_window,
+        decoupled_nonjustifiable_period,
+        decoupled_finality_debt,
+        decoupled_timeout_delay,
         gloas_fork_version,
         gloas_fork_epoch,
         seconds_per_slot,
@@ -2053,6 +2073,16 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 parent_root,
                 state_root,
                 body: electra::BeaconBlockBody::empty(),
+            },
+            signature: Default::default(),
+        }),
+        ForkName::Decoupled => SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: decoupled::BeaconBlock {
+                slot,
+                proposer_index,
+                parent_root,
+                state_root,
+                body: decoupled::BeaconBlockBody::empty(),
             },
             signature: Default::default(),
         }),
@@ -2949,7 +2979,12 @@ validators:
         let config = Config::mainnet();
         let mut state = beacon::mainnet_genesis_state().unwrap();
 
-        for fork in ForkName::ALL {
+        // Decoupled is a sibling of gloas, not a step before it: it has its own
+        // test below.
+        for fork in ForkName::ALL
+            .into_iter()
+            .filter(|fork| *fork != ForkName::Decoupled)
+        {
             if fork != ForkName::Phase0 {
                 state = ethlambda_state_transition::beacon::upgrade::upgrade_state(
                     &state, fork, &config,
@@ -2966,6 +3001,7 @@ validators:
                 ForkName::Electra | ForkName::Fulu => {
                     electra::BeaconBlockBody::empty().hash_tree_root()
                 }
+                ForkName::Decoupled => unreachable!("filtered out above"),
                 ForkName::Gloas => gloas::BeaconBlockBody::empty().hash_tree_root(),
                 ForkName::Lean => unreachable!("ForkName::ALL excludes Lean"),
             };
@@ -2981,6 +3017,34 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
+    }
+
+    /// A fulu genesis taken through the decoupled fork at epoch 0 anchors on a
+    /// decoupled block whose root is the genesis header's.
+    #[test]
+    fn a_decoupled_genesis_anchor_block_hashes_to_the_states_own_header() {
+        let config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+        ] {
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        let state = beacon::genesis_at_decoupled(state, &config);
+        assert_eq!(state.fork_name(), ForkName::Decoupled);
+
+        let block = genesis_anchor_block(&state);
+        assert_eq!(block.fork_name(), ForkName::Decoupled);
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot

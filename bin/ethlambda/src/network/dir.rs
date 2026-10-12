@@ -63,6 +63,8 @@ pub(crate) enum NetworkDirError {
         fork: ForkName,
         reason: String,
     },
+    #[error("{}: {reason}", path.display())]
+    Schedule { path: PathBuf, reason: String },
     #[error("could not read bootnodes from {}: {reason}", path.display())]
     Bootnodes { path: PathBuf, reason: String },
     #[error(
@@ -74,7 +76,17 @@ pub(crate) enum NetworkDirError {
 
 impl NetworkDir {
     /// Read `base`'s three consumed entries.
+    #[cfg(test)]
     pub(crate) fn load(base: &Path) -> Result<Self, NetworkDirError> {
+        Self::load_with(base, &super::ConfigOverrides::default())
+    }
+
+    /// [`Self::load`], with `overrides` applied to the parsed configuration
+    /// before the genesis state's fork is chosen from it.
+    pub(crate) fn load_with(
+        base: &Path,
+        overrides: &super::ConfigOverrides,
+    ) -> Result<Self, NetworkDirError> {
         let config_path = base.join(CONFIG_FILE);
         let text = read_required(&config_path)?;
         let parsed = ConfigFile::parse(&text).map_err(|source| NetworkDirError::Config {
@@ -82,6 +94,8 @@ impl NetworkDir {
             source,
         })?;
         parsed.warn_about_ignored_keys();
+        let mut parsed = parsed;
+        overrides.apply(&mut parsed.config);
 
         // Before `genesis.ssz` is decoded: its container bounds are the
         // compiled preset's, so a directory built for the other preset would
@@ -106,13 +120,26 @@ impl NetworkDir {
         // epoch 0 and ships a genesis state in the newest one, so decoding as
         // phase0 would fail on exactly the networks this flag exists for.
         let fork = parsed.config.fork_at_epoch(0);
-        let genesis_state = BeaconState::from_ssz(fork, &genesis_bytes).map_err(|err| {
+        // The decoupled fork's state is fulu's container, and a genesis
+        // generator that only knows fulu writes it so: decode it as fulu and
+        // upgrade it at epoch 0 below.
+        let decode_fork = if fork == ForkName::Decoupled {
+            ForkName::Fulu
+        } else {
+            fork
+        };
+        let genesis_state = BeaconState::from_ssz(decode_fork, &genesis_bytes).map_err(|err| {
             NetworkDirError::Genesis {
                 path: genesis_path,
-                fork,
+                fork: decode_fork,
                 reason: format!("{err:?}"),
             }
         })?;
+        let genesis_state = if fork == ForkName::Decoupled {
+            crate::beacon::genesis_at_decoupled(genesis_state, &parsed.config)
+        } else {
+            genesis_state
+        };
 
         let bootnodes = read_bootnodes(base)?;
 
@@ -129,6 +156,10 @@ impl NetworkDir {
         // once, before anything reads the config.
         let mut config = parsed.config;
         super::derive_genesis_fields(&mut config, genesis_state.genesis_time());
+        super::validate_schedule(&config).map_err(|err| NetworkDirError::Schedule {
+            path: config_path.clone(),
+            reason: err.to_string(),
+        })?;
         super::warn_if_unfollowed_fork_scheduled(config.config_name.as_str(), &config);
 
         Ok(Self {
@@ -387,6 +418,97 @@ mod tests {
 
         let loaded = NetworkDir::load(dir.path()).unwrap();
         assert_eq!(loaded.genesis_state.fork_name(), ForkName::Electra);
+    }
+
+    /// A directory whose genesis state is fulu's, as a generator that only
+    /// knows fulu writes it, with fulu at epoch 0 in its `config.yaml`.
+    fn fulu_genesis_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let config = std::fs::read_to_string(fixture("devnet-electra").join("config.yaml"))
+            .unwrap()
+            .replace("FULU_FORK_EPOCH: 411392", "FULU_FORK_EPOCH: 0");
+        std::fs::write(dir.path().join("config.yaml"), config).unwrap();
+        let config = Config::mainnet();
+        let mut state = crate::beacon::mainnet_genesis_state().unwrap();
+        for fork in [
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Deneb,
+            ForkName::Electra,
+            ForkName::Fulu,
+        ] {
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap_or_else(|err| panic!("upgrade to {fork:?} failed: {err}"));
+        }
+        std::fs::write(dir.path().join("genesis.ssz"), state.to_ssz()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_fulu_genesis_is_upgraded_when_the_decoupled_fork_is_scheduled_at_epoch_zero() {
+        use ethlambda_types::beacon::containers::decoupled;
+        use ethlambda_types::beacon::primitives::HashTreeRoot as _;
+
+        let dir = fulu_genesis_dir();
+        // Without the override the network is a fulu one.
+        let plain = NetworkDir::load(dir.path()).unwrap();
+        assert_eq!(plain.genesis_state.fork_name(), ForkName::Fulu);
+
+        let overrides = crate::network::ConfigOverrides {
+            decoupled_fork_epoch: Some(0),
+            decoupled_slots_per_round: Some(6),
+        };
+        let loaded = NetworkDir::load_with(dir.path(), &overrides).unwrap();
+        assert_eq!(loaded.config.decoupled_fork_epoch, 0);
+        assert_eq!(loaded.config.decoupled_slots_per_round, 6);
+        assert_eq!(loaded.genesis_state.fork_name(), ForkName::Decoupled);
+        assert_eq!(
+            loaded.genesis_state.fork().current_version,
+            loaded.config.decoupled_fork_version
+        );
+        assert_eq!(
+            loaded.genesis_state.fork().previous_version,
+            loaded.config.fulu_fork_version
+        );
+        // The anchor block of a decoupled chain has the decoupled empty body.
+        assert_eq!(
+            loaded.genesis_state.latest_block_header().body_root,
+            decoupled::BeaconBlockBody::empty().hash_tree_root()
+        );
+    }
+
+    #[test]
+    fn decoupled_and_gloas_scheduled_together_are_refused() {
+        let dir = fulu_genesis_dir();
+        let config_path = dir.path().join("config.yaml");
+        let config = std::fs::read_to_string(&config_path).unwrap().replace(
+            "GLOAS_FORK_EPOCH: 18446744073709551615",
+            "GLOAS_FORK_EPOCH: 5",
+        );
+        std::fs::write(&config_path, config).unwrap();
+        let overrides = crate::network::ConfigOverrides {
+            decoupled_fork_epoch: Some(0),
+            decoupled_slots_per_round: None,
+        };
+        let err = NetworkDir::load_with(dir.path(), &overrides)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("GLOAS_FORK_EPOCH"), "got {err}");
+    }
+
+    #[test]
+    fn a_decoupled_round_shorter_than_three_slots_is_refused() {
+        let dir = fulu_genesis_dir();
+        let overrides = crate::network::ConfigOverrides {
+            decoupled_fork_epoch: Some(0),
+            decoupled_slots_per_round: Some(2),
+        };
+        let err = NetworkDir::load_with(dir.path(), &overrides)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DECOUPLED_SLOTS_PER_ROUND"), "got {err}");
     }
 
     #[test]
