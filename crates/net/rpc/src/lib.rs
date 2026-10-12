@@ -19,6 +19,7 @@ mod admin;
 mod base;
 mod beacon;
 mod blocks;
+mod decoupled;
 mod events;
 mod fork_choice;
 mod genesis;
@@ -74,12 +75,14 @@ pub async fn start_rpc_server(
     sync_status: SyncStatusController,
     peer_id: String,
     events: EventBus,
+    decoupled_status: ethlambda_types::decoupled::SharedDecoupledStatus,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let api_router = build_api_router(store, config.version, peer_id)
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
-        .layer(Extension(events));
+        .layer(Extension(events))
+        .layer(Extension(decoupled_status));
     start_http_servers(config, Some(api_router), shutdown).await
 }
 
@@ -169,6 +172,7 @@ fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Rou
         .merge(node::routes(version, peer_id))
         .merge(genesis::routes())
         .merge(spec::routes())
+        .merge(decoupled::routes())
         .with_state(store)
 }
 

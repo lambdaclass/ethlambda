@@ -304,3 +304,35 @@ impl ChainState {
 fn empty_bits(validator_count: usize) -> ValidatorBits {
     ValidatorBits::with_length(validator_count).expect("validator count within the registry limit")
 }
+
+/// A node's view of the three chains and the finality gadget, for operators
+/// and tests: what `GET /lean/v0/decoupled/status` and the beacon node's
+/// decoupled status endpoint serve.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecoupledStatus {
+    /// The node's protocol clock.
+    pub slot: Slot,
+    pub round: Round,
+    /// The fork-choice head.
+    pub head: BlockRef,
+    /// `get_confirmed(Σ)`: the available chain's tip.
+    pub confirmed: BlockRef,
+    /// `get_stable(Σ)`: the stable chain's tip.
+    pub stable: BlockRef,
+    /// `Σ.F` and the height it was justified at.
+    pub finalized: BlockRef,
+    pub finalized_height: Height,
+    /// `Σ.J`, `Σ.h_j`.
+    pub justified: BlockRef,
+    pub justified_height: Height,
+    /// `Σ.h_max`.
+    pub max_height: Height,
+    /// `Σ.live_confirmed`, the protocol-facing confirmation.
+    pub live_confirmed: H256,
+    /// Blocks in the processed tree.
+    pub blocks: u64,
+}
+
+/// The latest [`DecoupledStatus`], written by a chain actor and read by the
+/// HTTP server. `None` until the actor's first tick.
+pub type SharedDecoupledStatus = std::sync::Arc<std::sync::RwLock<Option<DecoupledStatus>>>;

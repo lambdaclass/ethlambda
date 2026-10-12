@@ -179,6 +179,51 @@ impl KeyManager {
         self.sign_with_proposal_key(validator_id, slot, block_root)
     }
 
+    /// Sign `message` with `validator_id`'s attestation key at XMSS `epoch`.
+    ///
+    /// For the decoupled protocol, whose attestation key signs on a doubled
+    /// epoch grid (`ethlambda_types::lean_decoupled`), so the epoch is not the
+    /// slot here.
+    pub fn sign_attestation_message(
+        &mut self,
+        validator_id: u64,
+        epoch: u32,
+        message: &H256,
+    ) -> Result<XmssSignature, KeyManagerError> {
+        self.sign_with_attestation_key(validator_id, epoch, message)
+    }
+
+    /// Warm the attestation keys for `attestation_epoch`, and the proposer's
+    /// proposal key for `proposal_epoch`, on a background thread.
+    pub fn prepare_epochs_in_background(
+        &mut self,
+        attestation_epoch: u32,
+        proposal: Option<(u64, u32)>,
+    ) {
+        if let Some(worker) = self.warm_worker.take() {
+            if !worker.is_finished() {
+                self.warm_worker = Some(worker);
+                return;
+            }
+            let _ = worker.join();
+        }
+        let attestation_keys = self.keys_to_warm(None);
+        let proposal_key = proposal.and_then(|(id, epoch)| {
+            let pair = self.keys.get(&id)?;
+            Some((epoch, vec![(id, KeyRole::Proposal, Arc::clone(pair))]))
+        });
+        self.warm_worker = thread::Builder::new()
+            .name("xmss-warm".to_string())
+            .spawn(move || {
+                warm_keys(attestation_epoch, &attestation_keys);
+                if let Some((epoch, keys)) = proposal_key {
+                    warm_keys(epoch, &keys);
+                }
+            })
+            .inspect_err(|err| warn!(%err, "Failed to spawn XMSS warm thread"))
+            .ok();
+    }
+
     fn sign_with_attestation_key(
         &mut self,
         validator_id: u64,

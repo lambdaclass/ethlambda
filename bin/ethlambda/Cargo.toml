@@ -20,6 +20,7 @@ shadow-integration = ["ethlambda-crypto/shadow-integration"]
 
 [dependencies]
 ethlambda-blockchain.workspace = true
+ethlambda-decoupled.workspace = true
 ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-network-api.workspace = true

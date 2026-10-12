@@ -880,6 +880,7 @@ mod tests {
             attestation_committee_count: 1,
             subscription_subnets: HashSet::new(),
             milliseconds_per_slot: 4_000,
+            decoupled: None,
         })))
         .expect("lean swarm builds");
         assert!(

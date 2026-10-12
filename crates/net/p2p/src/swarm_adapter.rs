@@ -385,6 +385,9 @@ fn execute_command(swarm: &mut libp2p::Swarm<Behaviour>, cmd: SwarmCommand) {
                 ReqRespProtocol::LeanBlocksByRange => {
                     behaviour.lean_blocks_by_range.send_request(&peer, request)
                 }
+                ReqRespProtocol::LeanDecoupledBlocksByRoot => behaviour
+                    .lean_decoupled_blocks_by_root
+                    .send_request(&peer, request),
                 ReqRespProtocol::BeaconStatusV1 => {
                     behaviour.beacon_status_v1.send_request(&peer, request)
                 }

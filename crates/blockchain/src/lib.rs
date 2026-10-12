@@ -62,6 +62,7 @@ mod beacon_payloads;
 pub use beacon_payloads::checkpoint_hash;
 pub mod block_builder;
 pub(crate) mod coverage;
+pub mod decoupled_lean;
 mod epoch_precompute;
 pub mod events;
 pub(crate) mod fork_choice_tree;

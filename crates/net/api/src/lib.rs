@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use ethlambda_types::{
@@ -14,6 +16,7 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
+    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
     primitives::H256,
 };
 use spawned_concurrency::error::ActorError;
@@ -486,5 +489,59 @@ pub struct InitBlockChain {
     pub blockchain: P2PToBlockChainRef,
 }
 impl Message for InitBlockChain {
+    type Result = ();
+}
+
+// --- Lean decoupled consensus ---
+//
+// A lean node running the decoupled protocol speaks its own topics and its own
+// by-root protocol, and its chain actor is a separate one from the 3SF-mini
+// `BlockChain`, so it gets its own pair of protocols rather than more methods
+// on the two above, which every 3SF and beacon actor would have to implement.
+
+/// The decoupled blocks a lean decoupled node holds, by root: written by its
+/// chain actor on import, read by the p2p actor to answer by-root requests.
+pub type SharedDecoupledBlocks = Arc<RwLock<HashMap<H256, SignedDecoupledBlock>>>;
+
+#[protocol]
+pub trait DecoupledToP2P: Send + Sync {
+    fn publish_decoupled_block(&self, block: SignedDecoupledBlock) -> Result<(), ActorError>;
+    fn publish_decoupled_vote(&self, vote: SignedGoldfishVote) -> Result<(), ActorError>;
+    fn publish_decoupled_attestation(
+        &self,
+        attestation: SignedDecoupledAttestation,
+    ) -> Result<(), ActorError>;
+    /// Ask peers for these blocks by root.
+    fn fetch_decoupled_blocks(&self, roots: Vec<H256>) -> Result<(), ActorError>;
+}
+
+#[protocol]
+pub trait P2PToDecoupled: Send + Sync {
+    /// A block from gossip (`from_sync = false`) or a by-root answer.
+    fn new_decoupled_block(
+        &self,
+        block: SignedDecoupledBlock,
+        from_sync: bool,
+    ) -> Result<(), ActorError>;
+    fn new_decoupled_vote(&self, vote: SignedGoldfishVote) -> Result<(), ActorError>;
+    fn new_decoupled_attestation(
+        &self,
+        attestation: SignedDecoupledAttestation,
+    ) -> Result<(), ActorError>;
+}
+
+#[derive(Clone)]
+pub struct InitDecoupledP2P {
+    pub p2p: DecoupledToP2PRef,
+}
+impl Message for InitDecoupledP2P {
+    type Result = ();
+}
+
+#[derive(Clone)]
+pub struct InitDecoupledChain {
+    pub chain: P2PToDecoupledRef,
+}
+impl Message for InitDecoupledChain {
     type Result = ();
 }

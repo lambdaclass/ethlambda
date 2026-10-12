@@ -18,6 +18,7 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
+    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
@@ -31,6 +32,7 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
+        DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
         attestation_subnet_topic, topic_kind,
     },
 };
@@ -97,6 +99,9 @@ pub async fn handle_gossip_message(
     };
 
     match kind {
+        DECOUPLED_BLOCK_TOPIC_KIND => handle_decoupled_block(server, &payload),
+        DECOUPLED_VOTE_TOPIC_KIND => handle_decoupled_vote(server, &payload),
+        DECOUPLED_ATTESTATION_TOPIC_KIND => handle_decoupled_attestation(server, &payload),
         BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
@@ -176,6 +181,109 @@ async fn handle_lean_block(
             )
             .inspect_err(|err| error!(%err, "Failed to forward block to blockchain"));
     }
+}
+
+/// The decoupled chain actor, when this node runs one.
+fn decoupled_chain(server: &P2PServer) -> Option<&ethlambda_network_api::P2PToDecoupledRef> {
+    server
+        .wire
+        .decoupled()
+        .and_then(|decoupled| decoupled.chain.as_ref())
+}
+
+/// Decoupled gossip is forwarded without validation, like the rest of lean's
+/// gossip: the chain actor checks signatures before any handler sees it.
+fn handle_decoupled_block(server: &P2PServer, payload: &[u8]) {
+    let Some(block) = decode_lean::<SignedDecoupledBlock>(payload, "decoupled block") else {
+        return;
+    };
+    let block_root = block.message.hash_tree_root();
+    info!(
+        slot = block.message.slot,
+        proposer = block.message.proposer_index,
+        block_root = %ShortRoot(&block_root.0),
+        parent_root = %ShortRoot(&block.message.parent_root.0),
+        votes = block.message.body.votes.len(),
+        attestations = block.message.body.attestations.len(),
+        "Received decoupled block from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_block(block, false)
+            .inspect_err(|err| error!(%err, "Failed to forward decoupled block"));
+    }
+}
+
+fn handle_decoupled_vote(server: &P2PServer, payload: &[u8]) {
+    let Some(vote) = decode_lean::<SignedGoldfishVote>(payload, "decoupled vote") else {
+        return;
+    };
+    trace!(
+        slot = vote.vote.slot,
+        validator = vote.vote.validator,
+        head = %ShortRoot(&vote.vote.head.0),
+        "Received Goldfish vote from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_vote(vote)
+            .inspect_err(|err| error!(%err, "Failed to forward Goldfish vote"));
+    }
+}
+
+fn handle_decoupled_attestation(server: &P2PServer, payload: &[u8]) {
+    let Some(attestation) =
+        decode_lean::<SignedDecoupledAttestation>(payload, "decoupled attestation")
+    else {
+        return;
+    };
+    trace!(
+        round = attestation.attestation.data.round,
+        validator = attestation.attestation.validator,
+        "Received combined attestation from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_attestation(attestation)
+            .inspect_err(|err| error!(%err, "Failed to forward combined attestation"));
+    }
+}
+
+fn publish_decoupled(
+    server: &P2PServer,
+    topic: Option<libp2p::gossipsub::IdentTopic>,
+    bytes: Vec<u8>,
+) {
+    let Some(topic) = topic else {
+        warn!("Not on the decoupled wire; dropping a decoupled message");
+        return;
+    };
+    server.swarm_handle.publish(topic, compress_message(&bytes));
+}
+
+pub fn publish_decoupled_block(server: &P2PServer, block: SignedDecoupledBlock) {
+    let block_root = block.message.hash_tree_root();
+    info!(
+        slot = block.message.slot,
+        proposer = block.message.proposer_index,
+        block_root = %ShortRoot(&block_root.0),
+        parent_root = %ShortRoot(&block.message.parent_root.0),
+        votes = block.message.body.votes.len(),
+        attestations = block.message.body.attestations.len(),
+        "Published decoupled block to gossipsub"
+    );
+    let topic = server.wire.decoupled().map(|d| d.block_topic.clone());
+    publish_decoupled(server, topic, block.to_ssz());
+}
+
+pub fn publish_decoupled_vote(server: &P2PServer, vote: SignedGoldfishVote) {
+    let topic = server.wire.decoupled().map(|d| d.vote_topic.clone());
+    publish_decoupled(server, topic, vote.to_ssz());
+}
+
+pub fn publish_decoupled_attestation(server: &P2PServer, attestation: SignedDecoupledAttestation) {
+    let topic = server.wire.decoupled().map(|d| d.attestation_topic.clone());
+    publish_decoupled(server, topic, attestation.to_ssz());
 }
 
 async fn handle_lean_aggregation(server: &mut P2PServer, payload: &[u8], compressed_len: usize) {

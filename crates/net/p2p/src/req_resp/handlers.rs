@@ -27,6 +27,7 @@ use ethlambda_types::beacon::containers::fulu::{ColumnIndices, DataColumnsByRoot
 use ethlambda_types::beacon::containers::{DataColumnSidecar, SignedBeaconBlock};
 use ethlambda_types::beacon::fork::ForkName;
 use ethlambda_types::checkpoint::Checkpoint;
+use ethlambda_types::lean_decoupled::SignedDecoupledBlock;
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::{block::SignedBlock, primitives::H256};
 
@@ -182,6 +183,13 @@ pub async fn handle_req_resp_message(
                         )
                         .await;
                     }
+                    Request::DecoupledBlocksByRoot(roots) => {
+                        trace!(
+                            kind = "decoupled_blocks_by_root_request",
+                            peer_count, "P2P message received"
+                        );
+                        handle_decoupled_blocks_by_root_request(server, roots, channel, peer);
+                    }
                     Request::ExecutionPayloadEnvelopesByRoot(roots) => {
                         trace!(
                             kind = "execution_payload_envelopes_by_root_request",
@@ -209,6 +217,14 @@ pub async fn handle_req_resp_message(
                 let peer_count = server.connected_peers.len();
                 match response {
                     Response::Success { payload } => match payload {
+                        ResponsePayload::DecoupledBlocks(blocks) => {
+                            trace!(
+                                kind = "decoupled_blocks_response",
+                                peer_count, "P2P message received"
+                            );
+                            handle_decoupled_blocks_response(server, request_id, blocks, peer)
+                                .await;
+                        }
                         ResponsePayload::LeanStatus(status) => {
                             trace!(kind = "status_response", peer_count, "P2P message received");
                             handle_lean_status_response(server, status, peer).await;
@@ -404,6 +420,9 @@ pub async fn handle_req_resp_message(
                     Response::Error { code, message } => {
                         let error_str = String::from_utf8_lossy(&message);
                         debug!(%peer, ?code, %error_str, "Received error response");
+                        if retire_decoupled_request(server, &request_id).await {
+                            return;
+                        }
 
                         match server.outbound_requests.remove(&request_id) {
                             Some(PendingRequestKind::Range { .. }) => {
@@ -457,6 +476,9 @@ pub async fn handle_req_resp_message(
                 id: request_id,
             };
             debug!(%peer, ?request_id, %error, "Outbound request failed");
+            if retire_decoupled_request(server, &request_id).await {
+                return;
+            }
 
             // Check if this was a block fetch request
             match server.outbound_requests.remove(&request_id) {
@@ -660,6 +682,114 @@ async fn handle_lean_blocks_by_root_request(
     trace!(%peer, num_roots, found, "Responding to BlocksByRoot request");
 
     respond(server, channel, ResponsePayload::Blocks(blocks));
+}
+
+/// Answer a decoupled-mode by-root request from the blocks the decoupled
+/// chain actor holds. A missing root is skipped, as for 3SF-mini blocks.
+fn handle_decoupled_blocks_by_root_request(
+    server: &mut P2PServer,
+    roots: Vec<H256>,
+    channel: request_response::ResponseChannel<Response>,
+    peer: PeerId,
+) {
+    let blocks: Vec<SignedDecoupledBlock> = match server.wire.decoupled() {
+        Some(decoupled) => {
+            let held = decoupled
+                .blocks
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            roots
+                .iter()
+                .filter_map(|root| held.get(root).cloned())
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    trace!(%peer, asked = roots.len(), found = blocks.len(), "Responding to decoupled BlocksByRoot");
+    respond(server, channel, ResponsePayload::DecoupledBlocks(blocks));
+}
+
+/// Forward the block a decoupled by-root request asked for, or retry the
+/// lookup elsewhere when the peer did not have it.
+async fn handle_decoupled_blocks_response(
+    server: &mut P2PServer,
+    request_id: ReqRespRequestId,
+    blocks: Vec<SignedDecoupledBlock>,
+    peer: PeerId,
+) {
+    let Some(decoupled) = server.wire.decoupled_mut() else {
+        return;
+    };
+    let Some(root) = decoupled.outbound.remove(&request_id) else {
+        debug!(%peer, ?request_id, "Decoupled blocks response for an unknown request");
+        return;
+    };
+    let answer = blocks
+        .into_iter()
+        .find(|block| block.message.hash_tree_root() == root);
+    match answer {
+        Some(block) => {
+            decoupled.attempts.remove(&root);
+            if let Some(chain) = decoupled.chain.as_ref() {
+                let _ = chain
+                    .new_decoupled_block(block, true)
+                    .inspect_err(|err| error!(%err, "Failed to forward fetched decoupled block"));
+            }
+        }
+        None => {
+            debug!(%peer, root = %ethlambda_types::ShortRoot(&root.0), "Peer lacked the decoupled block");
+            fetch_decoupled_block(server, root).await;
+        }
+    }
+}
+
+/// Retire a failed decoupled lookup and retry it on another peer. `false`
+/// when `request_id` was not a decoupled request.
+async fn retire_decoupled_request(server: &mut P2PServer, request_id: &ReqRespRequestId) -> bool {
+    let Some(root) = server
+        .wire
+        .decoupled_mut()
+        .and_then(|decoupled| decoupled.outbound.remove(request_id))
+    else {
+        return false;
+    };
+    fetch_decoupled_block(server, root).await;
+    true
+}
+
+/// Give up on a decoupled block after this many attempts; the chain actor asks
+/// again if it still needs it.
+const MAX_DECOUPLED_FETCH_ATTEMPTS: u32 = 8;
+
+/// Ask a random connected peer for one decoupled block by root.
+pub async fn fetch_decoupled_block(server: &mut P2PServer, root: H256) {
+    let peers: Vec<PeerId> = server.connected_peers.keys().copied().collect();
+    let Some(decoupled) = server.wire.decoupled_mut() else {
+        return;
+    };
+    let attempts = decoupled.attempts.entry(root).or_insert(0);
+    if *attempts >= MAX_DECOUPLED_FETCH_ATTEMPTS || peers.is_empty() {
+        decoupled.attempts.remove(&root);
+        debug!(root = %ethlambda_types::ShortRoot(&root.0), "Giving up on a decoupled block lookup");
+        return;
+    }
+    let peer = peers[(*attempts as usize + rand::random::<u32>() as usize) % peers.len()];
+    *attempts += 1;
+    let Some(request_id) = server
+        .swarm_handle
+        .send_request(
+            peer,
+            Request::DecoupledBlocksByRoot(vec![root]),
+            ReqRespProtocol::LeanDecoupledBlocksByRoot,
+        )
+        .await
+    else {
+        return;
+    };
+    if let Some(decoupled) = server.wire.decoupled_mut() {
+        decoupled.outbound.insert(request_id, root);
+    }
+    trace!(%peer, root = %ethlambda_types::ShortRoot(&root.0), "Requested decoupled block by root");
 }
 
 async fn handle_lean_blocks_by_range_request(
@@ -2727,6 +2857,7 @@ pub(crate) mod tests {
                 attestation_committee_count: 1,
                 subscription_subnets: HashSet::new(),
                 milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                decoupled: None,
             }),
         })
         .expect("swarm builds");

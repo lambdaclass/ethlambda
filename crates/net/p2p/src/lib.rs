@@ -444,6 +444,7 @@ pub enum ReqRespProtocol {
     LeanStatus,
     LeanBlocksByRoot,
     LeanBlocksByRange,
+    LeanDecoupledBlocksByRoot,
     BeaconStatusV1,
     BeaconStatusV2,
     BeaconPing,
@@ -692,6 +693,10 @@ pub struct LeanWireConfig {
     /// Slot duration from the network's config file. Gossipsub's duplicate
     /// cache is specified in slots, so it has to follow the network's cadence.
     pub milliseconds_per_slot: u64,
+    /// `Some` when this node runs the decoupled consensus protocol: the
+    /// blocks its decoupled chain actor holds, which this actor serves by
+    /// root. Such a node speaks the decoupled topics instead of 3SF-mini's.
+    pub decoupled: Option<ethlambda_network_api::SharedDecoupledBlocks>,
 }
 
 /// Width of gossipsub's duplicate cache, in slots: leanSpec sets
@@ -748,12 +753,39 @@ pub struct LeanWire {
     pub(crate) attestation_committee_count: u64,
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) aggregation_topic: libp2p::gossipsub::IdentTopic,
+    /// Present on a node running the decoupled consensus protocol.
+    pub(crate) decoupled: Option<DecoupledWire>,
+}
+
+/// A lean decoupled node's wire state: its three topics, its chain actor,
+/// the blocks it serves, and its in-flight by-root lookups.
+pub(crate) struct DecoupledWire {
+    pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) vote_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    pub(crate) chain: Option<ethlambda_network_api::P2PToDecoupledRef>,
+    pub(crate) blocks: ethlambda_network_api::SharedDecoupledBlocks,
+    /// Root of each in-flight request, by request id.
+    pub(crate) outbound: HashMap<ReqRespRequestId, H256>,
+    /// Attempts per root still being looked up.
+    pub(crate) attempts: HashMap<H256, u32>,
 }
 
 impl Wire {
     pub(crate) fn lean(&self) -> Option<&LeanWire> {
         match self {
             Wire::Lean(lean) => Some(lean),
+            Wire::Beacon(_) => None,
+        }
+    }
+
+    pub(crate) fn decoupled(&self) -> Option<&DecoupledWire> {
+        self.lean().and_then(|lean| lean.decoupled.as_ref())
+    }
+
+    pub(crate) fn decoupled_mut(&mut self) -> Option<&mut DecoupledWire> {
+        match self {
+            Wire::Lean(lean) => lean.decoupled.as_mut(),
             Wire::Beacon(_) => None,
         }
     }
@@ -1014,6 +1046,34 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         })?;
 
     let wire = match wire {
+        WireConfig::Lean(lean) if lean.decoupled.is_some() => {
+            // A decoupled node speaks only the decoupled topics: its blocks and
+            // votes are different containers from 3SF-mini's.
+            let block_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_BLOCK_TOPIC_KIND);
+            let vote_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_VOTE_TOPIC_KIND);
+            let attestation_topic =
+                gossipsub::decoupled_topic(gossipsub::DECOUPLED_ATTESTATION_TOPIC_KIND);
+            for topic in [&block_topic, &vote_topic, &attestation_topic] {
+                swarm.behaviour_mut().gossipsub.subscribe(topic)?;
+                info!(topic = %topic, "Subscribed to decoupled topic");
+            }
+            info!(socket=%listening_socket, "P2P node started (decoupled consensus)");
+            Wire::Lean(LeanWire {
+                attestation_topics: HashMap::new(),
+                attestation_committee_count: lean.attestation_committee_count,
+                block_topic: gossipsub::block_topic(),
+                aggregation_topic: gossipsub::aggregation_topic(),
+                decoupled: Some(DecoupledWire {
+                    block_topic,
+                    vote_topic,
+                    attestation_topic,
+                    chain: None,
+                    blocks: lean.decoupled.clone().expect("guarded above"),
+                    outbound: HashMap::new(),
+                    attempts: HashMap::new(),
+                }),
+            })
+        }
         WireConfig::Lean(lean) => {
             // Subscribe to block topic (all nodes)
             let block_topic = block_topic();
@@ -1057,6 +1117,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 attestation_committee_count: lean.attestation_committee_count,
                 block_topic,
                 aggregation_topic,
+                decoupled: None,
             })
         }
         WireConfig::Beacon(beacon) => {
@@ -1701,6 +1762,64 @@ impl Handler<InitBlockChain> for P2PServer {
     }
 }
 
+impl Handler<ethlambda_network_api::InitDecoupledChain> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::InitDecoupledChain,
+        _ctx: &Context<Self>,
+    ) {
+        match self.wire.decoupled_mut() {
+            Some(decoupled) => {
+                decoupled.chain = Some(msg.chain);
+                info!("Decoupled chain protocol ref initialized");
+            }
+            None => warn!("Decoupled chain wired to a node that does not speak the decoupled wire"),
+        }
+    }
+}
+
+impl Handler<ethlambda_network_api::decoupled_to_p2p::PublishDecoupledBlock> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::decoupled_to_p2p::PublishDecoupledBlock,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_decoupled_block(self, msg.block);
+    }
+}
+
+impl Handler<ethlambda_network_api::decoupled_to_p2p::PublishDecoupledVote> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::decoupled_to_p2p::PublishDecoupledVote,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_decoupled_vote(self, msg.vote);
+    }
+}
+
+impl Handler<ethlambda_network_api::decoupled_to_p2p::PublishDecoupledAttestation> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::decoupled_to_p2p::PublishDecoupledAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_decoupled_attestation(self, msg.attestation);
+    }
+}
+
+impl Handler<ethlambda_network_api::decoupled_to_p2p::FetchDecoupledBlocks> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::decoupled_to_p2p::FetchDecoupledBlocks,
+        _ctx: &Context<Self>,
+    ) {
+        for root in msg.roots {
+            req_resp::fetch_decoupled_block(self, root).await;
+        }
+    }
+}
+
 impl Handler<PublishBlock> for P2PServer {
     async fn handle(&mut self, msg: PublishBlock, _ctx: &Context<Self>) {
         publish_block(self, msg.block).await;
@@ -2179,6 +2298,9 @@ async fn handle_behaviour_event(
             ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
             ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
             ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+            ReqRespEvent::LeanDecoupledBlocksByRoot(e) => {
+                (ReqRespProtocol::LeanDecoupledBlocksByRoot, e)
+            }
             ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
             ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
             ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
@@ -3223,6 +3345,7 @@ mod tests {
                     attestation_committee_count: 1,
                     subscription_subnets: HashSet::new(),
                     milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                    decoupled: None,
                 }),
             })
             .expect("swarm builds")
@@ -3365,6 +3488,9 @@ mod tests {
                 ReqRespEvent::LeanStatus(e) => (ReqRespProtocol::LeanStatus, e),
                 ReqRespEvent::LeanBlocksByRoot(e) => (ReqRespProtocol::LeanBlocksByRoot, e),
                 ReqRespEvent::LeanBlocksByRange(e) => (ReqRespProtocol::LeanBlocksByRange, e),
+                ReqRespEvent::LeanDecoupledBlocksByRoot(e) => {
+                    (ReqRespProtocol::LeanDecoupledBlocksByRoot, e)
+                }
                 ReqRespEvent::BeaconStatusV1(e) => (ReqRespProtocol::BeaconStatusV1, e),
                 ReqRespEvent::BeaconStatusV2(e) => (ReqRespProtocol::BeaconStatusV2, e),
                 ReqRespEvent::BeaconPing(e) => (ReqRespProtocol::BeaconPing, e),
@@ -3576,6 +3702,7 @@ mod tests {
             attestation_committee_count: 4,
             block_topic: block_topic(),
             aggregation_topic: aggregation_topic(),
+            decoupled: None,
         });
         assert!(wire.beacon().is_none());
         let lean = wire.lean().expect("a lean wire");
@@ -3636,6 +3763,7 @@ mod tests {
                 attestation_committee_count: 1,
                 subscription_subnets: HashSet::new(),
                 milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                decoupled: None,
             }),
         })
         .expect("a duplicated bootnode entry must not fail the build");
