@@ -194,7 +194,11 @@ const KEY_ANCHOR_SLOT: &[u8] = b"anchor_slot";
 /// would otherwise look identical to "no unrealized justification computed
 /// yet" rather than "this directory predates the table", the same silent
 /// wrong answer every prior bump exists to rule out.
-pub const DB_VERSION: u64 = 6;
+///
+/// 7 widened `Config` with the decoupled fork's version, epoch and protocol
+/// parameters, so a directory written by version 6 decodes into the wrong
+/// fields, and added fork selector 8 for decoupled blocks and states.
+pub const DB_VERSION: u64 = 7;
 
 /// The consensus protocol a data directory holds.
 ///
@@ -997,7 +1001,8 @@ fn builds_on_payload(block: &SignedBeaconBlock, payload_block_hash: &ExecutionBl
         | SignedBeaconBlock::Capella(_)
         | SignedBeaconBlock::Deneb(_)
         | SignedBeaconBlock::Electra(_)
-        | SignedBeaconBlock::Fulu(_) => false,
+        | SignedBeaconBlock::Fulu(_)
+        | SignedBeaconBlock::Decoupled(_) => false,
         SignedBeaconBlock::Lean(_) => Store::lean_only("builds_on_payload"),
     }
 }
@@ -3894,7 +3899,8 @@ impl Store {
                     | ForkName::Capella
                     | ForkName::Deneb
                     | ForkName::Electra
-                    | ForkName::Fulu,
+                    | ForkName::Fulu
+                    | ForkName::Decoupled,
                 ) => false,
                 // A beacon directory never holds a lean block row.
                 Some(ForkName::Lean) => unreachable!("lean block row in a beacon directory"),

@@ -979,11 +979,14 @@ behavior.
   in-memory map stays as a write-through cache in front of the table. Pruned
   on finalization to the same horizon as `LiveChain` (the finalized block's
   own slot, keeping that block's own entry).
-- `DB_VERSION` is 6: the unrealized-justifications table means a directory
+- `DB_VERSION` is 7: the decoupled fork's `Config` keys (version, epoch and
+  the five protocol parameters) widen the SSZ-encoded `Config`, and fork
+  selector 8 tags decoupled blocks and states. (6 was the
+  unrealized-justifications table: a directory
   written by an earlier version has no row there for any block it already
   imported, which would otherwise look identical to "no unrealized
   justification computed yet" rather than "this directory predates the
-  table". (5 was the gloas schedule, timing and churn keys in `Config`, which
+  table"; 5 was the gloas schedule, timing and churn keys in `Config`, which
   is SSZ-encoded under `KEY_CONFIG`; 4 was `PRESET_BASE`/`CONFIG_NAME` at the
   front of `Config`; 3 was the runtime keys a `config.yaml` supplies.)
   `Store::from_db_state` refuses any other version outright; there is no

@@ -10,8 +10,8 @@
 use ethlambda_types::primitives::H256;
 
 pub use ethlambda_types::decoupled::{
-    Attestation, AttestationData, BlockRef, FinalityVote, GoldfishVote, Height, HeightVote,
-    Round, SgKey, Slot, VALIDATOR_LIMIT, ValidatorIndex,
+    Attestation, AttestationData, BlockRef, FinalityVote, GoldfishVote, Height, HeightVote, Round,
+    SgKey, Slot, VALIDATOR_LIMIT, ValidatorIndex,
 };
 
 /// Time on the protocol's public grid, in units of `Δ` since genesis.
