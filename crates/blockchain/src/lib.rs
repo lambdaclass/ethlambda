@@ -824,8 +824,10 @@ fn data_availability_for(
             }
             Some(fork_choice::DataAvailability::NotRequired)
         }
-        SignedBeaconBlock::Fulu(inner) => {
-            if inner.message.body.blob_kzg_commitments.is_empty() {
+        // The decoupled body keeps fulu's commitments field and its column
+        // inclusion proof, so the two share the whole column pipeline.
+        SignedBeaconBlock::Fulu(_) | SignedBeaconBlock::Decoupled(_) => {
+            if block.blob_kzg_commitment_count() == 0 {
                 return Some(fork_choice::DataAvailability::NotRequired);
             }
 
@@ -858,7 +860,8 @@ fn data_availability_for(
                         .expect("a sidecar this node verified before storing decodes")
                         .expect("presence just confirmed above");
                     match sidecar {
-                        DataColumnSidecar::Fulu(sidecar) => sidecar,
+                        DataColumnSidecar::Fulu(sidecar)
+                        | DataColumnSidecar::Decoupled(sidecar) => sidecar,
                         // The row decodes by its slot's fork, and this arm is
                         // the fulu block at that slot.
                         DataColumnSidecar::Gloas(_) => {

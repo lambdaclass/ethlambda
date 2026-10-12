@@ -73,7 +73,9 @@ pub(crate) struct ColumnParking {
 /// commitments from its own block's bid, so it waits for that block instead.
 pub(crate) fn awaited_root(sidecar: &DataColumnSidecar) -> H256 {
     match sidecar {
-        DataColumnSidecar::Fulu(sidecar) => sidecar.signed_block_header.message.parent_root,
+        DataColumnSidecar::Fulu(sidecar) | DataColumnSidecar::Decoupled(sidecar) => {
+            sidecar.signed_block_header.message.parent_root
+        }
         DataColumnSidecar::Gloas(sidecar) => sidecar.beacon_block_root,
     }
 }
@@ -123,7 +125,7 @@ impl BlockChainServer {
     /// between them for ever.
     fn is_ready_to_judge(&self, sidecar: &DataColumnSidecar) -> bool {
         match sidecar {
-            DataColumnSidecar::Fulu(_) => {
+            DataColumnSidecar::Fulu(_) | DataColumnSidecar::Decoupled(_) => {
                 matches!(self.store.get_state(&awaited_root(sidecar)), Ok(Some(_)))
             }
             DataColumnSidecar::Gloas(gloas) => {

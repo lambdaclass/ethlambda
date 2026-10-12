@@ -619,7 +619,8 @@ impl BlockChainServer {
             .map(
                 |&index| match self.store.get_data_column(slot, root, index) {
                     Ok(Some(DataColumnSidecar::Gloas(sidecar))) => Some(sidecar),
-                    Ok(Some(DataColumnSidecar::Fulu(_))) | Ok(None) => None,
+                    Ok(Some(DataColumnSidecar::Fulu(_) | DataColumnSidecar::Decoupled(_)))
+                    | Ok(None) => None,
                     Err(err) => {
                         error!(%err, "Failed to read back a stored data column sidecar");
                         None
