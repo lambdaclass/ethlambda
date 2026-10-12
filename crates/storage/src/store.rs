@@ -5103,6 +5103,36 @@ mod tests {
     }
 
     #[test]
+    fn a_decoupled_block_round_trips_under_its_own_selector() {
+        use ethlambda_types::beacon::containers::decoupled;
+
+        let mut store = beacon_test_store(Arc::new(InMemoryBackend::new()));
+        let body = decoupled::BeaconBlockBody::empty();
+        let block = SignedBeaconBlock::Decoupled(decoupled::SignedBeaconBlock {
+            message: decoupled::BeaconBlock {
+                slot: 9,
+                proposer_index: 3,
+                parent_root: H256::from([2u8; 32]),
+                state_root: H256::from([3u8; 32]),
+                body,
+            },
+            signature: Default::default(),
+        });
+        let root = block.message_hash_tree_root();
+
+        store
+            .insert_signed_block(root, block.clone())
+            .expect("insert decoupled block");
+
+        assert_eq!(store.block_entry(&root), Some((9, H256::from([2u8; 32]))));
+        assert_eq!(
+            store.get_signed_block(&root).expect("read"),
+            Some(block.clone())
+        );
+        assert_eq!(encode_beacon_block_value(&block)[0], 8);
+    }
+
+    #[test]
     fn a_lean_block_still_records_its_attestation_votes() {
         // The lean arm's post-commit side effect must survive the split: a
         // beacon block has no lean attestations, so the decision has to be
