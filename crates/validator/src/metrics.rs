@@ -175,6 +175,54 @@ static PAYLOAD_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(
     .unwrap()
 });
 
+static GOLDFISH_VOTES_SIGNED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_goldfish_votes_signed_total",
+        "Goldfish votes signed (the record was advanced before each)"
+    )
+    .unwrap()
+});
+
+static GOLDFISH_VOTES_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_goldfish_votes_published_total",
+        "Goldfish votes the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static GOLDFISH_VOTE_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_goldfish_vote_failures_total",
+        "Slots whose Goldfish vote duty did not result in published votes, plus votes that failed to sign"
+    )
+    .unwrap()
+});
+
+static COMBINED_ATTESTATIONS_SIGNED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_combined_attestations_signed_total",
+        "Combined attestations signed (the anti-slashing record was persisted before each)"
+    )
+    .unwrap()
+});
+
+static COMBINED_ATTESTATIONS_PUBLISHED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_combined_attestations_published_total",
+        "Combined attestations the beacon node accepted"
+    )
+    .unwrap()
+});
+
+static COMBINED_ATTESTATION_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "ethlambda_validator_combined_attestation_failures_total",
+        "Rounds whose combined attestation duty did not result in published attestations, plus attestations that failed to sign or record"
+    )
+    .unwrap()
+});
+
 /// End to end, from the slot's start to the node accepting the block.
 ///
 /// The buckets are tighter at the low end than the attestation histogram's,
@@ -322,6 +370,12 @@ pub fn init() {
     LazyLock::force(&ENVELOPE_FAILURES_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATIONS_PUBLISHED_TOTAL);
     LazyLock::force(&PAYLOAD_ATTESTATION_FAILURES_TOTAL);
+    LazyLock::force(&GOLDFISH_VOTES_SIGNED_TOTAL);
+    LazyLock::force(&GOLDFISH_VOTES_PUBLISHED_TOTAL);
+    LazyLock::force(&GOLDFISH_VOTE_FAILURES_TOTAL);
+    LazyLock::force(&COMBINED_ATTESTATIONS_SIGNED_TOTAL);
+    LazyLock::force(&COMBINED_ATTESTATIONS_PUBLISHED_TOTAL);
+    LazyLock::force(&COMBINED_ATTESTATION_FAILURES_TOTAL);
     LazyLock::force(&SYNC_COMMITTEE_MESSAGES_PUBLISHED_TOTAL);
     LazyLock::force(&SYNC_COMMITTEE_FAILURES_TOTAL);
     LazyLock::force(&SYNC_CONTRIBUTIONS_PUBLISHED_TOTAL);
@@ -398,6 +452,30 @@ pub fn inc_payload_attestations_published(count: u64) {
 
 pub fn inc_payload_attestation_failures() {
     PAYLOAD_ATTESTATION_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_goldfish_votes_signed() {
+    GOLDFISH_VOTES_SIGNED_TOTAL.inc();
+}
+
+pub fn inc_goldfish_votes_published(count: u64) {
+    GOLDFISH_VOTES_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_goldfish_vote_failures() {
+    GOLDFISH_VOTE_FAILURES_TOTAL.inc();
+}
+
+pub fn inc_combined_attestations_signed() {
+    COMBINED_ATTESTATIONS_SIGNED_TOTAL.inc();
+}
+
+pub fn inc_combined_attestations_published(count: u64) {
+    COMBINED_ATTESTATIONS_PUBLISHED_TOTAL.inc_by(count);
+}
+
+pub fn inc_combined_attestation_failures() {
+    COMBINED_ATTESTATION_FAILURES_TOTAL.inc();
 }
 
 pub fn inc_sync_committee_messages_published(count: u64) {

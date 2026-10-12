@@ -20,7 +20,11 @@ use crate::beacon_node::dto::{
     SingleAttestationDto, SyncCommitteeSubscriptionDto, SyncDutyDto,
 };
 use crate::error::Result;
+use ethlambda_decoupled::AttestationInput;
 use ethlambda_types::beacon::containers::altair;
+use ethlambda_types::beacon::containers::decoupled::{
+    GoldfishVoteData, SignedCombinedAttestation, SignedGoldfishVote,
+};
 use ethlambda_types::beacon::containers::electra;
 use ethlambda_types::beacon::containers::gloas;
 
@@ -420,6 +424,36 @@ pub trait BeaconNodeApi: Send + Sync {
     async fn submit_payload_attestations(
         &self,
         messages: &[gloas::PayloadAttestationMessage],
+    ) -> Result<usize>;
+
+    /// What a committee member votes for at decoupled slot `slot`: the node's
+    /// head, as `(slot, head)`.
+    ///
+    /// # Contract: the answer is for `slot`, or this is an `Err`
+    ///
+    /// For the reason [`Self::attestation_data`] states. The node answers 400
+    /// when `slot` is not its current slot or not a decoupled slot.
+    async fn goldfish_vote_data(&self, slot: Slot) -> Result<GoldfishVoteData>;
+
+    /// Submit signed Goldfish votes to the node's pool. Returns how many it
+    /// accepted, with the same partial-success reading as
+    /// [`Self::submit_attestations`].
+    async fn submit_goldfish_votes(&self, votes: &[SignedGoldfishVote]) -> Result<usize>;
+
+    /// What the node's store hands the anti-slashing record at round `round`'s
+    /// attestation time: the safe block and the height and finality fields.
+    ///
+    /// # Contract: the answer is for `round`, or this is an `Err`
+    ///
+    /// For the reason [`Self::attestation_data`] states.
+    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput>;
+
+    /// Submit signed combined attestations to the node's pool. Returns how
+    /// many it accepted, with the same partial-success reading as
+    /// [`Self::submit_attestations`].
+    async fn submit_combined_attestations(
+        &self,
+        attestations: &[SignedCombinedAttestation],
     ) -> Result<usize>;
 
     /// Submits signed attestations to the node's pool, so they reach gossip.

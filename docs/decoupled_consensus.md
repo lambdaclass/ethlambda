@@ -135,3 +135,22 @@ Local devnet: `tooling/decoupled-devnet/lean-local.sh start|status|stop`.
 ## Beacon: the `decoupled` fork
 
 *(in progress)*
+
+### Validator client (`crates/validator/src/decoupled.rs`)
+
+At decoupled slots the VC makes no LMD attestation or aggregate. It runs:
+
+| Duty | Who | When | Beacon node endpoints |
+|---|---|---|---|
+| Goldfish vote | validators with an attester duty in the slot (`𝒦_s`) | `t_s + Δ` (2500 bps) | `GET /eth/v1/validator/decoupled/goldfish_vote_data`, `POST /eth/v1/beacon/pool/goldfish_votes` |
+| Combined attestation | every active validator, when `slot % R == 1` | `a_r`, 5000 bps into the round's second slot | `GET /eth/v1/validator/decoupled/attestation_input`, `POST /eth/v1/beacon/pool/combined_attestations` |
+
+Proposals use `produceBlockV3` as before; the node names `decoupled`.
+
+The anti-slashing record Λ is `ethlambda_decoupled::Record`, one per
+validator pubkey, at `<validators-dir>/decoupled/<0xpubkey>.json` with the last
+slot voted and the last round attested. Every change is written (tmp file,
+fsync, rename) before the signature it licenses exists; a record that does not
+parse makes that validator refuse to sign rather than reset. The VC never
+re-implements the pair rules: `Record::create_attestation` decides them from the
+node's `AttestationInput`.

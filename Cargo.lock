@@ -2235,6 +2235,7 @@ dependencies = [
  "axum",
  "blst",
  "ctr",
+ "ethlambda-decoupled",
  "ethlambda-metrics",
  "ethlambda-types",
  "hex",

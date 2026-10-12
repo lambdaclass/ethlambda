@@ -16,6 +16,14 @@ use ethlambda_types::beacon::primitives::{Epoch, Slot};
 /// Basis points in a whole, which is what the duty offsets are expressed in.
 const BASIS_POINTS: u64 = 10_000;
 
+/// Where in a decoupled slot the Goldfish vote is due: `t_s + Δ`, with the slot
+/// being `4Δ`.
+const GOLDFISH_VOTE_DUE_BPS: u64 = 2_500;
+
+/// Where in the second slot of a round the combined attestation is due:
+/// `a_r = T_r + 6Δ` is half a slot into slot `r * R + 1`.
+const DECOUPLED_ATTESTATION_DUE_BPS: u64 = 5_000;
+
 /// Converts wall-clock time to slots and back, for a chain whose genesis, slot
 /// length and duty offsets are fixed for the life of the clock.
 ///
@@ -94,6 +102,15 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Decoupled
     }
 
+    /// The round whose combined attestation is due during `slot`, if any.
+    ///
+    /// A round `r` attests at `a_r = start(r * R + 1) + slot_duration / 2`, so
+    /// the duty falls in the second slot of each round: `slot % R == 1`.
+    pub fn decoupled_round_attesting_in(&self, slot: Slot) -> Option<u64> {
+        let per_round = self.config.decoupled_slots_per_round;
+        (per_round > 1 && slot % per_round == 1).then_some(slot / per_round)
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -142,6 +159,20 @@ impl SlotClock {
     /// whatever the slot, and callers gate on [`Self::is_gloas`].
     pub fn payload_attestation_time(&self, slot: Slot) -> SystemTime {
         self.offset_into(slot, self.config.payload_attestation_due_bps)
+    }
+
+    /// When the Goldfish vote for `slot` should run: one `Δ` into the slot.
+    pub fn goldfish_vote_time(&self, slot: Slot) -> SystemTime {
+        self.offset_into(slot, GOLDFISH_VOTE_DUE_BPS)
+    }
+
+    /// When round `round`'s combined attestation should run, `a_r`: half a
+    /// slot into the round's second slot.
+    pub fn decoupled_attestation_time(&self, round: u64) -> SystemTime {
+        let slot = round
+            .saturating_mul(self.config.decoupled_slots_per_round)
+            .saturating_add(1);
+        self.offset_into(slot, DECOUPLED_ATTESTATION_DUE_BPS)
     }
 
     /// When the aggregation duty for `slot` should run.
@@ -256,6 +287,22 @@ impl SlotClock {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// How long from `now` until the Goldfish vote for `slot`, or zero once
+    /// that instant has passed.
+    pub fn until_goldfish_vote(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.goldfish_vote_time(slot)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
+    /// How long from `now` until round `round`'s combined attestation, or
+    /// zero once that instant has passed.
+    pub fn until_decoupled_attestation(&self, round: u64, now: SystemTime) -> Duration {
+        self.decoupled_attestation_time(round)
+            .duration_since(now)
+            .unwrap_or(Duration::ZERO)
+    }
+
     /// How long from `now` until the sync committee message for `slot`, or zero
     /// once that instant has passed.
     pub fn until_sync_message(&self, slot: Slot, now: SystemTime) -> Duration {
@@ -279,8 +326,16 @@ impl SlotClock {
     /// duties. Sleeping on the attestation alone would hold a sync message
     /// back when the network moves it earlier (gloas does).
     pub fn until_first_slot_duty(&self, slot: Slot, now: SystemTime) -> Duration {
-        self.until_attestation(slot, now)
-            .min(self.until_sync_message(slot, now))
+        let first = self
+            .until_attestation(slot, now)
+            .min(self.until_sync_message(slot, now));
+        // A decoupled slot has no attestation, but its Goldfish vote is due
+        // earlier than the attester offset.
+        if self.is_decoupled(slot) {
+            first.min(self.until_goldfish_vote(slot, now))
+        } else {
+            first
+        }
     }
 
     /// The next slot to serve, given the last one served, and how long until
@@ -704,6 +759,43 @@ mod tests {
             clock.until_first_slot_duty(5, start + Duration::from_secs(10)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn the_decoupled_offsets_are_a_quarter_and_half_a_slot_in() {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
+        config.decoupled_slots_per_round = 4;
+        let clock = SlotClock::from_config(GENESIS, &config);
+        // 12 s slots: the vote at 3 s, the attestation at 6 s of the round's
+        // second slot.
+        assert_eq!(
+            clock.until_goldfish_vote(5, clock.start_of(5)),
+            Duration::from_millis(3_000)
+        );
+        assert_eq!(
+            clock.until_decoupled_attestation(2, clock.start_of(9)),
+            Duration::from_millis(6_000)
+        );
+        assert_eq!(
+            clock.until_decoupled_attestation(2, clock.start_of(10)),
+            Duration::ZERO
+        );
+        // The vote is the first duty of a decoupled slot.
+        assert_eq!(
+            clock.until_first_slot_duty(5, clock.start_of(5)),
+            Duration::from_millis(3_000).min(clock.until_sync_message(5, clock.start_of(5)))
+        );
+    }
+
+    #[test]
+    fn a_round_attests_in_the_second_slot_of_its_window() {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
+        config.decoupled_slots_per_round = 4;
+        let clock = SlotClock::from_config(GENESIS, &config);
+        let rounds: Vec<_> = (0..10)
+            .filter_map(|slot| Some((slot, clock.decoupled_round_attesting_in(slot)?)))
+            .collect();
+        assert_eq!(rounds, vec![(1, 0), (5, 1), (9, 2)]);
     }
 
     #[test]
