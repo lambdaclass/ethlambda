@@ -1,0 +1,34 @@
+# An all-ethlambda beacon devnet running the decoupled fork from genesis.
+#
+# Needs ethereum-package with ethlambda support (lambdaclass/ethereum-package,
+# branch add-ethlambda) and a local image of this branch:
+#
+#   make docker-build DOCKER_TAG=decoupled
+#   kurtosis run --enclave decoupled <path-to>/ethereum-package \
+#     --args-file tooling/decoupled-devnet/beacon-kurtosis.yaml
+#
+# Every consensus client must run the decoupled fork: no other client
+# implements it. The genesis generator only knows fulu, so the fork is turned
+# on by flag and applied to the generated genesis at load time.
+participants:
+  - el_type: geth
+    el_image: ethereum/client-go:latest
+    cl_type: ethlambda
+    cl_image: ghcr.io/lambdaclass/ethlambda:decoupled
+    cl_extra_params:
+      - --decoupled-fork-epoch=0
+      - --decoupled-slots-per-round=4
+    vc_type: ethlambda
+    vc_image: ghcr.io/lambdaclass/ethlambda:decoupled
+    count: 4
+network_params:
+  preset: mainnet
+  num_validator_keys_per_node: 32
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  genesis_delay: 60
+additional_services:
+  # ethlambda does not report its ENR over the Beacon API, so a discv5
+  # bootnode service is how the participants find each other.
+  - bootnodoor
+  - dora

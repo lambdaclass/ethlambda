@@ -12,7 +12,10 @@ pub use handler::{
     publish_beacon_block, publish_beacon_operation, publish_block,
     publish_execution_payload_envelope, publish_payload_attestation_message,
 };
-pub use handler::{publish_decoupled_attestation, publish_decoupled_block, publish_decoupled_vote};
+pub use handler::{
+    publish_combined_attestation, publish_decoupled_attestation, publish_decoupled_block,
+    publish_decoupled_vote, publish_goldfish_vote,
+};
 pub use messages::{
     DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
     aggregation_topic, attestation_subnet_topic, block_topic, decoupled_topic, topic_kind,

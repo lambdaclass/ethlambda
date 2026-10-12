@@ -2901,6 +2901,7 @@ pub(crate) mod tests {
             swarm_handle,
             store,
             blockchain: None,
+            decoupled_node: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),

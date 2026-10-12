@@ -366,7 +366,7 @@ fn handle_beacon_gossip(
         kind,
         beacon_topics::GOLDFISH_VOTE | beacon_topics::COMBINED_ATTESTATION
     ) {
-        triage_decoupled_vote(kind)
+        triage_decoupled_vote(server, kind, payload)
     } else if kind == beacon_topics::EXECUTION_PAYLOAD {
         triage_envelope(server, payload)
     } else if kind == beacon_topics::PAYLOAD_ATTESTATION_MESSAGE {
@@ -404,12 +404,146 @@ fn handle_beacon_gossip(
 
 /// The decoupled fork's `goldfish_vote` and `combined_attestation` topics.
 ///
-/// Decode, validation and dispatch to the chain are not built yet: every
-/// message is reported `Ignore`, which keeps the mesh healthy (no peer is
-/// penalized) without forwarding what this node cannot yet judge.
-fn triage_decoupled_vote(kind: &str) -> Dispatch {
-    metrics::inc_beacon_gossip(kind, "no_consumer");
-    Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer))
+/// Decoded, checked against the head state (a vote's committee membership,
+/// and either message's signature) and offered to the shared decoupled
+/// engine. Accepted when the engine admits it, so only what this node holds
+/// is relayed; ignored when the engine refuses it (outside its slot or round
+/// window, a repeat, a third distinct vote), and rejected when malformed or
+/// wrongly signed. Validation runs inline: one BLS verification, against
+/// committees the cache already holds for the head's epochs.
+fn triage_decoupled_vote(server: &P2PServer, kind: &str, payload: &[u8]) -> Dispatch {
+    use ethlambda_state_transition::beacon::decoupled_node::{
+        validate_combined_attestation, validate_goldfish_vote,
+    };
+    use ethlambda_types::beacon::containers::decoupled::{
+        SignedCombinedAttestation, SignedGoldfishVote,
+    };
+    let Some(node) = server.decoupled_node.clone() else {
+        metrics::inc_beacon_gossip(kind, "no_consumer");
+        return Dispatch::Report(Outcome::Ignore(IgnoreReason::NoConsumer));
+    };
+    let Some((_, head_root)) = server.store.beacon_head() else {
+        return Dispatch::Report(Outcome::Ignore(IgnoreReason::StateUnavailable));
+    };
+    let Ok(Some(state)) = server.store.get_state(&head_root) else {
+        return Dispatch::Report(Outcome::Ignore(IgnoreReason::StateUnavailable));
+    };
+    let config = server.store.config();
+    let outcome = if kind == beacon_topics::GOLDFISH_VOTE {
+        let Ok(vote) = SignedGoldfishVote::from_ssz_bytes(payload) else {
+            metrics::inc_beacon_gossip(kind, "decode_failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        };
+        let committees = server.store.committee_cache();
+        match validate_goldfish_vote(&state, &config, &committees, &vote) {
+            Err(err) => {
+                debug!(slot = vote.data.slot, validator = vote.validator_index, %err, "Invalid Goldfish vote");
+                Outcome::Reject(RejectReason::BadSignature)
+            }
+            Ok(()) => {
+                let admitted = node
+                    .lock()
+                    .expect("decoupled node lock poisoned")
+                    .add_vote(&vote);
+                if admitted {
+                    Outcome::Accept
+                } else {
+                    Outcome::Ignore(IgnoreReason::AlreadySeen)
+                }
+            }
+        }
+    } else {
+        let Ok(attestation) = SignedCombinedAttestation::from_ssz_bytes(payload) else {
+            metrics::inc_beacon_gossip(kind, "decode_failed");
+            return Dispatch::Report(Outcome::Reject(RejectReason::Decode));
+        };
+        match validate_combined_attestation(&state, &config, &attestation) {
+            Err(err) => {
+                debug!(round = attestation.data.round, validator = attestation.validator_index, %err, "Invalid combined attestation");
+                Outcome::Reject(RejectReason::BadSignature)
+            }
+            Ok(()) => {
+                let admitted = node
+                    .lock()
+                    .expect("decoupled node lock poisoned")
+                    .add_attestation(&attestation);
+                if admitted {
+                    Outcome::Accept
+                } else {
+                    Outcome::Ignore(IgnoreReason::AlreadySeen)
+                }
+            }
+        }
+    };
+    let (verdict, _) = outcome.labels();
+    metrics::inc_beacon_gossip(kind, verdict);
+    Dispatch::Report(outcome)
+}
+
+/// Publish under the digest of `slot`'s epoch, on `kind`.
+fn publish_decoupled_beacon(server: &P2PServer, slot: u64, kind: &str, bytes: Vec<u8>) {
+    let Some(beacon) = server.wire.beacon() else {
+        error!(
+            kind,
+            "A decoupled beacon message reached a lean node; dropping it"
+        );
+        return;
+    };
+    let Some(digest) = beacon.publish_digest(slot) else {
+        warn!(
+            slot,
+            kind, "No held fork digest covers this message's slot; not publishing"
+        );
+        return;
+    };
+    let topic = IdentTopic::new(beacon_topics::topic_name(digest, kind));
+    server.swarm_handle.publish(topic, compress_message(&bytes));
+}
+
+/// Gossip a Goldfish vote this node's validator client submitted.
+pub fn publish_goldfish_vote(
+    server: &P2PServer,
+    vote: ethlambda_types::beacon::containers::decoupled::SignedGoldfishVote,
+) {
+    trace!(
+        slot = vote.data.slot,
+        validator = vote.validator_index,
+        "Publishing Goldfish vote"
+    );
+    publish_decoupled_beacon(
+        server,
+        vote.data.slot,
+        beacon_topics::GOLDFISH_VOTE,
+        vote.to_ssz(),
+    );
+}
+
+/// Gossip a combined attestation this node's validator client submitted.
+pub fn publish_combined_attestation(
+    server: &P2PServer,
+    attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
+) {
+    // Published under the digest of the slot it is being sent at: the
+    // round's attestation time falls in its second slot.
+    let slot = server
+        .decoupled_node
+        .as_ref()
+        .map(|node| {
+            let node = node.lock().expect("decoupled node lock poisoned");
+            node.params().opening_slot(attestation.data.round) + 1
+        })
+        .unwrap_or(0);
+    trace!(
+        round = attestation.data.round,
+        validator = attestation.validator_index,
+        "Publishing combined attestation"
+    );
+    publish_decoupled_beacon(
+        server,
+        slot,
+        beacon_topics::COMBINED_ATTESTATION,
+        attestation.to_ssz(),
+    );
 }
 
 /// Decode a beacon block and run its cheap gossip checks: a verdict already,

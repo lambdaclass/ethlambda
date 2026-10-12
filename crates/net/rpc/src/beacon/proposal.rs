@@ -38,6 +38,8 @@ use ethlambda_state_transition::beacon::{
         payload_inputs, verified_sync_aggregate,
     },
     data_columns::{self, SidecarBlock, SidecarError},
+    decoupled::slot_committee,
+    decoupled_node::SharedDecoupledNode,
     helpers::accessors::get_beacon_proposer_index,
     stf::verify_block_signature,
     sync_committee_pool::SharedSyncCommitteePool,
@@ -509,6 +511,7 @@ async fn get_block(
     Extension(sync_pool): Extension<SharedSyncCommitteePool>,
     Extension(fee_recipients): Extension<FeeRecipients>,
     Extension(OwnVersion(own_version)): Extension<OwnVersion>,
+    Extension(decoupled): Extension<Option<SharedDecoupledNode>>,
     headers: HeaderMap,
 ) -> Response {
     let Ok(slot) = slot.parse::<Slot>() else {
@@ -536,6 +539,7 @@ async fn get_block(
         &sync_pool,
         &fee_recipients,
         &own_version,
+        decoupled.as_ref(),
         slot,
         query.randao_reveal,
         graffiti,
@@ -580,12 +584,39 @@ async fn produce(
     sync_pool: &SharedSyncCommitteePool,
     fee_recipients: &FeeRecipients,
     own_version: &ClientVersionV1,
+    decoupled: Option<&SharedDecoupledNode>,
     slot: Slot,
     randao_reveal: BlsSignature,
     graffiti: Bytes32,
 ) -> Result<(BlockContents, String, ForkName), ApiError> {
     let config = store.config();
-    let (head_root, head_state) = head(store)?;
+    // At a decoupled slot the parent is the decoupled engine's proposal head
+    // (`propose_block`), not LMD-GHOST's, and the engine's votes and
+    // attestations of the same read go into the body.
+    let decoupled_proposal = match decoupled {
+        Some(node) if config.fork_at_epoch(compute_epoch_at_slot(slot)) == ForkName::Decoupled => {
+            let proposal = node
+                .lock()
+                .expect("decoupled node lock poisoned")
+                .proposal(slot)
+                .map_err(|_| ApiError::BadRequest("slot is not the current slot"))?;
+            Some(proposal)
+        }
+        _ => None,
+    };
+    let (head_root, head_state) = match &decoupled_proposal {
+        Some(proposal) => {
+            let root = proposal.parent_root;
+            let state = store
+                .get_state(&root)
+                .map_err(|_| ApiError::Internal("store read failed"))?
+                .ok_or(ApiError::ServiceUnavailable(
+                    "the proposal parent's state is not available",
+                ))?;
+            (root, state)
+        }
+        None => head(store)?,
+    };
     if slot <= head_state.slot() {
         return Err(ApiError::BadRequest("slot is not after the head block"));
     }
@@ -684,12 +715,30 @@ async fn produce(
     };
     let attestation_count = attestations.len();
     let has_operations = !operations.is_empty();
-    // The protocol fields (Goldfish votes and combined attestations) are not
-    // produced here yet: a decoupled block carries empty ones.
+    let decoupled_fields = match (&decoupled_proposal, decoupled) {
+        (Some(proposal), Some(node)) => {
+            let committees = store.committee_cache();
+            let committee = slot_committee(&state, slot - 1, &committees)
+                .map_err(|_| ApiError::Internal("no committee for the previous slot"))?;
+            let fields = node
+                .lock()
+                .expect("decoupled node lock poisoned")
+                .body_fields(proposal, &committee, state.validator_count());
+            info!(
+                %slot,
+                parent_root = %ethlambda_types::ShortRoot(&head_root.0),
+                goldfish_votes = fields.goldfish_votes.len(),
+                combined_attestations = fields.combined_attestations.len(),
+                "Decoupled proposal"
+            );
+            Some(fields)
+        }
+        _ => None,
+    };
     let block = match assemble_block(
         &state,
         inputs(attestations, operations, sync_aggregate),
-        None,
+        decoupled_fields.clone(),
         &config,
     ) {
         Ok(block) => block,
@@ -702,7 +751,7 @@ async fn produce(
             assemble_block(
                 &state,
                 inputs(Vec::new(), Operations::default(), empty_sync_aggregate()),
-                None,
+                decoupled_fields,
                 &config,
             )
             .map_err(|_| ApiError::Internal("the block failed to build"))?
@@ -862,6 +911,9 @@ mod tests {
             .layer(Extension(None::<EngineClient>))
             .layer(Extension(SharedSyncCommitteePool::default()))
             .layer(Extension(FeeRecipients::default()))
+            .layer(Extension(
+                None::<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
+            ))
             .layer(Extension(OwnVersion(Arc::new(
                 ethlambda_engine::types::ClientVersionV1 {
                     code: "LA".to_string(),

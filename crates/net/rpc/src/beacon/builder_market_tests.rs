@@ -272,6 +272,9 @@ impl World {
             .layer(Extension(self.market.clone()))
             .layer(Extension(self.fee_recipients.clone()))
             .layer(Extension(CustodyColumns::default()))
+            .layer(Extension(
+                None::<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
+            ))
             .layer(Extension(OwnVersion(Arc::new(
                 ethlambda_engine::types::ClientVersionV1 {
                     code: "LA".to_string(),

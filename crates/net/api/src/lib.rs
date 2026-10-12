@@ -7,6 +7,7 @@ use ethlambda_types::{
     beacon::containers::{
         DataColumnSidecar, SignedAggregateAndProof, SignedBeaconBlock,
         altair::{SignedContributionAndProof, SyncCommitteeMessage},
+        decoupled::{SignedCombinedAttestation, SignedGoldfishVote as BeaconSignedGoldfishVote},
         electra::SingleAttestation,
         gloas::{
             PayloadAttestationMessage, SignedExecutionPayloadBid, SignedExecutionPayloadEnvelope,
@@ -470,6 +471,15 @@ pub trait RpcToP2P: Send + Sync {
     fn publish_payload_attestation_message(
         &self,
         message: PayloadAttestationMessage,
+    ) -> Result<(), ActorError>;
+    /// Gossip a decoupled-fork Goldfish vote on `goldfish_vote`. The caller
+    /// validated it and added it to the shared decoupled node.
+    fn publish_goldfish_vote(&self, vote: BeaconSignedGoldfishVote) -> Result<(), ActorError>;
+    /// Gossip a decoupled-fork combined attestation on
+    /// `combined_attestation`, likewise already validated and added.
+    fn publish_combined_attestation(
+        &self,
+        attestation: SignedCombinedAttestation,
     ) -> Result<(), ActorError>;
 }
 

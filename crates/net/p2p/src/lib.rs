@@ -1243,6 +1243,7 @@ impl P2P {
             swarm_handle,
             store,
             blockchain: None,
+            decoupled_node: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),
@@ -1347,6 +1348,12 @@ pub struct P2PServer {
 
     // BlockChain protocol ref (set via InitBlockChain message)
     pub(crate) blockchain: Option<P2PToBlockChainRef>,
+
+    /// The decoupled fork's shared engine, on a beacon node whose network
+    /// schedules the fork (set via [`SetDecoupledNode`]). Gossip votes and
+    /// attestations are validated against the head state and added to it.
+    pub(crate) decoupled_node:
+        Option<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
 
     pub(crate) wire: Wire,
 
@@ -1872,6 +1879,42 @@ impl Handler<PublishExecutionPayloadBid> for P2PServer {
 impl Handler<PublishProposerPreferences> for P2PServer {
     async fn handle(&mut self, msg: PublishProposerPreferences, _ctx: &Context<Self>) {
         beacon::builder_market::publish_proposer_preferences(self, msg.preferences);
+    }
+}
+
+/// Hand the p2p actor the decoupled fork's shared engine.
+#[derive(Clone)]
+pub struct SetDecoupledNode(
+    pub ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode,
+);
+impl spawned_concurrency::message::Message for SetDecoupledNode {
+    type Result = ();
+}
+
+impl Handler<SetDecoupledNode> for P2PServer {
+    async fn handle(&mut self, msg: SetDecoupledNode, _ctx: &Context<Self>) {
+        self.decoupled_node = Some(msg.0);
+        info!("Decoupled node handed to the p2p actor");
+    }
+}
+
+impl Handler<ethlambda_network_api::rpc_to_p2p::PublishGoldfishVote> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::rpc_to_p2p::PublishGoldfishVote,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_goldfish_vote(self, msg.vote);
+    }
+}
+
+impl Handler<ethlambda_network_api::rpc_to_p2p::PublishCombinedAttestation> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::rpc_to_p2p::PublishCombinedAttestation,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_combined_attestation(self, msg.attestation);
     }
 }
 
@@ -3101,6 +3144,7 @@ pub(crate) mod test_support {
             swarm_handle,
             store,
             blockchain: None,
+            decoupled_node: None,
             wire: built.wire,
             connected_peers: HashMap::new(),
             peer_custody: HashMap::new(),

@@ -188,6 +188,9 @@ async fn spawn_server(
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
         .layer(Extension(engine))
+        .layer(Extension(
+            None::<ethlambda_state_transition::beacon::decoupled_node::SharedDecoupledNode>,
+        ))
         .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
             own_version(),
         ))));
