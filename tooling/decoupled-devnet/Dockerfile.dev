@@ -1,0 +1,26 @@
+# syntax=docker.io/docker/dockerfile:1.7-labs
+#
+# A development image for the decoupled devnets: release-fast (no LTO) with
+# BuildKit cache mounts for the registry and the target directory, so a rebuild
+# after an edit recompiles only the workspace crates that changed. The release
+# image (the repository's Dockerfile) rebuilds every dependency whenever a
+# manifest changes, which is the wrong trade while iterating on a devnet.
+#
+#   docker build -f tooling/decoupled-devnet/Dockerfile.dev \
+#     -t ghcr.io/lambdaclass/ethlambda:decoupled .
+FROM rust:1.97-bookworm AS builder
+RUN apt-get update && apt-get install -y libclang-dev pkg-config
+WORKDIR /app
+COPY --exclude=target . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --locked --profile release-fast --bin ethlambda \
+    && cp /app/target/release-fast/ethlambda /app/ethlambda
+
+FROM ubuntu AS runtime
+WORKDIR /app
+COPY --from=builder /app/ethlambda /usr/local/bin
+COPY LICENSE ./
+EXPOSE 9000/tcp 9000/udp 9001/udp 9001/tcp 5052 5054
+ENTRYPOINT ["/usr/local/bin/ethlambda"]

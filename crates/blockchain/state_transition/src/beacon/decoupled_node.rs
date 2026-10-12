@@ -495,3 +495,156 @@ pub fn validate_combined_attestation(
         .then_some(())
         .ok_or(DecoupledMessageError::BadSignature)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::beacon::containers::decoupled::{BeaconBlock, BeaconBlockBody};
+    use crate::beacon::decoupled::{process_decoupled_body, upgrade_to_decoupled};
+    use crate::beacon::fork::ForkName;
+    use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::preset::SLOTS_PER_EPOCH;
+    use ethlambda_types::decoupled::{FinalityVote, HeightVote};
+
+    const VALIDATORS: usize = 64;
+
+    /// A decoupled state at the first slot of epoch 1, with real keys.
+    fn decoupled_state(config: &Config) -> BeaconState {
+        let state = with_signing_validators_at(ForkName::Fulu, VALIDATORS);
+        let BeaconState::Fulu(inner) = state else {
+            unreachable!("built as fulu")
+        };
+        BeaconState::Decoupled(upgrade_to_decoupled(inner, config))
+    }
+
+    /// A config whose wall clock puts the current slot at `slot`: genesis
+    /// is set back by `slot` slots and half a slot.
+    fn config_at(slot: Slot) -> Config {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
+        let now = unix_now_ms() / 1000;
+        let slot_seconds = config.slot_duration_ms / 1000;
+        config.genesis_time = now - slot * slot_seconds - slot_seconds / 2;
+        config
+    }
+
+    #[test]
+    fn pooled_signatures_aggregate_into_a_body_the_state_transition_accepts() {
+        let slot = SLOTS_PER_EPOCH;
+        let config = config_at(slot);
+        let state = decoupled_state(&config);
+        let committees = CommitteeCache::default();
+        let genesis_root = Root::repeat_byte(0x11);
+        let mut node = DecoupledNode::new(&config, genesis_root, vec![32; VALIDATORS]);
+        node.sync();
+        assert_eq!(node.engine().current_slot(), slot);
+
+        // Every member of the previous slot's committee votes for genesis.
+        let previous = slot - 1;
+        let committee = slot_committee(&state, previous, &committees).unwrap();
+        assert!(!committee.is_empty());
+        let data = GoldfishVoteData {
+            slot: previous,
+            head: genesis_root,
+        };
+        let domain = get_domain_from_schedule(
+            &config,
+            &state,
+            DOMAIN_GOLDFISH_VOTE,
+            compute_epoch_at_slot(previous),
+        );
+        let root = compute_signing_root(data.hash_tree_root(), domain);
+        for &validator in &committee {
+            let vote = SignedGoldfishVote {
+                validator_index: validator,
+                data,
+                signature: sign_for(validator as usize, root),
+            };
+            validate_goldfish_vote(&state, &config, &committees, &vote).unwrap();
+            assert!(node.add_vote(&vote));
+        }
+
+        // Three validators attest for the current round with one data.
+        let round = node.params().round_of(slot);
+        let attestation_data = AttestationData::new(
+            round,
+            Some(genesis_root),
+            Some(HeightVote {
+                height: 1,
+                entry: genesis_root,
+                timeout: false,
+            }),
+            Some(FinalityVote {
+                height: 1,
+                target: genesis_root,
+            }),
+        );
+        let domain = get_domain_from_schedule(
+            &config,
+            &state,
+            DOMAIN_COMBINED_ATTESTATION,
+            compute_epoch_at_slot(node.params().opening_slot(round)),
+        );
+        let root = compute_signing_root(attestation_data.hash_tree_root(), domain);
+        for validator in [1u64, 4, 9] {
+            let attestation = SignedCombinedAttestation {
+                validator_index: validator,
+                data: attestation_data.clone(),
+                signature: sign_for(validator as usize, root),
+            };
+            validate_combined_attestation(&state, &config, &attestation).unwrap();
+            assert!(node.add_attestation(&attestation));
+        }
+        // A repeat is not admitted twice.
+        let repeat = SignedCombinedAttestation {
+            validator_index: 1,
+            data: attestation_data.clone(),
+            signature: sign_for(1, root),
+        };
+        assert!(!node.add_attestation(&repeat));
+
+        let proposal = node.proposal(slot).unwrap();
+        assert_eq!(proposal.parent_root, genesis_root);
+        let fields = node.body_fields(&proposal, &committee, state.validator_count());
+        assert_eq!(fields.goldfish_votes.len(), 1);
+        assert_eq!(fields.goldfish_support.get(0), Some(true));
+        assert_eq!(fields.combined_attestations.len(), 1);
+
+        let mut body = BeaconBlockBody::empty();
+        body.goldfish_votes = fields.goldfish_votes;
+        body.goldfish_support = fields.goldfish_support;
+        body.combined_attestations = fields.combined_attestations;
+        let block = BeaconBlock {
+            slot,
+            proposer_index: 0,
+            parent_root: genesis_root,
+            state_root: Root::ZERO,
+            body,
+        };
+        process_decoupled_body(&state, &block, &config, &committees, true)
+            .expect("aggregated signatures verify");
+    }
+
+    #[test]
+    fn a_vote_from_outside_the_committee_is_refused() {
+        let slot = SLOTS_PER_EPOCH;
+        let config = config_at(slot);
+        let state = decoupled_state(&config);
+        let committees = CommitteeCache::default();
+        let committee = slot_committee(&state, slot, &committees).unwrap();
+        let outsider = (0..VALIDATORS as u64)
+            .find(|v| !committee.contains(v))
+            .expect("64 validators do not all sit in one slot");
+        let vote = SignedGoldfishVote {
+            validator_index: outsider,
+            data: GoldfishVoteData {
+                slot,
+                head: Root::ZERO,
+            },
+            signature: BlsSignature::default(),
+        };
+        assert!(matches!(
+            validate_goldfish_vote(&state, &config, &committees, &vote),
+            Err(DecoupledMessageError::NotInCommittee { .. })
+        ));
+    }
+}
