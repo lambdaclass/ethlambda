@@ -3,7 +3,8 @@
 # Needs ethereum-package with ethlambda support (lambdaclass/ethereum-package,
 # branch add-ethlambda) and a local image of this branch:
 #
-#   make docker-build DOCKER_TAG=decoupled
+#   docker build -f tooling/decoupled-devnet/Dockerfile.dev \
+#     -t ghcr.io/lambdaclass/ethlambda:decoupled .
 #   kurtosis run --enclave decoupled <path-to>/ethereum-package \
 #     --args-file tooling/decoupled-devnet/beacon-kurtosis.yaml
 #
@@ -20,6 +21,9 @@ participants:
       - --decoupled-slots-per-round=4
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:decoupled
+    # Fulu at genesis needs a node custodying every column; 32 keys per node
+    # is below the package's 128-validator threshold for that.
+    supernode: true
     count: 4
 network_params:
   preset: mainnet
@@ -31,4 +35,10 @@ additional_services:
   # ethlambda does not report its ENR over the Beacon API, so a discv5
   # bootnode service is how the participants find each other.
   - bootnodoor
-  - dora
+# No dora: it decodes blocks by their version, and `decoupled` is not one it
+# knows. `GET /eth/v1/decoupled/status` on each node is the view instead.
+bootnodoor_params:
+  # bootnodoor filters ENRs by the fork digest it derives from the config,
+  # which has no decoupled fork: every participant's digest would be refused.
+  extra_args:
+    - --serve-all

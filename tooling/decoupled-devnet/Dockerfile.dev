@@ -8,6 +8,18 @@
 #
 #   docker build -f tooling/decoupled-devnet/Dockerfile.dev \
 #     -t ghcr.io/lambdaclass/ethlambda:decoupled .
+#
+# On a slow link, seed the registry and git sources from the host instead of
+# fetching them: pass a directory holding `registry/index`, `registry/cache`
+# and the `git/db` repositories the lockfile names (a copy, or hard links, of
+# those parts of `~/.cargo`), and the build runs offline.
+#
+#   docker build -f tooling/decoupled-devnet/Dockerfile.dev \
+#     --build-context cargoseed=<dir> -t ghcr.io/lambdaclass/ethlambda:decoupled .
+
+# Empty unless `--build-context cargoseed=<dir>` replaces it.
+FROM scratch AS cargoseed
+
 FROM rust:1.97-bookworm AS builder
 RUN apt-get update && apt-get install -y libclang-dev pkg-config
 WORKDIR /app
@@ -15,7 +27,15 @@ COPY --exclude=target . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --locked --profile release-fast --bin ethlambda \
+    --mount=type=bind,from=cargoseed,target=/cargoseed \
+    offline=""; \
+    if [ -d /cargoseed/registry ]; then \
+        cp -a /cargoseed/registry/. /usr/local/cargo/registry/ \
+        && mkdir -p /usr/local/cargo/git \
+        && cp -a /cargoseed/git/. /usr/local/cargo/git/ \
+        && offline="--offline"; \
+    fi \
+    && cargo build --locked $offline --profile release-fast --bin ethlambda \
     && cp /app/target/release-fast/ethlambda /app/ethlambda
 
 FROM ubuntu AS runtime
