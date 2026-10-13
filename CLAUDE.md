@@ -632,8 +632,12 @@ existing once per chain.
   - The fork has no LMD attestations: the `beacon_aggregate_and_proof` topic
     and attestation subnets are not subscribed, attestation/aggregate gossip
     and API calls for a decoupled slot are ignored or answered 400, and the VC
-    skips attestation and aggregation there. `goldfish_vote` and
-    `combined_attestation` topics are routed to a stub that ignores them.
+    skips attestation and aggregation there. Its own global topics,
+    `goldfish_vote` and `combined_attestation`, decode inline and run their
+    signature and committee checks plus the engine's admission on the
+    attestation permit pool (`Validated::Decoupled`); accepted means the
+    shared `DecoupledNode` took it. The engine, its Beacon API duty endpoints
+    and the VC's duties are in `docs/decoupled_consensus.md`.
 - Preset is a **compile-time** choice (`preset-minimal` feature on this crate)
   because SSZ container bounds are const-generic arguments; fork scheduling is
   runtime (`beacon::config`) instead. Every lean crate depends on
