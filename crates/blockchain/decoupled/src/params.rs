@@ -119,11 +119,15 @@ mod tests {
     fn validation_enforces_the_structural_floors() {
         assert!(Params::default().validate().is_ok());
         assert!(Params::with_lock_period(1).validate().is_err());
-        let mut params = Params::default();
-        params.nonjustifiable_period = 3;
-        assert!(params.validate().is_err());
-        let mut params = Params::default();
-        params.finality_debt = 1;
-        assert!(params.validate().is_err());
+        let short_period = Params {
+            nonjustifiable_period: 3,
+            ..Params::default()
+        };
+        assert!(short_period.validate().is_err());
+        let small_debt = Params {
+            finality_debt: 1,
+            ..Params::default()
+        };
+        assert!(small_debt.validate().is_err());
     }
 }

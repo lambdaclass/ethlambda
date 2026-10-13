@@ -8,15 +8,15 @@
 #
 # Environment: N (nodes, default 4), DIR (work dir, default
 # /tmp/ethlambda-decoupled-lean), BIN (ethlambda binary, default
-# target/release-fast/ethlambda), SLOT_MS (default 4000), ROUND (slots per
-# round, default 3), GENESIS_DELAY (seconds, default 30).
+# target/release-fast/ethlambda), SLOT_MS (default 4000), LOCK_PERIOD
+# (Goldilocks' k, default 4), GENESIS_DELAY (seconds, default 30).
 set -euo pipefail
 
 N=${N:-4}
 DIR=${DIR:-/tmp/ethlambda-decoupled-lean}
 BIN=${BIN:-target/release-fast/ethlambda}
 SLOT_MS=${SLOT_MS:-4000}
-ROUND=${ROUND:-3}
+LOCK_PERIOD=${LOCK_PERIOD:-4}
 GENESIS_DELAY=${GENESIS_DELAY:-30}
 
 gossip_port() { echo $((9300 + $1)); }
@@ -36,7 +36,7 @@ start() {
     echo "GENESIS_TIME: $genesis"
     echo "MILLISECONDS_PER_SLOT: $SLOT_MS"
     echo "DECOUPLED_CONSENSUS: true"
-    echo "DECOUPLED_SLOTS_PER_ROUND: $ROUND"
+    echo "DECOUPLED_LOCK_PERIOD: $LOCK_PERIOD"
     echo "GENESIS_VALIDATORS:"
     for i in $(seq 0 $((N - 1))); do
       echo "  - attestation_pubkey: \"$(hex_of "$DIR/keys/validator_${i}_attester_key_pk.ssz")\""

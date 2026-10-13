@@ -1,6 +1,6 @@
 [package]
 name = "ethlambda-decoupled"
-description = "Chain-agnostic decoupled consensus protocol: Goldfish, graded stabilization gadget, height-based finality gadget"
+description = "Chain-agnostic decoupled consensus protocol (Goldilocks): Goldfish with locks, height-based finality gadget"
 authors.workspace = true
 edition.workspace = true
 keywords.workspace = true

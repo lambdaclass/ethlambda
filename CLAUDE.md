@@ -610,7 +610,7 @@ existing once per chain.
 - **`ForkName::Decoupled` sits between `Fulu` and `Gloas`** (storage selector
   8; selectors are never renumbered) so `>= Fulu` gates include it and
   `>= Gloas` gates exclude it. It is the decoupled consensus protocol
-  (`crates/blockchain/decoupled`): state is **fulu's container**
+  (Goldilocks, `crates/blockchain/decoupled`): state is **fulu's container**
   (`BeaconState::Decoupled(fulu::BeaconState)`, so match
   `Fulu(s) | Decoupled(s)`), the block is its own
   (`SignedBeaconBlock::Decoupled`, electra's body plus the three protocol
@@ -624,7 +624,7 @@ existing once per chain.
     `Config::{next,previous}_scheduled_fork`. A network never schedules both
     decoupled and gloas (`Config::validate_fork_schedule`, run when a network
     is resolved); `upgrade_to_gloas` refuses a decoupled state as well.
-  - `ethlambda beacon --decoupled-fork-epoch N [--decoupled-slots-per-round R]`
+  - `ethlambda beacon --decoupled-fork-epoch N [--decoupled-lock-period K]`
     override the loaded network's config before anything reads it. A fulu
     genesis at decoupled epoch 0 is decoded as fulu and upgraded at load
     (`beacon::genesis_at_decoupled`, which also re-stamps the header's body

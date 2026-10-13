@@ -18,7 +18,7 @@ participants:
     cl_image: ghcr.io/lambdaclass/ethlambda:decoupled
     cl_extra_params:
       - --decoupled-fork-epoch=0
-      - --decoupled-slots-per-round=4
+      - --decoupled-lock-period=4
     vc_type: ethlambda
     vc_image: ghcr.io/lambdaclass/ethlambda:decoupled
     # Fulu at genesis needs a node custodying every column; 32 keys per node
