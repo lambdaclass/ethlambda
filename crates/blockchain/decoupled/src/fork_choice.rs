@@ -1,13 +1,23 @@
-//! The composed fork choice (PROTOCOL.md figure `alg:fc-full`, appendix A.5,
-//! A.10): viability, the FG root, the filtered tree, the Goldfish score and
-//! the GHOST walk from the SG root.
+//! The available chain's fork choice, constrained by the finality gadget:
+//! the frame (root and height floor), the filtered tree, the Goldfish score
+//! and the walk from the lock anchor.
+//!
+//! ```text
+//! blocks ─▶ state transition ─▶ F, J, h_max ─▶ frame ─▶ filtered tree ─┐
+//!                                          locks ─▶ anchor ────────────┼─▶ walk ─▶ head
+//!                                 Goldfish votes ─▶ scores ────────────┘
+//! ```
+//!
+//! Locks give the anchor, votes give the walk. Network attestations are not
+//! an input: they reach the fork choice only through the chain states of the
+//! blocks that carry them.
 
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_types::primitives::H256;
 
 use crate::store::Store;
-use crate::types::{GoldfishVote, Slot, ValidatorIndex};
+use crate::types::{BlockRef, GoldfishVote, Slot, ValidatorIndex};
 
 /// The vote sets a Goldfish walk reads: `votes` decides participation and
 /// equivocation, `support_votes ⊆ votes` decides subtree support.
@@ -50,15 +60,6 @@ impl Scores {
 }
 
 impl Store {
-    /// `get_fg_root(Σ)`: `Σ.J` when `h_max = h_j + 1`, else `Σ.F`.
-    pub fn fg_root(&self) -> H256 {
-        if self.max_height == self.justified_height + 1 {
-            self.justified
-        } else {
-            self.finalized
-        }
-    }
-
     /// For every descendant of `root` inside `view` (all of `Σ.𝒯` when
     /// `None`), the largest chain-state height in its subtree within `view`.
     /// `view` must be parent-closed, which both views the protocol uses are.
@@ -92,7 +93,8 @@ impl Store {
     }
 
     /// `viable_tree(Σ) ∋ B`: `Σ.F ⪯ B` and some processed descendant of `B`
-    /// has state height at least `h_max − 1`.
+    /// has state height at least `h_max − 1`. Finalization reads this; the
+    /// fork choice reads the frame's floor instead.
     pub(crate) fn is_viable(&self, block: &H256) -> bool {
         if !self.is_ancestor(&self.finalized, block) {
             return false;
@@ -103,17 +105,14 @@ impl Store {
             .is_some_and(|&h| h >= threshold)
     }
 
-    /// `get_filtered_block_tree_from(Σ, blocks)`: the viable blocks of the
-    /// view that descend from the FG root, viability recomputed inside the
-    /// view. `None` is the full processed tree.
+    /// The viable blocks of the view that descend from the frame's root:
+    /// those with a descendant in the view at the frame's floor or above.
+    /// `None` is the full processed tree.
     pub(crate) fn filtered_tree(&self, view: Option<&HashSet<H256>>) -> HashSet<H256> {
-        let root = self.fg_root();
-        let threshold = self.max_height.saturating_sub(1);
-        // `Σ.F ⪯ root` always holds, so the descendants of the root are
-        // descendants of `Σ.F`.
-        self.subtree_max_heights(&root, view)
+        let frame = self.frame;
+        self.subtree_max_heights(&frame.root, view)
             .into_iter()
-            .filter(|(_, h)| *h >= threshold)
+            .filter(|(_, h)| *h >= frame.floor)
             .map(|(block, _)| block)
             .collect()
     }
@@ -206,7 +205,7 @@ impl Store {
     }
 
     /// `goldfish_eligible(Σ, votes, support_votes, s, B)`: a child of a block
-    /// below the height band is eligible outright; otherwise it needs a
+    /// below the frame's floor is eligible outright; otherwise it needs a
     /// majority, unless it is a current-slot proposal.
     pub(crate) fn goldfish_eligible(&self, scores: &Scores, block: &H256) -> bool {
         let Some(node) = self.node(block) else {
@@ -217,29 +216,27 @@ impl Store {
             .and_then(|parent| self.node(&parent))
             .map(|parent| parent.state.height)
             .unwrap_or(node.state.height);
-        parent_height < self.max_height.saturating_sub(1)
-            || scores.majority(block)
-            || node.slot == self.slot
+        parent_height < self.frame.floor || scores.majority(block) || node.slot == self.slot
     }
 
-    /// `get_head_in_tree(Σ, tree, votes, support_votes, k)`: the Goldfish walk
-    /// from the SG root over `tree`.
+    /// The Goldfish walk over `tree` and the votes of `slot`, from the deepest
+    /// live lock in `tree` (or the frame's root when none is live).
     pub(crate) fn head_in_tree(&self, tree: &HashSet<H256>, view: &VoteView, slot: Slot) -> H256 {
-        let anchor = self.sg_root();
+        let anchor = self.anchor_in(tree, slot);
         let scores = self.scores(view, slot, &anchor);
         self.ghost(anchor, tree, &scores, |block| {
             self.goldfish_eligible(&scores, block)
         })
     }
 
-    /// `get_head(Σ, votes, support_votes, k)` over the full filtered tree.
+    /// The walk over the full filtered tree.
     pub fn head_with(&self, view: &VoteView, slot: Slot) -> H256 {
         let tree = self.filtered_tree(None);
         self.head_in_tree(&tree, view, slot)
     }
 
     /// The pool's votes for `slot` as a view: every held vote, and the
-    /// resolved ones as support (the proposer's view, `propose_block`).
+    /// resolved ones as support (the proposer's view).
     pub(crate) fn pool_view(&self, slot: Slot) -> VoteView {
         let votes = self.goldfish_votes(slot);
         let support = votes
@@ -250,18 +247,40 @@ impl Store {
         VoteView::new(votes, support)
     }
 
-    /// The node's current fork-choice head: the walk a proposer at the next
-    /// opportunity would take, over the latest slot that has votes.
+    /// The slot whose votes [`Store::head`] reads: the current slot once it
+    /// has votes, else the previous one.
+    fn head_slot(&self) -> Slot {
+        let slot = self.slot;
+        if self
+            .gf_votes
+            .get(&slot)
+            .is_some_and(|pool| !pool.is_empty())
+        {
+            slot
+        } else {
+            slot.saturating_sub(1)
+        }
+    }
+
+    /// The node's current fork-choice head: the walk over the latest slot
+    /// that has votes.
     ///
     /// The protocol has no single "head"; this is what the host reports to
-    /// users and to the execution layer.
+    /// users and to the execution layer, and what attestations read their
+    /// finality pair from.
     pub fn head(&self) -> H256 {
-        let slot = self.slot;
-        let current = self.pool_view(slot);
-        if !current.votes.is_empty() {
-            return self.head_with(&current, slot);
-        }
-        let previous = slot.saturating_sub(1);
-        self.head_with(&self.pool_view(previous), previous)
+        let slot = self.head_slot();
+        self.head_with(&self.pool_view(slot), slot)
+    }
+
+    /// The confirmed (locked) tip: the anchor of [`Store::head`]'s walk when
+    /// it is a live lock, else `Σ.F`. `Σ.F ⪯ confirmed ⪯ head` by
+    /// construction, since the walk starts at the anchor.
+    pub fn confirmed(&self) -> BlockRef {
+        let tree = self.filtered_tree(None);
+        let root = self
+            .deepest_live_lock(&tree, self.head_slot())
+            .unwrap_or(self.finalized);
+        self.block_ref(&root).expect("locks are processed blocks")
     }
 }

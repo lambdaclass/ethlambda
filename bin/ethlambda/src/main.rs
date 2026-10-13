@@ -549,7 +549,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             let decoupled = if lean.decoupled || genesis_config.decoupled.enabled {
                 let setup = decoupled_setup(
                     &genesis_config,
-                    lean.decoupled_slots_per_round,
+                    lean.decoupled_lock_period,
                     std::mem::take(&mut validator_keys),
                 )?;
                 Some(setup)
@@ -995,7 +995,7 @@ fn beacon_decoupled_node(
     info!(
         genesis_root = %ethlambda_types::ShortRoot(&anchor.root.0),
         validators,
-        slots_per_round = config.decoupled_slots_per_round,
+        lock_period = config.decoupled_lock_period,
         replayed,
         "Running the decoupled fork from genesis"
     );
@@ -1010,22 +1010,19 @@ fn beacon_decoupled_node(
 /// milliseconds.
 fn decoupled_setup(
     genesis: &GenesisConfig,
-    slots_per_round_override: Option<u64>,
+    lock_period_override: Option<u64>,
     validator_keys: HashMap<u64, ValidatorKeyPair>,
 ) -> eyre::Result<DecoupledSetup> {
     let keys = &genesis.decoupled;
-    let slots_per_round = slots_per_round_override
-        .or(keys.slots_per_round)
-        .unwrap_or(3);
-    let mut params = ethlambda_decoupled::Params::with_round_length(slots_per_round);
-    if let Some(window) = keys.sg_window {
-        params.eta_sg = window;
-    }
+    let lock_period = lock_period_override
+        .or(keys.lock_period)
+        .unwrap_or(ethlambda_decoupled::DEFAULT_LOCK_PERIOD);
+    let mut params = ethlambda_decoupled::Params::with_lock_period(lock_period);
     if let Some(period) = keys.nonjustifiable_period {
-        params.k = period;
+        params.nonjustifiable_period = period;
     }
     if let Some(debt) = keys.finality_debt {
-        params.d = debt;
+        params.finality_debt = debt;
     }
     if let Some(delay) = keys.timeout_delay {
         params.timeout_delay = delay;
@@ -1052,10 +1049,9 @@ fn decoupled_setup(
         })
         .collect();
     info!(
-        slots_per_round = params.slots_per_round,
-        sg_window = params.eta_sg,
-        nonjustifiable_period = params.k,
-        finality_debt = params.d,
+        lock_period = params.lock_period,
+        nonjustifiable_period = params.nonjustifiable_period,
+        finality_debt = params.finality_debt,
         timeout_delay = params.timeout_delay,
         genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
         "Decoupled consensus configured"
@@ -1814,8 +1810,7 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         // rules, so they are compared below too.
         decoupled_fork_version: _,
         decoupled_fork_epoch: _,
-        decoupled_slots_per_round: _,
-        decoupled_sg_window: _,
+        decoupled_lock_period: _,
         decoupled_nonjustifiable_period: _,
         decoupled_finality_debt: _,
         decoupled_timeout_delay: _,
@@ -1954,8 +1949,7 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         fulu_fork_epoch,
         decoupled_fork_version,
         decoupled_fork_epoch,
-        decoupled_slots_per_round,
-        decoupled_sg_window,
+        decoupled_lock_period,
         decoupled_nonjustifiable_period,
         decoupled_finality_debt,
         decoupled_timeout_delay,

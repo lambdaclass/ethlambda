@@ -1,4 +1,4 @@
-//! Engine-side types (PROTOCOL.md §1, appendix A.2/A.6/A.9).
+//! Engine-side types.
 //!
 //! The wire payloads (votes, attestations, the chain state) live in
 //! [`ethlambda_types::decoupled`] so both chains' containers can embed them;
@@ -10,21 +10,21 @@
 use ethlambda_types::primitives::H256;
 
 pub use ethlambda_types::decoupled::{
-    Attestation, AttestationData, BlockRef, FinalityVote, GoldfishVote, Height, HeightVote, Round,
-    SgKey, Slot, VALIDATOR_LIMIT, ValidatorIndex,
+    Attestation, AttestationData, BlockRef, FinalityVote, GoldfishVote, Height, HeightVote,
+    LockStatus, Slot, VALIDATOR_LIMIT, ValidatorIndex,
 };
 
 /// Time on the protocol's public grid, in units of `Δ` since genesis.
 ///
 /// Slot `s` starts at `4s` (`t_s = 4Δs`). Every public time of the protocol is
 /// a multiple of `Δ`, so integer ticks represent all of them exactly. An object
-/// processed between two public times is stamped with the earlier one
-/// (PROTOCOL.md §2), which is `floor(elapsed / Δ)`.
+/// processed between two public times is stamped with the earlier one, which
+/// is `floor(elapsed / Δ)`.
 pub type Tick = i64;
 
-/// The protocol content of a block, as the engine's `on_block` reads it
-/// (appendix A.2 and §1.4): identity, the carried Goldfish votes and their
-/// proposal-time support subset, and the carried combined attestations.
+/// The protocol content of a block, as the engine's `on_block` reads it:
+/// identity, the carried Goldfish votes and their proposal-time support
+/// subset, and the carried attestations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockInput {
     pub root: H256,
@@ -35,14 +35,15 @@ pub struct BlockInput {
     pub votes: Vec<GoldfishVote>,
     /// `B.support_votes ⊆ B.votes`: the members resolved at proposal time.
     pub support_votes: Vec<GoldfishVote>,
-    /// `B.attestations`: combined attestations, read by the state transition
-    /// and offered to the SG pool.
+    /// `B.attestations`: finality attestations, read by the state transition
+    /// and offered to the attestation pool.
     pub attestations: Vec<Attestation>,
 }
 
-/// Validator weights (appendix A.6): `w(v)`, `W` and the quorum `q = ⌈2W/3⌉`.
+/// Validator weights for the finality gadget: `w(v)`, `W` and the quorum
+/// `q = ⌈2W/3⌉`.
 ///
-/// The validator set is fixed for an execution (MODELING_CHOICES §5.4).
+/// The validator set is fixed for an execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Electorate {
     weights: Vec<u64>,

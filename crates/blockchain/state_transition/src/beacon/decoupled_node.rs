@@ -33,17 +33,20 @@ use crate::beacon::containers::decoupled::{
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
 use crate::beacon::primitives::{BlsSignature, Root, Slot, ValidatorIndex};
 use ethlambda_decoupled::{
-    AttestationInput, BlockError, BlockInput, Electorate, Params, Proposal, Store as Engine,
+    AttestationInput, BlockError, BlockInput, CommitteeSizes, Electorate, Params, Proposal,
+    Store as Engine,
 };
 use ethlambda_types::decoupled::{
-    Attestation, AttestationData, BlockRef, DecoupledStatus, GoldfishVote, Round,
+    Attestation, AttestationData, BlockRef, DecoupledStatus, GoldfishVote,
 };
 use ethlambda_types::primitives::HashTreeRoot as _;
 use ethlambda_types::time::unix_now_ms;
 use libssz_types::{SszBitlist, SszList};
 
 use crate::beacon::bls;
-use crate::beacon::decoupled::{DecoupledBodyFields, params, slot_committee};
+use crate::beacon::decoupled::{
+    DecoupledBodyFields, attestation_signing_epoch, params, slot_committee, slot_committee_size,
+};
 use crate::beacon::helpers::accessors::{CommitteeCache, get_domain_from_schedule};
 
 /// The shared handle.
@@ -72,8 +75,6 @@ pub enum DecoupledMessageError {
 pub enum DutyError {
     #[error("slot {asked} is not the current slot {current}")]
     WrongSlot { asked: Slot, current: Slot },
-    #[error("round {asked} is not the current round {current}")]
-    WrongRound { asked: Round, current: Round },
     #[error("the decoupled clock has not reached genesis")]
     BeforeGenesis,
 }
@@ -86,32 +87,40 @@ pub struct DecoupledNode {
     /// Individual signatures behind pooled votes, by slot and data.
     vote_signatures:
         BTreeMap<Slot, HashMap<GoldfishVoteData, BTreeMap<ValidatorIndex, BlsSignature>>>,
-    /// Individual signatures behind pooled attestations, by round and data.
-    attestation_signatures:
-        BTreeMap<Round, HashMap<AttestationData, BTreeMap<ValidatorIndex, BlsSignature>>>,
-    /// Aggregates carried by imported blocks, by round, for attestations this
-    /// node never saw individually: an aggregate can only be included whole.
-    carried_attestations: BTreeMap<Round, Vec<CombinedAttestationAggregate>>,
+    /// Individual signatures behind pooled attestations, by data. Pruned with
+    /// the engine's pool: data that can no longer count anywhere goes.
+    attestation_signatures: HashMap<AttestationData, BTreeMap<ValidatorIndex, BlsSignature>>,
+    /// Aggregates carried by imported blocks, for attestations this node
+    /// never saw individually: an aggregate can only be included whole.
+    carried_attestations: Vec<CombinedAttestationAggregate>,
     /// `goldfish_vote_head()` as of each slot's vote instant.
     vote_heads: BTreeMap<Slot, Root>,
-    /// `attestation_input()` as of each round's attestation instant.
-    attestation_inputs: BTreeMap<Round, AttestationInput>,
+    /// `attestation_input()` as of each slot's attestation instant.
+    attestation_inputs: BTreeMap<Slot, AttestationInput>,
 }
 
 impl DecoupledNode {
     /// A node anchored at the genesis block, for a chain that runs the
     /// decoupled fork from genesis. `weights` are the validators' effective
     /// balances (in increments), fixed for the execution.
+    ///
+    /// The slot committees `𝒦_s` are the slot's beacon committees, whose
+    /// sizes follow from the number of active validators alone; that number
+    /// is the count of validators with weight, fixed with the weights.
     pub fn new(config: &Config, genesis_block_root: Root, weights: Vec<u64>) -> Self {
         let params = params(config);
+        let active = weights.iter().filter(|weight| **weight > 0).count() as u64;
+        let sizes = CommitteeSizes::new(move |slot| slot_committee_size(active, slot));
+        let engine = Engine::from_genesis(params, Electorate::new(weights), genesis_block_root)
+            .with_committee_sizes(sizes);
         Self {
-            engine: Engine::from_genesis(params, Electorate::new(weights), genesis_block_root),
+            engine,
             params,
             genesis_time_ms: config.genesis_time * 1000,
             delta_ms: config.slot_duration_ms / 4,
             vote_signatures: BTreeMap::new(),
-            attestation_signatures: BTreeMap::new(),
-            carried_attestations: BTreeMap::new(),
+            attestation_signatures: HashMap::new(),
+            carried_attestations: Vec::new(),
             vote_heads: BTreeMap::new(),
             attestation_inputs: BTreeMap::new(),
         }
@@ -148,9 +157,9 @@ impl DecoupledNode {
                 let head = self.engine.goldfish_vote_head();
                 self.vote_heads.insert(event.slot, head);
             }
-            if let Some(round) = event.attest {
+            if event.attest {
                 let input = self.engine.attestation_input();
-                self.attestation_inputs.insert(round, input);
+                self.attestation_inputs.insert(event.slot, input);
             }
         }
         if ran {
@@ -161,13 +170,14 @@ impl DecoupledNode {
 
     fn prune(&mut self) {
         let slot = self.engine.current_slot();
-        let round = self.engine.current_round();
-        let oldest_round = round.saturating_sub(self.params.eta_sg);
         self.vote_signatures = self.vote_signatures.split_off(&slot.saturating_sub(1));
-        self.attestation_signatures = self.attestation_signatures.split_off(&oldest_round);
-        self.carried_attestations = self.carried_attestations.split_off(&oldest_round);
+        let engine = &self.engine;
+        self.attestation_signatures
+            .retain(|data, _| engine.attestation_is_useful(data));
+        self.carried_attestations
+            .retain(|aggregate| engine.attestation_is_useful(&aggregate.data));
         self.vote_heads = self.vote_heads.split_off(&slot.saturating_sub(2));
-        self.attestation_inputs = self.attestation_inputs.split_off(&round.saturating_sub(1));
+        self.attestation_inputs = self.attestation_inputs.split_off(&slot.saturating_sub(1));
     }
 
     // ── Duties ─────────────────────────────────────────────────────────────
@@ -191,18 +201,21 @@ impl DecoupledNode {
         Ok(GoldfishVoteData { slot, head })
     }
 
-    /// The attestation input of `round`, as of `a_r`.
-    pub fn attestation_input(&mut self, round: Round) -> Result<AttestationInput, DutyError> {
+    /// The attestation input of `slot`, as of `t_s + 2Δ` (right after the
+    /// confirmation update of `slot − 1`).
+    pub fn attestation_input(&mut self, slot: Slot) -> Result<AttestationInput, DutyError> {
         self.sync();
-        let current = self.engine.current_round();
-        if round != current {
-            return Err(DutyError::WrongRound {
-                asked: round,
+        let current = self.engine.current_slot();
+        if slot != current {
+            return Err(DutyError::WrongSlot {
+                asked: slot,
                 current,
             });
         }
-        Ok(match self.attestation_inputs.get(&round) {
+        Ok(match self.attestation_inputs.get(&slot) {
             Some(input) => *input,
+            // Asked before the attestation instant, or by a node that
+            // started after it: the input the duty would read now.
             None => self.engine.attestation_input(),
         })
     }
@@ -304,10 +317,7 @@ impl DecoupledNode {
         let mut combined_attestations = Vec::new();
         let mut uncovered: Vec<Attestation> = Vec::new();
         for (data, validators) in by_data {
-            let signatures = self
-                .attestation_signatures
-                .get(&data.round)
-                .and_then(|pool| pool.get(&data));
+            let signatures = self.attestation_signatures.get(&data);
             let mut bits = vec![false; validator_count];
             let mut parts = Vec::new();
             for validator in validators {
@@ -335,18 +345,13 @@ impl DecoupledNode {
         }
         // Rows only another block's aggregate can vouch for.
         for attestation in uncovered {
-            let carrier = self
-                .carried_attestations
-                .get(&attestation.data.round)
-                .and_then(|aggregates| {
-                    aggregates.iter().find(|aggregate| {
-                        aggregate.data == attestation.data
-                            && aggregate
-                                .aggregation_bits
-                                .get(attestation.validator as usize)
-                                == Some(true)
-                    })
-                });
+            let carrier = self.carried_attestations.iter().find(|aggregate| {
+                aggregate.data == attestation.data
+                    && aggregate
+                        .aggregation_bits
+                        .get(attestation.validator as usize)
+                        == Some(true)
+            });
             if let Some(aggregate) = carrier
                 && !combined_attestations.contains(aggregate)
             {
@@ -387,14 +392,12 @@ impl DecoupledNode {
     /// Admit an attestation that passed [`validate_combined_attestation`].
     pub fn add_attestation(&mut self, attestation: &SignedCombinedAttestation) -> bool {
         self.sync();
-        let admitted = self.engine.on_sg_vote(Attestation {
+        let admitted = self.engine.on_attestation(Attestation {
             validator: attestation.validator_index,
             data: attestation.data.clone(),
         });
         if admitted {
             self.attestation_signatures
-                .entry(attestation.data.round)
-                .or_default()
                 .entry(attestation.data.clone())
                 .or_default()
                 .insert(attestation.validator_index, attestation.signature);
@@ -411,10 +414,11 @@ impl DecoupledNode {
         self.sync();
         self.engine.on_block(input)?;
         for aggregate in attestations {
-            self.carried_attestations
-                .entry(aggregate.data.round)
-                .or_default()
-                .push(aggregate.clone());
+            if self.engine.attestation_is_useful(&aggregate.data)
+                && !self.carried_attestations.contains(aggregate)
+            {
+                self.carried_attestations.push(aggregate.clone());
+            }
         }
         Ok(())
     }
@@ -429,21 +433,23 @@ impl DecoupledNode {
         let engine = &self.engine;
         let head = engine.head();
         let (justified, justified_height) = engine.justified();
+        let frame = engine.frame();
         DecoupledStatus {
             slot: engine.current_slot(),
-            round: engine.current_round(),
             head: engine.block_ref(&head).unwrap_or(BlockRef {
                 root: head,
                 slot: 0,
             }),
             confirmed: engine.confirmed(),
-            stable: engine.stable(),
+            fg_confirmed: engine.fg_confirmed(),
+            locks: engine.locks(),
             finalized: engine.finalized(),
             finalized_height: engine.finalized_height(),
             justified,
             justified_height,
             max_height: engine.max_height(),
-            live_confirmed: engine.live_confirmed(),
+            fc_root: engine.block_ref(&frame.root).unwrap_or_default(),
+            height_floor: frame.floor,
             blocks: engine.blocks().count() as u64,
         }
     }
@@ -487,8 +493,7 @@ pub fn validate_combined_attestation(
         .validator(attestation.validator_index)
         .map(|validator| validator.pubkey)
         .map_err(|_| DecoupledMessageError::UnknownValidator(attestation.validator_index))?;
-    let opening = params(config).opening_slot(attestation.data.round);
-    let epoch = compute_epoch_at_slot(opening);
+    let epoch = attestation_signing_epoch(config);
     let domain = get_domain_from_schedule(config, state, DOMAIN_COMBINED_ATTESTATION, epoch);
     let root = compute_signing_root(attestation.data.hash_tree_root(), domain);
     bls::verify(&pubkey, root, &attestation.signature)
@@ -563,11 +568,8 @@ mod tests {
             assert!(node.add_vote(&vote));
         }
 
-        // Three validators attest for the current round with one data.
-        let round = node.params().round_of(slot);
+        // Three validators attest with one data.
         let attestation_data = AttestationData::new(
-            round,
-            Some(genesis_root),
             Some(HeightVote {
                 height: 1,
                 entry: genesis_root,
@@ -582,7 +584,7 @@ mod tests {
             &config,
             &state,
             DOMAIN_COMBINED_ATTESTATION,
-            compute_epoch_at_slot(node.params().opening_slot(round)),
+            attestation_signing_epoch(&config),
         );
         let root = compute_signing_root(attestation_data.hash_tree_root(), domain);
         for validator in [1u64, 4, 9] {

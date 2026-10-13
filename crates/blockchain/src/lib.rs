@@ -1075,7 +1075,7 @@ impl BlockChainServer {
                 // votes have to be in fork choice before the head this tick
                 // reports is chosen.
                 self.drain_deferred_aggregates();
-                // The decoupled engine's grades and confirmation run on its
+                // The decoupled engine's locks and confirmation run on its
                 // own Δ grid, before the head it picks is read.
                 self.decoupled_tick();
                 self.recompute_beacon_head().await;
@@ -2584,12 +2584,13 @@ impl BlockChainServer {
         // for a pre-gloas head, which keeps its own cached payload hash;
         // `None` there means a follower still on its checkpoint anchor.
         let mut plan = beacon_payloads::forkchoice_plan(&self.store, head_root)?;
-        // The decoupled fork's safe and finalized blocks are its stable and
-        // finalized tips: the legacy checkpoints stay at the fork boundary.
+        // The decoupled fork's safe and finalized blocks are its confirmed
+        // (locked) and finalized tips: the legacy checkpoints stay at the
+        // fork boundary.
         if self.decoupled_active()
-            && let Some((stable, finalized)) = self.decoupled_safe_and_finalized()
+            && let Some((confirmed, finalized)) = self.decoupled_safe_and_finalized()
         {
-            plan.state.safe_block_hash = beacon_payloads::checkpoint_hash(&self.store, stable);
+            plan.state.safe_block_hash = beacon_payloads::checkpoint_hash(&self.store, confirmed);
             plan.state.finalized_block_hash =
                 beacon_payloads::checkpoint_hash(&self.store, finalized);
         }
@@ -3716,7 +3717,7 @@ impl BlockChainServer {
         let config = self.store.config();
         match &self.duties {
             ChainDuties::Lean(_) => ms_until_next_interval(now_ms, &config.time_grid()),
-            // The decoupled fork's duties and grades fall on a quarter-slot grid.
+            // The decoupled fork's duties and locks fall on a quarter-slot grid.
             ChainDuties::Beacon if self.decoupled.is_some() => ms_until_next_boundary(
                 now_ms,
                 config.genesis_time_ms(),

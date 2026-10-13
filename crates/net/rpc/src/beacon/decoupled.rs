@@ -4,13 +4,13 @@
 //!   slot-`s` committee member votes for, as of `t_s + Δ`.
 //! - `POST /eth/v1/beacon/pool/goldfish_votes`: signed votes, checked as
 //!   gossip would, pooled for proposals and gossiped.
-//! - `GET /eth/v1/validator/decoupled/attestation_input?round=`: what the
-//!   validator client's anti-slashing record turns into a combined
-//!   attestation, as of the round's attestation time `a_r`.
+//! - `GET /eth/v1/validator/decoupled/attestation_input?slot=`: what the
+//!   validator client's anti-slashing record turns into an attestation, as of
+//!   the slot's attestation instant `t_s + 2Δ`.
 //! - `POST /eth/v1/beacon/pool/combined_attestations`: signed attestations,
 //!   checked, pooled and gossiped.
-//! - `GET /eth/v1/decoupled/status`: the node's head, confirmed, stable,
-//!   justified and finalized blocks and heights.
+//! - `GET /eth/v1/decoupled/status`: the node's head, confirmed (locked)
+//!   tip, live locks, frame, and justified and finalized blocks and heights.
 //!
 //! The record Λ stays in the validator client, as the protocol puts it: the
 //! node hands out the store-derived inputs and never sees the record.
@@ -85,12 +85,6 @@ struct SlotQuery {
     slot: Slot,
 }
 
-#[derive(Debug, Deserialize)]
-struct RoundQuery {
-    #[serde(with = "ethlambda_types::beacon::serde_helpers::quoted_or_bare")]
-    round: u64,
-}
-
 async fn get_goldfish_vote_data(
     Query(query): Query<SlotQuery>,
     State(store): State<Store>,
@@ -115,21 +109,21 @@ async fn get_goldfish_vote_data(
 }
 
 async fn get_attestation_input(
-    Query(query): Query<RoundQuery>,
+    Query(query): Query<SlotQuery>,
     State(store): State<Store>,
     Extension(decoupled): Extension<Option<SharedDecoupledNode>>,
     Extension(sync_status): Extension<SyncStatusController>,
 ) -> Response {
     let result = (|| {
         let node = node(&decoupled)?;
+        require_decoupled_slot(&store, query.slot)?;
         if sync_status.get() == SyncStatus::Syncing {
             return Err(ApiError::ServiceUnavailable("node is syncing"));
         }
-        let mut node = node.lock().expect("decoupled node lock poisoned");
-        let opening = node.params().opening_slot(query.round);
-        require_decoupled_slot(&store, opening)?;
-        node.attestation_input(query.round)
-            .map_err(|_| ApiError::BadRequest("round is not the current round"))
+        node.lock()
+            .expect("decoupled node lock poisoned")
+            .attestation_input(query.slot)
+            .map_err(|_| ApiError::BadRequest("slot is not the current slot"))
     })();
     match result {
         Ok(input) => crate::json_response(serde_json::json!({ "data": input })),
@@ -221,7 +215,7 @@ async fn post_combined_attestations(
     let mut failures = Vec::new();
     for (index, attestation) in attestations.into_iter().enumerate() {
         if let Err(err) = validate_combined_attestation(&state, &config, &attestation) {
-            warn!(round = attestation.data.round, validator = attestation.validator_index, %err, "Refused a submitted combined attestation");
+            warn!(validator = attestation.validator_index, %err, "Refused a submitted combined attestation");
             failures.push(Failure {
                 index,
                 message: err.to_string().into(),
@@ -235,13 +229,14 @@ async fn post_combined_attestations(
         if !admitted {
             failures.push(Failure {
                 index,
-                message: "not admitted: outside the round window or a repeat".into(),
+                message: "not admitted: can no longer count, or a repeat".into(),
             });
             continue;
         }
         debug!(
-            round = attestation.data.round,
             validator = attestation.validator_index,
+            height_pair = ?attestation.data.height_pair(),
+            finality_pair = ?attestation.data.finality_pair(),
             "Accepted combined attestation"
         );
         if p2p.publish_combined_attestation(attestation).is_err() {

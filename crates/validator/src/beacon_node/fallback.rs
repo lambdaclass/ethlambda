@@ -326,9 +326,9 @@ impl<B: BeaconNodeApi> BeaconNodeApi for FallbackBeaconNode<B> {
         .await
     }
 
-    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
+    async fn decoupled_attestation_input(&self, slot: Slot) -> Result<AttestationInput> {
         self.try_each("decoupled_attestation_input", |node| {
-            node.decoupled_attestation_input(round)
+            node.decoupled_attestation_input(slot)
         })
         .await
     }

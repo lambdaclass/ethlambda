@@ -1,10 +1,11 @@
 //! Decoupled consensus protocol payloads, shared by both chains.
 //!
-//! The unsigned objects of the decoupled consensus protocol (Goldfish votes,
-//! combined attestations, the finality gadget's chain state), as formalized in
-//! `fradamt/verified-consensus` (`docs/PROTOCOL.md`). The protocol logic lives
-//! in `ethlambda-decoupled`; these live here so that the lean and the beacon
-//! wire containers, which this crate defines, can embed them.
+//! The unsigned objects of Goldilocks (Goldfish votes, finality attestations,
+//! the finality gadget's chain state): Goldfish with locks as the available
+//! chain, composed with the height-based finality gadget of
+//! `fradamt/verified-consensus`. The protocol logic lives in
+//! `ethlambda-decoupled`; these live here so that the lean and the beacon wire
+//! containers, which this crate defines, can embed them.
 //!
 //! SSZ has no `Option`, so an optional field is a list of at most one
 //! element, which keeps the encoding canonical.
@@ -16,7 +17,6 @@ use serde::{Deserialize, Serialize};
 use crate::primitives::H256;
 
 pub type Slot = u64;
-pub type Round = u64;
 pub type Height = u64;
 pub type ValidatorIndex = u64;
 
@@ -26,8 +26,8 @@ pub type ValidatorIndex = u64;
 /// type serves both chains.
 pub const VALIDATOR_LIMIT: usize = 1 << 40;
 
-/// A Goldfish vote `(val_index, s, B)` (appendix A.2): validator `validator`,
-/// a member of slot `slot`'s committee, votes for head `head`.
+/// A Goldfish vote `(val_index, s, B)`: validator `validator`, a member of
+/// slot `slot`'s committee, votes for head `head`.
 #[derive(
     Debug,
     Clone,
@@ -49,12 +49,12 @@ pub struct GoldfishVote {
     pub head: H256,
 }
 
-/// A height pair `(h, T, τ)` (appendix A.9).
+/// A height pair `(h, T, timeout)`.
 ///
 /// `timeout = false` is a target vote naming the block `entry` that brought
 /// the chain into height `height`. `timeout = true` is a timeout; it still
 /// names the entry it times out at, and a chain counts it only when the entry
-/// is the chain's own (the formalization's `matchesEntry`).
+/// is the chain's own.
 #[derive(
     Debug,
     Clone,
@@ -76,7 +76,8 @@ pub struct HeightVote {
     pub timeout: bool,
 }
 
-/// A finality pair `(h_f, T_f)` with `T_f ≠ ⊥` (appendix A.9).
+/// A finality pair `(h_f, T_f)`: a vote to finalize the justification `T_f`
+/// made at height `h_f`.
 #[derive(
     Debug,
     Clone,
@@ -97,11 +98,13 @@ pub struct FinalityVote {
     pub target: H256,
 }
 
-/// Everything a combined attestation says, minus the signer (appendix A.9):
-/// `(round, safe, height pair, finality pair)`.
+/// Everything an attestation says, minus the signer: `(h, T, timeout, h_f,
+/// T_f)`, a height pair and a finality pair, either of which may be absent.
 ///
+/// Attestations are pure finality votes: there is no round and no safe block.
 /// This is what validators sign, and what the beacon host aggregates over:
-/// honest validators with the same view emit identical data.
+/// honest validators with the same view emit identical data, whenever they
+/// attest.
 #[derive(
     Debug,
     Clone,
@@ -117,31 +120,16 @@ pub struct FinalityVote {
 )]
 #[serde(into = "AttestationDataJson", from = "AttestationDataJson")]
 pub struct AttestationData {
-    pub round: Round,
-    /// The safe block, or empty for `⊥`. Honest validators always vote a
-    /// block; `⊥` only appears in adversarial votes.
-    pub safe: SszList<H256, 1>,
     pub height_pair: SszList<HeightVote, 1>,
     pub finality_pair: SszList<FinalityVote, 1>,
 }
 
 impl AttestationData {
-    pub fn new(
-        round: Round,
-        safe: Option<H256>,
-        height_pair: Option<HeightVote>,
-        finality_pair: Option<FinalityVote>,
-    ) -> Self {
+    pub fn new(height_pair: Option<HeightVote>, finality_pair: Option<FinalityVote>) -> Self {
         Self {
-            round,
-            safe: option_list(safe),
             height_pair: option_list(height_pair),
             finality_pair: option_list(finality_pair),
         }
-    }
-
-    pub fn safe(&self) -> Option<H256> {
-        self.safe.first().copied()
     }
 
     pub fn height_pair(&self) -> Option<HeightVote> {
@@ -151,13 +139,16 @@ impl AttestationData {
     pub fn finality_pair(&self) -> Option<FinalityVote> {
         self.finality_pair.first().copied()
     }
+
+    /// Neither pair: an attestation that says nothing.
+    pub fn is_empty(&self) -> bool {
+        self.height_pair.is_empty() && self.finality_pair.is_empty()
+    }
 }
 
 /// The JSON shape of [`AttestationData`]: absent fields are `null`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttestationDataJson {
-    round: Round,
-    safe: Option<H256>,
     height_pair: Option<HeightVote>,
     finality_pair: Option<FinalityVote>,
 }
@@ -165,8 +156,6 @@ struct AttestationDataJson {
 impl From<AttestationData> for AttestationDataJson {
     fn from(data: AttestationData) -> Self {
         Self {
-            round: data.round,
-            safe: data.safe(),
             height_pair: data.height_pair(),
             finality_pair: data.finality_pair(),
         }
@@ -175,7 +164,7 @@ impl From<AttestationData> for AttestationDataJson {
 
 impl From<AttestationDataJson> for AttestationData {
     fn from(json: AttestationDataJson) -> Self {
-        Self::new(json.round, json.safe, json.height_pair, json.finality_pair)
+        Self::new(json.height_pair, json.finality_pair)
     }
 }
 
@@ -184,38 +173,13 @@ fn option_list<T>(value: Option<T>) -> SszList<T, 1> {
     SszList::try_from(items).expect("at most one element fits a list of one")
 }
 
-/// A combined attestation `(val_index, round, safe, h, T, τ, h_f, T_f)`
-/// (appendix A.9). Its SG projection is `(validator, round, safe)`.
+/// An attestation `(validator, h, T, timeout, h_f, T_f)`.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
 )]
 pub struct Attestation {
     pub validator: ValidatorIndex,
     pub data: AttestationData,
-}
-
-impl Attestation {
-    pub fn round(&self) -> Round {
-        self.data.round
-    }
-
-    /// The SG projection `(val_index, round, safe)` every SG rule and grade
-    /// reads (PROTOCOL.md §1.4).
-    pub fn sg_key(&self) -> SgKey {
-        SgKey {
-            validator: self.validator,
-            round: self.data.round,
-            safe: self.data.safe(),
-        }
-    }
-}
-
-/// The SG projection of a combined attestation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SgKey {
-    pub validator: ValidatorIndex,
-    pub round: Round,
-    pub safe: Option<H256>,
 }
 
 /// A block identified by root and slot. The chain state keeps these instead
@@ -243,7 +207,7 @@ pub struct BlockRef {
 /// One bit per validator, sized to the electorate.
 pub type ValidatorBits = SszBitlist<VALIDATOR_LIMIT>;
 
-/// The chain state σ (§1.3).
+/// The chain state σ of the finality gadget.
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
 )]
@@ -279,7 +243,7 @@ pub struct ChainState {
 
 impl ChainState {
     /// The initial state: `L = T_h = J = F = B_gen`, `s = 0`, `h = 1`,
-    /// `h_j = h_F = 0`, `nj = false`, every bit clear (§1.3).
+    /// `h_j = h_F = 0`, `nj = false`, every bit clear.
     ///
     /// `anchor` is genesis on a chain that runs the protocol from slot 0.
     pub fn initial(anchor: BlockRef, validator_count: usize) -> Self {
@@ -305,20 +269,31 @@ fn empty_bits(validator_count: usize) -> ValidatorBits {
     ValidatorBits::with_length(validator_count).expect("validator count within the registry limit")
 }
 
-/// A node's view of the three chains and the finality gadget, for operators
-/// and tests: what `GET /lean/v0/decoupled/status` and the beacon node's
-/// decoupled status endpoint serve.
+/// A live lock of the available chain: `block` stays locked for every
+/// fork-choice run that reads votes of a slot before `deadline`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockStatus {
+    pub block: BlockRef,
+    pub deadline: Slot,
+}
+
+/// A node's view of the available chain and the finality gadget, for
+/// operators and tests: what `GET /lean/v0/decoupled/status` and the beacon
+/// node's decoupled status endpoint serve.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DecoupledStatus {
     /// The node's protocol clock.
     pub slot: Slot,
-    pub round: Round,
     /// The fork-choice head.
     pub head: BlockRef,
-    /// `get_confirmed(Σ)`: the available chain's tip.
+    /// The confirmed (locked) tip: the fork-choice anchor when it is a live
+    /// lock, else `Σ.F`.
     pub confirmed: BlockRef,
-    /// `get_stable(Σ)`: the stable chain's tip.
-    pub stable: BlockRef,
+    /// The deepest block the latest confirmation update fast locked, whose
+    /// state supplies the height pair of attestations.
+    pub fg_confirmed: Option<BlockRef>,
+    /// The live locks, deepest first.
+    pub locks: Vec<LockStatus>,
     /// `Σ.F` and the height it was justified at.
     pub finalized: BlockRef,
     pub finalized_height: Height,
@@ -327,8 +302,10 @@ pub struct DecoupledStatus {
     pub justified_height: Height,
     /// `Σ.h_max`.
     pub max_height: Height,
-    /// `Σ.live_confirmed`, the protocol-facing confirmation.
-    pub live_confirmed: H256,
+    /// The fork-choice root (`Σ.J` or `Σ.F`) and the height every viable
+    /// branch must reach.
+    pub fc_root: BlockRef,
+    pub height_floor: Height,
     /// Blocks in the processed tree.
     pub blocks: u64,
 }

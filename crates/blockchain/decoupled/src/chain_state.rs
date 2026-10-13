@@ -1,5 +1,9 @@
 //! The finality gadget's chain state σ and its state transition
-//! (PROTOCOL.md §1.3, figure `alg:chain-full`, appendix A.9).
+//! (PROTOCOL.md §1.3, figure `alg:chain-full`, appendix A.9). Goldilocks keeps
+//! the height-based finality gadget as it is: on chain, 2/3 target votes for
+//! `(h, T)` justify `T` and advance the height, 2/3 targets plus timeouts
+//! advance it after a delay, and 2/3 finality votes for the pending
+//! justification finalize it.
 //!
 //! Every block's post-state is a pure function of its parent's post-state and
 //! the block's carried attestations: `σ[B] = state_transition(σ[B.parent], B)`.
@@ -121,7 +125,8 @@ fn advance_height(state: &mut ChainState, params: &Params) {
 
 /// `nj ← (K | h) ∧ (h − h_F > D)`.
 pub fn nonjustifiable(params: &Params, height: Height, finalized_height: Height) -> bool {
-    height.is_multiple_of(params.k) && height.saturating_sub(finalized_height) > params.d
+    height.is_multiple_of(params.nonjustifiable_period)
+        && height.saturating_sub(finalized_height) > params.finality_debt
 }
 
 #[cfg(test)]
@@ -141,8 +146,6 @@ mod tests {
         Attestation {
             validator,
             data: AttestationData::new(
-                0,
-                Some(entry),
                 Some(HeightVote {
                     height,
                     entry,
@@ -155,7 +158,7 @@ mod tests {
 
     #[test]
     fn a_target_quorum_justifies_the_entry_and_advances() {
-        let params = Params::with_round_length(3);
+        let params = Params::default();
         let electorate = Electorate::uniform(4);
         let genesis = block(0, 0);
         let state = ChainState::initial(genesis, 4);
@@ -176,7 +179,7 @@ mod tests {
 
     #[test]
     fn a_finality_quorum_finalizes_the_justification() {
-        let params = Params::with_round_length(3);
+        let params = Params::default();
         let electorate = Electorate::uniform(4);
         let genesis = block(0, 0);
         let votes: Vec<_> = (0..3).map(|v| target_vote(v, 1, genesis.root)).collect();
@@ -191,8 +194,6 @@ mod tests {
             .map(|v| Attestation {
                 validator: v,
                 data: AttestationData::new(
-                    1,
-                    Some(H256([1; 32])),
                     None,
                     Some(FinalityVote {
                         height: 1,
@@ -208,7 +209,10 @@ mod tests {
 
     #[test]
     fn timeouts_wait_for_the_delay() {
-        let params = Params::with_round_length(3);
+        let params = Params {
+            timeout_delay: 6,
+            ..Params::default()
+        };
         let electorate = Electorate::uniform(4);
         let genesis = block(0, 0);
         let state = ChainState::initial(genesis, 4);
@@ -216,8 +220,6 @@ mod tests {
             .map(|v| Attestation {
                 validator: v,
                 data: AttestationData::new(
-                    0,
-                    Some(genesis.root),
                     Some(HeightVote {
                         height: 1,
                         entry: genesis.root,
@@ -238,7 +240,7 @@ mod tests {
 
     #[test]
     fn a_pair_naming_another_entry_records_nothing() {
-        let params = Params::with_round_length(3);
+        let params = Params::default();
         let electorate = Electorate::uniform(4);
         let genesis = block(0, 0);
         let state = ChainState::initial(genesis, 4);
@@ -250,7 +252,7 @@ mod tests {
 
     #[test]
     fn nonjustifiable_heights_need_debt() {
-        let params = Params::with_round_length(3); // K = 5, D = 2
+        let params = Params::default(); // K = 5, D = 2
         assert!(!nonjustifiable(&params, 5, 3));
         assert!(nonjustifiable(&params, 5, 2));
         assert!(!nonjustifiable(&params, 6, 0));

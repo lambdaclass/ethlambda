@@ -1,13 +1,17 @@
-//! The decoupled fork's validator duties: the Goldfish vote and the combined
+//! The decoupled fork's validator duties: the Goldfish vote and the
 //! attestation, and the anti-slashing record that guards both.
 //!
-//! The decoupled protocol has no LMD attestations. A validator instead:
+//! The decoupled protocol (Goldilocks) has no LMD attestations. A validator
+//! instead:
 //!
 //! - votes for the head once per slot it sits on the committee of, a quarter
 //!   of the way into the slot (`t_s + Δ`), and
-//! - casts one combined attestation per round of `R` slots, half a slot into
-//!   the round's second slot (`a_r`), carrying the safe block and the height
-//!   and finality pairs of the finality gadget.
+//! - reads its attestation input every slot, half way into the slot
+//!   (`t_s + 2Δ`, right after the node's confirmation update), and casts an
+//!   attestation, carrying the height and finality pairs of the finality
+//!   gadget, only when one of the pairs is new. On a chain without height
+//!   progress nothing is new, so the attestation traffic of a stalled
+//!   finality dies down by itself.
 //!
 //! # The record is the point
 //!
@@ -24,7 +28,7 @@
 //!
 //! One record per validator public key, at
 //! `<validators-dir>/decoupled/<0xpubkey>.json`, together with the last slot
-//! voted and the last round attested. Every change is written (to a temporary
+//! voted and the last slot attested. Every change is written (to a temporary
 //! file, synced, then renamed over the real one) **before** the signature that
 //! depends on it exists: record, then release. A process killed between the two
 //! loses one attestation and never signs a second, different one.
@@ -42,7 +46,7 @@
 //! # What it does not do
 //!
 //! It does not judge the vote information. `AttestationInput` is the node's
-//! answer, checked for being about the right round and nothing more; a node that
+//! answer, checked for being about the right slot and nothing more; a node that
 //! lies about the chain costs a validator a bad vote, never a slashing, since
 //! the record decides the pairs against what it already holds.
 
@@ -70,14 +74,15 @@ use crate::signing::SigningContext;
 pub const RECORDS_DIR: &str = "decoupled";
 
 /// One validator's persisted state: the protocol's record plus the two
-/// watermarks that stop a restart from signing twice for one slot or round.
+/// watermarks that stop a restart from signing twice in one slot.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ValidatorState {
     record: Record,
     /// The slot of the last Goldfish vote signed.
     last_vote_slot: Option<Slot>,
-    /// The round of the last combined attestation signed.
-    last_round: Option<u64>,
+    /// The slot of the last attestation signed.
+    #[serde(default)]
+    last_attestation_slot: Option<Slot>,
 }
 
 pub struct DecoupledService<B> {
@@ -206,32 +211,34 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
         Ok(published)
     }
 
-    /// Create, record, sign and submit round `round`'s combined attestations
-    /// for `validators` (every active validator this client runs).
+    /// Read slot `slot`'s attestation input, and create, record, sign and
+    /// submit an attestation for each of `validators` (every active
+    /// validator this client runs) that has something new to say.
     ///
     /// Returns how many attestations the node accepted.
     ///
-    /// A validator that has already attested in `round` or a later one is
-    /// skipped, across restarts.
+    /// A validator that has already attested in `slot` or a later one is
+    /// skipped, across restarts. One whose record makes nothing new of the
+    /// input is skipped too, and its record left untouched.
     pub async fn attest(
         &self,
-        round: u64,
+        slot: Slot,
         validators: &[(BlsPubkey, ValidatorIndex)],
         store: &RwLock<ValidatorStore>,
     ) -> Result<usize> {
         let pending: Vec<&(BlsPubkey, ValidatorIndex)> = validators
             .iter()
-            .filter(|(pubkey, index)| self.may_attest(pubkey, *index, round))
+            .filter(|(pubkey, index)| self.may_attest(pubkey, *index, slot))
             .collect();
         if pending.is_empty() {
             return Ok(0);
         }
 
-        let input = self.beacon_node.decoupled_attestation_input(round).await?;
-        if input.round != round {
+        let input = self.beacon_node.decoupled_attestation_input(slot).await?;
+        if input.slot != slot {
             return Err(Error::InconsistentResponse(format!(
-                "requested attestation input for round {round}, node answered for round {}",
-                input.round
+                "requested attestation input for slot {slot}, node answered for slot {}",
+                input.slot
             )));
         }
 
@@ -243,11 +250,11 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
                 // `create_attestation` updates the record, the state is
                 // persisted, and only then is anything signed.
                 let created = self.advance(pubkey, |state| {
-                    if state.last_round.is_some_and(|last| round <= last) {
+                    if state.last_attestation_slot.is_some_and(|last| slot <= last) {
                         return None;
                     }
-                    let attestation = state.record.create_attestation(*index, &input);
-                    state.last_round = Some(round);
+                    let attestation = state.record.create_attestation(*index, &input)?;
+                    state.last_attestation_slot = Some(slot);
                     // Heights below the finalized one can never be voted
                     // again. Pruned after the decision, so it was made against
                     // the whole record.
@@ -258,7 +265,7 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
                     Ok(Some(data)) => data,
                     Ok(None) => continue,
                     Err(err) => {
-                        error!(round, validator = index, %err, "Refusing to sign a combined attestation");
+                        error!(%slot, validator = index, %err, "Refusing to sign a combined attestation");
                         crate::metrics::inc_combined_attestation_failures();
                         continue;
                     }
@@ -277,7 +284,7 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
                         });
                     }
                     Err(err) => {
-                        error!(round, validator = index, %err, "Failed to sign combined attestation");
+                        error!(%slot, validator = index, %err, "Failed to sign combined attestation");
                         crate::metrics::inc_signing_failures();
                         crate::metrics::inc_combined_attestation_failures();
                     }
@@ -296,13 +303,13 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
             .await?;
         if published < submitted {
             warn!(
-                round,
+                %slot,
                 published,
                 submitted,
-                "Some combined attestations in this round's batch were rejected by the beacon node"
+                "Some combined attestations in this slot's batch were rejected by the beacon node"
             );
         }
-        info!(round, count = published, "Published combined attestations");
+        info!(%slot, count = published, "Published combined attestations");
         crate::metrics::inc_combined_attestations_published(published as u64);
         Ok(published)
     }
@@ -319,10 +326,10 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
         })
     }
 
-    /// Whether the validator may still attest in `round`; see [`Self::may_vote`].
-    fn may_attest(&self, pubkey: &BlsPubkey, index: ValidatorIndex, round: u64) -> bool {
+    /// Whether the validator may still attest in `slot`; see [`Self::may_vote`].
+    fn may_attest(&self, pubkey: &BlsPubkey, index: ValidatorIndex, slot: Slot) -> bool {
         self.peek(pubkey, index, |state| {
-            state.last_round.is_none_or(|last| round > last)
+            state.last_attestation_slot.is_none_or(|last| slot > last)
         })
     }
 
@@ -445,8 +452,7 @@ mod tests {
     }
 
     fn context() -> Arc<SigningContext> {
-        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
-        config.decoupled_slots_per_round = 4;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
         Arc::new(SigningContext {
             config,
             genesis_validators_root: Root::repeat_byte(7),
@@ -473,8 +479,7 @@ mod tests {
 
     fn input(source: Option<(u64, u8, bool)>) -> AttestationInput {
         AttestationInput {
-            round: 0,
-            safe: Root::repeat_byte(0xaa),
+            slot: 0,
             source: source.map(|(height, entry, nonjustifiable)| SourceFields {
                 height,
                 entry: Root::repeat_byte(entry),
@@ -513,16 +518,15 @@ mod tests {
         assert_eq!(vote.data.head, Root::repeat_byte(0x11));
 
         let input: DataResponse<AttestationInput> = serde_json::from_str(&format!(
-            r#"{{"data": {{"round": 5, "safe": "0x{a}", "source": {{"height": 3, "entry": "0x{b}", "nonjustifiable": false}}, "justified_height": 2, "justified": "0x{b}", "finalized_height": 1}}}}"#,
-            a = "aa".repeat(32),
+            r#"{{"data": {{"slot": 5, "source": {{"height": 3, "entry": "0x{b}", "nonjustifiable": false}}, "justified_height": 2, "justified": "0x{b}", "finalized_height": 1}}}}"#,
             b = "bb".repeat(32),
         ))
         .expect("attestation input parses");
-        assert_eq!(input.data.round, 5);
+        assert_eq!(input.data.slot, 5);
         assert_eq!(input.data.source.expect("a source").height, 3);
 
         let none: DataResponse<AttestationInput> = serde_json::from_str(&format!(
-            r#"{{"data": {{"round": 5, "safe": "0x{a}", "source": null, "justified_height": 2, "justified": "0x{a}", "finalized_height": 1}}}}"#,
+            r#"{{"data": {{"slot": 5, "source": null, "justified_height": 2, "justified": "0x{a}", "finalized_height": 1}}}}"#,
             a = "aa".repeat(32),
         ))
         .expect("a null source parses");
@@ -535,16 +539,11 @@ mod tests {
     fn the_submitted_json_matches_the_contract() {
         let attestation = SignedCombinedAttestation {
             validator_index: 7,
-            data: ethlambda_decoupled::AttestationData::new(
-                5,
-                Some(Root::repeat_byte(1)),
-                None,
-                None,
-            ),
+            data: ethlambda_decoupled::AttestationData::new(None, None),
             signature: Default::default(),
         };
         let json = serde_json::to_value(&attestation).expect("serializes");
-        assert_eq!(json["data"]["round"], 5);
+        assert!(json["data"].get("round").is_none(), "no rounds");
         assert!(json["data"]["height_pair"].is_null());
         assert!(json["data"]["finality_pair"].is_null());
         assert_eq!(json["validator_index"], "7");
@@ -609,7 +608,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_attestation_goes_through_the_record_and_is_signed_for_its_round() {
+    async fn the_attestation_goes_through_the_record_and_is_signed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
         let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
@@ -627,18 +626,34 @@ mod tests {
 
         // The very data `Record::create_attestation` decides for a fresh record.
         let expected = Record::default()
-            .create_attestation(
-                7,
-                &AttestationInput {
-                    round: 5,
-                    ..input(Some((3, 1, false)))
-                },
-            )
+            .create_attestation(7, &input(Some((3, 1, false))))
+            .expect("a fresh record attests")
             .data;
         assert_eq!(submitted[0].data, expected);
 
         let root = context().combined_attestation_signing_root(&submitted[0].data);
         assert!(verifies(&pubkey, &submitted[0].signature.0, root));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_input_is_not_attested_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, pubkey) = store();
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
+        let service = service(&node, dir.path());
+        let validators = [(pubkey, 7)];
+
+        assert_eq!(service.attest(5, &validators, &store).await.unwrap(), 1);
+        for slot in 6..10 {
+            assert_eq!(service.attest(slot, &validators, &store).await.unwrap(), 0);
+        }
+        assert_eq!(node.submitted_combined_attestations().len(), 1);
+        // The slot watermark only moves with an attestation.
+        let saved: ValidatorState = serde_json::from_str(
+            &std::fs::read_to_string(service.path(&pubkey)).expect("file exists"),
+        )
+        .expect("parses");
+        assert_eq!(saved.last_attestation_slot, Some(5));
     }
 
     #[tokio::test]
@@ -688,7 +703,7 @@ mod tests {
         let saved: ValidatorState =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("file exists"))
                 .expect("parses");
-        assert_eq!(saved.last_round, Some(5));
+        assert_eq!(saved.last_attestation_slot, Some(5));
         assert_eq!(saved.record.target.get(&3), Some(&Root::repeat_byte(1)));
 
         // And the lost attestation is not re-signed on a retry.
@@ -705,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_restart_refuses_a_repeated_round_and_keeps_the_record() {
+    async fn a_restart_refuses_a_repeated_slot_and_keeps_the_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
         let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
@@ -737,7 +752,7 @@ mod tests {
         restarted
             .attest(6, &validators, &store)
             .await
-            .expect("next round");
+            .expect("next slot");
         let submitted = node.submitted_combined_attestations();
         assert!(submitted[1].data.height_pair().expect("pair").timeout);
     }

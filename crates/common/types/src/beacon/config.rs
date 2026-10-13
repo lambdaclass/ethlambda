@@ -326,19 +326,18 @@ pub struct Config {
     /// supported); [`Config::validate_fork_schedule`] refuses it.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_fork_epoch: Epoch,
-    /// Slots per round of the decoupled protocol.
+    /// Goldilocks' `k`: how many slots a lock lives, and how many consecutive
+    /// confirmations form a slow lock.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
-    pub decoupled_slots_per_round: u64,
-    /// The decoupled protocol's stabilization window, in rounds.
-    #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
-    pub decoupled_sg_window: u64,
+    pub decoupled_lock_period: u64,
     /// The decoupled finality gadget's non-justifiable period, in heights.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_nonjustifiable_period: u64,
     /// How many heights the decoupled chain may run ahead of finality.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_finality_debt: u64,
-    /// Rounds without progress after which the decoupled protocol times out.
+    /// Slots a timeout waits after a height's entry before it can move the
+    /// height.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_timeout_delay: u64,
     /// The `Fork.current_version` a gloas block or attestation signs under.
@@ -745,8 +744,7 @@ impl Config {
             fulu_fork_epoch: 411_392,
             decoupled_fork_version: [0x0d, 0x00, 0x00, 0x00],
             decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
-            decoupled_slots_per_round: 4,
-            decoupled_sg_window: 2,
+            decoupled_lock_period: 4,
             decoupled_nonjustifiable_period: 5,
             decoupled_finality_debt: 2,
             decoupled_timeout_delay: 8,
@@ -886,8 +884,7 @@ impl Config {
             fulu_fork_epoch: constants::FAR_FUTURE_EPOCH,
             decoupled_fork_version: [0x0d, 0x00, 0x00, 0x01],
             decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
-            decoupled_slots_per_round: 4,
-            decoupled_sg_window: 2,
+            decoupled_lock_period: 4,
             decoupled_nonjustifiable_period: 5,
             decoupled_finality_debt: 2,
             decoupled_timeout_delay: 8,
@@ -1126,7 +1123,7 @@ impl Config {
     ///   reuses.
     /// * Its protocol parameters must be usable: the slot duration a
     ///   multiple of four milliseconds (the protocol's delta is a quarter
-    ///   slot) and at least three slots per round.
+    ///   slot) and a lock period of at least two slots.
     pub fn validate_fork_schedule(&self) -> Result<(), String> {
         if self.decoupled_fork_epoch == constants::FAR_FUTURE_EPOCH {
             return Ok(());
@@ -1152,10 +1149,10 @@ impl Config {
                 self.slot_duration_ms,
             ));
         }
-        if self.decoupled_slots_per_round < 3 {
+        if self.decoupled_lock_period < 2 {
             return Err(format!(
-                "DECOUPLED_SLOTS_PER_ROUND must be at least 3, got {}",
-                self.decoupled_slots_per_round,
+                "DECOUPLED_LOCK_PERIOD must be at least 2, got {}",
+                self.decoupled_lock_period,
             ));
         }
         Ok(())
@@ -1357,12 +1354,12 @@ mod tests {
     #[test]
     fn decoupled_keys_parse_and_default() {
         let yaml = "DECOUPLED_FORK_VERSION: 0x0d000000\nDECOUPLED_FORK_EPOCH: 3\n\
-                    DECOUPLED_SLOTS_PER_ROUND: 6\n";
+                    DECOUPLED_LOCK_PERIOD: 6\n";
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.fork_epoch(ForkName::Decoupled), 3);
         assert_eq!(config.fork_at_epoch(3), ForkName::Decoupled);
-        assert_eq!(config.decoupled_slots_per_round, 6);
-        assert_eq!(config.decoupled_sg_window, 2);
+        assert_eq!(config.decoupled_lock_period, 6);
+        assert_eq!(config.decoupled_timeout_delay, 8);
         let absent: Config = serde_yaml_ng::from_str("").unwrap();
         assert_eq!(absent.decoupled_fork_epoch, constants::FAR_FUTURE_EPOCH);
     }
@@ -1406,9 +1403,9 @@ mod tests {
             .with_fork_epoch(ForkName::Fulu, 0)
             .with_fork_epoch(ForkName::Decoupled, 1);
         assert!(ok.validate_fork_schedule().is_ok());
-        let mut bad_round = ok.clone();
-        bad_round.decoupled_slots_per_round = 2;
-        assert!(bad_round.validate_fork_schedule().is_err());
+        let mut bad_period = ok.clone();
+        bad_period.decoupled_lock_period = 1;
+        assert!(bad_period.validate_fork_schedule().is_err());
     }
 
     #[test]

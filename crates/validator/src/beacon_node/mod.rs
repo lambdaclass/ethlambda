@@ -440,13 +440,14 @@ pub trait BeaconNodeApi: Send + Sync {
     /// [`Self::submit_attestations`].
     async fn submit_goldfish_votes(&self, votes: &[SignedGoldfishVote]) -> Result<usize>;
 
-    /// What the node's store hands the anti-slashing record at round `round`'s
-    /// attestation time: the safe block and the height and finality fields.
+    /// What the node's store hands the anti-slashing record at slot `slot`'s
+    /// attestation instant: the height fields of the latest fast lock and
+    /// the finality fields of the head.
     ///
-    /// # Contract: the answer is for `round`, or this is an `Err`
+    /// # Contract: the answer is for `slot`, or this is an `Err`
     ///
     /// For the reason [`Self::attestation_data`] states.
-    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput>;
+    async fn decoupled_attestation_input(&self, slot: Slot) -> Result<AttestationInput>;
 
     /// Submit signed combined attestations to the node's pool. Returns how
     /// many it accepted, with the same partial-success reading as

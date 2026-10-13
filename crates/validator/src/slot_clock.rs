@@ -102,15 +102,6 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Decoupled
     }
 
-    /// The round whose combined attestation is due during `slot`, if any.
-    ///
-    /// A round `r` attests at `a_r = start(r * R + 1) + slot_duration / 2`, so
-    /// the duty falls in the second slot of each round: `slot % R == 1`.
-    pub fn decoupled_round_attesting_in(&self, slot: Slot) -> Option<u64> {
-        let per_round = self.config.decoupled_slots_per_round;
-        (per_round > 1 && slot % per_round == 1).then_some(slot / per_round)
-    }
-
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -166,12 +157,11 @@ impl SlotClock {
         self.offset_into(slot, GOLDFISH_VOTE_DUE_BPS)
     }
 
-    /// When round `round`'s combined attestation should run, `a_r`: half a
-    /// slot into the round's second slot.
-    pub fn decoupled_attestation_time(&self, round: u64) -> SystemTime {
-        let slot = round
-            .saturating_mul(self.config.decoupled_slots_per_round)
-            .saturating_add(1);
+    /// When `slot`'s attestation duty should run: half a slot in (`t_s + 2Δ`),
+    /// right after the node's confirmation update of the previous slot. It
+    /// runs every decoupled slot; whether it signs anything is the record's
+    /// call.
+    pub fn decoupled_attestation_time(&self, slot: Slot) -> SystemTime {
         self.offset_into(slot, DECOUPLED_ATTESTATION_DUE_BPS)
     }
 
@@ -297,8 +287,8 @@ impl SlotClock {
 
     /// How long from `now` until round `round`'s combined attestation, or
     /// zero once that instant has passed.
-    pub fn until_decoupled_attestation(&self, round: u64, now: SystemTime) -> Duration {
-        self.decoupled_attestation_time(round)
+    pub fn until_decoupled_attestation(&self, slot: Slot, now: SystemTime) -> Duration {
+        self.decoupled_attestation_time(slot)
             .duration_since(now)
             .unwrap_or(Duration::ZERO)
     }
@@ -763,21 +753,19 @@ mod tests {
 
     #[test]
     fn the_decoupled_offsets_are_a_quarter_and_half_a_slot_in() {
-        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
-        config.decoupled_slots_per_round = 4;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
         let clock = SlotClock::from_config(GENESIS, &config);
-        // 12 s slots: the vote at 3 s, the attestation at 6 s of the round's
-        // second slot.
+        // 12 s slots: the vote at 3 s, the attestation at 6 s of every slot.
         assert_eq!(
             clock.until_goldfish_vote(5, clock.start_of(5)),
             Duration::from_millis(3_000)
         );
         assert_eq!(
-            clock.until_decoupled_attestation(2, clock.start_of(9)),
+            clock.until_decoupled_attestation(9, clock.start_of(9)),
             Duration::from_millis(6_000)
         );
         assert_eq!(
-            clock.until_decoupled_attestation(2, clock.start_of(10)),
+            clock.until_decoupled_attestation(9, clock.start_of(10)),
             Duration::ZERO
         );
         // The vote is the first duty of a decoupled slot.
@@ -785,17 +773,6 @@ mod tests {
             clock.until_first_slot_duty(5, clock.start_of(5)),
             Duration::from_millis(3_000).min(clock.until_sync_message(5, clock.start_of(5)))
         );
-    }
-
-    #[test]
-    fn a_round_attests_in_the_second_slot_of_its_window() {
-        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
-        config.decoupled_slots_per_round = 4;
-        let clock = SlotClock::from_config(GENESIS, &config);
-        let rounds: Vec<_> = (0..10)
-            .filter_map(|slot| Some((slot, clock.decoupled_round_attesting_in(slot)?)))
-            .collect();
-        assert_eq!(rounds, vec![(1, 0), (5, 1), (9, 2)]);
     }
 
     #[test]

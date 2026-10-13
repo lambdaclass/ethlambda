@@ -458,11 +458,11 @@ mod tests {
 
         let overrides = crate::network::ConfigOverrides {
             decoupled_fork_epoch: Some(0),
-            decoupled_slots_per_round: Some(6),
+            decoupled_lock_period: Some(6),
         };
         let loaded = NetworkDir::load_with(dir.path(), &overrides).unwrap();
         assert_eq!(loaded.config.decoupled_fork_epoch, 0);
-        assert_eq!(loaded.config.decoupled_slots_per_round, 6);
+        assert_eq!(loaded.config.decoupled_lock_period, 6);
         assert_eq!(loaded.genesis_state.fork_name(), ForkName::Decoupled);
         assert_eq!(
             loaded.genesis_state.fork().current_version,
@@ -490,7 +490,7 @@ mod tests {
         std::fs::write(&config_path, config).unwrap();
         let overrides = crate::network::ConfigOverrides {
             decoupled_fork_epoch: Some(0),
-            decoupled_slots_per_round: None,
+            decoupled_lock_period: None,
         };
         let err = NetworkDir::load_with(dir.path(), &overrides)
             .unwrap_err()
@@ -499,16 +499,16 @@ mod tests {
     }
 
     #[test]
-    fn a_decoupled_round_shorter_than_three_slots_is_refused() {
+    fn a_decoupled_lock_period_shorter_than_two_slots_is_refused() {
         let dir = fulu_genesis_dir();
         let overrides = crate::network::ConfigOverrides {
             decoupled_fork_epoch: Some(0),
-            decoupled_slots_per_round: Some(2),
+            decoupled_lock_period: Some(1),
         };
         let err = NetworkDir::load_with(dir.path(), &overrides)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("DECOUPLED_SLOTS_PER_ROUND"), "got {err}");
+        assert!(err.contains("DECOUPLED_LOCK_PERIOD"), "got {err}");
     }
 
     #[test]

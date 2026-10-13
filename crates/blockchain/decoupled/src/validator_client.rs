@@ -7,6 +7,14 @@
 //! then releases it. `record_attestation` is the only writer of the record.
 //! A validator that follows these rules never produces E1 or E2 evidence
 //! (the formalization's `voteSafetyOfClients`).
+//!
+//! Goldilocks has no rounds: a validator reads its input every slot and
+//! attests only when the pairs it would sign differ from the last ones it
+//! signed. On a chain that makes no height progress the input does not
+//! change, so a validator whose vote landed is done, and attestation traffic
+//! dies down by itself while finality stalls. A reorg to another entry at the
+//! same height changes the input, and the record then turns the height pair
+//! into a timeout naming the new entry.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,20 +22,21 @@ use ethlambda_types::primitives::H256;
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    Attestation, AttestationData, FinalityVote, Height, HeightVote, Round, ValidatorIndex,
+    Attestation, AttestationData, FinalityVote, Height, HeightVote, Slot, ValidatorIndex,
 };
 
-/// What the node's store hands the validator client at the attestation time
-/// `a_r` (`attest()` in §2.3): the safe block, the height fields of the
-/// FG source (or `None` when there is no fresh grade-2 quorum), and the
+/// What the node's store hands the validator client at the attestation
+/// instant `t_s + 2Δ`: the height fields of `fg_confirmed`'s state (or `None`
+/// when the latest confirmation update fast locked nothing), and the
 /// finality fields of the fork-choice head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationInput {
-    pub round: Round,
-    /// `C_sg`, from `get_sg_vote`.
-    pub safe: H256,
-    /// `(h_c, T_c, ν)` from `get_fg_vote`: the source's height, its height
-    /// entry, and its nonjustifiable flag.
+    /// The slot whose attestation instant this input is for. Not part of
+    /// the attestation: it lets a validator client check that a node
+    /// answered for the slot it asked about.
+    pub slot: Slot,
+    /// `(h, T_h, ν)` from `fg_confirmed`'s state: its height, the height's
+    /// entry, and the nonjustifiable flag.
     pub source: Option<SourceFields>,
     /// `(h_j, J, h_F)` from the head's chain state.
     pub justified_height: Height,
@@ -42,7 +51,8 @@ pub struct SourceFields {
     pub nonjustifiable: bool,
 }
 
-/// The anti-slashing record Λ = `(target[·], timeout[·], lock[·], timeouts)`.
+/// The anti-slashing record Λ = `(target[·], timeout[·], lock[·], timeouts)`,
+/// plus the last attestation released.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// `target[h]`: the validator's first target at height `h`.
@@ -53,6 +63,12 @@ pub struct Record {
     pub lock: BTreeMap<Height, H256>,
     /// `timeouts`: the `(h, T)` entries its timeouts have named.
     pub timeouts: BTreeSet<(Height, H256)>,
+    /// The height pair of the last attestation that carried one.
+    #[serde(default)]
+    pub last_height_pair: Option<HeightVote>,
+    /// The finality pair of the last attestation that carried one.
+    #[serde(default)]
+    pub last_finality_pair: Option<FinalityVote>,
 }
 
 impl Record {
@@ -137,6 +153,7 @@ impl Record {
     pub fn record(&mut self, data: &AttestationData) {
         if let Some(pair) = data.finality_pair() {
             self.lock.insert(pair.height, pair.target);
+            self.last_finality_pair = Some(pair);
         }
         if let Some(vote) = data.height_pair() {
             if vote.timeout {
@@ -145,25 +162,39 @@ impl Record {
             } else {
                 self.target.entry(vote.height).or_insert(vote.entry);
             }
+            self.last_height_pair = Some(vote);
         }
     }
 
-    /// `create_attestation(Λ, r, safe, h_c, T_c, ν, h_j, J, h_F)`: decide the
-    /// pairs, record, then release.
-    pub fn create_attestation(
-        &mut self,
-        validator: ValidatorIndex,
-        input: &AttestationInput,
-    ) -> Attestation {
+    /// The data `create_attestation` would release for `input`, without
+    /// recording it: `None` unless one of its pairs is new.
+    ///
+    /// A pair is new when it is present and differs from the last pair of
+    /// its kind released. An absent pair is not news: a slot whose
+    /// confirmation update fast locked nothing leaves the height pair out
+    /// without retracting the one already cast.
+    pub fn preview(&self, input: &AttestationInput) -> Option<AttestationData> {
         let finality = self.finality_pair(
             input.justified_height,
             input.justified,
             input.finalized_height,
         );
         let height = self.height_pair(input.source, finality);
-        let data = AttestationData::new(input.round, Some(input.safe), height, finality);
+        let new_height = height.is_some() && height != self.last_height_pair;
+        let new_finality = finality.is_some() && finality != self.last_finality_pair;
+        (new_height || new_finality).then(|| AttestationData::new(height, finality))
+    }
+
+    /// `create_attestation(Λ, h_c, T_c, ν, h_j, J, h_F)`: decide the pairs,
+    /// record, then release. `None` when neither pair is new.
+    pub fn create_attestation(
+        &mut self,
+        validator: ValidatorIndex,
+        input: &AttestationInput,
+    ) -> Option<Attestation> {
+        let data = self.preview(input)?;
         self.record(&data);
-        Attestation { validator, data }
+        Some(Attestation { validator, data })
     }
 
     /// Drop entries below `height`. Heights at or below the finalized height
@@ -221,8 +252,7 @@ mod tests {
         h_f: Height,
     ) -> AttestationInput {
         AttestationInput {
-            round: 1,
-            safe: root(0xaa),
+            slot: 0,
             source: source.map(|(height, entry, nj)| SourceFields {
                 height,
                 entry: root(entry),
@@ -237,7 +267,9 @@ mod tests {
     #[test]
     fn a_fresh_record_targets_the_chains_entry() {
         let mut record = Record::default();
-        let att = record.create_attestation(7, &input(Some((3, 1, false)), (2, 9), 1));
+        let att = record
+            .create_attestation(7, &input(Some((3, 1, false)), (2, 9), 1))
+            .expect("a first attestation");
         assert_eq!(
             att.data.height_pair(),
             Some(HeightVote {
@@ -258,13 +290,52 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_input_attests_once() {
+        let mut record = Record::default();
+        let first = input(Some((3, 1, false)), (2, 9), 1);
+        assert!(record.create_attestation(0, &first).is_some());
+        assert!(record.create_attestation(0, &first).is_none());
+        assert!(record.preview(&first).is_none());
+        // A new justification on the head chain is something new to say.
+        let next = input(Some((3, 1, false)), (3, 1), 2);
+        assert!(record.create_attestation(0, &next).is_some());
+    }
+
+    #[test]
+    fn a_slot_without_a_fast_lock_retracts_nothing() {
+        let mut record = Record::default();
+        let with_source = input(Some((3, 1, false)), (2, 9), 1);
+        let without = input(None, (2, 9), 1);
+        assert!(record.create_attestation(0, &with_source).is_some());
+        for _ in 0..3 {
+            assert!(record.create_attestation(0, &without).is_none());
+            assert!(record.create_attestation(0, &with_source).is_none());
+        }
+    }
+
+    #[test]
+    fn an_input_with_nothing_to_say_does_not_attest() {
+        let mut record = Record::default();
+        assert!(
+            record
+                .create_attestation(0, &input(None, (0, 0), 0))
+                .is_none()
+        );
+        assert_eq!(record, Record::default());
+    }
+
+    #[test]
     fn a_different_entry_at_a_voted_height_times_out() {
         let mut record = Record::default();
         record.create_attestation(0, &input(Some((3, 1, false)), (0, 0), 0));
-        let att = record.create_attestation(0, &input(Some((3, 2, false)), (0, 0), 0));
+        let att = record
+            .create_attestation(0, &input(Some((3, 2, false)), (0, 0), 0))
+            .expect("a reorg to another entry attests again");
         assert!(att.data.height_pair().unwrap().timeout);
         // Once timed out, the height stays timed out.
-        let again = record.create_attestation(0, &input(Some((3, 1, false)), (0, 0), 0));
+        let again = record
+            .create_attestation(0, &input(Some((3, 1, false)), (0, 0), 0))
+            .expect("a timeout naming the first entry is new");
         assert!(again.data.height_pair().unwrap().timeout);
     }
 
@@ -273,7 +344,9 @@ mod tests {
         let mut record = Record::default();
         // Finality pair locks height 3 on entry 1.
         record.create_attestation(0, &input(None, (3, 1), 2));
-        let att = record.create_attestation(0, &input(Some((3, 2, false)), (0, 0), 0));
+        let att = record
+            .create_attestation(0, &input(Some((3, 2, false)), (4, 7), 3))
+            .expect("a new finality pair");
         assert_eq!(att.data.height_pair(), None);
     }
 
@@ -299,8 +372,7 @@ mod tests {
             let jh = Height::from(step % 3 + 1);
             let j = (step / 3 % 2) as u8;
             let source = (step % 5 != 0).then_some((h, entry, nj));
-            let att = record.create_attestation(0, &input(source, (jh, j), jh - 1));
-            emitted.push(att);
+            emitted.extend(record.create_attestation(0, &input(source, (jh, j), jh - 1)));
         }
         for a in &emitted {
             for b in &emitted {

@@ -4,7 +4,7 @@
 //! validator keys and anti-slashing records, and the signatures that back
 //! every object the engine holds. It ticks on the protocol's public grid
 //! (`Δ = slot / 4`), runs the duties each tick asks for, and imports blocks,
-//! Goldfish votes and combined attestations from the decoupled topics.
+//! Goldfish votes and attestations from the decoupled topics.
 //!
 //! Lean specifics, on top of the engine:
 //!
@@ -14,7 +14,7 @@
 //!   `ethlambda_types::lean_decoupled` for the epoch grid);
 //! * imported blocks and the anti-slashing records are persisted under
 //!   prefixed `Metadata` keys and replayed on restart. A replayed node is a
-//!   node that joins (`§6.2`): its saved grades start empty.
+//!   node that joins: it holds no locks until its first confirmation updates.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -33,8 +33,8 @@ use ethlambda_types::decoupled::{
     Attestation, BlockRef, DecoupledStatus, GoldfishVote, SharedDecoupledStatus,
 };
 use ethlambda_types::lean_decoupled::{
-    DecoupledBlock, DecoupledBlockBody, SignedDecoupledAttestation, SignedDecoupledBlock,
-    SignedGoldfishVote, attestation_epoch, goldfish_vote_epoch,
+    DecoupledBlock, DecoupledBlockBody, MAX_BLOCK_ATTESTATIONS, SignedDecoupledAttestation,
+    SignedDecoupledBlock, SignedGoldfishVote, attestation_epoch, goldfish_vote_epoch,
 };
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::time::unix_now_ms;
@@ -83,13 +83,14 @@ impl DecoupledLeanConfig {
 }
 
 /// One validator's persisted signing state: its anti-slashing record, and
-/// the last slot it voted in and round it attested in, so a restart inside a
-/// slot never signs a second message at one XMSS epoch.
+/// the last slots it voted and attested in, so a restart inside a slot never
+/// signs a second message at one XMSS epoch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct SigningState {
     record: Record,
     last_vote_slot: Option<u64>,
-    last_round: Option<u64>,
+    #[serde(default)]
+    last_attestation_slot: Option<u64>,
 }
 
 /// Handle to the running actor.
@@ -172,12 +173,14 @@ pub struct DecoupledLeanServer {
     pubkeys: Vec<(ValidatorPublicKey, ValidatorPublicKey)>,
     signing: HashMap<u64, SigningState>,
     /// The signature behind every vote and attestation the engine may put in
-    /// a proposal.
+    /// a proposal; an attestation's with the slot it was signed in, which
+    /// picks its XMSS epoch.
     vote_signatures: HashMap<GoldfishVote, XmssSignature>,
-    attestation_signatures: HashMap<Attestation, XmssSignature>,
-    /// Message roots whose signature checked out, with the slot they belong
-    /// to, so a vote already verified on gossip is not verified again when a
-    /// block carries it.
+    attestation_signatures: HashMap<Attestation, (u64, XmssSignature)>,
+    /// Roots whose signature checked out, with the slot they belong to, so a
+    /// vote or attestation already verified on gossip is not verified again
+    /// when a block carries it. A vote's root is the vote's; an attestation's
+    /// is its signed envelope's, which pins the epoch and signature too.
     verified: HashMap<H256, u64>,
     /// Blocks waiting for their parent, by parent root.
     parked: BTreeMap<H256, Vec<SignedDecoupledBlock>>,
@@ -275,8 +278,8 @@ impl DecoupledLeanServer {
                 self.vote(event.slot);
                 self.warm_keys(event.slot + 1);
             }
-            if let Some(round) = event.attest {
-                self.attest(round);
+            if event.attest {
+                self.attest(event.slot);
             }
         }
         self.retry_future_blocks();
@@ -327,17 +330,19 @@ impl DecoupledLeanServer {
             .attestations
             .iter()
             .filter_map(|attestation| {
-                let signature = self.attestation_signatures.get(attestation)?;
+                let (signed_slot, signature) = self.attestation_signatures.get(attestation)?;
                 Some(SignedDecoupledAttestation {
                     attestation: attestation.clone(),
+                    slot: *signed_slot,
                     signature: signature.clone(),
                 })
             })
+            .take(MAX_BLOCK_ATTESTATIONS)
             .collect();
         let body = DecoupledBlockBody {
             votes: SszList::try_from(votes).expect("at most two votes per validator"),
             support: SszBitlist::try_from(support).expect("one bit per vote"),
-            attestations: SszList::try_from(attestations).expect("bounded by the SG window"),
+            attestations: SszList::try_from(attestations).expect("capped above"),
         };
         let message = DecoupledBlock {
             slot,
@@ -410,47 +415,62 @@ impl DecoupledLeanServer {
         debug!(slot, head = %ShortRoot(&head.0), "Cast Goldfish votes");
     }
 
-    /// `attest` at `a_r`: every validator, through its own record.
-    fn attest(&mut self, round: u64) {
+    /// The attestation duty at `t_s + 2Δ`: every validator, through its own
+    /// record, which releases an attestation only when one of its pairs is
+    /// new.
+    fn attest(&mut self, slot: u64) {
         let input = self.engine.attestation_input();
-        let opening = self.config.params.opening_slot(round);
+        let epoch = attestation_epoch(slot) as u32;
+        let mut attested = 0;
+        let mut released = None;
         for validator in self.ours.clone() {
             let state = self.signing.entry(validator).or_default();
-            if state.last_round.is_some_and(|last| last >= round) {
+            if state.last_attestation_slot.is_some_and(|last| last >= slot) {
                 continue;
             }
-            let attestation = state.record.create_attestation(validator, &input);
-            state.last_round = Some(round);
+            let Some(attestation) = state.record.create_attestation(validator, &input) else {
+                continue;
+            };
+            state.last_attestation_slot = Some(slot);
+            state.record.prune_below(input.finalized_height);
             self.persist_signing(validator);
-            let epoch = attestation_epoch(opening) as u32;
             let root = attestation.hash_tree_root();
             let signature = match self.keys.sign_attestation_message(validator, epoch, &root) {
                 Ok(signature) => signature,
                 Err(err) => {
-                    error!(round, validator, %err, "Failed to sign combined attestation");
+                    error!(slot, validator, %err, "Failed to sign decoupled attestation");
                     continue;
                 }
             };
-            self.engine.on_sg_vote(attestation.clone());
+            self.engine.on_attestation(attestation.clone());
             self.attestation_signatures
-                .insert(attestation.clone(), signature.clone());
+                .insert(attestation.clone(), (slot, signature.clone()));
+            attested += 1;
+            released = Some(attestation.data.clone());
             if let Some(p2p) = &self.p2p {
                 let _ = p2p
                     .publish_decoupled_attestation(SignedDecoupledAttestation {
                         attestation,
+                        slot,
                         signature,
                     })
-                    .inspect_err(|err| error!(%err, "Failed to publish combined attestation"));
+                    .inspect_err(|err| error!(%err, "Failed to publish decoupled attestation"));
             }
         }
-        info!(
-            round,
-            safe = %ShortRoot(&input.safe.0),
-            source_height = input.source.map(|s| s.height),
-            justified_height = input.justified_height,
-            finalized_height = input.finalized_height,
-            "Attested"
-        );
+        if let Some(data) = released {
+            let height = data.height_pair();
+            let finality = data.finality_pair();
+            info!(
+                slot,
+                validators = attested,
+                height = height.map(|pair| pair.height),
+                entry = height.map(|pair| ShortRoot(&pair.entry.0).to_string()),
+                timeout = height.map(|pair| pair.timeout),
+                finality_height = finality.map(|pair| pair.height),
+                finality_target = finality.map(|pair| ShortRoot(&pair.target.0).to_string()),
+                "Attested"
+            );
+        }
     }
 
     // ── Imports ────────────────────────────────────────────────────────────
@@ -473,16 +493,16 @@ impl DecoupledLeanServer {
     fn on_attestation(&mut self, signed: SignedDecoupledAttestation) {
         if !self.verify_attestation(&signed) {
             debug!(
-                round = signed.attestation.data.round,
+                slot = signed.slot,
                 validator = signed.attestation.validator,
-                "Invalid combined attestation"
+                "Invalid decoupled attestation"
             );
             return;
         }
         let attestation = signed.attestation;
-        if self.engine.on_sg_vote(attestation.clone()) {
+        if self.engine.on_attestation(attestation.clone()) {
             self.attestation_signatures
-                .insert(attestation, signed.signature);
+                .insert(attestation, (signed.slot, signed.signature));
         }
     }
 
@@ -545,8 +565,10 @@ impl DecoupledLeanServer {
                 .insert(signed.vote, signed.signature.clone());
         }
         for signed in block.message.body.attestations.iter() {
-            self.attestation_signatures
-                .insert(signed.attestation.clone(), signed.signature.clone());
+            self.attestation_signatures.insert(
+                signed.attestation.clone(),
+                (signed.slot, signed.signature.clone()),
+            );
         }
         let finalized = self.engine.finalized();
         info!(
@@ -630,11 +652,12 @@ impl DecoupledLeanServer {
         let oldest_vote_slot = slot.saturating_sub(1);
         self.vote_signatures
             .retain(|vote, _| vote.slot >= oldest_vote_slot);
-        let round = self.engine.current_round();
-        let oldest_round = round.saturating_sub(self.config.params.eta_sg);
+        let engine = &self.engine;
         self.attestation_signatures
-            .retain(|attestation, _| attestation.round() >= oldest_round);
-        let oldest_slot = slot.saturating_sub(4 * self.config.params.slots_per_round);
+            .retain(|attestation, _| engine.attestation_is_useful(&attestation.data));
+        // Long enough for a block to carry what gossip delivered: votes are
+        // carried one slot later, attestations within a few.
+        let oldest_slot = slot.saturating_sub(4 * self.config.params.lock_period);
         self.verified
             .retain(|_, verified_slot| *verified_slot >= oldest_slot);
         self.requested
@@ -643,6 +666,8 @@ impl DecoupledLeanServer {
 
     // ── Signatures ─────────────────────────────────────────────────────────
 
+    /// Verify `signature` over `root` at `epoch`, remembering a success under
+    /// `root`.
     fn check(
         &mut self,
         pubkey: Option<&ValidatorPublicKey>,
@@ -654,14 +679,7 @@ impl DecoupledLeanServer {
         if self.verified.contains_key(&root) {
             return true;
         }
-        let Some(pubkey) = pubkey else {
-            return false;
-        };
-        let Ok(epoch) = u32::try_from(epoch) else {
-            return false;
-        };
-        let valid = ValidatorSignature::from_bytes(&signature.to_ssz())
-            .is_ok_and(|signature| signature.is_valid(pubkey, epoch, &root));
+        let valid = xmss_valid(pubkey, epoch, root, signature);
         if valid {
             self.verified.insert(root, slot);
         }
@@ -683,20 +701,34 @@ impl DecoupledLeanServer {
         )
     }
 
+    /// The attester's signature at the epoch of the slot the envelope names.
+    /// An envelope naming a slot ahead of the clock is refused: no honest
+    /// attester signs at an epoch it has not reached.
     fn verify_attestation(&mut self, signed: &SignedDecoupledAttestation) -> bool {
+        if signed.slot > self.engine.current_slot() + 1 {
+            return false;
+        }
+        let envelope = signed.hash_tree_root();
+        if self.verified.contains_key(&envelope) {
+            return true;
+        }
         let attestation = &signed.attestation;
-        let opening = self.config.params.opening_slot(attestation.round());
         let pubkey = self
             .pubkeys
             .get(attestation.validator as usize)
-            .map(|keys| keys.0.clone());
-        self.check(
-            pubkey.as_ref(),
-            attestation_epoch(opening),
+            .map(|keys| &keys.0);
+        // Not `check`: an attestation's own root may be signed again in
+        // another slot, so only the whole envelope can stand for a success.
+        let valid = xmss_valid(
+            pubkey,
+            attestation_epoch(signed.slot),
             attestation.hash_tree_root(),
-            opening,
             &signed.signature,
-        )
+        );
+        if valid {
+            self.verified.insert(envelope, signed.slot);
+        }
+        valid
     }
 
     /// The proposer schedule, the proposer's signature, and every carried
@@ -804,21 +836,23 @@ impl DecoupledLeanServer {
         let engine = &self.engine;
         let head_root = engine.head();
         let (justified, justified_height) = engine.justified();
+        let frame = engine.frame();
         let status = DecoupledStatus {
             slot: engine.current_slot(),
-            round: engine.current_round(),
             head: engine.block_ref(&head_root).unwrap_or(BlockRef {
                 root: head_root,
                 slot: 0,
             }),
             confirmed: engine.confirmed(),
-            stable: engine.stable(),
+            fg_confirmed: engine.fg_confirmed(),
+            locks: engine.locks(),
             finalized: engine.finalized(),
             finalized_height: engine.finalized_height(),
             justified,
             justified_height,
             max_height: engine.max_height(),
-            live_confirmed: engine.live_confirmed(),
+            fc_root: engine.block_ref(&frame.root).unwrap_or_default(),
+            height_floor: frame.floor,
             blocks: engine.blocks().count() as u64,
         };
         *self
@@ -854,6 +888,22 @@ fn block_input(block: &SignedDecoupledBlock, root: H256) -> BlockInput {
     }
 }
 
+fn xmss_valid(
+    pubkey: Option<&ValidatorPublicKey>,
+    epoch: u64,
+    root: H256,
+    signature: &XmssSignature,
+) -> bool {
+    let Some(pubkey) = pubkey else {
+        return false;
+    };
+    let Ok(epoch) = u32::try_from(epoch) else {
+        return false;
+    };
+    ValidatorSignature::from_bytes(&signature.to_ssz())
+        .is_ok_and(|signature| signature.is_valid(pubkey, epoch, &root))
+}
+
 /// The root of a lean decoupled chain's genesis block for a genesis state.
 pub fn genesis_root(genesis_state_root: H256) -> H256 {
     DecoupledBlock::genesis(genesis_state_root).hash_tree_root()
@@ -882,12 +932,9 @@ mod tests {
     #[test]
     fn the_signing_epochs_never_collide() {
         let mut epochs = HashSet::new();
-        let params = Params::with_round_length(3);
         for slot in 0..200 {
             assert!(epochs.insert(goldfish_vote_epoch(slot)));
-        }
-        for round in 0..60 {
-            assert!(epochs.insert(attestation_epoch(params.opening_slot(round))));
+            assert!(epochs.insert(attestation_epoch(slot)));
         }
     }
 }

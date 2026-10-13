@@ -605,11 +605,7 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     // The decoupled fork's protocol parameters. Absent keeps the defaults
     // already in `Config`, which every network without the fork leaves unused.
     for (key, field) in [
-        (
-            "DECOUPLED_SLOTS_PER_ROUND",
-            &mut config.decoupled_slots_per_round,
-        ),
-        ("DECOUPLED_SG_WINDOW", &mut config.decoupled_sg_window),
+        ("DECOUPLED_LOCK_PERIOD", &mut config.decoupled_lock_period),
         (
             "DECOUPLED_NONJUSTIFIABLE_PERIOD",
             &mut config.decoupled_nonjustifiable_period,

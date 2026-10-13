@@ -40,18 +40,27 @@ use crate::beacon::helpers::accessors::{
     ActiveBalanceCache, CommitteeCache, CommitteeCacheExt, get_domain_from_schedule,
 };
 use crate::beacon::helpers::misc::{compute_epoch_at_slot, compute_signing_root};
-use crate::beacon::primitives::{HashTreeRoot as _, Slot, ValidatorIndex};
+use crate::beacon::primitives::{Epoch, HashTreeRoot as _, Slot, ValidatorIndex};
 use crate::beacon::stf::ExecutionEngine;
 
-/// The protocol's parameters, read from the five `DECOUPLED_*` config keys.
+/// The protocol's parameters, read from the four `DECOUPLED_*` config keys.
 pub fn params(config: &Config) -> Params {
     Params {
-        slots_per_round: config.decoupled_slots_per_round,
-        eta_sg: config.decoupled_sg_window,
-        k: config.decoupled_nonjustifiable_period,
-        d: config.decoupled_finality_debt,
+        lock_period: config.decoupled_lock_period,
+        nonjustifiable_period: config.decoupled_nonjustifiable_period,
+        finality_debt: config.decoupled_finality_debt,
         timeout_delay: config.decoupled_timeout_delay,
     }
+}
+
+/// The epoch whose fork version an attestation's `DOMAIN_COMBINED_ATTESTATION`
+/// signature is computed at: the fork's activation epoch.
+///
+/// Goldilocks attestations name neither a slot nor a round, so there is no
+/// epoch of their own to sign at; any fixed epoch of the fork gives the same
+/// domain, since the fork has no successor.
+pub fn attestation_signing_epoch(config: &Config) -> Epoch {
+    config.decoupled_fork_epoch
 }
 
 /// The protocol fields a proposer supplies for a decoupled block body: what
@@ -84,6 +93,19 @@ pub fn slot_committee(
         members.extend_from_slice(epoch_committees.committee(slot, index)?);
     }
     Ok(members)
+}
+
+/// `|𝒦_s|` with `active` active validators: how many of them the shuffling
+/// assigns to slot `slot`.
+///
+/// The beacon committees split the shuffled active set into
+/// `SLOTS_PER_EPOCH · committees_per_slot` consecutive ranges, committee `c`
+/// taking `[active·c / C, active·(c+1) / C)`. A slot's committees are
+/// consecutive, so their ranges telescope and the committee count cancels.
+pub fn slot_committee_size(active: u64, slot: Slot) -> u64 {
+    let slots = crate::beacon::preset::SLOTS_PER_EPOCH;
+    let index = slot % slots;
+    active * (index + 1) / slots - active * index / slots
 }
 
 /// Fulu's state with its `fork` moved to the decoupled version.
@@ -207,14 +229,10 @@ pub fn process_decoupled_body(
         }
     }
 
-    let current_round = params.round_of(block.slot);
     let validator_count = state.validator_count();
     for aggregate in body.combined_attestations.iter() {
         let data = &aggregate.data;
-        verify(
-            data.round <= current_round,
-            "combined attestation round <= round(block.slot)",
-        )?;
+        verify(!data.is_empty(), "combined attestation names a pair")?;
         if aggregate.aggregation_bits.len() != validator_count {
             return Err(Error::InvalidDecoupledVote(
                 "combined aggregation_bits length != validator count",
@@ -231,7 +249,7 @@ pub fn process_decoupled_body(
                 config,
                 state,
                 constants::DOMAIN_COMBINED_ATTESTATION,
-                compute_epoch_at_slot(params.opening_slot(data.round)),
+                attestation_signing_epoch(config),
             );
             verify_aggregate(
                 state,
@@ -405,7 +423,7 @@ mod tests {
     use crate::beacon::primitives::{
         BlsSignature, Bytes32, ExecutionAddress, ExecutionBlockHash, Root, Uint256,
     };
-    use ethlambda_types::decoupled::AttestationData;
+    use ethlambda_types::decoupled::{AttestationData, HeightVote};
 
     const VALIDATORS: usize = 64;
 
@@ -541,18 +559,20 @@ mod tests {
         }
     }
 
-    fn combined_aggregate(
-        state: &BeaconState,
-        round: u64,
-        signers: &[usize],
-    ) -> CombinedAttestationAggregate {
-        let data = AttestationData::new(round, Some(Root::repeat_byte(0x22)), None, None);
-        let params = params(&config());
+    fn combined_aggregate(state: &BeaconState, signers: &[usize]) -> CombinedAttestationAggregate {
+        let data = AttestationData::new(
+            Some(HeightVote {
+                height: 1,
+                entry: Root::repeat_byte(0x22),
+                timeout: false,
+            }),
+            None,
+        );
         let domain = get_domain_from_schedule(
             &config(),
             state,
             constants::DOMAIN_COMBINED_ATTESTATION,
-            compute_epoch_at_slot(params.opening_slot(round)),
+            attestation_signing_epoch(&config()),
         );
         let root = compute_signing_root(data.hash_tree_root(), domain);
         let signatures: Vec<_> = signers.iter().map(|&i| sign_for(i, root)).collect();
@@ -561,6 +581,26 @@ mod tests {
             data,
             signature: bls::aggregate(&signatures).unwrap(),
         }
+    }
+
+    #[test]
+    fn slot_committee_sizes_follow_from_the_active_count() {
+        let state = decoupled_state();
+        let committees = CommitteeCache::default();
+        let epoch_start = state.slot() - state.slot() % preset::SLOTS_PER_EPOCH;
+        for slot in epoch_start..epoch_start + preset::SLOTS_PER_EPOCH {
+            let committee = slot_committee(&state, slot, &committees).unwrap();
+            assert_eq!(
+                slot_committee_size(VALIDATORS as u64, slot),
+                committee.len() as u64,
+                "slot {slot}"
+            );
+        }
+        // Uneven splits still cover the whole active set once per epoch.
+        let total: u64 = (0..preset::SLOTS_PER_EPOCH)
+            .map(|slot| slot_committee_size(1_000, slot))
+            .sum();
+        assert_eq!(total, 1_000);
     }
 
     #[test]
@@ -621,7 +661,7 @@ mod tests {
         let mut state = decoupled_state();
         let mut block = empty_block(&state, &config());
         let goldfish = goldfish_aggregate(&state, state.slot() - 1, 2);
-        let combined = combined_aggregate(&state, 0, &[1, 4, 9]);
+        let combined = combined_aggregate(&state, &[1, 4, 9]);
         block.body.goldfish_votes = vec![goldfish.clone()].try_into().unwrap();
         block.body.goldfish_support = bits(1, &[0]);
         block.body.combined_attestations = vec![combined.clone()].try_into().unwrap();
@@ -658,7 +698,7 @@ mod tests {
     fn a_bad_signature_is_rejected_only_when_verifying() {
         let mut state = decoupled_state();
         let mut block = empty_block(&state, &config());
-        let mut aggregate = combined_aggregate(&state, 0, &[2, 3]);
+        let mut aggregate = combined_aggregate(&state, &[2, 3]);
         aggregate.signature = sign_for(7, Root::repeat_byte(0x99));
         block.body.combined_attestations = vec![aggregate].try_into().unwrap();
 
@@ -676,21 +716,22 @@ mod tests {
         let block = empty_block(&state, &config());
 
         let mut short = block.clone();
-        let mut aggregate = combined_aggregate(&state, 0, &[1]);
+        let mut aggregate = combined_aggregate(&state, &[1]);
         aggregate.aggregation_bits = bits(VALIDATORS - 1, &[1]);
         short.body.combined_attestations = vec![aggregate].try_into().unwrap();
         assert!(apply(&mut state.clone(), &short, false).is_err());
 
         let mut empty = block.clone();
-        let mut aggregate = combined_aggregate(&state, 0, &[1]);
+        let mut aggregate = combined_aggregate(&state, &[1]);
         aggregate.aggregation_bits = bits(VALIDATORS, &[]);
         empty.body.combined_attestations = vec![aggregate].try_into().unwrap();
         assert!(apply(&mut state.clone(), &empty, false).is_err());
 
-        let mut future = block.clone();
-        let aggregate = combined_aggregate(&state, 1_000, &[1]);
-        future.body.combined_attestations = vec![aggregate].try_into().unwrap();
-        assert!(apply(&mut state.clone(), &future, false).is_err());
+        let mut silent = block.clone();
+        let mut aggregate = combined_aggregate(&state, &[1]);
+        aggregate.data = AttestationData::default();
+        silent.body.combined_attestations = vec![aggregate].try_into().unwrap();
+        assert!(apply(&mut state.clone(), &silent, false).is_err());
 
         let mut unmatched = block;
         unmatched.body.goldfish_votes = vec![goldfish_aggregate(&state, state.slot() - 1, 2)]

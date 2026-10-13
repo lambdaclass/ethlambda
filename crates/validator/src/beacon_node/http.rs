@@ -867,16 +867,16 @@ impl BeaconNodeApi for HttpBeaconNode {
             .await
     }
 
-    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
+    async fn decoupled_attestation_input(&self, slot: Slot) -> Result<AttestationInput> {
         let response: DataResponse<AttestationInput> = self
             .get(&format!(
-                "/eth/v1/validator/decoupled/attestation_input?round={round}"
+                "/eth/v1/validator/decoupled/attestation_input?slot={slot}"
             ))
             .await?;
-        if response.data.round != round {
+        if response.data.slot != slot {
             return Err(Error::InconsistentResponse(format!(
-                "requested attestation input for round {round}, node answered for round {}",
-                response.data.round
+                "requested attestation input for slot {slot}, node answered for slot {}",
+                response.data.slot
             )));
         }
         Ok(response.data)

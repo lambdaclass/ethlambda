@@ -374,7 +374,8 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     };
     // The decoupled fork's duties replace the attester ones at its slots: the
     // Goldfish vote of the slot's committee members at a quarter of the slot,
-    // then, once per round, every active validator's combined attestation.
+    // then, half way in, every active validator's attestation, cast only by
+    // those whose record finds something new in the node's input.
     let decoupled_duties = async {
         if !clock.is_decoupled(slot) {
             return;
@@ -383,11 +384,9 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
             tokio::time::sleep(clock.until_goldfish_vote(slot, SystemTime::now())).await;
             goldfish_vote(decoupled, clock, slot, slot_duties, store).await;
         }
-        if let Some(round) = clock.decoupled_round_attesting_in(slot)
-            && !active.is_empty()
-        {
-            tokio::time::sleep(clock.until_decoupled_attestation(round, SystemTime::now())).await;
-            combined_attest(decoupled, clock, slot, round, active, store).await;
+        if !active.is_empty() {
+            tokio::time::sleep(clock.until_decoupled_attestation(slot, SystemTime::now())).await;
+            combined_attest(decoupled, clock, slot, active, store).await;
         }
     };
     tokio::join!(
@@ -429,8 +428,7 @@ async fn goldfish_vote<B: BeaconNodeApi>(
     }
 }
 
-/// Run one round's combined attestation duty, bounded by what is left of the
-/// slot it is cast in (`slot`, the round's second).
+/// Run one slot's attestation duty, bounded by what is left of the slot.
 ///
 /// Abandoning it is safe for the reason [`goldfish_vote`]'s is: each
 /// validator's record is persisted before its signature exists.
@@ -438,21 +436,20 @@ async fn combined_attest<B: BeaconNodeApi>(
     service: &DecoupledService<B>,
     clock: &SlotClock,
     slot: u64,
-    round: u64,
     active: &[(BlsPubkey, ValidatorIndex)],
     store: &RwLock<ValidatorStore>,
 ) {
     let budget = clock.remaining_in(slot, SystemTime::now());
-    match tokio::time::timeout(budget, service.attest(round, active, store)).await {
+    match tokio::time::timeout(budget, service.attest(slot, active, store)).await {
         Ok(Ok(_)) => {}
         Ok(Err(err)) => {
-            error!(round, %err, "Failed to publish combined attestations for this round");
+            error!(%slot, %err, "Failed to publish combined attestations for this slot");
             metrics::inc_combined_attestation_failures();
             metrics::set_beacon_node_available(false);
         }
         Err(_) => {
             warn!(
-                round,
+                %slot,
                 budget_ms = budget.as_millis() as u64,
                 "Combined attestation duty ran past the end of its slot and was abandoned"
             );
@@ -1241,16 +1238,15 @@ mod tests {
     }
 
     /// At a decoupled slot the client votes for its committee seats at a quarter
-    /// of the slot and, in a round's second slot, attests for every active
-    /// validator; it makes no LMD attestation.
+    /// of the slot and, half way in, attests for every active validator that
+    /// has something new to say; it makes no LMD attestation.
     #[tokio::test]
-    async fn a_decoupled_slot_runs_the_goldfish_vote_and_the_round_attestation() {
+    async fn a_decoupled_slot_runs_the_goldfish_vote_and_the_attestation() {
         use ethlambda_decoupled::{AttestationInput, SourceFields};
 
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
             .with_fork_epoch(ethlambda_types::beacon::fork::ForkName::Decoupled, 0);
         config.slot_duration_ms = 1_000;
-        config.decoupled_slots_per_round = 4;
         let context = Arc::new(SigningContext {
             config: config.clone(),
             genesis_validators_root: Root::ZERO,
@@ -1260,9 +1256,7 @@ mod tests {
             .expect("after the epoch")
             .as_secs();
         let clock = SlotClock::from_config(now_secs - 100, &config);
-        // 101 is the second slot of round 25.
         let slot = clock.now().expect("after genesis") + 1;
-        assert_eq!(clock.decoupled_round_attesting_in(slot), Some(25));
 
         let mut store = ValidatorStore::new();
         let secret: [u8; 32] =
@@ -1277,8 +1271,7 @@ mod tests {
             MockBeaconNode::new()
                 .with_goldfish_head(Root::repeat_byte(5))
                 .with_decoupled_input(AttestationInput {
-                    round: 25,
-                    safe: Root::repeat_byte(6),
+                    slot,
                     source: Some(SourceFields {
                         height: 3,
                         entry: Root::repeat_byte(1),
@@ -1319,7 +1312,11 @@ mod tests {
         assert_eq!(node.attestation_data_call_count(), 0, "no LMD attestation");
         assert_eq!(node.submitted_goldfish_votes().len(), 1);
         assert_eq!(node.submitted_combined_attestations().len(), 1);
-        assert_eq!(node.submitted_combined_attestations()[0].data.round, 25);
+        let pair = node.submitted_combined_attestations()[0]
+            .data
+            .height_pair()
+            .expect("a height pair");
+        assert_eq!((pair.height, pair.entry), (3, Root::repeat_byte(1)));
     }
 
     /// The restructured loop: a client on a slot's committee with no attester

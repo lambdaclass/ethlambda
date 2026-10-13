@@ -238,14 +238,14 @@ fn handle_decoupled_attestation(server: &P2PServer, payload: &[u8]) {
         return;
     };
     trace!(
-        round = attestation.attestation.data.round,
+        slot = attestation.slot,
         validator = attestation.attestation.validator,
-        "Received combined attestation from gossip"
+        "Received decoupled attestation from gossip"
     );
     if let Some(chain) = decoupled_chain(server) {
         let _ = chain
             .new_decoupled_attestation(attestation)
-            .inspect_err(|err| error!(%err, "Failed to forward combined attestation"));
+            .inspect_err(|err| error!(%err, "Failed to forward decoupled attestation"));
     }
 }
 
@@ -407,11 +407,11 @@ fn handle_beacon_gossip(
 /// Decoded here; checked against the head state (a vote's committee
 /// membership, and either message's signature) and offered to the shared
 /// decoupled engine on a blocking thread ([`Validated::Decoupled`]), since a
-/// round's attestations arrive together and each costs a state read and a BLS
+/// committee's votes arrive together and each costs a state read and a BLS
 /// verification. Accepted when the engine admits it, so only what this node
-/// holds is relayed; ignored when the engine refuses it (outside its slot or
-/// round window, a repeat, a third distinct vote), and rejected when malformed
-/// or wrongly signed.
+/// holds is relayed; ignored when the engine refuses it (a vote outside its
+/// slot window or a third distinct vote; an attestation that can no longer
+/// count, or a repeat), and rejected when malformed or wrongly signed.
 fn triage_decoupled_vote(server: &P2PServer, kind: &str, payload: &[u8]) -> Dispatch {
     use ethlambda_types::beacon::containers::decoupled::{
         SignedCombinedAttestation, SignedGoldfishVote,
@@ -476,18 +476,17 @@ pub fn publish_combined_attestation(
     server: &P2PServer,
     attestation: ethlambda_types::beacon::containers::decoupled::SignedCombinedAttestation,
 ) {
-    // Published under the digest of the slot it is being sent at: the
-    // round's attestation time falls in its second slot.
+    // Published under the digest of the slot it is being sent at.
     let slot = server
         .decoupled_node
         .as_ref()
         .map(|node| {
             let node = node.lock().expect("decoupled node lock poisoned");
-            node.params().opening_slot(attestation.data.round) + 1
+            node.engine().current_slot()
         })
         .unwrap_or(0);
     trace!(
-        round = attestation.data.round,
+        slot,
         validator = attestation.validator_index,
         "Publishing combined attestation"
     );

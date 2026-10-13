@@ -319,10 +319,10 @@ pub(crate) struct MainnetOptions {
     #[arg(long)]
     pub(crate) decoupled_fork_epoch: Option<u64>,
 
-    /// Slots per round of the decoupled protocol, overriding the loaded
-    /// network's `DECOUPLED_SLOTS_PER_ROUND`. At least 3.
+    /// Goldilocks' lock period `k`, in slots, overriding the loaded network's
+    /// `DECOUPLED_LOCK_PERIOD`. At least 2.
     #[arg(long)]
-    pub(crate) decoupled_slots_per_round: Option<u64>,
+    pub(crate) decoupled_lock_period: Option<u64>,
 }
 
 /// Flags only the lean chain takes.
@@ -457,8 +457,8 @@ pub(crate) struct LeanOptions {
     /// `on_block`.
     #[arg(long, default_value = "3")]
     pub(crate) max_attestations_per_block: usize,
-    /// Run the decoupled consensus protocol (Goldfish + graded stabilization
-    /// gadget + height-based finality gadget) instead of 3SF-mini.
+    /// Run the decoupled consensus protocol (Goldilocks: Goldfish with locks,
+    /// composed with a height-based finality gadget) instead of 3SF-mini.
     ///
     /// The same as `DECOUPLED_CONSENSUS: true` in the genesis config, for
     /// tooling that generates that file. Every node of the network must agree:
@@ -466,10 +466,11 @@ pub(crate) struct LeanOptions {
     /// chain.
     #[arg(long = "decoupled", default_value = "false")]
     pub(crate) decoupled: bool,
-    /// Slots per round `R` (at least 3) for the decoupled protocol. Overrides
-    /// `DECOUPLED_SLOTS_PER_ROUND`; the default is 3.
-    #[arg(long = "decoupled.slots-per-round")]
-    pub(crate) decoupled_slots_per_round: Option<u64>,
+    /// Goldilocks' lock period `k` (at least 2), in slots: how long a lock
+    /// lives and how many consecutive confirmations form a slow lock.
+    /// Overrides `DECOUPLED_LOCK_PERIOD`; the default is 4.
+    #[arg(long = "decoupled.lock-period")]
+    pub(crate) decoupled_lock_period: Option<u64>,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]

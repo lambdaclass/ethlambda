@@ -1,8 +1,8 @@
 //! The beacon chain actor's side of the `decoupled` fork.
 //!
 //! From the fork on, the head is the decoupled engine's, not LMD-GHOST's, and
-//! the execution client hears the engine's stable and finalized blocks as
-//! `safe` and `finalized`. The legacy FFG checkpoints of the store stay where
+//! the execution client hears the engine's confirmed (locked) and finalized
+//! blocks as `safe` and `finalized`. The legacy FFG checkpoints of the store stay where
 //! the fork left them: nothing epoch-based may prune or gate on a finalized
 //! block the decoupled protocol chose at an arbitrary slot (see
 //! `docs/decoupled_consensus.md`).
@@ -117,7 +117,8 @@ impl BlockChainServer {
                 head_slot = status.head.slot,
                 head_root = %ShortRoot(&head.0),
                 confirmed_slot = status.confirmed.slot,
-                stable_slot = status.stable.slot,
+                fg_confirmed_slot = status.fg_confirmed.map(|block| block.slot),
+                locks = status.locks.len(),
                 finalized_slot = status.finalized.slot,
                 finalized_height = status.finalized_height,
                 justified_slot = status.justified.slot,
@@ -132,12 +133,13 @@ impl BlockChainServer {
     }
 
     /// The `safe` and `finalized` blocks for `forkchoiceUpdated`: the engine's
-    /// stable and finalized tips.
+    /// confirmed (locked) and finalized tips. A lock survives bounded
+    /// asynchrony, which is what `safe` promises.
     pub(crate) fn decoupled_safe_and_finalized(&self) -> Option<(H256, H256)> {
         let node = self.decoupled.as_ref()?;
         let node = node.lock().expect("decoupled node lock poisoned");
         let engine = node.engine();
-        Some((engine.stable().root, engine.finalized().root))
+        Some((engine.confirmed().root, engine.finalized().root))
     }
 }
 
@@ -146,8 +148,8 @@ impl BlockChainServer {
 /// The legacy FFG finality never advances in the decoupled fork, so
 /// `LiveChain` still holds every block since genesis; they are imported in
 /// slot order, each with its own post-state for the committee lookup. The
-/// rebuilt node is a node that joins (`§6.2`): every block is stamped now,
-/// and its saved grades start empty.
+/// rebuilt node is a node that joins: every block is stamped now, and it holds
+/// no locks until its first confirmation updates.
 pub fn replay(store: &ethlambda_storage::Store, node: &SharedDecoupledNode) -> usize {
     let mut blocks: Vec<(u64, H256)> = store
         .block_index()

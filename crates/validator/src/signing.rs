@@ -164,16 +164,15 @@ impl SigningContext {
         compute_signing_root(data.hash_tree_root(), domain)
     }
 
-    /// The root a combined attestation is computed over: its data under the
-    /// combined attestation domain at the epoch of the round's opening slot
-    /// (`round * DECOUPLED_SLOTS_PER_ROUND`), not of the slot it is cast in.
+    /// The root a decoupled attestation is computed over: its data under the
+    /// combined attestation domain at the decoupled fork's activation epoch.
+    /// The data names no slot or round to take an epoch from, and the fork
+    /// has no successor, so the fork's own version is the only one it can
+    /// sign under (`attestation_signing_epoch` in the state transition).
     pub fn combined_attestation_signing_root(&self, data: &DecoupledAttestationData) -> Root {
-        let opening_slot = data
-            .round
-            .saturating_mul(self.config.decoupled_slots_per_round);
         let domain = self.domain(
             DOMAIN_COMBINED_ATTESTATION,
-            compute_epoch_at_slot(opening_slot),
+            self.config.decoupled_fork_epoch,
         );
         compute_signing_root(data.hash_tree_root(), domain)
     }
@@ -824,8 +823,7 @@ mod tests {
     const DECOUPLED_EPOCH: Epoch = 10;
 
     fn decoupled_context() -> SigningContext {
-        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, DECOUPLED_EPOCH);
-        config.decoupled_slots_per_round = 4;
+        let config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, DECOUPLED_EPOCH);
         SigningContext {
             config,
             genesis_validators_root: Root::repeat_byte(7),
@@ -883,38 +881,22 @@ mod tests {
     }
 
     #[test]
-    fn a_combined_attestation_signs_at_the_epoch_of_the_rounds_opening_slot() {
+    fn a_combined_attestation_signs_under_the_decoupled_fork_version() {
         let context = decoupled_context();
-        let first_round = DECOUPLED_EPOCH * preset::SLOTS_PER_EPOCH / 4;
-        let data =
-            |round| DecoupledAttestationData::new(round, Some(Root::repeat_byte(3)), None, None);
-
-        // A round opening in the decoupled fork.
-        let inside = data(first_round + 1);
+        let inside = DecoupledAttestationData::new(
+            Some(ethlambda_types::decoupled::HeightVote {
+                height: 4,
+                entry: Root::repeat_byte(3),
+                timeout: false,
+            }),
+            None,
+        );
         assert_eq!(
             context.combined_attestation_signing_root(&inside),
             expected_root(
                 inside.hash_tree_root(),
                 DOMAIN_COMBINED_ATTESTATION,
                 context.config.decoupled_fork_version,
-                Root::repeat_byte(7),
-            )
-        );
-
-        // A round that opened one slot before the fork signs under the old
-        // fork's version (whatever precedes it) even though it is cast after the fork: the epoch is
-        // the opening slot's, as the state transition verifies it.
-        let straddling = data(first_round - 1);
-        let before = context
-            .config
-            .fork_version(context.config.fork_at_epoch(DECOUPLED_EPOCH - 1));
-        assert_ne!(before, context.config.decoupled_fork_version);
-        assert_eq!(
-            context.combined_attestation_signing_root(&straddling),
-            expected_root(
-                straddling.hash_tree_root(),
-                DOMAIN_COMBINED_ATTESTATION,
-                before,
                 Root::repeat_byte(7),
             )
         );

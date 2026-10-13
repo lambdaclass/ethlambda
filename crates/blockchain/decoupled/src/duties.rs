@@ -1,19 +1,20 @@
-//! Validator duties and available confirmation (PROTOCOL.md figures
-//! `alg:store` and `alg:duties`).
+//! Validator duties and the confirmation update.
 //!
 //! Duties are store reads: the engine computes what an honest validator would
 //! emit, and the host signs it, broadcasts it, and feeds it back through the
-//! ordinary handlers (`on_block`, `on_goldfish_vote`, `on_sg_vote`). Only the
-//! confirmation update writes the store, and it runs inside `on_tick`.
+//! ordinary handlers (`on_block`, `on_goldfish_vote`, `on_attestation`). Only
+//! the confirmation update and the fast unlocks write the store, and they run
+//! inside `on_tick`.
 
 use std::collections::{HashMap, HashSet};
 
 use ethlambda_types::primitives::H256;
 
 use crate::fork_choice::VoteView;
-use crate::params::{slot_start, view_freeze};
+use crate::locks::at_least_half;
+use crate::params::view_freeze;
 use crate::store::Store;
-use crate::types::{Attestation, GoldfishVote, Round, Slot, ValidatorIndex};
+use crate::types::{Attestation, GoldfishVote, Slot, ValidatorIndex};
 use crate::validator_client::{AttestationInput, SourceFields};
 
 /// The protocol content of an honest proposal (`propose_block`).
@@ -26,7 +27,7 @@ pub struct Proposal {
     pub votes: Vec<GoldfishVote>,
     /// `B.support_votes`: the members resolved at proposal time.
     pub support_votes: Vec<GoldfishVote>,
-    /// `B.attestations` (`proposal_attestations`).
+    /// `B.attestations`: the pooled attestations that count on `H`'s chain.
     pub attestations: Vec<Attestation>,
 }
 
@@ -48,89 +49,82 @@ impl Store {
         }
     }
 
-    /// `proposal_attestations(Σ, H)`: the pool's attestations in the inclusive
-    /// window `[max(0, r − η_SG), r]`, plus those carried by held blocks of a
-    /// slot in that window, minus every attestation already on `H`'s chain,
-    /// with at most two attestations per validator and round (the first two
-    /// in this order, as the formalization fixes).
-    pub fn proposal_attestations(&self, head: &H256) -> Vec<Attestation> {
-        let round = self.current_round();
-        let in_window = |r: Round| self.params.admits_round(round, r);
-
-        let mut candidates: Vec<Attestation> = Vec::new();
-        for (pool_round, pool) in &self.attestations {
-            if in_window(*pool_round) {
-                candidates.extend(pool.iter().map(|p| p.attestation.clone()));
-            }
-        }
-        let mut held: Vec<(&H256, &crate::store::Node)> = self
-            .blocks
-            .iter()
-            .filter(|(_, node)| in_window(self.params.round_of(node.slot)))
-            .collect();
-        held.sort_by_key(|(root, _)| **root);
-        for (_, node) in held {
-            candidates.extend(
-                node.attestations
-                    .iter()
-                    .filter(|a| in_window(a.round()))
-                    .cloned(),
-            );
-        }
-
-        let on_chain = self.attestations_on_chain(head, round.saturating_sub(self.params.eta_sg));
-        let mut seen: HashSet<Attestation> = HashSet::new();
-        let mut per_signer: HashMap<(ValidatorIndex, Round), usize> = HashMap::new();
+    /// The pooled attestations a block on `parent` should carry: those that
+    /// set a bit `σ[parent]` does not have yet. A block's attestations are
+    /// all counted against its parent's height, entry and justification (the
+    /// height events run once, after them), so this is exact: a height pair
+    /// naming the chain's current height and entry from a validator whose
+    /// target (or, for a timeout, progress) bit is clear, or a finality pair
+    /// naming the pending justification from a validator whose finality bit
+    /// is clear. At most one attestation per validator and kind of bit.
+    pub fn proposal_attestations(&self, parent: &H256) -> Vec<Attestation> {
+        let Some(state) = self.chain_state(parent) else {
+            return Vec::new();
+        };
+        let bit = |bits: &crate::chain_state::ValidatorBits, validator: ValidatorIndex| {
+            usize::try_from(validator)
+                .ok()
+                .and_then(|index| bits.get(index))
+                .unwrap_or(false)
+        };
+        let pending = state.justified_height > state.finalized_height;
+        let mut targeted: HashSet<ValidatorIndex> = HashSet::new();
+        let mut progressed: HashSet<ValidatorIndex> = HashSet::new();
+        let mut finalizing: HashSet<ValidatorIndex> = HashSet::new();
         let mut selected = Vec::new();
-        for attestation in candidates {
-            if on_chain.contains(&attestation) || seen.contains(&attestation) {
+        for attestation in self.pooled_attestations() {
+            let validator = attestation.validator;
+            let mut adds = false;
+            if let Some(vote) = attestation.data.height_pair()
+                && vote.height == state.height
+                && vote.entry == state.entry.root
+            {
+                if vote.timeout {
+                    adds |= !bit(&state.progress, validator)
+                        && !progressed.contains(&validator)
+                        && !targeted.contains(&validator);
+                } else {
+                    adds |= !bit(&state.target_participation, validator)
+                        && !targeted.contains(&validator);
+                }
+            }
+            if let Some(pair) = attestation.data.finality_pair()
+                && pending
+                && pair.height == state.justified_height
+                && pair.target == state.justified.root
+            {
+                adds |= !bit(&state.finalize, validator) && !finalizing.contains(&validator);
+            }
+            if !adds {
                 continue;
             }
-            let count = per_signer
-                .entry((attestation.validator, attestation.round()))
-                .or_default();
-            if *count >= 2 {
-                continue;
+            if let Some(vote) = attestation.data.height_pair()
+                && vote.height == state.height
+                && vote.entry == state.entry.root
+            {
+                progressed.insert(validator);
+                if !vote.timeout {
+                    targeted.insert(validator);
+                }
             }
-            *count += 1;
-            seen.insert(attestation.clone());
+            if let Some(pair) = attestation.data.finality_pair()
+                && pending
+                && pair.height == state.justified_height
+                && pair.target == state.justified.root
+            {
+                finalizing.insert(validator);
+            }
             selected.push(attestation);
         }
         selected
     }
 
-    /// The attestations carried by `head` and its ancestors of a round at or
-    /// after `from_round`. An attestation of round `k` can only sit in a
-    /// block of round at least `k`, so older blocks cannot hold a window row.
-    fn attestations_on_chain(&self, head: &H256, from_round: Round) -> HashSet<Attestation> {
-        let mut found = HashSet::new();
-        let mut cursor = Some(*head);
-        while let Some(root) = cursor {
-            let Some(node) = self.node(&root) else {
-                break;
-            };
-            if self.params.round_of(node.slot) < from_round {
-                break;
-            }
-            found.extend(node.attestations.iter().cloned());
-            cursor = node.parent;
-        }
-        found
-    }
-
-    /// `goldfish_vote(Σ)`: the head a slot-`Σ.s` committee member votes for.
-    /// Runs at `t_s + Δ`.
-    ///
-    /// The vote view merges the previous-slot pool frozen at
-    /// `t_{s−1} + 3Δ` with the votes carried by every held slot-`s` proposal;
-    /// the walk runs over the voter's processed-block view, which keeps only
-    /// blocks processed before the freeze plus the ancestors of current
-    /// proposals, with viability recomputed inside it.
-    pub fn goldfish_vote_head(&self) -> H256 {
-        let slot = self.slot;
+    /// The vote view of a slot-`slot` committee member at `t_s + Δ`: the
+    /// previous-slot pool frozen at `t_{s−1} + 3Δ`, merged with the votes
+    /// carried by every held slot-`s` proposal.
+    pub(crate) fn voter_view(&self, slot: Slot) -> VoteView {
         let previous = slot.saturating_sub(1);
         let freeze = view_freeze(previous);
-
         let mut votes = Vec::new();
         let mut support = Vec::new();
         if let Some(pool) = self.gf_votes.get(&previous) {
@@ -146,14 +140,8 @@ impl Store {
                 }
             }
         }
-        let proposals: Vec<H256> = self
-            .blocks
-            .iter()
-            .filter(|(_, node)| node.slot == slot)
-            .map(|(root, _)| *root)
-            .collect();
-        for proposal in &proposals {
-            let node = &self.blocks[proposal];
+        for proposal in self.proposals_of(slot) {
+            let node = &self.blocks[&proposal];
             votes.extend(node.votes.iter().filter(|v| v.slot == previous).copied());
             support.extend(
                 node.support_votes
@@ -162,21 +150,43 @@ impl Store {
                     .copied(),
             );
         }
-        let view = VoteView::new(votes, support);
-        let tree = self.voter_filtered_tree(slot, freeze, &proposals);
+        VoteView::new(votes, support)
+    }
+
+    fn proposals_of(&self, slot: Slot) -> Vec<H256> {
+        self.blocks
+            .iter()
+            .filter(|(_, node)| node.slot == slot)
+            .map(|(root, _)| *root)
+            .collect()
+    }
+
+    /// `goldfish_vote(Σ)`: the head a slot-`Σ.s` committee member votes for.
+    /// Runs at `t_s + Δ`, after the tick stepped the locks back over the same
+    /// view.
+    ///
+    /// The walk runs over the voter's processed-block view, which keeps only
+    /// blocks processed before the freeze plus the ancestors of current
+    /// proposals, with viability recomputed inside it.
+    pub fn goldfish_vote_head(&self) -> H256 {
+        let slot = self.slot;
+        let previous = slot.saturating_sub(1);
+        let view = self.voter_view(slot);
+        let tree = self.voter_filtered_tree(slot);
         self.head_in_tree(&tree, &view, previous)
     }
 
     /// `voter_filtered_block_tree(Σ, s)`.
-    fn voter_filtered_tree(&self, _slot: Slot, freeze: i64, proposals: &[H256]) -> HashSet<H256> {
+    fn voter_filtered_tree(&self, slot: Slot) -> HashSet<H256> {
+        let freeze = view_freeze(slot.saturating_sub(1));
         let mut blocks: HashSet<H256> = self
             .blocks
             .iter()
             .filter(|(_, node)| node.stamp < freeze)
             .map(|(root, _)| *root)
             .collect();
-        for proposal in proposals {
-            let mut cursor = Some(*proposal);
+        for proposal in self.proposals_of(slot) {
+            let mut cursor = Some(proposal);
             while let Some(root) = cursor {
                 if !blocks.insert(root) {
                     break;
@@ -187,9 +197,23 @@ impl Store {
         self.filtered_tree(Some(&blocks))
     }
 
-    /// `update_confirmation(Σ, s)` at `t_s + 6Δ` (= `t_{s+1} + 2Δ`): run the
-    /// composed walk over the confirmation window's votes, write
-    /// `Σ.live_confirmed`, and update the two user-facing records.
+    /// The confirmation update of slot `s`, at `t_s + 6Δ` (= `t_{s+1} + 2Δ`).
+    ///
+    /// Reads the slot's votes with the time-shifted quorum: support from the
+    /// votes resolved before the support cutoff `t_s + 2Δ` whose voter cast
+    /// nothing else before `t_s + 6Δ`, participation from every vote received
+    /// before `t_s + 6Δ`. Then, in order:
+    ///
+    /// 1. fast unlock over the late votes, so the voters of a new fast lock
+    ///    unlock whatever conflicts with it;
+    /// 2. fast lock: the deepest block of the filtered tree that at least
+    ///    half of the whole committee supports becomes `fg_confirmed` and is
+    ///    locked;
+    /// 3. the Goldfish confirmation: the majority walk from the anchor,
+    ///    which confirms its end block when that block holds a majority of
+    ///    the participants;
+    /// 4. slow lock: when this and the previous `k − 1` slots each confirmed
+    ///    a block, their deepest common ancestor is locked.
     pub(crate) fn update_confirmation(&mut self, slot: Slot) {
         let (support_cutoff, confirmation_time) = self.confirmation_window(slot);
         let pool: Vec<(GoldfishVote, i64)> = self
@@ -221,96 +245,92 @@ impl Store {
             .collect();
         let voters: HashSet<ValidatorIndex> = late.iter().map(|vote| vote.validator).collect();
 
+        // 1. Fast unlock.
+        self.step_back_locks(&late, slot);
+
+        // 2. Fast lock.
         let tree = self.filtered_tree(None);
-        let root = self.fg_root();
-        let anchor = self.sg_root();
+        let committee = self.committee_size(slot);
+        let mut supporters: HashMap<ValidatorIndex, H256> = HashMap::new();
+        for vote in &support {
+            supporters.insert(vote.validator, vote.head);
+        }
+        let tips: Vec<H256> = supporters.into_values().collect();
+        let fast = self
+            .support_counts(&tips)
+            .into_iter()
+            .filter(|(block, count)| tree.contains(block) && at_least_half(*count, committee))
+            .map(|(block, _)| block)
+            .reduce(|a, b| if self.deeper(&a, &b) { a } else { b });
+        if let Some(block) = fast {
+            self.form_lock(block, slot);
+        }
+        self.fg_confirmed = fast;
+
+        // 3. The Goldfish confirmation, from the (possibly new) anchor.
+        let anchor = self.anchor_in(&tree, slot);
         let view = VoteView::new(support.clone(), support);
         let mut scores = self.scores(&view, slot, &anchor);
         // `voters_count` is the late participants, not the support set's.
         scores.voters = voters.len() as u64;
         let head = self.ghost(anchor, &tree, &scores, |block| scores.majority(block));
+        let confirmed = scores.majority(&head).then_some(head);
 
-        let candidate = if scores.majority(&head) {
-            self.live_confirmed = head;
-            Some(head)
-        } else {
-            self.live_confirmed = root;
-            // The saved grade-2 block stands in for the walk.
-            let frame = self.read_frame(self.current_round());
-            self.active_prefix(frame.g2.flatten())
-        };
-        self.update_user_confirmation_records(candidate);
-    }
-
-    /// `update_user_confirmation_records(Σ, C)`.
-    fn update_user_confirmation_records(&mut self, candidate: Option<H256>) {
-        let confirmed = self.advance(self.latest_confirmed, candidate);
-        let stable_root = self.stable_root();
-        self.latest_stable = self.advance(self.latest_stable, Some(stable_root));
-        if self.is_ancestor(&self.latest_stable, &confirmed) {
-            // The candidate extends the new stable record.
-            self.latest_confirmed = confirmed;
-        } else if !self.is_ancestor(&self.latest_stable, &self.latest_confirmed) {
-            // The old record has left the stable chain.
-            self.latest_confirmed = self.latest_stable;
+        // 4. Slow lock.
+        let period = self.params.lock_period as usize;
+        self.confirmations.push_back((slot, confirmed));
+        while self.confirmations.len() > period {
+            self.confirmations.pop_front();
+        }
+        if let Some(meet) = self.streak_meet(slot) {
+            self.form_lock(meet, slot);
         }
     }
 
-    /// `advance(old, C)`: no candidate, or an ancestor, leaves the record.
-    fn advance(&self, old: H256, candidate: Option<H256>) -> H256 {
-        match candidate {
-            Some(c) if !self.is_ancestor(&c, &old) => c,
-            _ => old,
+    /// The deepest common ancestor of the last `k` confirmations, when they
+    /// are of the `k` consecutive slots ending at `slot` and each confirmed a
+    /// block.
+    fn streak_meet(&self, slot: Slot) -> Option<H256> {
+        let period = self.params.lock_period;
+        if self.confirmations.len() as u64 != period || slot + 1 < period {
+            return None;
         }
-    }
-
-    /// `attest(Σ, Λ)`, store side: the vote information the validator client
-    /// turns into a combined attestation at `a_r`. Run after the tick at
-    /// `a_r`, which has already run that instant's confirmation.
-    pub fn attestation_input(&self) -> AttestationInput {
-        let round = self.current_round();
-        let frame = self.read_frame(round);
-        let grade2 = self.grade2_block(&frame);
-        let anchor = self.sg_root();
-        let live = self.live_confirmed;
-
-        // `get_sg_vote(Σ, A_G2)`.
-        let safe = self
-            .deepest_clear(&anchor, &live, &frame)
-            .or(grade2)
-            .unwrap_or_else(|| match frame.g2 {
-                // Grade 2 exists, but the root has passed it.
-                Some(Some(_)) => self.fg_root(),
-                // The anchor fallback keeps voting total.
-                _ => anchor,
+        let first = slot + 1 - period;
+        let mut meet: Option<H256> = None;
+        for (offset, (confirmed_slot, confirmed)) in self.confirmations.iter().enumerate() {
+            if *confirmed_slot != first + offset as u64 {
+                return None;
+            }
+            let block = (*confirmed)?;
+            meet = Some(match meet {
+                None => block,
+                Some(previous) => self.meet(&previous, &block)?,
             });
+        }
+        meet
+    }
 
-        // `get_fg_vote(Σ, A_G2)`.
-        let view = self.pool_view(self.slot);
-        let head = self.head_with(&view, self.slot);
-        let head_state = &self.blocks[&head].state;
-        let source = grade2.map(|g2| {
-            let source = self.deepest_clear(&g2, &live, &frame).unwrap_or(g2);
-            let state = &self.blocks[&source].state;
-            SourceFields {
+    /// The store side of the attestation duty at `t_s + 2Δ`, right after the
+    /// confirmation update of slot `s − 1`: the height fields of
+    /// `fg_confirmed`'s state (none when that update fast locked nothing), and
+    /// the finality fields of the head's state.
+    pub fn attestation_input(&self) -> AttestationInput {
+        let source = self
+            .fg_confirmed
+            .and_then(|root| self.chain_state(&root))
+            .map(|state| SourceFields {
                 height: state.height,
                 entry: state.entry.root,
                 nonjustifiable: state.nonjustifiable,
-            }
-        });
+            });
+        let head = self.head();
+        let head_state = &self.blocks[&head].state;
         AttestationInput {
-            round,
-            safe,
+            slot: self.slot,
             source,
             justified_height: head_state.justified_height,
             justified: head_state.justified.root,
             finalized_height: head_state.finalized_height,
         }
-    }
-
-    /// Whether `t` is a slot's proposal instant, for hosts that schedule
-    /// their own timers.
-    pub fn is_proposal_time(t: i64) -> bool {
-        t >= 0 && t == slot_start(crate::params::slot_of(t)) && t > 0
     }
 }

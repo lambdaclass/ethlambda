@@ -117,7 +117,7 @@ pub struct MockBeaconNode {
     pub goldfish_head: Option<Root>,
     pub goldfish_vote_data_calls: Mutex<usize>,
     pub submitted_goldfish_votes: Mutex<Vec<SignedGoldfishVote>>,
-    /// What `decoupled_attestation_input` answers with. The round is the one
+    /// What `decoupled_attestation_input` answers with. The slot is the one
     /// asked for, like the real node's.
     pub decoupled_input: Mutex<Option<AttestationInput>>,
     pub decoupled_attestation_input_calls: Mutex<usize>,
@@ -398,14 +398,14 @@ impl MockBeaconNode {
         self.submitted_goldfish_votes.lock().expect("lock").clone()
     }
 
-    /// Answer `decoupled_attestation_input` with `input`, whatever round is
-    /// asked (the round field is rewritten to the one asked, like a node's).
+    /// Answer `decoupled_attestation_input` with `input`, whatever slot is
+    /// asked (the slot field is rewritten to the one asked, like a node's).
     pub fn with_decoupled_input(self, input: AttestationInput) -> Self {
         self.set_decoupled_input(input);
         self
     }
 
-    /// Replace the input served, for tests that move the chain between rounds.
+    /// Replace the input served, for tests that move the chain between slots.
     pub fn set_decoupled_input(&self, input: AttestationInput) {
         *self.decoupled_input.lock().expect("lock") = Some(input);
     }
@@ -835,7 +835,7 @@ impl BeaconNodeApi for MockBeaconNode {
         Ok(votes.len())
     }
 
-    async fn decoupled_attestation_input(&self, round: u64) -> Result<AttestationInput> {
+    async fn decoupled_attestation_input(&self, slot: Slot) -> Result<AttestationInput> {
         self.guard("decoupled_attestation_input")?;
         *self.decoupled_attestation_input_calls.lock().expect("lock") += 1;
         let input =
@@ -844,7 +844,7 @@ impl BeaconNodeApi for MockBeaconNode {
                 failure: BeaconNodeFailure::Request,
                 detail: "no attestation input set".to_string(),
             })?;
-        Ok(AttestationInput { round, ..input })
+        Ok(AttestationInput { slot, ..input })
     }
 
     async fn submit_combined_attestations(

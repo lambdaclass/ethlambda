@@ -4,12 +4,14 @@
 //! votes with these. They are deliberately separate types on separate topics:
 //! the 3SF-mini containers stay byte-for-byte what other lean clients speak.
 //!
-//! Every object carries an individual XMSS signature. The decoupled protocol
-//! has a validator sign two messages in some slots (a Goldfish vote every slot
-//! and a combined attestation once per round), and an XMSS one-time key may
-//! sign only one message per epoch, so the attestation key signs on a doubled
-//! epoch grid: see [`goldfish_vote_epoch`] and [`attestation_epoch`]. Blocks
-//! keep the proposal key at `epoch = slot`.
+//! Every object carries an individual XMSS signature. Goldilocks has a
+//! validator sign up to two messages per slot (a Goldfish vote every slot, and
+//! an attestation in a slot where it has something new to say), and an XMSS
+//! one-time key may sign only one message per epoch, so the attestation key
+//! signs on a doubled epoch grid: see [`goldfish_vote_epoch`] and
+//! [`attestation_epoch`]. Attestation data names no slot, so the signed
+//! envelope carries the slot it was signed in. Blocks keep the proposal key at
+//! `epoch = slot`.
 //!
 //! Signatures are not aggregated: leanVM aggregation costs seconds per proof,
 //! and a block carries the previous slot's votes three intervals after they
@@ -20,13 +22,13 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{SszBitlist, SszList};
 
 use crate::attestation::XmssSignature;
-use crate::decoupled::{Attestation, GoldfishVote, Round, Slot};
+use crate::decoupled::{Attestation, GoldfishVote, Slot};
 use crate::primitives::H256;
 
 /// Goldfish votes a block may carry: at most two per validator.
 pub const MAX_BLOCK_VOTES: usize = 8192;
 
-/// Combined attestations a block may carry.
+/// Attestations a block may carry.
 pub const MAX_BLOCK_ATTESTATIONS: usize = 16384;
 
 /// The XMSS epoch a Goldfish vote of `slot` is signed at: `2 · slot`.
@@ -34,11 +36,11 @@ pub fn goldfish_vote_epoch(slot: Slot) -> u64 {
     2 * slot
 }
 
-/// The XMSS epoch a combined attestation of the round opening at
-/// `opening_slot` is signed at: `2 · opening_slot + 1`. Odd, so it never meets
-/// a vote's epoch, and one per round.
-pub fn attestation_epoch(opening_slot: Slot) -> u64 {
-    2 * opening_slot + 1
+/// The XMSS epoch an attestation signed in `slot` is signed at:
+/// `2 · slot + 1`. Odd, so it never meets a vote's epoch, and at most one
+/// attestation per slot.
+pub fn attestation_epoch(slot: Slot) -> u64 {
+    2 * slot + 1
 }
 
 /// A Goldfish vote signed with the voter's attestation key at
@@ -49,11 +51,15 @@ pub struct SignedGoldfishVote {
     pub signature: XmssSignature,
 }
 
-/// A combined attestation signed with the attester's attestation key at
-/// [`attestation_epoch`], over the attestation's `hash_tree_root`.
+/// An attestation signed with the attester's attestation key at
+/// [`attestation_epoch`] of `slot`, over the attestation's `hash_tree_root`.
+///
+/// `slot` is not signed: it only picks the epoch, and an XMSS signature
+/// verifies at no epoch but its own.
 #[derive(Debug, Clone, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
 pub struct SignedDecoupledAttestation {
     pub attestation: Attestation,
+    pub slot: Slot,
     pub signature: XmssSignature,
 }
 
@@ -110,10 +116,4 @@ impl DecoupledBlock {
             },
         }
     }
-}
-
-/// The round a lean decoupled attestation belongs to, and the epoch it signs
-/// at, for a given round length.
-pub fn attestation_epoch_of(round: Round, slots_per_round: u64) -> u64 {
-    attestation_epoch(round * slots_per_round)
 }

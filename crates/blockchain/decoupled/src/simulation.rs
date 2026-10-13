@@ -3,9 +3,9 @@
 //! Every object sent at tick `t` reaches every node at `t` (after that tick's
 //! duties), or later when a node is cut off or a Byzantine sender splits its
 //! audience; that is synchrony with delay below `Δ`. The checks are the
-//! bundle's observable claims, read at the honest nodes: the three tips nest,
-//! finalized reads agree and only extend, the chains grow, and no honest pair
-//! of attestations is slashable.
+//! observable claims, read at the honest nodes: the outputs nest
+//! (`F ⪯ confirmed ⪯ head`), finalized reads agree and only extend, the chains
+//! grow, and no honest pair of attestations is slashable.
 
 use std::collections::{HashMap, HashSet};
 
@@ -32,9 +32,9 @@ enum Byzantine {
     /// Two blocks in each of its slots, one to each half of the network,
     /// each relayed to the other half a tick later.
     EquivocateProposals,
-    /// Besides its honest attestation, two more each round: an empty safe
-    /// value with a timeout and a finality pair naming a block that does not
-    /// exist, and a target vote for that block one height up.
+    /// Besides its honest attestations, two more every slot: a timeout and a
+    /// finality pair naming a block that does not exist, and a target vote
+    /// for that block one height up.
     JunkAttestations,
 }
 
@@ -53,7 +53,8 @@ type Outbox = Vec<(u64, Option<Vec<u64>>, Message)>;
 
 struct Network {
     nodes: Vec<Node>,
-    emitted: Vec<Attestation>,
+    /// Honest attestations, with the tick they were emitted at.
+    emitted: Vec<(Tick, Attestation)>,
     /// Messages a cut-off node missed, delivered when it comes back.
     backlog: HashMap<u64, Vec<Message>>,
     /// Messages to deliver at the next step, by recipient.
@@ -111,7 +112,7 @@ impl Network {
                 node.store.on_goldfish_vote(vote);
             }
             Message::Attestation(attestation) => {
-                node.store.on_sg_vote(attestation);
+                node.store.on_attestation(attestation);
             }
         }
     }
@@ -196,7 +197,7 @@ impl Network {
                     node.store.on_goldfish_vote(vote);
                     outbox.push((node.index, None, Message::Vote(vote)));
                     if node.byzantine == Some(Byzantine::EquivocateVotes)
-                        && let Some(parent) = node.store.node(&head).and_then(|b| b.parent)
+                        && let Some(parent) = node.store.parent(&head)
                     {
                         let second = GoldfishVote {
                             head: parent,
@@ -205,14 +206,15 @@ impl Network {
                         outbox.push((node.index, None, Message::Vote(second)));
                     }
                 }
-                if event.attest.is_some() {
+                if event.attest {
                     let input = node.store.attestation_input();
-                    let attestation = node.record.create_attestation(node.index, &input);
-                    node.store.on_sg_vote(attestation.clone());
-                    if node.byzantine.is_none() {
-                        self.emitted.push(attestation.clone());
+                    if let Some(attestation) = node.record.create_attestation(node.index, &input) {
+                        node.store.on_attestation(attestation.clone());
+                        if node.byzantine.is_none() {
+                            self.emitted.push((t, attestation.clone()));
+                        }
+                        outbox.push((node.index, None, Message::Attestation(attestation)));
                     }
-                    outbox.push((node.index, None, Message::Attestation(attestation)));
                     if node.byzantine == Some(Byzantine::JunkAttestations) {
                         for data in junk_attestations(&input) {
                             let message = Attestation {
@@ -272,14 +274,22 @@ impl Network {
             self.step(t);
         }
     }
+
+    /// Honest attestations emitted in `ticks`.
+    fn emitted_in(&self, ticks: std::ops::Range<Tick>) -> usize {
+        self.emitted
+            .iter()
+            .filter(|(t, _)| ticks.contains(t))
+            .count()
+    }
 }
 
 fn check_nesting(store: &Store) {
     let finalized = store.finalized().root;
-    let stable = store.stable().root;
     let confirmed = store.confirmed().root;
-    assert!(store.is_ancestor(&finalized, &stable), "F ⪯ stable");
-    assert!(store.is_ancestor(&stable, &confirmed), "stable ⪯ confirmed");
+    let head = store.head();
+    assert!(store.is_ancestor(&finalized, &confirmed), "F ⪯ confirmed");
+    assert!(store.is_ancestor(&confirmed, &head), "confirmed ⪯ head");
 }
 
 fn check_agreement(network: &Network) {
@@ -306,8 +316,8 @@ fn check_agreement(network: &Network) {
         }
     }
     // No honest attestation pair is slashable.
-    for a in &network.emitted {
-        for b in &network.emitted {
+    for (_, a) in &network.emitted {
+        for (_, b) in &network.emitted {
             assert!(!slashable(a, b), "honest evidence: {a:?} / {b:?}");
         }
     }
@@ -317,27 +327,23 @@ const SLOTS: u64 = 60;
 
 #[test]
 fn an_honest_synchronous_network_finalizes_and_nests() {
-    let params = Params::with_round_length(3);
-    let mut network = Network::new(4, params);
+    let mut network = Network::new(4, Params::default());
     network.run(0..(4 * SLOTS as Tick));
     check_agreement(&network);
 
     for node in &network.nodes {
         let finalized = node.store.finalized();
         let confirmed = node.store.confirmed();
-        let stable = node.store.stable();
         assert!(
-            finalized.slot + 3 * params.slots_per_round >= SLOTS,
-            "node {} finalized slot {} lags the head by more than three rounds",
+            finalized.slot + 8 >= SLOTS,
+            "node {} finalized slot {} lags the head by more than 8 slots",
             node.index,
             finalized.slot
         );
+        // Full participation fast locks every slot's proposal.
         assert!(confirmed.slot + 2 >= SLOTS, "confirmed {confirmed:?}");
-        assert!(
-            stable.slot + 2 * params.slots_per_round >= SLOTS,
-            "stable {stable:?}"
-        );
-        assert!(node.store.finalized_height() >= 5);
+        assert!(node.store.fg_confirmed().is_some());
+        assert!(node.store.finalized_height() >= 10);
     }
     // Every node ends on the same finalized block.
     let first = network.nodes[0].store.finalized();
@@ -346,8 +352,7 @@ fn an_honest_synchronous_network_finalizes_and_nests() {
 
 #[test]
 fn a_minority_going_offline_keeps_the_chain_live() {
-    let params = Params::with_round_length(3);
-    let mut network = Network::new(4, params);
+    let mut network = Network::new(4, Params::default());
     network.run(0..80);
     network.set_online(3, false);
     network.run(80..160);
@@ -364,19 +369,21 @@ fn a_minority_going_offline_keeps_the_chain_live() {
 
 #[test]
 fn half_offline_stalls_finality_but_not_availability_and_heals() {
-    let params = Params::with_round_length(3);
-    let mut network = Network::new(4, params);
+    let mut network = Network::new(4, Params::default());
     network.run(0..60);
     network.set_online(2, false);
     network.set_online(3, false);
     network.run(60..140);
     let stalled = network.nodes[0].store.finalized();
+    let confirmed_before = network.nodes[0].store.confirmed();
     network.run(140..200);
     assert_eq!(
         network.nodes[0].store.finalized(),
         stalled,
         "2 of 4 cannot finalize"
     );
+    // Half of the committee still fast locks: the confirmed chain grows.
+    assert!(network.nodes[0].store.confirmed().slot > confirmed_before.slot);
     network.set_online(2, true);
     network.set_online(3, true);
     network.run(200..(8 * SLOTS as Tick));
@@ -387,8 +394,65 @@ fn half_offline_stalls_finality_but_not_availability_and_heals() {
     );
 }
 
-fn slot_of_grade(store: &Store, grade: Option<Option<H256>>) -> Option<Option<u64>> {
-    grade.map(|g| g.and_then(|root| store.block_slot(&root)))
+#[test]
+fn attestation_traffic_dies_down_while_finality_stalls() {
+    let mut network = Network::new(4, Params::default());
+    network.run(0..60);
+    network.set_online(2, false);
+    network.set_online(3, false);
+    // Let the online pair cast what the stalled height asks of them.
+    network.run(60..100);
+    let quiet_from = network.emitted.len();
+    network.run(100..200);
+    assert_eq!(
+        network.emitted.len(),
+        quiet_from,
+        "no height progress, no new attestations: {:?}",
+        &network.emitted[quiet_from..]
+    );
+    // Every slot of a synchronous, finalizing run brings something new.
+    let mut live = Network::new(4, Params::default());
+    live.run(0..200);
+    assert!(live.emitted_in(100..200) > 0);
+}
+
+#[test]
+fn a_lone_validator_slow_locks_without_a_fast_quorum() {
+    // One validator of four online: it never sees half of a committee, so
+    // nothing fast locks, but each slot confirms a chain on its own vote, and
+    // k such slots in a row slow lock their common prefix.
+    let params = Params::default();
+    let mut network = Network::new(4, params);
+    network.run(0..40);
+    for index in 1..4 {
+        network.set_online(index, false);
+    }
+    network.run(40..120);
+    let store = &network.nodes[0].store;
+    assert_eq!(store.fg_confirmed(), None, "1 of 4 is not half a committee");
+    let locks = store.locks();
+    assert!(!locks.is_empty(), "k consecutive confirmations slow lock");
+    let confirmed = store.confirmed();
+    assert!(
+        confirmed.slot >= 20,
+        "the slow lock follows the chain: {confirmed:?}"
+    );
+}
+
+#[test]
+fn locks_expire_when_not_renewed() {
+    let params = Params::default();
+    let mut network = Network::new(4, params);
+    network.run(0..40);
+    // Everyone else goes dark and the remaining validator stops voting too:
+    // no confirmation renews any lock.
+    for index in 0..4 {
+        network.set_online(index, false);
+    }
+    network.run(40..(40 + 4 * (params.lock_period as Tick + 2)));
+    let store = &network.nodes[0].store;
+    assert!(store.locks().is_empty(), "{:?}", store.locks());
+    assert_eq!(store.confirmed(), store.finalized());
 }
 
 /// Prints node 0's view once per slot: `cargo test -p ethlambda-decoupled
@@ -396,8 +460,7 @@ fn slot_of_grade(store: &Store, grade: Option<Option<H256>>) -> Option<Option<u6
 #[test]
 #[ignore = "diagnostic trace"]
 fn trace() {
-    let params = Params::with_round_length(3);
-    let mut network = Network::new(4, params);
+    let mut network = Network::new(4, Params::default());
     for t in 0..(4 * 40) {
         network.step(t);
         if t % 4 != 3 {
@@ -405,37 +468,35 @@ fn trace() {
         }
         let s = &network.nodes[0].store;
         let (j, hj) = s.justified();
-        let g = s.saved_grades();
+        let frame = s.frame();
         println!(
-            "slot {:>3} head {:>3} conf {:>3} stable {:>3} fin {:>3} (h_F {}) J {:>3} (h_j {}) h_max {} G2 {:?} G1 {:?} G0 {:?}",
+            "slot {:>3} head {:>3} conf {:>3} fgc {:?} fin {:>3} (h_F {}) J {:>3} (h_j {}) h_max {} root {:?} floor {} locks {}",
             t / 4,
             s.block_slot(&s.head()).unwrap(),
             s.confirmed().slot,
-            s.stable().slot,
+            s.fg_confirmed().map(|b| b.slot),
             s.finalized().slot,
             s.finalized_height(),
             j.slot,
             hj,
             s.max_height(),
-            slot_of_grade(s, g.g2),
-            slot_of_grade(s, g.g1),
-            slot_of_grade(s, g.g0),
+            s.block_slot(&frame.root),
+            frame.floor,
+            s.locks().len(),
         );
     }
-    for a in network.emitted.iter().rev().take(4) {
+    for (_, a) in network.emitted.iter().rev().take(4) {
         println!("{a:?}");
     }
 }
 
-/// Two attestations nobody honest would send, for this round.
+/// Two attestations nobody honest would send.
 fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::AttestationData; 2] {
     use crate::types::{AttestationData, FinalityVote, HeightVote};
     let bogus = H256([0xee; 32]);
     let height = input.source.map_or(1, |source| source.height);
     [
         AttestationData::new(
-            input.round,
-            None,
             Some(HeightVote {
                 height,
                 entry: bogus,
@@ -447,8 +508,6 @@ fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::Attestat
             }),
         ),
         AttestationData::new(
-            input.round,
-            Some(bogus),
             Some(HeightVote {
                 height: height + 1,
                 entry: bogus,
@@ -461,8 +520,7 @@ fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::Attestat
 
 /// One Byzantine validator of four, with `behavior`, over 50 slots.
 fn byzantine_run(behavior: Byzantine) -> Network {
-    let params = Params::with_round_length(3);
-    let mut network = Network::new(4, params);
+    let mut network = Network::new(4, Params::default());
     network.nodes[3].byzantine = Some(behavior);
     network.run(0..200);
     check_agreement(&network);
