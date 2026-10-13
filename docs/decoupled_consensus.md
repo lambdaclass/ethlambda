@@ -134,7 +134,36 @@ Local devnet: `tooling/decoupled-devnet/lean-local.sh start|status|stop`.
 
 ## Beacon: the `decoupled` fork
 
-*(in progress)*
+A beacon fork named `decoupled`, between fulu and gloas in `ForkName`
+(storage selector 8), with `DECOUPLED_FORK_VERSION`/`DECOUPLED_FORK_EPOCH`
+and the five protocol keys `DECOUPLED_SLOTS_PER_ROUND` (default 4),
+`DECOUPLED_SG_WINDOW` (2), `DECOUPLED_NONJUSTIFIABLE_PERIOD` (5),
+`DECOUPLED_FINALITY_DEBT` (2) and `DECOUPLED_TIMEOUT_DELAY` (8) in the config.
+`ethlambda beacon --decoupled-fork-epoch 0 --decoupled-slots-per-round 4`
+overrides a generated config. Only activation at genesis is supported.
+
+| Piece | Choice |
+|---|---|
+| State | fulu's container, unchanged. σ is derived by each node and kept beside the state; the FFG fields stay at their fork-boundary values |
+| Block body | electra's 13 fields + `goldfish_votes`, `goldfish_support`, `combined_attestations`; `attestations` and `attester_slashings` must be empty. `blob_kzg_commitments` stays at index 11 and the body at 16 fields, so fulu's column sidecars and inclusion proofs carry over |
+| Votes on the wire | `SignedGoldfishVote` on `goldfish_vote`, `SignedCombinedAttestation` on `combined_attestation` (global topics); LMD attestation subnets and aggregates are not subscribed |
+| Votes in blocks | BLS aggregates per identical data: Goldfish votes per `(slot, head)` with bits over `𝒦_{s−1}` (the slot's beacon committees concatenated), combined attestations per `AttestationData` with bits over the registry; one support bit per vote aggregate (resolution depends only on the head) |
+| Signing | `DOMAIN_GOLDFISH_VOTE` (0x10) at the vote's epoch, `DOMAIN_COMBINED_ATTESTATION` (0x11) at the epoch of the round's opening slot |
+| Committee, proposer, weights | `𝒦_s` = the slot's beacon committees; the proposer schedule is the beacon one (checked by the STF); weights = effective balance in increments of the genesis registry, fixed for the run |
+| Block validity | fulu's, plus: protocol fields well formed, every vote of slot `B.slot − 1` by a committee member, every attestation of a round at most `round(B.slot)`, aggregate signatures valid |
+| Epoch processing | fulu's minus justification and finalization, inactivity updates, and rewards and penalties: none of them has an input in this fork |
+| Fork choice | the engine's head, not LMD-GHOST; blocks enter the engine after the beacon state transition accepted them |
+| Execution layer | `forkchoiceUpdated` head = the engine head, safe = the stable tip, finalized = `Σ.F` |
+| Engine placement | `DecoupledNode` (`state_transition::beacon::decoupled_node`), shared by the chain actor (ticks every `Δ`, imports blocks, reads the head), the p2p layer (gossip checks, then admission) and the Beacon API (duty inputs, pool submissions, block production) |
+| Restart | the stored blocks are replayed in slot order into a fresh engine |
+
+The validator client's duty inputs are computed at their protocol instant
+(the vote head at `t_s + Δ`, the attestation input at `a_r`) and cached, so a
+validator client asking a moment later reads what the protocol prescribes for
+that instant. `GET /eth/v1/decoupled/status` serves the node's view.
+
+Local devnet: `tooling/decoupled-devnet/beacon-kurtosis.yaml` (kurtosis with
+the ethlambda-enabled ethereum-package) and `Dockerfile.dev`.
 
 ### Validator client (`crates/validator/src/decoupled.rs`)
 
