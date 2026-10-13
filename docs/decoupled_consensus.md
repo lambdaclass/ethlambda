@@ -7,12 +7,19 @@ paper formalized and machine-checked in
 follow it). It replaces LMD-GHOST + Casper FFG on the beacon chain and
 LMD-GHOST + 3SF-mini on the lean chain, as an opt-in mode of each.
 
-The protocol has three layers, nested at every node and every time:
+The protocol has three layers, whose tips are nested at every node and every
+time, with the fork-choice head usually extending them:
 
 ```text
-finalized  ⪯  stable  ⪯  confirmed  ⪯  head
+finalized  ⪯  stable  ⪯  confirmed   (⪯ head, usually)
   (FG)         (SG)       (Goldfish)
 ```
+
+The head is not part of that guarantee. It is the Goldfish walk over the last
+slot's votes, which stops at the deepest block a majority of that slot's voters
+support: when they disagree, for example validators rejoining with a stale view,
+the head can fall back to an ancestor of the confirmed tip for a slot. A 4-node
+beacon devnet showed exactly that when half its stake came back online.
 
 | Layer | Who votes | When | What it decides |
 |---|---|---|---|
