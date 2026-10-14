@@ -7,6 +7,7 @@ use crate::{
     block::SingleMessageAggregate,
     checkpoint::Checkpoint,
     primitives::{H256, HashTreeRoot as _},
+    state::VALIDATOR_REGISTRY_LIMIT,
 };
 
 /// Validator specific attestation wrapping shared attestation data.
@@ -118,7 +119,7 @@ pub struct AggregatedAttestation {
 ///
 /// A general-purpose bitfield for tracking which validators have participated
 /// in some collective action (attestation, signature aggregation, etc.).
-pub type AggregationBits = SszBitlist<4096>;
+pub type AggregationBits = SszBitlist<VALIDATOR_REGISTRY_LIMIT>;
 
 /// Serialize an `AggregationBits` bitlist as a `0x`-prefixed hex string of its
 /// SSZ encoding (matching the beacon API convention).

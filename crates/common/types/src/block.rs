@@ -6,6 +6,7 @@ use libssz_types::SszList;
 use crate::{
     attestation::{AggregatedAttestation, AggregationBits, validator_indices},
     primitives::{self, ByteList, H256},
+    state::VALIDATOR_REGISTRY_LIMIT,
 };
 
 // Convenience trait for calling hash_tree_root() without a hasher argument
@@ -276,7 +277,7 @@ pub struct BlockBody {
 }
 
 /// List of aggregated attestations included in a block.
-pub type AggregatedAttestations = SszList<AggregatedAttestation, 4096>;
+pub type AggregatedAttestations = SszList<AggregatedAttestation, VALIDATOR_REGISTRY_LIMIT>;
 
 fn serialize_attestations<S>(
     attestations: &AggregatedAttestations,

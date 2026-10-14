@@ -52,8 +52,15 @@ pub type JustifiedSlots = SszBitlist<HISTORICAL_ROOTS_LIMIT>;
 /// List of justified block roots up to historical_roots_limit.
 pub type JustificationRoots = SszList<H256, HISTORICAL_ROOTS_LIMIT>;
 
-/// Maximum number of validators in the registry.
-pub const VALIDATOR_REGISTRY_LIMIT: usize = 4096;
+/// Maximum number of validators in the registry: `2**21`, the smallest power
+/// of two above two million.
+///
+/// leanSpec sets `2**12`. Every bound it derives from this one (the
+/// participation bits, a block's aggregated attestations, the justification
+/// bits) follows it, so the state, block body and attestation roots differ
+/// from every client on the spec value: a node built with this limit
+/// interoperates only with nodes built with the same one.
+pub const VALIDATOR_REGISTRY_LIMIT: usize = 1 << 21;
 
 /// Bitlist for tracking validator justifications per historical root.
 ///
