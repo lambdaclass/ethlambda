@@ -29,9 +29,8 @@ use crate::beacon::helpers::altair::{
 };
 use crate::beacon::helpers::finality::{get_eligible_validator_indices, is_in_inactivity_leak};
 use crate::beacon::helpers::math::saturating_sub;
-use crate::beacon::helpers::mutators::{decrease_balance, increase_balance};
+use crate::beacon::helpers::mutators::apply_balance_deltas;
 use crate::beacon::preset;
-use crate::beacon::primitives::ValidatorIndex;
 
 use super::justification::weigh_justification_and_finalization;
 
@@ -176,11 +175,11 @@ pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> R
 /// [`constants::PARTICIPATION_FLAG_WEIGHTS`]) plus the same kind of inactivity
 /// penalty, computed from [`crate::beacon::helpers::altair::get_inactivity_penalty_deltas`]
 /// against the scores [`process_inactivity_updates`] just brought up to date.
-/// Applying rewards and penalties as two separate passes (through
-/// [`increase_balance`] and [`decrease_balance`], not one netted delta) is
-/// unchanged from phase0, and for the same reason: [`decrease_balance`] floors
-/// at zero, so netting first would let a reward mask a penalty that should
-/// have driven a low balance all the way down.
+/// Rewards and penalties are applied as separate saturating steps, in spec
+/// order (see [`apply_balance_deltas`]), not as one netted delta: that is
+/// unchanged from phase0, and for the same reason: a penalty floors at zero,
+/// so netting first would let a reward mask a penalty that should have driven
+/// a low balance all the way down.
 ///
 /// Skipped entirely at the genesis epoch: rewards pay for participation
 /// recorded during the previous epoch, and genesis has none.
@@ -195,14 +194,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
     }
     deltas.push(get_inactivity_penalty_deltas(state, config)?);
 
-    let validator_count = state.validators().len() as ValidatorIndex;
-    for (rewards, penalties) in deltas {
-        for index in 0..validator_count {
-            increase_balance(state, index, rewards[index as usize])?;
-            decrease_balance(state, index, penalties[index as usize])?;
-        }
-    }
-    Ok(())
+    apply_balance_deltas(state, &deltas)
 }
 
 /// Rotates the current epoch's participation flags into the previous slot and
@@ -256,7 +248,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::altair::add_flag;
-    use crate::beacon::primitives::BlsPubkey;
+    use crate::beacon::primitives::{BlsPubkey, ValidatorIndex};
 
     /// A deterministic but genuinely valid BLS public key for validator
     /// `index`.
