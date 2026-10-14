@@ -25,11 +25,23 @@ pub const AGGREGATION_TOPIC_KIND: &str = "aggregation";
 /// kind, so one dispatch tells them apart.
 pub const DECOUPLED_BLOCK_TOPIC_KIND: &str = "decoupled_block";
 pub const DECOUPLED_VOTE_TOPIC_KIND: &str = "decoupled_vote";
-pub const DECOUPLED_ATTESTATION_TOPIC_KIND: &str = "decoupled_attestation";
+/// Kind prefix of the decoupled attestation subnets:
+/// `decoupled_attestation_{subnet}`.
+pub const DECOUPLED_ATTESTATION_SUBNET_TOPIC_PREFIX: &str = "decoupled_attestation";
+/// Aggregated decoupled attestations, subnet and cross-subnet alike. Every
+/// decoupled node subscribes.
+pub const DECOUPLED_AGGREGATE_TOPIC_KIND: &str = "decoupled_aggregate";
 
 /// Build a decoupled-mode gossipsub topic of the given kind.
 pub fn decoupled_topic(kind: &str) -> libp2p::gossipsub::IdentTopic {
     libp2p::gossipsub::IdentTopic::new(format!("/leanconsensus/{FORK_DIGEST}/{kind}/ssz_snappy"))
+}
+
+/// Build the decoupled attestation topic of `subnet`.
+pub fn decoupled_attestation_topic(subnet: u64) -> libp2p::gossipsub::IdentTopic {
+    decoupled_topic(&format!(
+        "{DECOUPLED_ATTESTATION_SUBNET_TOPIC_PREFIX}_{subnet}"
+    ))
 }
 
 /// Build the block gossipsub topic.

@@ -13,10 +13,11 @@ pub use handler::{
     publish_execution_payload_envelope, publish_payload_attestation_message,
 };
 pub use handler::{
-    publish_combined_attestation, publish_decoupled_attestation, publish_decoupled_block,
-    publish_decoupled_vote, publish_goldfish_vote,
+    publish_combined_attestation, publish_decoupled_aggregate, publish_decoupled_attestation,
+    publish_decoupled_block, publish_decoupled_vote, publish_goldfish_vote,
 };
 pub use messages::{
-    DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
-    aggregation_topic, attestation_subnet_topic, block_topic, decoupled_topic, topic_kind,
+    DECOUPLED_AGGREGATE_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
+    aggregation_topic, attestation_subnet_topic, block_topic, decoupled_attestation_topic,
+    decoupled_topic, topic_kind,
 };

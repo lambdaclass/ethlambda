@@ -21,6 +21,7 @@ pub(crate) use built_in::BuiltInNetwork;
 pub(crate) struct ConfigOverrides {
     pub(crate) decoupled_fork_epoch: Option<u64>,
     pub(crate) decoupled_lock_period: Option<u64>,
+    pub(crate) decoupled_slots_per_round: Option<u64>,
 }
 
 impl ConfigOverrides {
@@ -34,6 +35,9 @@ impl ConfigOverrides {
         if let Some(period) = self.decoupled_lock_period {
             config.decoupled_lock_period = period;
         }
+        if let Some(slots) = self.decoupled_slots_per_round {
+            config.decoupled_slots_per_round = slots;
+        }
     }
 }
 
@@ -42,6 +46,7 @@ impl From<&crate::cli::MainnetOptions> for ConfigOverrides {
         Self {
             decoupled_fork_epoch: options.decoupled_fork_epoch,
             decoupled_lock_period: options.decoupled_lock_period,
+            decoupled_slots_per_round: options.decoupled_slots_per_round,
         }
     }
 }

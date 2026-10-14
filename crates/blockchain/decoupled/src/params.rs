@@ -13,8 +13,13 @@ pub struct Params {
     /// `s` writes has the deadline `t_{s+k} + 5Δ`, and the slow test reads
     /// the saved confirmations of the previous `k − 1` slots.
     pub lock_period: u64,
-    /// `R`: slots per round. The FG action (the attestation duty) runs once
-    /// per round, at `a_r = T_r + 6Δ`.
+    /// `R ≥ 1`: slots per round. The FG action (the attestation duty) runs
+    /// once per round, at `a_r = T_r + 6Δ`.
+    ///
+    /// The specification asks `R ≥ max{2, ⌈(6Δ + Δ_F)/(4Δ)⌉}`, which keeps
+    /// `a_r` inside its own round. `R = 1` is allowed anyway: `a_r` then
+    /// falls in the next slot, so every slot from 1 on carries the previous
+    /// round's action, at its confirmation update.
     pub slots_per_round: u64,
     /// `K_W ≥ 2`: how many justifications `σ.pending_finality` keeps.
     pub pending_window: u64,
@@ -27,7 +32,7 @@ pub struct Params {
 pub enum ParamsError {
     #[error("lock period k = {0} must be at least 2")]
     LockPeriodTooShort(u64),
-    #[error("round length R = {0} must be at least 2")]
+    #[error("round length R = {0} must be at least 1")]
     RoundTooShort(u64),
     #[error("pending finality window K_W = {0} must be at least 2")]
     WindowTooSmall(u64),
@@ -67,7 +72,7 @@ impl Params {
         if self.lock_period < 2 {
             return Err(ParamsError::LockPeriodTooShort(self.lock_period));
         }
-        if self.slots_per_round < 2 {
+        if self.slots_per_round < 1 {
             return Err(ParamsError::RoundTooShort(self.slots_per_round));
         }
         if self.pending_window < 2 {
@@ -82,12 +87,18 @@ impl Params {
         confirmation_time(round * self.slots_per_round)
     }
 
-    /// Whether `t` is the action time of its round.
+    /// Whether `t` is an action time.
+    ///
+    /// `a_r` falls in slot `rR + 1`: still round `r` when `R ≥ 2`, the next
+    /// round when `R = 1`. So the round is read off the slot as
+    /// `(slot − 1) / R`, which is both.
     pub fn is_action_time(&self, t: Tick) -> bool {
-        // `a_r` falls in slot `rR + 1`, which is still round `r` since
-        // `R ≥ 2`.
-        let round = slot_of(t) / self.slots_per_round;
-        t >= 0 && t == self.action_time(round)
+        if t < 0 {
+            return false;
+        }
+        let slot = slot_of(t);
+        let rounds = self.slots_per_round.max(1);
+        slot >= 1 && (slot - 1).is_multiple_of(rounds) && t == self.action_time((slot - 1) / rounds)
     }
 
     /// The deadline of a lock that the confirmation update of `slot` writes:
@@ -153,6 +164,18 @@ mod tests {
     }
 
     #[test]
+    fn a_one_slot_round_acts_in_every_slot_from_the_first() {
+        let params = Params {
+            slots_per_round: 1,
+            ..Params::default()
+        };
+        let actions: Vec<Tick> = (0..24).filter(|&t| params.is_action_time(t)).collect();
+        // a_r = t_{r+1} + 2Δ: the confirmation update of every slot.
+        assert_eq!(actions, vec![6, 10, 14, 18, 22]);
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
     fn a_lock_expires_at_the_vote_time_k_plus_one_slots_later() {
         let params = Params::default();
         assert_eq!(
@@ -165,11 +188,11 @@ mod tests {
     fn validation_enforces_the_structural_floors() {
         assert!(Params::default().validate().is_ok());
         assert!(Params::with_lock_period(1).validate().is_err());
-        let short_round = Params {
-            slots_per_round: 1,
+        let empty_round = Params {
+            slots_per_round: 0,
             ..Params::default()
         };
-        assert!(short_round.validate().is_err());
+        assert!(empty_round.validate().is_err());
         let small_window = Params {
             pending_window: 1,
             ..Params::default()

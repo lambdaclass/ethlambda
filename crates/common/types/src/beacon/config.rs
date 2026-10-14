@@ -1156,9 +1156,9 @@ impl Config {
                 self.decoupled_lock_period,
             ));
         }
-        if self.decoupled_slots_per_round < 2 {
+        if self.decoupled_slots_per_round < 1 {
             return Err(format!(
-                "DECOUPLED_SLOTS_PER_ROUND must be at least 2, got {}",
+                "DECOUPLED_SLOTS_PER_ROUND must be at least 1, got {}",
                 self.decoupled_slots_per_round,
             ));
         }
@@ -1421,8 +1421,11 @@ mod tests {
         let mut bad_period = ok.clone();
         bad_period.decoupled_lock_period = 1;
         assert!(bad_period.validate_fork_schedule().is_err());
+        let mut one_slot_round = ok.clone();
+        one_slot_round.decoupled_slots_per_round = 1;
+        assert!(one_slot_round.validate_fork_schedule().is_ok());
         let mut bad_round = ok.clone();
-        bad_round.decoupled_slots_per_round = 1;
+        bad_round.decoupled_slots_per_round = 0;
         assert!(bad_round.validate_fork_schedule().is_err());
         let mut bad_window = ok.clone();
         bad_window.decoupled_pending_finality_window = 1;

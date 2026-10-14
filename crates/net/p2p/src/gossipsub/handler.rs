@@ -18,7 +18,10 @@ use ethlambda_types::{
     beacon::operation::BeaconOperation,
     beacon::primitives::ValidatorIndex,
     block::SignedBlock,
-    lean_decoupled::{SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote},
+    lean_decoupled::{
+        AggregatedDecoupledAttestation, SignedDecoupledAttestation, SignedDecoupledBlock,
+        SignedGoldfishVote, attestation_subnet,
+    },
     primitives::HashTreeRoot as _,
     time::unix_now_ms,
 };
@@ -32,8 +35,9 @@ use super::{
     encoding::{compress_message, decompress_message},
     messages::{
         AGGREGATION_TOPIC_KIND, ATTESTATION_SUBNET_TOPIC_PREFIX, BLOCK_TOPIC_KIND,
-        DECOUPLED_ATTESTATION_TOPIC_KIND, DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND,
-        attestation_subnet_topic, topic_kind,
+        DECOUPLED_AGGREGATE_TOPIC_KIND, DECOUPLED_ATTESTATION_SUBNET_TOPIC_PREFIX,
+        DECOUPLED_BLOCK_TOPIC_KIND, DECOUPLED_VOTE_TOPIC_KIND, attestation_subnet_topic,
+        decoupled_attestation_topic, topic_kind,
     },
 };
 use crate::beacon::constants::ATTESTATION_SUBNET_COUNT;
@@ -101,7 +105,10 @@ pub async fn handle_gossip_message(
     match kind {
         DECOUPLED_BLOCK_TOPIC_KIND => handle_decoupled_block(server, &payload),
         DECOUPLED_VOTE_TOPIC_KIND => handle_decoupled_vote(server, &payload),
-        DECOUPLED_ATTESTATION_TOPIC_KIND => handle_decoupled_attestation(server, &payload),
+        DECOUPLED_AGGREGATE_TOPIC_KIND => handle_decoupled_aggregate(server, &payload),
+        kind if kind.starts_with(DECOUPLED_ATTESTATION_SUBNET_TOPIC_PREFIX) => {
+            handle_decoupled_attestation(server, &payload)
+        }
         BLOCK_TOPIC_KIND => handle_lean_block(server, &payload, compressed_len, wire_at).await,
         AGGREGATION_TOPIC_KIND => handle_lean_aggregation(server, &payload, compressed_len).await,
         kind if kind.starts_with(ATTESTATION_SUBNET_TOPIC_PREFIX) => {
@@ -249,6 +256,25 @@ fn handle_decoupled_attestation(server: &P2PServer, payload: &[u8]) {
     }
 }
 
+fn handle_decoupled_aggregate(server: &P2PServer, payload: &[u8]) {
+    let Some(aggregate) =
+        decode_lean::<AggregatedDecoupledAttestation>(payload, "decoupled aggregate")
+    else {
+        return;
+    };
+    debug!(
+        slot = aggregate.slot,
+        participants = aggregate.participant_indices().count(),
+        proof_bytes = aggregate.proof.len(),
+        "Received decoupled aggregate from gossip"
+    );
+    if let Some(chain) = decoupled_chain(server) {
+        let _ = chain
+            .new_decoupled_aggregate(aggregate)
+            .inspect_err(|err| error!(%err, "Failed to forward decoupled aggregate"));
+    }
+}
+
 fn publish_decoupled(
     server: &P2PServer,
     topic: Option<libp2p::gossipsub::IdentTopic>,
@@ -281,9 +307,25 @@ pub fn publish_decoupled_vote(server: &P2PServer, vote: SignedGoldfishVote) {
     publish_decoupled(server, topic, vote.to_ssz());
 }
 
+/// Publish on the signer's subnet, by fanout when this node did not subscribe
+/// to it.
 pub fn publish_decoupled_attestation(server: &P2PServer, attestation: SignedDecoupledAttestation) {
-    let topic = server.wire.decoupled().map(|d| d.attestation_topic.clone());
+    let topic = server.wire.decoupled().map(|wire| {
+        let subnet = attestation_subnet(
+            attestation.attestation.validator,
+            wire.attestation_committee_count,
+        );
+        wire.attestation_topics
+            .get(&subnet)
+            .cloned()
+            .unwrap_or_else(|| decoupled_attestation_topic(subnet))
+    });
     publish_decoupled(server, topic, attestation.to_ssz());
+}
+
+pub fn publish_decoupled_aggregate(server: &P2PServer, aggregate: AggregatedDecoupledAttestation) {
+    let topic = server.wire.decoupled().map(|d| d.aggregate_topic.clone());
+    publish_decoupled(server, topic, aggregate.to_ssz());
 }
 
 async fn handle_lean_aggregation(server: &mut P2PServer, payload: &[u8], compressed_len: usize) {

@@ -1,23 +1,36 @@
 #!/usr/bin/env bash
 # A local lean devnet running the decoupled consensus protocol: N ethlambda
-# processes on 127.0.0.1, one validator each, peering over discv5 from node 0.
+# processes on 127.0.0.1, V validators each, peering over discv5 from node 0.
 #
 #   tooling/decoupled-devnet/lean-local.sh start   # keys, genesis, start nodes
 #   tooling/decoupled-devnet/lean-local.sh status  # each node's decoupled view
 #   tooling/decoupled-devnet/lean-local.sh stop
 #
-# Environment: N (nodes, default 4), DIR (work dir, default
-# /tmp/ethlambda-decoupled-lean), BIN (ethlambda binary, default
-# target/release-fast/ethlambda), SLOT_MS (default 4000), LOCK_PERIOD
-# (Goldilocks' k, default 4), GENESIS_DELAY (seconds, default 30).
+# Environment: N (nodes, default 4), V (validators per node, default 1), DIR
+# (work dir, default /tmp/ethlambda-decoupled-lean), BIN (ethlambda binary,
+# default target/release-fast/ethlambda), SLOT_MS (default 4000), LOCK_PERIOD
+# (Goldilocks' k, default 4), SLOTS_PER_ROUND (R, default: the client's),
+# GENESIS_DELAY (seconds, default 30),
+# COMMITTEES (attestation subnets, default 1), AGGREGATORS (which nodes
+# aggregate which subnets, as space-separated `node:subnet[,subnet]` entries,
+# or `node` alone for the subnets of its own validators; default: every node,
+# its own subnets), EXTRA_ARGS (appended to every node's command line).
+#
+# Attestations reach blocks only through aggregates, so a devnet with no
+# aggregator never finalizes.
 set -euo pipefail
 
 N=${N:-4}
+V=${V:-1}
 DIR=${DIR:-/tmp/ethlambda-decoupled-lean}
 BIN=${BIN:-target/release-fast/ethlambda}
 SLOT_MS=${SLOT_MS:-4000}
 LOCK_PERIOD=${LOCK_PERIOD:-4}
+SLOTS_PER_ROUND=${SLOTS_PER_ROUND:-}
 GENESIS_DELAY=${GENESIS_DELAY:-30}
+COMMITTEES=${COMMITTEES:-1}
+AGGREGATORS=${AGGREGATORS:-$(seq -s ' ' 0 $((N - 1)))}
+EXTRA_ARGS=${EXTRA_ARGS:-}
 
 gossip_port() { echo $((9300 + $1)); }
 discovery_port() { echo $((9400 + $1)); }
@@ -29,7 +42,8 @@ hex_of() { xxd -p -c 256 "$1" | tr -d '\n'; }
 start() {
   rm -rf "$DIR"
   mkdir -p "$DIR/keys"
-  "$BIN" keygen --num-validators "$N" --log-num-active-epochs 14 --output-dir "$DIR/keys" >/dev/null
+  local total=$((N * V))
+  "$BIN" keygen --num-validators "$total" --log-num-active-epochs 14 --output-dir "$DIR/keys" >/dev/null
 
   local genesis=$(( $(date +%s) + GENESIS_DELAY ))
   {
@@ -37,10 +51,11 @@ start() {
     echo "MILLISECONDS_PER_SLOT: $SLOT_MS"
     echo "DECOUPLED_CONSENSUS: true"
     echo "DECOUPLED_LOCK_PERIOD: $LOCK_PERIOD"
+    if [ -n "$SLOTS_PER_ROUND" ]; then echo "DECOUPLED_SLOTS_PER_ROUND: $SLOTS_PER_ROUND"; fi
     echo "GENESIS_VALIDATORS:"
-    for i in $(seq 0 $((N - 1))); do
-      echo "  - attestation_pubkey: \"$(hex_of "$DIR/keys/validator_${i}_attester_key_pk.ssz")\""
-      echo "    proposal_pubkey: \"$(hex_of "$DIR/keys/validator_${i}_proposer_key_pk.ssz")\""
+    for v in $(seq 0 $((total - 1))); do
+      echo "  - attestation_pubkey: \"$(hex_of "$DIR/keys/validator_${v}_attester_key_pk.ssz")\""
+      echo "    proposal_pubkey: \"$(hex_of "$DIR/keys/validator_${v}_proposer_key_pk.ssz")\""
     done
   } >"$DIR/config.yaml"
 
@@ -48,15 +63,17 @@ start() {
   echo "validators:" >"$DIR/validator-config.yaml"
   for i in $(seq 0 $((N - 1))); do
     openssl rand -hex 32 | tr -d '\n' >"$DIR/node_$i.key"
-    {
-      echo "node_$i:"
-      echo "  - index: $i"
-      echo "    pubkey_hex: \"$(hex_of "$DIR/keys/validator_${i}_attester_key_pk.ssz")\""
-      echo "    privkey_file: validator_${i}_attester_key_sk.ssz"
-      echo "  - index: $i"
-      echo "    pubkey_hex: \"$(hex_of "$DIR/keys/validator_${i}_proposer_key_pk.ssz")\""
-      echo "    privkey_file: validator_${i}_proposer_key_sk.ssz"
-    } >>"$DIR/annotated_validators.yaml"
+    echo "node_$i:" >>"$DIR/annotated_validators.yaml"
+    for v in $(seq $((i * V)) $((i * V + V - 1))); do
+      {
+        echo "  - index: $v"
+        echo "    pubkey_hex: \"$(hex_of "$DIR/keys/validator_${v}_attester_key_pk.ssz")\""
+        echo "    privkey_file: validator_${v}_attester_key_sk.ssz"
+        echo "  - index: $v"
+        echo "    pubkey_hex: \"$(hex_of "$DIR/keys/validator_${v}_proposer_key_pk.ssz")\""
+        echo "    privkey_file: validator_${v}_proposer_key_sk.ssz"
+      } >>"$DIR/annotated_validators.yaml"
+    done
     {
       echo "  - name: node_$i"
       echo "    privkey: \"0x$(cat "$DIR/node_$i.key")\""
@@ -78,11 +95,26 @@ start() {
   echo "genesis at $(date -r "$genesis" '+%H:%M:%S'); logs in $DIR/node_*.log"
 }
 
+# This node's aggregator flags, from AGGREGATORS.
+aggregator_args() {
+  local entry
+  for entry in $AGGREGATORS; do
+    case "$entry" in
+      "$1") echo "--is-aggregator" ;;
+      "$1":*) echo "--is-aggregator --aggregate-subnet-ids ${entry#*:}" ;;
+    esac
+  done
+}
+
 launch() {
   local i=$1
   local bootnodes=()
   if [ "$i" -ne 0 ]; then bootnodes=(--bootnodes "$DIR/bootnodes.yaml"); fi
+  # shellcheck disable=SC2046,SC2086 # word splitting is the point
   RUST_LOG=${RUST_LOG:-info} "$BIN" node \
+    --attestation-committee-count "$COMMITTEES" \
+    $(aggregator_args "$i") \
+    $EXTRA_ARGS \
     --genesis "$DIR/config.yaml" \
     --validators "$DIR/annotated_validators.yaml" \
     --validator-config "$DIR/validator-config.yaml" \

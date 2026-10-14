@@ -28,7 +28,7 @@ A slot is `4Δ`: proposal at `t_s`, revocation then vote at `t_s + Δ`,
 support cutoff and the confirmation update of `s − 1` at `t_s + 2Δ`, view
 freeze at `t_s + 3Δ`. A round is `R` slots; its action time
 `a_r = T_r + 6Δ` is the confirmation update of its first slot, half way into
-slot `rR + 1`.
+slot `rR + 1` (with `R = 1`, every slot from 1 on).
 
 ## The available chain
 
@@ -165,7 +165,7 @@ crates/common/types/src/beacon/containers/decoupled.rs   the beacon `decoupled` 
 | Item | Value or rule | Why |
 |---|---|---|
 | `k` | 4 (at least 2) | the slides' example |
-| `R` | 2 (at least 2) | the specification's floor `max{2, ⌈(6Δ + Δ_F)/4Δ⌉}` with `Δ_F = Δ` |
+| `R` | 2 (at least 1) | the specification's floor `max{2, ⌈(6Δ + Δ_F)/4Δ⌉}` with `Δ_F = Δ`; `R = 1` is allowed although the specification excludes it: `a_r` then falls in the next round's slot, and every slot from 1 on acts at its confirmation update |
 | `K_W` | 2 (at least 2) | the specification's floor; the honest steady state finalizes `j` in the block that justifies `j + 1` |
 | `δ_t` | `2k` slots | the specification leaves it open; the time conflicting locks need to drain after GST |
 | Pool bound | 8 attestations per validator, and attestations that cannot be valid against any viable head are dropped | resource bound; the specification's pool is unbounded |
@@ -178,28 +178,70 @@ crates/common/types/src/beacon/containers/decoupled.rs   the beacon `decoupled` 
 Enabled by `DECOUPLED_CONSENSUS: true` in the genesis config (or
 `--decoupled`). Optional `DECOUPLED_LOCK_PERIOD`, `DECOUPLED_SLOTS_PER_ROUND`,
 `DECOUPLED_PENDING_FINALITY_WINDOW`, `DECOUPLED_TIMEOUT_DELAY` override the
-defaults (`--decoupled.lock-period` overrides the first).
+defaults (`--decoupled.lock-period` and `--decoupled.slots-per-round`
+override the first two; on beacon, `--decoupled-lock-period` and
+`--decoupled-slots-per-round`).
+
+The round length `R` must outlast the attestations' delivery `Δ_F`: the
+specification asks `R ≥ ⌈(6Δ + Δ_F) / 4Δ⌉`. With aggregated attestations
+(below) the aggregates miss the first block after the action time, so with
+`R = 2` the block raising the height is confirmed only after the next
+action time, and validators attest every other round. On a local devnet
+(16 validators, 2 subnets, 8 s slots, four nodes proving on one machine)
+subnet aggregates landed about 6.5 s (`3.3Δ`) after the action time, which
+makes the bound `R = 3`; it restores one attestation per round and took
+the state around slot 30 from max height 8 and finalized slot 21 (`R = 2`)
+to max height 10 and finalized slot 24.
 
 - **Validators, committees, proposers.** Every validator weighs one, the
   slot committee is every validator, and the proposer of slot `s` is
   `s mod n`, as on 3SF-mini lean.
 - **Wire.** New containers (`lean_decoupled`) on the topics
-  `decoupled_block`, `decoupled_vote`, `decoupled_attestation`, plus a
-  `decoupled_blocks_by_root/1` req/resp protocol for missing parents. The
-  3SF-mini containers and topics are untouched; a decoupled network is
-  ethlambda-only.
+  `decoupled_block`, `decoupled_vote`, `decoupled_attestation_{subnet}` and
+  `decoupled_aggregate`, plus a `decoupled_blocks_by_root/1` req/resp
+  protocol for missing parents. The 3SF-mini containers and topics are
+  untouched; a decoupled network is ethlambda-only.
 - **Blocks** are `(slot, proposer_index, parent_root, body)` with the
-  previous slot's signed votes, a support bitlist and signed attestations.
-  There is no state root: σ names its own block, so a block cannot commit to
-  it.
+  previous slot's signed votes, a support bitlist and up to
+  `MAX_BLOCK_AGGREGATES` aggregated attestations, each signed in a slot
+  before the block's. There is no state root: σ names its own block, so a
+  block cannot commit to it.
 - **XMSS epochs.** A validator signs a Goldfish vote every slot and at most
   one attestation per slot: the vote of slot `s` at epoch `2s`, an
-  attestation signed in slot `s` at `2s + 1`. Attestation data names no
-  slot, so `SignedDecoupledAttestation` carries the slot it was signed in;
-  a node remembers a verified attestation by its whole envelope. A key
-  generated for `2^n` epochs lasts `2^(n−1)` slots.
-- **No aggregation.** Signatures are individual. A validator attests once per
-  height, so a block carries about one attestation per validator per height.
+  attestation signed in slot `s` at `2s + 1`. A vote signs the vote's root;
+  an attestation signs its *data's* root, so every validator with one view
+  signs one message and the signatures aggregate. Attestation data names no
+  slot, so attestation envelopes carry the slot they were signed in; a node
+  remembers a verified attestation or aggregate by its whole envelope. A
+  key generated for `2^n` epochs lasts `2^(n−1)` slots.
+- **Attestation aggregation** (`decoupled_aggregation.rs`). Goldfish votes
+  stay individual: a block carries them one interval after they are cast,
+  too soon for a proof. Attestations go through two levels of leanVM
+  aggregation, with signing staggered so proving overlaps arrival:
+
+  ```text
+  a_r = t_s + 2Δ   every validator's attestation decided from one input
+  a_r + g·spacing  subgroup g = (v / C) mod N signs, on subnet v mod C
+  aggregator       each time an N-th of its subnets' validators is pending,
+                   fold them into its running proof (the last proof a child)
+  final deadline   (or everyone in) last batch; publish on decoupled_aggregate
+  all subnets in   (or merge deadline) every aggregator merges the subnet
+                   proofs, one proof per data, and publishes it
+  proposer         the engine picks attestations; the block carries the
+                   fewest held aggregates covering them
+  ```
+
+  Defaults: `N = 4` subgroups, spacing `Δ/2` (the four subgroups sign over
+  the second half of the action slot), final deadline half a `Δ` after the
+  last subgroup, merge deadline two `Δ` after that (a slot after `a_r`),
+  merges of up to leanVM's 16 children per level. `--attestation-subgroups`,
+  `--attestation-subgroup-spacing-ms`, `--max-aggregation-children` and
+  `--global-aggregation-deadline-ms` change them; `--is-aggregator` and
+  `--aggregate-subnet-ids` pick who aggregates what (default: the subnets of
+  the node's own validators). Every node verifies each aggregate once and
+  feeds the engine one attestation per participant. A network with no
+  aggregator still votes and confirms but never justifies, since blocks
+  carry attestations only as aggregates.
 - **Actor.** `DecoupledLean` runs beside a keyless 3SF-mini `BlockChain`. It
   ticks every `Δ`, skips duties of ticks already past, persists imported
   blocks and each validator's record (with the last voted and attested

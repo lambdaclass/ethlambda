@@ -323,6 +323,15 @@ pub(crate) struct MainnetOptions {
     /// `DECOUPLED_LOCK_PERIOD`. At least 2.
     #[arg(long)]
     pub(crate) decoupled_lock_period: Option<u64>,
+
+    /// Goldilocks' round length `R`, in slots, overriding the loaded
+    /// network's `DECOUPLED_SLOTS_PER_ROUND`. At least 1. Validators attest
+    /// once per round, at the confirmation update of its first slot; with
+    /// `R = 1`, at every slot's. The specification asks
+    /// `R ≥ max{2, ⌈(6Δ + Δ_F) / 4Δ⌉}`, so a round outlasts the
+    /// attestations' delivery.
+    #[arg(long)]
+    pub(crate) decoupled_slots_per_round: Option<u64>,
 }
 
 /// Flags only the lean chain takes.
@@ -382,8 +391,56 @@ pub(crate) struct LeanOptions {
     /// different first IDs. Unset, the duty subnet falls back to the lowest
     /// subscribed subnet, which is the same value on every node whose
     /// validators span all subnets.
+    ///
+    /// Under decoupled consensus every listed subnet is one this node
+    /// aggregates, in order or not; unset, it aggregates every subnet it
+    /// subscribes to.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Decoupled consensus: signing subgroups per attestation subnet.
+    ///
+    /// At a round's action time every validator decides its attestation, but
+    /// validator `v` signs it in subgroup `(v / committee_count) % N`, one
+    /// --attestation-subgroup-spacing-ms after the previous subgroup. An
+    /// aggregator folds a batch each time an N-th of its subnets' validators
+    /// has signed. Every node of a network should use one value.
+    #[arg(
+        long,
+        default_value_t = ethlambda_blockchain::decoupled_aggregation::DEFAULT_ATTESTATION_SUBGROUPS,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub(crate) attestation_subgroups: u64,
+    /// Decoupled consensus: milliseconds between two subgroups' signing.
+    /// Unset: half a Δ (an eighth of the slot), which spreads four subgroups
+    /// over the second half of the action slot. Every node of a network should
+    /// use one value.
+    #[arg(long)]
+    pub(crate) attestation_subgroup_spacing_ms: Option<u64>,
+    /// Decoupled consensus: most child proofs one aggregation merges.
+    /// Requires --is-aggregator.
+    ///
+    /// The cross-subnet merge folds one proof per subnet. More than this many
+    /// are merged in levels of this many, and each level waits on the last,
+    /// so a narrower merge trades a longer chain for cheaper proofs. At most
+    /// leanVM's recursion limit.
+    #[arg(
+        long,
+        default_value_t = ethlambda_blockchain::decoupled_aggregation::DEFAULT_MAX_AGGREGATION_CHILDREN,
+        value_parser = clap::builder::RangedU64ValueParser::<usize>::new()
+            .range(2..=ethlambda_crypto::MAX_CHILD_PROOFS as u64),
+        requires = "is_aggregator"
+    )]
+    pub(crate) max_aggregation_children: usize,
+    /// Decoupled consensus: milliseconds after the action time an aggregator
+    /// waits for every subnet's aggregate before merging the ones it has.
+    /// Requires --is-aggregator.
+    ///
+    /// The merge starts as soon as every subnet with validators has published
+    /// one; this is the fallback for a subnet whose aggregate never comes.
+    /// Unset: two Δ after the last subgroup's votes are due (one slot after
+    /// the action time, at the default spacing).
+    #[arg(long, requires = "is_aggregator")]
+    pub(crate) global_aggregation_deadline_ms: Option<u64>,
     /// Sit out aggregation candidates whose level another duty subnet owns
     /// this slot. Requires --is-aggregator.
     ///
@@ -471,6 +528,15 @@ pub(crate) struct LeanOptions {
     /// Overrides `DECOUPLED_LOCK_PERIOD`; the default is 4.
     #[arg(long = "decoupled.lock-period")]
     pub(crate) decoupled_lock_period: Option<u64>,
+    /// Goldilocks' round length `R` (at least 1), in slots: validators attest
+    /// once per round, at the confirmation update of its first slot; with
+    /// `R = 1`, at every slot's. Overrides `DECOUPLED_SLOTS_PER_ROUND`; the
+    /// default is 2. The specification asks `R ≥ max{2, ⌈(6Δ + Δ_F) / 4Δ⌉}`,
+    /// so a round outlasts the attestations' delivery: with staggered signing
+    /// and two levels of aggregation that is 3 or more, or validators attest
+    /// every other round.
+    #[arg(long = "decoupled.slots-per-round")]
+    pub(crate) decoupled_slots_per_round: Option<u64>,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]

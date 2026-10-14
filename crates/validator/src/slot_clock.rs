@@ -104,10 +104,10 @@ impl SlotClock {
 
     /// Whether `slot` holds a round's FG action: `a_r = T_r + 6Δ` falls half
     /// way into slot `rR + 1`, right after the confirmation update of the
-    /// round's first slot.
+    /// round's first slot. With one-slot rounds that is every slot from 1 on.
     pub fn is_decoupled_action_slot(&self, slot: Slot) -> bool {
-        let slots_per_round = self.config.decoupled_slots_per_round.max(2);
-        self.is_decoupled(slot) && slot % slots_per_round == 1
+        let slots_per_round = self.config.decoupled_slots_per_round.max(1);
+        self.is_decoupled(slot) && slot >= 1 && (slot - 1).is_multiple_of(slots_per_round)
     }
 
     /// The slot containing `now`, or `None` before genesis.
@@ -420,6 +420,26 @@ mod tests {
 
     fn at(offset_secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(GENESIS + offset_secs)
+    }
+
+    fn action_slots(slots_per_round: u64) -> Vec<Slot> {
+        let mut config = Config::mainnet().with_fork_epoch(ForkName::Decoupled, 0);
+        config.decoupled_slots_per_round = slots_per_round;
+        let clock = SlotClock::from_config(GENESIS, &config);
+        (0..10)
+            .filter(|&slot| clock.is_decoupled_action_slot(slot))
+            .collect()
+    }
+
+    #[test]
+    fn the_action_slot_is_the_second_of_each_round() {
+        assert_eq!(action_slots(2), [1, 3, 5, 7, 9]);
+        assert_eq!(action_slots(3), [1, 4, 7]);
+    }
+
+    #[test]
+    fn one_slot_rounds_act_in_every_slot_from_the_first() {
+        assert_eq!(action_slots(1), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]

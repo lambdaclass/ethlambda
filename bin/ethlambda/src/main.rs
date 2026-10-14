@@ -547,9 +547,27 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // keeps the 3SF-mini one keyless: it then only ticks, and owns the
             // store the rest of the node is wired to.
             let decoupled = if lean.decoupled || genesis_config.decoupled.enabled {
+                // An aggregator aggregates the subnets it was assigned, else
+                // every subnet it subscribes to.
+                let duty_subnets = lean
+                    .aggregate_subnet_ids
+                    .as_ref()
+                    .map(|ids| ids.iter().copied().collect())
+                    .unwrap_or_else(|| subscribed_subnets.clone());
+                let aggregation = ethlambda_blockchain::decoupled_aggregation::AggregationConfig {
+                    aggregator: aggregator.clone(),
+                    committee_count: attestation_committee_count,
+                    duty_subnets,
+                    subgroups: lean.attestation_subgroups,
+                    subgroup_spacing_ms: lean.attestation_subgroup_spacing_ms,
+                    max_children: lean.max_aggregation_children,
+                    merge_deadline_ms: lean.global_aggregation_deadline_ms,
+                };
                 let setup = decoupled_setup(
                     &genesis_config,
                     lean.decoupled_lock_period,
+                    lean.decoupled_slots_per_round,
+                    aggregation,
                     std::mem::take(&mut validator_keys),
                 )?;
                 Some(setup)
@@ -1013,6 +1031,8 @@ fn beacon_decoupled_node(
 fn decoupled_setup(
     genesis: &GenesisConfig,
     lock_period_override: Option<u64>,
+    slots_per_round_override: Option<u64>,
+    aggregation: ethlambda_blockchain::decoupled_aggregation::AggregationConfig,
     validator_keys: HashMap<u64, ValidatorKeyPair>,
 ) -> eyre::Result<DecoupledSetup> {
     let keys = &genesis.decoupled;
@@ -1020,7 +1040,7 @@ fn decoupled_setup(
         .or(keys.lock_period)
         .unwrap_or(ethlambda_decoupled::DEFAULT_LOCK_PERIOD);
     let mut params = ethlambda_decoupled::Params::with_lock_period(lock_period);
-    if let Some(slots) = keys.slots_per_round {
+    if let Some(slots) = slots_per_round_override.or(keys.slots_per_round) {
         params.slots_per_round = slots;
     }
     if let Some(window) = keys.pending_finality_window {
@@ -1058,6 +1078,21 @@ fn decoupled_setup(
         genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
         "Decoupled consensus configured"
     );
+    // The action time is half way into its slot, so the subgroups sign at
+    // their slot's attestation epoch only while they all fit in its second
+    // half. Later still verifies (the epoch is the envelope's slot's), it
+    // just arrives late.
+    let delta_ms = genesis.milliseconds_per_slot / 4;
+    let schedule =
+        ethlambda_blockchain::decoupled_aggregation::Schedule::new(&aggregation, delta_ms);
+    let last_signing_ms = schedule.sign_offset_ms(schedule.subgroups - 1);
+    if last_signing_ms >= 2 * delta_ms {
+        warn!(
+            last_signing_ms,
+            slot_remainder_ms = 2 * delta_ms,
+            "The last attestation subgroup signs after its slot ends"
+        );
+    }
     Ok(DecoupledSetup {
         config: ethlambda_blockchain::decoupled_lean::DecoupledLeanConfig {
             params,
@@ -1065,6 +1100,7 @@ fn decoupled_setup(
             slot_duration_ms: genesis.milliseconds_per_slot,
             genesis_root,
             validators,
+            aggregation,
         },
         validator_keys,
         blocks: SharedDecoupledBlocks::default(),

@@ -97,6 +97,12 @@ On top of the common flags above.
 | `--discovery.enable` | `false` | Run discv5 peer discovery; off, the node peers from `--bootnodes` alone. See [Peer discovery](./discovery.md) |
 | `--aggregate-subnet-ids` | this node's subnets | Subnets to aggregate on; requires `--is-aggregator` |
 | `--attestation-committee-count` | from `validator-config.yaml`, else `1` | Committees per slot |
+| `--decoupled.lock-period` | `DECOUPLED_LOCK_PERIOD`, else `4` | Decoupled: Goldilocks' lock period `k` in slots (at least 2) |
+| `--decoupled.slots-per-round` | `DECOUPLED_SLOTS_PER_ROUND`, else `2` | Decoupled: Goldilocks' round length `R` in slots (at least 1); see [decoupled consensus](./decoupled_consensus.md) |
+| `--attestation-subgroups` | `4` | Decoupled: signing subgroups per attestation subnet |
+| `--attestation-subgroup-spacing-ms` | half a `Δ` | Decoupled: time between two subgroups' signing |
+| `--max-aggregation-children` | `16` | Decoupled: most child proofs one merge folds in; requires `--is-aggregator` |
+| `--global-aggregation-deadline-ms` | a slot after the action time | Decoupled: when to merge the subnet aggregates that arrived; requires `--is-aggregator` |
 | `--enable-proposer-aggregation` | `false` | Merge same-data proofs when building a block |
 | `--max-attestations-per-block` | `3` | Proposer-side self-limit |
 | `--disable-duty-sync-gate` | `false` | Track sync state without suppressing duties |
@@ -146,6 +152,7 @@ something specific here.
 |---|---|---|
 | `--decoupled-fork-epoch` | unset | Schedule the decoupled fork at this epoch, overriding the network's `DECOUPLED_FORK_EPOCH`. Refused when the network also schedules gloas, or when the slot duration is not divisible by 4 ms |
 | `--decoupled-lock-period` | unset | Goldilocks' lock period `k` in slots (lock lifetime and slow-lock streak), overriding `DECOUPLED_LOCK_PERIOD` (at least 2) |
+| `--decoupled-slots-per-round` | unset | Goldilocks' round length `R` in slots (one attestation per validator per round), overriding `DECOUPLED_SLOTS_PER_ROUND` (at least 1) |
 | `--network` | `mainnet` | A built-in network name (`mainnet`, `sepolia`, `hoodi` or `plataberget`), or a path to a directory of published network files. A value containing a slash is always a path, so `mainnet` is the built-in and `./mainnet` is a directory. The directory must hold `config.yaml` and `genesis.ssz`, and may hold `bootstrap_nodes.yaml` or `bootstrap_nodes.txt` |
 
 `genesis_validators_root` and `genesis_time`, which the fork digest that keys

@@ -763,7 +763,11 @@ pub struct LeanWire {
 pub(crate) struct DecoupledWire {
     pub(crate) block_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) vote_topic: libp2p::gossipsub::IdentTopic,
-    pub(crate) attestation_topic: libp2p::gossipsub::IdentTopic,
+    /// The attestation subnets this node subscribed to. Publishing to any
+    /// other subnet builds its topic on the fly and goes out by fanout.
+    pub(crate) attestation_topics: HashMap<u64, libp2p::gossipsub::IdentTopic>,
+    pub(crate) attestation_committee_count: u64,
+    pub(crate) aggregate_topic: libp2p::gossipsub::IdentTopic,
     pub(crate) chain: Option<ethlambda_network_api::P2PToDecoupledRef>,
     pub(crate) blocks: ethlambda_network_api::SharedDecoupledBlocks,
     /// Root of each in-flight request, by request id.
@@ -1049,14 +1053,23 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     let wire = match wire {
         WireConfig::Lean(lean) if lean.decoupled.is_some() => {
             // A decoupled node speaks only the decoupled topics: its blocks and
-            // votes are different containers from 3SF-mini's.
+            // votes are different containers from 3SF-mini's. Attestations go
+            // on subnets, subscribed the way 3SF-mini's are; aggregates on one
+            // topic every node follows.
             let block_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_BLOCK_TOPIC_KIND);
             let vote_topic = gossipsub::decoupled_topic(gossipsub::DECOUPLED_VOTE_TOPIC_KIND);
-            let attestation_topic =
-                gossipsub::decoupled_topic(gossipsub::DECOUPLED_ATTESTATION_TOPIC_KIND);
-            for topic in [&block_topic, &vote_topic, &attestation_topic] {
+            let aggregate_topic =
+                gossipsub::decoupled_topic(gossipsub::DECOUPLED_AGGREGATE_TOPIC_KIND);
+            for topic in [&block_topic, &vote_topic, &aggregate_topic] {
                 swarm.behaviour_mut().gossipsub.subscribe(topic)?;
                 info!(topic = %topic, "Subscribed to decoupled topic");
+            }
+            let mut attestation_topics = HashMap::new();
+            for &subnet in &lean.subscription_subnets {
+                let topic = gossipsub::decoupled_attestation_topic(subnet);
+                swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+                info!(subnet, "Subscribed to decoupled attestation subnet");
+                attestation_topics.insert(subnet, topic);
             }
             info!(socket=%listening_socket, "P2P node started (decoupled consensus)");
             Wire::Lean(LeanWire {
@@ -1067,7 +1080,9 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
                 decoupled: Some(Box::new(DecoupledWire {
                     block_topic,
                     vote_topic,
-                    attestation_topic,
+                    attestation_topics,
+                    attestation_committee_count: lean.attestation_committee_count,
+                    aggregate_topic,
                     chain: None,
                     blocks: lean.decoupled.clone().expect("guarded above"),
                     outbound: HashMap::new(),
@@ -1813,6 +1828,16 @@ impl Handler<ethlambda_network_api::decoupled_to_p2p::PublishDecoupledAttestatio
         _ctx: &Context<Self>,
     ) {
         gossipsub::publish_decoupled_attestation(self, msg.attestation);
+    }
+}
+
+impl Handler<ethlambda_network_api::decoupled_to_p2p::PublishDecoupledAggregate> for P2PServer {
+    async fn handle(
+        &mut self,
+        msg: ethlambda_network_api::decoupled_to_p2p::PublishDecoupledAggregate,
+        _ctx: &Context<Self>,
+    ) {
+        gossipsub::publish_decoupled_aggregate(self, msg.aggregate);
     }
 }
 
