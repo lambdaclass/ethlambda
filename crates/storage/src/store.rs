@@ -679,12 +679,10 @@ pub(crate) struct BeaconScratch {
     /// `prune_beacon_optimistic_roots` nothing would ever take those entries
     /// back out.
     ///
-    /// Nothing outside `fork_choice::mark_validated`'s own ancestor walk reads
-    /// [`Store::is_beacon_optimistic`] yet, so outside that walk this is
-    /// write-only. The readers it is waiting for are the ones that need to
-    /// answer "is my head optimistic?": the Beacon API's `execution_optimistic`
-    /// response field, and a sync status that distinguishes a head this node
-    /// has vouched for from one it has merely imported.
+    /// Read through [`Store::is_beacon_optimistic`] by
+    /// `fork_choice::mark_validated`'s own ancestor walk, by the Beacon API's
+    /// `execution_optimistic` response field, and by the chain events that
+    /// carry the same field.
     pub(crate) optimistic_roots: HashMap<H256, u64>,
     /// Payload statuses keyed by execution block hash, standing in for a call
     /// to an execution client exactly as `pow_blocks` does. Written only by
@@ -3331,19 +3329,23 @@ impl Store {
         self.beacon.lock().unwrap().optimistic_roots.remove(&root);
     }
 
-    /// Drops optimistic roots strictly below `finalized_slot`.
+    /// Drops optimistic roots strictly below `finalized_slot`, always keeping
+    /// `keep`.
     ///
     /// A root below finality can no longer be validated or invalidated in any
-    /// way this node acts on, so holding it only costs memory. Unlike
-    /// `el_block_hashes` this needs no exemption for the finalized checkpoint's
-    /// own root: nothing reads a finalized block's optimistic status, and
-    /// `mark_validated`'s walk stopping one block earlier is the same answer.
-    pub fn prune_beacon_optimistic_roots(&mut self, finalized_slot: u64) {
+    /// way this node acts on, so holding it only costs memory. `keep` is the
+    /// finalized checkpoint's own root, exempted for the reason
+    /// [`Store::prune_beacon_el_block_hashes`] gives: a skipped epoch boundary
+    /// leaves it below the slot bound. Its optimistic status is read after
+    /// this prune, by the `finalized_checkpoint` chain event and by the Beacon
+    /// API's `execution_optimistic` on a `finalized` id, and dropping it would
+    /// report an unvalidated block as validated.
+    pub fn prune_beacon_optimistic_roots(&mut self, finalized_slot: u64, keep: H256) {
         self.beacon
             .lock()
             .unwrap()
             .optimistic_roots
-            .retain(|_root, slot| *slot >= finalized_slot);
+            .retain(|root, slot| *slot >= finalized_slot || *root == keep);
     }
 
     /// The execution block hash cached for a beacon root at import.
@@ -6958,11 +6960,29 @@ mod tests {
         store.insert_beacon_optimistic_root(at, 5);
         store.insert_beacon_optimistic_root(above, 6);
 
-        store.prune_beacon_optimistic_roots(5);
+        store.prune_beacon_optimistic_roots(5, at);
 
         assert!(!store.is_beacon_optimistic(below));
         assert!(store.is_beacon_optimistic(at));
         assert!(store.is_beacon_optimistic(above));
+    }
+
+    /// The optimistic counterpart of
+    /// `el_block_hashes_keep_the_finalized_root_below_a_skipped_epoch_boundary`:
+    /// the finalized block sits below the stored checkpoint slot, and its flag
+    /// is still read after the prune.
+    #[test]
+    fn optimistic_roots_keep_the_finalized_root_below_a_skipped_epoch_boundary() {
+        let mut store = Store::test_store();
+        let finalized = H256::repeat_byte(1);
+        let stale = H256::repeat_byte(2);
+        store.insert_beacon_optimistic_root(finalized, 30);
+        store.insert_beacon_optimistic_root(stale, 29);
+
+        store.prune_beacon_optimistic_roots(32, finalized);
+
+        assert!(store.is_beacon_optimistic(finalized));
+        assert!(!store.is_beacon_optimistic(stale));
     }
 
     #[test]

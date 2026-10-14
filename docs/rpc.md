@@ -94,7 +94,7 @@ SSZ-encoded `SignedBlock` at the latest finalized checkpoint. The genesis/anchor
 
 ### `GET /lean/v0/events`
 
-Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Seven event types:
+Server-Sent Events stream (`Content-Type: text/event-stream`) of live chain events published by the blockchain actor. Eight event types:
 
 Payload fields mirror the Ethereum beacon-API eventstream where an analog exists: `block` is the block root, `state` the state root, and `slot` stands in for the beacon `epoch`. `justified_checkpoint` and `aggregate` are ethlambda extensions with no beacon topic.
 
@@ -107,6 +107,7 @@ Payload fields mirror the Ethereum beacon-API eventstream where an analog exists
 | `block_gossip` | `{ "slot": 128, "block": "0x…" }` | A block is seen on the network, before import |
 | `attestation` | `{ "validator_id": 4, "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A single validator vote passes gossip validation (signature omitted) |
 | `aggregate` | `{ "participants": [0, 3, 4], "data": { "slot": 128, "head": {…}, "target": {…}, "source": {…} } }` | A committee-signature aggregate is produced locally or accepted from gossip (proof omitted) |
+| `chain_reorg` | `{ "slot": 130, "depth": 1, "old_head_block": "0x…", "new_head_block": "0x…", "old_head_state": "0x…", "new_head_state": "0x…" }` | The new head does not descend from the previous one; sent ahead of that `head`, and never gated on recency. `slot` is the new head's; `depth` is how many slots the old head sat above the two heads' common ancestor (the Beacon API's definition, in slots; the `lean_fork_choice_reorg_depth` metric counts blocks walked instead) |
 
 The topic name travels only on the SSE `event:` line; the `data:` line carries the flat JSON payload. Example frame:
 
@@ -123,7 +124,7 @@ A **required** comma-separated list of event names selects which events to strea
 curl -N 'http://127.0.0.1:5052/lean/v0/events?topics=head,finalized_checkpoint'
 ```
 
-Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
+Valid values are exactly the event names above: `head`, `block`, `justified_checkpoint`, `finalized_checkpoint`, `block_gossip`, `attestation`, `aggregate`, `chain_reorg`. A Beacon API topic this surface does not serve (`data_column_sidecar`, say) is refused as unknown. As in the Beacon API `eventstream` endpoint, `topics` is mandatory: there is no "subscribe to everything" default; list the topics you want.
 
 | Status | Condition |
 |--------|-----------|
@@ -247,6 +248,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v3/validator/blocks/{slot}` | SSZ or JSON | An unsigned block built on the head (`produceBlockV3`) |
 | `POST` | `/eth/v2/beacon/blocks` | *(status only)* | Gossip and import a signed block (`publishBlockV2`, SSZ) |
 | `POST` | `/eth/v1/validator/prepare_beacon_proposer` | *(status only)* | Acknowledged, not acted on (see below) |
+| `GET` | `/eth/v1/events` | SSE | Live stream of chain events (see below) |
 
 ### Validator endpoints
 
@@ -287,8 +289,9 @@ the chain actor writes, so no request waits on the actor.
   `beacon_aggregate_and_proof` gossip conditions this node applies to its
   peers' aggregates (`gossip::aggregate`), signatures included, against a
   fresh seen-cache (a node never receives its own messages, so P2P's says
-  nothing about them). What passes is gossiped on the topic and goes into the
-  pool.
+  nothing about them). What passes is gossiped on the topic, goes into the
+  pool, and is handed to the chain actor, which applies it to fork choice and
+  announces it on `/eth/v1/events`'s `attestation`.
 - **The attestation pool** holds, the best-covered per data root and
   committee: votes from `pool/attestations` and the aggregator subnets,
   aggregates from `aggregate_and_proofs`, and every electra gossip aggregate
@@ -387,6 +390,77 @@ state. A slot the store holds nothing at is still a `404`.
 
 `/eth/v1/node/identity` reports `peer_id` and `metadata`; `enr`,
 `p2p_addresses` and `discovery_addresses` are empty.
+
+### `GET /eth/v1/events`
+
+The Beacon API eventstream: the same Server-Sent Events stream as
+[`/lean/v0/events`](#get-leanv0events) (topic on the `event:` line, payload on
+`data:`, one shared best-effort ring, `: error - dropped N messages` on a gap),
+with the Beacon API's own topics and payloads. The response also sets
+`X-Accel-Buffering: no`, so a reverse proxy does not hold events back.
+
+```bash
+curl -N 'http://127.0.0.1:5052/eth/v1/events?topics=head&topics=block,finalized_checkpoint'
+```
+
+`topics` is required, and may be repeated (`?topics=head&topics=block`, the
+specification's form) or comma-separated (`?topics=head,block`, which
+lighthouse also accepts). Duplicates collapse. A missing or empty `topics`, or
+a name that is not a Beacon API topic, is a `400` in the Beacon API error shape:
+`{"code":400,"message":"Invalid topic: weather_forecast"}`.
+
+**Accepted is not emitted.** Every topic in the specification is accepted, so
+a validator client subscribing to several at once is not turned away, but only
+these are ever sent:
+
+| Event | Payload | Emitted when |
+|-------|---------|--------------|
+| `head` | `{"slot":"10", "block":"0x…", "state":"0x…", "epoch_transition":false, "previous_duty_dependent_root":"0x…", "current_duty_dependent_root":"0x…", "execution_optimistic":false}` | The head changed, and is within 32 slots of the wall clock |
+| `block` | `{"slot":"10", "block":"0x…", "execution_optimistic":false}` | A block is imported |
+| `block_gossip` | `{"slot":"10", "block":"0x…"}` | A block passed gossip validation, or was published through `POST /eth/v2/beacon/blocks` |
+| `finalized_checkpoint` | `{"block":"0x…", "state":"0x…", "epoch":"2", "execution_optimistic":false}` | The finalized checkpoint advanced |
+| `chain_reorg` | `{"slot":"200", "depth":"50", "old_head_block":"0x…", "new_head_block":"0x…", "old_head_state":"0x…", "new_head_state":"0x…", "epoch":"2", "execution_optimistic":false}` | The new head does not descend from the previous one |
+| `attestation` | the aggregate's `Attestation` | An aggregate passed the `beacon_aggregate_and_proof` rules: accepted from gossip, or submitted through `POST /eth/v2/validator/aggregate_and_proofs` |
+| `data_column_sidecar` | `{"block_root":"0x…", "index":"1", "slot":"1"}` | A column this node custodies is stored, from any source |
+
+Never emitted: `single_attestation` (subnet votes are verified and relayed but
+never reach the chain actor), the operation topics (`voluntary_exit`,
+`proposer_slashing`, `attester_slashing`, `bls_to_execution_change`,
+`contribution_and_proof`: no operation pools), `payload_attributes`, the light
+client topics, `blob_sidecar`, and `head_v2` with every other gloas topic (this
+build stops at fulu).
+
+How head and finality events behave:
+
+- **One `head` per head recompute.** The chain actor recomputes the head once
+  per tick and once per import cascade, and diffs it against the head it last
+  reported. A cascade importing several blocks announces each `block`, then a
+  single `head` for where it ended.
+- **Any head change counts**, including one no block caused (a tick's votes
+  moving the head to a sibling, or an execution client's `INVALID` verdict
+  moving it back to an ancestor). Lighthouse reports only the `chain_reorg` for
+  those; Prysm reports both, as this node does.
+- **Stale heads are not reported.** A head more than 32 slots behind the wall
+  clock (catch-up) sends no `head`; `block` events still show progress.
+  `chain_reorg` and `finalized_checkpoint` are not gated.
+- **Order:** each `block` as it imports, then `chain_reorg`, `head`,
+  `finalized_checkpoint`.
+- `epoch_transition` is whether the head's epoch is later than the previous
+  head's. The dependent roots follow the specification, with the genesis block
+  root on underflow (epochs 0 and 1).
+- `chain_reorg.depth` is how many slots the previous head sat above the two
+  heads' common ancestor (lighthouse's definition).
+- `execution_optimistic` is reported as it is, optimistic heads included
+  (lighthouse suppresses those `head` events; Prysm sends them flagged).
+
+An aggregate this node's own validator client submits reaches the chain actor
+too: gossip never delivers a node its own messages, so
+`POST /eth/v2/validator/aggregate_and_proofs` hands each accepted one to the
+actor after gossiping it. That is also what puts this node's own aggregates
+into its fork choice.
+
+Event payloads are built only while at least one client is connected, whatever
+topics that client asked for; with none, the stream costs nothing.
 
 ## Metrics & Debug Server (`:5054`)
 
