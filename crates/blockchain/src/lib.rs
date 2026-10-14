@@ -18,6 +18,7 @@ use ethlambda_types::{
         containers::{SignedAggregateAndProof, SignedBeaconBlock, fulu},
         preset,
         primitives::ValidatorIndex,
+        signing::compute_epoch_at_slot,
     },
     block::SignedBlock,
     chain_config::ChainConfig,
@@ -836,7 +837,28 @@ fn data_availability_for(
 
             Some(fork_choice::DataAvailability::Columns(sidecars))
         }
-        _ => Some(fork_choice::DataAvailability::NotRequired),
+        SignedBeaconBlock::Phase0(_)
+        | SignedBeaconBlock::Altair(_)
+        | SignedBeaconBlock::Bellatrix(_)
+        | SignedBeaconBlock::Capella(_) => Some(fork_choice::DataAvailability::NotRequired),
+        // ePBS (EIP-7732) moves the availability question onto the payload
+        // envelope's data columns, not this block's own (nonexistent)
+        // `blob_kzg_commitments`, so this gate has nothing gloas-shaped to
+        // check yet. Unreachable from network input today:
+        // `process_or_pend_block` refuses every gloas block before this
+        // function is ever called, because this node cannot yet deliver the
+        // payload envelopes and payload attestations a gloas chain needs.
+        // `on_block` itself accepts a gloas block and reads no availability
+        // evidence for it. `None` here regardless, defensively: were that
+        // gate ever bypassed, `None` keeps a block this node cannot follow
+        // out of `on_block` entirely.
+        SignedBeaconBlock::Gloas(_) => None,
+        // `process_block` dispatches a lean block to `store::on_block` before
+        // this function is ever reached, so this arm is never observed for
+        // one; named on its own rather than folded into the group above so
+        // this value is not read as a claim about lean blocks' own
+        // availability.
+        SignedBeaconBlock::Lean(_) => Some(fork_choice::DataAvailability::NotRequired),
     }
 }
 
@@ -2200,16 +2222,18 @@ impl BlockChainServer {
 
     /// Re-run beacon fork choice and republish the head gauge.
     ///
-    /// `fork_choice::on_block` does not compute a head, and `Store::beacon_head`
-    /// only reads back whatever the last [`fork_choice::get_head`] recorded, so
-    /// without this an import moves no head at all: it just adds a block and a
-    /// post-state. Until the block path called this too, [`Self::on_tick`] was
-    /// the only caller, and it is one message per slot in the same mailbox as
-    /// every arriving block. A follower catching up imports back-to-back and
-    /// never drains that mailbox, so the tick did not run, the head stayed
-    /// pinned at the checkpoint-sync anchor, and `lean_head_slot` sat flat for
-    /// the entire catch-up even while imports were landing every few seconds.
-    /// That is what "the head is not advancing" looked like on the dashboard.
+    /// `fork_choice::on_block` may compute a head of its own now (to gate its
+    /// proposer-boost logic), but never records it: `Store::beacon_head` only
+    /// reads back whatever the last [`fork_choice::get_head`] recorded, so
+    /// without this an import moves no *visible* head at all: it just adds a
+    /// block and a post-state. Until the block path called this too,
+    /// [`Self::on_tick`] was the only caller, and it is one message per slot in
+    /// the same mailbox as every arriving block. A follower catching up
+    /// imports back-to-back and never drains that mailbox, so the tick did not
+    /// run, the head stayed pinned at the checkpoint-sync anchor, and
+    /// `lean_head_slot` sat flat for the entire catch-up even while imports
+    /// were landing every few seconds. That is what "the head is not
+    /// advancing" looked like on the dashboard.
     ///
     /// A failure here means fork choice could not find a head (for instance
     /// every known block is unjustifiable), which is a condition to log and
@@ -2570,6 +2594,38 @@ impl BlockChainServer {
         let proposer = signed_block.proposer_index();
         timings.guards_start = Some(Instant::now());
 
+        // Refused before anything else, including the columns/finalized-slot
+        // checks below: this node cannot follow a gloas chain yet, since
+        // nothing delivers the payload envelopes a block's full branch needs
+        // (`fork_choice::on_execution_payload_envelope`) or the payload
+        // attestations that vote on them, so persisting a gloas block as
+        // pending is pure waste. Worse than waste were this not here
+        // first: a gloas block whose parent is missing would otherwise be
+        // `insert_pending_block`-ed and tracked in `pending_block_parents`,
+        // and every later block naming it as an ancestor would walk back to
+        // it, fetch it out of storage, and requeue it, paying that same
+        // round trip again on every single delivery, forever, since nothing
+        // ever marks it imported. `discard_pending_subtree` clears any
+        // children already queued under it before this landed; logged once,
+        // here, rather than once per retry, since after this there is no
+        // retry.
+        //
+        // Decided by chain first: a lean block is not a point on the beacon
+        // fork schedule, and `ForkName::is_followed` refuses to answer for it.
+        let refused = match self.store.chain() {
+            Chain::Lean => false,
+            Chain::Beacon => !signed_block.fork_name().is_followed(),
+        };
+        if refused {
+            warn!(
+                %slot,
+                block_root = %ShortRoot(&block_root.0),
+                "Refusing a gloas block: this build cannot follow a gloas chain yet"
+            );
+            self.discard_pending_subtree(block_root);
+            return None;
+        }
+
         // Asked before the parent check, so that an absent `columns_wait` row
         // can be read two ways rather than one: the columns were never
         // missing, or they landed while this block was held for its parent.
@@ -2599,15 +2655,23 @@ impl BlockChainServer {
         }
 
         // Beacon: a block whose post-state is already here needs no work.
-        // `fork_choice::on_block` does not short-circuit on a known root: it
-        // goes straight from cloning the parent state to `state_transition`,
-        // so a re-delivery pays the entire import a second time. On mainnet
-        // 2026-09-08 that was 37 of 116 imports, a third of the actor's import
-        // budget, spent recomputing post-states the store already held.
-        // Children are still collected: this root did import, so anything
-        // pending on it is ready whether or not this delivery is the one that
-        // imported it. Beacon-only, because lean's `store::on_block` has its
-        // own already-imported early return.
+        // `fork_choice::on_block` also returns early on a root that already
+        // has a post-state now (`Store::has_state`, the specification's own
+        // `store.blocks` guard, mapped onto what that membership means here;
+        // see that call site's own doc for why `has_block` alone is the
+        // wrong check), so calling it again costs little more than that one
+        // lookup. This check still
+        // matters because `on_block` answers a bare `Ok(())` either way, with
+        // no signal that nothing happened, while this call site needs to
+        // collect the root's pending children and answer
+        // `ImportOutcome::Imported` regardless of which delivery actually did
+        // the importing. Before `on_block` had its own guard, that
+        // distinction was also a real cost: on mainnet 2026-09-08, a
+        // re-delivery recomputing the whole post-state was 37 of 116 imports,
+        // a third of the actor's import budget. Children are still collected:
+        // this root did import, so anything pending on it is ready whether or
+        // not this delivery is the one that imported it. Beacon-only, because
+        // lean's `store::on_block` has its own already-imported early return.
         if self.store.chain() == Chain::Beacon
             && self
                 .store
@@ -3072,16 +3136,16 @@ impl BlockChainServer {
     /// import — the two places beacon finality can move — bounds that by the
     /// unfinalized window rather than by this node's uptime.
     ///
-    /// Also bounds the two beacon scratch caches with the same horizon, the
-    /// execution-hash cache and the optimistic-root set, which is why the
-    /// finalized slot is read before the "nothing is held" early return rather
-    /// than after it: all three share a horizon and these two call sites, but
-    /// the caches fill on every beacon import whether or not anything is being
-    /// held for its columns.
+    /// Also bounds the three beacon scratch caches with the same horizon, the
+    /// execution-hash cache, the payload-link cache and the optimistic-root
+    /// set, which is why the finalized slot is read before the "nothing is
+    /// held" early return rather than after it: all four share a horizon and
+    /// these two call sites, but the caches fill on every beacon import
+    /// whether or not anything is being held for its columns.
     ///
     /// The held-block half is a no-op whenever nothing is held, which is always
     /// true on lean; the cache halves are no-ops there too, since only a beacon
-    /// import ever writes either.
+    /// import ever writes to them.
     fn evict_held_blocks_at_or_below_finality(&mut self) {
         let finalized = self
             .store
@@ -3097,6 +3161,20 @@ impl BlockChainServer {
         // checkpoint is stored as was itself skipped.
         self.store
             .prune_beacon_el_block_hashes(finalized_slot, finalized.root);
+
+        // The head walk's per-block payload links share that horizon: the walk
+        // weighs only blocks at or above the finalized block, so a link below
+        // it is never read again. The prune keys its bound on the finalized
+        // block's own link, which a restart loses, so it is recorded first.
+        if self.store.chain() == Chain::Beacon {
+            fork_choice::ensure_payload_link(&self.store, finalized.root)
+                .inspect_err(|err| {
+                    warn!(?err, "Could not record the finalized block's payload link")
+                })
+                .ok();
+        }
+        self.store
+            .prune_beacon_payload_links(finalized_slot, finalized.root);
 
         // Same horizon, same reason. An execution client doing a long state
         // sync answers `NOT_VALIDATED` to every block, so the optimistic set
@@ -3616,20 +3694,51 @@ impl BlockChainServer {
     ///
     /// Reads the head through [`Self::head_slot`], which is where the
     /// per-chain part of that lives (lean's `Store::head_slot` and beacon's
-    /// `Store::beacon_head` decode different tables); everything past that
-    /// point is chain-agnostic.
+    /// `Store::beacon_head` decode different tables). The tracker itself is
+    /// chain-agnostic, but the freshest block seen is not: on a beacon
+    /// follower, once the clock is past a fork the node does not follow (see
+    /// [`Self::clock_is_past_followed_forks`]) the network is treated as fresh.
     fn update_sync_status(&mut self, current_slot: u64) {
         let head_slot = self.head_slot();
-        let max_seen_slot = self
+        let live_max_slot = self
             .store
             .max_live_chain_slot()
             .expect("max live chain slot exists")
             .unwrap_or(head_slot);
+        let max_seen_slot = match self.store.chain() {
+            Chain::Beacon
+                if Self::clock_is_past_followed_forks(
+                    &self.store.config(),
+                    current_slot,
+                    head_slot,
+                ) =>
+            {
+                current_slot
+            }
+            Chain::Beacon | Chain::Lean => live_max_slot,
+        };
         let status = self
             .sync_status
             .update(current_slot, head_slot, max_seen_slot);
         metrics::set_node_sync_status(status);
         self.sync_status_controller.set(status);
+    }
+
+    /// Whether the clock is at a fork this node does not follow while the
+    /// node's own head is still from one it does.
+    ///
+    /// Blocks past the fork never reach the live chain, so the freshest block
+    /// the store knows stays at the head and the sync tracker would read the
+    /// network as stalled `NETWORK_STALL_THRESHOLD` slots after the fork and
+    /// report `Synced` for good on a node that follows nothing. Nothing else
+    /// tells the node the network is ahead: gossip blocks past the fork are
+    /// ignored in p2p, and a node that runs across the fork keeps the fork
+    /// digest it computed at startup, so peers' Status messages are dropped
+    /// and no range session starts. The clock is the one signal that is always
+    /// there, and treating the network as fresh lets head lag decide.
+    fn clock_is_past_followed_forks(config: &Config, current_slot: u64, head_slot: u64) -> bool {
+        let fork_at = |slot: u64| config.fork_at_epoch(compute_epoch_at_slot(slot));
+        !fork_at(current_slot).is_followed() && fork_at(head_slot).is_followed()
     }
 
     /// Milliseconds until this actor's next tick, dispatched by chain: lean's
@@ -5166,6 +5275,109 @@ mod tests {
         // ordering) — so this holds whether or not that attempt itself
         // succeeds, and it does not hang either way.
         assert!(!server.blocks_awaiting_columns.contains_key(&parent_root));
+    }
+
+    /// A beacon server scheduling gloas at `gloas_epoch` (never, for `None`),
+    /// holding nothing past its anchor: no block of any fork arrives in these
+    /// tests.
+    fn syncing_server(gloas_epoch: Option<u64>) -> BlockChainServer {
+        let config = match gloas_epoch {
+            Some(epoch) => Config::mainnet().with_fork_epoch(ForkName::Gloas, epoch),
+            None => Config::mainnet(),
+        };
+        beacon_server(beacon_store_with_config(GENESIS_TIME, 0, config))
+    }
+
+    #[test]
+    fn the_node_reports_syncing_once_the_clock_passes_the_fork_it_does_not_follow() {
+        // No block arrives at all: gossip blocks past the fork are ignored in
+        // p2p and peers' Status messages are dropped, so the store's freshest
+        // block stays at the head. The clock alone must keep the node from
+        // reading the network as stalled.
+        let mut server = syncing_server(Some(1));
+        let past_the_fork = preset::SLOTS_PER_EPOCH + 8;
+        server.update_sync_status(past_the_fork);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Syncing
+        );
+    }
+
+    #[test]
+    fn a_stalled_network_with_no_fork_ahead_still_reads_as_synced() {
+        // The same silence with no gloas scheduled is a stalled network, which
+        // the tracker deliberately reports as synced.
+        let mut server = syncing_server(None);
+        server.update_sync_status(preset::SLOTS_PER_EPOCH + 8);
+        assert_eq!(
+            server.sync_status_controller.get(),
+            crate::metrics::SyncStatus::Synced
+        );
+    }
+
+    /// Gloas at epoch 1, so slot `SLOTS_PER_EPOCH` is the first gloas slot.
+    fn gloas_at_epoch_one() -> Config {
+        Config::mainnet().with_fork_epoch(ForkName::Gloas, 1)
+    }
+
+    #[test]
+    fn the_clock_rule_holds_for_a_followed_head_once_the_clock_is_at_gloas() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot + 8,
+            0
+        ));
+    }
+
+    #[test]
+    fn the_clock_rule_does_not_hold_before_the_clock_reaches_gloas() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(!BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot - 1,
+            0
+        ));
+    }
+
+    #[test]
+    fn the_clock_rule_does_not_hold_for_a_head_already_past_the_fork() {
+        let first_gloas_slot = preset::SLOTS_PER_EPOCH;
+        assert!(!BlockChainServer::clock_is_past_followed_forks(
+            &gloas_at_epoch_one(),
+            first_gloas_slot + 8,
+            first_gloas_slot
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_lean_block_is_not_refused_as_an_unfollowed_fork() {
+        // The import path serves both chains, so a lean block reaches the
+        // fork check, and `ForkName::Lean` has no answer to "is it followed".
+        // With an unknown parent the block is parked, which is all that has to
+        // happen: the point is that it gets that far without a panic.
+        let backend = Arc::new(InMemoryBackend::default());
+        let store = Store::from_anchor_state(
+            backend,
+            State::from_genesis(0, Vec::new()),
+            DEFAULT_MILLISECONDS_PER_SLOT,
+        );
+        let mut server = beacon_server(store);
+        let block = SignedBeaconBlock::Lean(ethlambda_types::block::SignedBlock {
+            message: ethlambda_types::block::Block {
+                slot: 5,
+                proposer_index: 0,
+                parent_root: H256::repeat_byte(9),
+                state_root: H256::ZERO,
+                body: ethlambda_types::block::BlockBody::default(),
+            },
+            proof: ethlambda_types::block::MultiMessageAggregate::default(),
+        });
+        let mut queue = VecDeque::new();
+        let outcome = server
+            .process_or_pend_block(block, ImportTimings::default(), &mut queue)
+            .await;
+        assert_eq!(outcome, None);
     }
 
     #[tokio::test]

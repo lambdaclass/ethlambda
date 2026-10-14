@@ -2,8 +2,14 @@
 //! vectors (`tests/formats/networking/gossip_validation.md` in
 //! consensus-specs), run against `beacon::gossip`.
 //!
-//! These come from their own fixture tree; see [`super::gossip_fixture_root`].
+//! These used to come from a separate, newer-release fixture tree of their
+//! own; v1.7.0-beta.2's main tree now ships the same vectors under
+//! `networking/gossip_*` alongside every other runner, so they are collected
+//! from there like any other handler (see [`super::collect`]). `networking.rs`
+//! filters these same directories out of its own collection, so the two
+//! runners partition the tree rather than both claiming it.
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -22,16 +28,48 @@ use ethlambda_state_transition::beacon::helpers::accessors::CommitteeCache;
 use ethlambda_state_transition::beacon::primitives::Root;
 use ethlambda_storage::ForkCheckpoints;
 use libssz::SszDecode;
-use libtest_mimic::Trial;
+use libtest_mimic::{Failed, Trial};
 
-use super::{Case, PRESET, collect_gossip};
+use super::{Case, PRESET, collect, collect_all_handlers};
 
-/// The handlers this runner covers.
+/// The handlers this runner covers, and runs.
 const HANDLERS: &[&str] = &[
     "gossip_beacon_block",
     "gossip_data_column_sidecar",
     "gossip_beacon_aggregate_and_proof",
     "gossip_beacon_attestation",
+];
+
+/// Every other `gossip_*` handler the fixture tree ships, none of which this
+/// node validates yet: the topics it neither subscribes to nor has a
+/// validator for. Reported as ignored, named individually, rather than left
+/// for `HANDLERS` to silently not mention, so the gap is visible in the test
+/// list instead of inferred from an absence. [`trials`]'s accounting test
+/// fails if a fixture release adds a `gossip_*` handler that is in neither
+/// list, the same way [`super::UNMODELED_FORKS`] forces a decision on a new
+/// fork directory.
+///
+/// `gossip_execution_payload_bid`, `gossip_execution_payload_envelope`,
+/// `gossip_payload_attestation_message`, and `gossip_proposer_preferences`
+/// are gloas's own topics (EIP-7732 ePBS): the builder's bid, the revealed
+/// payload envelope, the payload timeliness committee's vote, and a
+/// builder's advertised preferences, respectively. None of them existed
+/// until gloas's fixture directory started parsing (`ForkName::Gloas`), so
+/// they land here rather than silently in `unknown` the first time this
+/// runner sees them. Alphabetized with the rest rather than kept together.
+const IGNORED_HANDLERS: &[&str] = &[
+    "gossip_attester_slashing",
+    "gossip_blob_sidecar",
+    "gossip_bls_to_execution_change",
+    "gossip_execution_payload_bid",
+    "gossip_execution_payload_envelope",
+    "gossip_partial_data_column_sidecar",
+    "gossip_payload_attestation_message",
+    "gossip_proposer_preferences",
+    "gossip_proposer_slashing",
+    "gossip_sync_committee_contribution_and_proof",
+    "gossip_sync_committee_message",
+    "gossip_voluntary_exit",
 ];
 
 /// Vectors that disagree with a deliberate deviation, by case name.
@@ -109,7 +147,9 @@ fn decode_block(case: &Case, name: &str) -> Result<SignedBeaconBlock, String> {
 /// needed one yet): every fork through deneb shares phase0's shape, and
 /// electra and fulu share electra's, exactly the split
 /// [`SignedAggregateAndProof`]'s own doc describes for
-/// [`SignedBeaconBlock::Fulu`].
+/// [`SignedBeaconBlock::Fulu`]. Gloas's own aggregate has no modeled variant,
+/// and this runner does not run its cases (see [`trials`]), so it is refused
+/// by name.
 fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAndProof, String> {
     let bytes = case.ssz_bytes(name);
     match case.fork {
@@ -125,39 +165,26 @@ fn decode_signed_aggregate(case: &Case, name: &str) -> Result<SignedAggregateAnd
             electra::SignedAggregateAndProof::from_ssz_bytes(&bytes)
                 .map_err(|err| format!("decoding {name}: {err:?}"))?,
         )),
-        other => Err(format!("no aggregate shape for fork {other:?}")),
+        ForkName::Gloas | ForkName::Lean => {
+            Err(format!("no aggregate shape for fork {:?}", case.fork))
+        }
     }
 }
 
-/// The case's own `config.yaml`, when it carries one: the vectors that pin a
-/// non-default blob schedule ship a full config alongside their blocks and
-/// state, which the compiled-in preset config does not share.
+/// [`super::case_config`], plus this suite's own `genesis_time` override.
 ///
-/// Most cases carry no `config.yaml` at all. Per the consensus-specs tests
-/// format README, a present `config.yaml` replaces the default runtime
-/// config, and an absent one means the preset default; the README says
-/// nothing about what fork epochs a present one holds. That is instead an
-/// observation of the vectors' own `config.yaml` files (checked by hand):
-/// every one of them sets every fork epoch to zero. So the fallback here
-/// models that same all-forks-at-genesis shape by hand: the compiled preset
-/// with every fork from altair up to and including the case's own fork pulled
-/// back to genesis, which is enough for `Config::fork_at_epoch` to resolve
-/// every case's low-epoch state without leaving a later fork's tree to
-/// inherit an earlier fork's fallback.
+/// The vectors that pin a non-default blob schedule ship a full
+/// `config.yaml` alongside their blocks and state, which the compiled-in
+/// preset config does not share; [`super::case_config`] is what reads it (or
+/// falls back) and corrects `seconds_per_slot`. Gossip validation additionally
+/// checks timestamps against the wall clock relative to `state.genesis_time`,
+/// which no case's `config.yaml` carries (every one of them was generated
+/// under [`super::PRESET`]'s own preset default), so this suite alone
+/// overrides it from the decoded state rather than trusting whatever
+/// `case_config` returned.
 fn case_config(case: &Case, state: &BeaconState) -> Config {
-    let mut config: Config = case.yaml_opt("config").unwrap_or_else(|| {
-        ForkName::ALL
-            .into_iter()
-            .take_while(|fork| *fork <= case.fork)
-            .filter(|fork| *fork != ForkName::Phase0)
-            .fold(Config::active(), |config, fork| {
-                config.with_fork_epoch(fork, 0)
-            })
-    });
+    let mut config = super::case_config(case);
     config.genesis_time = state.genesis_time();
-    // Newer configs name only `SLOT_DURATION_MS`; without `SECONDS_PER_SLOT`
-    // the field would keep mainnet's default.
-    config.seconds_per_slot = config.slot_duration_ms / 1000;
     config
 }
 
@@ -336,15 +363,64 @@ fn run_case(case: &Case) -> Result<(), String> {
 pub fn trials() -> Vec<Trial> {
     let mut trials = Vec::new();
     for handler in HANDLERS {
-        let cases = collect_gossip(PRESET, handler);
+        let cases = collect(PRESET, "networking", handler);
         trials.push(super::discovery_trial(
             &format!("gossip/{handler}"),
             cases.len(),
         ));
         for case in cases {
-            let ignored = !case.in_scope() || SKIPPED.iter().any(|(name, _)| *name == case.name);
+            // The block and column rules (`beacon::gossip::{block, column}`)
+            // are fulu's own `validate_beacon_block_gossip` and
+            // `validate_data_column_sidecar_gossip`. The aggregate and
+            // attestation rules (`beacon::gossip::{aggregate, attestation}`)
+            // are electra's (`p2p-interface.md`), which fulu keeps. Either
+            // way a case from any other fork is ignored rather than run, the
+            // same "known gap, not a silent one" treatment `case.in_scope()`
+            // already gives a fork
+            // past `HIGHEST_IMPLEMENTED_FORK`. `case.in_scope()` alone would
+            // pass every fork up to gloas, since the state transition handles
+            // them all; the gossip rules do not. In particular the node does
+            // not validate gloas gossip yet, so a gloas case stays ignored
+            // here even though its state transition runs.
+            let ignored = !case.in_scope()
+                || case.fork != ForkName::Fulu
+                || SKIPPED.iter().any(|(name, _)| *name == case.name);
             trials.push(super::case_trial("gossip", case, run_case).with_ignored_flag(ignored));
         }
     }
+
+    // Every other `gossip_*` handler and fork this fixture tree ships: named
+    // and ignored rather than left for the loop above to never mention, and
+    // `unknown` is what makes a fixture release adding a handler neither run
+    // nor listed here fail loudly instead of vanishing. Mirrors
+    // `fixture_fork_trials`'s treatment of `UNMODELED_FORKS`.
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    for (handler, case) in collect_all_handlers(PRESET, "networking") {
+        if !handler.starts_with("gossip_") || HANDLERS.contains(&handler.as_str()) {
+            continue;
+        }
+        if !IGNORED_HANDLERS.contains(&handler.as_str()) {
+            unknown.insert(handler);
+            continue;
+        }
+        let name = format!("gossip/{}", case.id());
+        trials.push(Trial::test(name, || Ok(())).with_ignored_flag(true));
+    }
+
+    trials.push(Trial::test(
+        "gossip/every_handler_is_accounted_for",
+        move || {
+            if unknown.is_empty() {
+                return Ok(());
+            }
+            Err(Failed::from(format!(
+                "the fixture release ships gossip_* handlers this runner neither runs nor lists \
+                 in IGNORED_HANDLERS, so every case under them is skipped without appearing \
+                 anywhere in the output: {}",
+                unknown.into_iter().collect::<Vec<_>>().join(", ")
+            )))
+        },
+    ));
+
     trials
 }

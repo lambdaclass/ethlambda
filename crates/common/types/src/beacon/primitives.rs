@@ -55,6 +55,9 @@ pub type Uint256 = U256;
 pub type ExecutionAddress = H160;
 /// An execution layer block hash.
 pub type ExecutionBlockHash = H256;
+/// A versioned hash of a blob's KZG commitment (deneb `beacon-chain.md`,
+/// `New VersionedHash`), derived by `kzg_commitment_to_versioned_hash`.
+pub type VersionedHash = H256;
 
 /// A fork version.
 pub type Version = [u8; 4];

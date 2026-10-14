@@ -111,16 +111,24 @@ pub fn process_justification_and_finalization(state: &mut BeaconState) -> Result
 ///
 /// Skipped at the genesis epoch, since the score update reads the previous
 /// epoch's participation and genesis has none.
+///
+/// Shared by every fork from altair on, gloas included: reading
+/// [`crate::beacon::containers::BeaconState::inactivity_scores_mut`] rather than
+/// [`crate::beacon::containers::BeaconState::altair_validator_lists_mut`] is what
+/// makes that so, since this only ever writes a score in place and never
+/// grows or replaces the list, and that narrower accessor extends to a gloas
+/// state's progressive `inactivity_scores` where the wider one cannot (see
+/// its own doc).
 pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> Result<()> {
     if get_current_epoch(state) == constants::GENESIS_EPOCH {
         return Ok(());
     }
 
     // Every read below needs `&BeaconState`, so they all run before this takes
-    // the mutable borrow `inactivity_scores` requires: `altair_validator_lists_mut`
-    // borrows the whole state, and there is no way to hold that mutably while
-    // also calling `get_eligible_validator_indices`, `get_unslashed_participating_indices`,
-    // or `is_in_inactivity_leak`, each of which needs its own `&BeaconState`.
+    // the mutable borrow `inactivity_scores_mut` requires, and there is no way
+    // to hold that mutably while also calling `get_eligible_validator_indices`,
+    // `get_unslashed_participating_indices`, or `is_in_inactivity_leak`, each
+    // of which needs its own `&BeaconState`.
     // `process_effective_balance_updates` in the parent module resolves the
     // identical conflict the same way: decide everything in one pass over
     // immutable state, then apply it in a second pass over a mutable borrow.
@@ -133,7 +141,7 @@ pub fn process_inactivity_updates(state: &mut BeaconState, config: &Config) -> R
     )?;
     let leaking = is_in_inactivity_leak(state);
 
-    let (_, _, inactivity_scores) = state.altair_validator_lists_mut()?;
+    let inactivity_scores = state.inactivity_scores_mut()?;
     let score_count = inactivity_scores.len();
     for index in eligible_indices {
         let score = inactivity_scores
@@ -195,7 +203,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
     }
     deltas.push(get_inactivity_penalty_deltas(state, config)?);
 
-    let validator_count = state.validators().len() as ValidatorIndex;
+    let validator_count = state.validator_count() as ValidatorIndex;
     for (rewards, penalties) in deltas {
         for index in 0..validator_count {
             increase_balance(state, index, rewards[index as usize])?;
@@ -220,7 +228,7 @@ pub fn process_rewards_and_penalties(state: &mut BeaconState, config: &Config) -
 /// the moment it can be attested for, and `process_attestation` (not
 /// implemented in this file) indexes into it directly rather than appending.
 pub fn process_participation_flag_updates(state: &mut BeaconState) -> Result<()> {
-    let validator_count = state.validators().len();
+    let validator_count = state.validator_count();
     let (previous_epoch_participation, current_epoch_participation, _) =
         state.altair_validator_lists_mut()?;
 
@@ -256,7 +264,7 @@ mod tests {
     use super::*;
     use crate::beacon::fork::ForkName;
     use crate::beacon::helpers::altair::add_flag;
-    use crate::beacon::primitives::BlsPubkey;
+    use crate::beacon::primitives::{BlsPubkey, Gwei};
 
     /// A deterministic but genuinely valid BLS public key for validator
     /// `index`.
@@ -344,13 +352,17 @@ mod tests {
     fn inactivity_updates_are_a_no_op_at_genesis() {
         let mut state = altair_state_with_validators(4);
         *state.slot_mut() = 0;
+        // Owned, not `.clone()`: `altair_validator_lists` now hands back a
+        // slice borrowed from `state`, and `<&[u64]>::clone()` would just
+        // copy the reference, not the contents, which could not outlive the
+        // `&mut state` call below anyway.
         let (_, _, scores) = state.altair_validator_lists().unwrap();
-        let before = scores.clone();
+        let before = scores.to_vec();
 
         process_inactivity_updates(&mut state, &Config::mainnet()).unwrap();
 
         let (_, _, scores) = state.altair_validator_lists().unwrap();
-        assert_eq!(*scores, before);
+        assert_eq!(scores, before);
     }
 
     #[test]
@@ -414,13 +426,13 @@ mod tests {
         let config = Config::mainnet();
         let mut state = altair_state_with_validators(4);
         *state.slot_mut() = 0;
-        let balances_before = state.balances().clone();
+        let balances_before: Vec<Gwei> = state.iter_balances().collect();
 
         process_rewards_and_penalties(&mut state, &config).unwrap();
 
         assert_eq!(
-            state.balances(),
-            &balances_before,
+            state.iter_balances().collect::<Vec<_>>(),
+            balances_before,
             "the genesis epoch has no previous epoch to reward"
         );
     }

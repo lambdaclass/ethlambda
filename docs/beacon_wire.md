@@ -149,6 +149,15 @@ reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the
 chain actor to do with one.
 
+The rules above are fulu's. A message from a fork this build has no rules for,
+gloas today, is IGNOREd with the reason `unsupported_fork` and is never scored
+against the peer: the decoders answer `DecodeError::UnsupportedFork`, not `Ssz`,
+for a gloas aggregate, attester slashing or subnet attestation, or for a block
+at a gloas slot that fails to decode, since an honest
+gloas peer sends exactly those once this node's clock reaches the fork. A gloas
+subnet attestation has the bytes of an electra one, but its `data.index` is the
+payload flag, so decoding it under electra's rules would reject honest votes.
+
 The remaining five global topics are decoded, logged at `debug`, and IGNOREd,
 since nothing consumes them; an undecodable payload on any topic is REJECTed.
 Nothing is published on any topic, columns included: nothing this node can
@@ -402,9 +411,10 @@ the availability gate. Nothing waits on the answer, so a short, empty or
 refused one costs nothing and is not retried; the per-block path is the
 backstop.
 
-Since the column request is aimed by custody, a batch reaching fulu is held
-back, blocks included, until every custody column has a known custodian among
-the connected peers. Lighthouse's range sync holds its batches the same way.
+Since the column request is aimed by custody, a batch whose last slot is fulu
+or later is held back, blocks included, until every custody column has a known
+custodian among the connected peers. Lighthouse's range sync holds its batches
+the same way.
 Right after startup, custody is known for almost no peer, since a peer's
 custody arrives with its `metadata/3` answer after it connects. A mainnet
 follower's first batch after a fresh checkpoint sync went out 5 s after
@@ -541,7 +551,7 @@ as a query filter, so a `quic`-only record is invisible to it.
 
 | Metric | Meaning |
 | --- | --- |
-| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` |
+| `lean_beacon_gossip_messages_total{topic,result}` | Gossip received, by topic and by `decoded` / `decode_failed` / `decompress_failed` / `unsupported_fork` |
 | `lean_beacon_gossip_validation_total{kind,outcome,reason}` | Gossip verdicts, now including `beacon_aggregate_and_proof` and `beacon_attestation`; see [metrics.md](./metrics.md#beacon-gossip-validation) |
 | `lean_beacon_gossip_verdict_expired_total{kind}` | Verdicts that came too late to propagate anything; should stay at zero |
 | `lean_beacon_status_digest_mismatch_total` | Handshakes seen from another fork digest |

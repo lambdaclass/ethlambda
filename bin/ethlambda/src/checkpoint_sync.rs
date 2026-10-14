@@ -180,6 +180,17 @@ pub enum CheckpointSyncError {
     BlockHeaderJustifiedRootMismatch,
     #[error("anchor block does not match anchor state")]
     AnchorPairingMismatch,
+    /// Startup refused the anchor outright because this build cannot follow
+    /// its fork yet (currently only gloas): a real anchor, not a peer serving
+    /// a mismatched pair, so it is named separately from
+    /// [`Self::AnchorPairingMismatch`] rather than folded into it.
+    #[error(
+        "this build cannot follow {fork} yet; the anchor is at {fork} and nothing past this \
+         point will import until that support lands"
+    )]
+    UnsupportedFork {
+        fork: ethlambda_types::beacon::fork::ForkName,
+    },
     #[error("no checkpoint urls configured")]
     NoCheckpointUrls,
     #[error("failed to insert anchor signed block into store")]
@@ -597,7 +608,7 @@ fn verify_beacon_checkpoint_state(state: &BeaconState) -> Result<(), CheckpointS
         return Err(CheckpointSyncError::SlotIsZero);
     }
 
-    if state.validators().is_empty() {
+    if state.validator_count() == 0 {
         return Err(CheckpointSyncError::NoValidators);
     }
 
@@ -1051,9 +1062,13 @@ mod tests {
     #[test]
     fn a_beacon_anchor_with_no_validators_is_rejected() {
         let mut state = beacon_anchor_state();
-        // `SszList`'s `DerefMut` target is a slice, which cannot shrink, so
-        // emptying the list means replacing it rather than mutating in place.
-        *state.validators_mut() = Default::default();
+        // No element accessor can empty the registry, so this reaches into
+        // the fork this fixture actually decodes as (see
+        // `beacon_anchor_state`) directly.
+        let BeaconState::Phase0(inner) = &mut state else {
+            unreachable!("beacon_anchor_state always builds a Phase0 state");
+        };
+        inner.validators = Default::default();
 
         assert!(matches!(
             verify_beacon_checkpoint_state(&state),
