@@ -134,7 +134,33 @@ pub fn state_transition(
     committees: &CommitteeCache,
 ) -> Result<()> {
     process_slots(state, signed_block.slot(), config)?;
+    apply_block(
+        state,
+        signed_block,
+        validate_result,
+        config,
+        engine,
+        committees,
+    )
+}
 
+/// [`state_transition`] from the point where `state` is already at the block's
+/// own slot: everything after `process_slots`.
+///
+/// For a caller that advanced the state itself (fork choice resuming from a
+/// precomputed epoch-boundary state). `process_slots` rejects a target equal to
+/// the current slot, so such a state cannot go through [`state_transition`]
+/// when the block sits exactly on the boundary. A state at the wrong slot is
+/// still refused: the block header check in `process_block` compares the
+/// block's slot with the state's.
+pub fn apply_block(
+    state: &mut BeaconState,
+    signed_block: &containers::SignedBeaconBlock,
+    validate_result: bool,
+    config: &Config,
+    engine: &ExecutionEngine,
+    committees: &CommitteeCache,
+) -> Result<()> {
     // After `process_slots`, never before it. A block proposed at the first slot
     // of a fork's activation epoch is the *post*-fork shape while the state
     // arriving here is still the pre-fork one, which is exactly the case a fork

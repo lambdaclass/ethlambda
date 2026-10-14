@@ -359,6 +359,30 @@ eleven cores busy to about eight. The 3.3x understates the hashing change,
 because the later run does strictly more work: `transition` went from failing
 immediately to running every case.
 
+## Epoch-transition precompute
+
+The first block of an epoch used to run `process_epoch` inline on the import
+path (`fork_choice::on_block`, then `process_slots`), followed by the rehash
+the state-root check needs. The beacon chain actor now does that work ahead of
+time, on a blocking worker, and the import resumes from the result.
+
+| Step | What happens |
+| --- | --- |
+| Trigger: head | An import leaves a block at the last slot of epoch `E` as head: precompute `(E+1, head_root)`. Covers a late last-slot block. |
+| Trigger: timer | Three quarters into the last slot of `E` (derived from the configured slot duration), if nothing for the current head is cached or running: precompute from the head, which is an earlier block when the last slot was skipped. |
+| Gate | Skipped while the sync tracker says syncing, and for a head more than a slot behind the wall clock. At most one worker runs; a key already cached is not recomputed. |
+| Work | Clone the head state, `process_slots` to the first slot of `E+1`, flush pending writes, `hash_tree_root` (so the tree nodes' hashes are memoized), send the state back to the actor. |
+| Store | The store's state cache under `CacheKey::CheckpointState { epoch: E+1, root: head_root }`. `fork_choice::checkpoint_state` derives the same value for that checkpoint (the checkpoint block's post-state advanced to the epoch's first slot), so attestation targets for `E+1` hit it too. |
+| Consume | `on_block` looks up `CheckpointState { block_epoch, parent_root }` when the parent's slot is before the epoch's first slot and the block is at or after it. A hit clones the entry, advances any remaining skipped slots, and applies the block with `stf::apply_block`; the post-state is identical to the inline path's. |
+| Miss | Today's path: clone the parent state and run `stf::state_transition`. A block that arrives while the worker is still running takes this path too; the late result is stored and goes unused by it. |
+
+The code lives in `crates/blockchain/src/epoch_precompute.rs` (triggers, worker,
+actor handlers) and `fork_choice::advance_to_epoch_start` /
+`fork_choice::transition_block` in the state-transition crate. The upgrade to a
+new fork at the boundary happens inside `process_slots`, so the precompute needs
+no fork-specific code. Hits and misses, worker time and trigger counts are
+exported as `lean_beacon_epoch_precompute_*`; see [metrics](metrics.md).
+
 ## One test per fixture case
 
 The suites were once one test apiece, each looping over its own cases and
