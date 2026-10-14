@@ -140,10 +140,21 @@ message; a message whose dependency is not ready yet is IGNOREd. See
 [Aggregate attestations](#aggregate-attestations) for the two topics with
 their own section.
 
-Blocks and data column sidecars are, either way, handed to the chain actor,
-which parks what it cannot import yet and imports the rest immediately, such
-as a sidecar whose slot merely falls outside its parent state's proposer
-lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the
+A block reaches the chain actor only once its proposer signature has
+verified: on `Accept`, or on `Queue` for one whose parent has no post-state
+yet but whose signature the cached head state checked. A block gossip could
+not judge that far (no cached head state, a proposer that state does not
+hold, or no free validation permit) is dropped, because the chain actor keeps
+a waiting block unjudged until its parent and then its custody columns
+arrive, and mainnet gossip carries altered copies of real blocks that no peer
+has columns for. A real block dropped here still arrives through a child's
+by-root fetch or range sync, and the chain actor checks the signature of
+those too before it lets one wait (see
+`lean_beacon_blocks_refused_before_waiting_total` in
+[metrics.md](./metrics.md)). Data column sidecars are, either way, handed to
+the chain actor, which parks what it cannot import yet and imports the rest
+immediately, such as a sidecar whose slot merely falls outside its parent
+state's proposer lookahead. An aggregate reaches the chain actor only on `Accept`, carrying the
 attesting indices gossip validation resolved. A subnet attestation never
 reaches it at all, on any outcome: verifying and relaying it is the whole of
 what this node owes the topic (see above), so there is nothing further for the

@@ -112,6 +112,12 @@ pub enum IgnoreReason {
     FinalizedNotAncestor,
     /// An ancestor lies outside what the state's `block_roots` can answer.
     AncestryUnknown,
+    /// A block whose parent has no post-state yet, and whose proposer
+    /// signature no cached state could check. Dropped rather than queued: a
+    /// queued block goes on to the chain actor, which would keep it, unjudged,
+    /// until its parent and then its columns arrive, and a forged one has no
+    /// columns to wait for.
+    SignatureUnverified,
 }
 
 impl IgnoreReason {
@@ -130,6 +136,7 @@ impl IgnoreReason {
             Self::StateUnavailable => "state_unavailable",
             Self::FinalizedNotAncestor => "finalized_not_ancestor",
             Self::AncestryUnknown => "ancestry_unknown",
+            Self::SignatureUnverified => "signature_unverified",
         }
     }
 }
