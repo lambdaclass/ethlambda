@@ -27,10 +27,18 @@ pub(crate) const GENESIS_TIME: u64 = 1_000;
 
 /// A store with no blocks, finalized at `finalized_slot`, fulu from genesis.
 pub(crate) fn store(finalized_slot: Slot) -> Store {
+    store_with_config(
+        finalized_slot,
+        Config::mainnet().with_fork_epoch(ForkName::Fulu, 0),
+    )
+}
+
+/// [`store`] under a fork schedule of the test's own.
+pub(crate) fn store_with_config(finalized_slot: Slot, config: Config) -> Store {
     Store::init_beacon(
         Arc::new(InMemoryBackend::new()),
         GENESIS_TIME,
-        Config::mainnet().with_fork_epoch(ForkName::Fulu, 0),
+        config,
         Root::ZERO,
         Checkpoint {
             root: Root::ZERO,

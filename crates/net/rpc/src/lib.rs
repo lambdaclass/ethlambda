@@ -463,13 +463,18 @@ pub(crate) mod test_utils {
     /// phase0 one whatever `state`'s fork: these endpoints read the state and
     /// the block's root and slot, never the block's body.
     pub(crate) fn beacon_store_at(state: BeaconState) -> (Store, H256) {
+        beacon_store_with_config(state, Config::mainnet())
+    }
+
+    /// [`beacon_store_at`] under a fork schedule of the test's own.
+    pub(crate) fn beacon_store_with_config(state: BeaconState, config: Config) -> (Store, H256) {
         let slot = state.slot();
         let block = phase0_beacon_block(slot, H256::ZERO);
         let root = block.message_hash_tree_root();
         let mut store = Store::init_beacon(
             Arc::new(InMemoryBackend::default()),
             1_606_824_023,
-            Config::mainnet(),
+            config,
             root,
             Checkpoint { root, slot },
             slot,
