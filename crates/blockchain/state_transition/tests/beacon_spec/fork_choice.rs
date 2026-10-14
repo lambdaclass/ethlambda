@@ -698,6 +698,41 @@ pub(super) fn apply_checks(
     if let Some(expected) = &checks.should_override_forkchoice_update {
         check_should_override_forkchoice_update(expected, store, config)?;
     }
+    check_weights_against_the_spec(store, config)
+}
+
+/// Oracle for the fork-choice weights, run at every `checks` step.
+///
+/// No fixture checks weights directly, but `get_head` descends on
+/// `compute_weights` (one pass over the votes, balances from the justified-
+/// balances snapshot), while `get_weight` is the specification's per-root
+/// definition and reads the justified checkpoint state itself. Comparing the
+/// two for every block in the filtered tree puts the snapshot against the spec
+/// path on every fixture, whatever the fixture asserts.
+fn check_weights_against_the_spec(store: &Store, config: &Config) -> Result<(), String> {
+    let index = store.block_index();
+    let tree = fork_choice::get_filtered_block_tree(store, &index, config)
+        .map_err(|err| format!("get_filtered_block_tree: {err:?}"))?;
+    let weights = fork_choice::compute_weights(store, &index, config)
+        .map_err(|err| format!("compute_weights: {err:?}"))?;
+    for root in tree.keys() {
+        let spec = match fork_choice::get_weight(store, &index, *root, config) {
+            Ok(spec) => spec,
+            // A vote for a block that invalidation removed from the index
+            // (`sync/optimistic`): the specification's `get_weight` raises on
+            // it, and `compute_weights` drops such a vote on purpose, so the
+            // two are not comparable for that case.
+            Err(err) if format!("{err:?}").contains("root in store.blocks") => continue,
+            Err(err) => return Err(format!("get_weight(0x{}): {err:?}", hex::encode(root.0))),
+        };
+        let single_pass = weights.get(root).copied().unwrap_or_default();
+        if spec != single_pass {
+            return Err(format!(
+                "weight of 0x{}: spec get_weight {spec}, compute_weights {single_pass}",
+                hex::encode(root.0)
+            ));
+        }
+    }
     Ok(())
 }
 
