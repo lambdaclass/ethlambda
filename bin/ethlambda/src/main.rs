@@ -529,6 +529,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                 );
             }
 
+            let runs_decoupled = lean.decoupled || genesis_config.decoupled.enabled;
             let blockchain_config = BlockChainConfig {
                 aggregator: aggregator.clone(),
                 sync_status_controller: sync_status.clone(),
@@ -546,7 +547,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
             // A decoupled node hands its keys to the decoupled chain actor and
             // keeps the 3SF-mini one keyless: it then only ticks, and owns the
             // store the rest of the node is wired to.
-            let decoupled = if lean.decoupled || genesis_config.decoupled.enabled {
+            let decoupled = if runs_decoupled {
                 // An aggregator aggregates the subnets it was assigned, else
                 // every subnet it subscribes to.
                 let duty_subnets = lean
@@ -567,6 +568,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     &genesis_config,
                     lean.decoupled_lock_period,
                     lean.decoupled_slots_per_round,
+                    lean.decoupled_goldfish_committee_size,
                     aggregation,
                     std::mem::take(&mut validator_keys),
                 )?;
@@ -1032,6 +1034,7 @@ fn decoupled_setup(
     genesis: &GenesisConfig,
     lock_period_override: Option<u64>,
     slots_per_round_override: Option<u64>,
+    goldfish_committee_override: Option<u64>,
     aggregation: ethlambda_blockchain::decoupled_aggregation::AggregationConfig,
     validator_keys: HashMap<u64, ValidatorKeyPair>,
 ) -> eyre::Result<DecoupledSetup> {
@@ -1057,6 +1060,15 @@ fn decoupled_setup(
         "the decoupled protocol needs a slot duration divisible by 4 ms (Δ = slot / 4), got {}",
         genesis.milliseconds_per_slot
     );
+    let validator_count = genesis.genesis_validators.len() as u64;
+    let goldfish_committee_size = goldfish_committee_override
+        .or(keys.goldfish_committee_size)
+        .unwrap_or(validator_count);
+    eyre::ensure!(
+        goldfish_committee_size >= 1,
+        "the Goldfish committee needs at least one member"
+    );
+    let goldfish_committee_size = goldfish_committee_size.min(validator_count);
     let genesis_state = State::from_genesis(genesis.genesis_time, genesis.validators());
     let genesis_root =
         ethlambda_blockchain::decoupled_lean::genesis_root(genesis_state.hash_tree_root());
@@ -1075,6 +1087,7 @@ fn decoupled_setup(
         slots_per_round = params.slots_per_round,
         pending_window = params.pending_window,
         timeout_delay = params.timeout_delay,
+        goldfish_committee_size,
         genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
         "Decoupled consensus configured"
     );
@@ -1100,6 +1113,7 @@ fn decoupled_setup(
             slot_duration_ms: genesis.milliseconds_per_slot,
             genesis_root,
             validators,
+            goldfish_committee_size,
             aggregation,
         },
         validator_keys,

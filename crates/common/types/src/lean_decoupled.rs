@@ -53,6 +53,27 @@ pub fn attestation_subgroup(validator: u64, committee_count: u64, subgroups: u64
     (validator / committee_count.max(1)) % subgroups.max(1)
 }
 
+/// Whether `validator` is on slot `slot`'s Goldfish committee `𝒦_s` of
+/// `size` members out of `validator_count`: the `size` consecutive indices
+/// from `slot · size mod validator_count` on, wrapping around. With `size`
+/// at least `validator_count`, `𝒦_s` is every validator, as Goldilocks
+/// specifies.
+///
+/// Consecutive windows rotate through the registry, so each validator votes
+/// in `size` of every `validator_count` slots and the members of a slot are
+/// spread evenly over nodes that hold every `n`-th index.
+pub fn in_goldfish_committee(validator: u64, slot: Slot, size: u64, validator_count: u64) -> bool {
+    if validator >= validator_count {
+        return false;
+    }
+    if size >= validator_count {
+        return true;
+    }
+    let count = u128::from(validator_count);
+    let start = (u128::from(slot) * u128::from(size) % count) as u64;
+    (validator + validator_count - start) % validator_count < size
+}
+
 /// The XMSS epoch a Goldfish vote of `slot` is signed at: `2 · slot`.
 pub fn goldfish_vote_epoch(slot: Slot) -> u64 {
     2 * slot
@@ -202,5 +223,58 @@ mod tests {
             counts[attestation_subgroup(validator, committees, subgroups) as usize] += 1;
         }
         assert_eq!(counts, [8, 8, 8, 8]);
+    }
+
+    fn committee(slot: Slot, size: u64, count: u64) -> Vec<u64> {
+        (0..count)
+            .filter(|&validator| in_goldfish_committee(validator, slot, size, count))
+            .collect()
+    }
+
+    #[test]
+    fn a_goldfish_committee_has_its_size() {
+        for (size, count) in [(512, 8192), (3, 10), (7, 7), (1, 5)] {
+            for slot in 0..40 {
+                assert_eq!(
+                    committee(slot, size, count).len() as u64,
+                    size,
+                    "slot {slot}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn goldfish_committees_rotate_through_the_registry() {
+        // 512 of 8192: sixteen consecutive slots cover everyone once.
+        let mut votes = vec![0u32; 8192];
+        for slot in 0..16 {
+            for validator in committee(slot, 512, 8192) {
+                votes[validator as usize] += 1;
+            }
+        }
+        assert!(votes.iter().all(|&count| count == 1));
+        // A size that does not divide the count wraps: slot 3 of size 3 out
+        // of 10 starts at 9.
+        assert_eq!(committee(3, 3, 10), vec![0, 1, 9]);
+    }
+
+    #[test]
+    fn a_goldfish_committee_spreads_over_round_robin_nodes() {
+        // 32 nodes, node `p` holding `{p + 32k}`: every node has 16 members.
+        for slot in 0..20 {
+            let mut per_node = [0usize; 32];
+            for validator in committee(slot, 512, 8192) {
+                per_node[(validator % 32) as usize] += 1;
+            }
+            assert!(per_node.iter().all(|&members| members == 16), "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn a_committee_as_large_as_the_registry_is_everyone() {
+        assert_eq!(committee(5, 8, 8), (0..8).collect::<Vec<_>>());
+        assert_eq!(committee(5, 100, 8), (0..8).collect::<Vec<_>>());
+        assert!(!in_goldfish_committee(8, 5, 100, 8));
     }
 }

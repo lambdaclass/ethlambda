@@ -77,6 +77,10 @@ pub struct DecoupledGenesisConfig {
     pub pending_finality_window: Option<u64>,
     #[serde(rename = "DECOUPLED_TIMEOUT_DELAY", default)]
     pub timeout_delay: Option<u64>,
+    /// Members of each slot's Goldfish committee (`|𝒦_s|`); unset means
+    /// every validator. See `lean_decoupled::in_goldfish_committee`.
+    #[serde(rename = "DECOUPLED_GOLDFISH_COMMITTEE_SIZE", default)]
+    pub goldfish_committee_size: Option<u64>,
 }
 
 impl GenesisConfig {

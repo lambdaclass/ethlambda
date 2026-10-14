@@ -177,10 +177,11 @@ crates/common/types/src/beacon/containers/decoupled.rs   the beacon `decoupled` 
 
 Enabled by `DECOUPLED_CONSENSUS: true` in the genesis config (or
 `--decoupled`). Optional `DECOUPLED_LOCK_PERIOD`, `DECOUPLED_SLOTS_PER_ROUND`,
-`DECOUPLED_PENDING_FINALITY_WINDOW`, `DECOUPLED_TIMEOUT_DELAY` override the
-defaults (`--decoupled.lock-period` and `--decoupled.slots-per-round`
-override the first two; on beacon, `--decoupled-lock-period` and
-`--decoupled-slots-per-round`).
+`DECOUPLED_PENDING_FINALITY_WINDOW`, `DECOUPLED_TIMEOUT_DELAY` and
+`DECOUPLED_GOLDFISH_COMMITTEE_SIZE` override the defaults
+(`--decoupled.lock-period`, `--decoupled.slots-per-round` and
+`--decoupled.goldfish-committee-size` override the first two and the last;
+on beacon, `--decoupled-lock-period` and `--decoupled-slots-per-round`).
 
 The round length `R` must outlast the attestations' delivery `Δ_F`: the
 specification asks `R ≥ ⌈(6Δ + Δ_F) / 4Δ⌉`. With aggregated attestations
@@ -193,9 +194,22 @@ makes the bound `R = 3`; it restores one attestation per round and took
 the state around slot 30 from max height 8 and finalized slot 21 (`R = 2`)
 to max height 10 and finalized slot 24.
 
-- **Validators, committees, proposers.** Every validator weighs one, the
-  slot committee is every validator, and the proposer of slot `s` is
-  `s mod n`, as on 3SF-mini lean.
+- **Validators, committees, proposers.** Every validator weighs one and the
+  proposer of slot `s` is `s mod n`, as on 3SF-mini lean. The slot
+  committee is every validator, as Goldilocks specifies, unless
+  `DECOUPLED_GOLDFISH_COMMITTEE_SIZE` (or `--decoupled.goldfish-committee-size`)
+  sets a size `K < n`: slot `s`'s committee is then the `K` indices from
+  `s · K mod n` on, wrapping around, so each validator votes in `K` of every
+  `n` slots. The fast test, revocation and the vote and block checks all use
+  that committee. Every validator still attests for FG.
+
+  Without it the Goldfish votes do not scale: each one carries its own XMSS
+  signature (1,208 bytes) and is checked one at a time on the chain actor.
+  On devnet-5 with 8,192 validators and 12 s slots that took about 5.9 s
+  of the actor's time per slot, so most votes were counted after the
+  support cutoff (`t_s + 2Δ`, `Δ` after they were cast) and no block was
+  ever confirmed; and a block carrying the previous slot's votes was
+  9.8 MiB, against the 10 MiB gossip limit.
 - **Wire.** New containers (`lean_decoupled`) on the topics
   `decoupled_block`, `decoupled_vote`, `decoupled_attestation_{subnet}` and
   `decoupled_aggregate`, plus a `decoupled_blocks_by_root/1` req/resp

@@ -10,6 +10,7 @@
 # (work dir, default /tmp/ethlambda-decoupled-lean), BIN (ethlambda binary,
 # default target/release-fast/ethlambda), SLOT_MS (default 4000), LOCK_PERIOD
 # (Goldilocks' k, default 4), SLOTS_PER_ROUND (R, default: the client's),
+# GOLDFISH_COMMITTEE (members per slot, default every validator),
 # GENESIS_DELAY (seconds, default 30),
 # COMMITTEES (attestation subnets, default 1), AGGREGATORS (which nodes
 # aggregate which subnets, as space-separated `node:subnet[,subnet]` entries,
@@ -27,6 +28,7 @@ BIN=${BIN:-target/release-fast/ethlambda}
 SLOT_MS=${SLOT_MS:-4000}
 LOCK_PERIOD=${LOCK_PERIOD:-4}
 SLOTS_PER_ROUND=${SLOTS_PER_ROUND:-}
+GOLDFISH_COMMITTEE=${GOLDFISH_COMMITTEE:-}
 GENESIS_DELAY=${GENESIS_DELAY:-30}
 COMMITTEES=${COMMITTEES:-1}
 AGGREGATORS=${AGGREGATORS:-$(seq -s ' ' 0 $((N - 1)))}
@@ -52,6 +54,7 @@ start() {
     echo "DECOUPLED_CONSENSUS: true"
     echo "DECOUPLED_LOCK_PERIOD: $LOCK_PERIOD"
     if [ -n "$SLOTS_PER_ROUND" ]; then echo "DECOUPLED_SLOTS_PER_ROUND: $SLOTS_PER_ROUND"; fi
+    if [ -n "$GOLDFISH_COMMITTEE" ]; then echo "DECOUPLED_GOLDFISH_COMMITTEE_SIZE: $GOLDFISH_COMMITTEE"; fi
     echo "GENESIS_VALIDATORS:"
     for v in $(seq 0 $((total - 1))); do
       echo "  - attestation_pubkey: \"$(hex_of "$DIR/keys/validator_${v}_attester_key_pk.ssz")\""

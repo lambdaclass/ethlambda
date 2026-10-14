@@ -8,8 +8,10 @@
 //!
 //! Lean specifics, on top of the engine:
 //!
-//! * every validator weighs one, the slot-`s` committee is every validator,
-//!   and the proposer of slot `s` is `s mod n`, as on 3SF-mini lean;
+//! * every validator weighs one, the slot-`s` committee is a rotating window
+//!   of the registry (`lean_decoupled::in_goldfish_committee`; every
+//!   validator unless the network sets a size), and the proposer of slot
+//!   `s` is `s mod n`, as on 3SF-mini lean;
 //! * Goldfish votes carry individual XMSS signatures (see
 //!   `ethlambda_types::lean_decoupled` for the epoch grid). Attestations are
 //!   signed in subgroups after the action time, travel on subnets and reach
@@ -24,7 +26,8 @@ use std::time::{Duration, Instant};
 
 use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_decoupled::{
-    AttestationInput, BlockError, BlockInput, Electorate, Params, Record, Store as Engine,
+    AttestationInput, BlockError, BlockInput, CommitteeSizes, Electorate, Params, Record,
+    Store as Engine,
 };
 use ethlambda_network_api::{
     DecoupledToP2PRef, InitDecoupledP2P, SharedDecoupledBlocks,
@@ -41,7 +44,7 @@ use ethlambda_types::decoupled::{
 use ethlambda_types::lean_decoupled::{
     AggregatedDecoupledAttestation, DecoupledBlock, DecoupledBlockBody, MAX_BLOCK_AGGREGATES,
     SignedDecoupledAttestation, SignedDecoupledBlock, SignedGoldfishVote, attestation_epoch,
-    attestation_subgroup, attestation_subnet, goldfish_vote_epoch,
+    attestation_subgroup, attestation_subnet, goldfish_vote_epoch, in_goldfish_committee,
 };
 use ethlambda_types::primitives::{H256, HashTreeRoot as _};
 use ethlambda_types::time::unix_now_ms;
@@ -89,6 +92,8 @@ pub struct DecoupledLeanConfig {
     pub genesis_root: H256,
     /// `(attestation_pubkey, proposal_pubkey)` of every validator, by index.
     pub validators: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `|𝒦_s|`, at most the validator count; see [`in_goldfish_committee`].
+    pub goldfish_committee_size: u64,
     /// Attestation subnets, signing subgroups and the aggregator role.
     pub aggregation: AggregationConfig,
 }
@@ -231,7 +236,8 @@ impl DecoupledLean {
             config.params,
             Electorate::uniform(validator_count),
             config.genesis_root,
-        );
+        )
+        .with_committee_sizes(CommitteeSizes::fixed(config.goldfish_committee_size));
         let ours: Vec<u64> = {
             let mut ids: Vec<u64> = validator_keys.keys().copied().collect();
             ids.sort();
@@ -544,11 +550,13 @@ impl DecoupledLeanServer {
         }
     }
 
-    /// `goldfish_vote` at `t_s + Δ`: every one of this node's validators is
-    /// in the committee.
+    /// `goldfish_vote` at `t_s + Δ`, by this node's members of `𝒦_s`.
     fn vote(&mut self, slot: u64) {
         let head = self.engine.goldfish_vote_head();
         for validator in self.ours.clone() {
+            if !self.in_committee(validator, slot) {
+                continue;
+            }
             let state = self.signing.entry(validator).or_default();
             if state.last_vote_slot.is_some_and(|last| last >= slot) {
                 continue;
@@ -1227,8 +1235,23 @@ impl DecoupledLeanServer {
         valid
     }
 
+    /// Whether `validator` is on slot `slot`'s Goldfish committee.
+    fn in_committee(&self, validator: u64, slot: u64) -> bool {
+        in_goldfish_committee(
+            validator,
+            slot,
+            self.config.goldfish_committee_size,
+            self.pubkeys.len() as u64,
+        )
+    }
+
+    /// A vote counts only from a member of its slot's committee, checked
+    /// before the signature since it costs nothing.
     fn verify_vote(&mut self, signed: &SignedGoldfishVote) -> bool {
         let vote = signed.vote;
+        if !self.in_committee(vote.validator, vote.slot) {
+            return false;
+        }
         let pubkey = self
             .pubkeys
             .get(vote.validator as usize)

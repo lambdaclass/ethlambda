@@ -537,6 +537,13 @@ pub(crate) struct LeanOptions {
     /// every other round.
     #[arg(long = "decoupled.slots-per-round")]
     pub(crate) decoupled_slots_per_round: Option<u64>,
+    /// Members of each slot's Goldfish committee (at least 1): slot `s`'s
+    /// committee is the indices from `s · size mod n` on, wrapping, so every
+    /// validator votes in `size` of every `n` slots. Overrides
+    /// `DECOUPLED_GOLDFISH_COMMITTEE_SIZE`; the default, and any size of `n`
+    /// or more, is every validator, as Goldilocks specifies.
+    #[arg(long = "decoupled.goldfish-committee-size")]
+    pub(crate) decoupled_goldfish_committee_size: Option<u64>,
     /// Shadow-simulator sim-cost + fake-XMSS flags (only under the
     /// `shadow-integration` feature).
     #[cfg(feature = "shadow-integration")]

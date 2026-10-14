@@ -99,6 +99,7 @@ On top of the common flags above.
 | `--attestation-committee-count` | from `validator-config.yaml`, else `1` | Committees per slot |
 | `--decoupled.lock-period` | `DECOUPLED_LOCK_PERIOD`, else `4` | Decoupled: Goldilocks' lock period `k` in slots (at least 2) |
 | `--decoupled.slots-per-round` | `DECOUPLED_SLOTS_PER_ROUND`, else `2` | Decoupled: Goldilocks' round length `R` in slots (at least 1); see [decoupled consensus](./decoupled_consensus.md) |
+| `--decoupled.goldfish-committee-size` | `DECOUPLED_GOLDFISH_COMMITTEE_SIZE`, else every validator | Decoupled: members of each slot's Goldfish committee (at least 1), a rotating window of the registry |
 | `--attestation-subgroups` | `4` | Decoupled: signing subgroups per attestation subnet |
 | `--attestation-subgroup-spacing-ms` | half a `Δ` | Decoupled: time between two subgroups' signing |
 | `--max-aggregation-children` | `16` | Decoupled: most child proofs one merge folds in; requires `--is-aggregator` |
