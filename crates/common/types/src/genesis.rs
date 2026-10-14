@@ -71,10 +71,10 @@ pub struct DecoupledGenesisConfig {
     pub enabled: bool,
     #[serde(rename = "DECOUPLED_LOCK_PERIOD", default)]
     pub lock_period: Option<u64>,
-    #[serde(rename = "DECOUPLED_NONJUSTIFIABLE_PERIOD", default)]
-    pub nonjustifiable_period: Option<u64>,
-    #[serde(rename = "DECOUPLED_FINALITY_DEBT", default)]
-    pub finality_debt: Option<u64>,
+    #[serde(rename = "DECOUPLED_SLOTS_PER_ROUND", default)]
+    pub slots_per_round: Option<u64>,
+    #[serde(rename = "DECOUPLED_PENDING_FINALITY_WINDOW", default)]
+    pub pending_finality_window: Option<u64>,
     #[serde(rename = "DECOUPLED_TIMEOUT_DELAY", default)]
     pub timeout_delay: Option<u64>,
 }

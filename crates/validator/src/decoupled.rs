@@ -211,15 +211,16 @@ impl<B: BeaconNodeApi> DecoupledService<B> {
         Ok(published)
     }
 
-    /// Read slot `slot`'s attestation input, and create, record, sign and
-    /// submit an attestation for each of `validators` (every active
-    /// validator this client runs) that has something new to say.
+    /// Read the attestation input of `slot` (a round's action slot), and
+    /// create, record, sign and submit an attestation for each of
+    /// `validators` (every active validator this client runs) whose record
+    /// finds a new height pair in it.
     ///
     /// Returns how many attestations the node accepted.
     ///
     /// A validator that has already attested in `slot` or a later one is
-    /// skipped, across restarts. One whose record makes nothing new of the
-    /// input is skipped too, and its record left untouched.
+    /// skipped, across restarts. One whose record makes nothing of the input
+    /// is skipped too, and its record left untouched.
     pub async fn attest(
         &self,
         slot: Slot,
@@ -477,13 +478,12 @@ mod tests {
         }
     }
 
-    fn input(source: Option<(u64, u8, bool)>) -> AttestationInput {
+    fn input(source: Option<(u64, u8)>) -> AttestationInput {
         AttestationInput {
             slot: 0,
-            source: source.map(|(height, entry, nonjustifiable)| SourceFields {
+            source: source.map(|(height, entry)| SourceFields {
                 height,
                 entry: Root::repeat_byte(entry),
-                nonjustifiable,
             }),
             justified_height: 2,
             justified: Root::repeat_byte(9),
@@ -518,7 +518,7 @@ mod tests {
         assert_eq!(vote.data.head, Root::repeat_byte(0x11));
 
         let input: DataResponse<AttestationInput> = serde_json::from_str(&format!(
-            r#"{{"data": {{"slot": 5, "source": {{"height": 3, "entry": "0x{b}", "nonjustifiable": false}}, "justified_height": 2, "justified": "0x{b}", "finalized_height": 1}}}}"#,
+            r#"{{"data": {{"slot": 5, "source": {{"height": 3, "entry": "0x{b}"}}, "justified_height": 2, "justified": "0x{b}", "finalized_height": 1}}}}"#,
             b = "bb".repeat(32),
         ))
         .expect("attestation input parses");
@@ -534,17 +534,24 @@ mod tests {
     }
 
     /// What the node is sent: quoted validator index, `AttestationData` with
-    /// absent pairs as `null`.
+    /// its height pair and an absent finality pair as `null`.
     #[test]
     fn the_submitted_json_matches_the_contract() {
         let attestation = SignedCombinedAttestation {
             validator_index: 7,
-            data: ethlambda_decoupled::AttestationData::new(None, None),
+            data: ethlambda_decoupled::AttestationData::new(
+                ethlambda_decoupled::HeightVote {
+                    height: 3,
+                    entry: Root::repeat_byte(1),
+                    timeout: false,
+                },
+                None,
+            ),
             signature: Default::default(),
         };
         let json = serde_json::to_value(&attestation).expect("serializes");
         assert!(json["data"].get("round").is_none(), "no rounds");
-        assert!(json["data"]["height_pair"].is_null());
+        assert_eq!(json["data"]["height_pair"]["height"], 3);
         assert!(json["data"]["finality_pair"].is_null());
         assert_eq!(json["validator_index"], "7");
     }
@@ -611,7 +618,7 @@ mod tests {
     async fn the_attestation_goes_through_the_record_and_is_signed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1)))));
         let service = service(&node, dir.path());
 
         let published = service
@@ -626,7 +633,7 @@ mod tests {
 
         // The very data `Record::create_attestation` decides for a fresh record.
         let expected = Record::default()
-            .create_attestation(7, &input(Some((3, 1, false))))
+            .create_attestation(7, &input(Some((3, 1))))
             .expect("a fresh record attests")
             .data;
         assert_eq!(submitted[0].data, expected);
@@ -639,7 +646,7 @@ mod tests {
     async fn an_unchanged_input_is_not_attested_again() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1)))));
         let service = service(&node, dir.path());
         let validators = [(pubkey, 7)];
 
@@ -660,13 +667,13 @@ mod tests {
     async fn a_different_target_at_a_recorded_height_times_out() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1)))));
         let service = service(&node, dir.path());
         let validators = [(pubkey, 7)];
 
         service.attest(5, &validators, &store).await.expect("first");
         // The chain now offers another entry at the same height.
-        node.set_decoupled_input(input(Some((3, 2, false))));
+        node.set_decoupled_input(input(Some((3, 2))));
         service
             .attest(6, &validators, &store)
             .await
@@ -674,9 +681,9 @@ mod tests {
 
         let submitted = node.submitted_combined_attestations();
         assert_eq!(submitted.len(), 2);
-        let first = submitted[0].data.height_pair().expect("a height pair");
+        let first = submitted[0].data.height_pair();
         assert!(!first.timeout);
-        let second = submitted[1].data.height_pair().expect("a height pair");
+        let second = submitted[1].data.height_pair();
         assert!(second.timeout, "voting two entries at one height is E2");
         assert_eq!(second.height, 3);
     }
@@ -688,7 +695,7 @@ mod tests {
         // The node refuses the submission, so nothing is ever released.
         let node = Arc::new(
             MockBeaconNode::new()
-                .with_decoupled_input(input(Some((3, 1, false))))
+                .with_decoupled_input(input(Some((3, 1))))
                 .failing_call("submit_combined_attestations", "node is unhappy"),
         );
         let service = service(&node, dir.path());
@@ -707,7 +714,7 @@ mod tests {
         assert_eq!(saved.record.target.get(&3), Some(&Root::repeat_byte(1)));
 
         // And the lost attestation is not re-signed on a retry.
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 9, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 9)))));
         let restarted = self::service(&node, dir.path());
         assert_eq!(
             restarted
@@ -723,7 +730,7 @@ mod tests {
     async fn a_restart_refuses_a_repeated_slot_and_keeps_the_record() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((3, 1)))));
         let validators = [(pubkey, 7)];
         service(&node, dir.path())
             .attest(5, &validators, &store)
@@ -748,13 +755,13 @@ mod tests {
         assert_eq!(node.submitted_combined_attestations().len(), 1);
 
         // The reloaded record still remembers entry 1 at height 3.
-        node.set_decoupled_input(input(Some((3, 2, false))));
+        node.set_decoupled_input(input(Some((3, 2))));
         restarted
             .attest(6, &validators, &store)
             .await
             .expect("next slot");
         let submitted = node.submitted_combined_attestations();
-        assert!(submitted[1].data.height_pair().expect("pair").timeout);
+        assert!(submitted[1].data.height_pair().timeout);
     }
 
     #[tokio::test]
@@ -763,7 +770,7 @@ mod tests {
         let (store, pubkey) = store();
         let node = Arc::new(
             MockBeaconNode::new()
-                .with_decoupled_input(input(Some((3, 1, false))))
+                .with_decoupled_input(input(Some((3, 1))))
                 .with_goldfish_head(Root::repeat_byte(5)),
         );
         let service = service(&node, dir.path());
@@ -798,7 +805,7 @@ mod tests {
     async fn the_record_is_pruned_below_the_finalized_height() {
         let dir = tempfile::tempdir().expect("tempdir");
         let (store, pubkey) = store();
-        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((1, 1, false)))));
+        let node = Arc::new(MockBeaconNode::new().with_decoupled_input(input(Some((1, 1)))));
         let service = service(&node, dir.path());
         service
             .attest(1, &[(pubkey, 7)], &store)
@@ -809,7 +816,7 @@ mod tests {
         node.set_decoupled_input(AttestationInput {
             finalized_height: 4,
             justified_height: 5,
-            ..input(Some((6, 2, false)))
+            ..input(Some((6, 2)))
         });
         service
             .attest(2, &[(pubkey, 7)], &store)

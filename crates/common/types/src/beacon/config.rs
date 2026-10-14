@@ -326,16 +326,17 @@ pub struct Config {
     /// supported); [`Config::validate_fork_schedule`] refuses it.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_fork_epoch: Epoch,
-    /// Goldilocks' `k`: how many slots a lock lives, and how many consecutive
-    /// confirmations form a slow lock.
+    /// Goldilocks' `k`: the slow window, and how many slots a lock entry
+    /// lives.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
     pub decoupled_lock_period: u64,
-    /// The decoupled finality gadget's non-justifiable period, in heights.
+    /// Goldilocks' `R`: slots per round; validators attest once per round.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
-    pub decoupled_nonjustifiable_period: u64,
-    /// How many heights the decoupled chain may run ahead of finality.
+    pub decoupled_slots_per_round: u64,
+    /// The finality gadget's `K_W`: how many justifications stay
+    /// finalizable.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
-    pub decoupled_finality_debt: u64,
+    pub decoupled_pending_finality_window: u64,
     /// Slots a timeout waits after a height's entry before it can move the
     /// height.
     #[serde(with = "crate::beacon::serde_helpers::quoted_or_bare")]
@@ -745,8 +746,8 @@ impl Config {
             decoupled_fork_version: [0x0d, 0x00, 0x00, 0x00],
             decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
             decoupled_lock_period: 4,
-            decoupled_nonjustifiable_period: 5,
-            decoupled_finality_debt: 2,
+            decoupled_slots_per_round: 2,
+            decoupled_pending_finality_window: 2,
             decoupled_timeout_delay: 8,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
@@ -885,8 +886,8 @@ impl Config {
             decoupled_fork_version: [0x0d, 0x00, 0x00, 0x01],
             decoupled_fork_epoch: constants::FAR_FUTURE_EPOCH,
             decoupled_lock_period: 4,
-            decoupled_nonjustifiable_period: 5,
-            decoupled_finality_debt: 2,
+            decoupled_slots_per_round: 2,
+            decoupled_pending_finality_window: 2,
             decoupled_timeout_delay: 8,
             gloas_fork_version: [0x07, 0x00, 0x00, 0x01],
             gloas_fork_epoch: constants::FAR_FUTURE_EPOCH,
@@ -1155,6 +1156,18 @@ impl Config {
                 self.decoupled_lock_period,
             ));
         }
+        if self.decoupled_slots_per_round < 2 {
+            return Err(format!(
+                "DECOUPLED_SLOTS_PER_ROUND must be at least 2, got {}",
+                self.decoupled_slots_per_round,
+            ));
+        }
+        if self.decoupled_pending_finality_window < 2 {
+            return Err(format!(
+                "DECOUPLED_PENDING_FINALITY_WINDOW must be at least 2, got {}",
+                self.decoupled_pending_finality_window,
+            ));
+        }
         Ok(())
     }
 
@@ -1354,11 +1367,13 @@ mod tests {
     #[test]
     fn decoupled_keys_parse_and_default() {
         let yaml = "DECOUPLED_FORK_VERSION: 0x0d000000\nDECOUPLED_FORK_EPOCH: 3\n\
-                    DECOUPLED_LOCK_PERIOD: 6\n";
+                    DECOUPLED_LOCK_PERIOD: 6\nDECOUPLED_SLOTS_PER_ROUND: 3\n";
         let config: Config = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(config.fork_epoch(ForkName::Decoupled), 3);
         assert_eq!(config.fork_at_epoch(3), ForkName::Decoupled);
         assert_eq!(config.decoupled_lock_period, 6);
+        assert_eq!(config.decoupled_slots_per_round, 3);
+        assert_eq!(config.decoupled_pending_finality_window, 2);
         assert_eq!(config.decoupled_timeout_delay, 8);
         let absent: Config = serde_yaml_ng::from_str("").unwrap();
         assert_eq!(absent.decoupled_fork_epoch, constants::FAR_FUTURE_EPOCH);
@@ -1406,6 +1421,12 @@ mod tests {
         let mut bad_period = ok.clone();
         bad_period.decoupled_lock_period = 1;
         assert!(bad_period.validate_fork_schedule().is_err());
+        let mut bad_round = ok.clone();
+        bad_round.decoupled_slots_per_round = 1;
+        assert!(bad_round.validate_fork_schedule().is_err());
+        let mut bad_window = ok.clone();
+        bad_window.decoupled_pending_finality_window = 1;
+        assert!(bad_window.validate_fork_schedule().is_err());
     }
 
     #[test]

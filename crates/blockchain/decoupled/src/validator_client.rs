@@ -1,20 +1,17 @@
 //! The validator client's anti-slashing record Λ and the attestation rules
-//! that read it (PROTOCOL.md §1.2, figure `alg:attn-full`, appendix A.10).
+//! that read it (the specification's figure 4).
 //!
 //! This is the hardened, store-free half of the attestation duty: it takes the
 //! vote information the node derived from its store ([`AttestationInput`]),
 //! decides the height and finality pairs, records the attestation, and only
 //! then releases it. `record_attestation` is the only writer of the record.
-//! A validator that follows these rules never produces E1 or E2 evidence
-//! (the formalization's `voteSafetyOfClients`).
+//! A validator that follows these rules never produces E1 or E2 evidence.
 //!
-//! Goldilocks has no rounds: a validator reads its input every slot and
-//! attests only when the pairs it would sign differ from the last ones it
-//! signed. On a chain that makes no height progress the input does not
-//! change, so a validator whose vote landed is done, and attestation traffic
-//! dies down by itself while finality stalls. A reorg to another entry at the
-//! same height changes the input, and the record then turns the height pair
-//! into a timeout naming the new entry.
+//! The client sends an attestation only with a height pair. It sends a
+//! target at a height only as its first vote at that height, and it names
+//! each entry at most once at a height, so a validator whose chain makes no
+//! height progress stops attesting by itself. It attaches the finality pair
+//! only when the pair is below the height of the height pair.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,18 +22,17 @@ use crate::types::{
     Attestation, AttestationData, FinalityVote, Height, HeightVote, Slot, ValidatorIndex,
 };
 
-/// What the node's store hands the validator client at the attestation
-/// instant `t_s + 2Δ`: the height fields of `fg_confirmed`'s state (or `None`
-/// when the latest confirmation update fast locked nothing), and the
-/// finality fields of the fork-choice head.
+/// What the node's store hands the validator client at the FG action `a_r`:
+/// the height fields of the source's state (or `None` when the AC has no
+/// source), and the finality fields of the head's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationInput {
-    /// The slot whose attestation instant this input is for. Not part of
-    /// the attestation: it lets a validator client check that a node
-    /// answered for the slot it asked about.
+    /// The slot of the action time this input is for. Not part of the
+    /// attestation: it lets a validator client check that a node answered
+    /// for the slot it asked about.
     pub slot: Slot,
-    /// `(h, T_h, ν)` from `fg_confirmed`'s state: its height, the height's
-    /// entry, and the nonjustifiable flag.
+    /// `(h_c, T_c)` from the source's state: its height and the height's
+    /// entry.
     pub source: Option<SourceFields>,
     /// `(h_j, J, h_F)` from the head's chain state.
     pub justified_height: Height,
@@ -44,35 +40,31 @@ pub struct AttestationInput {
     pub finalized_height: Height,
 }
 
+/// `(σ[source].h, σ[source].T_h)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceFields {
     pub height: Height,
     pub entry: H256,
-    pub nonjustifiable: bool,
 }
 
-/// The anti-slashing record Λ = `(target[·], timeout[·], lock[·], timeouts)`,
-/// plus the last attestation released.
+/// The anti-slashing record Λ = `(target[·], timeout[·], lock[·], sent)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     /// `target[h]`: the validator's first target at height `h`.
     pub target: BTreeMap<Height, H256>,
-    /// `timeout[h]`: whether it emitted a timeout at height `h`.
+    /// `timeout[h]`: whether it sent a timeout at height `h`.
     pub timeout: BTreeSet<Height>,
     /// `lock[h]`: the target of its first finality pair at height `h`.
     pub lock: BTreeMap<Height, H256>,
-    /// `timeouts`: the `(h, T)` entries its timeouts have named.
-    pub timeouts: BTreeSet<(Height, H256)>,
-    /// The height pair of the last attestation that carried one.
+    /// `sent`: the contents (height pair and finality pair) of the
+    /// attestations it sent.
     #[serde(default)]
-    pub last_height_pair: Option<HeightVote>,
-    /// The finality pair of the last attestation that carried one.
-    #[serde(default)]
-    pub last_finality_pair: Option<FinalityVote>,
+    pub sent: BTreeSet<(HeightVote, Option<FinalityVote>)>,
 }
 
 impl Record {
-    /// `finality_pair(Λ, h_j, J, h_F)`.
+    /// `finality_pair(Λ, h_j, J, h_F)`: a justification not yet finalized,
+    /// when the record allows it.
     pub fn finality_pair(
         &self,
         justified_height: Height,
@@ -97,17 +89,15 @@ impl Record {
         })
     }
 
-    /// `height_pair(Λ, h_c, T_c, ν, h_f, T_f)`.
+    /// `height_pair(Λ, h_c, T_c, h_f, T_f)`.
     ///
     /// ```text
-    /// timeout[h_c]  lock           target[h_c]       ν      result
-    /// true          —              —                 —      timeout at h_c
-    /// false         = T_c          —                 —      target (h_c, T_c)
-    /// false         ≠ ⊥, ≠ T_c     —                 —      empty: wait out the height
-    /// false         ⊥              = T_c             —      target (h_c, T_c)
-    /// false         ⊥              ≠ ⊥, ≠ T_c        —      timeout at h_c
-    /// false         ⊥              ⊥                 false  target (h_c, T_c)
-    /// false         ⊥              ⊥                 true   timeout at h_c
+    /// timeout[h_c]  lock           target[h_c]       result
+    /// true          —              —                 timeout at h_c
+    /// false         = T_c          —                 target (h_c, T_c)
+    /// false         ≠ ⊥, ≠ T_c     —                 none: wait out the height
+    /// false         ⊥              ⊥ or T_c          target (h_c, T_c)
+    /// false         ⊥              another entry     timeout at h_c
     /// ```
     ///
     /// The lock at `h_c` is this attestation's own finality pair when the two
@@ -118,83 +108,69 @@ impl Record {
         finality: Option<FinalityVote>,
     ) -> Option<HeightVote> {
         let source = source?;
-        let height = source.height;
-        let entry = source.entry;
-        let target = HeightVote {
+        let (height, entry) = (source.height, source.entry);
+        let vote = |timeout| HeightVote {
             height,
             entry,
-            timeout: false,
+            timeout,
         };
-        let timeout = HeightVote {
-            height,
-            entry,
-            timeout: true,
-        };
-        if self.timeout.contains(&height) {
-            // A timeout repeats, naming the current entry.
-            return Some(timeout);
-        }
         let lock = match finality {
             Some(pair) if pair.height == height => Some(pair.target),
             _ => self.lock.get(&height).copied(),
         };
+        if self.timeout.contains(&height) {
+            return Some(vote(true));
+        }
         if let Some(lock) = lock {
-            return (lock == entry).then_some(target);
+            return (lock == entry).then(|| vote(false));
         }
         match self.target.get(&height) {
-            Some(&recorded) if recorded == entry => Some(target),
-            Some(_) => Some(timeout),
-            None if !source.nonjustifiable => Some(target),
-            None => Some(timeout),
+            None => Some(vote(false)),
+            Some(&recorded) if recorded == entry => Some(vote(false)),
+            Some(_) => Some(vote(true)),
         }
     }
 
-    /// `record_attestation(Λ, a)`: the only writer of the record.
-    pub fn record(&mut self, data: &AttestationData) {
-        if let Some(pair) = data.finality_pair() {
-            self.lock.insert(pair.height, pair.target);
-            self.last_finality_pair = Some(pair);
-        }
-        if let Some(vote) = data.height_pair() {
-            if vote.timeout {
-                self.timeout.insert(vote.height);
-                self.timeouts.insert((vote.height, vote.entry));
-            } else {
-                self.target.entry(vote.height).or_insert(vote.entry);
-            }
-            self.last_height_pair = Some(vote);
-        }
-    }
-
-    /// The data `create_attestation` would release for `input`, without
-    /// recording it: `None` unless one of its pairs is new.
-    ///
-    /// A pair is new when it is present and differs from the last pair of
-    /// its kind released. An absent pair is not news: a slot whose
-    /// confirmation update fast locked nothing leaves the height pair out
-    /// without retracting the one already cast.
-    pub fn preview(&self, input: &AttestationInput) -> Option<AttestationData> {
-        let finality = self.finality_pair(
-            input.justified_height,
-            input.justified,
-            input.finalized_height,
-        );
-        let height = self.height_pair(input.source, finality);
-        let new_height = height.is_some() && height != self.last_height_pair;
-        let new_finality = finality.is_some() && finality != self.last_finality_pair;
-        (new_height || new_finality).then(|| AttestationData::new(height, finality))
-    }
-
-    /// `create_attestation(Λ, h_c, T_c, ν, h_j, J, h_F)`: decide the pairs,
-    /// record, then release. `None` when neither pair is new.
+    /// `create_attestation(Λ, h_c, T_c, h_j, J, h_F)`: decide the pairs,
+    /// record, then release. `None` without a height pair, or when the height
+    /// pair would repeat: a target only as the first vote at its height, and
+    /// no entry twice at a height.
     pub fn create_attestation(
         &mut self,
         validator: ValidatorIndex,
         input: &AttestationInput,
     ) -> Option<Attestation> {
-        let data = self.preview(input)?;
+        let finality = self.finality_pair(
+            input.justified_height,
+            input.justified,
+            input.finalized_height,
+        );
+        let height = self.height_pair(input.source, finality)?;
+        let repeats = self.sent.iter().any(|(sent, _)| {
+            sent.height == height.height && (!height.timeout || sent.entry == height.entry)
+        });
+        if repeats {
+            return None;
+        }
+        let finality = finality.filter(|pair| pair.height < height.height);
+        let data = AttestationData::new(height, finality);
         self.record(&data);
         Some(Attestation { validator, data })
+    }
+
+    /// `record_attestation(Λ, a)`: the only writer of the record.
+    pub fn record(&mut self, data: &AttestationData) {
+        let height = data.height_pair();
+        let finality = data.finality_pair();
+        self.sent.insert((height, finality));
+        if let Some(pair) = finality {
+            self.lock.insert(pair.height, pair.target);
+        }
+        if height.timeout {
+            self.timeout.insert(height.height);
+        } else {
+            self.target.entry(height.height).or_insert(height.entry);
+        }
     }
 
     /// Drop entries below `height`. Heights at or below the finalized height
@@ -203,20 +179,18 @@ impl Record {
         self.target = self.target.split_off(&height);
         self.lock = self.lock.split_off(&height);
         self.timeout = self.timeout.split_off(&height);
-        self.timeouts = self.timeouts.split_off(&(height, H256::ZERO));
+        self.sent.retain(|(vote, _)| vote.height >= height);
     }
 }
 
 /// E1: one finality pair `(h, T)` and, at the same height, a timeout or a
 /// target vote for another entry. The two occurrences may be one attestation.
 pub fn e1(left: &AttestationData, right: &AttestationData) -> bool {
-    let conflicts =
-        |finality: Option<FinalityVote>, height: Option<HeightVote>| match (finality, height) {
-            (Some(pair), Some(vote)) => {
-                vote.height == pair.height && (vote.timeout || vote.entry != pair.target)
-            }
-            _ => false,
-        };
+    let conflicts = |finality: Option<FinalityVote>, vote: HeightVote| {
+        finality.is_some_and(|pair| {
+            vote.height == pair.height && (vote.timeout || vote.entry != pair.target)
+        })
+    };
     conflicts(left.finality_pair(), right.height_pair())
         || conflicts(right.finality_pair(), left.height_pair())
 }
@@ -224,12 +198,8 @@ pub fn e1(left: &AttestationData, right: &AttestationData) -> bool {
 /// E2: two target votes at one height naming different entries. A timeout is
 /// never an E2 occurrence.
 pub fn e2(left: &AttestationData, right: &AttestationData) -> bool {
-    match (left.height_pair(), right.height_pair()) {
-        (Some(a), Some(b)) => {
-            !a.timeout && !b.timeout && a.height == b.height && a.entry != b.entry
-        }
-        _ => false,
-    }
+    let (a, b) = (left.height_pair(), right.height_pair());
+    !a.timeout && !b.timeout && a.height == b.height && a.entry != b.entry
 }
 
 /// Two attestations by one signer are slashable under E1 or E2.
@@ -247,16 +217,15 @@ mod tests {
     }
 
     fn input(
-        source: Option<(Height, u8, bool)>,
+        source: Option<(Height, u8)>,
         justified: (Height, u8),
         h_f: Height,
     ) -> AttestationInput {
         AttestationInput {
             slot: 0,
-            source: source.map(|(height, entry, nj)| SourceFields {
+            source: source.map(|(height, entry)| SourceFields {
                 height,
                 entry: root(entry),
-                nonjustifiable: nj,
             }),
             justified_height: justified.0,
             justified: root(justified.1),
@@ -268,15 +237,15 @@ mod tests {
     fn a_fresh_record_targets_the_chains_entry() {
         let mut record = Record::default();
         let att = record
-            .create_attestation(7, &input(Some((3, 1, false)), (2, 9), 1))
+            .create_attestation(7, &input(Some((3, 1)), (2, 9), 1))
             .expect("a first attestation");
         assert_eq!(
             att.data.height_pair(),
-            Some(HeightVote {
+            HeightVote {
                 height: 3,
                 entry: root(1),
                 timeout: false
-            })
+            }
         );
         assert_eq!(
             att.data.finality_pair(),
@@ -290,70 +259,87 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_input_attests_once() {
+    fn a_height_is_targeted_once() {
         let mut record = Record::default();
-        let first = input(Some((3, 1, false)), (2, 9), 1);
+        let first = input(Some((3, 1)), (2, 9), 1);
         assert!(record.create_attestation(0, &first).is_some());
         assert!(record.create_attestation(0, &first).is_none());
-        assert!(record.preview(&first).is_none());
-        // A new justification on the head chain is something new to say.
-        let next = input(Some((3, 1, false)), (3, 1), 2);
-        assert!(record.create_attestation(0, &next).is_some());
+        // A new justification alone is not a reason to attest again at the
+        // same height: the finality pair rides on the next height pair.
+        let next = input(Some((3, 1)), (3, 1), 2);
+        assert!(record.create_attestation(0, &next).is_none());
+        let higher = input(Some((4, 2)), (3, 1), 2);
+        let att = record.create_attestation(0, &higher).expect("a new height");
+        assert_eq!(att.data.finality_pair().map(|p| p.height), Some(3));
     }
 
     #[test]
-    fn a_slot_without_a_fast_lock_retracts_nothing() {
-        let mut record = Record::default();
-        let with_source = input(Some((3, 1, false)), (2, 9), 1);
-        let without = input(None, (2, 9), 1);
-        assert!(record.create_attestation(0, &with_source).is_some());
-        for _ in 0..3 {
-            assert!(record.create_attestation(0, &without).is_none());
-            assert!(record.create_attestation(0, &with_source).is_none());
-        }
-    }
-
-    #[test]
-    fn an_input_with_nothing_to_say_does_not_attest() {
+    fn no_source_means_no_attestation() {
         let mut record = Record::default();
         assert!(
             record
-                .create_attestation(0, &input(None, (0, 0), 0))
+                .create_attestation(0, &input(None, (2, 9), 1))
                 .is_none()
         );
         assert_eq!(record, Record::default());
     }
 
     #[test]
-    fn a_different_entry_at_a_voted_height_times_out() {
+    fn the_finality_pair_is_dropped_unless_below_the_height_pair() {
         let mut record = Record::default();
-        record.create_attestation(0, &input(Some((3, 1, false)), (0, 0), 0));
+        // Source at height 3, justification at height 3 naming the same
+        // block: the target stands, the finality pair is dropped.
         let att = record
-            .create_attestation(0, &input(Some((3, 2, false)), (0, 0), 0))
-            .expect("a reorg to another entry attests again");
-        assert!(att.data.height_pair().unwrap().timeout);
-        // Once timed out, the height stays timed out.
-        let again = record
-            .create_attestation(0, &input(Some((3, 1, false)), (0, 0), 0))
-            .expect("a timeout naming the first entry is new");
-        assert!(again.data.height_pair().unwrap().timeout);
+            .create_attestation(0, &input(Some((3, 1)), (3, 1), 2))
+            .expect("a target");
+        assert!(!att.data.height_pair().timeout);
+        assert_eq!(att.data.finality_pair(), None);
+        assert!(att.data.is_well_formed());
+    }
+
+    #[test]
+    fn a_different_entry_at_a_voted_height_times_out_once() {
+        let mut record = Record::default();
+        record.create_attestation(0, &input(Some((3, 1)), (0, 0), 0));
+        let att = record
+            .create_attestation(0, &input(Some((3, 2)), (0, 0), 0))
+            .expect("a reorg to another entry times out");
+        assert!(att.data.height_pair().timeout);
+        // Once timed out, the height stays timed out, and each entry is
+        // named once: entry 1 by the target, entry 2 by the timeout.
+        for entry in [2, 1] {
+            assert!(
+                record
+                    .create_attestation(0, &input(Some((3, entry)), (0, 0), 0))
+                    .is_none()
+            );
+        }
+        let third = record
+            .create_attestation(0, &input(Some((3, 3)), (0, 0), 0))
+            .expect("a timeout naming a third entry is new");
+        assert!(third.data.height_pair().timeout);
     }
 
     #[test]
     fn a_lock_elsewhere_abstains() {
         let mut record = Record::default();
-        // Finality pair locks height 3 on entry 1.
-        record.create_attestation(0, &input(None, (3, 1), 2));
-        let att = record
-            .create_attestation(0, &input(Some((3, 2, false)), (4, 7), 3))
-            .expect("a new finality pair");
-        assert_eq!(att.data.height_pair(), None);
+        // A finality pair locks height 3 on entry 1.
+        record
+            .create_attestation(0, &input(Some((4, 5)), (3, 1), 2))
+            .expect("a target with a finality pair");
+        assert_eq!(record.lock.get(&3), Some(&root(1)));
+        assert!(
+            record
+                .create_attestation(0, &input(Some((3, 2)), (0, 0), 0))
+                .is_none()
+        );
     }
 
     #[test]
     fn a_timeout_blocks_the_finality_pair() {
         let mut record = Record::default();
-        record.create_attestation(0, &input(Some((3, 1, true)), (0, 0), 0));
+        record.create_attestation(0, &input(Some((3, 1)), (0, 0), 0));
+        record.create_attestation(0, &input(Some((3, 2)), (0, 0), 0));
         assert!(record.timeout.contains(&3));
         assert_eq!(record.finality_pair(3, root(1), 2), None);
     }
@@ -362,19 +348,21 @@ mod tests {
     fn honest_records_never_produce_evidence() {
         // Drive one record through every combination of inputs over a few
         // heights and entries and check no two emitted attestations are
-        // slashable, nor any single one with itself.
+        // slashable, nor any single one with itself, and every one is well
+        // formed.
         let mut record = Record::default();
         let mut emitted = Vec::new();
         for step in 0..400u32 {
             let h = Height::from(step % 4 + 1);
             let entry = (step / 4 % 3) as u8;
-            let nj = step % 7 == 0;
             let jh = Height::from(step % 3 + 1);
             let j = (step / 3 % 2) as u8;
-            let source = (step % 5 != 0).then_some((h, entry, nj));
+            let source = (step % 5 != 0).then_some((h, entry));
             emitted.extend(record.create_attestation(0, &input(source, (jh, j), jh - 1)));
         }
+        assert!(!emitted.is_empty());
         for a in &emitted {
+            assert!(a.data.is_well_formed(), "{a:?}");
             for b in &emitted {
                 assert!(!slashable(a, b), "{a:?} vs {b:?}");
             }

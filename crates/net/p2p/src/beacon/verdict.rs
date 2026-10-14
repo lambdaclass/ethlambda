@@ -688,6 +688,7 @@ fn decoupled_stateful_checks(
                 Outcome::Reject(RejectReason::UnknownValidator)
             }
             DecoupledMessageError::BadSignature => Outcome::Reject(RejectReason::BadSignature),
+            DecoupledMessageError::Malformed => Outcome::Reject(RejectReason::Malformed),
         };
     }
     let mut node = node.lock().expect("decoupled node lock poisoned");

@@ -9,18 +9,17 @@ use crate::types::{Slot, Tick};
 /// duration (`4Δ` per slot).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
-    /// `k ≥ 2`: how many slots a lock lives, and how many consecutive
-    /// confirmations form a slow lock.
-    ///
-    /// A lock formed by the confirmation update of slot `s` anchors every
-    /// fork-choice run over votes of slots `s ..= s + k − 1`: the votes of
-    /// slots `s + 2 ..= s + k` and the updates of slots `s + 1 ..= s + k − 1`.
+    /// `k ≥ 2`: the slow window. A lock that the confirmation update of slot
+    /// `s` writes has the deadline `t_{s+k} + 5Δ`, and the slow test reads
+    /// the saved confirmations of the previous `k − 1` slots.
     pub lock_period: u64,
-    /// `K ≥ 4`: every `K`-th height is nonjustifiable under finality debt.
-    pub nonjustifiable_period: u64,
-    /// `D ≥ 2`: the finality-debt bound.
-    pub finality_debt: u64,
-    /// `δ_t`: slots a timeout waits before it can move a height.
+    /// `R`: slots per round. The FG action (the attestation duty) runs once
+    /// per round, at `a_r = T_r + 6Δ`.
+    pub slots_per_round: u64,
+    /// `K_W ≥ 2`: how many justifications `σ.pending_finality` keeps.
+    pub pending_window: u64,
+    /// `δ_t`: slots a timeout waits after a height's entry before it can
+    /// move the height.
     pub timeout_delay: u64,
 }
 
@@ -28,10 +27,10 @@ pub struct Params {
 pub enum ParamsError {
     #[error("lock period k = {0} must be at least 2")]
     LockPeriodTooShort(u64),
-    #[error("nonjustifiable period K = {0} must be at least 4")]
-    PeriodTooShort(u64),
-    #[error("finality-debt bound D = {0} must be at least 2")]
-    DebtTooSmall(u64),
+    #[error("round length R = {0} must be at least 2")]
+    RoundTooShort(u64),
+    #[error("pending finality window K_W = {0} must be at least 2")]
+    WindowTooSmall(u64),
 }
 
 impl Default for Params {
@@ -43,16 +42,22 @@ impl Default for Params {
 /// The lock period of the Goldilocks examples.
 pub const DEFAULT_LOCK_PERIOD: u64 = 4;
 
+/// The smallest round the specification allows when attestations travel as
+/// fast as blocks (`Δ_F = Δ`): `R ≥ max{2, ⌈(6Δ + Δ_F)/(4Δ)⌉} = 2`.
+pub const DEFAULT_SLOTS_PER_ROUND: u64 = 2;
+
+/// The smallest pending finality window the specification allows.
+pub const DEFAULT_PENDING_WINDOW: u64 = 2;
+
 impl Params {
-    /// The defaults for a given lock period: `K = 5` (the smallest value at
-    /// which the formal finality claims are non-vacuous), `D = 2` (the
-    /// structural floor) and `δ_t = 2k`, the time conflicting locks need to
-    /// drain away after the network turns synchronous.
+    /// The defaults for a given lock period: the smallest `R` and `K_W` the
+    /// specification allows, and `δ_t = 2k`, the time conflicting locks need
+    /// to drain away after the network turns synchronous.
     pub fn with_lock_period(lock_period: u64) -> Self {
         Self {
             lock_period,
-            nonjustifiable_period: 5,
-            finality_debt: 2,
+            slots_per_round: DEFAULT_SLOTS_PER_ROUND,
+            pending_window: DEFAULT_PENDING_WINDOW,
             timeout_delay: 2 * lock_period,
         }
     }
@@ -62,13 +67,33 @@ impl Params {
         if self.lock_period < 2 {
             return Err(ParamsError::LockPeriodTooShort(self.lock_period));
         }
-        if self.nonjustifiable_period < 4 {
-            return Err(ParamsError::PeriodTooShort(self.nonjustifiable_period));
+        if self.slots_per_round < 2 {
+            return Err(ParamsError::RoundTooShort(self.slots_per_round));
         }
-        if self.finality_debt < 2 {
-            return Err(ParamsError::DebtTooSmall(self.finality_debt));
+        if self.pending_window < 2 {
+            return Err(ParamsError::WindowTooSmall(self.pending_window));
         }
         Ok(())
+    }
+
+    /// `a_r = T_r + 6Δ`: the action time of round `r`, which is the
+    /// confirmation update of its first slot `rR` (`t_{rR+1} + 2Δ`).
+    pub fn action_time(&self, round: u64) -> Tick {
+        confirmation_time(round * self.slots_per_round)
+    }
+
+    /// Whether `t` is the action time of its round.
+    pub fn is_action_time(&self, t: Tick) -> bool {
+        // `a_r` falls in slot `rR + 1`, which is still round `r` since
+        // `R ≥ 2`.
+        let round = slot_of(t) / self.slots_per_round;
+        t >= 0 && t == self.action_time(round)
+    }
+
+    /// The deadline of a lock that the confirmation update of `slot` writes:
+    /// `t_{s+k} + 5Δ`, which is the vote time of slot `s + k + 1`.
+    pub fn lock_deadline(&self, slot: Slot) -> Tick {
+        slot_start(slot + self.lock_period) + 5
     }
 }
 
@@ -82,13 +107,14 @@ pub fn slot_of(t: Tick) -> Slot {
     if t < 0 { 0 } else { (t / 4) as Slot }
 }
 
-/// `t_s + Δ`: the Goldfish vote of slot `s`.
+/// `t_s + Δ`: the Goldfish vote of slot `s`, and the revocation of the locks
+/// against slot-`(s − 1)` votes just before it.
 pub fn vote_time(slot: Slot) -> Tick {
     slot_start(slot) + 1
 }
 
-/// `t_s + 2Δ`: the support cutoff of slot `s`, which is also the slot-`(s−1)`
-/// confirmation update and the attestation instant of slot `s`.
+/// `t_s + 2Δ`: the support cutoff of slot `s`, which is also the
+/// confirmation update of slot `s − 1`.
 pub fn support_cutoff(slot: Slot) -> Tick {
     slot_start(slot) + 2
 }
@@ -116,18 +142,38 @@ mod tests {
     }
 
     #[test]
+    fn the_action_time_is_once_per_round_after_its_first_update() {
+        let params = Params {
+            slots_per_round: 3,
+            ..Params::default()
+        };
+        let actions: Vec<Tick> = (0..40).filter(|&t| params.is_action_time(t)).collect();
+        // Rounds start at slots 0, 3, 6: a_r = t_{3r+1} + 2Δ.
+        assert_eq!(actions, vec![6, 18, 30]);
+    }
+
+    #[test]
+    fn a_lock_expires_at_the_vote_time_k_plus_one_slots_later() {
+        let params = Params::default();
+        assert_eq!(
+            params.lock_deadline(10),
+            vote_time(10 + params.lock_period + 1)
+        );
+    }
+
+    #[test]
     fn validation_enforces_the_structural_floors() {
         assert!(Params::default().validate().is_ok());
         assert!(Params::with_lock_period(1).validate().is_err());
-        let short_period = Params {
-            nonjustifiable_period: 3,
+        let short_round = Params {
+            slots_per_round: 1,
             ..Params::default()
         };
-        assert!(short_period.validate().is_err());
-        let small_debt = Params {
-            finality_debt: 1,
+        assert!(short_round.validate().is_err());
+        let small_window = Params {
+            pending_window: 1,
             ..Params::default()
         };
-        assert!(small_debt.validate().is_err());
+        assert!(small_window.validate().is_err());
     }
 }

@@ -1,47 +1,34 @@
-//! Goldilocks locks: how the available chain stays put across bounded
-//! asynchrony.
+//! Goldilocks lock entries: how the available chain stays put across bounded
+//! asynchrony (the specification's figure 7 and section 3.2).
 //!
-//! A lock pins the start of the Goldfish walk: every fork-choice run starts
-//! from the deepest live lock in the filtered tree (the *anchor*), and the
-//! slot committee's votes decide the walk from there. Locks form and dissolve
-//! by four rules, two each way:
+//! `𝒜.lock_entries` is a set of entries `(B, d)`, a block and a deadline. An
+//! entry is *live* while `d > t` and `B ∈ Φ.tree`; a block is *locked* when
+//! it is an ancestor of (or is) the block of a live entry. Every walk of a
+//! duty starts at the *anchor*: the deepest locked block of the full viable
+//! tree, or `Φ.fc_root` when there is none.
 //!
 //! | Rule | When | Effect |
 //! |---|---|---|
-//! | Fast lock | the confirmation update of slot `s` sees at least `n/2` of the whole committee `𝒦_s` supporting `B` | lock the deepest such `B` until `s + k` |
-//! | Slow lock | the confirmation updates of `k` consecutive slots each confirmed a block | lock their deepest common ancestor until `s + k` |
-//! | Fast unlock | before every fork-choice run, at least `n/2` of the committee oppose the lock | the lock steps back to the deepest ancestor with fewer than `n/2` opponents |
-//! | Expiry | a lock is not renewed within `k` slots | it is dropped |
+//! | Write | the confirmation update of slot `s` confirms `C` and no live lock vetoes it | lock the deepest block on the path to `C` that passes the fast test (half of `𝒦_s` supports it) or the slow test (it is under the saved confirmations of the previous `k − 1` slots), until `t_{s+k} + 5Δ` |
+//! | Revocation | at `t_s + Δ`, before the vote, against the slot-`(s − 1)` votes | each live entry moves back to the deepest ancestor that fewer than half of `𝒦_{s−1}` oppose |
+//! | Expiry | the first tick at or after the deadline | the entry is removed |
 //!
-//! `n` is the committee size, not the participation: half of the whole
-//! committee means a fast lock is backed by a quorum that a conflicting fast
-//! lock cannot also gather, and a fast lock's voters are enough to unlock any
-//! lock that conflicts with it.
-//!
-//! # Support and opposition
-//!
-//! A committee member's *stance* in a slot is the deepest common ancestor of
-//! the processed heads of its votes in that slot: its one head when it voted
-//! once, less when it equivocated. It supports `B` when `B ⪯ stance` and
-//! opposes `B` otherwise. Votes whose head is not processed are left out on
-//! both sides: their head may well extend `B`, so counting them as
-//! opposition would unlock on missing data.
+//! An opponent of `B'` is a validator with one resolved slot-`(s − 1)` vote
+//! whose head conflicts with `B'`. A vote for an ancestor or a descendant of
+//! `B'` does not oppose it, an equivocator never opposes, and a vote whose
+//! head is not resolved counts neither way.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ethlambda_types::primitives::H256;
 
+use crate::params::slot_of;
 use crate::store::Store;
-use crate::types::{GoldfishVote, LockStatus, Slot, ValidatorIndex};
+use crate::types::{LockStatus, Slot, Tick, ValidatorIndex};
 
-/// `count ≥ n/2`, without division.
-pub(crate) fn at_least_half(count: u64, committee: u64) -> bool {
-    committee > 0 && 2 * count >= committee
-}
-
-/// `|𝒦_s|` for every slot: the lock thresholds are relative to the whole
-/// committee, not to whoever voted, so the engine must know its size.
+/// `|𝒦_s|` for every slot: the fast test and revocation are relative to the
+/// whole committee, not to whoever voted, so the engine must know its size.
 #[derive(Clone)]
 pub struct CommitteeSizes(Arc<dyn Fn(Slot) -> u64 + Send + Sync>);
 
@@ -50,8 +37,8 @@ impl CommitteeSizes {
         Self(Arc::new(size))
     }
 
-    /// The same committee size every slot: every validator, on the lean
-    /// chain.
+    /// The same committee size every slot: every validator, as Goldilocks
+    /// specifies (`𝒦_s = V`).
     pub fn fixed(size: u64) -> Self {
         Self::new(move |_| size)
     }
@@ -81,130 +68,133 @@ impl Store {
         self
     }
 
-    /// Lock `block` from the confirmation update of `slot`, or renew it.
-    pub(crate) fn form_lock(&mut self, block: H256, slot: Slot) {
-        let deadline = slot + self.params.lock_period;
-        let entry = self.locks.entry(block).or_insert(deadline);
+    /// Add the entry `(block, deadline)`. Entries on one block keep the later
+    /// deadline: they lock the same blocks, revocation moves them alike, and
+    /// the earlier one expires first.
+    pub(crate) fn add_lock_entry(&mut self, block: H256, deadline: Tick) {
+        let entry = self.lock_entries.entry(block).or_insert(deadline);
         *entry = (*entry).max(deadline);
     }
 
-    /// Whether a lock with `deadline` anchors a walk over votes of `slot`.
-    pub(crate) fn lock_is_live(deadline: Slot, slot: Slot) -> bool {
-        slot < deadline
-    }
-
-    /// The anchor of a walk over votes of `slot` inside `tree`: the deepest
-    /// live lock in it, or the fork-choice root.
-    pub(crate) fn anchor_in(&self, tree: &HashSet<H256>, slot: Slot) -> H256 {
-        self.deepest_live_lock(tree, slot)
-            .unwrap_or(self.frame.root)
-    }
-
-    pub(crate) fn deepest_live_lock(&self, tree: &HashSet<H256>, slot: Slot) -> Option<H256> {
-        self.locks
+    /// The live entries: `d > t` and `B ∈ Φ.tree`.
+    pub(crate) fn live_entries(&self) -> impl Iterator<Item = (H256, Tick)> + '_ {
+        let now = self.now();
+        self.lock_entries
             .iter()
-            .filter(|(block, deadline)| {
-                Self::lock_is_live(**deadline, slot) && tree.contains(*block)
+            .filter(move |(block, deadline)| {
+                **deadline > now && self.is_ancestor(&self.finalized, block)
             })
-            .map(|(block, _)| *block)
-            .reduce(|a, b| if self.deeper(&a, &b) { a } else { b })
+            .map(|(block, deadline)| (*block, *deadline))
     }
 
-    /// Each committee member's stance in `slot`: the deepest common ancestor
-    /// of its votes' processed heads.
-    pub(crate) fn stances(&self, votes: &[GoldfishVote], slot: Slot) -> Vec<H256> {
-        let mut heads: HashMap<ValidatorIndex, H256> = HashMap::new();
-        for vote in votes {
-            if vote.slot != slot || !self.vote_resolves(vote) {
-                continue;
-            }
-            match heads.get(&vote.validator) {
-                None => {
-                    heads.insert(vote.validator, vote.head);
-                }
-                Some(head) => {
-                    let meet = self.meet(head, &vote.head).unwrap_or(self.anchor);
-                    heads.insert(vote.validator, meet);
-                }
-            }
-        }
-        heads.into_values().collect()
-    }
-
-    /// How many of `tips` each block at or above `Σ.F`'s depth is an ancestor
-    /// of. A block absent from the map has no supporter.
-    pub(crate) fn support_counts(&self, tips: &[H256]) -> HashMap<H256, u64> {
-        let floor = self.depth(&self.finalized).unwrap_or(0);
-        let mut counts: HashMap<H256, u64> = HashMap::new();
-        for tip in tips {
-            let mut cursor = Some(*tip);
-            while let Some(root) = cursor {
-                let Some(node) = self.node(&root) else {
+    /// `get_anchor(𝒜, Φ, t)`: the deepest locked block of `viable` (the full
+    /// viable tree), or `Φ.fc_root` when there is none. The locked blocks of
+    /// an entry in the viable tree are a path from the root down, so its
+    /// deepest one is the first viable block on the way up from the entry.
+    pub(crate) fn get_anchor(&self, viable: &HashSet<H256>) -> H256 {
+        let root_depth = self.depth(&self.frame.root).unwrap_or(0);
+        let mut anchor: Option<H256> = None;
+        for (block, _) in self.live_entries() {
+            let mut cursor = Some(block);
+            while let Some(current) = cursor {
+                let Some(node) = self.node(&current) else {
                     break;
                 };
-                if node.depth < floor {
+                if node.depth < root_depth {
                     break;
                 }
-                *counts.entry(root).or_default() += 1;
+                if viable.contains(&current) {
+                    if anchor.is_none_or(|best| self.deeper(&current, &best)) {
+                        anchor = Some(current);
+                    }
+                    break;
+                }
                 cursor = node.parent;
             }
         }
-        counts
+        anchor.unwrap_or(self.frame.root)
     }
 
-    /// The fast unlock: before a fork-choice run over `votes` of `slot`, every
-    /// lock that at least half of `𝒦_slot` opposes steps back to its deepest
-    /// ancestor with fewer opponents than that, keeping its deadline. A lock
-    /// that would step back past `Σ.F` is dropped.
-    pub(crate) fn step_back_locks(&mut self, votes: &[GoldfishVote], slot: Slot) {
-        let committee = self.committee_size(slot);
-        if committee == 0 || self.locks.is_empty() {
+    /// `revoke_locks(𝒜, Φ, t, s)` at `t_s + Δ`, against every held slot-`(s
+    /// − 1)` vote: each live entry moves back to the deepest non-genesis
+    /// `B'` with `Φ.F ⪯ B' ⪯ B` that fewer than half of `𝒦_{s−1}` oppose,
+    /// keeping its deadline, or is deleted when there is no such block.
+    /// Entries that are not live are dropped.
+    pub(crate) fn revoke_locks(&mut self, slot: Slot) {
+        let Some(previous) = slot.checked_sub(1) else {
             return;
-        }
-        let stances = self.stances(votes, slot);
-        if !at_least_half(stances.len() as u64, committee) {
-            // Fewer than half the committee spoke: nothing can be opposed by
-            // half of it.
-            return;
-        }
-        let support = self.support_counts(&stances);
-        let voters = stances.len() as u64;
-        let opposed = |block: &H256| {
-            let supporters = support.get(block).copied().unwrap_or(0);
-            at_least_half(voters - supporters, committee)
         };
-        let locks: Vec<(H256, Slot)> = self.locks.iter().map(|(b, d)| (*b, *d)).collect();
-        for (block, deadline) in locks {
-            if !opposed(&block) {
+        let votes = self.goldfish_votes(previous);
+        let mut per_validator: HashMap<ValidatorIndex, usize> = HashMap::new();
+        for vote in &votes {
+            *per_validator.entry(vote.validator).or_default() += 1;
+        }
+        // Resolved heads of the non-equivocators. A resolved head is in the
+        // tree; one strictly below `Φ.F` is compatible with every candidate,
+        // so it can be kept without changing any count.
+        let heads: Vec<H256> = votes
+            .iter()
+            .filter(|vote| per_validator[&vote.validator] == 1 && self.vote_resolves(vote))
+            .map(|vote| vote.head)
+            .collect();
+        let committee = self.committee_size(previous);
+        let floor_depth = self
+            .depth(&self.finalized)
+            .unwrap_or(0)
+            .max(self.depth(&self.anchor).unwrap_or(0) + 1);
+
+        let live: Vec<(H256, Tick)> = self.live_entries().collect();
+        let mut entries: HashMap<H256, Tick> = HashMap::new();
+        for (block, deadline) in live {
+            let Some(depth) = self.depth(&block) else {
                 continue;
-            }
-            self.locks.remove(&block);
-            let mut cursor = self.node(&block).and_then(|node| node.parent);
-            while let Some(root) = cursor {
-                if !self.is_ancestor(&self.finalized, &root) || root == self.finalized {
-                    break;
-                }
-                if !opposed(&root) {
-                    let entry = self.locks.entry(root).or_insert(deadline);
-                    *entry = (*entry).max(deadline);
-                    break;
-                }
-                cursor = self.node(&root).and_then(|node| node.parent);
+            };
+            // A head conflicts with the ancestor of `block` at depth `d`
+            // exactly when it leaves `block`'s chain above `d`: its meet with
+            // `block` is shallower than `d` and it is not itself on the chain.
+            let branch_points: Vec<u64> = heads
+                .iter()
+                .filter(|head| !self.is_ancestor(head, &block))
+                .filter_map(|head| self.meet_depth(head, &block))
+                .collect();
+            let opponents = |d: u64| branch_points.iter().filter(|&&m| m < d).count() as u64;
+            // Opponents only grow with depth, so the deepest candidate is the
+            // first one from the bottom that passes.
+            let moved = (floor_depth..=depth)
+                .rev()
+                .find(|&d| 2 * opponents(d) < committee)
+                .and_then(|d| self.ancestor_at_depth(&block, d));
+            if let Some(moved) = moved {
+                let entry = entries.entry(moved).or_insert(deadline);
+                *entry = (*entry).max(deadline);
             }
         }
+        self.lock_entries = entries;
     }
 
-    /// The live locks at the current slot, deepest first.
+    /// The depth of the deepest common ancestor of two processed blocks.
+    pub(crate) fn meet_depth(&self, a: &H256, b: &H256) -> Option<u64> {
+        let depth = self.depth(a)?.min(self.depth(b)?);
+        let mut x = self.ancestor_at_depth(a, depth)?;
+        let mut y = self.ancestor_at_depth(b, depth)?;
+        let mut depth = depth;
+        while x != y {
+            depth = depth.checked_sub(1)?;
+            x = self.node(&x)?.parent?;
+            y = self.node(&y)?.parent?;
+        }
+        Some(depth)
+    }
+
+    /// The live lock entries, deepest first, with each deadline given as the
+    /// slot at whose vote time it expires.
     pub fn locks(&self) -> Vec<LockStatus> {
-        let reading = self.slot.saturating_sub(1);
         let mut live: Vec<LockStatus> = self
-            .locks
-            .iter()
-            .filter(|(_, deadline)| Self::lock_is_live(**deadline, reading))
+            .live_entries()
             .filter_map(|(block, deadline)| {
                 Some(LockStatus {
-                    block: self.block_ref(block)?,
-                    deadline: *deadline,
+                    block: self.block_ref(&block)?,
+                    deadline: slot_of(deadline),
                 })
             })
             .collect();
@@ -214,31 +204,13 @@ impl Store {
         });
         live
     }
-
-    /// Drop locks no walk can read any more: expired for every slot a duty
-    /// still reads, or no longer strictly above `Σ.F`.
-    pub(crate) fn prune_locks(&mut self) {
-        let oldest_read = self.slot.saturating_sub(1);
-        let finalized = self.finalized;
-        let keep: HashSet<H256> = self
-            .locks
-            .iter()
-            .filter(|(block, deadline)| {
-                Self::lock_is_live(**deadline, oldest_read)
-                    && **block != finalized
-                    && self.is_ancestor(&finalized, block)
-            })
-            .map(|(block, _)| *block)
-            .collect();
-        self.locks.retain(|block, _| keep.contains(block));
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Params, slot_start};
-    use crate::types::{BlockInput, Electorate};
+    use crate::params::{Params, slot_start, vote_time};
+    use crate::types::{BlockInput, Electorate, GoldfishVote};
 
     fn root(byte: u8) -> H256 {
         H256([byte; 32])
@@ -266,84 +238,129 @@ mod tests {
         }
     }
 
-    /// `G ← A ← B` and `A ← C`, all processed by slot 3.
-    fn fork() -> (Store, [H256; 4]) {
+    const FAR: Tick = 1000;
+
+    /// `G ← A ← B` and `A ← C`, all processed by slot 3, with the slot-2
+    /// votes `votes` held.
+    fn fork(votes: &[GoldfishVote]) -> (Store, [H256; 4]) {
         let genesis = H256::ZERO;
         let mut store = Store::from_genesis(Params::default(), Electorate::uniform(4), genesis);
-        store.advance_to(slot_start(3));
+        store.advance_to(slot_start(2));
         let a = block(&mut store, 1, 1, genesis);
         let b = block(&mut store, 2, 2, a);
         let c = block(&mut store, 3, 2, a);
+        for v in votes {
+            store.on_goldfish_vote(*v);
+        }
+        store.advance_to(slot_start(3));
         (store, [genesis, a, b, c])
     }
 
-    #[test]
-    fn half_a_committee_against_a_lock_steps_it_back() {
-        let (mut store, [_, a, b, c]) = fork();
-        store.form_lock(b, 2);
-        // One of four against B: fewer than n/2, the lock holds.
-        store.step_back_locks(&[vote(0, 2, c)], 2);
-        assert_eq!(store.locks.get(&b), Some(&6));
-        // Two of four: B steps back to A, the deepest ancestor C's voters
-        // do not oppose, keeping its deadline.
-        store.step_back_locks(&[vote(0, 2, c), vote(1, 2, c)], 2);
-        assert_eq!(store.locks.get(&b), None);
-        assert_eq!(store.locks.get(&a), Some(&6));
+    fn revoke(store: &mut Store) {
+        store.revoke_locks(3);
     }
 
     #[test]
-    fn votes_for_a_descendant_do_not_oppose() {
-        let (mut store, [_, a, b, _]) = fork();
-        let d = block(&mut store, 4, 3, b);
-        store.form_lock(b, 2);
-        let votes: Vec<_> = (0..4).map(|v| vote(v, 3, d)).collect();
-        store.step_back_locks(&votes, 3);
-        assert_eq!(store.locks.get(&b), Some(&6));
-        // Votes for an ancestor do not support the lock: half of them
-        // step it back to that ancestor.
-        let votes: Vec<_> = (0..2).map(|v| vote(v, 3, a)).collect();
-        store.step_back_locks(&votes, 3);
-        assert_eq!(store.locks.get(&a), Some(&6));
+    fn half_a_committee_against_a_lock_moves_it_back() {
+        let c = root(3);
+        let (mut store, [_, a, b, _]) = fork(&[vote(0, 2, c)]);
+        store.add_lock_entry(b, FAR);
+        // One of four against B: fewer than n/2, the entry stays.
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), Some(&FAR));
+
+        let (mut store, _) = fork(&[vote(0, 2, c), vote(1, 2, c)]);
+        store.add_lock_entry(b, FAR);
+        // Two of four: B moves back to A, which C's voters do not oppose,
+        // keeping its deadline.
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), None);
+        assert_eq!(store.lock_entries.get(&a), Some(&FAR));
     }
 
     #[test]
-    fn an_equivocator_opposes_what_its_votes_disagree_on() {
-        let (mut store, [_, a, b, c]) = fork();
-        store.form_lock(b, 2);
-        // Validator 0 votes B and C: its stance is A, so it opposes B. With
-        // validator 1 on C that is half the committee.
-        store.step_back_locks(&[vote(0, 2, b), vote(0, 2, c), vote(1, 2, c)], 2);
-        assert_eq!(store.locks.get(&a), Some(&6));
+    fn votes_for_an_ancestor_or_a_descendant_do_not_oppose() {
+        let a = root(1);
+        let (mut store, [_, _, b, _]) = fork(&[vote(0, 2, a), vote(1, 2, a), vote(2, 2, a)]);
+        store.add_lock_entry(b, FAR);
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), Some(&FAR));
+    }
+
+    #[test]
+    fn equivocators_never_oppose() {
+        let (b, c) = (root(2), root(3));
+        let (mut store, _) = fork(&[
+            vote(0, 2, c),
+            vote(0, 2, b),
+            vote(1, 2, c),
+            vote(1, 2, b),
+            vote(2, 2, c),
+        ]);
+        store.add_lock_entry(b, FAR);
+        // Validators 0 and 1 equivocate; only validator 2 opposes B.
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), Some(&FAR));
     }
 
     #[test]
     fn votes_for_unknown_heads_count_neither_way() {
-        let (mut store, [_, _, b, _]) = fork();
-        store.form_lock(b, 2);
         let unknown = root(0x77);
-        store.step_back_locks(&[vote(0, 2, unknown), vote(1, 2, unknown)], 2);
-        assert_eq!(store.locks.get(&b), Some(&6));
+        let (mut store, [_, _, b, _]) = fork(&[vote(0, 2, unknown), vote(1, 2, unknown)]);
+        store.add_lock_entry(b, FAR);
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), Some(&FAR));
     }
 
     #[test]
-    fn a_lock_anchors_walks_until_its_deadline() {
-        let (mut store, [genesis, _, b, _]) = fork();
-        store.form_lock(b, 2);
-        let tree = store.filtered_tree(None);
-        let deadline = 2 + store.params.lock_period;
-        assert_eq!(store.anchor_in(&tree, deadline - 1), b);
-        assert_eq!(store.anchor_in(&tree, deadline), genesis);
+    fn an_entry_with_no_unopposed_ancestor_is_deleted() {
+        // Every non-genesis ancestor of B is opposed by votes for a sibling
+        // of A.
+        let genesis = H256::ZERO;
+        let mut store = Store::from_genesis(Params::default(), Electorate::uniform(4), genesis);
+        store.advance_to(slot_start(2));
+        let a = block(&mut store, 1, 1, genesis);
+        let b = block(&mut store, 2, 2, a);
+        let d = block(&mut store, 4, 2, genesis);
+        store.on_goldfish_vote(vote(0, 2, d));
+        store.on_goldfish_vote(vote(1, 2, d));
+        store.advance_to(slot_start(3));
+        store.add_lock_entry(b, FAR);
+        revoke(&mut store);
+        assert!(store.lock_entries.is_empty());
     }
 
     #[test]
-    fn the_committee_size_sets_the_thresholds() {
-        let (store, [_, _, b, c]) = fork();
+    fn the_committee_size_sets_the_threshold() {
+        let c = root(3);
+        let (store, [_, _, b, _]) = fork(&[vote(0, 2, c), vote(1, 2, c)]);
         let mut store = store.with_committee_sizes(CommitteeSizes::fixed(6));
-        store.form_lock(b, 2);
+        store.add_lock_entry(b, FAR);
         // A committee of six needs three opponents.
-        store.step_back_locks(&[vote(0, 2, c), vote(1, 2, c)], 2);
-        assert_eq!(store.locks.get(&b), Some(&6));
-        store.step_back_locks(&[vote(0, 2, c), vote(1, 2, c), vote(2, 2, c)], 2);
-        assert_eq!(store.locks.get(&b), None);
+        revoke(&mut store);
+        assert_eq!(store.lock_entries.get(&b), Some(&FAR));
+    }
+
+    #[test]
+    fn an_entry_expires_at_its_deadline() {
+        let (mut store, [genesis, _, b, _]) = fork(&[]);
+        let deadline = vote_time(5);
+        store.add_lock_entry(b, deadline);
+        let viable = store.viable_tree(None);
+        assert_eq!(store.get_anchor(&viable), b);
+        store.advance_to(deadline - 1);
+        assert_eq!(store.get_anchor(&viable), b);
+        store.advance_to(deadline);
+        assert_eq!(store.get_anchor(&viable), genesis);
+    }
+
+    #[test]
+    fn the_anchor_is_the_deepest_viable_ancestor_of_an_entry() {
+        let (mut store, [_, a, b, _]) = fork(&[]);
+        store.add_lock_entry(b, FAR);
+        // Without B in the tree the anchor walks up to A.
+        let mut viable = store.viable_tree(None);
+        viable.remove(&b);
+        assert_eq!(store.get_anchor(&viable), a);
     }
 }

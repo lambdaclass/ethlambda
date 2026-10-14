@@ -1,10 +1,11 @@
-//! The cumulative node store Σ and its handlers.
+//! The node store: the FG state Σ, the AC state 𝒜, and their handlers.
 //!
-//! The store keeps messages and their receipt stamps, the processed block tree
-//! with every block's chain state, the finality caches, the fork-choice frame
-//! the finality gadget imposes, and the available chain's locks. Views,
-//! filtered trees and scores are derived when used, from stamps compared
-//! against past instants.
+//! The store keeps the processed block tree with every block's chain state
+//! and receipt stamp, the finality caches and the attestation pool (Σ), and
+//! the Goldfish votes, saved confirmations, lock entries, fast set and
+//! confirmation record of the available chain (𝒜). The FG frame, viable
+//! trees and scores are derived when used, from stamps compared against past
+//! instants.
 //!
 //! # Trust boundary
 //!
@@ -13,24 +14,25 @@
 //! each chain's keys and shuffling, so the host checks them before it calls a
 //! handler.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ethlambda_types::primitives::H256;
 
-use crate::chain_state::{ChainState, state_transition};
+use crate::chain_state::{ChainState, InvalidAttestation, state_transition};
 use crate::locks::CommitteeSizes;
-use crate::params::{Params, confirmation_time, slot_of, slot_start, support_cutoff};
+use crate::params::{Params, slot_of, slot_start, support_cutoff, vote_time};
 use crate::types::{
     Attestation, AttestationData, BlockInput, BlockRef, Electorate, GoldfishVote, Height, Slot,
     Tick, ValidatorIndex,
 };
 
-/// The stamp of the anchor block: `Σ.timestamp(B_gen) = −∞`.
+/// The stamp of the anchor block: `𝒜.timestamp[B_gen] = −∞`.
 pub const ANCHOR_STAMP: Tick = Tick::MIN;
 
-/// Attestations the pool keeps per validator. An honest validator attests
-/// once per height on its chain, plus once per reorg to another entry and
-/// once per new justification to finalize, so a handful covers every
+/// Attestations the pool keeps per validator, a resource bound the
+/// specification does not have. An honest validator sends at most one target
+/// per height and one timeout per entry at a height, and the pool drops what
+/// can no longer count on a viable chain, so a handful covers every
 /// attestation still useful; past it the oldest is evicted, which only ever
 /// costs the sender itself.
 pub const MAX_POOLED_ATTESTATIONS_PER_VALIDATOR: usize = 8;
@@ -42,12 +44,15 @@ pub(crate) struct Node {
     pub(crate) slot: Slot,
     /// Parent edges from the anchor.
     pub(crate) depth: u64,
-    /// `Σ.timestamp(B)`.
+    /// `𝒜.timestamp[B]`.
     pub(crate) stamp: Tick,
     /// `Σ.σ[B]`.
     pub(crate) state: ChainState,
     pub(crate) votes: Vec<GoldfishVote>,
     pub(crate) support_votes: Vec<GoldfishVote>,
+    /// `B.attestations`, so a proposal can leave out what its parent's chain
+    /// already carries.
+    pub(crate) attestations: Vec<Attestation>,
     pub(crate) children: Vec<H256>,
 }
 
@@ -76,67 +81,68 @@ pub enum BlockError {
     VoteOfWrongSlot { vote_slot: Slot, slot: Slot },
     #[error("support vote not among the carried votes")]
     SupportNotSubset,
+    #[error("carried attestation {0} is not well formed")]
+    MalformedAttestation(usize),
+    #[error(transparent)]
+    InvalidAttestation(#[from] InvalidAttestation),
 }
 
-/// What a tick asks the host to do. The store side of the tick (clock, fast
-/// unlocks, the confirmation update and its locks) has already run when this
-/// is returned.
+/// What a tick asks the host to do. The store side of the tick (clock,
+/// expiry, revocation, the confirmation update) has already run when this is
+/// returned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TickEvents {
     pub tick: Tick,
     pub slot: Slot,
     /// `t = t_s`, `s > 0`: the slot's proposer builds its block now.
     pub propose: bool,
-    /// `t = t_s + Δ`, `s > 0`: committee members cast their Goldfish vote.
+    /// `t = t_s + Δ`: committee members cast their Goldfish vote, after the
+    /// locks were revoked against the previous slot's votes.
     pub vote: bool,
-    /// `t = t_s + 2Δ`, `s > 0`, right after the confirmation update of slot
-    /// `s − 1`: every validator reads its attestation input and attests if
-    /// it has something new to say.
+    /// `t = a_r`, the action time of the round, right after the confirmation
+    /// update of its first slot: every validator runs the FG action
+    /// (`ATTEST`).
     pub attest: bool,
 }
 
-/// The fork-choice frame the finality gadget imposes on the available chain:
-/// the walk stays inside the descendants of `root` whose subtree reaches
-/// height `floor`.
+/// The fork-choice frame the finality gadget imposes on the available chain
+/// (`Φ.fc_root` and the head height floor that defines `Φ.viable_heads`).
 ///
 /// ```text
-/// J at h_max − 1?   a block at h_max not on J?   root   floor
-/// no                —                            F      h_max − 1
-/// yes               no                           J      h_max − 1
-/// yes               yes (a contest)              F      h_max
+/// h_max = h_j + 1?   a block at h_max not on J?   root   floor
+/// no                 —                            F      h_max − 1
+/// yes                no                           J      h_max − 1
+/// yes                yes (a contest)              F      h_max
 /// ```
-///
-/// A contest never goes away: once a block at `h_max` that does not extend
-/// `J` is seen, that `J` is spent for this `h_max`, even if finality later
-/// prunes the contesting branch. So each height changes the frame at most
-/// twice (J revealed, then contested) before it rises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     pub root: H256,
     pub floor: Height,
 }
 
-/// The decoupled-consensus store Σ.
+/// The decoupled-consensus store.
 #[derive(Debug, Clone)]
 pub struct Store {
     pub(crate) params: Params,
     pub(crate) electorate: Electorate,
-    /// `Σ.t`: the last tick run, `None` before the first.
+    /// The clock `t`: the last tick run, `None` before the first.
     pub(crate) time: Option<Tick>,
-    /// `Σ.s`.
+    /// `slot(t)`.
     pub(crate) slot: Slot,
     pub(crate) anchor: H256,
-    /// `Σ.𝒯` with `Σ.σ[·]` and `Σ.timestamp[·]` of blocks.
+    /// `Σ.𝒯` with `Σ.σ[·]` and `𝒜.timestamp[·]` of blocks.
     pub(crate) blocks: HashMap<H256, Node>,
     /// The finalized block's ancestors, indexed by depth, for O(1) ancestry
     /// below `Σ.F`.
     pub(crate) finalized_chain: Vec<H256>,
-    /// `Σ.gf_votes[·]`.
+    /// `𝒜.gf_votes[·]` with `𝒜.timestamp[·]` of votes.
     pub(crate) gf_votes: BTreeMap<Slot, Vec<PooledVote>>,
-    /// Attestations waiting to be carried by a block, by validator, oldest
-    /// first. They feed proposals only: the fork choice reads attestations
-    /// through the chain states of blocks, never from the network.
-    pub(crate) attestations: HashMap<ValidatorIndex, Vec<Attestation>>,
+    /// `Σ.attestations`, in the order of first acceptance. They feed
+    /// proposals only: the fork choice reads attestations through the chain
+    /// states of blocks, never from the network.
+    pub(crate) attestations: Vec<Attestation>,
+    pub(crate) pooled: HashSet<Attestation>,
+    pub(crate) pooled_per_validator: HashMap<ValidatorIndex, usize>,
     /// `|𝒦_s|`.
     pub(crate) committee_sizes: CommitteeSizes,
     /// `Σ.F`, and the height at which it was justified (`σ.h_F` of the
@@ -148,19 +154,23 @@ pub struct Store {
     pub(crate) justified_height: Height,
     /// `Σ.h_max`.
     pub(crate) max_height: Height,
-    /// The fork-choice frame, refreshed whenever a block is processed.
+    /// The FG frame, refreshed whenever the FG state changes.
     pub(crate) frame: Frame,
-    /// The `(h_max, J)` the frame last evaluated in full.
-    pub(crate) frame_key: Option<(Height, H256)>,
-    /// The `(h_max, J)` a contest has spent.
-    pub(crate) contested: Option<(Height, H256)>,
-    /// Locked blocks and their deadlines.
-    pub(crate) locks: HashMap<H256, Slot>,
-    /// The deepest block the latest confirmation update fast locked.
-    pub(crate) fg_confirmed: Option<H256>,
-    /// The latest confirmation updates, oldest first, at most `k` of them:
-    /// the slot and the block it confirmed, if any.
-    pub(crate) confirmations: VecDeque<(Slot, Option<H256>)>,
+    /// The `(h_max, J, F)` whose contest the frame last evaluated in full,
+    /// and the answer: the tree only grows while they stay, so only a new
+    /// block can start a contest.
+    pub(crate) frame_key: Option<(Height, H256, H256)>,
+    pub(crate) contested: bool,
+    /// `𝒜.lock_entries`: locked blocks and their deadlines. Entries on one
+    /// block keep the latest deadline, which locks exactly what the separate
+    /// entries would.
+    pub(crate) lock_entries: HashMap<H256, Tick>,
+    /// `𝒜.saved_confirmation[·]` of the slots the slow test can still read.
+    pub(crate) saved_confirmation: BTreeMap<Slot, Option<H256>>,
+    /// `𝒜.fast_blocks`.
+    pub(crate) fast_blocks: Vec<H256>,
+    /// `𝒜.latest_confirmed`.
+    pub(crate) latest_confirmed: H256,
 }
 
 impl Store {
@@ -184,6 +194,7 @@ impl Store {
             state: anchor_state,
             votes: Vec::new(),
             support_votes: Vec::new(),
+            attestations: Vec::new(),
             children: Vec::new(),
         };
         let committee_sizes = CommitteeSizes::fixed(electorate.len() as u64);
@@ -196,7 +207,9 @@ impl Store {
             blocks: HashMap::from([(root, node)]),
             finalized_chain: vec![root],
             gf_votes: BTreeMap::new(),
-            attestations: HashMap::new(),
+            attestations: Vec::new(),
+            pooled: HashSet::new(),
+            pooled_per_validator: HashMap::new(),
             committee_sizes,
             finalized: root,
             finalized_height: 0,
@@ -205,10 +218,11 @@ impl Store {
             max_height: 1,
             frame: Frame { root, floor: 0 },
             frame_key: None,
-            contested: None,
-            locks: HashMap::new(),
-            fg_confirmed: None,
-            confirmations: VecDeque::new(),
+            contested: false,
+            lock_entries: HashMap::new(),
+            saved_confirmation: BTreeMap::new(),
+            fast_blocks: Vec::new(),
+            latest_confirmed: root,
         };
         store.refresh_frame(None);
         store
@@ -232,12 +246,12 @@ impl Store {
         &self.electorate
     }
 
-    /// `Σ.t`, the last tick run.
+    /// The clock `t`, the last tick run.
     pub fn time(&self) -> Option<Tick> {
         self.time
     }
 
-    /// `Σ.s`.
+    /// `slot(t)`.
     pub fn current_slot(&self) -> Slot {
         self.slot
     }
@@ -264,57 +278,72 @@ impl Store {
         (first..=now).map(|t| self.on_tick(t)).collect()
     }
 
-    /// One public tick, store side.
-    ///
-    /// Advances the clock, then: at `t_s` and `t_s + Δ` steps locks back
-    /// before the proposer's and the voters' fork choice (each over the view
-    /// that run reads), and at `t_s + 2Δ` runs the confirmation update of
-    /// slot `s − 1`. Proposals, votes and attestations need the host's keys,
-    /// so they come back as [`TickEvents`]; the host runs them, in that order,
-    /// against the store as this call leaves it.
+    /// `on_tick(t)`, store side: advance the clock and run `AC_ON_TICK`
+    /// (expiry, then at `t_s + Δ` the revocation against the slot-`(s − 1)`
+    /// votes, and at `t_s + 2Δ` the confirmation update of slot `s − 1`).
+    /// The proposal, the vote and the FG action need the host's keys, so
+    /// they come back as [`TickEvents`]; the host runs them against the
+    /// store as this call leaves it.
     pub fn on_tick(&mut self, t: Tick) -> TickEvents {
         let slot = slot_of(t);
         self.time = Some(t);
         self.slot = slot;
         self.prune();
 
-        let start = slot_start(slot);
-        let propose = slot > 0 && t == start;
-        let vote = slot > 0 && t == start + 1;
-        let attest = slot > 0 && t == support_cutoff(slot);
-        if propose {
-            let votes = self.goldfish_votes(slot - 1);
-            self.step_back_locks(&votes, slot - 1);
-        }
+        // An entry expires at the first tick at or after its deadline.
+        self.lock_entries.retain(|_, deadline| *deadline > t);
+        let vote = t == vote_time(slot);
         if vote {
-            let view = self.voter_view(slot);
-            self.step_back_locks(&view.votes, slot - 1);
+            self.revoke_locks(slot);
         }
-        if attest {
-            self.update_confirmation(slot - 1);
+        if t == support_cutoff(slot) {
+            self.update_confirmation(slot);
         }
         TickEvents {
             tick: t,
             slot,
-            propose,
+            propose: slot > 0 && t == slot_start(slot),
             vote,
-            attest,
+            attest: self.params.is_action_time(t),
         }
     }
 
     /// Discard what no rule can read any more: Goldfish votes older than the
     /// previous slot (votes that old are refused on arrival and read by no
-    /// duty), expired locks, and attestations that can no longer count on
-    /// any viable chain.
+    /// duty), saved confirmations older than the slow window, lock entries
+    /// whose block left the tree, and attestations that can no longer count
+    /// on any viable chain.
     fn prune(&mut self) {
-        let oldest_slot = self.slot.saturating_sub(1);
-        self.gf_votes = self.gf_votes.split_off(&oldest_slot);
-        self.prune_locks();
+        let oldest_vote_slot = self.slot.saturating_sub(1);
+        self.gf_votes = self.gf_votes.split_off(&oldest_vote_slot);
+        let oldest_saved = self.slot.saturating_sub(self.params.lock_period + 1);
+        self.saved_confirmation = self.saved_confirmation.split_off(&oldest_saved);
+        let blocks = &self.blocks;
+        self.lock_entries
+            .retain(|block, _| blocks.contains_key(block));
+
         let (max_height, finalized_height) = (self.max_height, self.finalized_height);
-        self.attestations.retain(|_, pooled| {
-            pooled.retain(|attestation| useful(&attestation.data, max_height, finalized_height));
-            !pooled.is_empty()
-        });
+        let stale =
+            |attestation: &Attestation| !useful(&attestation.data, max_height, finalized_height);
+        if self.attestations.iter().any(stale) {
+            let (keep, drop): (Vec<_>, Vec<_>) = std::mem::take(&mut self.attestations)
+                .into_iter()
+                .partition(|attestation| !stale(attestation));
+            self.attestations = keep;
+            for attestation in drop {
+                self.forget_pooled(&attestation);
+            }
+        }
+    }
+
+    fn forget_pooled(&mut self, attestation: &Attestation) {
+        self.pooled.remove(attestation);
+        if let Some(count) = self.pooled_per_validator.get_mut(&attestation.validator) {
+            *count -= 1;
+            if *count == 0 {
+                self.pooled_per_validator.remove(&attestation.validator);
+            }
+        }
     }
 
     // ── Ancestry ───────────────────────────────────────────────────────────
@@ -387,21 +416,6 @@ impl Store {
         self.is_ancestor(a, b) || self.is_ancestor(b, a)
     }
 
-    /// The deepest common ancestor of two processed blocks.
-    pub(crate) fn meet(&self, a: &H256, b: &H256) -> Option<H256> {
-        let depth_a = self.depth(a)?;
-        let depth_b = self.depth(b)?;
-        let mut depth = depth_a.min(depth_b);
-        let mut x = self.ancestor_at_depth(a, depth)?;
-        let mut y = self.ancestor_at_depth(b, depth)?;
-        while x != y {
-            depth = depth.checked_sub(1)?;
-            x = self.blocks.get(&x)?.parent?;
-            y = self.blocks.get(&y)?.parent?;
-        }
-        Some(x)
-    }
-
     /// "Deepest" with the fixed tie-break: greater depth, then greater root.
     pub(crate) fn deeper(&self, a: &H256, b: &H256) -> bool {
         let (da, db) = (self.depth(a).unwrap_or(0), self.depth(b).unwrap_or(0));
@@ -410,12 +424,14 @@ impl Store {
 
     // ── Handlers ───────────────────────────────────────────────────────────
 
-    /// `on_block(Σ, B)`: admit a block whose parent is held, compute its chain
-    /// state, stamp it, unpack its Goldfish votes, fold its finality, refresh
-    /// the fork-choice frame, and offer its attestations to the pool.
+    /// `on_block(B)`: `FG_ON_BLOCK` (admit a block whose parent is held and
+    /// that extends `Σ.F`, compute its chain state, fold its finality, offer
+    /// its attestations to the pool), then `AC_ON_BLOCK` (stamp it and
+    /// unpack its Goldfish votes). A refused block changes nothing.
     ///
-    /// The host must have checked the proposer schedule, every signature, and
-    /// the committee membership of every carried vote.
+    /// The host must have checked the proposer schedule, every signature, the
+    /// committee membership of every carried vote, and the form of every
+    /// carried attestation.
     pub fn on_block(&mut self, block: &BlockInput) -> Result<(), BlockError> {
         if block.slot > self.slot {
             return Err(BlockError::FutureSlot {
@@ -435,6 +451,7 @@ impl Store {
                 parent_slot: parent.slot,
             });
         }
+        // `AC_VALID_PAYLOAD(B)`.
         if let Some(vote) = block.votes.iter().find(|v| v.slot + 1 != block.slot) {
             return Err(BlockError::VoteOfWrongSlot {
                 vote_slot: vote.slot,
@@ -447,6 +464,15 @@ impl Store {
             .any(|support| !block.votes.contains(support))
         {
             return Err(BlockError::SupportNotSubset);
+        }
+        // The forms of section 2, which a handler requires of every
+        // attestation a block carries.
+        if let Some(index) = block
+            .attestations
+            .iter()
+            .position(|attestation| !attestation.data.is_well_formed())
+        {
+            return Err(BlockError::MalformedAttestation(index));
         }
         if !self.is_ancestor(&self.finalized, &block.parent_root) {
             return Err(BlockError::NotDescendantOfFinalized);
@@ -463,15 +489,16 @@ impl Store {
             &block.attestations,
             &self.params,
             &self.electorate,
-        );
+        )?;
         let node = Node {
             parent: Some(block.parent_root),
             slot: block.slot,
             depth: parent_depth + 1,
             stamp: self.now(),
-            state,
+            state: state.clone(),
             votes: block.votes.clone(),
             support_votes: block.support_votes.clone(),
+            attestations: block.attestations.clone(),
             children: Vec::new(),
         };
         self.blocks.insert(block.root, node);
@@ -481,20 +508,18 @@ impl Store {
             .children
             .push(block.root);
 
-        for vote in &block.votes {
-            self.on_goldfish_vote(*vote);
-        }
-        let state = self.blocks[&block.root].state.clone();
-        self.update_finality(&state);
-        self.refresh_frame(Some(block.root));
+        self.update_finality(&state, block.root);
         for attestation in &block.attestations {
             self.on_attestation(attestation.clone());
+        }
+        for vote in &block.votes {
+            self.on_goldfish_vote(*vote);
         }
         Ok(())
     }
 
-    /// `on_goldfish_vote(Σ, vote)`. Returns whether the vote entered the pool.
-    /// The host must have checked the committee and the signature.
+    /// `on_goldfish_vote(𝒜, t, vote)`. Returns whether the vote entered the
+    /// pool. The host must have checked the committee and the signature.
     pub fn on_goldfish_vote(&mut self, vote: GoldfishVote) -> bool {
         if vote.slot < self.slot.saturating_sub(1) || vote.slot > self.slot {
             return false;
@@ -515,34 +540,44 @@ impl Store {
         true
     }
 
-    /// Admit an attestation to the pool proposals draw from, unless it says
-    /// nothing, is already held, or can no longer count on any viable chain.
-    /// Returns whether it entered the pool. The host must have checked the
-    /// signature.
+    /// `FG_ON_ATTESTATION(Σ, a)`: add a well-formed attestation to the pool
+    /// proposals draw from, one copy of each. Returns whether it entered the
+    /// pool. The host must have checked the signature.
     ///
-    /// Attestations never reach the fork choice from here: they count only
-    /// once a block carries them, through its chain state. A node that drops
-    /// network attestations still follows the chain.
+    /// Two resource bounds the specification does not have: an attestation
+    /// that can no longer count on any viable chain is not kept, and each
+    /// validator keeps at most [`MAX_POOLED_ATTESTATIONS_PER_VALIDATOR`].
     pub fn on_attestation(&mut self, attestation: Attestation) -> bool {
-        if attestation.data.is_empty() || !self.attestation_is_useful(&attestation.data) {
+        if !attestation.data.is_well_formed()
+            || !self.attestation_is_useful(&attestation.data)
+            || self.pooled.contains(&attestation)
+        {
             return false;
         }
-        let pooled = self.attestations.entry(attestation.validator).or_default();
-        if pooled.contains(&attestation) {
-            return false;
-        }
-        pooled.push(attestation);
-        if pooled.len() > MAX_POOLED_ATTESTATIONS_PER_VALIDATOR {
-            pooled.remove(0);
+        let validator = attestation.validator;
+        let count = self.pooled_per_validator.entry(validator).or_default();
+        *count += 1;
+        let evict = *count > MAX_POOLED_ATTESTATIONS_PER_VALIDATOR;
+        self.pooled.insert(attestation.clone());
+        self.attestations.push(attestation);
+        if evict
+            && let Some(oldest) = self
+                .attestations
+                .iter()
+                .position(|pooled| pooled.validator == validator)
+        {
+            let oldest = self.attestations.remove(oldest);
+            self.forget_pooled(&oldest);
         }
         true
     }
 
     /// `update_finality(Σ, σ)`: raise `h_max`, adopt a lex-greater
-    /// justification compatible with `Σ.F`, and advance `Σ.F` to a viable
-    /// proper descendant below `Σ.J`. The three statements run in order, each
-    /// reading the store the previous one left.
-    fn update_finality(&mut self, state: &ChainState) {
+    /// justification compatible with `Σ.F`, and advance `Σ.F` to a proper
+    /// descendant at or below `Σ.J` with a viable descendant. Each statement
+    /// reads the store the previous one left, so the viability test reads
+    /// the frame of the new `h_max` and `J`.
+    fn update_finality(&mut self, state: &ChainState, new_block: H256) {
         self.max_height = self.max_height.max(state.height);
         if self.is_ancestor(&self.finalized, &state.justified.root)
             && (state.justified_height, state.justified.root)
@@ -551,42 +586,48 @@ impl Store {
             self.justified = state.justified.root;
             self.justified_height = state.justified_height;
         }
+        self.refresh_frame(Some(new_block));
         let candidate = state.finalized.root;
         if candidate != self.finalized
             && self.is_ancestor(&self.finalized, &candidate)
             && self.is_ancestor(&candidate, &self.justified)
-            && self.is_viable(&candidate)
+            && self.has_viable_descendant(&candidate)
         {
             self.advance_finalized(candidate);
             self.finalized_height = state.finalized_height;
+            self.refresh_frame(None);
         }
     }
 
-    /// Recompute the fork-choice frame after `new_block` was processed (or
-    /// from scratch with `None`). See [`Frame`].
+    /// Recompute the frame (`fg_contest`, `head_height_floor`,
+    /// `get_fc_root`) after `new_block` was added, or from scratch with
+    /// `None`. See [`Frame`].
     fn refresh_frame(&mut self, new_block: Option<H256>) {
         let floor = self.max_height.saturating_sub(1);
         if self.justified_height + 1 != self.max_height {
+            self.frame_key = None;
+            self.contested = false;
             self.frame = Frame {
                 root: self.finalized,
                 floor,
             };
             return;
         }
-        let key = (self.max_height, self.justified);
+        // Every accepted block extends `Σ.F` or is one of its ancestors, and
+        // an ancestor of `F ⪯ J` is below `h_j`, so the whole tree can be
+        // read in place of `Φ.tree`.
+        let key = (self.max_height, self.justified, self.finalized);
         let contests = |store: &Self, block: &H256| {
-            store.blocks[block].state.height >= store.max_height
+            store.blocks[block].state.height == store.max_height
                 && !store.is_ancestor(&store.justified, block)
         };
-        let contested = self.contested == Some(key)
-            || match new_block {
-                // Every other block was evaluated against this key already.
-                Some(block) if self.frame_key == Some(key) => contests(self, &block),
-                _ => self.blocks.keys().any(|block| contests(self, block)),
-            };
+        self.contested = match new_block {
+            // The tree only grew by this block since the key was evaluated.
+            Some(block) if self.frame_key == Some(key) => self.contested || contests(self, &block),
+            _ => self.blocks.keys().any(|block| contests(self, block)),
+        };
         self.frame_key = Some(key);
-        self.frame = if contested {
-            self.contested = Some(key);
+        self.frame = if self.contested {
             Frame {
                 root: self.finalized,
                 floor: self.max_height,
@@ -601,7 +642,7 @@ impl Store {
 
     /// Move `Σ.F` to `new` and drop every branch that now conflicts with it:
     /// the admission guard refuses their children, so nothing can extend
-    /// them. Locks on dropped blocks go with them at the next tick.
+    /// them. Lock entries on dropped blocks go with them at the next tick.
     fn advance_finalized(&mut self, new: H256) {
         let old = self.finalized;
         let mut path = Vec::new();
@@ -675,15 +716,9 @@ impl Store {
         self.max_height
     }
 
-    /// The fork-choice frame.
+    /// The FG frame.
     pub fn frame(&self) -> Frame {
         self.frame
-    }
-
-    /// The deepest block the latest confirmation update fast locked, if it is
-    /// still in the tree.
-    pub fn fg_confirmed(&self) -> Option<BlockRef> {
-        self.fg_confirmed.and_then(|root| self.block_ref(&root))
     }
 
     /// The Goldfish votes held for `slot`, in arrival order.
@@ -701,14 +736,9 @@ impl Store {
         useful(data, self.max_height, self.finalized_height)
     }
 
-    /// Every pooled attestation, by validator and then arrival.
-    pub fn pooled_attestations(&self) -> Vec<Attestation> {
-        let mut validators: Vec<&ValidatorIndex> = self.attestations.keys().collect();
-        validators.sort();
-        validators
-            .into_iter()
-            .flat_map(|validator| self.attestations[validator].iter().cloned())
-            .collect()
+    /// `Σ.attestations`, in the order of first acceptance.
+    pub fn pooled_attestations(&self) -> &[Attestation] {
+        &self.attestations
     }
 
     /// Every processed block as `(root, parent, slot)`, for diagnostics.
@@ -718,36 +748,34 @@ impl Store {
             .map(|(root, node)| (*root, node.parent, node.slot))
     }
 
-    /// `Σ.resolution_time(vote)` for a Goldfish vote: `+∞` (`None`) while the
-    /// head is unknown or of a later slot, else the later of the two stamps.
+    /// `resolution_time(𝒜, Φ, vote)`: `+∞` (`None`) while the head is
+    /// unknown or of a later slot, else the later of the two stamps.
     pub(crate) fn vote_resolution(&self, vote: &GoldfishVote, stamp: Tick) -> Option<Tick> {
         let head = self.blocks.get(&vote.head)?;
         (head.slot <= vote.slot).then(|| stamp.max(head.stamp))
     }
 
-    /// Whether a vote's head resolves in the tree at all (finite resolution).
+    /// Whether a vote is resolved (finite resolution time).
     pub(crate) fn vote_resolves(&self, vote: &GoldfishVote) -> bool {
         self.blocks
             .get(&vote.head)
             .is_some_and(|head| head.slot <= vote.slot)
     }
-
-    pub(crate) fn confirmation_window(&self, slot: Slot) -> (Tick, Tick) {
-        (support_cutoff(slot), confirmation_time(slot))
-    }
 }
 
-/// Whether attestation data can still count on some viable chain: a height
-/// pair at the band of viable heights or above, or a finality pair for a
-/// justification above `Σ.h_F`.
+/// Whether attestation data can still be valid against the state of a
+/// viable head. Every viable head has state height at least `h_max − 1`, so
+/// its own entry is at `h_max − 1` or above, and its pending pairs are above
+/// its finalized height and below `h_max`. Reading `Σ.h_F` for the chain's
+/// finalized height drops finality pairs at or below `Σ.F`, which no chain
+/// extending `Σ.F` needs.
 fn useful(data: &AttestationData, max_height: Height, finalized_height: Height) -> bool {
-    let height = data
-        .height_pair()
-        .is_some_and(|pair| pair.height + 1 >= max_height);
-    let finality = data
-        .finality_pair()
-        .is_some_and(|pair| pair.height > finalized_height);
-    height || finality
+    let height = data.height_pair().height;
+    height + 1 >= max_height
+        || (height < max_height
+            && data
+                .finality_pair()
+                .is_some_and(|pair| pair.height > finalized_height))
 }
 
 #[cfg(test)]
@@ -765,11 +793,11 @@ mod tests {
             .map(|validator| Attestation {
                 validator,
                 data: AttestationData::new(
-                    Some(HeightVote {
+                    HeightVote {
                         height,
                         entry,
                         timeout,
-                    }),
+                    },
                     None,
                 ),
             })
@@ -813,10 +841,10 @@ mod tests {
         assert_eq!(store.frame(), Frame { root: a1, floor: 2 });
 
         // G ← C1 reaches height 2 on its own justification of G: a branch
-        // at h_max − 1 that J revealed late pulls the root away from.
+        // at h_max − 1, below the floor once J is the root.
         let c1 = block(&mut store, 3, 3, genesis, height_votes(1, genesis, false));
         assert_eq!(store.frame(), Frame { root: a1, floor: 2 });
-        assert!(!store.filtered_block_tree().contains(&c1));
+        assert!(!store.viable_block_tree().contains(&c1));
 
         // C1 ← C2 times out of height 2 into h_max without A1: a contest. The
         // root falls back to F and the floor rises to h_max.
@@ -829,10 +857,10 @@ mod tests {
                 floor: 3
             }
         );
-        let tree = store.filtered_block_tree();
+        let tree = store.viable_block_tree();
         assert!(tree.contains(&b) && tree.contains(&c2));
 
-        // The contest is spent for this (h_max, J): it stays whatever comes.
+        // The contest lasts while its witness is in the tree.
         block(&mut store, 5, 6, b, Vec::new());
         assert_eq!(
             store.frame(),
@@ -841,6 +869,27 @@ mod tests {
                 floor: 3
             }
         );
+    }
+
+    #[test]
+    fn a_block_carrying_an_invalid_attestation_is_refused() {
+        let genesis = H256::ZERO;
+        let mut store = Store::from_genesis(Params::default(), Electorate::uniform(4), genesis);
+        store.advance_to(slot_start(4));
+        let input = BlockInput {
+            root: root(1),
+            parent_root: genesis,
+            slot: 1,
+            proposer: 0,
+            votes: Vec::new(),
+            support_votes: Vec::new(),
+            attestations: height_votes(1, root(9), false),
+        };
+        assert!(matches!(
+            store.on_block(&input),
+            Err(BlockError::InvalidAttestation(_))
+        ));
+        assert!(!store.contains(&input.root));
     }
 
     #[test]
@@ -856,19 +905,27 @@ mod tests {
         let current = Attestation {
             validator: 3,
             data: AttestationData::new(
-                Some(HeightVote {
+                HeightVote {
                     height: 3,
                     entry: root(2),
                     timeout: false,
-                }),
+                },
                 None,
             ),
         };
         assert!(store.on_attestation(current.clone()));
         assert!(!store.on_attestation(current), "already held");
-        assert!(!store.on_attestation(Attestation {
+        let malformed = Attestation {
             validator: 3,
-            data: AttestationData::default(),
-        }));
+            data: AttestationData::new(
+                HeightVote {
+                    height: 0,
+                    entry: root(2),
+                    timeout: false,
+                },
+                None,
+            ),
+        };
+        assert!(!store.on_attestation(malformed));
     }
 }

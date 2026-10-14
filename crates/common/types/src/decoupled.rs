@@ -2,8 +2,8 @@
 //!
 //! The unsigned objects of Goldilocks (Goldfish votes, finality attestations,
 //! the finality gadget's chain state): Goldfish with locks as the available
-//! chain, composed with the height-based finality gadget of
-//! `fradamt/verified-consensus`. The protocol logic lives in
+//! chain, composed with a height-based finality gadget, as the Goldilocks
+//! specification defines them. The protocol logic lives in
 //! `ethlambda-decoupled`; these live here so that the lean and the beacon wire
 //! containers, which this crate defines, can embed them.
 //!
@@ -99,64 +99,56 @@ pub struct FinalityVote {
 }
 
 /// Everything an attestation says, minus the signer: `(h, T, timeout, h_f,
-/// T_f)`, a height pair and a finality pair, either of which may be absent.
+/// T_f)`, a height pair and an optional finality pair.
 ///
 /// Attestations are pure finality votes: there is no round and no safe block.
 /// This is what validators sign, and what the beacon host aggregates over:
-/// honest validators with the same view emit identical data, whenever they
-/// attest.
+/// honest validators with the same view emit identical data. A handler admits
+/// one only when it is [well formed](AttestationData::is_well_formed).
 #[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    Default,
-    Serialize,
-    Deserialize,
-    SszEncode,
-    SszDecode,
-    HashTreeRoot,
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
 )]
 #[serde(into = "AttestationDataJson", from = "AttestationDataJson")]
 pub struct AttestationData {
-    pub height_pair: SszList<HeightVote, 1>,
+    pub height_pair: HeightVote,
     pub finality_pair: SszList<FinalityVote, 1>,
 }
 
 impl AttestationData {
-    pub fn new(height_pair: Option<HeightVote>, finality_pair: Option<FinalityVote>) -> Self {
+    pub fn new(height_pair: HeightVote, finality_pair: Option<FinalityVote>) -> Self {
         Self {
-            height_pair: option_list(height_pair),
+            height_pair,
             finality_pair: option_list(finality_pair),
         }
     }
 
-    pub fn height_pair(&self) -> Option<HeightVote> {
-        self.height_pair.first().copied()
+    pub fn height_pair(&self) -> HeightVote {
+        self.height_pair
     }
 
     pub fn finality_pair(&self) -> Option<FinalityVote> {
         self.finality_pair.first().copied()
     }
 
-    /// Neither pair: an attestation that says nothing.
-    pub fn is_empty(&self) -> bool {
-        self.height_pair.is_empty() && self.finality_pair.is_empty()
+    /// The forms of the spec's section 2: a height pair at a height `h ≥ 1`,
+    /// and a finality pair that is absent or below it (`h_f < h`).
+    pub fn is_well_formed(&self) -> bool {
+        let height = self.height_pair.height;
+        height >= 1 && self.finality_pair().is_none_or(|pair| pair.height < height)
     }
 }
 
-/// The JSON shape of [`AttestationData`]: absent fields are `null`.
+/// The JSON shape of [`AttestationData`]: an absent finality pair is `null`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AttestationDataJson {
-    height_pair: Option<HeightVote>,
+    height_pair: HeightVote,
     finality_pair: Option<FinalityVote>,
 }
 
 impl From<AttestationData> for AttestationDataJson {
     fn from(data: AttestationData) -> Self {
         Self {
-            height_pair: data.height_pair(),
+            height_pair: data.height_pair,
             finality_pair: data.finality_pair(),
         }
     }
@@ -207,10 +199,23 @@ pub struct BlockRef {
 /// One bit per validator, sized to the electorate.
 pub type ValidatorBits = SszBitlist<VALIDATOR_LIMIT>;
 
+/// One entry of `σ.pending_finality`: a justification `(j, T)` above `h_F`
+/// that is not finalized yet, with its `finality_participation[j]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingFinality {
+    /// `j`: the height `T` was justified at.
+    pub height: Height,
+    /// `T`.
+    pub target: BlockRef,
+    /// `finality_participation[j]`, whose set is `Q_fin(σ, j)`.
+    #[serde(skip)]
+    pub participation: ValidatorBits,
+}
+
 /// The chain state σ of the finality gadget.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, SszEncode, SszDecode, HashTreeRoot,
-)]
+///
+/// Node-derived and never on the wire, so it has no SSZ encoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChainState {
     /// `L`: the latest block.
     pub latest: BlockRef,
@@ -220,17 +225,15 @@ pub struct ChainState {
     pub height: Height,
     /// `T_h`: the block that brought the chain into height `h`.
     pub entry: BlockRef,
-    /// `nj`: computed on entry into `h`, fixed until the height changes.
-    pub nonjustifiable: bool,
     /// `target_participation`, `Q_target`.
     #[serde(skip)]
     pub target_participation: ValidatorBits,
     /// `progress`, `Q_prog`.
     #[serde(skip)]
     pub progress: ValidatorBits,
-    /// `finalize`, `Q_finality`.
-    #[serde(skip)]
-    pub finalize: ValidatorBits,
+    /// `pending_finality` with `finality_participation[·]`: at most `K_W`
+    /// justifications in increasing height, each with `h_F < j ≤ h_j`.
+    pub pending_finality: Vec<PendingFinality>,
     /// `J`: the latest justification on the chain.
     pub justified: BlockRef,
     /// `h_j`: its height.
@@ -243,7 +246,7 @@ pub struct ChainState {
 
 impl ChainState {
     /// The initial state: `L = T_h = J = F = B_gen`, `s = 0`, `h = 1`,
-    /// `h_j = h_F = 0`, `nj = false`, every bit clear.
+    /// `h_j = h_F = 0`, every bit clear, nothing pending.
     ///
     /// `anchor` is genesis on a chain that runs the protocol from slot 0.
     pub fn initial(anchor: BlockRef, validator_count: usize) -> Self {
@@ -253,15 +256,21 @@ impl ChainState {
             slot: anchor.slot,
             height: 1,
             entry: anchor,
-            nonjustifiable: false,
             target_participation: empty.clone(),
-            progress: empty.clone(),
-            finalize: empty,
+            progress: empty,
+            pending_finality: Vec::new(),
             justified: anchor,
             justified_height: 0,
             finalized: anchor,
             finalized_height: 0,
         }
+    }
+
+    /// The entry of `pending_finality` that a finality pair names, if any.
+    pub fn pending(&self, pair: &FinalityVote) -> Option<&PendingFinality> {
+        self.pending_finality
+            .iter()
+            .find(|pending| pending.height == pair.height && pending.target.root == pair.target)
     }
 }
 
@@ -269,8 +278,8 @@ fn empty_bits(validator_count: usize) -> ValidatorBits {
     ValidatorBits::with_length(validator_count).expect("validator count within the registry limit")
 }
 
-/// A live lock of the available chain: `block` stays locked for every
-/// fork-choice run that reads votes of a slot before `deadline`.
+/// A live lock entry of the available chain: `block` (and every ancestor)
+/// stays locked until the entry expires at the vote time of slot `deadline`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LockStatus {
     pub block: BlockRef,
@@ -286,13 +295,14 @@ pub struct DecoupledStatus {
     pub slot: Slot,
     /// The fork-choice head.
     pub head: BlockRef,
-    /// The confirmed (locked) tip: the fork-choice anchor when it is a live
-    /// lock, else `Σ.F`.
+    /// The available tip `AC_CONFIRMED`: the confirmation record while it
+    /// is in the tree, else `Σ.F`.
     pub confirmed: BlockRef,
-    /// The deepest block the latest confirmation update fast locked, whose
-    /// state supplies the height pair of attestations.
-    pub fg_confirmed: Option<BlockRef>,
-    /// The live locks, deepest first.
+    /// The source an FG action would read now: the deepest block of the
+    /// full viable tree that the latest confirmation update locked by the
+    /// fast test. Its state supplies the height pair of attestations.
+    pub source: Option<BlockRef>,
+    /// The live lock entries, deepest first.
     pub locks: Vec<LockStatus>,
     /// `Σ.F` and the height it was justified at.
     pub finalized: BlockRef,

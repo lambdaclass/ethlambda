@@ -415,9 +415,9 @@ impl DecoupledLeanServer {
         debug!(slot, head = %ShortRoot(&head.0), "Cast Goldfish votes");
     }
 
-    /// The attestation duty at `t_s + 2Δ`: every validator, through its own
-    /// record, which releases an attestation only when one of its pairs is
-    /// new.
+    /// The FG action at `a_r`, once per round: every validator, through its
+    /// own record, which releases an attestation only with a new height
+    /// pair.
     fn attest(&mut self, slot: u64) {
         let input = self.engine.attestation_input();
         let epoch = attestation_epoch(slot) as u32;
@@ -463,9 +463,9 @@ impl DecoupledLeanServer {
             info!(
                 slot,
                 validators = attested,
-                height = height.map(|pair| pair.height),
-                entry = height.map(|pair| ShortRoot(&pair.entry.0).to_string()),
-                timeout = height.map(|pair| pair.timeout),
+                height = height.height,
+                entry = %ShortRoot(&height.entry.0),
+                timeout = height.timeout,
                 finality_height = finality.map(|pair| pair.height),
                 finality_target = finality.map(|pair| ShortRoot(&pair.target.0).to_string()),
                 "Attested"
@@ -705,7 +705,8 @@ impl DecoupledLeanServer {
     /// An envelope naming a slot ahead of the clock is refused: no honest
     /// attester signs at an epoch it has not reached.
     fn verify_attestation(&mut self, signed: &SignedDecoupledAttestation) -> bool {
-        if signed.slot > self.engine.current_slot() + 1 {
+        if signed.slot > self.engine.current_slot() + 1 || !signed.attestation.data.is_well_formed()
+        {
             return false;
         }
         let envelope = signed.hash_tree_root();
@@ -844,7 +845,7 @@ impl DecoupledLeanServer {
                 slot: 0,
             }),
             confirmed: engine.confirmed(),
-            fg_confirmed: engine.fg_confirmed(),
+            source: engine.source().and_then(|root| engine.block_ref(&root)),
             locks: engine.locks(),
             finalized: engine.finalized(),
             finalized_height: engine.finalized_height(),

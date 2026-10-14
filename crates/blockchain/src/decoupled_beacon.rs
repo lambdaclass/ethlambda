@@ -1,8 +1,8 @@
 //! The beacon chain actor's side of the `decoupled` fork.
 //!
 //! From the fork on, the head is the decoupled engine's, not LMD-GHOST's, and
-//! the execution client hears the engine's confirmed (locked) and finalized
-//! blocks as `safe` and `finalized`. The legacy FFG checkpoints of the store stay where
+//! the execution client hears the engine's available tip (`AC_CONFIRMED`) and
+//! finalized block as `safe` and `finalized`. The legacy FFG checkpoints of the store stay where
 //! the fork left them: nothing epoch-based may prune or gate on a finalized
 //! block the decoupled protocol chose at an arbitrary slot (see
 //! `docs/decoupled_consensus.md`).
@@ -86,6 +86,10 @@ impl BlockChainServer {
                 attestations = input.attestations.len(),
                 "Decoupled engine imported block"
             ),
+            // The engine's refusal is the protocol's (for instance a carried
+            // attestation that is not valid against the parent's state): the
+            // block stays in the beacon store, but neither it nor any
+            // descendant ever enters the fork choice.
             Err(err) => warn!(
                 slot = input.slot,
                 block_root = %ShortRoot(&root.0),
@@ -117,7 +121,7 @@ impl BlockChainServer {
                 head_slot = status.head.slot,
                 head_root = %ShortRoot(&head.0),
                 confirmed_slot = status.confirmed.slot,
-                fg_confirmed_slot = status.fg_confirmed.map(|block| block.slot),
+                source_slot = status.source.map(|block| block.slot),
                 locks = status.locks.len(),
                 finalized_slot = status.finalized.slot,
                 finalized_height = status.finalized_height,
@@ -133,8 +137,9 @@ impl BlockChainServer {
     }
 
     /// The `safe` and `finalized` blocks for `forkchoiceUpdated`: the engine's
-    /// confirmed (locked) and finalized tips. A lock survives bounded
-    /// asynchrony, which is what `safe` promises.
+    /// available tip (`AC_CONFIRMED`) and finalized block. The available tip
+    /// survives bounded asynchrony behind the locks, which is what `safe`
+    /// promises.
     pub(crate) fn decoupled_safe_and_finalized(&self) -> Option<(H256, H256)> {
         let node = self.decoupled.as_ref()?;
         let node = node.lock().expect("decoupled node lock poisoned");

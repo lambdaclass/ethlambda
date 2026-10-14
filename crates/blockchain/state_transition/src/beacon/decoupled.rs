@@ -47,8 +47,8 @@ use crate::beacon::stf::ExecutionEngine;
 pub fn params(config: &Config) -> Params {
     Params {
         lock_period: config.decoupled_lock_period,
-        nonjustifiable_period: config.decoupled_nonjustifiable_period,
-        finality_debt: config.decoupled_finality_debt,
+        slots_per_round: config.decoupled_slots_per_round,
+        pending_window: config.decoupled_pending_finality_window,
         timeout_delay: config.decoupled_timeout_delay,
     }
 }
@@ -232,7 +232,7 @@ pub fn process_decoupled_body(
     let validator_count = state.validator_count();
     for aggregate in body.combined_attestations.iter() {
         let data = &aggregate.data;
-        verify(!data.is_empty(), "combined attestation names a pair")?;
+        verify(data.is_well_formed(), "combined attestation is well formed")?;
         if aggregate.aggregation_bits.len() != validator_count {
             return Err(Error::InvalidDecoupledVote(
                 "combined aggregation_bits length != validator count",
@@ -561,11 +561,11 @@ mod tests {
 
     fn combined_aggregate(state: &BeaconState, signers: &[usize]) -> CombinedAttestationAggregate {
         let data = AttestationData::new(
-            Some(HeightVote {
+            HeightVote {
                 height: 1,
                 entry: Root::repeat_byte(0x22),
                 timeout: false,
-            }),
+            },
             None,
         );
         let domain = get_domain_from_schedule(
@@ -727,11 +727,12 @@ mod tests {
         empty.body.combined_attestations = vec![aggregate].try_into().unwrap();
         assert!(apply(&mut state.clone(), &empty, false).is_err());
 
-        let mut silent = block.clone();
+        // Height 0 is not a form any handler admits.
+        let mut malformed = block.clone();
         let mut aggregate = combined_aggregate(&state, &[1]);
-        aggregate.data = AttestationData::default();
-        silent.body.combined_attestations = vec![aggregate].try_into().unwrap();
-        assert!(apply(&mut state.clone(), &silent, false).is_err());
+        aggregate.data.height_pair.height = 0;
+        malformed.body.combined_attestations = vec![aggregate].try_into().unwrap();
+        assert!(apply(&mut state.clone(), &malformed, false).is_err());
 
         let mut unmatched = block;
         unmatched.body.goldfish_votes = vec![goldfish_aggregate(&state, state.slot() - 1, 2)]

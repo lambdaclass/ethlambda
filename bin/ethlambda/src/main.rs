@@ -996,6 +996,8 @@ fn beacon_decoupled_node(
         genesis_root = %ethlambda_types::ShortRoot(&anchor.root.0),
         validators,
         lock_period = config.decoupled_lock_period,
+        slots_per_round = config.decoupled_slots_per_round,
+        pending_window = config.decoupled_pending_finality_window,
         replayed,
         "Running the decoupled fork from genesis"
     );
@@ -1018,11 +1020,11 @@ fn decoupled_setup(
         .or(keys.lock_period)
         .unwrap_or(ethlambda_decoupled::DEFAULT_LOCK_PERIOD);
     let mut params = ethlambda_decoupled::Params::with_lock_period(lock_period);
-    if let Some(period) = keys.nonjustifiable_period {
-        params.nonjustifiable_period = period;
+    if let Some(slots) = keys.slots_per_round {
+        params.slots_per_round = slots;
     }
-    if let Some(debt) = keys.finality_debt {
-        params.finality_debt = debt;
+    if let Some(window) = keys.pending_finality_window {
+        params.pending_window = window;
     }
     if let Some(delay) = keys.timeout_delay {
         params.timeout_delay = delay;
@@ -1050,8 +1052,8 @@ fn decoupled_setup(
         .collect();
     info!(
         lock_period = params.lock_period,
-        nonjustifiable_period = params.nonjustifiable_period,
-        finality_debt = params.finality_debt,
+        slots_per_round = params.slots_per_round,
+        pending_window = params.pending_window,
         timeout_delay = params.timeout_delay,
         genesis_root = %ethlambda_types::ShortRoot(&genesis_root.0),
         "Decoupled consensus configured"
@@ -1811,8 +1813,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         decoupled_fork_version: _,
         decoupled_fork_epoch: _,
         decoupled_lock_period: _,
-        decoupled_nonjustifiable_period: _,
-        decoupled_finality_debt: _,
+        decoupled_slots_per_round: _,
+        decoupled_pending_finality_window: _,
         decoupled_timeout_delay: _,
         gloas_fork_version: _,
         gloas_fork_epoch: _,
@@ -1950,8 +1952,8 @@ fn first_config_difference(persisted: &Config, supplied: &Config) -> Option<Stri
         decoupled_fork_version,
         decoupled_fork_epoch,
         decoupled_lock_period,
-        decoupled_nonjustifiable_period,
-        decoupled_finality_debt,
+        decoupled_slots_per_round,
+        decoupled_pending_finality_window,
         decoupled_timeout_delay,
         gloas_fork_version,
         gloas_fork_epoch,

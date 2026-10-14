@@ -884,11 +884,11 @@ mod tests {
     fn a_combined_attestation_signs_under_the_decoupled_fork_version() {
         let context = decoupled_context();
         let inside = DecoupledAttestationData::new(
-            Some(ethlambda_types::decoupled::HeightVote {
+            ethlambda_types::decoupled::HeightVote {
                 height: 4,
                 entry: Root::repeat_byte(3),
                 timeout: false,
-            }),
+            },
             None,
         );
         assert_eq!(

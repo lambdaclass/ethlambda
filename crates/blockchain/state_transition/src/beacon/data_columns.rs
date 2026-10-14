@@ -441,7 +441,14 @@ mod tests {
         body.combined_attestations =
             SszList::try_from(vec![decoupled::CombinedAttestationAggregate {
                 aggregation_bits: libssz_types::SszBitlist::with_length(3).unwrap(),
-                data: Default::default(),
+                data: ethlambda_types::decoupled::AttestationData::new(
+                    ethlambda_types::decoupled::HeightVote {
+                        height: 1,
+                        entry: Default::default(),
+                        timeout: false,
+                    },
+                    None,
+                ),
                 signature: Default::default(),
             }])
             .unwrap();

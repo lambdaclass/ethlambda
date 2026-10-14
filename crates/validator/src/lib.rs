@@ -374,8 +374,9 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
     };
     // The decoupled fork's duties replace the attester ones at its slots: the
     // Goldfish vote of the slot's committee members at a quarter of the slot,
-    // then, half way in, every active validator's attestation, cast only by
-    // those whose record finds something new in the node's input.
+    // then, half way into the action slot of each round, every active
+    // validator's attestation, cast only by those whose record finds a new
+    // height pair in the node's input.
     let decoupled_duties = async {
         if !clock.is_decoupled(slot) {
             return;
@@ -384,7 +385,7 @@ async fn serve_slot_duties<B: BeaconNodeApi>(
             tokio::time::sleep(clock.until_goldfish_vote(slot, SystemTime::now())).await;
             goldfish_vote(decoupled, clock, slot, slot_duties, store).await;
         }
-        if !active.is_empty() {
+        if !active.is_empty() && clock.is_decoupled_action_slot(slot) {
             tokio::time::sleep(clock.until_decoupled_attestation(slot, SystemTime::now())).await;
             combined_attest(decoupled, clock, slot, active, store).await;
         }
@@ -1237,11 +1238,11 @@ mod tests {
         assert_eq!(duties.indices(), &[11, 22]);
     }
 
-    /// At a decoupled slot the client votes for its committee seats at a quarter
-    /// of the slot and, half way in, attests for every active validator that
-    /// has something new to say; it makes no LMD attestation.
+    /// At a round's action slot the client votes for its committee seats at a
+    /// quarter of the slot and, half way in, attests for every active
+    /// validator that has a new height pair; it makes no LMD attestation.
     #[tokio::test]
-    async fn a_decoupled_slot_runs_the_goldfish_vote_and_the_attestation() {
+    async fn a_decoupled_action_slot_runs_the_goldfish_vote_and_the_attestation() {
         use ethlambda_decoupled::{AttestationInput, SourceFields};
 
         let mut config = ethlambda_types::beacon::config::Config::mainnet()
@@ -1256,7 +1257,11 @@ mod tests {
             .expect("after the epoch")
             .as_secs();
         let clock = SlotClock::from_config(now_secs - 100, &config);
-        let slot = clock.now().expect("after genesis") + 1;
+        let next = clock.now().expect("after genesis") + 1;
+        // The first action slot ahead: `slot ≡ 1 (mod R)`.
+        let slot = (next..)
+            .find(|slot| clock.is_decoupled_action_slot(*slot))
+            .expect("an action slot every round");
 
         let mut store = ValidatorStore::new();
         let secret: [u8; 32] =
@@ -1275,7 +1280,6 @@ mod tests {
                     source: Some(SourceFields {
                         height: 3,
                         entry: Root::repeat_byte(1),
-                        nonjustifiable: false,
                     }),
                     justified_height: 2,
                     justified: Root::repeat_byte(2),
@@ -1312,10 +1316,7 @@ mod tests {
         assert_eq!(node.attestation_data_call_count(), 0, "no LMD attestation");
         assert_eq!(node.submitted_goldfish_votes().len(), 1);
         assert_eq!(node.submitted_combined_attestations().len(), 1);
-        let pair = node.submitted_combined_attestations()[0]
-            .data
-            .height_pair()
-            .expect("a height pair");
+        let pair = node.submitted_combined_attestations()[0].data.height_pair();
         assert_eq!((pair.height, pair.entry), (3, Root::repeat_byte(1)));
     }
 

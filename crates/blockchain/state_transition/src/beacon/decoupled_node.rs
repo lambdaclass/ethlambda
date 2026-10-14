@@ -64,6 +64,8 @@ pub enum DecoupledMessageError {
     },
     #[error("invalid signature")]
     BadSignature,
+    #[error("attestation data is not well formed")]
+    Malformed,
     #[error("committee lookup failed: {0}")]
     Committee(String),
     #[error("not admitted: outside the window or a duplicate")]
@@ -441,7 +443,7 @@ impl DecoupledNode {
                 slot: 0,
             }),
             confirmed: engine.confirmed(),
-            fg_confirmed: engine.fg_confirmed(),
+            source: engine.source().and_then(|root| engine.block_ref(&root)),
             locks: engine.locks(),
             finalized: engine.finalized(),
             finalized_height: engine.finalized_height(),
@@ -489,6 +491,9 @@ pub fn validate_combined_attestation(
     config: &Config,
     attestation: &SignedCombinedAttestation,
 ) -> Result<(), DecoupledMessageError> {
+    if !attestation.data.is_well_formed() {
+        return Err(DecoupledMessageError::Malformed);
+    }
     let pubkey = state
         .validator(attestation.validator_index)
         .map(|validator| validator.pubkey)
@@ -570,15 +575,29 @@ mod tests {
 
         // Three validators attest with one data.
         let attestation_data = AttestationData::new(
-            Some(HeightVote {
+            HeightVote {
                 height: 1,
                 entry: genesis_root,
                 timeout: false,
-            }),
-            Some(FinalityVote {
-                height: 1,
-                target: genesis_root,
-            }),
+            },
+            None,
+        );
+        // A finality pair at the height pair's height is not a form any
+        // handler admits.
+        let malformed = SignedCombinedAttestation {
+            validator_index: 1,
+            data: AttestationData::new(
+                attestation_data.height_pair(),
+                Some(FinalityVote {
+                    height: 1,
+                    target: genesis_root,
+                }),
+            ),
+            signature: BlsSignature::default(),
+        };
+        assert_eq!(
+            validate_combined_attestation(&state, &config, &malformed),
+            Err(DecoupledMessageError::Malformed)
         );
         let domain = get_domain_from_schedule(
             &config,

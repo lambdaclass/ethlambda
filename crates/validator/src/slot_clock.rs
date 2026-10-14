@@ -102,6 +102,14 @@ impl SlotClock {
         self.config.fork_at_epoch(self.epoch_of(slot)) == ForkName::Decoupled
     }
 
+    /// Whether `slot` holds a round's FG action: `a_r = T_r + 6Δ` falls half
+    /// way into slot `rR + 1`, right after the confirmation update of the
+    /// round's first slot.
+    pub fn is_decoupled_action_slot(&self, slot: Slot) -> bool {
+        let slots_per_round = self.config.decoupled_slots_per_round.max(2);
+        self.is_decoupled(slot) && slot % slots_per_round == 1
+    }
+
     /// The slot containing `now`, or `None` before genesis.
     ///
     /// Divides in milliseconds, not seconds, so a chain whose slot is not a
@@ -159,8 +167,9 @@ impl SlotClock {
 
     /// When `slot`'s attestation duty should run: half a slot in (`t_s + 2Δ`),
     /// right after the node's confirmation update of the previous slot. It
-    /// runs every decoupled slot; whether it signs anything is the record's
-    /// call.
+    /// runs in the action slot of every round
+    /// ([`Self::is_decoupled_action_slot`]); whether it signs anything is the
+    /// record's call.
     pub fn decoupled_attestation_time(&self, slot: Slot) -> SystemTime {
         self.offset_into(slot, DECOUPLED_ATTESTATION_DUE_BPS)
     }

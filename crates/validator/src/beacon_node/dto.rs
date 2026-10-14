@@ -607,12 +607,12 @@ pub fn config_from_spec_response(value: &serde_json::Value) -> Result<Config> {
     for (key, field) in [
         ("DECOUPLED_LOCK_PERIOD", &mut config.decoupled_lock_period),
         (
-            "DECOUPLED_NONJUSTIFIABLE_PERIOD",
-            &mut config.decoupled_nonjustifiable_period,
+            "DECOUPLED_SLOTS_PER_ROUND",
+            &mut config.decoupled_slots_per_round,
         ),
         (
-            "DECOUPLED_FINALITY_DEBT",
-            &mut config.decoupled_finality_debt,
+            "DECOUPLED_PENDING_FINALITY_WINDOW",
+            &mut config.decoupled_pending_finality_window,
         ),
         (
             "DECOUPLED_TIMEOUT_DELAY",

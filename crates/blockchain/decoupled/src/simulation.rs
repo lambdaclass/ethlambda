@@ -3,9 +3,9 @@
 //! Every object sent at tick `t` reaches every node at `t` (after that tick's
 //! duties), or later when a node is cut off or a Byzantine sender splits its
 //! audience; that is synchrony with delay below `Δ`. The checks are the
-//! observable claims, read at the honest nodes: the outputs nest
-//! (`F ⪯ confirmed ⪯ head`), finalized reads agree and only extend, the chains
-//! grow, and no honest pair of attestations is slashable.
+//! observable claims, read at the honest nodes: both available tips extend
+//! `F`, finalized reads agree and only extend, the chains grow, no honest
+//! block is refused, and no honest pair of attestations is slashable.
 
 use std::collections::{HashMap, HashSet};
 
@@ -284,12 +284,16 @@ impl Network {
     }
 }
 
+/// Both tips of the available chain extend `Φ.F` (the specification's AC
+/// requirements 1 and 3). The confirmed tip need not be an ancestor of the
+/// head: the head walks the current votes from the anchor, the record keeps
+/// the latest unvetoed majority.
 fn check_nesting(store: &Store) {
     let finalized = store.finalized().root;
     let confirmed = store.confirmed().root;
     let head = store.head();
     assert!(store.is_ancestor(&finalized, &confirmed), "F ⪯ confirmed");
-    assert!(store.is_ancestor(&confirmed, &head), "confirmed ⪯ head");
+    assert!(store.is_ancestor(&finalized, &head), "F ⪯ head");
 }
 
 fn check_agreement(network: &Network) {
@@ -340,9 +344,9 @@ fn an_honest_synchronous_network_finalizes_and_nests() {
             node.index,
             finalized.slot
         );
-        // Full participation fast locks every slot's proposal.
+        // Full participation confirms and fast locks every slot's proposal.
         assert!(confirmed.slot + 2 >= SLOTS, "confirmed {confirmed:?}");
-        assert!(node.store.fg_confirmed().is_some());
+        assert!(node.store.source().is_some());
         assert!(node.store.finalized_height() >= 10);
     }
     // Every node ends on the same finalized block.
@@ -410,7 +414,7 @@ fn attestation_traffic_dies_down_while_finality_stalls() {
         "no height progress, no new attestations: {:?}",
         &network.emitted[quiet_from..]
     );
-    // Every slot of a synchronous, finalizing run brings something new.
+    // Every round of a synchronous, finalizing run brings a new height.
     let mut live = Network::new(4, Params::default());
     live.run(0..200);
     assert!(live.emitted_in(100..200) > 0);
@@ -419,8 +423,8 @@ fn attestation_traffic_dies_down_while_finality_stalls() {
 #[test]
 fn a_lone_validator_slow_locks_without_a_fast_quorum() {
     // One validator of four online: it never sees half of a committee, so
-    // nothing fast locks, but each slot confirms a chain on its own vote, and
-    // k such slots in a row slow lock their common prefix.
+    // nothing passes the fast test, but each slot confirms a chain on its own
+    // vote, and k such slots in a row pass the slow test.
     let params = Params::default();
     let mut network = Network::new(4, params);
     network.run(0..40);
@@ -429,30 +433,34 @@ fn a_lone_validator_slow_locks_without_a_fast_quorum() {
     }
     network.run(40..120);
     let store = &network.nodes[0].store;
-    assert_eq!(store.fg_confirmed(), None, "1 of 4 is not half a committee");
+    assert_eq!(store.source(), None, "1 of 4 is not half a committee");
     let locks = store.locks();
     assert!(!locks.is_empty(), "k consecutive confirmations slow lock");
-    let confirmed = store.confirmed();
     assert!(
-        confirmed.slot >= 20,
-        "the slow lock follows the chain: {confirmed:?}"
+        locks[0].block.slot >= 20,
+        "the slow lock follows the chain: {locks:?}"
     );
+    let confirmed = store.confirmed();
+    assert!(confirmed.slot >= 25, "the record follows: {confirmed:?}");
 }
 
 #[test]
-fn locks_expire_when_not_renewed() {
+fn locks_expire_when_not_renewed_and_the_record_stays() {
     let params = Params::default();
     let mut network = Network::new(4, params);
     network.run(0..40);
-    // Everyone else goes dark and the remaining validator stops voting too:
-    // no confirmation renews any lock.
+    // Every validator goes dark: no confirmation renews any lock. The update
+    // right after still reads the last slot's votes.
     for index in 0..4 {
         network.set_online(index, false);
     }
-    network.run(40..(40 + 4 * (params.lock_period as Tick + 2)));
+    network.run(40..48);
+    let confirmed = network.nodes[0].store.confirmed();
+    network.run(48..(48 + 4 * (params.lock_period as Tick + 2)));
     let store = &network.nodes[0].store;
     assert!(store.locks().is_empty(), "{:?}", store.locks());
-    assert_eq!(store.confirmed(), store.finalized());
+    // An update with no result leaves the record where it was.
+    assert_eq!(store.confirmed(), confirmed);
 }
 
 /// Prints node 0's view once per slot: `cargo test -p ethlambda-decoupled
@@ -470,11 +478,11 @@ fn trace() {
         let (j, hj) = s.justified();
         let frame = s.frame();
         println!(
-            "slot {:>3} head {:>3} conf {:>3} fgc {:?} fin {:>3} (h_F {}) J {:>3} (h_j {}) h_max {} root {:?} floor {} locks {}",
+            "slot {:>3} head {:>3} conf {:>3} source {:?} fin {:>3} (h_F {}) J {:>3} (h_j {}) h_max {} root {:?} floor {} locks {}",
             t / 4,
             s.block_slot(&s.head()).unwrap(),
             s.confirmed().slot,
-            s.fg_confirmed().map(|b| b.slot),
+            s.source().and_then(|b| s.block_slot(&b)),
             s.finalized().slot,
             s.finalized_height(),
             j.slot,
@@ -497,22 +505,22 @@ fn junk_attestations(input: &crate::AttestationInput) -> [crate::types::Attestat
     let height = input.source.map_or(1, |source| source.height);
     [
         AttestationData::new(
-            Some(HeightVote {
-                height,
+            HeightVote {
+                height: height + 2,
                 entry: bogus,
                 timeout: true,
-            }),
+            },
             Some(FinalityVote {
-                height: input.justified_height + 1,
+                height: height + 1,
                 target: bogus,
             }),
         ),
         AttestationData::new(
-            Some(HeightVote {
+            HeightVote {
                 height: height + 1,
                 entry: bogus,
                 timeout: false,
-            }),
+            },
             None,
         ),
     ]
