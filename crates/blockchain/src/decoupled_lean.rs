@@ -66,6 +66,7 @@ use crate::decoupled_aggregation::{
     verify_aggregate,
 };
 use crate::key_manager::{KeyManager, ValidatorKeyPair};
+use crate::metrics;
 
 /// `Metadata` key prefix of a persisted block, followed by its root.
 const BLOCK_KEY_PREFIX: &[u8] = b"decoupled/block/";
@@ -243,6 +244,7 @@ impl DecoupledLean {
             ids.sort();
             ids
         };
+        metrics::update_validators_count(ours.len() as u64);
         let mut server = DecoupledLeanServer {
             config,
             engine,
@@ -476,6 +478,7 @@ impl DecoupledLeanServer {
         if !self.ours.contains(&proposer) {
             return;
         }
+        let timing = metrics::time_block_building();
         let proposal = self.engine.proposal();
         let mut votes = Vec::new();
         let mut support = Vec::new();
@@ -513,6 +516,7 @@ impl DecoupledLeanServer {
                 "Packed attestations"
             );
         }
+        metrics::observe_block_aggregated_payloads(attestations.len());
         let body = DecoupledBlockBody {
             votes: SszList::try_from(votes).expect("at most two votes per validator"),
             support: SszBitlist::try_from(support).expect("one bit per vote"),
@@ -529,9 +533,12 @@ impl DecoupledLeanServer {
             Ok(signature) => signature,
             Err(err) => {
                 error!(slot, proposer, %err, "Failed to sign decoupled block");
+                metrics::inc_block_building_failures();
                 return;
             }
         };
+        drop(timing);
+        metrics::inc_block_building_success();
         let block = SignedDecoupledBlock { message, signature };
         info!(
             slot,
@@ -863,7 +870,10 @@ impl DecoupledLeanServer {
                 let mut produced = Vec::with_capacity(jobs.len());
                 let mut failed = 0;
                 for job in jobs {
-                    match run_job(job, max_children) {
+                    let timing = metrics::time_pq_sig_aggregated_signatures_building();
+                    let result = run_job(job, max_children);
+                    drop(timing);
+                    match result {
                         Ok(output) => produced.push(output),
                         Err(err) => {
                             warn!(%err, "Decoupled attestation aggregation failed");
@@ -899,6 +909,15 @@ impl DecoupledLeanServer {
             return;
         };
         let elapsed_ms = msg.elapsed.as_millis() as u64;
+        metrics::observe_committee_signatures_aggregation(msg.elapsed);
+        for produced in &msg.produced {
+            let aggregate = &produced.aggregate;
+            metrics::observe_aggregated_proof_size(aggregate.proof.len());
+            metrics::inc_pq_sig_aggregated_signatures();
+            metrics::inc_pq_sig_attestations_in_aggregated_signatures(
+                aggregate.participant_indices().count() as u64,
+            );
+        }
         match run.kind {
             RunKind::Batch { last } => {
                 let Some(pipeline) = self.pipelines.get_mut(&run.slot) else {
@@ -991,8 +1010,10 @@ impl DecoupledLeanServer {
     // ── Imports ────────────────────────────────────────────────────────────
 
     fn on_vote(&mut self, signed: SignedGoldfishVote) {
+        let _timing = metrics::time_attestation_validation();
         let vote = signed.vote;
         if !self.verify_vote(&signed) {
+            metrics::inc_attestations_invalid();
             debug!(
                 slot = vote.slot,
                 validator = vote.validator,
@@ -1000,6 +1021,7 @@ impl DecoupledLeanServer {
             );
             return;
         }
+        metrics::inc_attestations_valid();
         if self.engine.on_goldfish_vote(vote) {
             self.vote_signatures.insert(vote, signed.signature);
         }
@@ -1023,7 +1045,9 @@ impl DecoupledLeanServer {
         {
             return;
         }
+        let timing = metrics::time_attestation_validation();
         if !self.verify_attestation(&signed) {
+            metrics::inc_attestations_invalid();
             debug!(
                 slot = signed.slot,
                 validator = signed.attestation.validator,
@@ -1031,6 +1055,8 @@ impl DecoupledLeanServer {
             );
             return;
         }
+        drop(timing);
+        metrics::inc_attestations_valid();
         self.raw.insert(
             &signed.attestation.data,
             signed.slot,
@@ -1085,7 +1111,10 @@ impl DecoupledLeanServer {
     /// on it.
     fn import(&mut self, block: SignedDecoupledBlock, root: H256) {
         let input = block_input(&block, root);
-        match self.engine.on_block(&input) {
+        let timing = metrics::time_fork_choice_block_processing();
+        let imported = self.engine.on_block(&input);
+        drop(timing);
+        match imported {
             Ok(()) => {}
             Err(BlockError::Duplicate) => return,
             Err(BlockError::FutureSlot { .. }) => {
@@ -1256,13 +1285,21 @@ impl DecoupledLeanServer {
             .pubkeys
             .get(vote.validator as usize)
             .map(|keys| keys.0.clone());
-        self.check(
+        let root = vote.hash_tree_root();
+        let cached = self.verified.contains_key(&root);
+        let timing = (!cached).then(metrics::time_pq_sig_attestation_verification);
+        let valid = self.check(
             pubkey.as_ref(),
             goldfish_vote_epoch(vote.slot),
-            vote.hash_tree_root(),
+            root,
             vote.slot,
             &signed.signature,
-        )
+        );
+        drop(timing);
+        if !cached {
+            count_attestation_signature(valid);
+        }
+        valid
     }
 
     /// The attester's signature at the epoch of the slot the envelope names.
@@ -1285,12 +1322,15 @@ impl DecoupledLeanServer {
         // Not `check`: the data root is signed by every attester of the
         // round, and again in another slot, so only the whole envelope can
         // stand for a success.
+        let timing = metrics::time_pq_sig_attestation_verification();
         let valid = xmss_valid(
             pubkey,
             attestation_epoch(signed.slot),
             attestation.data.hash_tree_root(),
             &signed.signature,
         );
+        drop(timing);
+        count_attestation_signature(valid);
         if valid {
             self.verified.insert(envelope, signed.slot);
         }
@@ -1304,9 +1344,14 @@ impl DecoupledLeanServer {
         if self.verified.contains_key(&root) {
             return true;
         }
+        let timing = metrics::time_pq_sig_aggregated_signatures_verification();
         let valid = verify_aggregate(aggregate, &self.attestation_keys);
+        drop(timing);
         if valid {
+            metrics::inc_pq_sig_aggregated_signatures_valid();
             self.verified.insert(root, aggregate.slot);
+        } else {
+            metrics::inc_pq_sig_aggregated_signatures_invalid();
         }
         valid
     }
@@ -1445,6 +1490,13 @@ impl DecoupledLeanServer {
             height_floor: frame.floor,
             blocks: engine.blocks().count() as u64,
         };
+        // The 3SF-mini gauges, which that actor leaves alone on a decoupled
+        // node. The confirmed tip stands in for the safe target: it is what
+        // the beacon host reports as `safe`.
+        metrics::update_head_slot(status.head.slot);
+        metrics::update_safe_target_slot(status.confirmed.slot);
+        metrics::update_latest_justified_slot(status.justified.slot);
+        metrics::update_latest_finalized_slot(status.finalized.slot);
         *self
             .status
             .write()
@@ -1484,6 +1536,16 @@ fn expand<'a>(
         .flat_map(AggregatedDecoupledAttestation::attestations)
         .filter(|attestation| seen.insert(attestation.clone()))
         .collect()
+}
+
+/// One individual attestation-key signature checked, on the 3SF-mini
+/// counters: a Goldfish vote or an FG attestation.
+fn count_attestation_signature(valid: bool) {
+    if valid {
+        metrics::inc_pq_sig_attestation_signatures_valid();
+    } else {
+        metrics::inc_pq_sig_attestation_signatures_invalid();
+    }
 }
 
 fn xmss_valid(

@@ -106,6 +106,10 @@ pub struct BlockChainConfig {
     pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
+    /// Whether this actor drives the head, justified and finalized gauges.
+    /// Off on a decoupled node: this actor then never sees a block, and the
+    /// decoupled chain actor reports its own chain on the same gauges.
+    pub chain_gauges: bool,
 }
 
 // The interval grid lives in `ethlambda-types` because `ethlambda-storage` also
@@ -258,6 +262,7 @@ impl BlockChain {
             aggregation_duty_subnet,
             skip_redundant_aggregation,
             proposer_config,
+            chain_gauges,
         } = config;
 
         metrics::set_is_aggregator(aggregator.is_enabled());
@@ -275,6 +280,7 @@ impl BlockChain {
             skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
+            chain_gauges,
         };
 
         // Warm the XMSS signing caches for the next duties before the first
@@ -703,6 +709,10 @@ struct LeanDuties {
     /// single-threaded message loop, so no synchronization is needed.
     /// Observability-only.
     pre_merge_coverage: Option<coverage::CoverageSnapshot>,
+
+    /// Whether this actor drives the head, justified and finalized gauges
+    /// (see [`BlockChainConfig::chain_gauges`]).
+    chain_gauges: bool,
 }
 
 impl LeanDuties {
@@ -1109,8 +1119,11 @@ impl BlockChainServer {
             .await;
 
         // Update safe target slot metric (updated by store.on_tick at interval 3).
-        // Lean-only: a beacon store keeps no safe target.
-        if self.store.chain() == Chain::Lean {
+        // Lean-only: a beacon store keeps no safe target. A decoupled node's
+        // chain actor reports its own (see `BlockChainConfig::chain_gauges`).
+        if let ChainDuties::Lean(lean) = &self.duties
+            && lean.chain_gauges
+        {
             metrics::update_safe_target_slot(self.store.safe_target_slot());
         }
 
@@ -1128,6 +1141,11 @@ impl BlockChainServer {
     /// they read the chain the same way: head through [`Self::head_slot`],
     /// which is the only spelling of that dispatch.
     fn refresh_chain_metrics(&self) {
+        if let ChainDuties::Lean(lean) = &self.duties
+            && !lean.chain_gauges
+        {
+            return;
+        }
         metrics::update_head_slot(self.head_slot());
         let latest_justified_slot = self
             .store
@@ -4443,6 +4461,7 @@ mod tests {
                 enable_proposer_aggregation: false,
                 max_attestations_per_block: 0,
             },
+            chain_gauges: true,
         };
 
         let _ = BlockChain::spawn(store, HashMap::new(), config, EventBus::default());

@@ -542,6 +542,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
                     enable_proposer_aggregation: lean.enable_proposer_aggregation,
                     max_attestations_per_block: lean.max_attestations_per_block,
                 },
+                chain_gauges: !runs_decoupled,
             };
 
             // A decoupled node hands its keys to the decoupled chain actor and
