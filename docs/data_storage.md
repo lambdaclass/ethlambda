@@ -387,7 +387,20 @@ root.
 `get_live_chain()` build the `root → (slot, parent_root)` block tree without
 deserializing a single block. It contains the finalized anchor plus all
 non-finalized blocks, and is pruned as finalization advances (the finalized
-block itself is kept).
+block itself is kept) on both chains.
+
+The pruning horizon differs by chain because the two store their finalized
+checkpoint's slot differently. Lean's is always a real block's own slot, so
+`update_checkpoints` prunes to it directly. A beacon checkpoint's stored slot
+is its epoch's *start* slot (`Store::beacon_checkpoint_as_stored`), which can
+name a slot nobody ever built a block for; pruning to it directly would
+delete the finalized block's own row whenever that start slot was skipped,
+since the block then sits strictly below it, and every fork-choice walk that
+asks for the ancestor at that start slot (`get_checkpoint_block`) would fall
+through the gap into a hard `SpecAssert` instead of finding it. So the beacon
+arm looks up the finalized root's own slot (from `BlockHeaders`, which is
+never pruned) and prunes to that instead: lower than or equal to the epoch
+start slot, and always a slot some row actually occupies.
 
 Presence in `LiveChain` is what makes a block _visible to fork choice_:
 `insert_pending_block` deliberately writes a block's header/body/proof
@@ -623,9 +636,11 @@ a deferred heavy phase.
 
 **Immediately, when finalization advances** (inside `update_checkpoints`):
 
-- `prune_live_chain`: deletes `LiveChain` entries below the finalized slot,
-  keeping the finalized block itself. This keeps the fork choice working set
-  bounded to the non-finalized chain.
+- `prune_live_chain`: deletes `LiveChain` entries below a horizon, keeping the
+  finalized block itself. This keeps the fork choice working set bounded to
+  the non-finalized chain. The horizon is `finalized.slot` on lean, and the
+  finalized block's own slot (read from `BlockHeaders`) on beacon — see
+  [LiveChain](#livechain) for why the two differ.
 - `prune_gossip_signatures`: drops buffered in-memory gossip signatures at or
   below the finalized slot.
 - `prune_stale_aggregated_payloads`: drops in-memory aggregated payloads
