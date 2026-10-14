@@ -208,18 +208,29 @@ impl KeyManager {
         self.sign_with_proposal_key(validator_id, slot, block_root)
     }
 
-    /// Sign `message` with `validator_id`'s attestation key at XMSS `epoch`.
+    /// Signs each `(validator_id, epoch, message)` with that validator's
+    /// attestation key at XMSS `epoch`, spread over at most one thread per
+    /// core like [`Self::sign_attestations`], and returns one result per
+    /// request in `requests` order.
     ///
     /// For the decoupled protocol, whose attestation key signs on a doubled
     /// epoch grid (`ethlambda_types::lean_decoupled`), so the epoch is not the
-    /// slot here.
-    pub fn sign_attestation_message(
-        &mut self,
-        validator_id: u64,
-        epoch: u32,
-        message: &H256,
-    ) -> Result<XmssSignature, KeyManagerError> {
-        self.sign_with_attestation_key(validator_id, epoch, message)
+    /// slot here, and whose Goldfish votes name their validator, so each
+    /// signs its own message.
+    pub fn sign_attestation_messages(
+        &self,
+        requests: &[(u64, u32, H256)],
+    ) -> Vec<Result<XmssSignature, KeyManagerError>> {
+        let max_threads = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        map_batched(
+            requests,
+            max_threads,
+            1,
+            "xmss-sign",
+            |&(validator_id, epoch, message)| {
+                self.sign_with_attestation_key(validator_id, epoch, &message)
+            },
+        )
     }
 
     /// Warm the attestation keys for `attestation_epoch`, and the proposer's
@@ -601,6 +612,32 @@ mod tests {
             let signature = ValidatorSignature::from_bytes(result.as_ref().unwrap()).unwrap();
             let pubkey = pair.attestation_key.public_key();
             assert!(signature.is_valid(&pubkey, 1, &message), "id {id}");
+        }
+    }
+
+    #[test]
+    fn sign_attestation_messages_signs_each_request_in_order() {
+        let key_manager = tiny_key_manager(4);
+        // Each request its own message and epoch, an unknown id in the middle.
+        let requests: Vec<(u64, u32, H256)> = [(2, 0), (0, 1), (77, 0), (3, 1), (1, 0)]
+            .into_iter()
+            .map(|(id, epoch)| (id, epoch, H256::from([id as u8 + 1; 32])))
+            .collect();
+
+        let results = key_manager.sign_attestation_messages(&requests);
+
+        assert_eq!(results.len(), requests.len());
+        for (&(id, epoch, message), result) in requests.iter().zip(&results) {
+            let Some(pair) = key_manager.keys.get(&id) else {
+                assert!(
+                    matches!(result, Err(KeyManagerError::ValidatorKeyNotFound(missing)) if *missing == id),
+                    "id {id}: {result:?}"
+                );
+                continue;
+            };
+            let signature = ValidatorSignature::from_bytes(result.as_ref().unwrap()).unwrap();
+            let pubkey = pair.attestation_key.public_key();
+            assert!(signature.is_valid(&pubkey, epoch, &message), "id {id}");
         }
     }
 

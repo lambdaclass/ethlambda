@@ -560,6 +560,9 @@ impl DecoupledLeanServer {
     /// `goldfish_vote` at `t_s + Δ`, by this node's members of `𝒦_s`.
     fn vote(&mut self, slot: u64) {
         let head = self.engine.goldfish_vote_head();
+        // Every record is advanced and persisted before anything is signed,
+        // then the signatures run at once (see `sign_subgroup`).
+        let mut votes = Vec::new();
         for validator in self.ours.clone() {
             if !self.in_committee(validator, slot) {
                 continue;
@@ -570,23 +573,26 @@ impl DecoupledLeanServer {
             }
             state.last_vote_slot = Some(slot);
             self.persist_signing(validator);
-            let vote = GoldfishVote {
+            votes.push(GoldfishVote {
                 validator,
                 slot,
                 head,
+            });
+        }
+        let epoch = goldfish_vote_epoch(slot) as u32;
+        let requests: Vec<(u64, u32, H256)> = votes
+            .iter()
+            .map(|vote| (vote.validator, epoch, vote.hash_tree_root()))
+            .collect();
+        let signatures = self.keys.sign_attestation_messages(&requests);
+        for (vote, signature) in votes.into_iter().zip(signatures) {
+            let signature = match signature {
+                Ok(signature) => signature,
+                Err(err) => {
+                    error!(slot, validator = vote.validator, %err, "Failed to sign Goldfish vote");
+                    continue;
+                }
             };
-            let epoch = goldfish_vote_epoch(slot) as u32;
-            let signature =
-                match self
-                    .keys
-                    .sign_attestation_message(validator, epoch, &vote.hash_tree_root())
-                {
-                    Ok(signature) => signature,
-                    Err(err) => {
-                        error!(slot, validator, %err, "Failed to sign Goldfish vote");
-                        continue;
-                    }
-                };
             self.engine.on_goldfish_vote(vote);
             self.vote_signatures.insert(vote, signature.clone());
             if let Some(p2p) = &self.p2p {
@@ -644,8 +650,13 @@ impl DecoupledLeanServer {
         let committee_count = self.config.aggregation.committee_count;
         let subgroups = self.schedule.subgroups;
         let aggregating = self.is_aggregating();
-        let mut attested = 0;
-        let mut released = None;
+        // Every record releases and persists its attestation before anything
+        // is signed, so a crash mid-signing never leaves a signature its
+        // record does not know about. Then the signatures run at once: one
+        // XMSS signature takes tens of milliseconds, so a node signing its
+        // subgroup one after another trailed its last attestation by
+        // seconds, past the aggregators' final deadline.
+        let mut attestations = Vec::new();
         for validator in self.ours.clone() {
             if attestation_subgroup(validator, committee_count, subgroups) != subgroup {
                 continue;
@@ -660,8 +671,24 @@ impl DecoupledLeanServer {
             state.last_attestation_slot = Some(slot);
             state.record.prune_below(input.finalized_height);
             self.persist_signing(validator);
-            let root = attestation.data.hash_tree_root();
-            let signature = match self.keys.sign_attestation_message(validator, epoch, &root) {
+            attestations.push(attestation);
+        }
+        let requests: Vec<(u64, u32, H256)> = attestations
+            .iter()
+            .map(|attestation| {
+                (
+                    attestation.validator,
+                    epoch,
+                    attestation.data.hash_tree_root(),
+                )
+            })
+            .collect();
+        let signatures = self.keys.sign_attestation_messages(&requests);
+        let mut attested = 0;
+        let mut released = None;
+        for (attestation, signature) in attestations.into_iter().zip(signatures) {
+            let validator = attestation.validator;
+            let signature = match signature {
                 Ok(signature) => signature,
                 Err(err) => {
                     error!(slot, validator, %err, "Failed to sign decoupled attestation");
