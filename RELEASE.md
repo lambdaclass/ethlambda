@@ -12,7 +12,7 @@ Three workflows do the publishing:
 
 | Workflow | Trigger | Publishes |
 |----------|---------|-----------|
-| [Release](.github/workflows/release.yaml) | push to `main` | `unstable`, `sha-<7>` (and `-shadow` twins) |
+| [Release](.github/workflows/release.yaml) | push to `main` | `unstable`, `sha-<7>` (and `-shadow` twins). It also builds the binaries and the changelog, publishing neither, so a broken release path fails on the commit that broke it |
 | | push of a `vX.Y.Z-rc.N` tag | `X.Y.Z-rc.N` image, binaries, GitHub pre-release |
 | | manual run | nothing: builds the images and binaries of the chosen ref as a rehearsal |
 | [Release promotion](.github/workflows/release_promote.yaml) | a pre-release edited into a final release, or manual run | `X.Y.Z`, `latest` |

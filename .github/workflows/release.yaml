@@ -4,7 +4,10 @@ name: Release
 # candidates:
 #
 #   push to main         -> `unstable` and `unstable-shadow`, plus the immutable
-#                           `sha-<7>` and `sha-<7>-shadow`.
+#                           `sha-<7>` and `sha-<7>-shadow`. Also builds the
+#                           release binaries and the changelog without publishing
+#                           them, so a break in that path shows up on the commit
+#                           that caused it rather than on the next tag.
 #   push tag vX.Y.Z-rc.N -> `X.Y.Z-rc.N`, the release binaries, and a GitHub
 #                           pre-release with those binaries attached.
 #   workflow_dispatch    -> builds everything the chosen ref would build and
@@ -52,7 +55,6 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       variants: ${{ steps.meta.outputs.variants }}
       publish: ${{ steps.meta.outputs.publish }}
-      binaries: ${{ steps.meta.outputs.binaries }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -90,7 +92,6 @@ jobs:
 
             image_tag="$tag"
             variants='["default"]'
-            binaries=true
           else
             version="dev-${SHA::7}"
             channel="$REF_NAME"
@@ -103,10 +104,6 @@ jobs:
               image_tag="${REF_NAME//\//-}"
               variants='["default"]'
             fi
-            # Main pushes skip the binaries: they are release assets, and the
-            # images already prove main builds. A dispatch builds them so the
-            # whole release-candidate path can be rehearsed.
-            binaries=$([ "$EVENT_NAME" = "workflow_dispatch" ] && echo true || echo false)
           fi
 
           publish=$([ "$EVENT_NAME" = "push" ] && echo true || echo false)
@@ -117,7 +114,6 @@ jobs:
             echo "version=$version"
             echo "variants=$variants"
             echo "publish=$publish"
-            echo "binaries=$binaries"
           } | tee -a "$GITHUB_OUTPUT"
 
   build-image:
@@ -218,7 +214,6 @@ jobs:
   build-binaries:
     name: Build binary (${{ matrix.target.name }})
     needs: meta
-    if: needs.meta.outputs.binaries == 'true'
     strategy:
       matrix:
         target:
@@ -269,8 +264,6 @@ jobs:
   changelog:
     name: Generate changelog
     needs: meta
-    # Wherever the binaries are built: on a candidate tag, and in a rehearsal.
-    if: needs.meta.outputs.binaries == 'true'
     runs-on: ubuntu-latest
     # Read-only on purpose: the third-party action never holds the token that
     # can publish a release.
