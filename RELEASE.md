@@ -51,26 +51,15 @@ Every release candidate attaches these binaries, plus a `SHA256SUMS` file:
 | `ethlambda-linux-aarch64` | Linux aarch64, glibc 2.35+ |
 | `ethlambda-macos-aarch64` | macOS on Apple silicon |
 
-Every asset, `SHA256SUMS` included, comes with a minisign signature
-(`<asset>.minisig`).
-
 ## Verifying a release
 
-Releases are verifiable two independent ways:
-
-- **minisign signatures**, made with the project's key. Its public key is
-  committed at [`.github/minisign.pub`](.github/minisign.pub); take it from the
-  repository rather than from a release, since whoever could replace a release's
-  assets could replace a key shipped beside them.
-- **GitHub build provenance attestations** (Sigstore), which tie the binaries
-  and the images to the workflow run and commit that built them. Final images
-  are re-stamped at promotion, so they are attested by the promotion run.
+The binaries and the images carry GitHub build provenance attestations
+(Sigstore), which tie each one to the workflow run and commit that built it.
+They need no key: each run signs with a short-lived certificate bound to its
+workflow identity. Final images are re-stamped at promotion, so they are attested
+by the promotion run.
 
 ```bash
-# minisign: the trusted comment names the asset, the tag and the commit
-minisign -Vm ethlambda-linux-x86_64 -p minisign.pub
-
-# attestations, for a binary and for an image
 gh attestation verify ethlambda-linux-x86_64 --repo lambdaclass/ethlambda
 gh attestation verify oci://ghcr.io/lambdaclass/ethlambda:X.Y.Z --repo lambdaclass/ethlambda
 ```
@@ -90,26 +79,6 @@ candidate tag), and the `ETHLAMBDA_CHANNEL` environment variable overrides it at
 runtime. Promotion sets `ETHLAMBDA_CHANNEL=stable` on the image config, which is
 how the promoted image reports `stable` while running the candidate's binary.
 The release binaries are the candidate's, so they keep reporting `rc.N`.
-
-## Signing key
-
-The Release workflow signs with the minisign key in the `MINISIGN_SECRET_KEY` and
-`MINISIGN_PASSWORD` repository secrets. It refuses to publish from this
-repository when the key is missing, or when it does not match
-`.github/minisign.pub`. Attestations need no setup.
-
-To create the key (once), or to rotate it:
-
-```bash
-minisign -G -p .github/minisign.pub -s minisign.key   # prompts for a password
-gh secret set MINISIGN_SECRET_KEY --repo lambdaclass/ethlambda < minisign.key
-gh secret set MINISIGN_PASSWORD --repo lambdaclass/ethlambda   # prompts for it
-```
-
-Then commit `.github/minisign.pub` through a PR, and keep `minisign.key` and its
-password in the team's password manager. A rotation takes effect when both the
-secret and the committed key have changed; until then every release run fails
-on the mismatch, which is the point.
 
 ## Cutting a release
 
@@ -151,10 +120,9 @@ The Release workflow then:
 
 1. Builds the `amd64` and `arm64` images, publishes them as `X.Y.Z-rc.1`, and
    attests the image.
-2. Builds the binaries listed above.
-3. Signs the binaries and `SHA256SUMS` with minisign, and attests the binaries.
-4. Creates a GitHub pre-release named after the tag, with the binaries,
-   `SHA256SUMS` and the signatures attached and a changelog in its notes.
+2. Builds the binaries listed above and attests them.
+3. Creates a GitHub pre-release named after the tag, with the binaries and
+   `SHA256SUMS` attached and a changelog in its notes.
 
 The changelog lists the [Conventional Commits](https://www.conventionalcommits.org/)
 of type `feat`, `fix`, `perf`, `refactor` and `revert` since the previous final
@@ -264,13 +232,6 @@ next candidate instead.
 
 **The tag names the wrong version.** Delete it (`git push origin :refs/tags/vX.Y.Z-rc.N`),
 fix the version on the release branch, and tag again.
-
-**`Sign the assets` failed.** The error names the cause. `MINISIGN_SECRET_KEY is
-not set` and `could not derive a public key` mean the secrets are missing or the
-password is wrong. `does not match .github/minisign.pub` means the key was rotated
-in one place only. Fix the secret or the committed key (see
-[Signing key](#signing-key)) and re-run the failed jobs. A committed key only
-takes effect on a new tag, since the run checks out the tagged commit.
 
 ## Publishing devnet images
 

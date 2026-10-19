@@ -392,10 +392,6 @@ jobs:
       attestations: write
 
     steps:
-      # For the signing script and the committed public key.
-      - name: Checkout repository
-        uses: actions/checkout@v6
-
       # Anchored on `ethlambda-`: build-push-action also uploads build records,
       # named `<owner>~<repo>~<id>.dockerbuild`, which download-artifact cannot
       # extract.
@@ -412,23 +408,6 @@ jobs:
           sha256sum ethlambda-* > SHA256SUMS
           cat SHA256SUMS
 
-      # A dry run signs with the real key too, so a broken key or script fails
-      # before a tag does. Its trusted comment says DRY-RUN, so its signatures
-      # cannot pass for a release's. The canonical repository refuses to
-      # publish unsigned; a fork without a key publishes unsigned, with a
-      # warning.
-      - name: Sign the assets
-        env:
-          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
-          REQUIRE_SIGNATURE: ${{ needs.meta.outputs.publish == 'true' && github.repository == 'lambdaclass/ethlambda' }}
-          TRUSTED_COMMENT_SUFFIX: >-
-            ethlambda ${{ needs.meta.outputs.publish != 'true' && 'DRY-RUN ' || '' }}${{ needs.meta.outputs.candidate }} ${{ github.sha }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y minisign
-          .github/scripts/sign-release-assets.sh dist
-
       # Not in a dry run: an attestation is published the moment it is made.
       - name: Attest build provenance
         if: needs.meta.outputs.publish == 'true'
@@ -443,7 +422,6 @@ jobs:
         run: |
           set -euo pipefail
           for binary in dist/ethlambda-*; do
-            case "$binary" in *.minisig) continue ;; esac
             gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY"
           done
 
@@ -462,7 +440,7 @@ jobs:
 
           **Binaries:** attached below, with their \`SHA256SUMS\`. The \`linux-x86_64\` build targets x86-64-v3, so it needs a CPU with AVX2 (Haswell or later).
 
-          **Verifying:** every asset has a minisign signature (\`.minisig\`), and the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
+          **Verifying:** the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
 
           $CHANGELOG
           EOF

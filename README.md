@@ -335,9 +335,8 @@ images are published to `ghcr.io/lambdaclass/ethlambda` with the following tags:
 | `unstable` | Built from the latest main commit |
 | `sha-XXXXXXX` | Specific commit |
 
-Release binaries are signed with minisign, and binaries and images carry GitHub
-build provenance attestations; [`RELEASE.md`](./RELEASE.md#verifying-a-release)
-shows how to verify them.
+Release binaries and images carry GitHub build provenance attestations;
+[`RELEASE.md`](./RELEASE.md#verifying-a-release) shows how to verify them.
 
 [`RELEASE.md`](./RELEASE.md) has more details on our release process and how to tag new images.
 
