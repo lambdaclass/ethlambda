@@ -307,11 +307,14 @@ pub struct BlockInputs {
 /// sync aggregate. The block is run through `process_block` on a copy of
 /// `state` with an execution engine that accepts the payload, which is the
 /// node's own execution client's payload; that run is also what rejects a body
-/// the network would, before anything is signed.
+/// the network would, before anything is signed. `options` is what that run may
+/// leave unchecked: only a caller that set `skip_randao_verification` passes
+/// anything but the default.
 pub fn assemble_block(
     state: &BeaconState,
     inputs: BlockInputs,
     config: &Config,
+    options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
     let body = BeaconBlockBody {
         randao_reveal: inputs.randao_reveal,
@@ -366,6 +369,7 @@ pub fn assemble_block(
         config,
         &ExecutionEngine::valid(),
         &CommitteeCache::default(),
+        options,
     )?;
     block.state_root = post.hash_tree_root();
     Ok(block)
@@ -379,6 +383,7 @@ mod tests {
     use crate::beacon::helpers::fulu::initialize_proposer_lookahead;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::stf::block::{BlockProcessingOptions, RandaoVerification};
     use ethlambda_types::beacon::containers::shared::{AttestationData, Checkpoint};
 
     /// A fulu state one epoch in, its lookahead and sync committee filled from
@@ -438,7 +443,13 @@ mod tests {
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        let block = assemble_block(&state, inputs, &Config::mainnet()).unwrap();
+        let block = assemble_block(
+            &state,
+            inputs,
+            &Config::mainnet(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(block.slot, state.slot());
         assert_eq!(
@@ -458,6 +469,68 @@ mod tests {
             &Config::mainnet(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(block.state_root, post.hash_tree_root());
+    }
+
+    fn skip_randao() -> BlockProcessingOptions {
+        BlockProcessingOptions {
+            randao: RandaoVerification::Skip,
+        }
+    }
+
+    fn inputs_with_infinity_reveal(state: &BeaconState) -> BlockInputs {
+        BlockInputs {
+            randao_reveal: BlsSignature(bls::G2_POINT_AT_INFINITY),
+            graffiti: Bytes32::ZERO,
+            attestations: Vec::new(),
+            execution_payload: payload_for(state),
+            blob_kzg_commitments: Vec::new(),
+            execution_requests: ExecutionRequests::default(),
+        }
+    }
+
+    #[test]
+    fn a_block_with_the_infinity_reveal_is_produced_only_when_randao_is_skipped() {
+        let state = state_to_build_on();
+        let config = Config::mainnet();
+        assert!(
+            assemble_block(
+                &state,
+                inputs_with_infinity_reveal(&state),
+                &config,
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
+
+        let block = assemble_block(
+            &state,
+            inputs_with_infinity_reveal(&state),
+            &config,
+            skip_randao(),
+        )
+        .unwrap();
+        assert_eq!(
+            block.body.randao_reveal,
+            BlsSignature(bls::G2_POINT_AT_INFINITY)
+        );
+
+        // Importing it with the same option lands on the state root it names.
+        let mut post = state.clone();
+        let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
+            message: block.clone(),
+            signature: BlsSignature::default(),
+        });
+        stf::block::process_block(
+            &mut post,
+            &signed,
+            &config,
+            &ExecutionEngine::valid(),
+            &CommitteeCache::default(),
+            skip_randao(),
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());
@@ -476,7 +549,15 @@ mod tests {
             blob_kzg_commitments: Vec::new(),
             execution_requests: ExecutionRequests::default(),
         };
-        assert!(assemble_block(&state, inputs, &Config::mainnet()).is_err());
+        assert!(
+            assemble_block(
+                &state,
+                inputs,
+                &Config::mainnet(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     /// An attestation at `slot` voting for this state's own chain: sourced from

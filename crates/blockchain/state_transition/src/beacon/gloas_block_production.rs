@@ -367,11 +367,13 @@ pub struct GloasBidBlockInputs {
 /// a copy fills `state_root` and enforces `process_execution_payload_bid`:
 /// the builder is active, covers the bid and signed it, and the bid's slot,
 /// parent hash and root and randao are the state's. There is no envelope: the
-/// builder reveals the payload itself.
+/// builder reveals the payload itself. `options` is what that run may leave
+/// unchecked, as in [`assemble_gloas_block`].
 pub fn assemble_gloas_block_on_bid(
     state: &BeaconState,
     inputs: GloasBidBlockInputs,
     config: &Config,
+    options: stf::block::BlockProcessingOptions,
 ) -> Result<BeaconBlock> {
     verify(
         matches!(state, BeaconState::Gloas(_)),
@@ -396,7 +398,13 @@ pub fn assemble_gloas_block_on_bid(
         body,
     };
     let mut post = state.clone();
-    stf::gloas::process_block(&mut post, &block, config, &CommitteeCache::default())?;
+    stf::gloas::process_block(
+        &mut post,
+        &block,
+        config,
+        &CommitteeCache::default(),
+        options,
+    )?;
     block.state_root = post.hash_tree_root();
     Ok(block)
 }
@@ -459,11 +467,14 @@ pub struct GloasProduced {
 /// is also what rejects a body the network would, before anything is signed.
 /// The envelope is then checked against that post-state with every condition
 /// `verify_execution_payload_envelope` holds it to except the signature, so a
-/// malformed build fails here and not on the network.
+/// malformed build fails here and not on the network. `options` is what the
+/// `process_block` run may leave unchecked: only a caller that set
+/// `skip_randao_verification` passes anything but the default.
 pub fn assemble_gloas_block(
     state: &BeaconState,
     inputs: GloasBlockInputs,
     config: &Config,
+    options: stf::block::BlockProcessingOptions,
 ) -> Result<GloasProduced> {
     verify(
         matches!(state, BeaconState::Gloas(_)),
@@ -512,7 +523,13 @@ pub fn assemble_gloas_block(
     let BeaconState::Gloas(_) = &post else {
         unreachable!("checked above")
     };
-    stf::gloas::process_block(&mut post, &block, config, &CommitteeCache::default())?;
+    stf::gloas::process_block(
+        &mut post,
+        &block,
+        config,
+        &CommitteeCache::default(),
+        options,
+    )?;
     block.state_root = post.hash_tree_root();
 
     let envelope = ExecutionPayloadEnvelope {
@@ -604,6 +621,7 @@ pub mod test_support {
     use crate::beacon::helpers::gloas::compute_ptc;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::{sign_for, with_signing_validators_at};
+    use crate::beacon::stf::block::BlockProcessingOptions;
     use ethlambda_types::beacon::containers::bellatrix::{ExtraData, LogsBloom};
     use ethlambda_types::beacon::primitives::Uint256;
 
@@ -712,13 +730,21 @@ pub mod test_support {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            BlockProcessingOptions::default(),
         )
     }
 
     /// The state after `block` is applied to `state`, as the chain stores it.
     pub fn post_state(state: &BeaconState, block: &BeaconBlock) -> BeaconState {
         let mut post = state.clone();
-        stf::gloas::process_block(&mut post, block, &config(), &CommitteeCache::default()).unwrap();
+        stf::gloas::process_block(
+            &mut post,
+            block,
+            &config(),
+            &CommitteeCache::default(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
         post
     }
 
@@ -754,6 +780,7 @@ mod gloas_block_production_tests {
     use crate::beacon::helpers::accessors::get_domain;
     use crate::beacon::helpers::misc::compute_signing_root;
     use crate::beacon::helpers::test_state::sign_for;
+    use crate::beacon::stf::block::{BlockProcessingOptions, RandaoVerification};
 
     /// A vote on the parent block (slot 32) signed by `validator`.
     fn ptc_message(
@@ -816,6 +843,7 @@ mod gloas_block_production_tests {
             &config(),
             &ExecutionEngine::valid(),
             &CommitteeCache::default(),
+            BlockProcessingOptions::default(),
         )
         .unwrap();
         assert_eq!(block.state_root, post.hash_tree_root());
@@ -907,6 +935,52 @@ mod gloas_block_production_tests {
     }
 
     #[test]
+    fn a_gloas_block_with_the_infinity_reveal_is_produced_only_when_randao_is_skipped() {
+        let state = state_to_build_on();
+        let skip = BlockProcessingOptions {
+            randao: RandaoVerification::Skip,
+        };
+        let produce_with = |options| {
+            let requests = ExecutionRequests::default();
+            let inputs = gloas_payload_inputs(&state, true, &requests, &config()).unwrap();
+            assemble_gloas_block(
+                &state,
+                GloasBlockInputs {
+                    randao_reveal: BlsSignature(bls::G2_POINT_AT_INFINITY),
+                    graffiti: Bytes32::ZERO,
+                    attestations: Vec::new(),
+                    payload_attestations: Vec::new(),
+                    parent_execution_requests: requests,
+                    execution_payload: payload_for(&inputs),
+                    blob_kzg_commitments: Vec::new(),
+                    execution_requests: ExecutionRequests::default(),
+                },
+                &config(),
+                options,
+            )
+        };
+        assert!(produce_with(BlockProcessingOptions::default()).is_err());
+
+        let produced = produce_with(skip).unwrap();
+        assert_eq!(
+            produced.block.body.randao_reveal,
+            BlsSignature(bls::G2_POINT_AT_INFINITY)
+        );
+
+        // Importing it with the same option lands on the state root it names.
+        let mut post = state.clone();
+        stf::gloas::process_block(
+            &mut post,
+            &produced.block,
+            &config(),
+            &CommitteeCache::default(),
+            skip,
+        )
+        .unwrap();
+        assert_eq!(produced.block.state_root, post.hash_tree_root());
+    }
+
+    #[test]
     fn a_payload_on_the_wrong_parent_is_refused_before_signing() {
         let state = state_to_build_on();
         let requests = ExecutionRequests::default();
@@ -926,6 +1000,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            BlockProcessingOptions::default(),
         );
         assert!(result.is_err());
     }
@@ -956,6 +1031,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            BlockProcessingOptions::default(),
         );
         assert!(produced.is_err());
     }
@@ -1109,6 +1185,7 @@ mod gloas_block_production_tests {
                 execution_requests: ExecutionRequests::default(),
             },
             &config(),
+            BlockProcessingOptions::default(),
         )
         .unwrap();
     }
@@ -1183,6 +1260,7 @@ mod bid_assembly_tests {
     use crate::beacon::builder_market::test_support::{
         builder_secret, gloas_state_with_builder, sign_bid,
     };
+    use crate::beacon::stf::block::BlockProcessingOptions;
     use ethlambda_types::beacon::primitives::{BlsPubkey, ExecutionAddress};
 
     /// A state at slot 33 with a funded, active builder 0, and a bid on its
@@ -1233,8 +1311,13 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
-        let block =
-            assemble_gloas_block_on_bid(&state, inputs(&state, bid.clone()), &config()).unwrap();
+        let block = assemble_gloas_block_on_bid(
+            &state,
+            inputs(&state, bid.clone()),
+            &config(),
+            BlockProcessingOptions::default(),
+        )
+        .unwrap();
         assert_eq!(block.body.signed_execution_payload_bid, bid);
         assert_eq!(block.slot, state.slot());
         assert_ne!(block.state_root, Root::ZERO);
@@ -1262,7 +1345,15 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
-        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+        assert!(
+            assemble_gloas_block_on_bid(
+                &state,
+                inputs(&state, bid),
+                &config(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1276,7 +1367,15 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
-        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+        assert!(
+            assemble_gloas_block_on_bid(
+                &state,
+                inputs(&state, bid),
+                &config(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1288,7 +1387,15 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
-        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+        assert!(
+            assemble_gloas_block_on_bid(
+                &state,
+                inputs(&state, bid),
+                &config(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1301,7 +1408,15 @@ mod bid_assembly_tests {
             &bid,
             &ExecutionRequests::default()
         ));
-        assert!(assemble_gloas_block_on_bid(&state, inputs(&state, bid), &config()).is_err());
+        assert!(
+            assemble_gloas_block_on_bid(
+                &state,
+                inputs(&state, bid),
+                &config(),
+                BlockProcessingOptions::default(),
+            )
+            .is_err()
+        );
     }
 
     #[test]
