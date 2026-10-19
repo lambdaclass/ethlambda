@@ -30,3 +30,7 @@ datatest-stable = "0.3.3"
 name = "stf_spectests"
 path = "tests/stf_spectests.rs"
 harness = false
+# Skipped by `cargo test`: the released leanSpec fixtures still carry the old
+# leanVM key format and fail to decode. Run on demand with
+# `cargo test --profile release-fast --test <name>`.
+test = false

@@ -1,4 +1,4 @@
-//! The dial loop: turn what discv5 found into libp2p QUIC connections.
+//! The dial loop: turn what discv5 found into libp2p connections.
 //!
 //! Runs as a `P2PServer` tick every [`DISCOVERY_DIAL_INTERVAL`], asking
 //! discovery for candidates, ranking them by subnet coverage, and dialing one
@@ -12,11 +12,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use ethrex_p2p::discovery::{DiscoveryHandle, PeerEvent};
 use libp2p::PeerId;
+use libp2p::swarm::dial_opts::DialOpts;
 use tracing::info;
 
 use super::admission::{DialTargets, DiscoveredPeer, rank_by_uncovered_subnets};
 use super::node_id::node_id_from_peer_id;
 use super::{DISCOVERY_CANDIDATE_BATCH, SpawnedDiscovery};
+use crate::swarm_adapter::DialOutcome;
 use crate::{P2PServer, metrics};
 
 /// Everything the dial loop needs from a running discovery server.
@@ -139,14 +141,30 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
         subnets = ?candidate.subnets,
         "Dialing discovered peer"
     );
-    // Record the peer only once the swarm has taken the dial. A dial it rejects
-    // synchronously — already connected, already dialing, no addresses, denied —
-    // raises no `OutgoingConnectionError`, so `forget_discovered_peer` would
-    // never run and the entry would outlive the process's interest in it.
-    if !server.swarm_handle.dial_accepted(candidate.addr).await {
-        return;
+    // One `DialOpts` carrying every address, not one dial per address: libp2p
+    // races them within the attempt, which is what lets a live TCP address
+    // rescue a peer whose advertised QUIC port does not answer.
+    let opts = DialOpts::peer_id(candidate.peer_id)
+        .addresses(candidate.addrs)
+        .build();
+    // The candidate has already been popped and marked tried by discovery, so
+    // this is the only chance to record its subnets: whatever happens here,
+    // it will not be offered again. Which makes the refusal the swarm gives back
+    // decide whether recording them is right.
+    match server.swarm_handle.dial_outcome(opts).await {
+        // Nothing in flight and nothing coming, so `forget_discovered_peer`
+        // would never run: recording the subnets here would leave
+        // `covered_subnets` counting a peer we never reach.
+        DialOutcome::Unreachable => return,
+        // A dial to this peer is already in flight, from an earlier tick or from
+        // the static bootnode path in `build_swarm`. Recording is still right:
+        // that attempt has a terminal event coming, which tears the entry down.
+        // Skipping it is what would drift, and permanently — the peer connects,
+        // covers subnets, and `covered_subnets` never counts them, so the dial
+        // loop keeps hunting for coverage it already has.
+        DialOutcome::AlreadyInProgress => {}
+        DialOutcome::Queued => metrics::inc_discovered_peers_dialed(),
     }
-    metrics::inc_discovered_peers_dialed();
     if let Some(discovery) = server.discovery.as_mut() {
         discovery
             .peer_attnets
@@ -163,7 +181,7 @@ pub(crate) async fn dial_tick(server: &mut P2PServer) {
 /// everything that arrives here has already passed admission.
 ///
 /// What arrives is a `Node`, which knows an address and a key and nothing about
-/// `quic` or `attnets`, so the dial target is looked back up in [`DialTargets`]
+/// `quic`, `tcp` or `attnets`, so the dial target is looked back up in [`DialTargets`]
 /// under the node's id. A miss is ordinary: bootnodes are dialable to ethrex
 /// before they have published an ENR, and one we never read a record for is one
 /// we cannot build a libp2p multiaddr for. Skipping costs nothing, since the

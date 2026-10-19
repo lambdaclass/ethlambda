@@ -248,13 +248,13 @@ mod tests {
     fn base_state() -> State {
         let validators = vec![
             Validator {
-                attestation_pubkey: [1u8; 52],
-                proposal_pubkey: [2u8; 52],
+                attestation_pubkey: [1u8; 32],
+                proposal_pubkey: [2u8; 32],
                 index: 0,
             },
             Validator {
-                attestation_pubkey: [3u8; 52],
-                proposal_pubkey: [4u8; 52],
+                attestation_pubkey: [3u8; 32],
+                proposal_pubkey: [4u8; 32],
                 index: 1,
             },
         ];

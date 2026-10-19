@@ -212,6 +212,32 @@ pub fn notify_peer_connected(node_name: &str, direction: &str, result: &str) {
     }
 }
 
+/// Count an established connection against the transport that carried it.
+///
+/// A separate metric rather than a third label on
+/// `lean_peer_connection_events_total`: that one is leanMetrics-specified down
+/// to its `direction`/`result` label set, so widening it would put ethlambda
+/// off-spec. This is the production-visible answer to "did the TCP fallback
+/// actually carry anything", which the `transport` trace field alone cannot give
+/// at default verbosity.
+///
+/// Counts connections, not peers: a peer holding both a QUIC and a TCP
+/// connection is counted once per connection, so the total can exceed the
+/// `result="success"` count next door, which fires only on a peer's first.
+pub fn inc_peer_connection_transport(direction: &str, transport: &str) {
+    static LEAN_PEER_CONNECTIONS_BY_TRANSPORT: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_peer_connections_by_transport_total",
+            "Established peer connections by the transport that carried them",
+            &["direction", "transport"]
+        )
+        .unwrap()
+    });
+    LEAN_PEER_CONNECTIONS_BY_TRANSPORT
+        .with_label_values(&[direction, transport])
+        .inc();
+}
+
 /// Notify that a peer disconnected.
 ///
 /// Decrements the connected peer count and increments the disconnection event counter.

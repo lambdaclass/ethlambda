@@ -21,10 +21,15 @@ pub(crate) struct NodeOptions {
     /// Directory containing per-validator XMSS keys (e.g., hash-sig-keys/).
     #[arg(long)]
     pub(crate) hash_sig_keys_dir: PathBuf,
-    /// UDP port for the libp2p QUIC listener.
+    /// Port for the libp2p listeners: UDP for QUIC and TCP for the noise+yamux
+    /// fallback, both on this same number.
+    ///
+    /// TCP and UDP are separate namespaces, so one number names both. It must
+    /// still differ from every other port the node binds: `--discovery.port`
+    /// (also UDP), and `--api-port`/`--metrics-port` (also TCP).
     ///
     /// Defaults one above `--discovery.port` so that `--discovery.enable` works
-    /// on its own: both are UDP sockets and cannot share a port.
+    /// on its own.
     #[arg(long, default_value = "9001")]
     pub(crate) gossipsub_port: u16,
     #[arg(long, default_value = "127.0.0.1")]
@@ -78,8 +83,45 @@ pub(crate) struct NodeOptions {
     pub(crate) attestation_committee_count: Option<u64>,
     /// Subnet IDs this aggregator should subscribe to (comma-separated).
     /// Requires --is-aggregator. Defaults to the subnets of the node's validators.
+    /// Every ID must be below --attestation-committee-count; the node refuses to
+    /// start otherwise, since a higher ID names a topic no validator publishes on.
+    ///
+    /// The first ID is also this node's aggregation duty subnet: where its
+    /// aggregation window starts, and what --skip-redundant-aggregation
+    /// rotates ownership over. Order matters, so give co-located aggregators
+    /// different first IDs. Unset, the duty subnet falls back to the lowest
+    /// subscribed subnet, which is the same value on every node whose
+    /// validators span all subnets.
     #[arg(long, value_delimiter = ',', requires = "is_aggregator")]
     pub(crate) aggregate_subnet_ids: Option<Vec<u64>>,
+    /// Sit out aggregation candidates whose level another duty subnet owns
+    /// this slot. Requires --is-aggregator.
+    ///
+    /// By default every aggregator merges proofs for a window of subnets
+    /// starting at its duty subnet, and windows belonging to neighbouring duty
+    /// subnets overlap, so some prover work is duplicated. With this flag an
+    /// aggregator skips a candidate whose width it does not own in the current
+    /// slot and spends that job on the next-best attestation data instead. The
+    /// owner rotates with the slot, so no node is permanently the one sitting
+    /// out, and the narrowest width is owned by everyone, so a candidate whose
+    /// pool holds nothing on this node's subnet, which is the raw-signature
+    /// case, is never skipped.
+    ///
+    /// Worth enabling when leanVM prover CPU is the bottleneck on co-located
+    /// aggregators.
+    ///
+    /// Deployment precondition: give every subnet below
+    /// --attestation-committee-count an aggregator holding it as its duty
+    /// subnet. Ownership is `duty_subnet % width == slot % width`, so on a
+    /// sparser placement a width can have no owner at all while every
+    /// configured node is healthy. With duty subnets {0, 2} at committee count
+    /// 4, nothing owns width 4 in an odd slot, and since this flag also
+    /// disables the full-width fallback, that merge level is simply dropped
+    /// for the slot. The narrower levels still run and the next slot rotates to
+    /// a different owner, but the loss is structural, not just the cost of a
+    /// node that is down or late.
+    #[arg(long, default_value = "false", requires = "is_aggregator")]
+    pub(crate) skip_redundant_aggregation: bool,
     /// Directory for RocksDB storage
     #[arg(long, default_value = "./data")]
     pub(crate) data_dir: PathBuf,
@@ -105,6 +147,19 @@ pub(crate) struct NodeOptions {
     /// coverage.
     #[arg(long, default_value = "false")]
     pub(crate) enable_proposer_aggregation: bool,
+    /// Prove on leanVM's bump arena instead of the system allocator.
+    ///
+    /// Buys proving throughput with memory: the arena's slabs stay faulted in
+    /// across proofs (a phase reset abandons their contents, it does not return
+    /// the pages), and on Linux it also stops glibc trimming its own heap. RSS
+    /// therefore ratchets up to the process's allocation high-water mark and
+    /// stays there for the lifetime of the node. Off by default so a long-lived
+    /// node keeps bounded memory; worth enabling on hosts with memory to spare
+    /// where proving latency is the constraint.
+    ///
+    /// Read once at startup: the allocator is fixed before the first proof.
+    #[arg(long, default_value = "false")]
+    pub(crate) prover_arena: bool,
     /// Maximum number of distinct attestations to pack when building a block.
     ///
     /// Bounds how many distinct `AttestationData` entries the proposer includes
@@ -160,18 +215,54 @@ pub(crate) struct DiscoveryConfig {
 }
 
 impl NodeOptions {
-    /// Reject a discovery port that collides with the QUIC port.
+    /// Reject port assignments that cannot all bind, before anything binds.
     ///
-    /// Both are UDP. Without this the collision surfaces at bind time as an
-    /// opaque `EADDRINUSE` on whichever socket loses the race.
-    pub(crate) fn validate_discovery(&self) -> eyre::Result<()> {
-        if self.discovery.enable && self.discovery.port == self.gossipsub_port {
+    /// There are two clashes to catch, on two protocols. `--discovery.port` and
+    /// `--gossipsub-port` are both UDP. `--gossipsub-port` also binds TCP for
+    /// the noise+yamux listener, which puts it in the same namespace as the
+    /// HTTP servers: sharing that number with `--api-port` was legal while the
+    /// swarm bound UDP only, and is now a real collision. Without these checks
+    /// either surfaces at bind time as an opaque `EADDRINUSE` on whichever
+    /// socket loses the race.
+    ///
+    /// Every comparison skips `0`, which is not a port but a request for one:
+    /// two `0` binds always land on different OS-assigned ports and can never
+    /// collide. Rejecting a pair of them would refuse the setup that exists to
+    /// avoid collisions, which test harnesses and several-nodes-per-host runs
+    /// rely on.
+    pub(crate) fn validate_ports(&self) -> eyre::Result<()> {
+        if self.discovery.enable
+            && self.gossipsub_port != 0
+            && self.discovery.port == self.gossipsub_port
+        {
             eyre::bail!(
                 "--discovery.port ({}) must differ from --gossipsub-port ({}): \
                  both bind UDP and cannot share a port",
                 self.discovery.port,
                 self.gossipsub_port
             );
+        }
+        // A discovery-enabled node publishes `quic` and `tcp` entries naming
+        // this port. Port 0 asks the OS to pick, so the two listeners land on
+        // different real ports and the record advertises neither of them: a
+        // peer reading it finds nothing dialable.
+        if self.discovery.enable && self.gossipsub_port == 0 {
+            eyre::bail!(
+                "--gossipsub-port 0 cannot be used with --discovery.enable: the \
+                 advertised ENR would name port 0, which no peer can dial"
+            );
+        }
+        for (flag, port) in [
+            ("--api-port", self.api_port),
+            ("--metrics-port", self.metrics_port),
+        ] {
+            if self.gossipsub_port != 0 && port == self.gossipsub_port {
+                eyre::bail!(
+                    "{flag} ({port}) must differ from --gossipsub-port ({}): the \
+                     libp2p swarm binds TCP on that port as well as UDP",
+                    self.gossipsub_port
+                );
+            }
         }
         Ok(())
     }
@@ -255,16 +346,87 @@ mod tests {
         let options = parse(&["--discovery.enable"]);
 
         assert_ne!(options.discovery.port, options.gossipsub_port);
-        assert!(options.validate_discovery().is_ok());
+        assert!(options.validate_ports().is_ok());
     }
 
     #[test]
-    fn colliding_ports_are_rejected_only_when_discovery_is_enabled() {
+    fn colliding_udp_ports_are_rejected_only_when_discovery_is_enabled() {
         let ports = ["--gossipsub-port", "9000", "--discovery.port", "9000"];
         let mut enabled = ports.to_vec();
         enabled.push("--discovery.enable");
 
-        assert!(parse(&ports).validate_discovery().is_ok());
-        assert!(parse(&enabled).validate_discovery().is_err());
+        assert!(parse(&ports).validate_ports().is_ok());
+        assert!(parse(&enabled).validate_ports().is_err());
+    }
+
+    /// Unlike the UDP clash above, this one does not depend on discovery: the
+    /// swarm binds TCP either way, so an HTTP port sharing the number always
+    /// loses one of the two listeners.
+    #[test]
+    fn an_http_port_sharing_the_gossipsub_port_is_rejected() {
+        // A port no default claims, so only the flag under test collides and
+        // the message can be checked for naming it.
+        const SHARED: &str = "9100";
+
+        for flag in ["--api-port", "--metrics-port"] {
+            let err = parse(&["--gossipsub-port", SHARED, flag, SHARED])
+                .validate_ports()
+                .expect_err("a TCP clash with an HTTP port must be rejected");
+            assert!(
+                err.to_string().contains(flag),
+                "the message must name the offending flag, got: {err}"
+            );
+        }
+    }
+
+    /// `--api-port` and `--metrics-port` sharing one number is supported (the
+    /// RPC crate merges the routers onto a single listener), so the TCP check
+    /// must not sweep that up.
+    #[test]
+    fn api_and_metrics_may_share_a_port() {
+        let options = parse(&["--api-port", "5052", "--metrics-port", "5052"]);
+
+        assert!(options.validate_ports().is_ok());
+    }
+
+    /// Port 0 leaves the two listeners on different OS-assigned ports, so the
+    /// one number the ENR publishes describes neither.
+    #[test]
+    fn gossipsub_port_zero_is_rejected_with_discovery() {
+        assert!(parse(&["--gossipsub-port", "0"]).validate_ports().is_ok());
+        assert!(
+            parse(&["--gossipsub-port", "0", "--discovery.enable"])
+                .validate_ports()
+                .is_err()
+        );
+    }
+
+    /// Two `0`s are two OS-assigned ports, so the equality checks must not read
+    /// them as a clash: without discovery, `--gossipsub-port 0` is a supported
+    /// configuration (the test above pins that), and it stays supported when an
+    /// HTTP port asks the OS to pick as well.
+    #[test]
+    fn port_zero_never_counts_as_a_clash() {
+        for flag in ["--api-port", "--metrics-port", "--discovery.port"] {
+            let mut argv = vec!["--gossipsub-port", "0", flag, "0"];
+            if flag == "--discovery.port" {
+                argv.push("--discovery.enable");
+                // Discovery rejects a `0` gossipsub port on its own grounds:
+                // the ENR would publish a port no peer can dial. What must not
+                // happen is the pair being rejected as a collision.
+                let err = parse(&argv)
+                    .validate_ports()
+                    .expect_err("gossipsub port 0 stays invalid under discovery");
+                assert!(
+                    !err.to_string().contains("must differ"),
+                    "0 == 0 must not be reported as a clash, got: {err}"
+                );
+                continue;
+            }
+            assert!(
+                parse(&argv).validate_ports().is_ok(),
+                "{flag} 0 alongside --gossipsub-port 0 must be accepted"
+            );
+        }
     }
 }

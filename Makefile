@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -7,12 +7,45 @@ fmt: ## 🎨 Format all code using rustfmt
 	cargo fmt --all
 
 lint: ## 🔍 Run clippy on all workspace crates
-	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
+	# The spectests are `test = false` (stale leanSpec fixtures), which
+	# `--all-targets` skips: lint them by name so they keep compiling
+	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
 
 test: leanSpec/fixtures ## 🧪 Run all tests
 	# release-fast: release-grade opt-level to avoid stack overflows during
 	# signature verification/aggregation, without paying for LTO on every rebuild
-	cargo test --workspace --profile release-fast
+	cargo test --locked --workspace --profile release-fast
+
+# Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
+# is nightly-only, everything else runs on the stable toolchain pinned in
+# rust-toolchain.toml.
+RESOLVER_TOOLCHAIN := nightly-2026-06-21
+
+# Versions published less than 14 days ago are excluded from resolution.
+# Resolution done on stable (`cargo add`, plain `cargo update`) is NOT covered;
+# this target is the intended path for routine updates. Git dependencies have
+# no publish age and are refreshed WITHOUT any cooldown: review their lockfile
+# rev changes manually.
+update: ## 📦 Update dependencies under the publish-age cooldown (UPDATE_ARGS="-p foo")
+	rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
+	cargo +$(RESOLVER_TOOLCHAIN) update -Z min-publish-age $(UPDATE_ARGS)
+
+# Stable cargo ignores the cooldown, so a lockfile can pin too-young crates;
+# same check as the CI `cooldown` job, without touching the files. A cooldown
+# downgrade is annotated with the too-young version's publish date; downgrades
+# for other reasons carry no such note and are not flagged.
+cooldown-check: ## 🔎 Fail if a lockfile pins crates younger than the publish-age cooldown
+	@rustup toolchain install $(RESOLVER_TOOLCHAIN) --profile minimal > /dev/null && \
+	status=0; \
+	for manifest in Cargo.toml tooling/event-monitor/Cargo.toml; do \
+		if ! out=$$(cargo +$(RESOLVER_TOOLCHAIN) update --dry-run -Z min-publish-age --manifest-path $$manifest 2>&1); then \
+			echo "WARNING: publish-age cooldown probe failed for $$manifest:"; echo "$$out" | grep -v "^ *Updating " | head -20; continue; \
+		fi; \
+		hits=$$(echo "$$out" | grep -E "^ *Downgrading .*published" || true); \
+		if [ -n "$$hits" ]; then echo "ERROR: $$manifest pins crates younger than the publish-age cooldown:"; echo "$$hits"; status=1; fi; \
+	done; \
+	exit $$status
 
 BENCH_ARGS ?= synthetic --mock-crypto
 
@@ -62,10 +95,30 @@ leanSpec/fixtures:
 	mkdir -p leanSpec/fixtures; \
 	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
 
+# lambdaclass fork of lean-quickstart: genesis keys come from `ethlambda keygen`, and the
+# partner clients run their devnet-5 images. An existing lean-quickstart/ is never
+# re-cloned, so delete it to pick up a new pin.
+LEAN_QUICKSTART_REPO ?= https://github.com/lambdaclass/lean-quickstart.git
+LEAN_QUICKSTART_BRANCH ?= devnet5-ethlambda-keygen
+
 lean-quickstart:
-	git clone https://github.com/blockblaz/lean-quickstart.git --depth 1 --single-branch
+	git clone $(LEAN_QUICKSTART_REPO) --branch $(LEAN_QUICKSTART_BRANCH) --depth 1 --single-branch
 
 run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-quickstart
+	@# The branch name check works offline. On the right branch, also compare against the
+	@# remote tip, so a clone left behind by a moved pin is caught too. ls-remote reads the
+	@# ref without touching the clone
+	@if [ "$$(git -C lean-quickstart rev-parse --abbrev-ref HEAD)" != "$(LEAN_QUICKSTART_BRANCH)" ]; then \
+		echo "⚠️  lean-quickstart/ is not on the pinned $(LEAN_QUICKSTART_BRANCH) branch; delete it to re-clone"; \
+	else \
+		have=$$(git -C lean-quickstart rev-parse HEAD); \
+		want=$$(git ls-remote $(LEAN_QUICKSTART_REPO) refs/heads/$(LEAN_QUICKSTART_BRANCH) 2>/dev/null | cut -f1); \
+		if [ -z "$$want" ]; then \
+			echo "⚠️  could not resolve $(LEAN_QUICKSTART_BRANCH) at $(LEAN_QUICKSTART_REPO); skipping the lean-quickstart/ freshness check"; \
+		elif [ "$$have" != "$$want" ]; then \
+			echo "⚠️  lean-quickstart/ is at $$(printf '%.8s' "$$have"), but $(LEAN_QUICKSTART_BRANCH) is at $$(printf '%.8s' "$$want"); delete it to re-clone"; \
+		fi; \
+	fi
 	@# Remove local devnet data folder to avoid stale data
 	@# NOTE: --cleanData flag in spin-node.sh doesn't work
 	@rm -rf lean-quickstart/local-devnet/data/
@@ -73,12 +126,15 @@ run-devnet: docker-build lean-quickstart ## 🚀 Run a local devnet using lean-q
 	@echo
 	@echo "Devnet will be using the current configuration. For custom configurations, modify lean-quickstart/local-devnet/genesis/validator-config.yaml and restart the devnet."
 	@echo
-	@# Use temp file instead of sed -i for macOS/GNU portability
-	@sed 's|ghcr.io/lambdaclass/ethlambda:[^ ]*|ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)|' lean-quickstart/client-cmds/ethlambda-cmd.sh > lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp \
+	@# Use temp file instead of sed -i for macOS/GNU portability. The tag stops at a `}` so an
+	@# image written as a shell parameter default keeps its closing brace
+	@sed 's|ghcr.io/lambdaclass/ethlambda:[^ }]*|ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG)|' lean-quickstart/client-cmds/ethlambda-cmd.sh > lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp \
 		&& mv lean-quickstart/client-cmds/ethlambda-cmd.sh.tmp lean-quickstart/client-cmds/ethlambda-cmd.sh
 	@echo "Starting local devnet. Press Ctrl+C to stop all nodes."
+	@# Generate the genesis keys with the image under test, so they match its leanVM revision
 	@cd lean-quickstart \
-		&& NETWORK_DIR=local-devnet ./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
+		&& NETWORK_DIR=local-devnet KEYGEN_IMAGE=ghcr.io/lambdaclass/ethlambda:$(DOCKER_TAG) \
+			./spin-node.sh --node all --generateGenesis --metrics > ../devnet.log 2>&1
 
 docs-deps: ## 📦 Install dependencies for generating the documentation
 	cargo install --version 0.5.2 --locked mdbook

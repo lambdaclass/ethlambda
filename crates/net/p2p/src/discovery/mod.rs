@@ -3,7 +3,9 @@
 //! ethrex's `DiscoveryServer` runs discv5-only on its own UDP socket and keeps
 //! what it finds to itself. ethlambda asks it for dial candidates, applies the
 //! spec checks in [`admission`] as each ENR arrives, and dials the survivors
-//! over libp2p QUIC. Static bootnode dialing is untouched.
+//! over libp2p. Both dial paths, discovered peers and static bootnodes alike, hand
+//! the swarm every address a peer advertises (`quic` and `tcp`) in one attempt
+//! and let libp2p race them.
 //!
 //! The traffic across that boundary runs one way, into discovery: a request for
 //! the next candidate, and a cast per connection opened or closed. Those casts
@@ -68,7 +70,10 @@ pub struct DiscoverySpawnConfig {
     pub node_key: Vec<u8>,
     pub bind_ip: IpAddr,
     pub discovery_port: u16,
-    pub quic_port: u16,
+    /// Port the libp2p transports are bound to, advertised in the ENR as both
+    /// `quic` (UDP) and `tcp`. One number for both: see
+    /// [`LocalEnrParams::p2p_port`](enr::LocalEnrParams::p2p_port).
+    pub p2p_port: u16,
     pub subscription_subnets: HashSet<u64>,
     pub attestation_committee_count: u64,
     pub bootnodes: Vec<Bootnode>,
@@ -111,8 +116,10 @@ pub struct SpawnedDiscovery {
 /// (ask the OS for a free port) still produces an ENR advertising the real
 /// bound port rather than the literal 0, which would be undialable.
 ///
-/// Only bootnodes whose ENR advertises a `udp` port can seed discv5; the rest
-/// are still dialed statically by `build_swarm`.
+/// Only bootnodes whose ENR advertises a `udp` port can seed discv5. That is a
+/// separate question from whether `build_swarm` dials one statically, which
+/// turns on its `quic`/`tcp` entries: a bootnode can do both, either, or
+/// neither.
 pub async fn spawn_discovery(
     config: DiscoverySpawnConfig,
 ) -> Result<SpawnedDiscovery, DiscoveryError> {
@@ -133,7 +140,7 @@ pub async fn spawn_discovery(
         signer,
         ip: advertise_ip,
         discovery_port: bound.port(),
-        quic_port: config.quic_port,
+        p2p_port: config.p2p_port,
         subscription_subnets: config.subscription_subnets,
         attestation_committee_count: config.attestation_committee_count,
     };
@@ -166,9 +173,10 @@ pub async fn spawn_discovery(
 
     // The record we hand over is the same one `enr_url` above reported, so what
     // ethrex answers discv5 queries with carries the consensus entries (`eth2`,
-    // `attnets`, `quic`) and a lean peer applying our own admission rules to it
-    // admits us. ethrex re-signs it under `params.signer` whenever IP voting
-    // bumps the sequence number, keeping the extra entries.
+    // `attnets`, `quic`) and the `tcp` port of the fallback transport, and a
+    // lean peer applying our own admission rules to it admits us. ethrex
+    // re-signs it under `params.signer` whenever IP voting bumps the sequence
+    // number, keeping the extra entries.
     //
     // `shared_local_node` is ethrex's live mirror of that identity, which its RPC
     // layer serves the current record from. Nothing on this side reads it yet, so
@@ -257,7 +265,7 @@ mod tests {
                 .to_vec(),
             bind_ip: IpAddr::from(Ipv4Addr::LOCALHOST),
             discovery_port,
-            quic_port: 9001,
+            p2p_port: 9001,
             subscription_subnets: HashSet::from([0u64]),
             attestation_committee_count: TEST_COMMITTEE_COUNT,
             bootnodes: Vec::new(),

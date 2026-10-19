@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
-use ethlambda_crypto::signature::{ValidatorPublicKey, ValidatorSignature};
 use ethlambda_network_api::{BlockChainToP2PRef, BlockSource, InitP2P};
 use ethlambda_state_transition::is_proposer;
 use ethlambda_storage::{ALL_TABLES, Store};
@@ -9,7 +8,7 @@ use ethlambda_types::{
     ShortRoot,
     aggregator::AggregatorController,
     attestation::{SignedAggregatedAttestation, SignedAttestation},
-    block::{ByteList512KiB, MultiMessageAggregate, SignedBlock},
+    block::SignedBlock,
     chain_config::ChainConfig,
     primitives::{H256, HashTreeRoot as _},
 };
@@ -65,6 +64,14 @@ pub struct BlockChainConfig {
     pub gate_duties: bool,
     /// Attestation subnets this node subscribes to.
     pub subscribed_subnets: HashSet<u64>,
+    /// The subnet this aggregator is responsible for when scoring recursive
+    /// aggregation. Aggregators on different duty subnets merge different
+    /// children, which is what stops them all producing the same proof.
+    pub aggregation_duty_subnet: u64,
+    /// Whether the aggregator sits out candidates whose level another duty
+    /// subnet owns in the slot, trading window overlap for less duplicated prover
+    /// work.
+    pub skip_redundant_aggregation: bool,
     /// Proposer-side block-building policy.
     pub proposer_config: ProposerConfig,
 }
@@ -167,6 +174,8 @@ impl BlockChain {
             attestation_committee_count,
             gate_duties,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
         } = config;
 
@@ -174,17 +183,9 @@ impl BlockChain {
         metrics::set_node_sync_status(metrics::SyncStatus::Idle);
         let time_config = *store.config();
         let genesis_time = time_config.genesis_time;
-        let mut key_manager = key_manager::KeyManager::new(validator_keys);
+        let key_manager = key_manager::KeyManager::new(validator_keys);
 
-        // Catch XMSS keys up to the current slot before the first tick
-        // store.time() doesn't work here: after an offline gap it lags wall-clock by
-        // exactly the gap we need to catch up through
-        let now_ms = unix_now_ms();
-        let current_slot = (now_ms.saturating_sub(time_config.genesis_time_ms())
-            / time_config.milliseconds_per_slot) as u32;
-        key_manager.advance_keys_to(current_slot);
-
-        let handle = BlockChainServer {
+        let server = BlockChainServer {
             store,
             p2p: None,
             key_manager,
@@ -195,13 +196,47 @@ impl BlockChain {
             last_tick_instant: None,
             attestation_committee_count,
             subscribed_subnets,
+            aggregation_duty_subnet,
+            skip_redundant_aggregation,
             proposer_config,
             pre_merge_coverage: None,
             sync_status: SyncStatusTracker::new(gate_duties),
             sync_status_controller,
             events,
+        };
+
+        // Warm the XMSS signing caches for the next duties before the first
+        // tick, which fires right away and runs the current interval's duty.
+        // store.time() doesn't work here: after an offline gap it lags
+        // wall-clock by exactly the gap the first duty will be at.
+        let ms_since_genesis = unix_now_ms().saturating_sub(time_config.genesis_time_ms());
+        let current_slot = ms_since_genesis / time_config.milliseconds_per_slot;
+        match SlotInterval::from_ms_since_genesis(ms_since_genesis, &time_config) {
+            // The first tick still attests at the current slot. No proposal
+            // key: the current slot's block was due at the previous slot's
+            // interval 4, before we started, and the interval-1 tick warms the
+            // next slot's.
+            SlotInterval::BlockPublication | SlotInterval::AttestationProduction => {
+                server
+                    .key_manager
+                    .prepare_keys_for(current_slot as u32, None);
+            }
+            // This slot's attestations are behind us, so the next signatures
+            // are the next slot's block, built at this slot's interval 4, and
+            // that slot's attestations.
+            SlotInterval::Aggregation
+            | SlotInterval::SafeTargetUpdate
+            | SlotInterval::EndOfSlot => {
+                let num_validators = server.store.head_state().validators.len() as u64;
+                let next_slot = current_slot + 1;
+                let proposer = server.get_our_proposer(next_slot, num_validators);
+                server
+                    .key_manager
+                    .prepare_keys_for(next_slot as u32, proposer);
+            }
         }
-        .start();
+
+        let handle = server.start();
         let time_until_genesis = (SystemTime::UNIX_EPOCH + Duration::from_secs(genesis_time))
             .duration_since(SystemTime::now())
             .unwrap_or_default();
@@ -267,6 +302,16 @@ pub struct BlockChainServer {
     /// Used to scale the early-aggregation threshold.
     subscribed_subnets: HashSet<u64>,
 
+    /// The subnet this aggregator is responsible for. Scores which children
+    /// recursive aggregation merges, so aggregators on different duty subnets
+    /// build different proofs.
+    aggregation_duty_subnet: u64,
+
+    /// Whether to sit out aggregation candidates whose level another duty
+    /// subnet owns this slot, trading window overlap for less duplicated
+    /// prover work. See [`aggregation::owns_width`] for the rotation.
+    skip_redundant_aggregation: bool,
+
     /// Proposer-side block-building policy
     proposer_config: ProposerConfig,
 
@@ -322,8 +367,10 @@ impl BlockChainServer {
         }
 
         // Fail fast: a state with zero validators is invalid and would cause
-        // panics in proposer selection and attestation processing.
-        if self.store.head_state().validators.is_empty() {
+        // panics in proposer selection and attestation processing. Read once
+        // per tick, since `head_state` clones the whole state.
+        let num_validators = self.store.head_state().validators.len() as u64;
+        if num_validators == 0 {
             error!("Head state has no validators, skipping tick");
             return;
         }
@@ -361,7 +408,7 @@ impl BlockChainServer {
         // Whether one of our validators proposes this slot. Drives the store's
         // interval-0 attestation acceptance.
         let is_proposer = (interval == SlotInterval::BlockPublication && slot > 0)
-            .then(|| self.get_our_proposer(slot))
+            .then(|| self.get_our_proposer(slot, num_validators))
             .flatten()
             .is_some();
 
@@ -424,6 +471,20 @@ impl BlockChainServer {
                         EarlyAggregationCheck,
                     );
                 }
+
+                // Warm the XMSS signing caches for the next slot so the signing
+                // paths don't have to, now that this slot's attestations are
+                // signed: a key caches one bottom subtree, so warming any earlier
+                // evicts the subtree this slot's attestation signs with whenever
+                // the two slots straddle a subtree boundary. This lands before
+                // interval 4 signs the next slot's block. A skipped interval-1
+                // tick costs only latency, since `sign` rebuilds the subtree
+                // itself on a miss. Runs off the actor so a subtree boundary
+                // doesn't stall the tick.
+                let next_slot = slot + 1;
+                let proposer = self.get_our_proposer(next_slot, num_validators);
+                self.key_manager
+                    .prepare_keys_in_background(next_slot as u32, proposer);
             }
 
             // ==== interval 2 ====
@@ -461,7 +522,7 @@ impl BlockChainServer {
             SlotInterval::EndOfSlot => {
                 let next_slot = slot + 1;
                 let next_proposer = self
-                    .get_our_proposer(next_slot)
+                    .get_our_proposer(next_slot, num_validators)
                     .filter(|_| self.sync_status.duties_allowed());
 
                 if let Some(validator_id) = next_proposer {
@@ -474,9 +535,6 @@ impl BlockChainServer {
         metrics::update_safe_target_slot(self.store.safe_target_slot());
         // Update head slot metric (head may change when attestations are promoted at intervals 0/4)
         metrics::update_head_slot(self.store.head_slot());
-
-        // Advance XMSS keys for next slot so the signing paths don't have to
-        self.key_manager.advance_keys_to((slot + 1) as u32);
     }
 
     /// Kick off a committee-signature aggregation session:
@@ -513,8 +571,9 @@ impl BlockChainServer {
 
         // Limit ourselves to a single round of aggregation if we propose next round.
         // This buys us time to build the block before the next slot's interval-0 tick.
+        let num_validators = self.store.head_state().validators.len() as u64;
         let next_proposer = self
-            .get_our_proposer(slot + 1)
+            .get_our_proposer(slot + 1, num_validators)
             .filter(|_| self.sync_status.duties_allowed());
         let max_jobs = if next_proposer.is_some() {
             1
@@ -522,7 +581,13 @@ impl BlockChainServer {
             MAX_AGGREGATION_JOBS
         };
 
-        let Some(snapshot) = aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs)
+        let window_config = aggregation::AggregationWindowConfig {
+            duty_subnet: self.aggregation_duty_subnet,
+            committee_count: self.attestation_committee_count,
+            skip_redundant: self.skip_redundant_aggregation,
+        };
+        let Some(snapshot) =
+            aggregation::snapshot_aggregation_inputs(&self.store, slot, max_jobs, window_config)
         else {
             // No current-slot gossip sigs — nothing to aggregate this slot.
             return;
@@ -658,10 +723,7 @@ impl BlockChainServer {
     }
 
     /// Returns the validator ID if any of our validators is the proposer for this slot.
-    fn get_our_proposer(&self, slot: u64) -> Option<u64> {
-        let head_state = self.store.head_state();
-        let num_validators = head_state.validators.len() as u64;
-
+    fn get_our_proposer(&self, slot: u64, num_validators: u64) -> Option<u64> {
         self.key_manager
             .validator_ids()
             .into_iter()
@@ -780,116 +842,19 @@ impl BlockChainServer {
             block.body.attestations.iter(),
         );
 
-        // Sign the block root with the proposal key
-        let block_root = block.hash_tree_root();
-        let Ok(proposer_signature) = self
-            .key_manager
-            .sign_block_root(validator_id, slot as u32, &block_root)
-            .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to sign block root"))
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        // Wrap the proposer's raw XMSS signature into a singleton
-        // single-message aggregate SNARK, then merge it with every attestation
-        // single-message aggregate into the single multi-message aggregate.
+        // Sign the block root, wrap the signature as a singleton single-message
+        // aggregate, and merge it with every attestation aggregate into the
+        // block's multi-message aggregate.
         let head_state = self.store.head_state();
-        let validators = &head_state.validators;
-        let Some(proposer_validator) = validators.get(validator_id as usize) else {
-            error!(%slot, %validator_id, "Proposer index out of range when assembling block");
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        // Decode the proposer's proposal pubkey once and reuse it both for the
-        // singleton single-message aggregate wrap and for the multi-message
-        // aggregate merge inputs.
-        let Ok(proposer_pubkey) = ValidatorPublicKey::from_bytes(
-            &proposer_validator.proposal_pubkey,
+        let Ok(signed_block) = block_builder::seal_block(
+            &head_state,
+            &mut self.key_manager,
+            block,
+            single_message_aggregates,
         )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to decode proposer proposal pubkey"),
-        ) else {
+        .inspect_err(|err| error!(%slot, %validator_id, %err, "Failed to seal block")) else {
             metrics::inc_block_building_failures();
             return;
-        };
-
-        let Ok(proposer_validator_signature) =
-            ValidatorSignature::from_bytes(&proposer_signature).inspect_err(|err| {
-                error!(%slot, %validator_id, %err, "Failed to decode proposer signature bytes")
-            })
-        else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-        let Ok(proposer_proof_bytes) = ethlambda_crypto::aggregate_signatures(
-            vec![proposer_pubkey.clone()],
-            vec![proposer_validator_signature],
-            &block_root,
-            slot as u32,
-        )
-        .inspect_err(
-            |err| error!(%slot, %validator_id, %err, "Failed to wrap proposer signature as single-message aggregate"),
-        ) else {
-            metrics::inc_block_building_failures();
-            return;
-        };
-
-        let mut merge_inputs: Vec<(Vec<ValidatorPublicKey>, ByteList512KiB)> =
-            Vec::with_capacity(single_message_aggregates.len() + 1);
-        let mut resolve_failed = false;
-        for sma in &single_message_aggregates {
-            let mut pubkeys = Vec::new();
-            for vid in sma.participant_indices() {
-                let Some(validator) = validators.get(vid as usize) else {
-                    error!(%slot, %validator_id, vid, "Participant out of range while resolving pubkeys");
-                    resolve_failed = true;
-                    break;
-                };
-                match ValidatorPublicKey::from_bytes(&validator.attestation_pubkey) {
-                    Ok(pk) => pubkeys.push(pk),
-                    Err(err) => {
-                        error!(%slot, %validator_id, vid, %err, "Failed to decode attestation pubkey");
-                        resolve_failed = true;
-                        break;
-                    }
-                }
-            }
-            if resolve_failed {
-                break;
-            }
-            merge_inputs.push((pubkeys, sma.proof.clone()));
-        }
-        if resolve_failed {
-            metrics::inc_block_building_failures();
-            return;
-        }
-        merge_inputs.push((vec![proposer_pubkey], proposer_proof_bytes));
-
-        // Merge yields raw lean-multisig type-2 bytes. Per-component
-        // participants are rederived at verify time from
-        // `block.body.attestations[i].aggregation_bits` plus
-        // `block.proposer_index`, so nothing else needs persisting.
-        let merged_bytes = match ethlambda_crypto::merge_type_1s_into_type_2(merge_inputs) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to merge Type-1s into Type-2");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
-        let proof = match MultiMessageAggregate::from_bytes(merged_bytes.iter().as_slice()) {
-            Ok(p) => p,
-            Err(err) => {
-                error!(%slot, %validator_id, %err, "Failed to build multi-message aggregate");
-                metrics::inc_block_building_failures();
-                return;
-            }
-        };
-        let signed_block = SignedBlock {
-            message: block,
-            proof,
         };
 
         // Stop timing here: the build is done, and the alignment wait below must

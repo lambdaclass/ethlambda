@@ -36,16 +36,22 @@ pub(crate) struct Sample {
     /// Pool entries (new + known) visible to this build; reported so pool
     /// growth across iterations is visible in the samples.
     pub pool_entries: usize,
+    /// Seconds spent producing this slot's pool entries: every validator's
+    /// XMSS attestation signature plus their type-1 aggregation. That is
+    /// aggregator-side work a proposer never does, so it sits outside `wall`.
+    /// Zero in mock mode.
+    pub aggregate_seconds: f64,
+    /// Seconds to import the block after the measured span; in real mode this
+    /// includes verifying the merged multi-message aggregate.
+    pub import_seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Environment {
     pub client_version: &'static str,
-    /// Resolved leansig git revision from Cargo.lock. leansig is pinned to a
-    /// moving branch, so results are not comparable across revisions.
-    pub leansig_rev: &'static str,
-    /// Resolved leanVM git revision from Cargo.lock. leanVM does the signature
-    /// aggregation, so a rev bump moves the measured crypto too.
+    /// Resolved leanVM git revision from Cargo.lock. leanVM owns the whole
+    /// signature stack (XMSS and aggregation), so a rev bump moves the
+    /// measured crypto and results are not comparable across revisions.
     pub leanvm_rev: &'static str,
     pub os: &'static str,
     pub arch: &'static str,
@@ -56,7 +62,6 @@ impl Environment {
     pub(crate) fn collect() -> Self {
         Self {
             client_version: version::CLIENT_VERSION,
-            leansig_rev: env!("ETHLAMBDA_LEANSIG_REV"),
             leanvm_rev: env!("ETHLAMBDA_LEANVM_REV"),
             os: std::env::consts::OS,
             arch: std::env::consts::ARCH,
@@ -97,6 +102,8 @@ pub(crate) struct Summary {
     pub phases: BTreeMap<String, Stats>,
     pub overhead: Stats,
     pub wall: Stats,
+    pub aggregate: Stats,
+    pub import: Stats,
 }
 
 #[derive(Debug, Serialize)]
@@ -120,18 +127,12 @@ impl Report {
                 phases.insert(phase.clone(), stats(&values));
             }
         }
-        let overhead = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.overhead_seconds)
-                .collect::<Vec<_>>(),
-        );
-        let wall = stats(
-            &samples
-                .iter()
-                .map(|sample| sample.wall_seconds)
-                .collect::<Vec<_>>(),
-        );
+        let column =
+            |value: fn(&Sample) -> f64| stats(&samples.iter().map(value).collect::<Vec<_>>());
+        let overhead = column(|sample| sample.overhead_seconds);
+        let wall = column(|sample| sample.wall_seconds);
+        let aggregate = column(|sample| sample.aggregate_seconds);
+        let import = column(|sample| sample.import_seconds);
 
         if wall.cv > CV_WARN_THRESHOLD {
             eprintln!(
@@ -151,6 +152,8 @@ impl Report {
                 phases,
                 overhead,
                 wall,
+                aggregate,
+                import,
             },
         }
     }
@@ -185,13 +188,8 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "  {} leansig={} leanvm={} os={} arch={} threads={}",
-            env.client_version,
-            env.leansig_rev,
-            env.leanvm_rev,
-            env.os,
-            env.arch,
-            env.available_parallelism
+            "  {} leanvm={} os={} arch={} threads={}",
+            env.client_version, env.leanvm_rev, env.os, env.arch, env.available_parallelism
         );
         let _ = writeln!(out);
 
@@ -205,7 +203,11 @@ impl Report {
         for phase in &phases {
             let _ = write!(out, " {phase:>16}");
         }
-        let _ = writeln!(out, " {:>10} {:>10} {:>12}", "overhead", "wall", "root");
+        let _ = writeln!(
+            out,
+            " {:>10} {:>10} {:>10} {:>10} {:>12}",
+            "overhead", "wall", "aggregate", "import", "root"
+        );
 
         for sample in &self.samples {
             let _ = write!(out, "  {:<5}", sample.iteration);
@@ -215,9 +217,11 @@ impl Report {
             }
             let _ = writeln!(
                 out,
-                " {:>10} {:>10} {:>12}",
+                " {:>10} {:>10} {:>10} {:>10} {:>12}",
                 format_ms(sample.overhead_seconds),
                 format_ms(sample.wall_seconds),
+                format_ms(sample.aggregate_seconds),
+                format_ms(sample.import_seconds),
                 &sample.block_root[..10],
             );
         }
@@ -233,6 +237,10 @@ impl Report {
         }
         let _ = writeln!(out, "{}", stats_row("overhead", &self.summary.overhead));
         let _ = writeln!(out, "{}", stats_row("wall", &self.summary.wall));
+        let _ = writeln!(out);
+        let _ = writeln!(out, "  outside the measured span:");
+        let _ = writeln!(out, "{}", stats_row("aggregate", &self.summary.aggregate));
+        let _ = writeln!(out, "{}", stats_row("import", &self.summary.import));
         out
     }
 }

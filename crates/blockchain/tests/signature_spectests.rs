@@ -18,11 +18,15 @@ const SUPPORTED_FIXTURE_FORMAT: &str = "verify_signatures_test";
 
 /// Tests that require cryptographic signature verification at block level.
 ///
-/// Block-level crypto verification is now wired through lean-multisig devnet5's
+/// Block-level crypto verification is now wired through leanVM's
 /// `verify_type_2`, so every fixture is exercised against the real primitive.
 const SKIP_TESTS: &[&str] = &[];
 
 fn run(path: &Path) -> datatest_stable::Result<()> {
+    // These fixtures verify real signatures, so they need the backend a binary would set
+    // up at startup. Idempotent, so calling it per fixture costs nothing after the first.
+    ethlambda_crypto::init_leanvm(false);
+
     let tests = VerifySignaturesTestVector::from_file(path)?;
 
     for (name, test) in tests.tests {
