@@ -697,6 +697,7 @@ async fn run_node(options: Options) -> eyre::Result<()> {
         // the loop has stopped asking for.
         target_peers: common.discovery.target_peers,
         wire: setup.wire,
+        agent_version: version::CLIENT_VERSION,
     })
     .wrap_err("failed to build swarm")?;
 

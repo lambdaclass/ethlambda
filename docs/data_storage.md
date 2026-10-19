@@ -56,8 +56,11 @@ Everything persisted is SSZ-encoded bytes.
 The `StorageBackend` trait knows nothing about consensus types. It moves raw
 bytes in and out of named tables:
 
-- `begin_read()` returns a `StorageReadView` with `get(table, key)` and
-  `prefix_iterator(table, prefix)`.
+- `begin_read()` returns a `StorageReadView`. Its one required lookup is
+  `read(table, key, read_fn)`, which lends the value to `read_fn` without
+  copying it; `get` (an owned copy) and `contains` are built on it, and
+  `StorageReadViewExt::read_with` decodes straight from the borrowed bytes.
+  It also has `prefix_iterator(table, prefix)`.
 - `begin_write()` returns a `StorageWriteBatch` with `put_batch`,
   `delete_batch`, and `commit()`. A batch stages puts and deletes across
   **multiple tables** and applies them **atomically** on commit.
@@ -66,7 +69,7 @@ The two implementations live in `crates/storage/src/backend/`:
 
 | Backend           | Details                                                                                                                                                                                                                       |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `RocksDBBackend`  | One column family per table. Writes go through a native `WriteBatch` with `sync=false` (no fsync per commit).                                                                                                                 |
+| `RocksDBBackend`  | One column family per table. Writes go through a native `WriteBatch` with `sync=false` (no fsync per commit). `States` and `StateDiffs` keep values of 4 KiB and up in LZ4-compressed blob files, so compaction never rewrites a snapshot and a lookup miss never reads one. |
 | `InMemoryBackend` | A `HashMap` per table behind an `RwLock`. Its `prefix_iterator` sorts keys lexicographically to match RocksDB's iteration order, because pruning relies on slot-ordered early-stop scans (see [Key encoding](#key-encoding)). |
 
 ### Store: all the semantics
