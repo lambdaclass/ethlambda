@@ -1627,24 +1627,39 @@ fn handle_goodbye(peer: PeerId, goodbye: Goodbye) {
 }
 
 /// The `[start_slot, end_exclusive)` a beacon range sync should now cover,
-/// given how far this node has fetched and a peer's advertised head. `None`
-/// when the peer is not ahead of `fetched_through`.
+/// given how far this node has the chain and a peer's advertised head. `None`
+/// when the peer is not ahead of it.
 ///
-/// Takes `fetched_through` rather than a `Store`, deliberately: this is
-/// `server.beacon_fetched_through`, not `server.store.head_slot()`. Delivery
-/// to the chain actor is a message and import is work, so the store's own
-/// head lags a delivered batch by the whole actor mailbox. Driven off the
-/// store's head, the live follower kept re-requesting the part of the range
-/// still draining and pulled 11,213 blocks off the wire to import 100; see
-/// `beacon_fetched_through`'s own doc comment on `P2PServer`. Bounded by
-/// [`MAX_SYNC_RANGE`], the same ceiling `handle_lean_status_response` bounds
-/// its own request span by.
-fn beacon_sync_target(fetched_through: u64, peer_head_slot: u64) -> Option<std::ops::Range<u64>> {
-    if peer_head_slot <= fetched_through {
+/// How far this node has the chain is the higher of two floors, because each
+/// one misses blocks the other sees:
+///
+/// - `fetched_through` is `server.beacon_fetched_through`, the highest slot a
+///   range answer has handed to the chain actor. Delivery is a message and
+///   import is work, so the store's head lags a delivered batch by the whole
+///   actor mailbox. Driven off the store's head alone, the live follower kept
+///   re-requesting the part of the range still draining and pulled 11,213
+///   blocks off the wire to import 100.
+/// - `head_slot` is the store's head, which gossip imports move and nothing on
+///   the range path sees. Driven off `fetched_through` alone, a follower that
+///   had caught up kept it at its last range batch, so every peer that
+///   connected later was asked again for every block gossip had delivered
+///   since: 748 blocks in 66 bursts on one follower, a single burst of
+///   which held a gossip block 4.2 s in the chain actor's queue. The head is
+///   a safe floor, since a head block's whole ancestry is already imported.
+///
+/// Bounded by [`MAX_SYNC_RANGE`], the same ceiling
+/// `handle_lean_status_response` bounds its own request span by.
+fn beacon_sync_target(
+    fetched_through: u64,
+    head_slot: u64,
+    peer_head_slot: u64,
+) -> Option<std::ops::Range<u64>> {
+    let synced_through = fetched_through.max(head_slot);
+    if peer_head_slot <= synced_through {
         return None;
     }
-    let gap = peer_head_slot - fetched_through;
-    let start_slot = fetched_through.saturating_add(1);
+    let gap = peer_head_slot - synced_through;
+    let start_slot = synced_through.saturating_add(1);
     let end_exclusive = start_slot.saturating_add(gap.min(MAX_SYNC_RANGE));
     Some(start_slot..end_exclusive)
 }
@@ -1686,7 +1701,11 @@ async fn handle_status_response(
         "Beacon handshake complete"
     );
 
-    let Some(target_range) = beacon_sync_target(server.beacon_fetched_through, peer_head_slot)
+    // A whole-block decode per handshake, the same one `build_status` already
+    // pays to send ours.
+    let head_slot = server.store.beacon_head().map_or(0, |(slot, _)| slot);
+    let Some(target_range) =
+        beacon_sync_target(server.beacon_fetched_through, head_slot, peer_head_slot)
     else {
         return;
     };
@@ -1695,6 +1714,7 @@ async fn handle_status_response(
         %peer,
         peer_head_slot,
         fetched_through = server.beacon_fetched_through,
+        head_slot,
         start_slot = target_range.start,
         end_exclusive = target_range.end,
         "Beacon peer status head is ahead of what has been fetched"
@@ -2409,8 +2429,8 @@ async fn handle_beacon_blocks_by_range_response(
     debug!(%peer, received, accepted, "Beacon blocks received");
 
     // Highest slot *handed to* the actor, not the highest imported: see
-    // `beacon_fetched_through`'s own doc comment on `P2PServer` for why range
-    // sync must be driven off this rather than the store's head.
+    // [`beacon_sync_target`] for why range sync reads this beside the store's
+    // head rather than the head alone.
     if let Some(highest) = highest_forwarded_slot {
         server.beacon_fetched_through = server.beacon_fetched_through.max(highest);
     }
@@ -2863,24 +2883,36 @@ mod tests {
     }
 
     #[test]
-    fn beacon_sync_target_keys_off_fetched_through_not_store_head() {
+    fn beacon_sync_target_keys_off_fetched_through_while_the_head_lags() {
         // A batch already handed to the chain actor but not yet imported
         // leaves the store's own head behind `fetched_through`; the sync
         // target must still be computed from `fetched_through`. See
-        // `beacon_sync_target`'s own doc comment for why the store's head is
-        // the wrong signal to drive this off: it is what pulled 11,213
-        // blocks off the wire to import 100 on the live follower.
-        assert_eq!(beacon_sync_target(100, 150), Some(101..151));
+        // `beacon_sync_target`'s own doc comment for why the store's head
+        // alone is the wrong signal to drive this off: it is what pulled
+        // 11,213 blocks off the wire to import 100 on the live follower.
+        assert_eq!(beacon_sync_target(100, 40, 150), Some(101..151));
         // A peer at or behind what has already been fetched has nothing to
         // offer, regardless of what the store's own (possibly much lower)
         // head happens to be.
-        assert_eq!(beacon_sync_target(150, 150), None);
-        assert_eq!(beacon_sync_target(150, 100), None);
+        assert_eq!(beacon_sync_target(150, 40, 150), None);
+        assert_eq!(beacon_sync_target(150, 40, 100), None);
+    }
+
+    #[test]
+    fn beacon_sync_target_starts_after_a_head_gossip_moved_past_fetched_through() {
+        // A caught-up follower imports from gossip, which leaves
+        // `fetched_through` at its last range batch. A peer one block ahead
+        // is owed that one block, not every block since that batch.
+        assert_eq!(beacon_sync_target(100, 149, 150), Some(150..151));
+        // A peer at or behind the head has nothing to offer, however far
+        // behind `fetched_through` is.
+        assert_eq!(beacon_sync_target(100, 150, 150), None);
+        assert_eq!(beacon_sync_target(100, 160, 150), None);
     }
 
     #[test]
     fn beacon_sync_target_is_bounded_by_max_sync_range() {
-        let target = beacon_sync_target(0, u64::MAX).expect("peer is far ahead");
+        let target = beacon_sync_target(0, 0, u64::MAX).expect("peer is far ahead");
         assert_eq!(target, 1..(1 + MAX_SYNC_RANGE));
     }
 
