@@ -70,6 +70,7 @@ pub fn process_block(
     engine: &ExecutionEngine,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     super::block::process_block_header(
         state,
@@ -81,7 +82,7 @@ pub fn process_block(
     if is_execution_enabled(state, &block.body.execution_payload)? {
         process_execution_payload(state, &block.body.execution_payload, config, engine)?;
     }
-    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     super::operations::process_operations(
         state,

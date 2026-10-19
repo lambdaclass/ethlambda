@@ -104,6 +104,7 @@ pub fn process_block(
     config: &Config,
     committees: &CommitteeCache,
     active_balances: &ActiveBalanceCache,
+    options: super::block::BlockProcessingOptions,
 ) -> Result<()> {
     // [New in Gloas:EIP7732]
     let parent_slot = state.latest_block_header().slot;
@@ -122,7 +123,7 @@ pub fn process_block(
     // [Modified in Gloas:EIP7732] Removed `process_execution_payload`.
     // [New in Gloas:EIP7732]
     process_execution_payload_bid(state, &block.body.signed_execution_payload_bid, config)?;
-    super::block::process_randao(state, &block.body.randao_reveal)?;
+    super::block::process_randao(state, &block.body.randao_reveal, options.randao)?;
     super::block::process_eth1_data(state, &block.body.eth1_data)?;
     // [Modified in Gloas:EIP7732]
     process_operations(

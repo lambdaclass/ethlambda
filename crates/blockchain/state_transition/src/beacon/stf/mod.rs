@@ -191,6 +191,7 @@ pub fn apply_block(
         engine,
         committees,
         active_balances,
+        block::BlockProcessingOptions::default(),
     )?;
     // As in `process_slot`: the post-state's root, checked below and needed
     // again in the next slot, is then computed on the state's own nodes.

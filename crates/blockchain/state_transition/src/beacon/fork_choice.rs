@@ -9870,8 +9870,8 @@ mod tests {
     }
 
     impl ethlambda_storage::StorageReadView for CountingView<'_> {
-        // Counted at `read`, which `get` and `contains` both go through, so
-        // every lookup of the block table counts once however it is made.
+        // Counted in `read` rather than `get`: every value read, `get` and
+        // `read_with` alike, goes through it.
         fn read(
             &self,
             table: ethlambda_storage::Table,
@@ -9882,6 +9882,16 @@ mod tests {
                 BLOCK_READS.with(|reads| reads.set(reads.get() + 1));
             }
             self.inner.read(table, key, read_fn)
+        }
+
+        // Forwarded rather than left to the default, which goes through
+        // `read`: an existence check decodes no block, so it is not counted.
+        fn contains(
+            &self,
+            table: ethlambda_storage::Table,
+            key: &[u8],
+        ) -> std::result::Result<bool, StorageError> {
+            self.inner.contains(table, key)
         }
 
         fn prefix_iterator(
@@ -10224,7 +10234,13 @@ mod tests {
             execution_requests: ExecutionRequests::default(),
             sync_aggregate: crate::beacon::block_production::empty_sync_aggregate(),
         };
-        let message = assemble_block(&advanced, inputs, &config).expect("assemble");
+        let message = assemble_block(
+            &advanced,
+            inputs,
+            &config,
+            crate::beacon::stf::block::BlockProcessingOptions::default(),
+        )
+        .expect("assemble");
         let state_root = message.state_root;
         let signed = SignedBeaconBlock::Fulu(electra::SignedBeaconBlock {
             message,

@@ -851,6 +851,7 @@ mod tests {
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
             wire,
+            agent_version: "ethlambda/test",
         };
 
         let beacon = build_swarm(swarm_config(WireConfig::Beacon(Box::new(
