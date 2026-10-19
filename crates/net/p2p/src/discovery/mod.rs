@@ -15,13 +15,14 @@ pub mod enr;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ethrex_p2p::discovery::{DiscoveryConfig, DiscoveryServer};
 use ethrex_p2p::peer_table::{PeerTable, PeerTableServer};
-use ethrex_p2p::types::Node;
+use ethrex_p2p::types::{LocalNode, Node, SharedLocalNode};
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::Bootnode;
@@ -226,6 +227,17 @@ pub async fn spawn_discovery(
     // lean peer applying our own admission rules to it admits us. ethrex
     // re-signs it under `params.signer` whenever IP voting bumps the sequence
     // number, keeping the extra entries.
+    //
+    // ethrex mirrors each re-signed record into the shared identity for its own
+    // RPC and shutdown; nothing here reads it back, so it is handed over and
+    // dropped. The fork id channel republishes an execution chain's EIP-2124
+    // `eth` entry, which a consensus record does not carry: it starts at `None`
+    // and its sender is dropped at once, which ethrex reads as "never changes".
+    let shared_local_node: SharedLocalNode = Arc::new(RwLock::new(LocalNode {
+        node: local_node.clone(),
+        record: local_record.clone(),
+    }));
+    let (_, no_fork_id) = watch::channel(None);
     DiscoveryServer::spawn(
         local_node,
         local_record,
@@ -236,7 +248,12 @@ pub async fn spawn_discovery(
         DiscoveryConfig {
             discv4_enabled: false,
             discv5_enabled: true,
+            // An operator-supplied advertise IP is the address peers should
+            // reach us on, so IP voting must not replace it.
+            nat_extip_set: config.advertise_ip.is_some(),
         },
+        shared_local_node,
+        no_fork_id,
     )
     .await
     .map_err(|err| DiscoveryError::Server(err.to_string()))?;

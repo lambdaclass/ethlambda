@@ -2252,8 +2252,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-blockchain"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "crossbeam",
@@ -2277,8 +2277,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-common"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -2311,8 +2311,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-crypto"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "ark-bn254",
  "ark-ec",
@@ -2333,8 +2333,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-guest-program"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2356,8 +2356,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-l2-common"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2374,14 +2374,15 @@ dependencies = [
 
 [[package]]
 name = "ethrex-levm"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
  "ethrex-common",
  "ethrex-crypto",
  "ethrex-rlp",
+ "foldhash 0.2.0",
  "libssz 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "malachite",
  "rustc-hash",
@@ -2392,8 +2393,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-metrics"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "ethrex-common",
  "serde",
@@ -2404,8 +2405,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-p2p"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2446,8 +2447,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-rlp"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "ethereum-types",
@@ -2456,8 +2457,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-storage"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2466,6 +2467,7 @@ dependencies = [
  "ethrex-rlp",
  "ethrex-trie",
  "fastbloom",
+ "indexmap 2.14.0",
  "lru",
  "rayon",
  "rustc-hash",
@@ -2478,8 +2480,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-trie"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2498,8 +2500,8 @@ dependencies = [
 
 [[package]]
 name = "ethrex-vm"
-version = "25.0.0"
-source = "git+https://github.com/lambdaclass/ethrex?tag=v25.0.0#f3b90bc6dc57704940d1ff4f2bc74a8dd5788df2"
+version = "29.0.1"
+source = "git+https://github.com/lambdaclass/ethrex?tag=v29.0.1#57101c1c2c199ebac8a827e6468341895972cb72"
 dependencies = [
  "bytes",
  "derive_more 1.0.0",
