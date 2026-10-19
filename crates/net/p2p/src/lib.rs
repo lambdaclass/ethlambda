@@ -624,6 +624,9 @@ pub struct SwarmConfig {
     /// the connection limits, and so decides the [`Wire`] the built swarm
     /// carries.
     pub wire: WireConfig,
+    /// The identify `agentVersion`, which crawlers read to name a peer's
+    /// client. Left unset, rust-libp2p reports its own crate version instead.
+    pub agent_version: &'static str,
 }
 
 /// The half of [`SwarmConfig`] the two networks disagree about.
@@ -828,6 +831,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
         listening_socket,
         target_peers,
         wire,
+        agent_version,
     } = config;
 
     // The codec comes out of this match too, not from `Default`: the two beacon
@@ -869,6 +873,7 @@ pub fn build_swarm(config: SwarmConfig) -> Result<BuiltSwarm, SwarmBuildError> {
     // peer reports into the address book, loopback included, and `req_resp` dials those.
     let identify = libp2p::identify::Behaviour::new(
         libp2p::identify::Config::new(identify_version.to_owned(), identity.public())
+            .with_agent_version(agent_version.to_owned())
             .with_cache_size(0),
     );
 
@@ -1239,8 +1244,9 @@ pub struct P2PServer {
     pub(crate) outbound_requests: HashMap<ReqRespRequestId, PendingRequestKind>,
     pub(crate) range_sync_state: Option<RangeSyncState>,
 
-    /// Highest beacon slot handed to the chain actor, whether or not it has
-    /// been imported yet.
+    /// Highest beacon slot a range answer has handed to the chain actor,
+    /// whether or not it has been imported yet. Gossip never advances it, so
+    /// range sync reads it beside the store's head; see `beacon_sync_target`.
     pub(crate) beacon_fetched_through: u64,
     bootnode_addrs: HashMap<PeerId, Vec<Multiaddr>>,
     node_names: HashMap<PeerId, String>,
@@ -2647,6 +2653,7 @@ pub(crate) mod test_support {
             bootnodes: Vec::new(),
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
             wire: WireConfig::Beacon(Box::new(BeaconWireConfig {
                 fork_digest: [0u8; 4],
                 fork: config.fork_at_epoch(0),
@@ -2931,6 +2938,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
                 target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
                 wire: WireConfig::Lean(LeanWireConfig {
                     validator_ids: Vec::new(),
                     attestation_committee_count: 1,
@@ -2984,6 +2992,62 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(10), both_connect)
             .await
             .expect("both swarms must connect over TCP within the timeout");
+    }
+
+    /// The identify reply carries `SwarmConfig::agent_version`, not
+    /// rust-libp2p's default `rust-libp2p/<version>`.
+    #[tokio::test]
+    async fn identify_reports_the_configured_agent_version() {
+        fn build(node_key_byte: u8) -> BuiltSwarm {
+            build_swarm(SwarmConfig {
+                node_key: vec![node_key_byte; 32],
+                bootnodes: Vec::new(),
+                listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
+                target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
+                wire: WireConfig::Lean(LeanWireConfig {
+                    validator_ids: Vec::new(),
+                    attestation_committee_count: 1,
+                    subscription_subnets: HashSet::new(),
+                    milliseconds_per_slot: DEFAULT_MILLISECONDS_PER_SLOT,
+                }),
+            })
+            .expect("swarm builds")
+        }
+
+        let mut dialer = build(1);
+        let mut listener = build(2);
+
+        let listener_addr = loop {
+            if let SwarmEvent::NewListenAddr { address, .. } =
+                listener.swarm.select_next_some().await
+            {
+                break address
+                    .with_p2p(listener.local_peer_id)
+                    .expect("failed to add peer ID to multiaddr");
+            }
+        };
+        dialer.swarm.dial(listener_addr).expect("dial is accepted");
+
+        let received = async {
+            loop {
+                tokio::select! {
+                    event = dialer.swarm.select_next_some() => {
+                        if let SwarmEvent::Behaviour(BehaviourEvent::Identify(
+                            libp2p::identify::Event::Received { info, .. },
+                        )) = event
+                        {
+                            return info.agent_version;
+                        }
+                    }
+                    _ = listener.swarm.select_next_some() => {}
+                }
+            }
+        };
+        let agent_version = tokio::time::timeout(Duration::from_secs(10), received)
+            .await
+            .expect("identify must complete within the timeout");
+        assert_eq!(agent_version, "ethlambda/test");
     }
 
     #[test]
@@ -3050,6 +3114,7 @@ mod tests {
                 bootnodes: Vec::new(),
                 listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
                 target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+                agent_version: "ethlambda/test",
                 wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
                     fork_digest: [0x11, 0x22, 0x33, 0x44],
                     fork: ForkName::Fulu,
@@ -3344,6 +3409,7 @@ mod tests {
             bootnodes,
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
             wire: WireConfig::Lean(LeanWireConfig {
                 validator_ids: Vec::new(),
                 attestation_committee_count: 1,
@@ -3793,6 +3859,7 @@ mod tests {
             bootnodes: Vec::new(),
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
             wire: WireConfig::Beacon(Box::new(beacon::swarm::BeaconWireConfig {
                 fork_digest: [0x11, 0x22, 0x33, 0x44],
                 fork: ForkName::Fulu,

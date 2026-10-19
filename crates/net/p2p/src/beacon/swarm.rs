@@ -274,6 +274,7 @@ mod tests {
             listening_socket: "127.0.0.1:0".parse().expect("valid socket"),
             bootnodes: mainnet_bootnodes,
             target_peers: crate::discovery::DEFAULT_DISCOVERY_TARGET_PEERS,
+            agent_version: "ethlambda/test",
             wire: crate::WireConfig::Beacon(Box::new(BeaconWireConfig {
                 fork_digest: [0x8c, 0x9f, 0x62, 0xfe],
                 fork: ForkName::Fulu,
