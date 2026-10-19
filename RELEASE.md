@@ -164,7 +164,12 @@ The first release has no changelog, as there is nothing to compare against.
 
 ### 4. Test the candidate
 
-Run `ghcr.io/lambdaclass/ethlambda:X.Y.Z-rc.N` on the current devnet and confirm
+#### Testing checklist
+
+- [ ] TODO: list the checks every candidate must pass, with the devnets or
+  hosts to run them on and the commands to upgrade each one.
+
+Until that list exists, run `ghcr.io/lambdaclass/ethlambda:X.Y.Z-rc.N` on the current devnet and confirm
 it keeps finalizing alongside the other clients, and that `--version` reports
 `vX.Y.Z-rc.N`. If the release changes what is stored on disk, check what it does
 with an existing data directory.
@@ -234,6 +239,15 @@ in this order, and drop the boxes that do not apply:
 
 Open a PR from `release/vX.Y.Z` into `main` and merge it, so the version bump and
 any candidate fixes land on `main`.
+
+## Distribution channels
+
+Releases are published to GitHub Releases and GHCR only. Not covered yet:
+
+- **crates.io**: not possible while the workspace depends on `leanvm` from git,
+  since crates.io rejects crates with git dependencies.
+- **apt and Homebrew**: future work. Either would be fed from the promoted
+  release's binaries, after the release is promoted.
 
 ## Troubleshooting
 
