@@ -10,9 +10,10 @@ name: Release
 #                           that caused it rather than on the next tag.
 #   push tag vX.Y.Z-rc.N -> `X.Y.Z-rc.N`, the release binaries, and a GitHub
 #                           pre-release with those binaries attached.
-#   workflow_dispatch    -> builds everything the chosen ref would build and
-#                           publishes nothing: a rehearsal of a release-candidate
-#                           run without cutting a tag.
+#   workflow_dispatch    -> a dry run of the `rc_tag` input on the chosen ref:
+#                           everything a push of that tag would run, version
+#                           check and release notes included, publishing nothing.
+#                           Run it on `release/vX.Y.Z` before tagging.
 #
 # A candidate becomes the final release through release_promote.yaml, which
 # re-stamps the tested images as `X.Y.Z` and `latest` without rebuilding them.
@@ -24,6 +25,11 @@ on:
     branches: [main]
     tags: ["v*.*.*-*"]
   workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "Release-candidate tag to dry-run on the chosen ref, e.g. v0.2.0-rc.1. Nothing is published."
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -55,6 +61,7 @@ jobs:
       version: ${{ steps.meta.outputs.version }}
       variants: ${{ steps.meta.outputs.variants }}
       publish: ${{ steps.meta.outputs.publish }}
+      candidate: ${{ steps.meta.outputs.candidate }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -65,18 +72,28 @@ jobs:
           REF_TYPE: ${{ github.ref_type }}
           REF_NAME: ${{ github.ref_name }}
           EVENT_NAME: ${{ github.event_name }}
+          INPUT_RC_TAG: ${{ inputs.rc_tag }}
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          if [ "$REF_TYPE" = "tag" ]; then
+          # The candidate tag this run builds: the pushed tag, or the one a dry
+          # run names. A push to main builds none.
+          candidate=""
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            candidate="$INPUT_RC_TAG"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            candidate="$REF_NAME"
+          fi
+
+          if [ -n "$candidate" ]; then
             # Final tags are never built: promotion creates them from a tested
-            # candidate. Only a dispatch on one could get here.
-            if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
-              echo "::error::'$REF_NAME' is not a release-candidate tag (vX.Y.Z-rc.N)"
+            # candidate.
+            if ! [[ "$candidate" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-[0-9A-Za-z.-]+$ ]]; then
+              echo "::error::'$candidate' is not a release-candidate tag (vX.Y.Z-rc.N)"
               exit 1
             fi
-            tag="${REF_NAME#v}"     # 0.2.0-rc.1
+            tag="${candidate#v}"    # 0.2.0-rc.1
             version="${tag%%-*}"    # 0.2.0
             # The baked channel. Promotion overrides it with ETHLAMBDA_CHANNEL=stable.
             channel="${tag#*-}"     # rc.1
@@ -86,7 +103,7 @@ jobs:
             # with the release they belong to.
             cargo_version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
             if [ "$version" != "$cargo_version" ]; then
-              echo "::error::tag $REF_NAME names $version, but [workspace.package] version is '$cargo_version'"
+              echo "::error::tag $candidate names $version, but [workspace.package] version is '$cargo_version'"
               exit 1
             fi
 
@@ -95,20 +112,14 @@ jobs:
           else
             version="dev-${SHA::7}"
             channel="$REF_NAME"
-            if [ "$REF_NAME" = "main" ]; then
-              image_tag=unstable
-              variants='["default","shadow"]'
-            else
-              # Only a dispatch builds other branches, and it pushes nothing; the
-              # tag just names the local build. Docker tags may not contain '/'.
-              image_tag="${REF_NAME//\//-}"
-              variants='["default"]'
-            fi
+            image_tag=unstable
+            variants='["default","shadow"]'
           fi
 
           publish=$([ "$EVENT_NAME" = "push" ] && echo true || echo false)
 
           {
+            echo "candidate=$candidate"
             echo "image_tag=$image_tag"
             echo "channel=$channel"
             echo "version=$version"
@@ -328,9 +339,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   github-release:
-    name: Create GitHub pre-release
+    name: ${{ needs.meta.outputs.publish == 'true' && 'Create GitHub pre-release' || 'Dry-run GitHub pre-release' }}
     needs: [meta, build-binaries, publish-docker, changelog]
-    if: github.event_name == 'push' && github.ref_type == 'tag'
+    # On a candidate tag, and in a dry run. A dry run skips publish-docker, and a
+    # skipped dependency skips this job too unless the condition checks status.
+    if: ${{ !cancelled() && !failure() && needs.meta.outputs.candidate != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -352,16 +365,15 @@ jobs:
           sha256sum ethlambda-* > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create pre-release
+      # Outside dist/, whose every file becomes a release asset.
+      - name: Write release notes
         env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
           IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}
           VERSION: ${{ needs.meta.outputs.version }}
           CHANGELOG: ${{ needs.changelog.outputs.changes }}
         run: |
           set -euo pipefail
-          notes=$(cat <<EOF
+          cat > notes.md <<EOF
           Release candidate for ethlambda \`$VERSION\`. It becomes the final release once promoted; see [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md).
 
           **Docker image:** \`$IMAGE\` (amd64 and arm64)
@@ -370,8 +382,14 @@ jobs:
 
           $CHANGELOG
           EOF
-          )
 
+      - name: Create pre-release
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.candidate }}
+        run: |
+          set -euo pipefail
           # A re-run of this job finds the release already there: refresh its
           # assets instead of failing on the create.
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
@@ -382,5 +400,32 @@ jobs:
               --verify-tag \
               --prerelease \
               --title "ethlambda $TAG" \
-              --notes "$notes"
+              --notes-file notes.md
           fi
+
+      - name: Show the release a push of the tag would create
+        if: needs.meta.outputs.publish != 'true'
+        env:
+          TAG: ${{ needs.meta.outputs.candidate }}
+        run: |
+          {
+            echo "## Dry run of $TAG: nothing was published"
+            echo
+            echo "Assets:"
+            echo
+            echo '```'
+            ls -l dist
+            echo '```'
+            echo
+            echo "Notes:"
+            echo
+            cat notes.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release assets
+        if: needs.meta.outputs.publish != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dry-run-release-assets
+          path: dist
+          if-no-files-found: error

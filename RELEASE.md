@@ -14,7 +14,7 @@ Three workflows do the publishing:
 |----------|---------|-----------|
 | [Release](.github/workflows/release.yaml) | push to `main` | `unstable`, `sha-<7>` (and `-shadow` twins). It also builds the binaries and the changelog, publishing neither, so a broken release path fails on the commit that broke it |
 | | push of a `vX.Y.Z-rc.N` tag | `X.Y.Z-rc.N` image, binaries, GitHub pre-release |
-| | manual run | nothing: builds the images and binaries of the chosen ref as a rehearsal |
+| | manual run, given a `vX.Y.Z-rc.N` tag | nothing: a dry run of pushing that tag on the chosen ref. It shows the pre-release it would create and keeps its assets as a workflow artifact |
 | [Release promotion](.github/workflows/release_promote.yaml) | a pre-release edited into a final release, or manual run | `X.Y.Z`, `latest` |
 | [Publish Docker Image](.github/workflows/docker_publish.yaml) | manual run | devnet and other ad-hoc tags, plus `sha-<7>` (and `-shadow` twins) |
 
@@ -90,9 +90,11 @@ differs from this version, since the binary reports the Cargo version, not the
 tag.
 
 > [!TIP]
-> To rehearse the release run before tagging, run the **Release** workflow by
-> hand on `release/vX.Y.Z`. It builds the images and binaries without publishing
-> anything.
+> Dry-run the tag before pushing it: **Actions → Release → Run workflow** on
+> `release/vX.Y.Z`, with `rc_tag` set to `vX.Y.Z-rc.1`. It runs everything a push
+> of that tag would, including the version check, and publishes nothing. The run
+> summary shows the pre-release it would create, and the assets are kept as the
+> `dry-run-release-assets` artifact.
 
 ### 3. Tag a release candidate
 
