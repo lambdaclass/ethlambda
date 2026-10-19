@@ -102,6 +102,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     env:
       RC_TAG: ${{ needs.resolve.outputs.rc_tag }}
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -134,6 +137,23 @@ jobs:
             -t "$IMAGE:latest" \
             --push .
 
+      # The re-stamped image is a new manifest, so the candidate's attestation
+      # does not cover it.
+      - name: Resolve the promoted image's digest
+        id: image
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE:$VERSION -> $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
   verify:
     name: Verify promotion
     needs: [resolve, promote]
@@ -141,6 +161,7 @@ jobs:
     permissions:
       contents: read
       packages: read
+      attestations: read
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
     steps:
@@ -171,6 +192,11 @@ jobs:
             echo "::error::expected '/v$VERSION-stable-' in the version string"
             exit 1
           fi
+
+      - name: Assert the promoted image is attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh attestation verify "oci://$IMAGE:$VERSION" --repo "$GITHUB_REPOSITORY"
 
   assert-latest-promoted:
     name: Assert release was promoted to latest

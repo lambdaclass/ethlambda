@@ -222,6 +222,46 @@ jobs:
               "$IMAGE:$TAG$suffix-arm64"
           done
 
+  # A job of its own so the OIDC and attestation permissions are granted only
+  # where a release asset is published, not on every push to main.
+  attest-image:
+    name: Attest the candidate image
+    needs: [meta, publish-docker]
+    if: needs.meta.outputs.publish == 'true' && needs.meta.outputs.candidate != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+
+    steps:
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The multi-arch index, which is what a tag resolves to.
+      - name: Resolve the image digest
+        id: image
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.meta.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          digest=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}')
+          echo "$IMAGE -> $digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
   build-binaries:
     name: Build binary (${{ matrix.target.name }})
     needs: meta
@@ -340,15 +380,22 @@ jobs:
 
   github-release:
     name: ${{ needs.meta.outputs.publish == 'true' && 'Create GitHub pre-release' || 'Dry-run GitHub pre-release' }}
-    needs: [meta, build-binaries, publish-docker, changelog]
-    # On a candidate tag, and in a dry run. A dry run skips publish-docker, and a
-    # skipped dependency skips this job too unless the condition checks status.
+    needs: [meta, build-binaries, publish-docker, attest-image, changelog]
+    # On a candidate tag, and in a dry run. A dry run skips publish-docker and
+    # attest-image, and a skipped dependency skips this job too unless the
+    # condition checks status.
     if: ${{ !cancelled() && !failure() && needs.meta.outputs.candidate != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
 
     steps:
+      # For the signing script and the committed public key.
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
       # Anchored on `ethlambda-`: build-push-action also uploads build records,
       # named `<owner>~<repo>~<id>.dockerbuild`, which download-artifact cannot
       # extract.
@@ -365,6 +412,41 @@ jobs:
           sha256sum ethlambda-* > SHA256SUMS
           cat SHA256SUMS
 
+      # A dry run signs with the real key too, so a broken key or script fails
+      # before a tag does. Its trusted comment says DRY-RUN, so its signatures
+      # cannot pass for a release's. The canonical repository refuses to
+      # publish unsigned; a fork without a key publishes unsigned, with a
+      # warning.
+      - name: Sign the assets
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          REQUIRE_SIGNATURE: ${{ needs.meta.outputs.publish == 'true' && github.repository == 'lambdaclass/ethlambda' }}
+          TRUSTED_COMMENT_SUFFIX: >-
+            ethlambda ${{ needs.meta.outputs.publish != 'true' && 'DRY-RUN ' || '' }}${{ needs.meta.outputs.candidate }} ${{ github.sha }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+          .github/scripts/sign-release-assets.sh dist
+
+      # Not in a dry run: an attestation is published the moment it is made.
+      - name: Attest build provenance
+        if: needs.meta.outputs.publish == 'true'
+        uses: actions/attest@v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Verify the attestations as a consumer would
+        if: needs.meta.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for binary in dist/ethlambda-*; do
+            case "$binary" in *.minisig) continue ;; esac
+            gh attestation verify "$binary" --repo "$GITHUB_REPOSITORY"
+          done
+
       # Outside dist/, whose every file becomes a release asset.
       - name: Write release notes
         env:
@@ -379,6 +461,8 @@ jobs:
           **Docker image:** \`$IMAGE\` (amd64 and arm64)
 
           **Binaries:** attached below, with their \`SHA256SUMS\`. The \`linux-x86_64\` build targets x86-64-v3, so it needs a CPU with AVX2 (Haswell or later).
+
+          **Verifying:** every asset has a minisign signature (\`.minisig\`), and the binaries and the image carry GitHub build provenance attestations. See [RELEASE.md](https://github.com/$GITHUB_REPOSITORY/blob/main/RELEASE.md#verifying-a-release) for the commands.
 
           $CHANGELOG
           EOF
