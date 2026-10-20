@@ -1,0 +1,74 @@
+[package]
+name = "ethlambda-validator"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ethlambda-types.workspace = true
+ethlambda-metrics.workspace = true
+
+# A produced block is decoded and re-published as SSZ, not JSON: signing it
+# needs its `hash_tree_root`, which only the typed container can give. See
+# `beacon_node::block_contents`.
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-types.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# `time` for the duty loop's sleep between slots. Declared here rather than
+# relied on through workspace feature unification, so this crate still builds
+# if it is ever compiled on its own.
+tokio = { workspace = true, features = ["time"] }
+reqwest = { workspace = true, features = ["json"] }
+
+# BLS12-381. Same version and backend the state transition verifies with, so a
+# signature produced here and one checked there come from one implementation.
+blst = "0.3.16"
+
+# `BeaconNodeApi` is held behind a trait object so the duty services can be
+# driven by a mock. Native async-fn-in-trait is not dyn-safe, and spelling out
+# the `impl Future + Send` bounds at every method is noise this trait does not
+# need.
+async-trait = "0.1"
+
+# EIP-2335 keystore decryption.
+scrypt = { version = "0.11", default-features = false }
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+hmac = "0.12"
+sha2.workspace = true
+aes = "0.8"
+ctr = "0.9"
+unicode-normalization = "0.1"
+uuid = { version = "1", features = ["v4"] }
+# `serde` feature: `ImportRequest.passwords` deserializes straight into a
+# `Zeroizing<Vec<String>>` rather than a plain `Vec<String>` that would leave
+# plaintext passwords behind in freed memory.
+zeroize = { version = "1", features = ["serde"] }
+
+axum = "0.8.1"
+
+# Constant-time comparison for the keymanager API's bearer token.
+subtle = "2.6"
+
+# `O_NOFOLLOW` for writing key material without following a pre-placed
+# symlink at a predictable, pubkey-derived path (see `secure_fs`). Already in
+# the workspace's dependency tree transitively; this makes it a direct one.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile = "3"

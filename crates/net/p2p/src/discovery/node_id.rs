@@ -16,11 +16,6 @@ use ethrex_p2p::utils::node_id;
 use libp2p::PeerId;
 use libp2p::identity::secp256k1::PublicKey;
 
-/// Multihash code under which libp2p inlines a public key rather than hashing
-/// it. Keys short enough to fit are stored verbatim, which is what makes the
-/// key recoverable from a `PeerId` at all.
-const IDENTITY_MULTIHASH_CODE: u64 = 0x00;
-
 /// The discv5 node id for a libp2p secp256k1 key.
 ///
 /// ethrex hashes the 64-byte uncompressed point, so the `0x04` prefix libp2p
@@ -36,13 +31,12 @@ pub(crate) fn node_id_from_public_key(key: &PublicKey) -> H256 {
 /// short enough, and a secp256k1 key always is. Lean's spec mandates secp256k1
 /// for the libp2p identity, so the `None` arm covers a peer speaking something
 /// else: nothing to report about it, rather than an error.
+///
+/// The decode itself is [`super::enr::node_id_from_peer_id`]'s, which custody
+/// reads peers' node ids through; this only names its answer the way discovery
+/// does.
 pub(crate) fn node_id_from_peer_id(peer_id: &PeerId) -> Option<H256> {
-    let multihash = peer_id.as_ref();
-    if multihash.code() != IDENTITY_MULTIHASH_CODE {
-        return None;
-    }
-    let key = libp2p::identity::PublicKey::try_decode_protobuf(multihash.digest()).ok()?;
-    Some(node_id_from_public_key(&key.try_into_secp256k1().ok()?))
+    super::enr::node_id_from_peer_id(peer_id).map(H256)
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@
 //! report, and the current limitations.
 
 mod corpus;
+mod import;
 mod keys;
 mod report;
 
@@ -26,7 +27,9 @@ use ethlambda_types::primitives::HashTreeRoot as _;
 use eyre::WrapErr as _;
 
 use corpus::CryptoMode;
-use report::{Environment, Params, Report, Sample};
+use import::ImportOptions;
+use report::common::Environment;
+use report::synthetic::{Params, Report, Sample};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct BenchmarkOptions {
@@ -38,6 +41,8 @@ pub(crate) struct BenchmarkOptions {
 enum Workload {
     /// Benchmark block building on a synthetic in-memory chain.
     Synthetic(SyntheticOptions),
+    /// Benchmark block import by replaying a real corpus offline.
+    Import(ImportOptions),
 }
 
 #[derive(Debug, clap::Args)]
@@ -140,8 +145,10 @@ enum OutputFormat {
 }
 
 pub(crate) fn run(options: BenchmarkOptions) -> eyre::Result<()> {
-    let Workload::Synthetic(synthetic) = options.workload;
-    run_synthetic(synthetic)
+    match options.workload {
+        Workload::Synthetic(synthetic) => run_synthetic(synthetic),
+        Workload::Import(import) => import::run(import),
+    }
 }
 
 fn run_synthetic(options: SyntheticOptions) -> eyre::Result<()> {
@@ -262,7 +269,7 @@ fn build_one_slot(
     // Round-robin proposer, matching `is_proposer`.
     let proposer = slot % num_validators;
 
-    let phases = PhaseTimer::start();
+    let phases = PhaseTimer::start(PHASE_HISTOGRAM);
     let build_start = Instant::now();
     let (block, aggregates, _checkpoints) =
         produce_block_with_signatures(store, slot, proposer, proposer_config)
@@ -310,20 +317,26 @@ fn build_one_slot(
 
 const PHASE_HISTOGRAM: &str = "lean_block_proposal_attestation_build_phase_seconds";
 
-/// Exact per-phase durations for one block build and seal, taken from the
-/// block-proposal phase histogram in the default prometheus registry.
+/// Exact per-phase durations for one block build and seal (or one import),
+/// taken from a phase histogram in the default prometheus registry.
 ///
 /// Histogram sums accumulate the raw f64 seconds of every observation, so the
 /// difference between two readings IS the build's phase time — bucket
 /// boundaries play no role, and the hot path needs no extra instrumentation.
 struct PhaseTimer {
+    /// The histogram this timer reads; the import workload uses a different
+    /// one (`lean_block_import_phase_seconds`) than the synthetic build does.
+    histogram: &'static str,
     /// Per-phase (sample_sum, sample_count) before the build.
     before: HashMap<String, (f64, u64)>,
 }
 
 impl PhaseTimer {
-    fn start() -> Self {
-        Self { before: read() }
+    fn start(histogram: &'static str) -> Self {
+        Self {
+            histogram,
+            before: read(histogram),
+        }
     }
 
     /// Per-phase durations since [`PhaseTimer::start`] for `expected` phases.
@@ -336,7 +349,7 @@ impl PhaseTimer {
         self,
         expected: impl Iterator<Item = &'static str>,
     ) -> eyre::Result<BTreeMap<String, f64>> {
-        let after = read();
+        let after = read(self.histogram);
         let mut phases = BTreeMap::new();
         for phase in expected {
             let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
@@ -351,13 +364,43 @@ impl PhaseTimer {
         }
         Ok(phases)
     }
+
+    /// Per-phase durations for phases that ran at most once.
+    ///
+    /// [`Self::finish`]'s exactly-once assertion is right for a block build,
+    /// where every phase runs. It is wrong for an import: `decode`, `defer`,
+    /// `parent_wait` and `columns_wait` never run for a corpus block, and a
+    /// phase that did not run is omitted rather than recorded as zero, so it
+    /// stays distinguishable from one that ran instantly.
+    ///
+    fn finish_at_most_once(
+        self,
+        expected: impl Iterator<Item = &'static str>,
+    ) -> eyre::Result<BTreeMap<String, f64>> {
+        let after = read(self.histogram);
+        let mut phases = BTreeMap::new();
+        for phase in expected {
+            let (sum_before, count_before) = self.before.get(phase).copied().unwrap_or((0.0, 0));
+            let (sum_after, count_after) = after.get(phase).copied().unwrap_or((0.0, 0));
+            let observations = count_after.saturating_sub(count_before);
+            eyre::ensure!(
+                observations <= 1,
+                "phase '{phase}' was observed {observations} times during one import \
+                 (expected at most 1); phase attribution would be wrong"
+            );
+            if observations == 1 {
+                phases.insert(phase.to_string(), sum_after - sum_before);
+            }
+        }
+        Ok(phases)
+    }
 }
 
-/// Current (sample_sum, sample_count) per phase label.
-fn read() -> HashMap<String, (f64, u64)> {
+/// Current (sample_sum, sample_count) per phase label on `histogram`.
+fn read(histogram: &str) -> HashMap<String, (f64, u64)> {
     ethlambda_metrics::gather()
         .iter()
-        .filter(|family| family.name() == PHASE_HISTOGRAM)
+        .filter(|family| family.name() == histogram)
         .flat_map(|family| family.get_metric())
         .filter_map(|metric| {
             let phase = metric
@@ -373,4 +416,104 @@ fn read() -> HashMap<String, (f64, u64)> {
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod phase_timer_tests {
+    use super::*;
+
+    #[test]
+    fn an_unobserved_phase_is_omitted_rather_than_reported_as_zero() {
+        // An import runs a subset of BLOCK_IMPORT_PHASES: decode, defer,
+        // parent_wait and columns_wait legitimately never run for a corpus
+        // block. A zero would read as work that took no time, which is not the
+        // same claim as work that did not happen.
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_at_most_once_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["phase"]
+        )
+        .expect("registers once");
+
+        let timer = PhaseTimer::start("test_phase_timer_at_most_once_seconds");
+        histogram.with_label_values(&["stf"]).observe(0.5);
+
+        let phases = timer
+            .finish_at_most_once(["stf", "columns_wait"].into_iter())
+            .expect("finish");
+
+        assert!((phases["stf"] - 0.5).abs() < 1e-9);
+        assert!(
+            !phases.contains_key("columns_wait"),
+            "a phase that never ran is absent, not zero"
+        );
+    }
+
+    #[test]
+    fn finish_succeeds_when_every_expected_phase_ran_exactly_once() {
+        // Pins the pre-refactor success path of `finish` under the new
+        // `histogram` parameter.
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_exactly_once_ok_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["phase"]
+        )
+        .expect("registers once");
+
+        let timer = PhaseTimer::start("test_phase_timer_exactly_once_ok_seconds");
+        histogram
+            .with_label_values(&["select_payloads"])
+            .observe(0.25);
+        histogram.with_label_values(&["compact"]).observe(0.1);
+
+        let phases = timer
+            .finish(["select_payloads", "compact"].into_iter())
+            .expect("every expected phase ran exactly once");
+        assert!((phases["select_payloads"] - 0.25).abs() < 1e-9);
+        assert!((phases["compact"] - 0.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn finish_rejects_a_phase_that_never_ran() {
+        // Unlike `finish_at_most_once`, a phase that never fired is a hard
+        // error for `finish`, since every phase in a block build is expected
+        // to run.
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_exactly_once_missing_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["phase"]
+        )
+        .expect("registers once");
+
+        let timer = PhaseTimer::start("test_phase_timer_exactly_once_missing_seconds");
+        histogram
+            .with_label_values(&["select_payloads"])
+            .observe(0.25);
+
+        let result = timer.finish(["select_payloads", "compact"].into_iter());
+        assert!(
+            result.is_err(),
+            "a phase observed zero times must be a hard error for `finish`"
+        );
+    }
+
+    #[test]
+    fn finish_rejects_a_phase_observed_twice() {
+        let histogram = ethlambda_metrics::register_histogram_vec!(
+            "test_phase_timer_exactly_once_doubled_seconds",
+            "Phase histogram used only by the PhaseTimer tests",
+            &["phase"]
+        )
+        .expect("registers once");
+
+        let timer = PhaseTimer::start("test_phase_timer_exactly_once_doubled_seconds");
+        histogram.with_label_values(&["compact"]).observe(0.1);
+        histogram.with_label_values(&["compact"]).observe(0.2);
+
+        let result = timer.finish(["compact"].into_iter());
+        assert!(
+            result.is_err(),
+            "a phase observed twice must be a hard error for `finish`"
+        );
+    }
 }

@@ -111,7 +111,7 @@ pub fn apply_fork_choice_step(
 ) -> Result<(), StepError> {
     match step.step_type.as_str() {
         "tick" => {
-            let config = *store.config();
+            let config = store.config().time_grid();
             let timestamp_ms = match (step.time, step.interval) {
                 (Some(time_s), _) => time_s * 1000,
                 (None, Some(interval)) => {
@@ -134,7 +134,7 @@ pub fn apply_fork_choice_step(
             let signed_block = block_data.to_blank_signed_block();
             if step.tick_to_slot {
                 let block_time_ms = store.config().genesis_time_ms()
-                    + signed_block.message.slot * store.config().milliseconds_per_slot;
+                    + signed_block.message.slot * store.config().slot_duration_ms;
                 store::on_tick(store, block_time_ms, true);
             }
             store::on_block_without_verification(store, signed_block)?;

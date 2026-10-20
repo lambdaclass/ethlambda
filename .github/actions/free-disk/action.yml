@@ -1,0 +1,19 @@
+name: "Free disk space"
+description: "Remove pre-installed software to free disk space for Rust builds"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Free up disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /opt/ghc || true
+        sudo rm -rf "/usr/local/share/boost" || true
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /usr/local/share/powershell || true
+        sudo rm -rf /usr/share/swift || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+        sudo rm -rf /usr/local/.ghcup || true
+        df -h /

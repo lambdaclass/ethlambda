@@ -11,6 +11,7 @@ version.workspace = true
 
 [dependencies]
 ethlambda-crypto.workspace = true
+ethlambda-metrics.workspace = true
 ethlambda-types.workspace = true
 
 tracing.workspace = true
@@ -22,6 +23,8 @@ libssz-derive.workspace = true
 libssz-types.workspace = true
 
 lru.workspace = true
+xdelta3.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+proptest = "1"

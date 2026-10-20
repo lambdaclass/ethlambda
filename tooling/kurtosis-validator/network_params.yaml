@@ -1,0 +1,36 @@
+# geth + lighthouse, with ethlambda as the only validator client.
+#
+# The lighthouse participant gets no keys, so ethereum-package registers all 128
+# genesis validators (`preregistered_validator_count`) without handing any of
+# them to a client. The ethlambda validator derives and signs for all of them,
+# and the keyless validator client ethereum-package still starts for lighthouse
+# is removed. The chain therefore finalizes only if ethlambda works.
+#
+# Run from the repository root, after `make docker-build DOCKER_TAG=validator-local`:
+#
+#   kurtosis run --enclave ethlambda-devnet tooling/kurtosis-validator \
+#     --args-file tooling/kurtosis-validator/network_params.yaml
+#
+# Mainnet preset is mandatory, not a preference: the ethlambda binary is built
+# with mainnet SSZ bounds and 32-slot epochs.
+participants:
+  - el_type: geth
+    cl_type: lighthouse
+    validator_count: 0
+    # Fulu needs a node custodying every data column. A node normally earns that
+    # from the validators attached to it, and this one has none.
+    supernode: true
+network_params:
+  preset: mainnet
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  preregistered_validator_count: 128
+additional_services:
+  - dora
+
+# Read by this package, not by ethereum-package. The key range is derived: every
+# genesis validator no participant holds, which here is all of them.
+ethlambda_validator:
+  image: ghcr.io/lambdaclass/ethlambda:validator-local
+  name: ethlambda-vc  # shown in Dora, and used as the block graffiti
+  suggested_fee_recipient: "0x000000000000000000000000000000000000dEaD"

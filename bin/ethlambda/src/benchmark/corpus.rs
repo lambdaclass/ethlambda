@@ -207,9 +207,11 @@ impl SyntheticCorpus {
     /// Import the sealed block. Real mode verifies the merged proof, so a bad
     /// seal fails the run instead of producing a report about invalid blocks.
     pub(crate) fn import(&self, store: &mut Store, block: SignedBlock) -> Result<(), StoreError> {
+        // The import's own timing timings are dropped: this harness times the
+        // build, and reports the import through its own phase timers.
         match self.crypto {
-            CryptoMode::Mock => on_block_without_verification(store, block),
-            CryptoMode::Real { .. } => on_block(store, block),
+            CryptoMode::Mock => on_block_without_verification(store, block).map(|_| ()),
+            CryptoMode::Real { .. } => on_block(store, block).map(|_| ()),
         }
     }
 

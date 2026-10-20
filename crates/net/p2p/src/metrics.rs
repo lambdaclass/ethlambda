@@ -249,6 +249,56 @@ pub fn notify_peer_disconnected(node_name: &str, direction: &str, reason: &str) 
     LEAN_CONNECTED_PEERS.with_label_values(&[node_name]).dec();
 }
 
+/// Count a closed connection against what actually ended it.
+///
+/// A separate metric rather than more values on
+/// `lean_peer_disconnection_events_total`'s `reason`, for the same reason
+/// [`inc_peer_connection_transport`] is separate: that one is leanMetrics-
+/// specified down to its label values, so adding to them would put ethlambda
+/// off-spec.
+///
+/// The specified set is `timeout`/`remote_close`/`local_close`/`error`, and on
+/// a mainnet follower nine in ten closes land in `error`, which says only that
+/// libp2p handed back a cause. This splits that bucket: see
+/// [`crate::disconnect_cause`] for the values and what each one means.
+pub fn inc_peer_disconnect_cause(direction: &str, cause: &str) {
+    static LEAN_PEER_DISCONNECT_CAUSE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_peer_disconnect_cause_total",
+            "Closed peer connections by the cause libp2p reported for the close",
+            &["direction", "cause"]
+        )
+        .unwrap()
+    });
+    LEAN_PEER_DISCONNECT_CAUSE
+        .with_label_values(&[direction, cause])
+        .inc();
+}
+
+/// Count a `goodbye/1` received, against the reason the peer gave.
+///
+/// The only place a peer states *why* it is leaving. Everything else about a
+/// disconnect is inferred from how the socket ended, and the two readings that
+/// matter most are indistinguishable there: a peer that is merely full closes
+/// exactly like one that has scored us badly or banned us.
+///
+/// One-directional by construction, so there is no `direction` label: this node
+/// never sends a `goodbye`, and the protocol is registered inbound-only.
+///
+/// See [`crate::beacon::messages::Goodbye::reason_label`] for the values, which
+/// are bounded there because the wire code is not.
+pub fn inc_peer_goodbye(reason: &str) {
+    static LEAN_PEER_GOODBYE: LazyLock<IntCounterVec> = LazyLock::new(|| {
+        register_int_counter_vec!(
+            "lean_peer_goodbye_total",
+            "Goodbye messages received, by the reason code the peer sent",
+            &["reason"]
+        )
+        .unwrap()
+    });
+    LEAN_PEER_GOODBYE.with_label_values(&[reason]).inc();
+}
+
 /// Counts dials initiated from discv5 discovery, as opposed to static bootnode
 /// dials. Connection outcomes are already covered by the peer connect and
 /// disconnect metrics.
@@ -290,4 +340,278 @@ pub fn update_gossip_mesh_peers<'a>(
             .with_label_values(&[&name])
             .set(count);
     }
+}
+
+static LEAN_BEACON_GOSSIP_MESSAGES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_messages_total",
+        "Beacon gossip messages received, by topic and decode outcome",
+        &["topic", "result"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "lean_beacon_status_digest_mismatch_total",
+        "Beacon Status requests whose fork digest did not match ours"
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_FORK_DIGEST: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_beacon_fork_digest",
+        "The fork digest this node computed at startup, as a label",
+        &["digest"]
+    )
+    .unwrap()
+});
+
+/// Count one gossip message. `result` is `decoded`, `decode_failed`, or
+/// `decompress_failed`.
+pub fn inc_beacon_gossip(topic: &str, result: &str) {
+    LEAN_BEACON_GOSSIP_MESSAGES_TOTAL
+        .with_label_values(&[topic, result])
+        .inc();
+}
+
+static LEAN_BEACON_GOSSIP_VALIDATION_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_validation_total",
+        "Beacon gossip verdicts, by topic kind, outcome and reason",
+        &["kind", "outcome", "reason"]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_GOSSIP_VALIDATION_SECONDS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
+        "lean_beacon_gossip_validation_seconds",
+        "Time from a beacon gossip message's arrival to its verdict",
+        &["kind"],
+        vec![
+            0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
+        ]
+    )
+    .unwrap()
+});
+
+static LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_gossip_verdict_expired_total",
+        "Beacon gossip verdicts reported after gossipsub had evicted the message",
+        &["kind"]
+    )
+    .unwrap()
+});
+
+/// Every reason `beacon::column_checks` can count a sidecar under: the
+/// `Outcome` reason labels `column::chain_checks` drops with, less
+/// `already_stored`, which is a duplicate rather than a rejection. Seeded at
+/// zero by [`init`], so a reason this node never fires is still visible on a
+/// dashboard.
+const DATA_COLUMN_REJECT_REASONS: &[&str] = &[
+    "malformed",
+    "future_slot",
+    "finalized",
+    "not_after_parent",
+    "unknown_proposer",
+    "bad_signature",
+    "wrong_proposer",
+    "finalized_not_ancestor",
+    "parent_not_ready",
+    "inclusion_proof",
+    "kzg",
+    "internal",
+];
+
+static LEAN_DATA_COLUMNS_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_data_columns_rejected_total",
+        "Data column sidecars the chain checks dropped, by reason (gossip verdicts are counted by lean_beacon_gossip_validation_total)",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Count one sidecar the chain checks dropped. `reason` is one of
+/// [`DATA_COLUMN_REJECT_REASONS`].
+pub fn inc_data_column_rejected(reason: &str) {
+    LEAN_DATA_COLUMNS_REJECTED_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Register the metrics that should be visible before their first
+/// observation.
+pub fn init() {
+    LazyLock::force(&LEAN_DATA_COLUMNS_REJECTED_TOTAL);
+    for &reason in DATA_COLUMN_REJECT_REASONS {
+        LEAN_DATA_COLUMNS_REJECTED_TOTAL.with_label_values(&[reason]);
+    }
+}
+
+/// Count one beacon gossip verdict and how long it took from arrival.
+pub fn observe_beacon_gossip_verdict(
+    kind: &str,
+    outcome: &str,
+    reason: &str,
+    elapsed: std::time::Duration,
+) {
+    LEAN_BEACON_GOSSIP_VALIDATION_TOTAL
+        .with_label_values(&[kind, outcome, reason])
+        .inc();
+    LEAN_BEACON_GOSSIP_VALIDATION_SECONDS
+        .with_label_values(&[kind])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Count one verdict gossipsub could no longer act on.
+pub fn inc_beacon_gossip_verdict_expired(kind: &str) {
+    LEAN_BEACON_GOSSIP_VERDICT_EXPIRED_TOTAL
+        .with_label_values(&[kind])
+        .inc();
+}
+
+pub fn inc_beacon_status_digest_mismatch() {
+    LEAN_BEACON_STATUS_DIGEST_MISMATCH_TOTAL.inc();
+}
+
+/// Publish the computed fork digest as a label, so a dashboard can tell at a
+/// glance whether a node is stranded on a boundary it failed to cross.
+pub fn set_beacon_fork_digest(digest: &str) {
+    LEAN_BEACON_FORK_DIGEST.with_label_values(&[digest]).set(1);
+}
+
+static LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_data_column_fetch_failures_total",
+        "Data column sidecar lookups abandoned, by reason",
+        &["reason"]
+    )
+    .unwrap()
+});
+
+/// Count one `DataColumnsByRoot` lookup this node gave up on. `reason` is
+/// `"no_peers"` (nothing connected to ask) or `"max_retries"` (the retry
+/// ladder ran out).
+pub fn inc_data_column_fetch_failure(reason: &str) {
+    LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .inc();
+}
+
+/// Test-only readback of [`inc_data_column_fetch_failure`]'s counter. The
+/// metric otherwise has no consumer inside the crate itself (Prometheus
+/// scrapes it), so this is the only way a test can observe that a failure was
+/// actually counted rather than merely that the code path returned.
+#[cfg(test)]
+pub(crate) fn data_column_fetch_failures_total(reason: &str) -> u64 {
+    LEAN_DATA_COLUMN_FETCH_FAILURES_TOTAL
+        .with_label_values(&[reason])
+        .get()
+}
+
+// --- Peer composition and custody-column supply ---
+
+/// Connected peers split by which side opened the connection.
+///
+/// Separate from `lean_connected_peers`, which is labelled by node name and
+/// exists to answer "who are we talking to". This one answers "how did we get
+/// them", and the difference is operational: inbound supply is unbounded and
+/// unchosen, while an outbound peer is one this node picked and is the only
+/// kind it can aim at a column it needs. A node pinned at its inbound cap with
+/// zero outbound peers looks perfectly healthy on a total peer count and cannot
+/// steer its own custody coverage at all.
+static LEAN_PEERS_BY_DIRECTION: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_peers_by_direction",
+        "Connected peers by the direction the connection was opened in",
+        &["direction"]
+    )
+    .unwrap()
+});
+
+/// Established connections as libp2p itself counts them.
+///
+/// The connection limits are enforced against these, not against
+/// [`LEAN_PEERS_BY_DIRECTION`], so publishing both is what makes a leaked
+/// connection visible: one the swarm still charges against the cap but that no
+/// live peer is using would show up here and nowhere else. The two are not
+/// expected to be equal, since this counts connections and the other counts
+/// peers, and a peer may hold more than one; what matters is that the gap
+/// stays small and does not grow.
+static LEAN_SWARM_ESTABLISHED_CONNECTIONS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_swarm_established_connections",
+        "Established connections as counted by the libp2p swarm, which is what \
+         the connection limits are enforced against",
+        &["direction"]
+    )
+    .unwrap()
+});
+
+/// Connected peers known to custody each column this node samples.
+static LEAN_CUSTODY_COLUMN_PEERS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    register_int_gauge_vec!(
+        "lean_custody_column_peers",
+        "Connected peers known to custody each data column this node samples",
+        &["column"]
+    )
+    .unwrap()
+});
+
+/// Set the peers-by-direction gauges from a full re-count.
+pub fn set_peers_by_direction(inbound: usize, outbound: usize) {
+    LEAN_PEERS_BY_DIRECTION
+        .with_label_values(&["inbound"])
+        .set(inbound as i64);
+    LEAN_PEERS_BY_DIRECTION
+        .with_label_values(&["outbound"])
+        .set(outbound as i64);
+}
+
+/// Set the swarm's own established-connection gauges.
+pub fn set_swarm_established_connections(inbound: u32, outbound: u32) {
+    LEAN_SWARM_ESTABLISHED_CONNECTIONS
+        .with_label_values(&["inbound"])
+        .set(i64::from(inbound));
+    LEAN_SWARM_ESTABLISHED_CONNECTIONS
+        .with_label_values(&["outbound"])
+        .set(i64::from(outbound));
+}
+
+/// Set how many connected peers are known to custody `column`.
+///
+/// A peer counts only once it has answered `metadata/3` or arrived with a
+/// usable `cgc`, matching `P2PServer::peer_custody`. That makes this a floor on
+/// real supply rather than an estimate of it, which is the right direction for
+/// a gauge whose job is to show a column running dry.
+pub fn set_custody_column_peers(column: u64, peers: usize) {
+    LEAN_CUSTODY_COLUMN_PEERS
+        .with_label_values(&[&column.to_string()])
+        .set(peers as i64);
+}
+
+/// How long this actor spent turning one aggregate's bytes into a container.
+///
+/// The first section of the aggregate path, and the only one that happens
+/// before the chain actor's mailbox. Its two siblings
+/// (`lean_beacon_aggregate_mailbox_wait_seconds` and
+/// `lean_beacon_aggregate_processing_seconds`) live in `ethlambda-blockchain`,
+/// where the rest of the path runs; together the three say which layer a slow
+/// aggregate was slow in.
+pub fn observe_beacon_aggregate_decode(duration: std::time::Duration) {
+    static LEAN_BEACON_AGGREGATE_DECODE_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_aggregate_decode_seconds",
+            "Time spent decoding one gossip aggregate off the wire",
+            vec![
+                0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05
+            ]
+        )
+        .unwrap()
+    });
+    LEAN_BEACON_AGGREGATE_DECODE_SECONDS.observe(duration.as_secs_f64());
 }
