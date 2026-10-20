@@ -45,7 +45,7 @@ here wins over both.
 | `--ethrex.target-peers` | ethrex's | |
 | `--ethrex.http-addr` | `127.0.0.1` | |
 | `--ethrex.http-port` | off | turns on the execution JSON-RPC server (`eth_*`, `net_*`, `web3_*`) |
-| `--ethrex.metrics-port` | off | turns on ethrex's own Prometheus server; its metrics live in their own registries, apart from `--metrics-port` |
+| `--ethrex.metrics-port` | off | turns on ethrex's own Prometheus server. Both servers also export the process-wide default registry, so each repeats some of the other's series (`lean_*` here, a few `ethrex_*` on `--metrics-port`); the prefixes keep them from colliding |
 
 Every ethrex port is checked against the beacon node's own (`--gossipsub-port`,
 `--api-port`, `--metrics-port`, `--discovery.port`) and against each other
