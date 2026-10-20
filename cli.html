@@ -1,0 +1,649 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Command line - ethlambda</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-4829553b.svg">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-34fa44cf.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/cli.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="command-line"><a class="header" href="#command-line">Command line</a></h1>
+<p><code>ethlambda</code> follows one of two chains, selected by a subcommand:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Invocation</th><th>Chain</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethlambda node &lt;flags&gt;</code></td><td>The lean consensus protocol this repository implements</td></tr>
+<tr><td><code>ethlambda beacon &lt;flags&gt;</code></td><td>The Ethereum Beacon Chain, as a gossip follower</td></tr>
+<tr><td><code>ethlambda &lt;flags&gt;</code></td><td><code>node</code>: the subcommand is injected</td></tr>
+</tbody>
+</table>
+</div>
+<p>Two subcommands follow no chain. <code>ethlambda benchmark</code> is the offline
+benchmarking harness, covering block building (<code>benchmark synthetic</code>, run
+through <code>make bench</code>) and block import (<code>benchmark import fetch</code> /
+<code>benchmark import replay</code>). See <a href="./benchmarking.html"><code>benchmarking.md</code></a> for
+what each workload measures; <code>benchmark import</code>’s flags are in
+<a href="#benchmark-import-flags">their own section</a> below. <code>ethlambda validator</code> is
+the validator client: a separate process that holds keys and performs duties
+against a beacon node over the standard REST API, documented in
+<a href="#validator-flags">its own section</a> below.</p>
+<h2 id="node-is-the-default"><a class="header" href="#node-is-the-default"><code>node</code> is the default</a></h2>
+<p>clap has no native default subcommand, so the binary rewrites its own argv
+before parsing. If the first argument is not <code>node</code>, <code>beacon</code>, <code>benchmark</code>,
+<code>validator</code>, <code>help</code>, <code>-h</code>, <code>--help</code>, <code>-V</code>, or <code>--version</code>, then <code>node</code> is
+inserted ahead of it. The function is <code>inject_default_subcommand</code> in
+<code>bin/ethlambda/src/command.rs</code>. Every subcommand has to be listed there: a
+missing one would have <code>node</code> inserted ahead of it and become unreachable.</p>
+<pre><code>ethlambda --genesis c.yaml ...              -&gt;  ethlambda node --genesis c.yaml ...
+ethlambda node --genesis c.yaml ...         -&gt;  unchanged
+ethlambda beacon --gossipsub-port 9001 ...  -&gt;  unchanged
+ethlambda benchmark synthetic ...           -&gt;  unchanged
+ethlambda --help | --version | -h | -V      -&gt;  unchanged, no injection
+</code></pre>
+<p>This is what keeps every existing caller working with no edit: the Docker
+<code>ENTRYPOINT</code>, <code>lean-quickstart</code>’s <code>client-cmds/ethlambda-cmd.sh</code>, the Hive lean
+client shim, <code>preview-config.nix</code>, and the <code>docker run</code> blocks in the
+devnet-runner skill all pass bare flags.</p>
+<p><code>ethlambda</code> with no arguments at all is left alone, so it prints the subcommand
+listing rather than a missing-flag error for <code>node</code>.</p>
+<h2 id="common-flags"><a class="header" href="#common-flags">Common flags</a></h2>
+<p>Taken by both subcommands, with the same meaning and the same defaults, from
+one <code>CommonOptions</code> struct flattened into each.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--data-dir</code></td><td><code>./data</code></td><td>RocksDB directory. Both sub-commands open one here now: <code>node</code>’s live chain state, and <code>beacon</code>’s checkpoint-synced (or resumed) anchor</td></tr>
+<tr><td><code>--gossipsub-port</code></td><td><code>9001</code></td><td>Port for libp2p gossip: UDP for QUIC and TCP for the noise+yamux fallback, same number on both, since they are separate namespaces. Binding TCP puts it in the HTTP servers’ namespace, so it must differ from <code>--api-port</code> and <code>--metrics-port</code> as well as from <code>--discovery.port</code></td></tr>
+<tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for both HTTP servers</td></tr>
+<tr><td><code>--api-port</code></td><td><code>5052</code></td><td>API server port. <code>beacon</code> binds it too, off its own anchored store rather than an empty one; the lean-shaped <code>/lean/v0</code> routes still don’t answer for it (see <a href="#beacon-flags"><code>beacon</code> flags</a> below)</td></tr>
+<tr><td><code>--metrics-port</code></td><td><code>5054</code></td><td>Metrics and debug server port. Equal to <code>--api-port</code> merges the routers onto one listener</td></tr>
+<tr><td><code>--node-key</code></td><td>generates an ephemeral key</td><td>Hex file holding the secp256k1 key that is this node’s libp2p and discv5 identity. When omitted, a fresh key is generated in memory each start (logged as a warning), so the PeerId and ENR differ on every restart</td></tr>
+<tr><td><code>--bootnodes</code></td><td>see below</td><td>Bootnode ENR list: one <code>enr:...</code> per line, as a YAML block sequence, a YAML flow sequence, or a plain list (<code>#</code> comments and leading <code>- </code> are both tolerated)</td></tr>
+<tr><td><code>--checkpoint-sync-url</code></td><td>see below</td><td>API base URLs, tried in order until one answers. Supplies <code>node</code>’s starting state on the lean API, and <code>beacon</code>’s anchor on a standard Beacon API; required on a fresh <code>beacon</code> data directory only for a built-in network, since a loaded network anchors at its own <code>genesis.ssz</code> instead. See <a href="checkpoint_sync.html"><code>checkpoint_sync.md</code></a></td></tr>
+<tr><td><code>--discovery.port</code></td><td><code>9000</code></td><td>discv5 UDP port; must differ from <code>--gossipsub-port</code>. See <a href="./discovery.html">Peer discovery</a></td></tr>
+<tr><td><code>--discovery.advertise-ip</code></td><td>bind address</td><td>IP published in the ENR</td></tr>
+<tr><td><code>--discovery.target-peers</code></td><td><code>200</code></td><td>Connected-peer count above which discovery stops dialing</td></tr>
+</tbody>
+</table>
+</div>
+<p>Three of those have no clap default, because the two chains answer them
+differently. A single <code>default_value</code> can only say one thing, so the flag
+carries none and each chain resolves an absent value itself:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Absent on <code>node</code></th><th>Absent on <code>beacon</code></th></tr>
+</thead>
+<tbody>
+<tr><td><code>--node-key</code></td><td>ephemeral in-memory key, warned about</td><td>same</td></tr>
+<tr><td><code>--bootnodes</code></td><td>no bootnodes: peers only via discv5 (with <code>--discovery.enable</code>) or by being dialed, warned about</td><td>falls back to the resolved network’s own bootnode list: a built-in network’s embedded list, or a loaded directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
+<tr><td><code>--checkpoint-sync-url</code></td><td>start from a resumable DB, else from genesis</td><td>start from a resumable DB, else anchor at the resolved network’s own genesis (loaded network only), else abort</td></tr>
+</tbody>
+</table>
+</div>
+<p>Whether discv5 runs is not a common flag. <code>beacon</code> always runs it, since
+published mainnet bootnode ENRs carry no <code>quic</code> entry and so are not statically
+dialable; <code>node</code> runs it only with <code>--discovery.enable</code> (see below). Where it
+runs, it binds <code>DEFAULT_DISCOVERY_PORT</code> (9000) unless <code>--discovery.port</code> says
+otherwise. The two defaults are one apart because both sockets are UDP; pointing
+either flag at the other’s port is rejected at startup, before the node touches
+its data directory. Without discovery neither that check nor the ban on
+<code>--gossipsub-port 0</code> applies, since nothing binds the discovery port and no ENR
+is published.</p>
+<h2 id="node-flags"><a class="header" href="#node-flags"><code>node</code> flags</a></h2>
+<p>On top of the common flags above.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--genesis</code></td><td>required</td><td>Chain genesis config, e.g. <code>config.yaml</code></td></tr>
+<tr><td><code>--validators</code></td><td>required</td><td>Validator registry, e.g. <code>annotated_validators.yaml</code></td></tr>
+<tr><td><code>--validator-config</code></td><td>required</td><td><code>validator-config.yaml</code>, the node-name registry</td></tr>
+<tr><td><code>--hash-sig-keys-dir</code></td><td>required</td><td>Directory of per-validator XMSS keys</td></tr>
+<tr><td><code>--node-id</code></td><td>required</td><td>The key in <code>annotated_validators.yaml</code> naming this node, e.g. <code>ethlambda_0</code></td></tr>
+<tr><td><code>--is-aggregator</code></td><td><code>false</code></td><td>Seed the runtime aggregator flag</td></tr>
+<tr><td><code>--discovery.enable</code></td><td><code>false</code></td><td>Run discv5 peer discovery; off, the node peers from <code>--bootnodes</code> alone. See <a href="./discovery.html">Peer discovery</a></td></tr>
+<tr><td><code>--aggregate-subnet-ids</code></td><td>this node’s subnets</td><td>Subnets to aggregate on; requires <code>--is-aggregator</code></td></tr>
+<tr><td><code>--attestation-committee-count</code></td><td>from <code>validator-config.yaml</code>, else <code>1</code></td><td>Committees per slot</td></tr>
+<tr><td><code>--enable-proposer-aggregation</code></td><td><code>false</code></td><td>Merge same-data proofs when building a block</td></tr>
+<tr><td><code>--max-attestations-per-block</code></td><td><code>3</code></td><td>Proposer-side self-limit</td></tr>
+<tr><td><code>--disable-duty-sync-gate</code></td><td><code>false</code></td><td>Track sync state without suppressing duties</td></tr>
+</tbody>
+</table>
+</div>
+<p>A <code>shadow-integration</code> build adds the <code>--shadow-xmss-*</code> flags; they are absent
+from a normal build.</p>
+<h2 id="beacon-flags"><a class="header" href="#beacon-flags"><code>beacon</code> flags</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--custody-group-count</code></td><td><code>CUSTODY_REQUIREMENT</code> (4)</td><td>How many custody groups this node custodies, advertised as the ENR’s <code>cgc</code></td></tr>
+<tr><td><code>--execution-endpoint</code></td><td>none</td><td>Base URL of the execution client’s Engine API endpoint, e.g. <code>http://127.0.0.1:8551</code>. Must be given together with <code>--execution-jwt-secret</code></td></tr>
+<tr><td><code>--execution-jwt-secret</code></td><td>none</td><td>File holding the 32-byte hex JWT secret shared with the execution client</td></tr>
+<tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone</td></tr>
+</tbody>
+</table>
+</div>
+<p>Accepted range is <code>CUSTODY_REQUIREMENT</code> to <code>NUMBER_OF_CUSTODY_GROUPS</code> (4 to
+128), enforced at parse time rather than clamped: serving a different set than
+the operator asked for is the failure hardest to notice.</p>
+<p><strong>It is not the number of columns custodied.</strong> That is <code>sampling_size</code>, the
+larger of this and <code>SAMPLES_PER_SLOT</code>, so the default still custodies 8 columns
+and the two only converge once the flag is raised past 8. A node at 128 is a
+supernode, custodying every column; raising the value costs storage and
+bandwidth in proportion and makes this node useful to more peers, which on a
+network where a <code>cgc=4</code> peer holds 4 of 128 columns is what decides whether a
+lookup finds a custodian at all.</p>
+<p>Changing it changes which columns this node custodies, since the custody set is
+a function of the node id <em>and</em> the count. Sidecars already on disk belong to
+the old set: nothing is corrupted, but the node advertises a set it has not
+finished filling until it backfills the difference.</p>
+<p>With neither execution flag, the follower contacts no execution client and
+imports blocks without validating their payloads, which is what it did before
+those flags existed. Supplying one without the other is refused at startup: an
+Engine API endpoint always requires authentication. See
+<a href="./beacon_engine.html">the execution layer pairing</a> for what each verdict does and
+for the limitations that go with the retry ladder.</p>
+<p><code>beacon</code> takes one more flag of its own, and two common flags also mean
+something specific here.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--network</code></td><td><code>mainnet</code></td><td>A built-in network name (<code>mainnet</code>, <code>sepolia</code> or <code>hoodi</code>), or a path to a directory of published network files. A value containing a slash is always a path, so <code>mainnet</code> is the built-in and <code>./mainnet</code> is a directory. The directory must hold <code>config.yaml</code> and <code>genesis.ssz</code>, and may hold <code>bootstrap_nodes.yaml</code> or <code>bootstrap_nodes.txt</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>genesis_validators_root</code> and <code>genesis_time</code>, which the fork digest that keys
+every gossip topic, the ENR <code>eth2</code> entry and discv5 admission is computed from,
+come from the resolved network:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>--network</code></th><th>genesis values</th><th>config</th><th>bootnodes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mainnet</code> (default), <code>sepolia</code>, <code>hoodi</code></td><td>two constants in <code>network::built_in</code>; no genesis state is carried (a built-in network never anchors at genesis, and the states run from 5 MB to 150 MB)</td><td><code>bin/ethlambda/assets/&lt;name&gt;/config.yaml</code>, <code>eth-clients/&lt;name&gt;</code>’s file byte for byte</td><td><code>bin/ethlambda/assets/&lt;name&gt;/bootstrap_nodes.yaml</code>, from the same repo</td></tr>
+<tr><td>a directory</td><td>read off the directory’s own <code>genesis.ssz</code></td><td>the directory’s <code>config.yaml</code></td><td>the directory’s <code>bootstrap_nodes.yaml</code>/<code>.txt</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The genesis constants are checked twice at runtime: checkpoint sync verifies the
+downloaded anchor state against both, and a resumed data directory is checked
+the same way, so a wrong constant fails at startup rather than following the
+wrong chain.</p>
+<p><code>beacon</code> therefore takes no genesis config, validator registry, or bootnode file
+of its own the way <code>node</code> does: those are read off the resolved network instead
+of being separate operator input. A <code>config.yaml</code> (a directory’s, or a built-in
+network’s embedded one) is read permissively: absent keys fall back to mainnet’s values,
+numbers are accepted quoted or bare, and unrecognised keys (on a current
+config, the gloas and heze schedule this build cannot process) are dropped
+with one warning line naming each. Its <code>PRESET_BASE</code> is checked against the
+compiled preset; a mismatch is a hard startup error naming the cargo feature
+that would fix it. The keys this build runs on compile-time constants for (the
+custody and subnet counts, the <code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the
+snappy message domains and <code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code>) must equal those
+constants, or startup fails naming each key that differs: the node cannot
+follow a network that sets them otherwise, and <code>/eth/v1/config/spec</code> would
+report values it does not use. For a directory, both checks run before its
+<code>genesis.ssz</code> is decoded, so a directory built for the other preset fails with
+the preset error rather than an SSZ one.</p>
+<p>Resuming a data directory under a <code>config.yaml</code> whose <code>CONFIG_NAME</code> differs
+from the stored one only logs a warning; the stored name is kept. Any changed
+chain value (a fork epoch or version, the slot time, <code>PRESET_BASE</code>) is still a
+hard error.</p>
+<p><code>--checkpoint-sync-url</code> now supplies the beacon anchor: a finalized
+<code>BeaconState</code> and its anchor block, fetched from a standard Beacon API server
+and verified against the genesis identity above plus the anchor’s own internal
+consistency (see <a href="checkpoint_sync.html"><code>checkpoint_sync.md</code></a>). The full anchor
+precedence is: a resumable data directory, then <code>--checkpoint-sync-url</code>, then,
+for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The
+URL is therefore <strong>required</strong> on a fresh data directory only for a built-in
+network: this follower imports nothing past its anchor, so anchoring a built-in
+network at genesis would leave it parked at slot 0 while claiming to follow a
+chain that has been live for years. A loaded network’s own genesis
+state is a legitimate anchor instead, since a freshly started devnet has no
+checkpoint provider at slot 0 and this is the only way to join one. A
+directory already anchored from a previous run resumes without the flag
+either way, the same way <code>node</code>’s does.</p>
+<p><code>--api-port</code> is bound here too, off <code>beacon</code>’s own anchored store now rather
+than an empty one: one HTTP call site (<code>start_rpc_server</code>) serves both chains.
+The lean-shaped <code>/lean/v0/...</code> routes read metadata keys and state variants a
+beacon directory never carries, though, so calling one of them, e.g. <code>GET /lean/v0/states/finalized</code>, panics that request rather than answering for a
+chain that isn’t running. This is deliberate for now: giving the beacon
+follower its own HTTP surface is a change of its own. Treat <code>/metrics</code> on
+<code>--metrics-port</code> as the only meaningful HTTP surface of a <code>beacon</code> run today.</p>
+<h2 id="what-ethlambda-beacon-does-today"><a class="header" href="#what-ethlambda-beacon-does-today">What <code>ethlambda beacon</code> does today</a></h2>
+<p>It follows the resolved network’s gossip and nothing above it. It now anchors a real,
+RocksDB-backed store at a checkpoint-synced (or resumed) finalized state, but
+does nothing more with it: no state transition, no fork choice, and no block
+import past that anchor. The node joins the network, decodes what arrives, and
+logs it. See <a href="./beacon_wire.html"><code>beacon_wire.md</code></a> for what goes on the wire and
+how to check a run against the live network.</p>
+<h3 id="one-entry-point-two-chains"><a class="header" href="#one-entry-point-two-chains">One entry point, two chains</a></h3>
+<p>Both sub-commands run through <code>run_node</code> in <code>bin/ethlambda/src/main.rs</code>. Each
+parses into a single <code>cli::Options</code>, whose <code>network</code> field is <code>Network::Lean</code> or
+<code>Network::Mainnet</code> and carries that chain’s own flags. <code>run_node</code> does what is
+not chain-specific, branches once, and shares the shutdown:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>step</th><th>lean</th><th>mainnet</th></tr>
+</thead>
+<tbody>
+<tr><td>validate the ports (discv5 rules only where it runs)</td><td>shared</td><td>shared</td></tr>
+<tr><td>register metrics, print the banner, log the version</td><td>shared</td><td>shared</td></tr>
+<tr><td>raise <code>RLIMIT_NOFILE</code></td><td>shared</td><td>shared</td></tr>
+<tr><td><code>HIVE_LEAN_TEST_DRIVER</code> early return</td><td>yes</td><td>no: those endpoints are lean’s</td></tr>
+<tr><td>resolve <code>--node-key</code></td><td>shared</td><td>shared</td></tr>
+<tr><td>resolve <code>--network</code> into a <code>NetworkSource</code></td><td>n/a: lean has no <code>--network</code></td><td>classify the value (built-in name vs. directory); parse the <code>config.yaml</code> (embedded, or the directory’s) and check <code>PRESET_BASE</code> against the compiled preset and the constant-backed keys against their constants; for a directory, then decode <code>genesis.ssz</code></td></tr>
+<tr><td>read <code>--bootnodes</code> (falls back to the chain’s default list; see the table above)</td><td>shared</td><td>shared</td></tr>
+<tr><td>build the aggregator, sync-status and event handles</td><td>shared</td><td>shared</td></tr>
+<tr><td>open <code>--data-dir</code>’s RocksDB backend</td><td>shared</td><td>shared</td></tr>
+<tr><td><strong>the one <code>match</code></strong>: produce a <code>ChainSetup</code></td><td>genesis config, validator keys, checkpoint sync or resume onto the shared backend, subnets</td><td><code>beacon::wire_params</code> (genesis metadata, epoch, fork digest), then checkpoint sync or resume onto the same backend</td></tr>
+<tr><td>build the swarm, spawn P2P, start discv5</td><td>shared; discv5 only with <code>--discovery.enable</code></td><td>shared</td></tr>
+<tr><td>start the HTTP server</td><td>shared</td><td>shared</td></tr>
+<tr><td>spawn the chain actor and wire it to P2P</td><td>yes</td><td>no: it imports nothing</td></tr>
+<tr><td>ctrl-c, stop and join the actors</td><td>shared</td><td>shared</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>ChainSetup</code> is what the <code>match</code> produces: the wire configuration, the ENR
+entries that describe it, the store the req/resp handlers answer from, the
+node-name roster, and an <code>Option</code> holding the validator keys and
+<code>BlockChainConfig</code>. The operator-supplied half of the discv5 configuration (node
+key, ports, bootnodes, peer target) is the same on either chain, so it is filled
+in once below the match. That <code>Option</code> being <code>None</code> is what ends the mainnet path:
+<code>run_node</code> returns straight into the shared shutdown after starting the wire.</p>
+<p><code>beacon::wire_params</code> reads <code>genesis_time</code> and <code>genesis_validators_root</code> off
+the resolved network (a built-in network’s two constants, or a loaded
+network’s own <code>genesis.ssz</code>, decoded at whatever fork its own schedule names
+for epoch 0), derives the wall-clock epoch
+and fork digest from them, and logs the next boundary that would move the
+digest. It builds nothing: one <code>build_swarm</code> serves both chains, dispatching on
+the <code>WireConfig</code> variant for the topics, the req/resp protocol set, the
+gossipsub <code>seen_ttl</code>, the identify version and the connection limits.</p>
+<p>The chain actor is the one thing mainnet has none of, so <code>RunningNode</code>
+carries it as an <code>Option</code> and the shared shutdown skips it.</p>
+<p>Not implemented here: block import and fork choice past the anchor. A decoded
+block is logged and dropped.</p>
+<h2 id="validator-flags"><a class="header" href="#validator-flags"><code>validator</code> flags</a></h2>
+<p><code>ethlambda validator</code> is not a node. It binds no libp2p port, opens no
+database, runs no discovery and follows no chain: it holds validator keys and
+performs duties against a beacon node’s standard REST API. It works against any
+conformant beacon node, this repository’s <code>beacon</code> subcommand or another
+implementation’s, so none of the <a href="#common-flags">common flags</a> apply to it.</p>
+<blockquote>
+<p><strong>It keeps no slashing-protection record.</strong> Read
+<a href="./spec_deviations.html#the-validator-client-keeps-no-slashing-protection-record">Spec Deviations</a>
+before running it with keys that hold real stake. In short: do not run these
+keys in any other client while this one runs, and treat a restart with the
+same care as a manual key move. The client repeats this warning at startup.</p>
+</blockquote>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--beacon-nodes</code></td><td>required</td><td>Base URLs of the beacon nodes to use, comma-separated or repeated. Tried in list order; the first that answers serves the request, so the order is a preference, not load balancing</td></tr>
+<tr><td><code>--validators-dir</code></td><td>required</td><td>Directory holding the EIP-2335 keystores and <code>validator_definitions.yml</code></td></tr>
+<tr><td><code>--secrets-dir</code></td><td>required</td><td>Directory holding one password file per keystore, named after the validator’s public key</td></tr>
+<tr><td><code>--http-address</code></td><td><code>127.0.0.1</code></td><td>Bind address for the metrics and keymanager servers</td></tr>
+<tr><td><code>--metrics-port</code></td><td><code>5064</code></td><td>Prometheus metrics port</td></tr>
+<tr><td><code>--keymanager-port</code></td><td><code>5062</code></td><td>Keymanager API port. Only bound with <code>--enable-keymanager</code></td></tr>
+<tr><td><code>--suggested-fee-recipient</code></td><td>none</td><td>Execution address to receive block rewards, <code>0x</code>-prefixed. Optional, and startup warns when it is absent: without it the beacon node picks an address, and it will not be yours</td></tr>
+<tr><td><code>--graffiti</code></td><td>empty</td><td>Text for the graffiti field of proposed blocks. At most 32 bytes as UTF-8, right-padded with zeros. Refused rather than truncated if longer</td></tr>
+<tr><td><code>--enable-keymanager</code></td><td>off</td><td>Serve the keymanager API. Off by default because it mutates key material</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="what-it-does-today"><a class="header" href="#what-it-does-today">What it does today</a></h3>
+<p>Attestations, block proposals and attestation aggregation.</p>
+<p>Each epoch it resolves its validators’ indices, fetches their attester duties
+for this epoch and the next, fetches this epoch’s proposer duties, subscribes
+to the committee subnets the attester duties need, and registers its fee
+recipient with the beacon node. The subscription also tells the node which
+committees this client will aggregate for, which it has to know in advance so
+it can collect the votes.</p>
+<p>Each slot it wakes at the boundary. If one of its validators proposes that
+slot, it signs the RANDAO reveal, asks the beacon node for a block, checks that
+the block is for the slot and proposer it asked about, signs it and publishes
+it. One third into the slot it fetches the attestation data, signs for every
+validator due that slot, and submits the batch. Two thirds in, for any duty it
+was selected to aggregate, it asks the node for the aggregate covering that
+committee’s votes on the data it just signed, wraps it with the selection proof
+and publishes it.</p>
+<p>Aggregation is not a choice. A validator signs the slot under a dedicated
+domain, and whether the hash of that signature divides evenly by a modulus from
+the committee’s size decides it. Signatures are deterministic, so a validator
+gets one answer per slot, cannot search for a better one, and cannot decline:
+the beacon node checks the same thing when the aggregate arrives.</p>
+<p>Proposals are bounded by that one-third mark rather than by the end of the
+slot. The specification defines no block-production deadline; the nearest thing
+it defines is the point attesters stop waiting for a block, which is the same
+instant. A proposal still running then has already lost most of the block’s
+value, and every second past it comes out of this client’s own attestations, so
+it is abandoned and the slot’s attesters still vote.</p>
+<p>Electra is the earliest fork it will propose under. A deneb block body has one
+field fewer than an electra one, so it would need a container pair of its own,
+and it would buy nothing: the attestations this client submits are electra’s
+<code>SingleAttestation</code>, which has no earlier form, so a pre-electra chain is one it
+cannot serve whatever it does with blocks. A block from any earlier fork is
+refused by name rather than failing to decode.</p>
+<p>Blocks are fetched and published as SSZ rather than JSON. Signing a block means
+computing its <code>hash_tree_root</code>, which only the typed container can give; a
+hand-written JSON mapping of an execution payload would be a large surface on
+which a single wrong field silently produces a signature over the wrong block.</p>
+<p>Not implemented: the builder flow and blinded blocks (the client asks for an
+unblinded block and refuses a blinded one), sync-committee duties, voluntary
+exits, doppelganger protection and remote signing.</p>
+<h3 id="duty-offsets-come-from-the-network"><a class="header" href="#duty-offsets-come-from-the-network">Duty offsets come from the network</a></h3>
+<p>The slot length and the two duty offsets are read from the beacon node’s
+<code>/eth/v1/config/spec</code>, not divided out of a compiled-in constant. The
+specification states them as <code>SLOT_DURATION_MS</code> plus basis points of it,
+<code>ATTESTATION_DUE_BPS</code> and <code>AGGREGATE_DUE_BPS</code>, which on mainnet’s 12-second slot
+work out at 3999 ms and 8000 ms.</p>
+<p><code>SECONDS_PER_SLOT</code> no longer exists in the specification and is accepted only as
+a fallback, since deployed nodes still send it. A node sending both is required
+to agree with itself.</p>
+<h3 id="proposer-duties-are-less-durable-than-attester-ones"><a class="header" href="#proposer-duties-are-less-durable-than-attester-ones">Proposer duties are less durable than attester ones</a></h3>
+<p>Worth knowing if a proposal is ever missed after a reorg. An attester schedule
+depends on the block two epochs back and survives anything shallower; a
+proposer schedule depends on the block one epoch back, so a reorg that leaves
+attester duties untouched can still move a proposer between slots. This client
+fetches proposer duties once per epoch, at the boundary, so a reorg inside the
+epoch is not picked up until the next one.</p>
+<h3 id="the-keymanager-api"><a class="header" href="#the-keymanager-api">The keymanager API</a></h3>
+<p>Off unless <code>--enable-keymanager</code> is passed. It serves <code>GET</code>, <code>POST</code> and
+<code>DELETE /eth/v1/keystores</code>, authenticated with a bearer token read from
+<code>api-token.txt</code> in the validators directory and generated there on first start
+if absent. The token file is written <code>0600</code> and a file too short to be a real
+token is refused rather than accepted.</p>
+<p>The specification requires TLS. This binds to <code>--http-address</code>, loopback by
+default; exposing it further means putting a TLS terminator in front.</p>
+<h3 id="metrics"><a class="header" href="#metrics">Metrics</a></h3>
+<p>Served on <code>--metrics-port</code>, prefixed <code>ethlambda_validator_</code> rather than the
+<code>lean_</code> used elsewhere in this repository, since this process follows the
+beacon chain. Every series is registered at startup so it reads zero rather
+than being absent before its first event, which is what lets an alert fire on
+“attestations stopped”. See <a href="./metrics.html#validator-client">Metrics</a>.</p>
+<h2 id="benchmark-import-flags"><a class="header" href="#benchmark-import-flags"><code>benchmark import</code> flags</a></h2>
+<p>Neither sub-command follows a chain; see <a href="./benchmarking.html#import-workload"><code>benchmarking.md</code></a>
+for what the workload measures and why it exists.</p>
+<h3 id="benchmark-import-fetch"><a class="header" href="#benchmark-import-fetch"><code>benchmark import fetch</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--url</code></td><td>required</td><td>Base URL of the source beacon node, e.g. <code>http://127.0.0.1:5052</code></td></tr>
+<tr><td><code>--from</code></td><td>required</td><td>First slot of the range, and its first sample, so it must hold a block. The anchor is the block at the first slot of the epoch before it; the blocks in between are fetched too, and replayed as unsampled warm-up</td></tr>
+<tr><td><code>--to</code></td><td>required</td><td>Last slot of the range, inclusive. May not pass the source’s head. Otherwise not capped: <code>fetch</code> streams, so a long range costs disk and time but not memory</td></tr>
+<tr><td><code>--corpus</code></td><td>required</td><td>Corpus directory to create</td></tr>
+<tr><td><code>--force</code></td><td><code>false</code></td><td>Replace an existing corpus in that directory</td></tr>
+<tr><td><code>--network</code></td><td><code>mainnet</code></td><td>Which network the source follows</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="benchmark-import-replay"><a class="header" href="#benchmark-import-replay"><code>benchmark import replay</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--corpus</code></td><td>required</td><td>Corpus directory written by <code>fetch</code></td></tr>
+<tr><td><code>--network</code></td><td><code>mainnet</code></td><td>Which network the corpus belongs to. Checked against the manifest’s recorded genesis validators root before anything is built</td></tr>
+<tr><td><code>--data-dir</code></td><td>required</td><td>Where to build the replay’s RocksDB store. A real backend rather than the in-memory one, since state persistence is part of what is measured</td></tr>
+<tr><td><code>--force</code></td><td><code>false</code></td><td>Replace an existing store in that directory</td></tr>
+<tr><td><code>--safe-slots-to-import-optimistically</code></td><td>the specification’s own value</td><td>How far behind the wall clock a block must be before it may be imported optimistically on age alone. Exposed for parity with <code>beacon</code>’s own flag of the same name; a corpus replay never sees the merge transition block it gates</td></tr>
+<tr><td><code>--format</code></td><td><code>human</code></td><td><code>human</code> or <code>json</code></td></tr>
+<tr><td><code>--output</code></td><td>none</td><td>Also write the JSON report to this file</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="beacon_engine.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="rpc.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="beacon_engine.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="rpc.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

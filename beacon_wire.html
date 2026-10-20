@@ -1,0 +1,873 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>The mainnet wire - ethlambda</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-4829553b.svg">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-34fa44cf.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/beacon_wire.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="the-mainnet-wire"><a class="header" href="#the-mainnet-wire">The mainnet wire</a></h1>
+<p><code>ethlambda beacon</code> follows the Ethereum Beacon Chain’s gossip. This page
+describes what it puts on the wire; <a href="./discovery.html"><code>discovery.md</code></a> covers the
+discv5 stack it shares with lean, and <a href="./cli.html"><code>cli.md</code></a> the flags and the
+startup order.</p>
+<p>It follows, from its checkpoint anchor to the tip: a chain actor imports what
+gossip announces and what range sync fetches, and the two block protocols serve
+other peers from the same store. Fork choice learns its votes from block bodies
+and from the aggregate topic, which is how it sees votes for the <em>current</em> head
+rather than only ones at least a block old; see <a href="#aggregate-attestations">Aggregate
+attestations</a>. It publishes nothing. It also custodies
+and serves a slice of the fulu data column matrix, and backbones a slice of the
+attestation subnets, both sized and selected by its own node id; see <a href="#data-column-sidecars">Data
+column sidecars</a>.</p>
+<h2 id="running-it"><a class="header" href="#running-it">Running it</a></h2>
+<pre><code class="language-bash">ethlambda beacon \
+  --node-key ./node-key \
+  --gossipsub-port 9001
+</code></pre>
+<p>No flag is required, but that is only true for a built-in network:
+<code>ethlambda beacon</code> on its own follows mainnet, since <code>--network</code> defaults to
+<code>mainnet</code>. Sepolia and Hoodi are built in too, and any other network is a
+<code>--network</code> naming a directory of published files (<code>config.yaml</code> and
+<code>genesis.ssz</code>, see <a href="./cli.html"><code>cli.md</code></a>):</p>
+<pre><code class="language-bash">ethlambda beacon --network hoodi --checkpoint-sync-url https://checkpoint-sync.hoodi.ethpandaops.io
+ethlambda beacon --network ./my-network --node-key ./node-key
+</code></pre>
+<p><code>genesis_time</code> and <code>genesis_validators_root</code>, and therefore the fork digest,
+are derived from the resolved network: a built-in network (<code>mainnet</code>,
+<code>sepolia</code>, <code>hoodi</code>) carries the two values as constants beside its
+<code>eth-clients</code> <code>config.yaml</code> and bootnode list, and no genesis state; for a
+loaded network they are read off that directory’s own <code>genesis.ssz</code>. Nothing
+about startup touches the network to get there. discv5 is forced on and needs no flag either: published mainnet
+bootnodes are largely seed-only, so a crawl is how a peer is reached.</p>
+<h2 id="the-fork-digest"><a class="header" href="#the-fork-digest">The fork digest</a></h2>
+<p>Computed once at startup from the resolved network’s genesis state, never
+hardcoded as a digest:</p>
+<pre><code>epoch        = (now - genesis_time) / (SECONDS_PER_SLOT * SLOTS_PER_EPOCH)
+fork_version = the resolved network's fork schedule at epoch
+base         = compute_fork_data_root(fork_version, genesis_validators_root)
+digest       = base[..4]                                    if epoch &lt;  FULU_FORK_EPOCH
+             = xor(base, sha256(le64(bp.epoch) ++
+                                le64(bp.max_blobs)))[..4]   if epoch &gt;= FULU_FORK_EPOCH
+</code></pre>
+<p><code>bp</code> is the latest blob-schedule entry at or before <code>epoch</code>, falling back to
+<code>(ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA)</code>. The fulu branch is
+EIP-7892’s, which is why mainnet’s digest is <code>8c9f62fe</code> rather than fulu’s bare
+<code>82fae541</code>.</p>
+<p>Startup logs the next boundary’s epoch and wall-clock time. The digest is
+computed once, so crossing one strands the node on topic names nobody publishes
+to; restart it to pick up the new digest.</p>
+<h2 id="gossip"><a class="header" href="#gossip">Gossip</a></h2>
+<p>Seven global topics, <code>/eth2/{digest}/{name}/ssz_snappy</code>, plus two subnet
+families this node’s own node id selects a narrow slice of: the data column
+subnets it custodies and the attestation subnets it backbones, both described
+below.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Topic</th><th>Decoded as</th></tr>
+</thead>
+<tbody>
+<tr><td><code>beacon_block</code></td><td><code>SignedBeaconBlock</code>, fork chosen by the block’s slot</td></tr>
+<tr><td><code>beacon_aggregate_and_proof</code></td><td><code>SignedAggregateAndProof</code>, phase0 or electra</td></tr>
+<tr><td><code>attester_slashing</code></td><td><code>AttesterSlashing</code>, phase0 or electra</td></tr>
+<tr><td><code>voluntary_exit</code></td><td><code>SignedVoluntaryExit</code></td></tr>
+<tr><td><code>proposer_slashing</code></td><td><code>ProposerSlashing</code></td></tr>
+<tr><td><code>bls_to_execution_change</code></td><td><code>SignedBLSToExecutionChange</code></td></tr>
+<tr><td><code>sync_committee_contribution_and_proof</code></td><td><code>SignedContributionAndProof</code></td></tr>
+<tr><td><code>beacon_attestation_{subnet_id}</code></td><td><code>Attestation</code>, phase0 or electra</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>beacon_attestation_{0..63}</code> is no longer wholly unsubscribed. This node holds
+<code>SUBNETS_PER_NODE</code> (2 on mainnet) long-lived subscriptions from that family,
+chosen by <code>compute_subscribed_subnets(node_id, epoch)</code>, a public function of
+this node’s own discv5 node id in the same way <code>custody_columns</code> is, so any
+peer can compute the set without asking. <code>p2p-interface.md</code> asks every beacon
+node to hold them whether or not it runs validators: phase 0 has no shard
+committees, so nothing else gives these subnets a stable membership for
+validators to publish into. The subscription is therefore owed to the network
+rather than to this node’s head: this node verifies and relays what arrives on
+it (see <a href="#gossip">Gossip validation</a> below) but never applies it to fork
+choice. A lighthouse node with no validators behaves the same way, subscribing
+to its own node-id backbone and verifying what arrives on it while
+<code>should_process_attestation</code> keeps it out of fork choice unless a local
+aggregator duty or <code>--import-all-attestations</code> says otherwise.</p>
+<p>One deliberate shortfall: the set is computed once at startup and kept for the
+process’s lifetime rather than rotating every <code>EPOCHS_PER_SUBNET_SUBSCRIPTION</code>
+epochs. Lighthouse does the same, and reads that constant nowhere.</p>
+<p><code>sync_committee_{0..3}</code> stays unsubscribed and arrives with the work that reads
+it. <code>blob_sidecar_{subnet_id}</code> stays absent permanently: it is deneb’s format
+for blobs, deprecated at fulu in favor of the column matrix below.</p>
+<p><code>data_column_sidecar_{0..127}</code> is no longer in that absent list. This node
+subscribes to <code>sampling_size(CUSTODY_REQUIREMENT)</code> of them — the sampling size
+floored by <code>SAMPLES_PER_SLOT</code> above <code>CUSTODY_REQUIREMENT</code> itself — chosen by
+<code>custody_columns(node_id, …)</code>, a public function of this node’s own discv5
+node id (<code>das-core.md</code>), so any peer can compute the same set without asking.
+<code>NUMBER_OF_CUSTODY_GROUPS</code> and <code>DATA_COLUMN_SIDECAR_SUBNET_COUNT</code> are equal
+today, so a column is its own subnet with no reduction. That makes this
+node’s total subscription count the seven global topics plus its sampling size
+plus <code>SUBNETS_PER_NODE</code>, still far short of a full subscription to every
+attestation, sync-committee and data-column subnet, and narrower still than
+<code>NUMBER_OF_CUSTODY_GROUPS</code> columns of custody, which is what a supernode
+would carry alone. A sidecar decodes as
+<code>fulu::DataColumnSidecar</code>; the checks it passes before this node keeps or
+forwards it are described just below. How a kept sidecar is later served back
+out over req/resp is under <a href="#data-column-sidecars">Data column sidecars</a>.</p>
+<p>Every beacon message is held by gossipsub until it has a verdict
+(<code>validate_messages()</code> is on for this wire only). Blocks, data column
+sidecars, aggregates and subnet attestations are all validated by fulu’s
+gossip rules (<code>ethlambda_state_transition::beacon::gossip</code>, one module per
+topic family): the checks that need no state run inline in the p2p actor, the
+rest on a bounded <code>spawn_blocking</code> task whose verdict comes back to the actor
+(<code>crate::beacon::verdict</code>). Two permit pools bound how many of these run at
+once, so a burst on one family cannot starve another:
+<code>gossip_validation_permits</code> for blocks and columns,
+<code>attestation_validation_permits</code> for aggregates and subnet attestations. A
+mainnet slot carries up to <code>MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE</code> aggregates alone, arriving every slot rather
+than only during a range sync, which is why that traffic needs a pool of its
+own rather than sharing the block and column one. Accept propagates the
+message; a message whose dependency is not ready yet is IGNOREd. See
+<a href="#aggregate-attestations">Aggregate attestations</a> for the two topics with
+their own section.</p>
+<p>Blocks and data column sidecars are, either way, handed to the chain actor,
+which parks what it cannot import yet and imports the rest immediately, such
+as a sidecar whose slot merely falls outside its parent state’s proposer
+lookahead. An aggregate reaches the chain actor only on <code>Accept</code>, carrying the
+attesting indices gossip validation resolved. A subnet attestation never
+reaches it at all, on any outcome: verifying and relaying it is the whole of
+what this node owes the topic (see above), so there is nothing further for the
+chain actor to do with one.</p>
+<p>The remaining five global topics are decoded, logged at <code>debug</code>, and IGNOREd,
+since nothing consumes them; an undecodable payload on any topic is REJECTed.
+Nothing is published on any topic, columns included: nothing this node can
+produce today would be signature-valid.</p>
+<h2 id="aggregate-attestations"><a class="header" href="#aggregate-attestations">Aggregate attestations</a></h2>
+<p><code>beacon_aggregate_and_proof</code> reaches fork choice. It is how a follower learns
+votes for the <em>current</em> head rather than only the votes a block body carries,
+which are always at least one block old. <code>beacon_attestation_{subnet_id}</code>,
+covered in the same section below, never does: this node relays its backbone
+subnets without ever applying what arrives on them.</p>
+<p>Both topics are validated the same way blocks and columns are, in
+<code>ethlambda_state_transition::beacon::gossip::{aggregate,attestation}</code>: cheap
+conditions (seen cache, propagation window, <code>data.index == 0</code>, exactly one
+committee named) run inline in the p2p actor; the rest run on a blocking
+thread, in this order:</p>
+<ol>
+<li>The vote’s block is known (<code>Store::has_block</code>); if not, IGNORE.</li>
+<li><strong>Committees, signatures and ancestry all resolve against the vote block’s
+own cached post-state</strong>
+(<code>store.cached_state(CacheKey::BlockState(beacon_block_root))</code>), not the
+specification’s head state and not the target checkpoint’s state either.
+Three reasons converge: it is the attested chain’s own state, so its
+shuffling is the one the attesters were actually assigned, where the head
+(or a checkpoint reached by replaying a different branch) can name the
+wrong one; it is an <code>O(1)</code> cache read rather than a lookup or a replay; and
+its own <code>block_roots</code> answers both ancestry questions without a
+<code>Store::block_index</code> / <code>LiveChain</code> scan.</li>
+<li>The signatures that need only a pubkey, before any committee derivation: an
+aggregate’s selection proof and aggregator signature, an attestation’s own
+signature. An unknown validator index REJECTs here rather than paying for a
+committee lookup first, since a forged message must not be able to reach a
+shuffling derivation.</li>
+<li>The committees, through the <code>Store</code>-held cache both actors share; then
+<code>is_aggregator</code> (rewritten to take a committee length rather than a
+pre-fetched cache), committee membership, and, for a subnet attestation, the
+subnet match (<code>compute_subnet_for_attestation</code>).</li>
+<li>An aggregate’s own signature, over the indexed attestation built from that
+committee. The indices it verifies travel to the chain actor; it never
+rebuilds them.</li>
+<li>Ancestry against the vote state’s <code>block_roots</code>: the target is the vote
+block’s ancestor at the target epoch (REJECT), and the finalized checkpoint
+is an ancestor of the vote block (IGNORE).</li>
+</ol>
+<p>The seen caches (<code>SeenAggregates</code>, keyed both by <code>(target_epoch, aggregator_index)</code> and by <code>(hash_tree_root(data), committee_index)</code>;
+<code>SeenAttestations</code>, by <code>(target_epoch, attester_index)</code>) live in p2p now,
+recorded only on <code>Accept</code> by <code>verdict::settle</code>, and are bounded by capacity
+(an LRU, like the block and column seen caches) rather than pruned on
+finality: a peer must not get to grow either one just by outlasting
+finalization. Recording only after the signatures verify is still what keeps a
+garbage aggregate from being able to censor a genuine one for the rest of the
+epoch by claiming its <code>(epoch, aggregator)</code> pair first; lighthouse splits the
+same way, reading its observed-sets in <code>verify_early_checks</code> and writing them
+in <code>verify_late_checks</code>.</p>
+<p>Only an aggregate that gossip <code>Accept</code>s reaches the chain actor, carrying the
+attesting indices already resolved; the actor never re-derives a committee or
+checks a signature for this topic. What is left for it:</p>
+<ul>
+<li><strong>A lighter, actor-local applied-bits gate</strong>, a running union of aggregation
+bits already applied per <code>(target_epoch, hash_tree_root(data), committee_index)</code>. Not a spec seen-set (p2p owns that one now); it exists so
+a committee’s other aggregators, each individually accepted by gossip
+because each is a first-seen, valid message, do not all pay for
+<code>apply_verified_aggregate</code> when the first one already covered their bits.
+Pruned by the store’s own clock to the current and previous epoch, not by
+finality, so a stalled chain cannot make this grow without bound either.</li>
+<li><strong>The deferral queue.</strong> <code>validate_on_attestation</code> requires
+<code>get_current_slot(store) &gt;= data.slot + 1</code>, and aggregates are published two
+thirds of the way through the slot they vote for, so every one arrives too
+early. Without the queue this topic would apply approximately nothing. It
+drains once per beacon tick, between the clock advancing and the head being
+recomputed, so released votes are in fork choice before that tick’s head is
+chosen. The specification licenses this directly (“consider scheduling it for
+later processing in such case”) and lighthouse has the same queue. Held
+entries now carry their gossip-resolved attesting indices alongside them, so
+a drain applies them without recomputing anything.</li>
+</ul>
+<p>A subnet attestation is fully verified by this same pipeline and then simply
+dropped: nothing forwards it to the chain actor, on any outcome, matching a
+lighthouse follower with no validators, which verifies and relays its own
+backbone subnets while <code>should_process_attestation</code> keeps them out of its fork
+choice.</p>
+<h2 id="requestresponse"><a class="header" href="#requestresponse">Request/response</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Protocol</th><th>Direction</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status/1</code>, <code>status/2</code></td><td>both</td></tr>
+<tr><td><code>ping/1</code></td><td>both</td></tr>
+<tr><td><code>metadata/1</code>, <code>metadata/2</code>, <code>metadata/3</code></td><td>both</td></tr>
+<tr><td><code>goodbye/1</code></td><td>inbound; the reason code is logged and the stream closed</td></tr>
+<tr><td><code>beacon_blocks_by_range/2</code></td><td>both</td></tr>
+<tr><td><code>beacon_blocks_by_root/2</code></td><td>both</td></tr>
+<tr><td><code>data_column_sidecars_by_root/1</code></td><td>both</td></tr>
+<tr><td><code>data_column_sidecars_by_range/1</code></td><td>both</td></tr>
+</tbody>
+</table>
+</div>
+<p>The two data column sidecar protocols are registered because this node
+custodies the columns its node id selects and can answer for them out of
+<code>Table::DataColumns</code> (see <a href="./data_storage.html">data_storage.md</a>); see
+<a href="#data-column-sidecars">Data column sidecars</a> for what each serves and asks
+for. The blob sidecar protocols stay absent: nothing here custodies a whole
+blob, only the erasure-coded columns fulu derives it into, and a registered
+protocol with no implementation behind it is an untested encoder peers can
+reach.</p>
+<p>Only version 2 of the two block protocols is registered. Version 1 is deprecated
+by the spec, which lets a client answer it with an empty list, and its chunks
+carry no <code>&lt;context-bytes&gt;</code>, so serving it would mean a second response encoder
+for a shape no mainnet peer needs.</p>
+<p>The <code>Status</code> this node sends is derived from its anchored store, so a peer
+reading it has a reason to ask for the blocks the two block protocols serve.
+There is one window where every checkpoint is still zero, before fork choice has
+inserted the block <code>KEY_HEAD</code> names; lighthouse’s relevance check exempts a zero
+<code>finalized_root</code>, so that reads as “peer is syncing” rather than as a
+conflicting chain. Either way it is answered in the version the stream asked
+for: a v1 body on a v2 stream is eight bytes short and the codec refuses to
+write it, which drops the connection of every peer that opens the handshake on
+<code>status/2</code>.</p>
+<h3 id="the-two-block-protocols"><a class="header" href="#the-two-block-protocols">The two block protocols</a></h3>
+<p>Both request bodies have a shape that cannot be guessed from the response they
+produce:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Protocol</th><th>Request body</th><th>On the wire</th></tr>
+</thead>
+<tbody>
+<tr><td><code>beacon_blocks_by_range/2</code></td><td><code>(start_slot, count, step)</code></td><td>24 bytes, an SSZ <strong>container</strong></td></tr>
+<tr><td><code>beacon_blocks_by_root/2</code></td><td><code>List[Root, MAX_REQUEST_BLOCKS]</code></td><td><code>32 * n</code> bytes, an SSZ <strong>field</strong></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>step</code> is deprecated and must be 1, but it is still on the wire: altair says the
+v2 request is unchanged from phase0’s, and lighthouse pins this protocol’s
+request length to <code>min == max == 24 bytes</code>, so a two-field body is refused before
+it is ever decoded. A body naming any other <code>step</code> is answered with
+<code>INVALID_REQUEST</code>, not dropped: the field is carried up to the handler precisely
+so the peer learns which rule it broke, where refusing at decode would close the
+stream with nothing on it. Phase0 does permit answering a larger step with a
+single block, but that leniency is for a transition that finished years ago, and
+the spec’s requirement on the requester is a MUST.</p>
+<p>The root request is a bare list with no container around it, because the spec
+says this body “MUST be encoded as an SSZ-field” where the range body is “an
+SSZ-container”. The difference shows up on the wire: a container holding one
+variable-length field prefixes it with a four-byte offset.</p>
+<p><strong>Neither of those differences reaches above the codec.</strong> What a peer is asking
+for is the same question on either chain, so <code>req_resp::messages</code> owns the
+shared <code>BlocksByRangeRequest</code>, and each chain’s encoder converts to and from its
+own wire container: lean’s has no <code>step</code> and fills it with 1 on the way in,
+beacon’s carries all three fields. The shared struct is deliberately not
+SSZ-derived, so it cannot be written to either wire by accident. The root list
+needs no conversion at all, since <code>beacon::primitives::Root</code> <em>is</em> <code>H256</code> and
+both lists are <code>SszList&lt;H256, 1024&gt;</code>; only lean’s container comes off.</p>
+<p>Which chain a request arrived on is not on the message either: a node speaks one
+wire for its whole life, so the dispatch reads <code>Wire::is_beacon</code> instead. The
+same holds for the answer. <code>ResponsePayload::Blocks</code> is one variant for all four
+block protocols, because <code>SignedBeaconBlock</code> already carries a <code>Lean</code> variant
+and both stores hand blocks back in exactly that type. The narrowing to lean’s
+own <code>SignedBlock</code> happens once, where a fetched block is handed to the chain
+actor, and <code>lean::encoding::write_blocks_response</code> refuses to put a block of any
+other fork on a lean stream.</p>
+<p>Two ceilings apply, and they are not the same number. <code>MAX_REQUEST_BLOCKS</code>
+(1024) is what an inbound request is judged against, because it is the widest a
+peer may ever legitimately have been built to ask for; a <code>count</code> above it is
+refused as <code>INVALID_REQUEST</code>. <code>MAX_REQUEST_BLOCKS_DENEB</code> (128) is what an
+outbound request is built to and what an answer is truncated to, since the spec
+allows “Clients MAY limit the number of blocks in the response” and a peer
+asking for more than 128 is running older logic rather than misbehaving.</p>
+<p>A range answer comes off the canonical branch in ascending slot order, with
+empty slots skipped: <code>BlockRoots</code> holds one root per slot on the branch ending
+at the current head, so a sibling block at a slot the head does not descend from
+is never read. A root answer follows the order the roots were asked in, and
+leaves out any root this node does not hold.</p>
+<h3 id="context-bytes"><a class="header" href="#context-bytes">Context bytes</a></h3>
+<p>Every successful block chunk carries a four-byte <code>ForkDigest</code> between the result
+byte and the payload:</p>
+<pre><code class="language-text">response_chunk ::= &lt;result&gt; | &lt;context-bytes&gt; | &lt;encoding-dependent-header&gt; | &lt;encoded-payload&gt;
+</code></pre>
+<p>The digest is the one that block’s own epoch computes to, not the one this node
+is running on, so a backfill labels each chunk with its own fork. On an error
+chunk the field is empty, which is why the reader only reads it after a SUCCESS
+byte. Serving history therefore needs <code>genesis_validators_root</code> as well as the
+current digest, which is why <code>BeaconWire</code> and the codec both carry it.</p>
+<p>Going the other way, the fork a chunk decodes under comes from the <strong>slot inside
+the payload</strong>, through the same decode path gossip uses, and the context bytes
+are then checked against the digest that slot implies. That is a stronger test
+than using them as the decoder key: it catches a peer whose
+<code>genesis_validators_root</code> or fork schedule differs from ours, which is exactly
+what the digest exists to say and is not otherwise visible until a signature
+fails. A mismatch ends the stream, logged at <code>warn</code> with both digests: the one way to
+reach it in good faith is a blob schedule of ours that has fallen behind the
+network’s.</p>
+<h3 id="data-column-sidecars"><a class="header" href="#data-column-sidecars">Data column sidecars</a></h3>
+<p>Both protocols are registered <code>Full</code>, since with the columns on disk this node
+can serve every slot it has custodied:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Protocol</th><th>Served from</th></tr>
+</thead>
+<tbody>
+<tr><td><code>data_column_sidecars_by_root/1</code></td><td>a point lookup per identifier: the slot is recovered from <code>BlockHeaders</code> off the named root, then each requested column is read straight out of <code>Table::DataColumns</code></td></tr>
+<tr><td><code>data_column_sidecars_by_range/1</code></td><td>a prefix scan over the slot range, restricted to each slot’s canonical root (<code>BlockRoots</code>) and filtered to the requested columns</td></tr>
+</tbody>
+</table>
+</div>
+<p>Restricting the range answer to the canonical root matters because
+<code>Table::DataColumns</code> is never pruned and gossip only asks that a sidecar’s
+block name a known, finalized-descendant parent, not a canonical one: a live
+fork can leave both siblings’ columns stored at the same slot, and an
+unscoped scan would leak the losing side into every future range answer
+covering it.</p>
+<p>Both per-item lookups are lenient the way the block protocols are: a column
+this node never custodied, or a root it holds no header for, is left out of
+the answer rather than turned into an error, since the spec’s own words are
+“Clients MUST respond with at least one sidecar, if they have it.” A
+<code>data_column_sidecars_by_range/1</code> request starting before <code>Store::anchor_slot</code>
+gets <code>RESOURCE_UNAVAILABLE</code> instead of a merely-empty answer, the same
+distinction the block-range handler draws and for the same reason: an empty
+window this node’s canonical chain skipped is normal, but a window below where
+this node’s chain begins cannot be served from any point onward. That floor is
+the same value <code>Status</code> advertises as <code>earliest_available_slot</code>, so the refusal
+and the advertisement cannot disagree.
+<code>max_request_data_column_sidecars()</code> (<code>MAX_REQUEST_BLOCKS_DENEB * NUMBER_OF_COLUMNS</code>) bounds what one request may ask for; an answer over that
+is truncated, not refused, matching how the block protocols treat a peer
+built to an older, wider ceiling.</p>
+<p><em>Asking</em> happens on two paths, bulk and per block.</p>
+<p>The bulk one rides with range sync: every <code>BeaconBlocksByRange</code> batch sends a
+<code>data_column_sidecars_by_range/1</code> for the same slot span, covering this node’s
+whole custody set. The spec names this protocol for exactly that —
+“<code>DataColumnSidecarsByRange</code> is primarily used to sync data columns that may
+have been missed on gossip and to sync within the
+<code>MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS</code> window” — and it is what keeps a
+follower backfilling from a checkpoint anchor from needing the per-block path
+at all: the columns are normally already stored by the time their block reaches
+the availability gate. Nothing waits on the answer, so a short, empty or
+refused one costs nothing and is not retried; the per-block path is the
+backstop.</p>
+<p>Since the column request is aimed by custody, a batch reaching fulu is held
+back, blocks included, until every custody column has a known custodian among
+the connected peers. Lighthouse’s range sync holds its batches the same way.
+Right after startup, custody is known for almost no peer, since a peer’s
+custody arrives with its <code>metadata/3</code> answer after it connects. A mainnet
+follower’s first batch after a fresh checkpoint sync went out 5 s after
+startup with two peers and at most one known custodian per column, and 121 of
+the 122 holds it caused were missing every custody column. The
+batch is re-checked after every metadata answer and every <code>Status</code> answer, and
+it goes regardless once <code>RANGE_BATCH_CUSTODY_WAIT</code> has passed, because nothing
+here searches for a custodian of a specific column; past that deadline the
+uncovered columns go to a couple of peers whose custody is unknown, as before.</p>
+<p>The per-block one starts at <code>hold_block_for_columns</code>, called when a
+fulu block carrying commitments arrives short of the columns this node
+custodies for it. Import holds the block — it stays out of fork choice, but
+its header, body and proof are already written, the same way a block missing
+its parent is held. What happens next depends on the block’s age. A block
+still at or ahead of the current slot asks for nothing yet: its columns are
+published alongside it, so the rest are normally already in flight on gossip,
+and a peer asked at that moment usually does not have them either; on mainnet
+followers at the tip, gossip completed a held block within 0.3 s at p99. A
+block already older than the current slot has no such gossip left to race,
+since whatever delivered it did so long before this node held it, so it sends
+<code>data_column_sidecars_by_root/1</code> immediately instead: a range-synced catch-up
+hits this on every held block, and without it such a follower imported
+roughly one block per slot, waiting out the redrive below for a request
+gossip was never going to answer. Either way, <code>redrive_held_blocks</code> runs on
+every slot tick: for each block still held it sends the same request for
+exactly the columns still missing, with
+<code>MAX_FETCH_RETRIES</code> attempts and backoff doubling from <code>INITIAL_BACKOFF_MS</code>, a
+peer that has already failed this lookup excluded until the whole pool is
+exhausted. A lookup that runs out of peers or
+retries stops asking until the next tick asks again; see
+<code>lean_data_column_fetch_failures_total</code> in <a href="./metrics.html">metrics.md</a>. The
+block is released the moment its last missing column arrives, and dropped
+along with any pending descendants once finality passes its slot, whichever
+comes first — nothing else times out a hold, so a peer that claims commitments
+and never answers pins the block only until finality clears it, not
+indefinitely.</p>
+<p>Both asking paths aim per column rather than per peer. A peer’s custody set is
+a public function of its node id and its advertised custody group count, so
+this node computes it and sends each column to someone who actually holds it —
+the spec’s own observation that “due to the deterministic custody functions, a
+node knows exactly what a peer should be able to respond to”. The count comes
+from <code>metadata/3</code>, requested once per connection right behind <code>Status</code>, and is
+seeded from the ENR <code>cgc</code> for a peer this node dialed; a peer that has supplied
+neither is not assumed to custody anything, and the by-root path falls back to
+asking one at random for whatever no known custodian covers. At mainnet’s
+<code>CUSTODY_REQUIREMENT</code> a peer holds 8 of 128 columns, so this is the difference
+between a request that can be answered and one that usually cannot.</p>
+<p>What this node deliberately does not do with its own slice of the matrix: it
+does not run <code>compute_matrix</code> or <code>recover_matrix</code> to reconstruct the rest of a
+block’s data from it, since reconstruction needs half of
+<code>NUMBER_OF_CUSTODY_GROUPS</code> and this node never holds more than its own
+sampling size; and, over req/resp, it does not cross-seed a verified column to
+a peer that never asked for it: every sidecar this node sends over
+<code>data_column_sidecars_by_{root,range}</code> leaves in direct answer to that peer’s
+own request. Gossip is the one path where the same column <em>is</em> an
+unsolicited push by design: an Accept verdict (see <a href="#gossip">Gossip</a> above)
+both hands the sidecar to the chain actor and re-propagates it to every mesh
+peer, whether or not any of them asked for it.</p>
+<h3 id="what-is-not-wired-yet"><a class="header" href="#what-is-not-wired-yet">What is not wired yet</a></h3>
+<p>Serving both protocols is live, off the checkpoint-anchored store, and so is
+asking on both. A request
+that reaches a node whose data directory is <em>not</em> a beacon one is refused with
+<code>RESOURCE_UNAVAILABLE</code>, the spec’s own code for a peer “unable to reply to block
+requests”, where <code>INVALID_REQUEST</code> would blame the asker for a request that was
+fine. That guard is for a lean directory, not for the ordinary case.</p>
+<p><em>Asking</em> is now driven from two places. A peer’s <code>Status</code> starts a range
+session, which sends through <code>request_beacon_blocks_by_range</code>; and
+<code>Handler&lt;FetchBlock&gt;</code> reaches <code>request_beacon_block_by_root</code> through
+<code>fetch_block_from_peer</code>, which picks its protocol from the wire so a beacon
+node cannot put a lean-framed <code>BlocksByRoot</code> on its beacon streams.</p>
+<p>Both paths now import. A fetched block reaches the chain actor as
+<code>BlockSource::Sync</code>, keeping every per-block range and root check on the way in,
+and the by-root path is what resolves a gossiped block’s missing parent.</p>
+<p>Range sync is paced by <code>P2PServer::beacon_fetched_through</code>, the highest slot
+handed to the actor, not by the store’s head. Delivery is a message and import
+is work, so the store trails a delivered batch by the whole actor mailbox.
+Driven off the head, every resync tick re-requested the part still draining,
+which on the live follower meant 11,213 blocks off the wire to import 100, each
+duplicate paying a <code>hash_tree_root</code> before the store could reject it. Paced off
+the watermark, the ratio was 1.7:1.</p>
+<p>The watermark alone misses gossip, though. Only a range answer advances it, so a
+follower that had caught up and then imported from gossip kept it at its last
+range batch, and every peer that connected later was asked again for every block
+since: 748 blocks in 66 bursts on one follower. A <code>Status</code> answer is
+therefore measured against the higher of the watermark and the store’s head
+(<code>beacon_sync_target</code>). The head is a safe floor, since a head block’s whole
+ancestry is already imported.</p>
+<p><code>Status</code> is store-derived: head from <code>Store::beacon_head</code>, the finalized
+checkpoint from <code>Store::beacon_finalized_checkpoint</code>, and
+<code>earliest_available_slot</code> from the anchor’s own slot rather than
+<code>finalized_epoch * SLOTS_PER_EPOCH</code>, since this node keeps only the unfinalized
+window above its anchor and the epoch’s first slot is not necessarily one it
+holds. Naming that slot tells a peer not to ask for anything older; naming zero
+would claim genesis is in reach. There is one window where <code>beacon_head</code> answers
+<code>None</code>, between <code>init_beacon</code> seeding <code>KEY_HEAD</code> and fork choice inserting the
+block that root names, and every field but the fork digest falls back to zero
+there. That stays honest: lighthouse’s relevance check exempts a zero
+<code>finalized_root</code> from its finalized-root comparison, reading it as “this peer is
+syncing” rather than as a conflicting chain.</p>
+<h2 id="the-enr"><a class="header" href="#the-enr">The ENR</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Entry</th><th>Value</th></tr>
+</thead>
+<tbody>
+<tr><td><code>eth2</code></td><td>the computed <code>ENRForkID</code></td></tr>
+<tr><td><code>attnets</code></td><td>64 bits, with this node’s <code>SUBNETS_PER_NODE</code> backbone subnets set</td></tr>
+<tr><td><code>cgc</code></td><td><code>CUSTODY_REQUIREMENT</code></td></tr>
+<tr><td><code>quic</code></td><td><code>--gossipsub-port</code></td></tr>
+<tr><td><code>tcp</code></td><td><code>--gossipsub-port</code>, the same number: TCP and UDP are separate namespaces</td></tr>
+<tr><td><code>udp</code></td><td><code>--discovery.port</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Two of these advertise less, or more, than they look like:</p>
+<ul>
+<li><code>attnets</code> names exactly the subnets this node subscribed to, which is the
+only honest value: claiming one it does not serve earns peer-score penalties
+for silence there, and claiming none while serving two loses the peers
+looking for precisely that. It used to be all-unset, which was honest while
+this node held no subscription at all.</li>
+<li><code>cgc</code> advertises <code>CUSTODY_REQUIREMENT</code>, the floor below which peers may
+reject a record outright, not <code>sampling_size(CUSTODY_REQUIREMENT)</code>, the
+larger number of columns this node actually custodies, stores and serves
+(see <a href="#data-column-sidecars">Data column sidecars</a>). That undersells rather
+than oversells: a request for more than <code>cgc</code>’s worth of columns still
+succeeds, since this node holds every column its own node id assigned it at
+the sampling size, not merely <code>cgc</code>’s worth.</li>
+</ul>
+<p>The <code>tcp</code> entry is what makes us discoverable in return: lighthouse’s discovery
+predicate requires <code>enr.tcp4().is_some() || enr.tcp6().is_some()</code> and applies it
+as a query filter, so a <code>quic</code>-only record is invisible to it.</p>
+<h2 id="metrics"><a class="header" href="#metrics">Metrics</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_gossip_messages_total{topic,result}</code></td><td>Gossip received, by topic and by <code>decoded</code> / <code>decode_failed</code> / <code>decompress_failed</code></td></tr>
+<tr><td><code>lean_beacon_gossip_validation_total{kind,outcome,reason}</code></td><td>Gossip verdicts, now including <code>beacon_aggregate_and_proof</code> and <code>beacon_attestation</code>; see <a href="./metrics.html#beacon-gossip-validation">metrics.md</a></td></tr>
+<tr><td><code>lean_beacon_gossip_verdict_expired_total{kind}</code></td><td>Verdicts that came too late to propagate anything; should stay at zero</td></tr>
+<tr><td><code>lean_beacon_status_digest_mismatch_total</code></td><td>Handshakes seen from another fork digest</td></tr>
+<tr><td><code>lean_beacon_fork_digest{digest}</code></td><td>The digest computed at startup, as a label</td></tr>
+<tr><td><code>lean_beacon_aggregate_decode_seconds</code></td><td>Time spent decoding one aggregate off the wire</td></tr>
+<tr><td><code>lean_beacon_aggregate_mailbox_wait_seconds</code></td><td>How long an aggregate sat in the chain actor’s mailbox</td></tr>
+<tr><td><code>lean_beacon_aggregate_processing_seconds</code></td><td>Time the chain actor spent applying one already-verified aggregate</td></tr>
+<tr><td><code>lean_beacon_aggregate_end_to_end_seconds</code></td><td>Wire to fork choice, for aggregates applied on arrival</td></tr>
+<tr><td><code>lean_beacon_aggregate_total{outcome}</code></td><td>Aggregates by <code>applied</code>, <code>invalid</code>, <code>known_subset</code> or <code>queue_full</code></td></tr>
+<tr><td><code>lean_beacon_aggregates_deferred</code></td><td>Aggregates held until their own slot has passed</td></tr>
+</tbody>
+</table>
+</div>
+<p>The four aggregate histograms no longer cover what they used to: gossip
+validation (committees, all three signatures, the seen caches) runs in p2p now
+and is folded into <code>lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}</code>
+instead. <code>decode</code> is p2p’s own decode step; the other three, all in
+<code>ethlambda-blockchain</code>, now measure only <code>apply_verified_aggregate</code> and the
+actor’s applied-bits gate, which is why <code>processing</code> reads far lower than it
+used to. <code>mailbox_wait</code> is still the one that cannot be derived any other way,
+and it is still the failure mode this path introduces: roughly a thousand
+aggregates a slot (verified ones only, now) queueing behind block imports arrive too
+late to move the head while every other timing still looks healthy.</p>
+<p>The <code>lean_</code> prefix is the repo-wide convention and applies here too. Data
+column sidecar metrics (<code>lean_data_columns_stored_total</code>,
+<code>lean_data_columns_rejected_total</code>, <code>lean_data_column_kzg_verify_seconds</code>,
+<code>lean_data_column_fetch_failures_total</code>, <code>lean_blocks_held_for_columns</code>) and
+the disk-growth gauge for
+<code>Table::DataColumns</code> (<code>lean_table_bytes{table="data_columns"}</code>) are documented
+in full in <a href="./metrics.html">metrics.md</a> rather than repeated here.</p>
+<p><code>ethlambda beacon</code> serves these on <code>--metrics-port</code>, alongside <code>/health</code> and
+the <code>/debug/pprof</code> heap-profiling routes, through the same <code>start_rpc_server</code>
+entry point <code>ethlambda node</code> uses: one HTTP call site in <code>run_node</code> serves both
+chains. It also binds <code>--api-port</code> and mounts the <code>/lean/v0</code> API, off the empty
+in-memory <code>Store</code> and the default <code>AggregatorController</code>, <code>SyncStatusController</code>
+and <code>EventBus</code> this startup path hands it. Those routes answer for a chain that
+is not running; treat <code>/metrics</code> as the only meaningful HTTP surface of a
+<code>beacon</code> run until the follower gets an API of its own.</p>
+<h2 id="checking-it-against-the-live-network"><a class="header" href="#checking-it-against-the-live-network">Checking it against the live network</a></h2>
+<p>No unit test can assert “peers with mainnet”, so this is the procedure.</p>
+<pre><code class="language-bash">openssl rand -hex 32 &gt; /tmp/beacon-node-key
+RUST_LOG=info,ethlambda_p2p=debug \
+cargo run --profile release-fast -p ethlambda --bin ethlambda -- beacon \
+  --node-key /tmp/beacon-node-key \
+  --gossipsub-port 9001
+</code></pre>
+<p>Within 5 seconds:</p>
+<pre><code>Derived the mainnet wire parameters  genesis_time=1606824023 genesis_validators_root=0x4b363db9… epoch=… fork=fulu fork_digest=8c9f62fe
+No fork or blob-schedule boundary is scheduled
+Custodying data columns  columns=[…]
+Backboning attestation subnets  subnets_per_node=2 subnets=[…]
+Advertising cgc=4 while subscribing to no sync committee subnet, and publishing nothing
+Beacon P2P node started  socket=0.0.0.0:9001 fork_digest=8c9f62fe topics=17 columns=8 attestation_subnets=[…]
+HTTP server listening  addr=127.0.0.1:5054
+Starting discv5 discovery  discovery_addr=0.0.0.0:9002 seeds=17 total_bootnodes=17
+Local ENR  enr=enr:-…
+</code></pre>
+<p>The <code>Advertising cgc=…</code> line names what is still true: this node subscribes to
+no sync-committee subnet and publishes nothing of its own. Storing and serving
+the columns it custodies (see <a href="#data-column-sidecars">Data column
+sidecars</a>) is no longer part of that gap, and neither is
+the attestation subnet backbone.</p>
+<p><code>seeds=17</code> proves the built-in list parsed; a lower number means a bootnode
+ENR was skipped with a warning. <code>topics=17</code> proves the subscription set: the 7
+global topics, the 8 column subnets this run’s (randomly generated) node id
+selected, and the 2 attestation subnets the same id selected; <code>columns=8</code> and
+<code>attestation_subnets=[…]</code> confirm the two families directly.</p>
+<p>Within 30 seconds:</p>
+<pre><code>External IP detected via PONG voting, updating local ENR  old_ip=0.0.0.0 new_ip=…
+Beacon block decoded  slot=… proposer=… fork=fulu block_root=… bytes=…
+Beacon aggregate attestation decoded  slot=… aggregator=… attesters=… target_epoch=… target_root=… bytes=…
+</code></pre>
+<p>A measured run on 2026-08-31, from a laptop behind NAT with no port forwarding,
+reached its first decoded block 16 seconds after start and its first aggregate
+at 24 seconds, then took a block every slot. <code>bytes</code> on mainnet is typically
+100 KB to 310 KB for a block and about 500 for an aggregate, and <code>attesters</code>
+sits in the low hundreds. Peer lifecycle lines (<code>Peer connected</code>, <code>Beacon handshake complete</code>) are at <code>trace</code>: at mainnet peer counts they are what
+drowned the log, so raise the level to see them.</p>
+<p>What each failure looks like:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Symptom</th><th>Cause</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Peer said goodbye reason=129</code> right after a connection</td><td>nothing local: 129 is lighthouse’s <code>TooManyPeers</code></td></tr>
+<tr><td><code>fork_digest</code> is not what a live crawl reports</td><td>the blob-schedule branch, or the schedule itself</td></tr>
+<tr><td>connections but no <code>Beacon handshake complete</code></td><td>the <code>Status</code> encoding, or answering the wrong version</td></tr>
+<tr><td><code>Handshake answered from another fork digest</code></td><td>the digest</td></tr>
+<tr><td><code>Beacon gossip decode failed</code> for <code>beacon_block</code></td><td>the fork selection or the slot offset</td></tr>
+<tr><td>the same for <code>beacon_aggregate_and_proof</code> alone</td><td>the electra boundary in <code>decode_gossip</code>; the block path is fine</td></tr>
+<tr><td>connected peers above zero, no gossip at all</td><td>the topic hash: almost always the digest’s hex formatting or <code>compute_message_id</code></td></tr>
+<tr><td>every candidate rejected as <code>missing or undecodable eth2 entry</code></td><td>see below</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="both-transports-not-just-quic"><a class="header" href="#both-transports-not-just-quic">Both transports, not just QUIC</a></h3>
+<p>ethlambda used to dial QUIC only, against the <code>quic</code> port a peer’s ENR
+advertises. Most mainnet beacon nodes are reachable over TCP and advertise a
+<code>quic</code> entry that does not answer, either because the node is behind a NAT that
+forwards only TCP or because QUIC is disabled behind an advertised port. The
+result was a long run of <code>Handshake with the remote timed out</code> against otherwise
+valid, correctly admitted peers.</p>
+<p>The node now listens on and dials both transports, and admission accepts a peer
+advertising either, so a dead <code>quic</code> entry falls back to TCP within the same
+dial rather than ending it. The TCP transport offers mplex alongside yamux
+because mainnet peers answer <code>na</code> to a yamux-only proposal; see the <code>muxers</code>
+module in <code>crates/net/p2p/src/lib.rs</code> for that measurement.</p>
+<p>A node behind NAT with no inbound UDP can only ever be the dialer, and peers
+fill up: expect to wait for a peer that stays, and expect a first connection to
+be refused with a <code>Goodbye</code>.</p>
+<p>A run where discv5 finds contacts but every one is rejected for a missing <code>eth2</code>
+entry means the records reaching the dial loop are not the ones the peers
+published. discv5 hands back a full <code>NodeRecord</code> per NODES response, so an
+<code>eth2</code> entry that was there on the wire and absent here is a record-plumbing
+problem in the discovery layer rather than anything in <code>admit</code>, which is
+covered by unit tests against records carrying every entry. Bootnode records are
+a poor control: mainnet’s advertise the phase0 digest and are <em>supposed</em> to be
+rejected, just as <code>fork digest mismatch</code> rather than as <code>missing</code>.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="beacon_stf.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="beacon_engine.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="beacon_stf.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="beacon_engine.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

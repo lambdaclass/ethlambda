@@ -1,0 +1,737 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Beacon Chain State Transition - ethlambda</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Minimalist, fast and modular implementation of the Lean Ethereum client written in Rust">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="favicon-4829553b.svg">
+        <link rel="stylesheet" href="css/variables-8adf115d.css">
+        <link rel="stylesheet" href="css/general-2459343d.css">
+        <link rel="stylesheet" href="css/chrome-ae938929.css">
+        <link rel="stylesheet" href="css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="toc-34fa44cf.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">ethlambda</h1>
+
+                    <div class="right-buttons">
+                        <a href="print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/lambdaclass/ethlambda/edit/main/docs/beacon_stf.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="beacon-chain-state-transition"><a class="header" href="#beacon-chain-state-transition">Beacon Chain state transition</a></h1>
+<p>The <code>beacon</code> module of <code>ethlambda-state-transition</code>
+(<code>crates/blockchain/state_transition/src/beacon/</code>) implements the Ethereum
+<strong>Beacon Chain</strong> consensus specification,
+<a href="https://github.com/ethereum/consensus-specs"><code>ethereum/consensus-specs</code></a>, phase0 through fulu.</p>
+<p>This is not the Lean consensus protocol the rest of the crate implements. The two
+sit in one crate for the reason their types sit in one crate: a caller
+dispatching on a state’s fork can then reach either chain’s rules without the two
+living in separate dependency trees. They share nothing else. Nothing above
+<code>beacon</code> in this crate reads anything inside it, and nothing inside it reads
+lean’s own modules.</p>
+<p>The containers, presets, configuration and primitives this module transitions are
+in <code>ethlambda-types</code>, under its own <code>beacon</code> namespace, because
+<code>ethlambda-storage</code> and the networking crates need those types and must not
+depend on <code>blst</code> and <code>c-kzg</code>. What lives here is the behavior: the state
+transition, the fork choice store, the helpers, and the two cryptography modules.</p>
+<p><code>blst</code>, <code>c-kzg</code> and <code>num-bigint</code> are therefore on the lean binary’s dependency
+path, since <code>ethlambda-blockchain</code>, <code>ethlambda-rpc</code> and <code>ethlambda-test-fixtures</code>
+all depend on this crate. The module is not feature-gated; that is the accepted
+cost of holding both chains’ rules in one place.</p>
+<p>The types are re-exported at the paths they had when they were defined here, so
+<code>crate::beacon::containers</code>, <code>crate::beacon::preset</code> and <code>crate::beacon::config</code>
+still resolve, and
+<code>ethlambda_state_transition::beacon::containers::X</code> and
+<code>ethlambda_types::beacon::containers::X</code>
+are one type by one name. Two definitions travel in the other direction, for the
+same reason they moved: <code>fork_choice</code> re-exports <code>LatestMessage</code> and <code>PowBlock</code>,
+which <code>ethlambda-storage</code> persists, and <code>helpers::misc</code> re-exports
+<code>compute_fork_data_root</code>, which the networking crate’s fork digest is built on.</p>
+<p>One consequence reaches every match in the module. <code>ethlambda-types</code> gives
+<code>BeaconState</code> and <code>ForkName</code> a <code>Lean</code> variant, so that one state type can carry
+either chain, and every match on either needs an arm for it. No lean value can
+reach this module: a fixture case’s fork is parsed from a directory name and
+<code>ForkName::ALL</code> has no lean entry, and a beacon block or a deposit set produces a
+beacon state. So those arms panic and name themselves, through
+<code>lean_state_unreachable</code>/<code>lean_fork_unreachable</code> (<code>src/beacon/lean_boundary.rs</code>) and
+<code>lean_is_not_a_fixture_fork</code> in the spec tests, rather than widening signatures to
+a <code>Result</code> no correct caller could ever see. They are named arms rather than a
+catch-all <code>_</code>, so a real fork added to the enum still breaks every match that has
+to grow an arm for it.</p>
+<p>Correctness is defined by the released spec test fixtures, pinned in the
+<code>Makefile</code>.</p>
+<h2 id="running-the-tests"><a class="header" href="#running-the-tests">Running the tests</a></h2>
+<pre><code class="language-bash">make consensus-spec-tests   # download the fixture tarballs (about 2.2 GB)
+make test-beacon            # build and test once per preset
+</code></pre>
+<p><code>make test-beacon</code> is the two per-preset targets, <code>test-beacon-mainnet</code> and
+<code>test-beacon-minimal</code>, run one after the other. Either can be run on its own,
+which is what CI does: the presets get a job each, so the two build and run
+concurrently instead of end to end.</p>
+<p>A run reads its own preset’s tree plus <code>general</code>, the preset-independent BLS and
+KZG vectors, and opens nothing else. <code>CONSENSUS_SPEC_TESTS_CONFIGS</code> narrows the
+download to that, and CI sets it, which takes roughly 1.25 GB of tarballs down to
+0.8 GB for mainnet and 0.6 GB for minimal. Locally the default fetches all three,
+so both presets can be run without re-downloading.</p>
+<p>The download is stamped with the release it came from and the configs it holds
+(<code>consensus-spec-tests/.version-&lt;version&gt;-&lt;configs&gt;</code>), so changing either wipes
+the tree and fetches afresh. Without the version in that name a bump would be a
+silent no-op: the extracted directories already exist, so <code>make</code> would consider
+them current and both presets would report green against the old fixtures.
+Without the configs, a narrowed download would mark a tree missing one preset as
+complete, and that preset’s next run would fail on a missing directory rather
+than fetching what it needs. The wipe matters as much as the re-download, since
+the tarballs unpack side by side into one directory, and layering a new release
+over an old one would keep cases the new one deleted.</p>
+<p><code>make test</code> covers the whole workspace, in two halves, and still needs no
+fixture download. The halves are all that <code>test-node</code>’s <code>--exclude</code> flags do;
+nothing is dropped to keep the beacon suite out. Two gates keep it that way,
+both tied to the <code>beacon-spec-tests</code> feature that <code>make test-beacon</code> turns on:</p>
+<ul>
+<li>The <code>beacon_spec_tests</code> target declares <code>required-features = ["beacon-spec-tests"]</code>, so <code>cargo test</code> skips building it entirely.</li>
+<li>The BLS and KZG fixture vectors are unit tests inside the module, which no
+target gate reaches, so each carries
+<code>#[cfg_attr(not(feature = "beacon-spec-tests"), ignore = ...)]</code>. They report as
+ignored rather than disappearing, which is why <code>make test-beacon</code> also passes
+<code>--lib</code>: 15 tests would otherwise never run.</li>
+</ul>
+<p>Neither gate touches the module itself, which always compiles. What they stand
+for is the fixture tree, not the code.</p>
+<h2 id="layout"><a class="header" href="#layout">Layout</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Module</th><th>Holds</th></tr>
+</thead>
+<tbody>
+<tr><td><code>preset</code></td><td>Compile-time constants, mainnet or minimal</td></tr>
+<tr><td><code>config</code></td><td>Runtime configuration: fork schedule, churn limits, blob schedule</td></tr>
+<tr><td><code>constants</code></td><td>Values the spec fixes outright: domain types, flag weights, sentinels</td></tr>
+<tr><td><code>fork</code></td><td><code>ForkName</code>, ordered oldest to newest</td></tr>
+<tr><td><code>primitives</code></td><td>Scalar aliases, <code>Root</code>, and the fixed-length byte strings</td></tr>
+<tr><td><code>bls</code></td><td>BLS12-381 via <code>blst</code></td></tr>
+<tr><td><code>kzg</code></td><td>KZG via <code>c-kzg</code>, plus the two challenge functions c-kzg does not export</td></tr>
+<tr><td><code>containers</code></td><td>The <code>BeaconState</code> enum, fork-invariant containers, per-fork containers</td></tr>
+<tr><td><code>helpers</code></td><td>The spec’s helper functions</td></tr>
+<tr><td><code>stf</code></td><td>The state transition: slots, blocks, operations, epoch processing</td></tr>
+<tr><td><code>genesis</code></td><td>Building a genesis state from Eth1 deposits</td></tr>
+<tr><td><code>upgrade</code></td><td>Fork upgrades between per-fork state shapes</td></tr>
+<tr><td><code>fork_choice</code></td><td>The LMD GHOST store</td></tr>
+<tr><td><code>lean_boundary</code></td><td>The two <code>#[track_caller]</code> panics for the <code>Lean</code> arm of the shared enums</td></tr>
+</tbody>
+</table>
+</div>
+<p>The first five come from <code>ethlambda_types::beacon</code> and are re-exported by
+<code>beacon/mod.rs</code>; the rest are defined here.</p>
+<h2 id="three-kinds-of-parameter"><a class="header" href="#three-kinds-of-parameter">Three kinds of parameter</a></h2>
+<p>The specification distinguishes constants, presets, and configuration, and so
+does this module, because they have genuinely different lifetimes.</p>
+<p><strong>Presets</strong> (<code>preset</code>) set container sizes, so they must be compile-time
+constants: <code>SszVector&lt;Root, { preset::SLOTS_PER_HISTORICAL_ROOT }&gt;</code>. The preset
+therefore cannot be a runtime value or a type parameter. Stable Rust cannot take a
+const-generic argument from a trait’s associated const, so the preset is selected
+by Cargo feature: mainnet by default, minimal with <code>preset-minimal</code>. The test
+target builds the crate twice and each run walks only its own fixture tree.</p>
+<p><strong>Configuration</strong> (<code>config</code>) is runtime, because the <code>transition</code> fixture suite
+moves a fork’s activation epoch per test case. That is the concrete reason fork
+scheduling is not a preset.</p>
+<p><strong>Constants</strong> (<code>constants</code>) are fixed by the specification and vary by neither.</p>
+<h2 id="retuning-a-value-without-redefining-a-function"><a class="header" href="#retuning-a-value-without-redefining-a-function">Retuning a value without redefining a function</a></h2>
+<p>The specification expresses a retuned constant as a fresh name per fork
+(<code>MIN_SLASHING_PENALTY_QUOTIENT</code>, then <code>..._ALTAIR</code>, then <code>..._BELLATRIX</code>) and
+redefines the function that reads it, so each fork carries its own copy of
+that function differing in one identifier. <code>preset::retuned</code>
+(<code>crates/common/types/src/beacon/preset.rs</code>, reached here as <code>crate::preset</code>)
+selects the value by fork instead, in four functions, so <code>slash_validator</code> and its neighbors stay a single copy each
+rather than one per fork.</p>
+<p>This is the one place in the crate where a preset value is chosen at runtime.
+It is sound because none of these values bound a container: they are divisors
+and multipliers in balance arithmetic, not container shape.</p>
+<p>The minimal preset is <strong>not</strong> a uniformly scaled mainnet: it overrides only
+<em>phase0’s</em> retuned values and inherits every later fork’s from mainnet
+unchanged. So a value can move one way across a fork boundary under mainnet
+and the other way under minimal: <code>INACTIVITY_PENALTY_QUOTIENT</code> falls from
+phase0 to altair under mainnet and rises under minimal. A test asserting that
+slashing gets uniformly harsher across the forks holds under mainnet and is
+false under minimal, so <code>preset::retuned</code>’s own tests pin the fork-to-constant
+mapping directly, which holds under both presets, rather than any numeric
+relationship, which does not.</p>
+<h2 id="how-forks-are-represented"><a class="header" href="#how-forks-are-represented">How forks are represented</a></h2>
+<p>Containers that change between forks are defined once per fork as plain structs
+that derive their SSZ encoding, decoding, and merkleization, and an enum wraps
+them:</p>
+<pre class="playground"><code class="language-rust edition2024"><span class="boring">#![allow(unused)]
+</span><span class="boring">fn main() {
+</span>pub enum BeaconState {
+    Phase0(phase0::BeaconState),
+    // one variant per fork that changes the state's shape
+}
+<span class="boring">}</span></code></pre>
+<p>Deriving the SSZ traits is the whole reason for that shape. Container
+serialization and merkleization is the highest-risk code in the crate, and the
+per-fork field lists are not a growing tail:</p>
+<ul>
+<li><code>previous_epoch_attestations</code> and <code>current_epoch_attestations</code> exist <strong>only</strong> in
+phase0. From altair on they are absent from both the encoding and the merkle
+tree, replaced in position by <code>previous_epoch_participation</code> and
+<code>current_epoch_participation</code>, which have a different type.</li>
+<li><code>latest_execution_payload_header</code> keeps its name from bellatrix on, but is a
+different container only in bellatrix, capella, and deneb; electra and fulu
+reuse deneb’s shape unchanged.</li>
+<li>The field count crosses a power of two at electra, so the state’s merkle tree is
+five levels deep through deneb and six from electra on. The same logical field
+has a different generalized index in different forks.</li>
+<li><code>SignedBeaconBlock::Fulu</code> wraps <code>electra::SignedBeaconBlock</code> rather than a
+<code>fulu</code> type of its own, since fulu changes no field of a block. It still
+needs to be its own variant: fulu changes how a block is <em>processed</em>, since
+the blob commitment limit becomes epoch-dependent, so code that dispatches
+on fork still has to tell a fulu block from an electra one even though both
+carry the identical payload.</li>
+</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Fork</th><th>State fields</th><th>HTR leaves</th><th>Depth</th></tr>
+</thead>
+<tbody>
+<tr><td>phase0</td><td>21</td><td>32</td><td>5</td></tr>
+<tr><td>altair</td><td>24</td><td>32</td><td>5</td></tr>
+<tr><td>bellatrix</td><td>25</td><td>32</td><td>5</td></tr>
+<tr><td>capella, deneb</td><td>28</td><td>32</td><td>5</td></tr>
+<tr><td>electra</td><td>37</td><td>64</td><td>6</td></tr>
+<tr><td>fulu</td><td>38</td><td>64</td><td>6</td></tr>
+</tbody>
+</table>
+</div>
+<p>A single container with fork-conditional serialization would have to reproduce all
+of that by hand. Derived codecs get it from the struct definition, which is
+checked field by field against the spec text and then verified by <code>ssz_static</code>.</p>
+<p>Since SSZ carries no type tag, the fork cannot be recovered from the bytes, so
+decoding takes it from context: <code>BeaconState::from_ssz(fork, bytes)</code>.</p>
+<h3 id="not-duplicating-the-state-transition-seven-times"><a class="header" href="#not-duplicating-the-state-transition-seven-times">Not duplicating the state transition seven times</a></h3>
+<p>The cost of per-fork structs is that a naive implementation would copy every
+function once per fork. Two things prevent that:</p>
+<ol>
+<li>
+<p><strong>Accessors for the fork-invariant fields.</strong> About twenty of the state’s fields
+are identical in every fork. One <code>macro_rules!</code> in <code>containers/mod.rs</code>
+generates their read and write accessors from a single list, and that list
+doubles as the crate’s statement of which fields are fork-invariant: a fork
+that changes one moves it out of the list and gains an explicit match at each
+use site.</p>
+</li>
+<li>
+<p><strong>Matching only where the spec diverges.</strong> Functions take the enum and use
+accessors, matching on the fork only where the specification itself changes
+behavior, so a match arm can be reviewed against the spec’s own diff.</p>
+</li>
+</ol>
+<h3 id="no-block-body-enum"><a class="header" href="#no-block-body-enum">No block-body enum</a></h3>
+<p><code>BeaconState</code> and <code>SignedBeaconBlock</code> are the only enums; there is no
+<code>BeaconBlockBody</code> enum or a body trait. Such a type would have to grow a
+method or match arm per fork-specific field or operation list, which defeats
+the point of dispatching once: a caller of <code>body.attester_slashings()</code> would
+still have to know which fork it is dealing with to make sense of what comes
+back, since electra’s attester slashings are not phase0’s. What actually lets
+one function serve every fork is narrower and cheaper: <code>process_block_header</code>,
+<code>process_randao</code>, and <code>process_eth1_data</code> each take the handful of fields they
+read directly, rather than a whole body, so validating a header does not care
+whether the body it came from also carries a sync aggregate or an execution
+payload. A shared step earns its genericity by needing less, not by being
+handed a bigger abstraction to see through. See <code>stf/mod.rs</code>’s module doc for
+the full reasoning.</p>
+<h3 id="crossing-a-fork-boundary"><a class="header" href="#crossing-a-fork-boundary">Crossing a fork boundary</a></h3>
+<p><code>process_slots</code> performs the fork-boundary state upgrade itself, inside its
+slot loop, at the first slot of the activation epoch, looping again in case a
+single configuration activates two forks at the same epoch. <code>state_transition</code>
+checks the block’s fork against the state’s own only <em>after</em> calling
+<code>process_slots</code>, not before: a block at the first slot of an activation epoch
+is legitimately post-fork shaped while the state arriving there is still
+pre-fork, which is exactly what a fork transition consists of. Checking first
+would reject every legitimate fork-boundary block and make crossing a fork
+impossible.</p>
+<h2 id="registry-and-balances"><a class="header" href="#registry-and-balances">Registry and balances</a></h2>
+<p><code>validators</code> and <code>balances</code> hold one entry per validator, about 2.4M on
+mainnet, so they dominate both the cost of a state root and the memory of every
+cached state. They are <code>ethlambda_ssz_tree::List</code>s rather than <code>SszList</code>s:
+persistent Merkle trees in the shape of the SSZ one, modeled on the <code>milhouse</code>
+lists lighthouse keeps its state in.</p>
+<ul>
+<li><strong>Nodes cache their hash, and states share nodes.</strong> A state derived from
+another shares every subtree the block did not touch through <code>Arc</code>, and its
+root rehashes only the touched paths. A state decoded from storage is rebased
+onto a cached relative, so it shares memory with it too.</li>
+<li><strong>Leaves and inner nodes are page-sized.</strong> A leaf holds a contiguous run of
+elements (32 validators, 512 balances), and an inner node up to 512 child
+pointers standing for nine binary levels at once. A lookup therefore crosses
+a handful of nodes rather than one per level of the registry’s depth, and
+iteration walks each leaf as a slice. A composite leaf also keeps each
+element’s root once hashed, and a rebuilt leaf carries over the roots of the
+elements it did not change, so one changed validator costs one validator
+hash plus a fold of the cached roots.</li>
+<li><strong>Writes are buffered.</strong> <code>get_mut</code>, <code>IndexMut</code> and <code>push</code> record the new
+value; <code>BeaconState::apply_pending_mutations</code> folds everything buffered into
+the trees in one pass. The state transition calls it at the top of
+<code>process_slot</code>, after <code>process_block</code>, and at the end of <code>process_slots</code> (epoch
+processing runs after the loop’s last <code>process_slot</code>). A root taken with
+writes pending is still correct but computed on a throwaway copy, and the
+store flushes a state before caching it, since a shared <code>Arc</code> cannot be
+flushed later.</li>
+</ul>
+<p>The access pattern matters. <code>state.validator(i)</code> and <code>balances()[i]</code> are tree
+descents, cheap next to a hash but far from an array index, and they add up
+when a helper calls them once per validator:
+<code>get_total_active_balance</code> builds the active-index <code>Vec</code> and then reads every
+index back, and runs several times per block (once per attestation through
+<code>get_base_reward_per_increment</code>, once per execution request through the churn
+limits). In the 2026-09-28 import profile, those per-index reads and the
+repeated whole-registry scans were the largest cost left after hashing. A loop
+over the registry should walk <code>validators().iter()</code>, zipped with
+<code>balances().iter()</code> where it needs both. The total active balance is the obvious
+candidate for computing once per epoch rather than per call, once it is shown
+that no block operation changes it mid-epoch.</p>
+<h2 id="macros-and-traits"><a class="header" href="#macros-and-traits">Macros and traits</a></h2>
+<p>Two <code>macro_rules!</code> in the whole crate, both local, both replacing boilerplate that
+would otherwise run to hundreds of near-identical lines: the fixed-length byte
+strings in <code>primitives</code>, and the state accessors in <code>containers</code>. No procedural
+macros beyond the SSZ derives, and no trait abstracting over BLS or KZG backends.</p>
+<h2 id="cryptography"><a class="header" href="#cryptography">Cryptography</a></h2>
+<p><code>bls</code> wraps <code>blst</code>, and <code>kzg</code> wraps <code>c-kzg</code> with the <code>eip-7594</code> cell and column
+functions fulu needs, both matching the versions ethrex uses.</p>
+<p>Two details worth knowing:</p>
+<ul>
+<li>Every BLS function re-validates its inputs on each call rather than trusting a
+wrapper validated once. <code>BlsPubkey</code> is deliberately unvalidated on construction,
+because deposit processing has to be able to hold a key that never validates, so
+nothing upstream guarantees a key is a subgroup-correct point.</li>
+<li><code>compute_challenge</code> and <code>compute_verify_cell_kzg_proof_batch_challenge</code> are
+implemented directly from the spec rather than called, because c-kzg keeps them
+as private steps of its own proof routines yet both have their own fixture
+handlers.</li>
+</ul>
+<h2 id="fixture-suites"><a class="header" href="#fixture-suites">Fixture suites</a></h2>
+<p><code>consensus-spec-tests/tests/&lt;config&gt;/&lt;fork&gt;/&lt;runner&gt;/&lt;handler&gt;/&lt;suite&gt;/&lt;case&gt;/</code>,
+where <code>&lt;config&gt;</code> is <code>general</code> for the configuration-independent suites and the
+preset name otherwise. Container files are <code>.ssz_snappy</code>: SSZ compressed with
+<em>raw</em> snappy, not the framed format.</p>
+<p>Runners discover their cases from disk rather than listing them, so a fixture
+release that adds cases needs no code change. Two properties are deliberate: a
+suite that matches no case <strong>fails</strong> rather than reporting green, and a container
+or fork pair with no implementation yet is counted and printed rather than passed
+over silently, so the output never implies more coverage than exists.</p>
+<p><code>value.yaml</code> goes unread in <code>ssz_static</code>. Using it would need a serde
+implementation for every container and would pin down nothing that the serialized
+bytes and expected root do not already.</p>
+<h2 id="performance"><a class="header" href="#performance">Performance</a></h2>
+<p>The mainnet spec suite went from 1576s to about 106s. Two causes:</p>
+<ol>
+<li><code>sha2</code>’s <code>asm</code> feature selects the CPU’s SHA-256 instructions. Without it,
+<code>sha2</code> compiles the portable scalar backend on aarch64 regardless of what
+the CPU supports, and merkleization is almost entirely SHA-256
+compressions, so a spec fixture case running two whole-state
+merkleizations feels the difference more than anything else does.</li>
+<li>Every fixture case is its own test, so the harness runs them concurrently at
+one case per work item. That is finer-grained than a suite-per-test layout
+could balance, where the slowest suite alone set the wall clock.</li>
+</ol>
+<p>CPU time and wall clock separate the two cleanly, since running work in
+parallel cannot reduce the total CPU time it takes:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Measure</th><th>Before</th><th>After</th><th>Factor</th></tr>
+</thead>
+<tbody>
+<tr><td>CPU time</td><td>3041s</td><td>928s</td><td>3.3x, the hardware SHA-256</td></tr>
+<tr><td>Wall clock</td><td>1576s</td><td>106s</td><td>14.9x, both causes together</td></tr>
+</tbody>
+</table>
+</div>
+<p>So parallelism accounts for the remaining 4.9x, taking the run from two of
+eleven cores busy to about eight. The 3.3x understates the hashing change,
+because the later run does strictly more work: <code>transition</code> went from failing
+immediately to running every case.</p>
+<h2 id="one-test-per-fixture-case"><a class="header" href="#one-test-per-fixture-case">One test per fixture case</a></h2>
+<p>The suites were once one test apiece, each looping over its own cases and
+aggregating outcomes. That made every failure a failure of the whole suite: the
+name in the output was the suite’s, and a single bad case marked thousands of
+passing ones as part of one failed test.</p>
+<p>A fixture case is not known until the fixture tree is walked, and <code>#[test]</code>
+needs its tests at compile time, so the spec binary supplies its own harness
+(<code>harness = false</code>, with <code>libtest_mimic</code>) and builds its test list at run time.
+Each case is then named, counted, filtered, and attributed on its own, and
+<code>--test-threads</code>, <code>--ignored</code>, <code>--list</code>, and substring filters all keep working.
+A filter selects a whole suite as readily as one case, since a test’s name is
+its runner followed by <code>Case::id</code>:</p>
+<pre><code class="language-text">operations/electra/attester_slashing/pyspec_tests/basic_double
+</code></pre>
+<p>Two things that arrangement has to be careful about:</p>
+<ul>
+<li>A case whose fork this module does not implement becomes an <strong>ignored</strong> test
+rather than a missing one. The harness counts and names ignored tests, which
+says more than the tally the old aggregate printed.</li>
+<li>A suite that matches no case at all would otherwise contribute no tests, and a
+run of nothing passes. The aggregate used to assert it had matched something;
+that check survives as one <code>&lt;runner&gt;/matched_fixture_cases</code> test per suite, so
+a stale runner or handler name still fails loudly.</li>
+</ul>
+<h2 id="status"><a class="header" href="#status">Status</a></h2>
+<p>All seven forks, phase0 through fulu, have containers, fork upgrades, state
+transitions, and epoch processing. Every fixture case passes on both presets:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Preset</th><th>Fixture cases</th><th>Ignored</th><th>Lib tests</th></tr>
+</thead>
+<tbody>
+<tr><td>mainnet</td><td>5705, all green</td><td>152</td><td>195</td></tr>
+<tr><td>minimal</td><td>40009, all green</td><td>3692</td><td>196</td></tr>
+</tbody>
+</table>
+</div>
+<p>The lib counts were 244 and 245 while the containers, presets, configuration and
+primitives were defined here. Their 48 unit tests moved with them and run in
+<code>ethlambda-types</code>; the fixture counts, which are what defines correctness here,
+are unchanged.</p>
+<p>Minimal runs more cases because the release ships more fixtures for it, and it
+runs two runners mainnet does not: <code>genesis</code>’s <code>initialization</code> and <code>validity</code>.
+The release ships no mainnet <code>genesis</code> fixtures, so that whole runner is gated
+behind the <code>preset-minimal</code> feature (<code>tests/spec/genesis.rs</code>).</p>
+<p>Nothing is ignored for being unimplemented. Every ignored case is one of two
+deliberate exclusions:</p>
+<ul>
+<li><code>LightClient*</code> containers under <code>ssz_static</code>, 5 container types across altair
+through fulu. The light-client sync protocol is a different layer from the
+state transition and fork choice, and is not in this module’s scope.</li>
+<li>The <code>gloas</code> and <code>eip7805</code> fixture trees, one ignored entry each. See
+“Accounting for every fork directory” below.</li>
+</ul>
+<h2 id="accounting-for-every-fork-directory"><a class="header" href="#accounting-for-every-fork-directory">Accounting for every fork directory</a></h2>
+<p><code>collect</code> identifies a fork by parsing the directory name into a <code>ForkName</code>, and
+a name that does not parse is skipped. That skip is silent in a way the
+<code>HIGHEST_IMPLEMENTED_FORK</code> gate is not: the cases never become tests, so they are
+not counted as ignored either, and nothing in the output says they exist.</p>
+<p>The release does ship two such trees. <code>gloas</code> is the fork after fulu, and
+<code>eip7805</code> is not a fork in the sequence at all, being one of the per-EIP trees
+generated against a variant of some fork’s rules. Between them they hold 1898
+mainnet and 17539 minimal cases, all of which were previously dropped without a
+trace, which is the opposite of what this harness promises.</p>
+<p>So <code>UNMODELED_FORKS</code> names them, each reports as one ignored test, and
+<code>fixture_forks/every_directory_is_accounted_for</code> fails if the tree holds a fork
+directory that is neither parseable nor listed. A release that adds a fork now
+forces a decision instead of quietly widening the gap.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Suite</th><th>Covers</th></tr>
+</thead>
+<tbody>
+<tr><td><code>general/bls</code></td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>general/kzg</code></td><td>Cryptography, fork- and preset-independent</td></tr>
+<tr><td><code>ssz_static</code></td><td>Every fork’s containers</td></tr>
+<tr><td><code>shuffling</code></td><td>Committee helpers</td></tr>
+<tr><td><code>operations</code>, <code>epoch_processing</code></td><td>Every fork’s operation and epoch sub-function</td></tr>
+<tr><td><code>sanity/blocks</code>, <code>sanity/slots</code>, <code>finality</code>, <code>random</code>, <code>rewards</code></td><td>Whole blocks and slots, end to end</td></tr>
+<tr><td><code>fork</code>, <code>transition</code></td><td>Fork upgrades, standalone and mid-chain</td></tr>
+<tr><td><code>genesis</code></td><td>Genesis initialization (minimal only, see above)</td></tr>
+<tr><td><code>fork_choice</code></td><td>The <code>Store</code>; see below</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="fork-choice-is-fixture-verified"><a class="header" href="#fork-choice-is-fixture-verified">Fork choice is fixture-verified</a></h3>
+<p>150 mainnet <code>fork_choice</code> cases pass, covering bellatrix’s <code>on_merge_block</code>/
+terminal-PoW validation, <code>should_override_forkchoice_update</code>, deneb’s blob
+data availability, and fulu’s column data availability.</p>
+<p>The release still ships no phase0 <code>fork_choice</code> suite: the earliest is
+altair’s, built from altair-shaped states even though altair changes nothing
+about fork choice itself (<code>Store</code> accepts a block from any fork this module
+implements; see <code>fork_choice.rs</code>’s own module doc). Landing altair’s state
+transition is what let this suite start running at all.</p>
+<h3 id="a-note-on-earlier-case-counts"><a class="header" href="#a-note-on-earlier-case-counts">A note on earlier case counts</a></h3>
+<p>Counts reported before the runners landed were too high by roughly sevenfold.
+<code>collect_all_handlers</code> walked the fork directories and then delegated to
+<code>collect</code>, which walks them again, so every case was emitted once per fork
+shipping that runner. The cases were always being <em>run</em>; they were counted many
+times over. Both collectors now share one suite walk.</p>
+<h2 id="a-recurring-bug-projecting-when-an-accessor-was-needed"><a class="header" href="#a-recurring-bug-projecting-when-an-accessor-was-needed">A recurring bug: projecting when an accessor was needed</a></h2>
+<p>Reach for a concrete per-fork projection, such as <code>altair_state(state)</code>, only
+when the return type must be that fork’s own. Reach through a <code>BeaconState</code>
+accessor when the fields involved are shared. The trap is that a projection
+like <code>altair_state(state)</code> matches only <code>BeaconState::Altair</code>, so it compiles
+cleanly, passes the fork that introduced the field, and returns
+<code>UnsupportedForFork</code> for every later fork that shares the exact same field
+through a different variant.</p>
+<p>This caused five separate bugs during implementation:</p>
+<ul>
+<li>Capella’s withdrawal sweep, projected to capella’s own state.</li>
+<li>Deneb reusing that same sweep, still projected to capella’s state.</li>
+<li>Altair’s participation fields, projected to altair’s state, so every one of
+the five later forks that also carries participation failed.</li>
+<li>Deneb’s <code>process_attestation</code>, projected to deneb’s state.</li>
+<li><code>slash_validator</code> calling phase0’s <code>initiate_validator_exit</code> at electra,
+which also left electra’s EIP-7251 churn cursor unadvanced, mispricing every
+later exit processed in the same epoch.</li>
+</ul>
+<h2 id="deliberate-simplifications"><a class="header" href="#deliberate-simplifications">Deliberate simplifications</a></h2>
+<ul>
+<li>Light client containers and suites are out of scope.</li>
+<li><code>ssz_generic</code> exercises the SSZ library rather than the beacon containers, so
+it is not a gate.</li>
+<li>The state transition mutates in place, as the specification does, so a state
+passed to <code>state_transition</code> is left partly modified when a block turns out to
+be invalid. Callers that need the pre-state clone it first, which is what the
+fixture runners do.</li>
+<li><code>ExecutionEngine</code> (<code>stf::mod</code>) stands in for a real execution client: just
+<code>execution_valid: bool</code>, read straight from a fixture’s <code>execution.yaml</code>
+rather than a payload actually validated.</li>
+</ul>
+<h2 id="what-the-fixture-format-asserts-by-omission"><a class="header" href="#what-the-fixture-format-asserts-by-omission">What the fixture format asserts by omission</a></h2>
+<p>A case with a <code>post</code> state must succeed and land exactly on it. A case <em>without</em>
+one must be <strong>rejected</strong>. The second half is what keeps the suites honest: an
+implementation that accepted everything would otherwise pass every case that
+ships a post-state. That rule lives in one place, <code>check_transition</code>, and every
+state-comparing runner goes through it.</p>
+<p>Two consequences worth knowing:</p>
+<ul>
+<li>Roughly a quarter of the phase0 <code>operations</code> cases are rejection cases, so the
+invalid path gets as much coverage as the valid one.</li>
+<li>The <code>rewards</code> suite is the exception to state comparison: it compares the five
+per-component delta vectors directly. That is sharper, because the components
+are summed into balances, so a sign error in one component and a compensating
+error in another would produce correct balances from incorrect deltas.</li>
+</ul>
+<h2 id="where-the-specifications-python-does-more-than-it-appears-to"><a class="header" href="#where-the-specifications-python-does-more-than-it-appears-to">Where the specification’s Python does more than it appears to</a></h2>
+<p>Two places where a faithful-looking transcription is wrong, both found by the
+fixtures rather than by reading:</p>
+<ul>
+<li><code>get_matching_target_attestations</code> evaluates <code>get_block_root</code> <strong>inside</strong> a list
+comprehension, so it never runs when there are no attestations. That call has
+its own range assertion, which fails for the epoch a state sits at the start of.
+Hoisting it out of the loop rejects states the specification accepts.</li>
+<li><code>get_attesting_indices</code> returns an unordered set, and <code>get_indexed_attestation</code>
+sorts it. A committee is a <em>shuffled</em> slice of the registry, so filtering it in
+position order yields attesters in shuffle order, which is almost never
+ascending. <code>is_valid_indexed_attestation</code> requires sorted indices, so skipping
+the sort rejects every valid attestation.</li>
+</ul>
+<p>Both are cases where the Python reads as if order or evaluation point does not
+matter, and both change the result.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="lmd_ghost.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="beacon_wire.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="lmd_ghost.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="beacon_wire.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="elasticlunr-ef4e11c1.min.js"></script>
+        <script src="mark-09e88c2c.min.js"></script>
+        <script src="searcher-c2a407aa.js"></script>
+
+        <script src="clipboard-1626706a.min.js"></script>
+        <script src="highlight-abc7f01d.js"></script>
+        <script src="book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fa33901c.js";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7b7e66e6.js"></script>
+        <script src="toc-34fa44cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -185,7 +185,12 @@
 <li><strong>API server</strong> — consensus data (blocks, states, checkpoints, fork choice) and admin controls.</li>
 <li><strong>Metrics &amp; debug server</strong> — Prometheus metrics and heap-profiling endpoints. No store access.</li>
 </ul>
-<p>All consensus API paths are versioned under the <code>/lean/v0</code> prefix. Roots are serialized as <code>0x</code>-prefixed hex strings.</p>
+<p>Which API server a node serves follows from its store’s chain tag, not from the
+sub-command: <code>ethlambda node</code> serves the lean surface under <code>/lean/v0</code>,
+<code>ethlambda beacon</code> serves the <a href="#beacon-api-server-5052-on-ethlambda-beacon">Beacon API</a>
+under <code>/eth/v1</code> and <code>/eth/v2</code>. The two are alternatives, never merged, because the
+lean handlers read state variants and metadata keys a beacon directory does not
+carry. Roots are serialized as <code>0x</code>-prefixed hex strings on both.</p>
 <h2 id="servers--ports"><a class="header" href="#servers--ports">Servers &amp; Ports</a></h2>
 <div class="table-wrapper">
 <table>
@@ -211,7 +216,7 @@
 <tr><td><code>GET</code></td><td><code>/lean/v0/config/spec</code></td><td>JSON</td><td>Protocol constants the node runs with</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/genesis</code></td><td>JSON</td><td>Genesis time and validator count</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/states/finalized</code></td><td>SSZ</td><td>Latest finalized <code>State</code></td></tr>
-<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ</td><td>Latest finalized <code>SignedBlock</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/lean/v0/blocks/finalized</code></td><td>SSZ, or JSON on request</td><td>Latest finalized <code>SignedBlock</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/checkpoints/justified</code></td><td>JSON</td><td>Latest justified <code>Checkpoint</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/events</code></td><td>SSE</td><td>Live stream of chain events</td></tr>
 <tr><td><code>GET</code></td><td><code>/lean/v0/blocks/{block_id}</code></td><td>JSON</td><td>Block by root or slot</td></tr>
@@ -368,6 +373,168 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 <blockquote>
 <p><strong>Note:</strong> Runtime toggles do <strong>not</strong> resubscribe gossip subnets, which are frozen at startup. A standby aggregator should boot with <code>--is-aggregator=true</code> (so subscriptions are in place), then use this endpoint to rotate duties. See the CLAUDE.md “Runtime Aggregator Toggle” notes for the operational model.</p>
 </blockquote>
+<h2 id="beacon-api-server-5052-on-ethlambda-beacon"><a class="header" href="#beacon-api-server-5052-on-ethlambda-beacon">Beacon API Server (<code>:5052</code>, on <code>ethlambda beacon</code>)</a></h2>
+<p>The subset of the <a href="https://ethereum.github.io/beacon-APIs/">Ethereum Beacon API</a>
+that this follower can answer from its own store. It <strong>replaces</strong> the <code>/lean/v0</code>
+surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon node is a
+<code>404</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Method</th><th>Path</th><th>Response</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>GET</code></td><td><code>/eth/v2/beacon/blocks/{block_id}</code></td><td>JSON or SSZ</td><td><code>SignedBeaconBlock</code> at <code>block_id</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/blocks/{block_id}/root</code></td><td>JSON</td><td>That block’s root</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/headers/{block_id}</code></td><td>JSON</td><td><code>SignedBeaconBlockHeader</code>, plus <code>canonical</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v2/debug/beacon/states/{state_id}</code></td><td>JSON or SSZ</td><td><code>BeaconState</code> at <code>state_id</code></td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/finality_checkpoints</code></td><td>JSON</td><td>That state’s three checkpoints</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/genesis</code></td><td>JSON</td><td>Genesis time, validators root, fork version</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/config/spec</code></td><td>JSON</td><td>The store’s <code>Config</code>, plus <code>PRESET_BASE</code>, <code>CONFIG_NAME</code>, the preset and the constants (see below)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, optimistic flag</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID and metadata only (see below)</td></tr>
+<tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for the head’s epoch or the next</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/attester/{epoch}</code></td><td>JSON</td><td>Committee assignments for the given indices</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v2/validator/aggregate_attestation</code></td><td>JSON</td><td>The pooled votes for a data root and committee, aggregated</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/validator/aggregate_and_proofs</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SignedAggregateAndProof</code>s</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v3/validator/blocks/{slot}</code></td><td>SSZ or JSON</td><td>An unsigned block built on the head (<code>produceBlockV3</code>)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v2/beacon/blocks</code></td><td><em>(status only)</em></td><td>Gossip and import a signed block (<code>publishBlockV2</code>, SSZ)</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/prepare_beacon_proposer</code></td><td><em>(status only)</em></td><td>Acknowledged, not acted on (see below)</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="validator-endpoints"><a class="header" href="#validator-endpoints">Validator endpoints</a></h3>
+<p>These are what <code>ethlambda validator</code> needs to attest through this node. Every
+answer is computed from the fork-choice head’s post-state, read off the store
+the chain actor writes, so no request waits on the actor.</p>
+<ul>
+<li><strong>Duties</strong> answer for a window around the head, not any epoch. Proposer
+duties read fulu’s <code>proposer_lookahead</code>, which covers the head’s epoch and the
+next; attester duties cover the head’s previous, current and next epoch,
+which is as far as its shuffling is already fixed. Anything else is a <code>400</code>.
+<code>dependent_root</code> follows each endpoint’s v1 definition. Attester duties walk
+every committee of the epoch, a full shuffle per request on mainnet.</li>
+<li><strong><code>attestation_data</code></strong> follows phase0’s <code>validator.md</code>: the head block, the
+epoch’s boundary block as target, and as source the current justified
+checkpoint of the head state advanced to the slot’s epoch (through fork
+choice’s cached <code>checkpoint_state</code>, and only when the head is in an earlier
+epoch). A slot before the head, or past the wall clock, is a <code>400</code>.</li>
+<li><strong><code>pool/attestations</code></strong> checks each attestation against the electra
+<code>beacon_attestation_{subnet_id}</code> gossip conditions it can evaluate (clock
+window, <code>data.index == 0</code>, target epoch, the voted block known and the target
+its checkpoint block, committee membership, BLS signature), then gossips it on
+its subnet through fanout, without subscribing. A rejected attestation comes
+back in an <code>IndexedErrorMessage</code> with its position; the valid ones in the
+same batch are still published. There is no seen-attestation cache. Each
+accepted attestation also goes into the node’s <strong>attestation pool</strong>, since
+gossip never delivers a node its own messages.</li>
+<li><strong><code>beacon_committee_subscriptions</code></strong>: each aggregator’s entry makes the node
+join its committee’s attestation subnet until the end of that slot, so the
+committee’s votes from other validators reach the pool too: every
+attestation this node relays has passed the <code>beacon_attestation_{subnet_id}</code>
+checks first, and the ones accepted on a joined subnet are pooled. Joined
+subnets are left once their slot has passed, and never appear in <code>attnets</code>.</li>
+<li><strong><code>aggregate_attestation</code></strong> answers from the pool: every vote held for the
+data root and committee, as electra’s <code>Attestation</code> with the BLS aggregate of
+their signatures. <code>404</code> when nothing is held.</li>
+<li><strong><code>aggregate_and_proofs</code></strong> checks each aggregate with the same
+<code>beacon_aggregate_and_proof</code> gossip conditions this node applies to its
+peers’ aggregates (<code>gossip::aggregate</code>), signatures included, against a
+fresh seen-cache (a node never receives its own messages, so P2P’s says
+nothing about them). What passes is gossiped on the topic and goes into the
+pool.</li>
+<li><strong>The attestation pool</strong> holds, the best-covered per data root and
+committee: votes from <code>pool/attestations</code> and the aggregator subnets,
+aggregates from <code>aggregate_and_proofs</code>, and every electra gossip aggregate
+P2P accepts, once all three of its signatures have verified. Gossip
+aggregates are pooled on arrival, so a slot’s aggregates are there when the
+next slot’s block is asked for. Entries more than an epoch old are dropped
+once a slot.</li>
+<li><strong><code>prepare_beacon_proposer</code></strong> records each validator’s fee recipient, in
+memory (a validator client repeats the call every epoch).</li>
+<li><strong><code>blocks/{slot}</code></strong> advances the head state to the slot and asks the node’s
+own execution client to build on the head (<code>forkchoiceUpdatedV3</code> with
+payload attributes, then <code>getPayloadV5</code>), with the proposer’s fee recipient.
+The body packs the pool’s best aggregates (committees voting alike merged
+into one EIP-7549 attestation, up to <code>MAX_ATTESTATIONS_ELECTRA</code>). A candidate
+is packed only if its target root is the advanced state’s own block root for
+that epoch and its aggregate signature verifies against that state, so an
+aggregate made on another branch cannot fail the whole block. The body also
+votes the state’s own <code>eth1_data</code>, and carries an empty sync aggregate and no
+slashings, exits or credential changes. The state root comes from running
+the block through <code>process_block</code>. The answer is fulu <code>BlockContents</code>, with
+<code>Eth-Execution-Payload-Blinded: false</code>; there is no builder flow. It is a
+<strong><code>503</code></strong> without a configured execution client, or when the payload carries
+blobs.</li>
+<li><strong><code>POST beacon/blocks</code></strong> takes SSZ <code>SignedBlockContents</code>, checks the block
+is after the head and its proposer signature, then gossips it on
+<code>beacon_block</code> and hands it to the chain actor to import.</li>
+</ul>
+<p><strong>Blobs are not supported yet.</strong> Publishing a blob-carrying block means
+computing and gossiping its data column sidecars, which this node does not do,
+and peers will not import a block they cannot sample. Such payloads are refused
+at production (<code>503</code>, which a validator client fails over on) and such blocks
+at publication (<code>400</code>).</p>
+<p><code>tooling/kurtosis-validator/network_params_ethlambda_beacon.yaml</code> points the
+validator client at this node alone, so every block on that devnet is one this
+node built.</p>
+<h3 id="encoding"><a class="header" href="#encoding">Encoding</a></h3>
+<p><strong>JSON is the default</strong>; SSZ is served on <code>Accept: application/octet-stream</code>,
+which is the order lighthouse serves. An <code>Accept</code> listing both is ranked by its
+<code>q</code> weights. Every response carrying a fork-versioned container also sets
+<code>Eth-Consensus-Version</code> to the lowercase fork name, in both encodings, since SSZ
+carries no type tag.</p>
+<p>JSON here follows the Beacon API’s own encoding, which is <strong>not</strong> the lean
+surface’s: every integer is a quoted decimal string, byte strings are
+<code>0x</code>-prefixed hex, and <code>Uint256</code> is quoted decimal rather than hex. Errors are
+<code>{"code": ..., "message": ...}</code>, where the lean surface uses <code>{"error": ...}</code>.</p>
+<p>Serving <code>/eth/v2/debug/beacon/states/finalized</code> as SSZ is what makes this client
+checkpoint-syncable from itself: it is the exact path
+<a href="./checkpoint_sync.html"><code>checkpoint_sync.rs</code></a> fetches from other clients.</p>
+<h3 id="get-ethv1configspec"><a class="header" href="#get-ethv1configspec"><code>GET /eth/v1/config/spec</code></a></h3>
+<p>One flat object holding the network’s configuration, the compiled preset, and
+the specification’s constants, as the Beacon API asks. Validator clients depend
+on it: lighthouse’s refuses a beacon node whose <code>PRESET_BASE</code> does not match
+its own, and treats an absent key as a mismatch.</p>
+<p>The key set is lighthouse’s, less gloas-only keys (this build cannot process
+gloas) and three keys the specification does not define
+(<code>GAS_LIMIT_ADJUSTMENT_FACTOR</code>, <code>RESP_TIMEOUT</code>, <code>TTFB_TIMEOUT</code>). Domain types
+and withdrawal prefixes are <code>0x</code>-prefixed hex; <code>VERSIONED_HASH_VERSION_KZG</code> is
+a decimal, as lighthouse reports it. <code>GENESIS_TIME</code> is absent:
+<code>/eth/v1/beacon/genesis</code> reports it.</p>
+<p>The configuration keys come from the <code>Config</code> the data directory was
+initialized with. Some of them (the custody and subnet counts, the
+<code>MAX_REQUEST_*</code> limits, <code>MAX_PAYLOAD_SIZE</code>, the snappy message domains,
+<code>MAXIMUM_GOSSIP_CLOCK_DISPARITY</code>) the node runs on compile-time constants for,
+rather than reading them from <code>Config</code>. Startup refuses a network whose
+<code>config.yaml</code> sets any of them to a different value (see
+<a href="./cli.html"><code>cli.md</code></a>), so what this endpoint reports is what the node uses.
+<code>CONFIG_NAME</code> is the stored name: a resume under a renamed <code>config.yaml</code> warns
+and keeps it.</p>
+<h3 id="accepted-ids-and-three-that-are-refused"><a class="header" href="#accepted-ids-and-three-that-are-refused">Accepted ids, and three that are refused</a></h3>
+<p><code>block_id</code> and <code>state_id</code> accept <code>head</code>, <code>finalized</code>, <code>justified</code>, a slot
+number, and a <code>0x</code>-prefixed 32-byte root. Two cases are deliberate refusals,
+both recorded in <a href="./spec_deviations.html">Spec Deviations</a>:</p>
+<ul>
+<li><strong><code>genesis</code></strong> is a <code>404</code> on either id. <code>Table::BlockRoots</code> indexes the
+canonical branch above the store’s anchor, and the anchor’s own slot is never
+written to it; a checkpoint-synced directory has no genesis block either way.</li>
+<li><strong>A <code>state_id</code> given as a <code>0x…</code> root</strong> is a <code>404</code>: states are keyed by <em>block</em>
+root here, with no reverse index. The refusal names the ids that do work.</li>
+</ul>
+<p>The <strong>anchor’s own slot</strong> does resolve, despite being absent from that index:
+the lookup falls back to the roots the store can name and accepts one only when
+the block under it really sits at that slot. This matters because it is the
+slot a checkpoint-syncing peer asks for right after reading the finalized
+state. A slot the store holds nothing at is still a <code>404</code>.</p>
+<p><code>/eth/v1/node/identity</code> reports <code>peer_id</code> and <code>metadata</code>; <code>enr</code>,
+<code>p2p_addresses</code> and <code>discovery_addresses</code> are empty.</p>
 <h2 id="metrics--debug-server-5054"><a class="header" href="#metrics--debug-server-5054">Metrics &amp; Debug Server (<code>:5054</code>)</a></h2>
 <div class="table-wrapper">
 <table>
@@ -420,7 +587,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="lmd_ghost.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="cli.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -434,7 +601,7 @@ curl -X POST http://127.0.0.1:5052/lean/v0/admin/aggregator \
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="lmd_ghost.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="cli.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

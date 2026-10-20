@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fa33901c.js";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7b7e66e6.js"></script>
+        <script src="toc-34fa44cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -353,8 +353,9 @@ phases it contains.</p>
 </table>
 </div>
 <h3 id="peer-discovery"><a class="header" href="#peer-discovery">Peer Discovery</a></h3>
-<p>Only emitted when discv5 discovery is enabled (<code>--discovery.enable</code>); see
-<a href="./discovery.html">Peer discovery</a>. Counts dials discovery initiated, as opposed to
+<p>See <a href="./discovery.html">Peer discovery</a>, which is always on for <code>beacon</code> and
+opt-in (<code>--discovery.enable</code>) for <code>node</code>. Counts dials
+discovery initiated, as opposed to
 the static bootnode dials every node makes. Connection outcomes are not repeated
 here: a discovery dial that succeeds or fails shows up in
 <code>lean_peer_connection_events_total</code> like any other.</p>
@@ -389,6 +390,146 @@ which nothing ethlambda binds produces.</p>
 </tbody>
 </table>
 </div>
+<h3 id="why-peers-leave"><a class="header" href="#why-peers-leave">Why Peers Leave</a></h3>
+<p><code>lean_peer_disconnection_events_total</code> above is leanMetrics-specified down to
+its <code>reason</code> values, and those four cannot carry this: measured on the mainnet
+follower, 92% of outbound closes land in <code>error</code>, which says only that libp2p
+handed back a cause. These two split that bucket without widening the specified
+metric, the same way the transport counter above sits beside the specified
+connect counter rather than inside it.</p>
+<p><code>lean_peer_goodbye_total</code> is the only one of the three that is not an
+inference. A <code>goodbye</code> is the peer stating why it is dropping us, and the two
+readings that matter are indistinguishable from the socket alone:
+<code>too_many_peers</code> means the peer had no room, while <code>bad_score</code>, <code>banned</code> and
+<code>banned_ip</code> mean it decided against <em>this node</em>, and those call for opposite
+responses. It has no <code>direction</code> label because <code>goodbye/1</code> is registered
+inbound-only; ethlambda never sends one. The reason is a <code>u64</code> off the wire, so
+the labels are a fixed set with <code>other</code> as the residue: a remote must not be
+able to choose this node’s metric cardinality.</p>
+<p><code>lean_peer_disconnect_cause_total</code> covers the closes that carry no <code>goodbye</code>,
+read off the <code>ConnectionError</code> variant and the error types inside it. It is
+charged on the same event as the specified counter, once per peer fully
+disconnecting rather than once per connection, so the two total to the same
+number and can be read against each other directly. <code>clean_close</code> is libp2p
+reporting no error at all, which for a beacon peer is the ordinary shape of a
+deliberate disconnect and should be read beside <code>lean_peer_goodbye_total</code>.</p>
+<p>An I/O close almost always arrives as <code>ErrorKind::Other</code> with the muxer’s own
+error inside, so the label comes from that inner error. The <code>quic_*</code> values
+are QUIC’s close reasons: <code>quic_application_close</code> is the peer’s application
+closing (libp2p’s normal close after a <code>goodbye</code>, and go-libp2p’s connection
+gater), <code>quic_transport_close</code> a transport-level close. TCP closes resolve to
+the socket error beneath the muxer where there is one (<code>unexpected_eof</code>,
+<code>connection_reset</code>), otherwise <code>yamux_closed</code> for a clean yamux shutdown.
+<code>io_other</code> is the residue and should stay near empty; the <code>Peer connection closed</code> line at <code>DEBUG</code> prints the full cause for whatever lands there.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_peer_goodbye_total</code></td><td>Counter</td><td>Goodbye messages received, by the reason code the peer sent</td><td>On receiving a <code>goodbye/1</code></td><td>reason=unknown,client_shutdown,irrelevant_network,fault,unable_to_verify_network,too_many_peers,bad_score,banned,banned_ip,other</td></tr>
+<tr><td><code>lean_peer_disconnect_cause_total</code></td><td>Counter</td><td>Closed peer connections by the cause libp2p reported for the close</td><td>On a peer’s last connection closing</td><td>direction=inbound,outbound<br>cause=clean_close,keep_alive_timeout,connection_reset,connection_aborted,broken_pipe,not_connected,timed_out,unexpected_eof,quic_application_close,quic_transport_close,quic_reset,quic_timed_out,quic_local_close,quic_other,yamux_closed,yamux_other,mplex_other,io_other</td></tr>
+</tbody>
+</table>
+</div>
+<p>Reason codes 1, 2 and 3 are the only ones
+<a href="https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md">the spec</a>
+names; it reserves <code>[4, 127]</code> and leaves 128 and up to each client. The four
+above 127 follow lighthouse’s <code>GoodbyeReason</code>, which is what mainnet peers
+actually send.</p>
+<h3 id="peer-supply"><a class="header" href="#peer-supply">Peer Supply</a></h3>
+<p>Who this node is connected to, and whether those peers can serve what it needs.
+All three are set from a full re-count of the state that decides them rather
+than incremented and decremented per event: a gauge meant to reveal a leak must
+not be able to leak itself.</p>
+<p><code>lean_peers_by_direction</code> read against <code>lean_swarm_established_connections</code> is
+that leak check. The first counts peers this node believes it holds; the second
+libp2p’s own counters, which the connection limits in
+<a href="./discovery.html">discovery.md</a> are enforced against. A persistent gap is a
+connection charged to the cap that no live peer is using.</p>
+<p><code>lean_custody_column_peers</code> is the supply side of the data-availability gate: a
+fulu block is held until every column this node custodies arrives, so a column
+sitting at zero connected custodians is a stall waiting to happen, and it is
+invisible in a total peer count. Only the columns this node samples get a
+series, since publishing all 128 would bury the ones that can actually block an
+import. Read it beside <code>lean_blocks_held_for_columns</code>. Beacon-only; a lean node
+samples nothing and publishes no series here.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_peers_by_direction</code></td><td>Gauge</td><td>Connected peers by the direction the connection was opened in</td><td>On every connection established and closed</td><td>direction=inbound,outbound</td></tr>
+<tr><td><code>lean_swarm_established_connections</code></td><td>Gauge</td><td>Established connections as libp2p itself counts them</td><td>On the swarm’s own metric tick</td><td>direction=inbound,outbound</td></tr>
+<tr><td><code>lean_custody_column_peers</code></td><td>Gauge</td><td>Connected peers known to custody each data column this node samples</td><td>On every connection established and closed, and whenever a peer’s custody is recorded from its <code>metadata/3</code> answer or its ENR <code>cgc</code></td><td>column=<code>&lt;index&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="block-import-timing"><a class="header" href="#block-import-timing">Block Import Timing</a></h3>
+<p>These record where a block’s time goes between coming off the wire and having a post-state, which is the question <code>lean_fork_choice_block_processing_time_seconds</code> cannot answer: it starts inside <code>store::on_block</code>, so the mailbox hop, the holds, the head update and the per-table size estimates every import pays for all fall outside it. The sections here are the same ones the <code>Block import timing</code> log prints as a tree, and a test asserts the two lists stay identical.</p>
+<p>One histogram carries every section, including <code>total</code> for a whole import and the sections an arrival is charged once for. They share a unit and a bucket set, and the query that matters is <code>rate(..._sum[5m])</code>, seconds spent per second, which does not divide by an event count and so does not care that some sections are counted per block and others per arrival. <code>lean_block_import_cascade_blocks</code> is what relates the two counts when you do need them.</p>
+<p><code>total</code> is written only when the block actually imported. A held block publishes every section it crossed and no total, because its import has not finished: that is what keeps a block that waited two slots for its parent out of the import-cost percentiles, and why there is no <code>outcome</code> label to filter on.</p>
+<p><code>parent_wait</code> and <code>columns_wait</code> are separate sections rather than one “pending”, so a block held for its parent and a block held for its custody columns never collapse into the same number. An absent <code>columns_wait</code> still has two readings, and only the log separates them: its <code>da_complete_on_arrival</code> field says whether the columns were never missing, or landed while the block was held for its parent.</p>
+<p>The bookkeeping an import triggers (chain-event emission, the finality eviction sweep, the gauge refresh including a RocksDB size estimate per table) has no section of its own. It is charged to the section it follows, which is <code>fc_head</code> on lean and <code>block_atts</code> on beacon. Those three were sections once: across 5248 imports on a mainnet follower none of them reached a millisecond, so they were three rows that never moved in every tree and three label values that never said anything. The work is still counted, just where it happens.</p>
+<p><code>decode</code> is a gossip-only section, so <code>queue</code> is the only one a fetched block crosses before the chain actor. The req/resp codec has already turned the bytes into a block before any handler sees one, leaving no decode boundary to take; the path reports nothing rather than a zero, since a zero reads as free work rather than as unmeasured work and would drag the decode histogram down with samples that measured nothing. Two consequences: <code>decode</code> is a gossip population even though the <code>source</code> label allows <code>sync</code>, and a fetched block’s <code>total</code> starts later in its life than a gossiped block’s, having never counted the request round trip at all.</p>
+<p>On the beacon wire, <code>decode</code> for <code>source="gossip"</code> spans more than its name says. <code>BlockArrival::decode_start</code> is still the wire arrival, but <code>handed_off</code> is stamped only once the block has a gossip verdict, so the section also covers the cheap, stateless checks, the stateful check’s own <code>spawn_blocking</code> task, and the verdict’s trip back through the p2p actor’s mailbox. There is no wait for a free validation slot to attribute here either: <code>try_acquire_owned</code> never blocks, and a message arriving with none free is reported <code>Ignore(Overloaded)</code> (and still forwarded to the chain actor) rather than queued. A rising <code>decode</code> on the beacon wire alone therefore does not mean decoding got slower; check <code>lean_beacon_gossip_validation_seconds</code> before assuming so.</p>
+<p><code>engine</code> and <code>fcu</code> are execution-client round trips. They are I/O waits rather than work, so a node whose import time is dominated by them is waiting on its execution client, not spending CPU.</p>
+<p>The <code>source</code> label has two values, <code>gossip</code> and <code>sync</code> (req/resp backfill). Two populations are deliberately absent. A block re-delivered to itself because its slot had not started reports under the source it first arrived on, since the hold is already visible as its <code>defer</code> section and a third label value would take the block out of the population it belongs to for every section it has left. A block this node built itself is not measured at all: it crossed no wire, so it has no <code>decode</code> and an empty <code>queue</code> taken when the import began. Both still appear in the log, which names them <code>deferred</code> and <code>local</code>.</p>
+<p>Series appear as blocks arrive rather than being seeded, since a third of the phases are beacon-only and a lean node can never write to them.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_block_import_phase_seconds</code></td><td>Histogram</td><td>Time one section of a block’s import, or of the arrival carrying it, took</td><td>Per section that ran, on each import, hold or failure</td><td>phase (see below); source=gossip,sync</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8, 12, 16, 32</td></tr>
+<tr><td><code>lean_block_import_cascade_blocks</code></td><td>Histogram</td><td>Blocks one arrival put through the import path (attempts, so a block that ends held or pended counts)</td><td>Once per arriving block message</td><td></td><td>1, 2, 3, 5, 8, 16, 32, 64, 128</td></tr>
+</tbody>
+</table>
+</div>
+<p>Per-block phases, in the order a block crosses them, plus <code>total</code> for a completed import:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>What it covers</th><th>Chain</th></tr>
+</thead>
+<tbody>
+<tr><td><code>decode</code></td><td>Snappy decompression, SSZ decode and the root the p2p handler computes; on the beacon wire this also spans gossip validation. Gossip only; see above</td><td>both</td></tr>
+<tr><td><code>queue</code></td><td>The wait in the chain actor’s mailbox</td><td>both</td></tr>
+<tr><td><code>defer</code></td><td>Held because the block’s own slot had not started yet</td><td>beacon</td></tr>
+<tr><td><code>guards</code></td><td>Finality and future-slot checks, the already-imported check, the parent-state lookup</td><td>both</td></tr>
+<tr><td><code>preamble</code></td><td>The checks <code>store::on_block</code> makes before verifying: parent state load, duplicate attestation data scan</td><td>lean</td></tr>
+<tr><td><code>parent_wait</code></td><td>Held because the parent had no post-state</td><td>both</td></tr>
+<tr><td><code>cascade_wait</code></td><td>Between the parent’s import finishing and this block being popped off the cascade queue</td><td>both</td></tr>
+<tr><td><code>da_check</code></td><td>The custody-column availability check itself, not the wait</td><td>beacon</td></tr>
+<tr><td><code>columns_wait</code></td><td>Held because custody columns had not all arrived</td><td>beacon</td></tr>
+<tr><td><code>engine</code></td><td>The <code>engine_newPayload</code> round trip, including its retry ladder</td><td>beacon</td></tr>
+<tr><td><code>verify_struct</code></td><td>Participant bounds checks and pubkey resolution</td><td>lean</td></tr>
+<tr><td><code>verify_crypto</code></td><td>The leanVM multi-message aggregate verification</td><td>lean</td></tr>
+<tr><td><code>stf</code></td><td>The state transition. On beacon this bundles the transition, the state root and the state write</td><td>both</td></tr>
+<tr><td><code>db_write</code></td><td>The block write and handing the post-state off to the storage crate’s background writer; the state’s own encode/diff/commit cost is <code>lean_state_write_seconds</code> instead, not this row</td><td>lean</td></tr>
+<tr><td><code>fc_head</code></td><td><code>update_head</code></td><td>lean</td></tr>
+<tr><td><code>block_atts</code></td><td>Replaying the block’s own attestations and slashings into fork choice</td><td>beacon</td></tr>
+<tr><td><code>total</code></td><td>The whole import, wire to post-state, spanning any holds. Only on a completed import</td><td>both</td></tr>
+</tbody>
+</table>
+</div>
+<p>Per-arrival phases, charged once per arriving message however many blocks its cascade imported:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>What it covers</th></tr>
+</thead>
+<tbody>
+<tr><td><code>arrival</code></td><td>The whole handler call: the cascade plus everything after it</td></tr>
+<tr><td><code>cascade</code></td><td>The block drain alone</td></tr>
+<tr><td><code>prune</code></td><td><code>prune_old_data</code> after the cascade (lean)</td></tr>
+<tr><td><code>get_head</code></td><td><code>fork_choice::get_head</code> (beacon)</td></tr>
+<tr><td><code>fcu</code></td><td>The <code>engine_forkchoiceUpdated</code> round trip (beacon)</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="gossip-arrival-timing"><a class="header" href="#gossip-arrival-timing">Gossip Arrival Timing</a></h3>
 <p>These histograms record the absolute distance between a gossip message’s arrival and the start of the interval it was due in, so an arrival that is early by some amount and one that is late by the same amount land in the same bucket; the counters’ <code>position</code> label is what tells them apart. <code>inside</code> means the message arrived within the interval it was due in, not merely somewhere in the right slot: an attestation for slot 10 that lands during slot 10’s interval 2 is <code>after</code>, not <code>inside</code>, since it missed the AttestationProduction interval it was actually due in.</p>
 <p>The bucket boundaries are the interval and slot edges of the default 4-second cadence. Prometheus fixes buckets when a histogram is registered, so a network that sets <code>MILLISECONDS_PER_SLOT</code> reads these histograms against the default grid rather than its own; the <code>position</code> label still follows the configured interval width.</p>
@@ -419,9 +560,237 @@ which nothing ethlambda binds produces.</p>
 </thead>
 <tbody>
 <tr><td><code>lean_table_bytes</code></td><td>Gauge</td><td>Estimated byte size of a storage table (key + value bytes)</td><td>After each processed block (one update per table); retains its previous value on empty slots</td><td>table=<code>&lt;table_name&gt;</code></td></tr>
+<tr><td><code>lean_state_write_queue_depth</code></td><td>Gauge</td><td>States handed to the background writer but not yet committed</td><td>On every hand-off and on every commit</td><td></td></tr>
+<tr><td><code>lean_state_write_seconds</code></td><td>Histogram</td><td>Time the background writer spends encoding, diffing and committing one state</td><td>Per state written</td><td></td></tr>
 </tbody>
 </table>
 </div>
+<p><strong>On a beacon follower, watch <code>lean_table_bytes{table="data_columns"}</code>.</strong> Every
+other table’s series either stays flat or is bounded by pruning; <code>data_columns</code>
+backs <code>Table::DataColumns</code>, the one table with no pruning rule (see
+<a href="./data_storage.html#datacolumns">data_storage.md</a>), so this is the disk-growth
+trajectory for the whole node. Budget roughly 360 KB per slot across the
+columns this node custodies at the blob cap, nearer 1 GB per day at current
+mainnet blob counts, and size the disk against however long the node is meant
+to run before a pruner exists.</p>
+<p><strong><code>lean_state_write_queue_depth</code> is the early warning for a slow disk.</strong> Up to
+three states can be in flight without the importer ever blocking — two queued
+plus the one the writer thread is currently encoding, diffing and committing —
+so a depth resting at or below three is healthy overlap. A depth climbing past
+three means <code>insert_state</code> blocked on the full channel waiting for the writer,
+and <code>lean_state_write_seconds</code> says whether that time went into the encode or
+the commit. A depth that stays at zero means the writer has nothing
+outstanding.</p>
+<h3 id="beacon-gossip-validation"><a class="header" href="#beacon-gossip-validation">Beacon Gossip Validation</a></h3>
+<p>Every beacon gossip message gets a verdict before gossipsub forwards it
+(<code>validate_messages()</code> is on for the beacon wire only), <code>beacon_aggregate_and_proof</code>
+and <code>beacon_attestation_{subnet_id}</code> included: both are validated the same way
+blocks and columns are, in <code>ethlambda_state_transition::beacon::gossip::{aggregate,attestation}</code>.
+See <a href="./beacon_wire.html#gossip">beacon_wire.md</a> for the flow and
+<a href="./beacon_wire.html#aggregate-attestations">beacon_wire.md</a> for the two topics’
+own section. These are ethlambda-specific, not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_gossip_validation_total</code></td><td>Counter</td><td>Verdicts, by topic kind, outcome and reason</td><td>On every verdict reported to gossipsub</td><td>kind, outcome=accept,queue,ignore,reject, reason</td><td></td></tr>
+<tr><td><code>lean_beacon_gossip_validation_seconds</code></td><td>Histogram</td><td>Time from a message’s arrival to its verdict</td><td>On every verdict reported to gossipsub</td><td>kind</td><td>0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8</td></tr>
+<tr><td><code>lean_beacon_gossip_verdict_expired_total</code></td><td>Counter</td><td>Verdicts that arrived after gossipsub evicted the message, so an Accept propagated nothing</td><td>When <code>report_message_validation_result</code> returns <code>false</code></td><td>kind</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>kind</code> is the topic kind, with every <code>data_column_sidecar_{subnet}</code> sharing the
+label <code>data_column_sidecar</code> and every <code>beacon_attestation_{subnet_id}</code> sharing
+<code>beacon_attestation</code>. <code>queue</code> means IGNORE to gossipsub while the chain actor
+still receives the object and parks it; neither the aggregate nor the
+attestation topic ever answers <code>queue</code>, since the vote block’s post-state is
+either cached or it is not (<code>IgnoreReason::UnknownBlock</code>/<code>StateUnavailable</code>),
+with nothing to hold the message for. <strong><code>verdict_expired_total</code> should stay at
+zero</strong>: a rising count means validation is too slow for gossipsub’s message
+cache.</p>
+<p>The two topics add reasons the others do not, all <code>reason</code> label values on
+<code>lean_beacon_gossip_validation_total</code>: <code>outside_epoch_window</code>, <code>covered_bits</code>
+(aggregate only), <code>unknown_block</code>, <code>state_unavailable</code>,
+<code>finalized_not_ancestor</code>, <code>ancestry_unknown</code> on the ignore side;
+<code>epoch_mismatch</code>, <code>no_participants</code> (aggregate only), <code>non_zero_data_index</code>,
+<code>committee_bits</code> (aggregate only), <code>committee_index</code>, <code>bits_length</code> (aggregate
+only), <code>not_aggregator</code> (aggregate only), <code>not_in_committee</code>,
+<code>unknown_validator</code>, <code>selection_proof</code> (aggregate only),
+<code>aggregator_signature</code> (aggregate only), <code>aggregate_signature</code> (aggregate
+only), <code>target_not_ancestor</code>, <code>wrong_subnet</code> (attestation only) on the reject
+side. <code>already_seen</code> and <code>overloaded</code> are shared with every other topic.</p>
+<p>Two permit pools bound the blocking-thread half of validation:
+<code>gossip_validation_permits</code> for blocks and columns,
+<code>attestation_validation_permits</code> for aggregates and subnet attestations. They
+are deliberately separate: a mainnet slot’s worth of aggregates and backbone
+attestations arrives every slot, not only during a range sync, and sharing one
+pool would let that burst answer <code>Ignore(Overloaded)</code> for a block or a column
+instead. Neither pool has a metric of its own yet; a permit exhausted on
+either shows up as <code>outcome="ignore",reason="overloaded"</code> on
+<code>lean_beacon_gossip_validation_total</code>, for the topics that draw from it.</p>
+<h3 id="beacon-committee-cache"><a class="header" href="#beacon-committee-cache">Beacon Committee Cache</a></h3>
+<p><code>ethlambda beacon</code> derives an epoch’s attester committees with one whole-epoch
+shuffle and keeps the result in <code>CommitteeCache</code>, keyed by epoch and the block
+that decided the shuffling. The cache itself lives in the <code>Store</code>
+(<code>crates/storage/src/committee_cache.rs</code>), shared by both actors: the chain
+actor’s own attestation processing and p2p’s gossip validation for
+<code>beacon_aggregate_and_proof</code>/<code>beacon_attestation_{subnet_id}</code> read the same
+entries rather than each keeping a copy, which is what lets a validation task
+and the actor race a shuffle at an epoch boundary and have only the first one
+pay for it. <code>CommitteeCacheExt</code> in
+<code>crates/blockchain/state_transition/src/beacon/helpers/accessors.rs</code> is the
+consensus-logic wrapper (<code>ShufflingKey</code> derivation, the shuffle itself) around
+the storage-side container. This is ethlambda-specific, not part of the
+leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_committee_cache_lookups_total</code></td><td>Counter</td><td>Committee lookups, by whether the cache served them</td><td>On every <code>CommitteeCacheExt::committees</code> call: the state transition’s, fork choice’s and p2p’s gossip validation’s attestation processing</td><td>result=hit,miss,unkeyable</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Read the miss rate against the epoch rate, not the hit rate.</strong> A follower on
+one chain misses about once per epoch, when the first block of a new epoch asks
+for that epoch’s shuffling, and hits on everything else. Misses that track
+imports instead mean entries are being evicted and rebuilt, which happens when
+more branches are being imported at once than the cache has room for; each miss
+is a registry scan plus a whole-epoch shuffle on the import thread. <code>unkeyable</code>
+is a lookup the cache could not key at all, mostly the genesis state asking
+about its own first epochs, and should be zero on a checkpoint-synced follower.</p>
+<h3 id="beacon-pubkey-cache"><a class="header" href="#beacon-pubkey-cache">Beacon Pubkey Cache</a></h3>
+<p>Every BLS signature check <code>ethlambda beacon</code> runs (block import, fork choice,
+gossip validation) resolves its signers’ compressed public keys to validated
+curve points through one process-wide cache, keyed by the compressed bytes. See
+<code>PubkeyCache</code> in <code>crates/blockchain/state_transition/src/beacon/bls.rs</code>. This is
+ethlambda-specific, not part of the leanMetrics spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_pubkey_cache_lookups_total</code></td><td>Counter</td><td>Public keys resolved for a signature check, by whether the cache already held them</td><td>Once per signature check, counting every signer</td><td>result=hit,miss</td></tr>
+<tr><td><code>lean_beacon_pubkey_cache_entries</code></td><td>Gauge</td><td>Validated public keys the cache holds</td><td>On each key added; the cache never removes one</td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>Misses should fall to near zero within an epoch of a start</strong>, once every
+active validator has signed something the node checked. A steady miss rate
+after that means keys the cache is refusing to hold: either the entry bound is
+reached (the gauge stops rising), or the keys are invalid, which are never
+cached and pay the full check every time. <code>entries</code> is also the cache’s memory
+footprint, roughly a decompressed point plus its compressed key per entry.</p>
+<h3 id="data-column-sidecars-fulu-das"><a class="header" href="#data-column-sidecars-fulu-das">Data Column Sidecars (Fulu DAS)</a></h3>
+<p><code>ethlambda beacon</code> is a fulu data-availability-sampling custodian: it derives
+a slice of the column matrix from its own discv5 node id (see
+<a href="./beacon_wire.html#data-column-sidecars">beacon_wire.md</a>), verifies what gossip
+and req/resp deliver for that slice, stores what verifies, serves it back to
+peers, and refuses to import a fulu block until every column it owes for that
+block is on hand. These are ethlambda-specific, not part of the leanMetrics
+spec.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_data_columns_stored_total</code></td><td>Counter</td><td>Data column sidecars verified and written to <code>Table::DataColumns</code></td><td>On the chain actor storing a sidecar the p2p layer verified</td><td></td><td></td></tr>
+<tr><td><code>lean_data_columns_rejected_total</code></td><td>Counter</td><td>Sidecars the p2p layer’s chain checks dropped, by reason</td><td>On each drop in <code>beacon::column_checks</code>, except an already stored sidecar</td><td>reason=malformed,future_slot,finalized,not_after_parent,unknown_proposer,bad_signature,wrong_proposer,finalized_not_ancestor,parent_not_ready,inclusion_proof,kzg,internal</td><td></td></tr>
+<tr><td><code>lean_data_column_kzg_verify_seconds</code></td><td>Histogram</td><td>Time spent batch-verifying one sidecar’s cells against its own commitments</td><td>On each KZG batch verification, in gossip validation or the chain checks</td><td></td><td>0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0</td></tr>
+<tr><td><code>lean_data_column_fetch_failures_total</code></td><td>Counter</td><td><code>DataColumnsByRoot</code> lookups this node gave up on, by reason</td><td>On lookup abandonment</td><td>reason=no_peers,max_retries</td><td></td></tr>
+<tr><td><code>lean_blocks_held_for_columns</code></td><td>Gauge</td><td>Blocks held out of fork choice pending their custody columns</td><td>On every hold, release, and finality eviction of the held-block set</td><td></td><td></td></tr>
+<tr><td><code>lean_sidecars_awaiting_parent</code></td><td>Gauge</td><td>Sidecars parked until their block’s parent has a post-state</td><td>On every park, replay, and finality eviction of the parked set</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>lean_data_columns_rejected_total</code> counts the chain checks, which run in the
+p2p layer on every sidecar gossip did not accept: every fetched sidecar, a
+gossiped one reported <code>Queue</code> or <code>Ignore(Overloaded)</code>, and a parked one sent
+back once its parent imported. A gossiped sidecar is judged first by the
+gossip rules and counted in
+<code>lean_beacon_gossip_validation_total{kind="data_column_sidecar"}</code>; the reasons
+here are that counter’s reason labels. The chain actor stores what reaches it
+without checking it again.</p>
+<p><strong>Watch <code>lean_blocks_held_for_columns</code>.</strong> It is the first symptom of a stalled
+availability gate, and a healthy node returns it to zero within a slot or two
+of a hold: fetch or gossip should complete well inside the retry ladder
+<code>lean_data_column_fetch_failures_total</code> counts down. A gauge that sits above
+zero for several slots means either the fetch is failing — check whether
+<code>lean_data_column_fetch_failures_total</code>’s <code>no_peers</code> or <code>max_retries</code> reason
+is climbing — or no reachable peer actually serves the missing columns; short
+of that, only finality passing the held block’s slot clears it, which can be
+minutes away.</p>
+<p><strong>Read <code>lean_sidecars_awaiting_parent</code> beside it.</strong> A sidecar whose block’s
+parent has no post-state yet is parked rather than dropped, and a held block is
+precisely a block with no post-state, so the two gauges rise together while the
+gate waits: held blocks on one, their children’s columns on the other. Both
+returning to zero is a recovered hold. <code>lean_sidecars_awaiting_parent</code> climbing
+without coming back down while <code>lean_blocks_held_for_columns</code> stays above zero
+is the signature of a gate that is not recovering. The parked queue is
+uncapped, so that gauge is also the only warning that a peer is parking
+sidecars under parents it never means to supply: each one holds a
+<code>Table::PendingDataColumns</code> row until finality passes its slot.</p>
+<h3 id="beacon-aggregate-attestations"><a class="header" href="#beacon-aggregate-attestations">Beacon Aggregate Attestations</a></h3>
+<p><code>ethlambda beacon</code> applies <code>beacon_aggregate_and_proof</code> to fork choice, which is
+how it sees votes for the current head rather than only the votes a block body
+carries (see
+<a href="./beacon_wire.html#aggregate-attestations">beacon_wire.md</a>). These are
+ethlambda-specific, not part of the leanMetrics spec, and lean nodes never emit
+them.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Name</th><th>Type</th><th>Usage</th><th>Sample collection event</th><th>Labels</th><th>Buckets</th></tr>
+</thead>
+<tbody>
+<tr><td><code>lean_beacon_aggregate_decode_seconds</code></td><td>Histogram</td><td>Time the p2p actor spent decoding one aggregate off the wire</td><td>On each successful decode in the gossip handler</td><td></td><td>0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05</td></tr>
+<tr><td><code>lean_beacon_aggregate_mailbox_wait_seconds</code></td><td>Histogram</td><td>Time an already-verified aggregate spent in the chain actor’s mailbox</td><td>On the chain actor taking one off the mailbox</td><td></td><td>0.0005 … 2.5</td></tr>
+<tr><td><code>lean_beacon_aggregate_processing_seconds</code></td><td>Histogram</td><td>Time the chain actor spent applying one already-verified aggregate (<code>apply_verified_aggregate</code> plus the applied-bits gate)</td><td>On each aggregate the actor processed, applied or not</td><td></td><td>0.0005 … 2.5</td></tr>
+<tr><td><code>lean_beacon_aggregate_end_to_end_seconds</code></td><td>Histogram</td><td>Wire to fork choice, for aggregates applied on arrival</td><td>On applying an aggregate that was not deferred</td><td></td><td>0.0005 … 2.5</td></tr>
+<tr><td><code>lean_beacon_aggregate_total</code></td><td>Counter</td><td>Aggregates by outcome</td><td>On each aggregate reaching a verdict</td><td>outcome=applied,invalid,known_subset,queue_full</td><td></td></tr>
+<tr><td><code>lean_beacon_aggregates_deferred</code></td><td>Gauge</td><td>Aggregates held until their own slot has passed</td><td>On every defer and every per-slot drain</td><td></td><td></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>decode</code> is the only one of the four histograms still timing what it always
+did. The other three no longer include gossip validation: committees, all
+three signature checks and the specification’s own seen sets moved to p2p
+(<code>lean_beacon_gossip_validation_seconds{kind="beacon_aggregate_and_proof"}</code>
+covers that half now), so <code>processing</code> and <code>end_to_end</code> read a great deal
+lower than before this change, and a comparison against an older deployment’s
+values is comparing two different things. What is left for these three to
+measure is real, though: <code>validate_on_attestation_indexed</code> and the applied-bits
+gate still cost a <code>Table::LiveChain</code> scan and a hash-map lookup per aggregate,
+so a slow chain-actor number still points at the store rather than at
+cryptography.</p>
+<p><strong>Watch <code>lean_beacon_aggregate_mailbox_wait_seconds</code>.</strong> It is the failure mode
+this path introduces and the one no other timing can show: a mainnet slot
+carries up to <code>MAX_COMMITTEES_PER_SLOT * TARGET_AGGREGATORS_PER_COMMITTEE</code>
+aggregates, and if they queue behind block imports their votes arrive too late
+to move the head while every per-aggregate timing still looks healthy.</p>
+<p><strong>Read <code>lean_beacon_aggregate_total{outcome}</code> as a ratio, not a rate.</strong>
+<code>known_subset</code> is the actor’s own applied-bits gate now, not the specification’s
+seen set (that one is p2p’s, and a duplicate or already-covered aggregate is
+refused there, under <code>lean_beacon_gossip_validation_total</code>, before it ever
+reaches this counter). <code>known_subset</code> dominating is still the design working:
+a committee’s aggregators mostly converge on the same votes, and each one the
+running union already covers is dropped before another
+<code>apply_verified_aggregate</code> call. <code>applied</code> falling toward zero while
+<code>known_subset</code> stays high means the node is seeing only aggregates it has
+already covered, which is normal; <code>invalid</code> climbing means aggregates gossip
+already accepted are failing <code>apply_verified_aggregate</code> regardless, most often
+because this node has not imported the block being voted for, or has since
+finalized past its target.</p>
+<p><strong><code>queue_full</code> should be zero.</strong> The deferral queue holds two slots’ worth, and
+reaching its cap means aggregates are arriving faster than the once-per-slot
+drain clears them. Read it beside <code>lean_beacon_aggregates_deferred</code>, which sits
+near one slot’s worth in the steady state and near the cap when the drain is
+falling behind.</p>
 <h3 id="attestation-aggregate-coverage"><a class="header" href="#attestation-aggregate-coverage">Attestation Aggregate Coverage</a></h3>
 <p>Observability into how many validators/subnets are covered by the attestations the node has aggregated, broken down by pipeline section (the <code>section</code> label). The slot is the X-axis. These are sampled roughly once per slot, but emission is gated by the section’s source data, so a gauge can retain its previous value:</p>
 <ul>
@@ -443,6 +812,63 @@ which nothing ethlambda binds produces.</p>
 </div>
 <hr>
 <p>✅(*) <strong>Partial support</strong>: These metrics are implemented but not collected “on scrape” as the spec requires. They are updated on specific events (e.g., on tick, on block processing) rather than being computed fresh on each Prometheus scrape.</p>
+<h2 id="validator-client"><a class="header" href="#validator-client">Validator client</a></h2>
+<p>Served by <code>ethlambda validator</code> on its own <code>--metrics-port</code>, separate from the
+node’s. Prefixed <code>ethlambda_validator_</code> rather than <code>lean_</code>, because this
+process follows the beacon chain and a <code>lean_</code> series here would be misleading
+on a shared dashboard.</p>
+<p>Every series is registered at startup rather than on first use, so each reads
+zero from the moment the process is up. That matters for alerting: a rule on
+“attestations stopped” cannot fire against a series that does not exist yet,
+and absent is not the same as zero.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Type</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ethlambda_validator_validators_loaded</code></td><td>Gauge</td><td>Validator keys loaded from the keystores</td></tr>
+<tr><td><code>ethlambda_validator_validators_resolved</code></td><td>Gauge</td><td>Loaded keys that have an index on chain, out of <code>validators_loaded</code>. A persistent gap means validators are deposited but not yet activated</td></tr>
+<tr><td><code>ethlambda_validator_duties_held</code></td><td>Gauge</td><td>Attester duties currently scheduled</td></tr>
+<tr><td><code>ethlambda_validator_attestations_published_total</code></td><td>Counter</td><td>Attestations a beacon node accepted</td></tr>
+<tr><td><code>ethlambda_validator_attestation_failures_total</code></td><td>Counter</td><td>Slots whose attestation duty failed and returned</td></tr>
+<tr><td><code>ethlambda_validator_attestation_deadline_missed_total</code></td><td>Counter</td><td>Slots whose duty never returned in time and was abandoned. Points at a slow or hung beacon node rather than a rejected attestation</td></tr>
+<tr><td><code>ethlambda_validator_attestations_refused_total</code></td><td>Counter</td><td>Signatures deliberately not attempted, because this process had already signed a conflicting attestation for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_signing_failures_total</code></td><td>Counter</td><td>Signatures attempted and failed</td></tr>
+<tr><td><code>ethlambda_validator_blocks_proposed_total</code></td><td>Counter</td><td>Blocks signed and accepted by a beacon node</td></tr>
+<tr><td><code>ethlambda_validator_blocks_broadcast_not_imported_total</code></td><td>Counter</td><td>Blocks a node broadcast but could not import into its own database, which is what a 202 means. A subset of <code>blocks_proposed_total</code>, not a failure: the block reached the network. Points at that node’s execution layer</td></tr>
+<tr><td><code>ethlambda_validator_blocks_refused_total</code></td><td>Counter</td><td>Blocks deliberately not signed, because this process had already proposed that slot for that validator. Should normally read zero</td></tr>
+<tr><td><code>ethlambda_validator_block_proposal_failures_total</code></td><td>Counter</td><td>Proposal duties that did not end in a published block, including ones abandoned for overrunning</td></tr>
+<tr><td><code>ethlambda_validator_aggregates_published_total</code></td><td>Counter</td><td>Aggregates accepted by a beacon node. Bursty rather than steady: a validator is selected a few times a day, so hours at zero are normal for a small deployment</td></tr>
+<tr><td><code>ethlambda_validator_aggregation_failures_total</code></td><td>Counter</td><td>Aggregation duties that ended in no published aggregate, including ones abandoned for overrunning the slot</td></tr>
+<tr><td><code>ethlambda_validator_fee_recipient_mismatches_total</code></td><td>Counter</td><td>Blocks paying execution rewards to an address this client did not request. Should read zero forever; a non-zero value means every proposal is paying somewhere else</td></tr>
+<tr><td><code>ethlambda_validator_block_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to block accepted. Its buckets are tighter than the attestation histogram’s, because a block is due at the slot boundary rather than a third of the way in</td></tr>
+<tr><td><code>ethlambda_validator_beacon_node_available</code></td><td>Gauge</td><td>1 when a beacon node answered the last duty refresh or attestation</td></tr>
+<tr><td><code>ethlambda_validator_signing_duration_seconds</code></td><td>Histogram</td><td>Time to sign one slot’s batch, store read lock included</td></tr>
+<tr><td><code>ethlambda_validator_publication_delay_seconds</code></td><td>Histogram</td><td>Slot start to attestations accepted. The headline health number: it should sit near the one-third-slot duty offset</td></tr>
+</tbody>
+</table>
+</div>
+<p>Three of these distinguish failures that look alike on a dashboard but have
+different causes, and the distinction is the reason they are separate series:
+<code>attestation_failures_total</code> is a duty that ran and failed,
+<code>attestation_deadline_missed_total</code> is one that never finished, and
+<code>attestations_refused_total</code> is one deliberately not attempted. A rise in the
+second points at the beacon nodes; a rise in the third points at the clock or
+the duty schedule and is worth investigating even though the attestation was
+correctly suppressed.</p>
+<p>The proposal series split the same way, plus one that is neither a success nor
+a failure. <code>blocks_proposed_total</code> counts blocks a node accepted;
+<code>block_proposal_failures_total</code> counts duties that produced none;
+<code>blocks_refused_total</code> counts blocks deliberately not signed. Between them,
+<code>blocks_broadcast_not_imported_total</code> counts blocks that did reach the network
+but that the node answering could not import, which is a beacon-node fault
+rather than a validator one and is why it is not folded into either.</p>
+<p>Two series should read zero for the life of a healthy deployment, and are the
+ones worth alerting on at any non-zero value rather than on a rate:
+<code>attestations_refused_total</code> and <code>blocks_refused_total</code> mean this client’s own
+guards caught a duty they judged unsafe, and <code>fee_recipient_mismatches_total</code>
+means blocks are being proposed that pay someone else.</p>
 <h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
 <h3 id="docker-desktop-on-macos"><a class="header" href="#docker-desktop-on-macos">Docker Desktop on MacOS</a></h3>
 <p>lean-quickstart uses the host network mode for Docker containers, which is a problem on MacOS.

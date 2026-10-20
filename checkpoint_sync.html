@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fa33901c.js";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7b7e66e6.js"></script>
+        <script src="toc-34fa44cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,7 +182,9 @@
                         <h1 id="checkpoint-sync"><a class="header" href="#checkpoint-sync">Checkpoint Sync</a></h1>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
 <p>Checkpoint sync allows a new consensus node to skip replaying the entire chain from genesis. Instead, it downloads a recent finalized state from a running peer and starts from there. This mitigates long-range attacks by starting from a recent trusted checkpoint.</p>
+<p>Both <code>ethlambda node</code> (the lean consensus chain) and <code>ethlambda beacon</code> (an Ethereum Beacon Chain gossip follower, mainnet by default, or another network via <code>--network</code>) use it. The two paths share the retry loop and the URL fan-out, and now share the same fetch order, but talk to different endpoints and verify a different container shape; where they differ, this document says so.</p>
 <h2 id="usage"><a class="header" href="#usage">Usage</a></h2>
+<h3 id="ethlambda-node"><a class="header" href="#ethlambda-node"><code>ethlambda node</code></a></h3>
 <p>Checkpoint sync still requires the network config files (genesis, validators, bootnodes, etc.). The genesis config is needed to verify the downloaded state: checkpoint sync only replaces the starting state, not node configuration.</p>
 <p>Pass the <code>--checkpoint-sync-url</code> flag when starting ethlambda:</p>
 <pre><code class="language-bash">ethlambda \
@@ -197,57 +199,81 @@
 </code></pre>
 <p>Where <code>&lt;URL&gt;</code> is the address of a checkpoint source (see <a href="#checkpoint-sources">Checkpoint Sources</a> below).</p>
 <p>State already on disk takes precedence over both checkpoint sync and genesis: if the data directory holds a previous run’s chain state for this network, the node resumes from it. <code>--checkpoint-sync-url</code> is the fallback for when there is nothing resumable on disk, or when what is there has fallen too far behind (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>). With no resumable state and no URL, the node initializes from genesis.</p>
+<h3 id="ethlambda-beacon"><a class="header" href="#ethlambda-beacon"><code>ethlambda beacon</code></a></h3>
+<p><code>beacon</code> takes no genesis config, validator registry, or bootnode file of its own: it takes <code>--network</code> instead, naming a built-in network or a directory of published network files (see <a href="cli.html"><code>cli.md</code></a>). <code>genesis_time</code>, <code>genesis_validators_root</code>, and the bootnode list all come from whichever network <code>--network</code> resolves to; for the built-in networks (<code>mainnet</code>, the default, plus <code>sepolia</code> and <code>hoodi</code>), they are built into the binary (see <code>CLAUDE.md</code>’s “Built-in networks”).</p>
+<pre><code class="language-bash">ethlambda beacon --network &lt;network&gt; --checkpoint-sync-url &lt;URL&gt;
+</code></pre>
+<p>The anchor precedence is, in order: a resumable data directory, then <code>--checkpoint-sync-url</code>, then, for a loaded network only, that directory’s own <code>genesis.ssz</code>, then abort. The URL is therefore <strong>required</strong> on a fresh data directory only for a built-in network, unlike on <code>node</code>: this follower imports nothing past its anchor, so anchoring a built-in network at genesis would leave it parked at slot 0 while claiming to follow a chain that has been live for years. A loaded network’s own genesis state is a legitimate anchor instead, since a freshly started devnet has no checkpoint provider at slot 0 and this is the only way to join one. With neither a resumable DB, a URL, nor (for a loaded network) a genesis fallback, startup aborts with <code>CheckpointSyncError::BeaconGenesisSync</code>. A data directory already anchored from a previous run resumes exactly as <code>node</code>’s does, without a URL, subject to the same resume window (see <a href="#restarts-and-existing-state">Restarts and Existing State</a>).</p>
 <h2 id="checkpoint-sources"><a class="header" href="#checkpoint-sources">Checkpoint Sources</a></h2>
-<h3 id="direct-peer"><a class="header" href="#direct-peer">Direct peer</a></h3>
+<h3 id="direct-peer-lean"><a class="header" href="#direct-peer-lean">Direct peer (lean)</a></h3>
 <p>Any running node that serves the finalized state as SSZ can be used as a checkpoint source, not just ethlambda. For ethlambda nodes, the endpoint is <code>/lean/v0/states/finalized</code>.</p>
 <p>This is the simplest option, with no additional infrastructure needed. The trade-off is that you trust a single peer to provide a correct finalized state.</p>
-<h3 id="leanpoint"><a class="header" href="#leanpoint">Leanpoint</a></h3>
+<h3 id="leanpoint-lean"><a class="header" href="#leanpoint-lean">Leanpoint (lean)</a></h3>
 <p><a href="https://github.com/blockblaz/leanpoint">Leanpoint</a> is a dedicated checkpoint sync provider. It polls multiple nodes and only serves state when 50%+ agree on finality, adding a layer of consensus validation.</p>
 <p>This is the recommended option for production deployments since it reduces trust in any single peer.</p>
+<h3 id="any-standard-beacon-api-provider-beacon"><a class="header" href="#any-standard-beacon-api-provider-beacon">Any standard Beacon API provider (beacon)</a></h3>
+<p><code>ethlambda beacon</code> speaks the standard Beacon API against <code>--checkpoint-sync-url</code>, so any conforming server works as a source: a public checkpoint-sync provider, an infrastructure endpoint, or another beacon client’s own API port. Nothing ethlambda-specific is required of the peer; it only has to answer the two endpoints in <a href="#how-it-works">How It Works</a> below the way the spec describes them.</p>
 <h2 id="how-it-works"><a class="header" href="#how-it-works">How It Works</a></h2>
 <ol>
 <li>
-<p><strong>Fetch and verify</strong>: The node sends an HTTP GET to the provided URL requesting the SSZ-encoded finalized state. Once downloaded, the state is decoded and verified against the local genesis config (see <a href="#verification-checks">Verification Checks</a> below).</p>
-<p>Timeouts:</p>
+<p><strong>Fetch, sequentially</strong>: the node downloads the finalized state first, decodes and verifies it, then downloads the anchor block. State before block, on both chains, because the block is addressed by a slot that only the state carries; the two fetches used to run concurrently on lean (<code>tokio::try_join!</code>), but the beacon path cannot do that (it cannot address its block request until it has read the anchor block’s slot off the state), so both now run sequentially. This is lighthouse’s order.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th></th><th><code>node</code> (lean)</th><th><code>beacon</code></th></tr>
+</thead>
+<tbody>
+<tr><td>Finalized state</td><td><code>GET /lean/v0/states/finalized</code></td><td><code>GET /eth/v2/debug/beacon/states/finalized</code></td></tr>
+<tr><td>Anchor block</td><td><code>GET /lean/v0/blocks/finalized</code></td><td><code>GET /eth/v2/beacon/blocks/{slot}</code>, where <code>slot</code> is read off <code>state.latest_block_header.slot</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Both endpoints on both chains mean “whatever is finalized right now”, so the peer can advance finalization between the state and block requests; a mismatched pair is retried rather than treated as a hard failure (see <a href="#anchor-pairing">Anchor Pairing</a> below).</p>
+<p>Timeouts, shared by both chains:</p>
 <ul>
 <li><strong>Connect</strong>: 15 seconds (fail fast if peer is unreachable)</li>
 <li><strong>Read</strong>: 15 seconds of inactivity that resets on each successful read, so large states can download as long as data keeps flowing</li>
 </ul>
 </li>
 <li>
-<p><strong>Initialize</strong>: The node stores the block header and the full state from the checkpoint. No block body is stored since it isn’t available from the checkpoint. The node does not need the anchor block body to participate from this point forward.</p>
+<p><strong>Fork resolution (beacon only)</strong>: SSZ carries no type tag, so decoding the downloaded state first requires knowing which fork’s container shape to decode it as. <code>BeaconState::slot_from_ssz</code> reads the slot straight off its fixed byte offset, without decoding the rest of the container; the configured fork schedule then names the fork at that slot. The <code>Eth-Consensus-Version</code> response header is not consulted at all. This matches lighthouse’s checkpoint-sync client, and removes any dependence on the peer setting that header correctly: a self-describing slot cannot lie about its own fork the way a header can. The anchor block is decoded the same way, reusing the gossip path’s own slot-peeking decoder.</p>
+</li>
+<li>
+<p><strong>Initialize</strong>: the node stores the anchor block’s header, its body (present unless the fetched block’s own body happens to be empty, same as any other block), and the full state from the checkpoint. On <code>node</code>, persisting the block itself also means it can be served over <code>BlocksByRoot</code>; without that, peers requesting the anchor by root would get a synthetic block whose hash differs from <code>latest_finalized.root</code> and would score-penalize this node. <code>beacon</code>’s req/resp protocol has no <code>BlocksByRoot</code> handler yet, so that benefit doesn’t apply there today; the block is stored anyway, since the pairing check above needs it.</p>
 </li>
 </ol>
 <h3 id="failure-and-success"><a class="header" href="#failure-and-success">Failure and success</a></h3>
 <p>If any step fails (network error, decoding error, verification failure), the node logs the error and exits. There is no automatic retry; restart the node to try again. The database is not modified until verification succeeds, so a failed checkpoint sync leaves the data directory clean.</p>
-<p>After successful initialization, the node starts normally: it connects to the P2P network and begins participating from the checkpoint slot.</p>
+<p>After successful initialization, the node starts normally: <code>node</code> connects to the P2P network and begins participating from the checkpoint slot; <code>beacon</code> joins the resolved network’s gossip and logs what it decodes, without advancing its state past the anchor (see <code>docs/cli.md</code>, “What <code>ethlambda beacon</code> does today”).</p>
 <h2 id="restarts-and-existing-state"><a class="header" href="#restarts-and-existing-state">Restarts and Existing State</a></h2>
-<p>A node restarted against a populated data directory resumes from disk rather than re-initializing, so no flag is needed to preserve the chain across a redeploy. The decision is made before any download:</p>
+<p>A node restarted against a populated data directory resumes from disk rather than re-initializing, so no flag is needed to preserve the chain across a redeploy. The decision is made before any download, and is the same shape on both chains except for one row:</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>State in data directory</th><th><code>--checkpoint-sync-url</code></th><th>Result</th></tr>
+<tr><th>State in data directory</th><th><code>--checkpoint-sync-url</code></th><th><code>node</code></th><th><code>beacon</code></th></tr>
 </thead>
 <tbody>
-<tr><td>None</td><td>omitted</td><td>Initialize from genesis</td></tr>
-<tr><td>None</td><td>set</td><td>Checkpoint sync</td></tr>
-<tr><td>Present, head within the resume window</td><td>either</td><td>Resume from disk (no download)</td></tr>
-<tr><td>Present, head beyond the resume window</td><td>set</td><td>Checkpoint sync</td></tr>
-<tr><td>Present, head beyond the resume window</td><td>omitted</td><td>Resume from disk anyway, with a warning</td></tr>
-<tr><td><strong>From another network</strong></td><td>either</td><td><strong>Startup aborts</strong> (see <a href="#foreign-state">Foreign State</a>)</td></tr>
+<tr><td>None</td><td>omitted</td><td>Initialize from genesis</td><td>Built-in network: abort, <code>CheckpointSyncError::BeaconGenesisSync</code> (no genesis-sync path). Loaded network: initialize from the directory’s own <code>genesis.ssz</code></td></tr>
+<tr><td>None</td><td>set</td><td>Checkpoint sync</td><td>Checkpoint sync</td></tr>
+<tr><td>Present, head within the resume window</td><td>either</td><td>Resume from disk (no download)</td><td>Resume from disk (no download)</td></tr>
+<tr><td>Present, head beyond the resume window</td><td>set</td><td>Checkpoint sync</td><td>Checkpoint sync</td></tr>
+<tr><td>Present, head beyond the resume window</td><td>omitted</td><td>Resume from disk anyway, with a warning</td><td>Resume from disk anyway, with a warning</td></tr>
+<tr><td><strong>Wrong network, or the other chain</strong></td><td>either</td><td><strong>Startup aborts</strong> (see <a href="#foreign-state">Foreign State</a>)</td><td><strong>Startup aborts</strong> (see <a href="#foreign-state">Foreign State</a>)</td></tr>
 </tbody>
 </table>
 </div>
-<p>The resume window is <code>MAX_RESUMABLE_DB_STATE_AGE</code> (450 slots, ~30 minutes at 4-second slots) measured as <code>current_slot - head_slot</code>. Staleness is measured against the head, not the finalized checkpoint, so a node whose head is current still resumes during a finality stall.</p>
-<p>Beyond that window the node prefers a checkpoint when one is offered, since catching up over P2P costs more than downloading a recent state. With no URL configured there is no anchor to switch to, so the node simply runs against the data directory it was given: that is the setup that was asked for. The warning is there because range sync may not be able to close a gap this large. Peers prune block signatures past <code>SIGNATURE_PRUNING_RANGE</code> (21600 slots, ~1 day), so beyond that horizon they cannot serve the history the node is missing and it needs a checkpoint URL to catch up at all. The warning logs the gap so this is visible in the boot log.</p>
-<p>When a checkpoint URL <em>is</em> set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for “resume whatever is on disk”; that path never exits.</p>
-<p>To deliberately discard existing state and start over from genesis or from a checkpoint, remove the data directory first. Checkpoint sync itself writes its anchor state on top without clearing existing data.</p>
+<p>The resume window is <code>MAX_RESUMABLE_DB_STATE_AGE</code> (450 slots) measured as <code>current_slot - head_slot</code>. Staleness is measured against the head, not the finalized checkpoint, so a node whose head is current still resumes during a finality stall. The same 450-slot window means a different wall-clock budget on each chain: ~30 minutes at lean’s four-second slots, ~90 minutes at beacon’s twelve-second ones.</p>
+<p>Beyond that window, <code>node</code> prefers a checkpoint when one is offered, since catching up over P2P costs more than downloading a recent state. With no URL configured there is no anchor to switch to, so the node simply runs against the data directory it was given: that is the setup that was asked for. The warning is there because range sync may not be able to close a gap this large. Peers prune block signatures past <code>SIGNATURE_PRUNING_RANGE</code> (21600 slots, ~1 day), so beyond that horizon they cannot serve the history the node is missing and it needs a checkpoint URL to catch up at all. The warning logs the gap so this is visible in the boot log. <code>beacon</code> follows the same preference, though it imports nothing past its anchor today, so there is no backfill cost yet to weigh against a fresh download.</p>
+<p>When a checkpoint URL <em>is</em> set and every URL fails, the node exits rather than falling back to the stale state on disk. This is intentional, on either chain: configuring the flag asks for a specific anchor, so an unreachable source is a misconfiguration worth surfacing at boot instead of quietly starting a node that is hours behind. Omitting the flag is how you ask for “resume whatever is on disk”; that path never exits.</p>
+<p>To deliberately discard existing state and start over, remove the data directory first. <code>node</code> then starts over from genesis or from a checkpoint, whichever <code>--checkpoint-sync-url</code> says; <code>beacon</code> does the same, except that a built-in-network run still needs the URL, since the built-in networks alone have no genesis-sync path. Checkpoint sync itself writes its anchor state on top without clearing existing data.</p>
 <h3 id="foreign-state"><a class="header" href="#foreign-state">Foreign State</a></h3>
-<p>Persisted state is accepted only after it is verified against the local genesis config: same <code>GENESIS_TIME</code>, same <code>MILLISECONDS_PER_SLOT</code>, and the same validator registry (count, sequential indices, and both pubkeys per validator). The validator set is fixed at genesis, so any state of this chain must carry exactly that registry. These are the same identity checks checkpoint sync applies to a downloaded state, sharing one implementation.</p>
-<p>If the data directory belongs to a different network, startup <strong>aborts</strong> with <code>persisted state does not match the configured genesis: …</code>. It is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain’s rows in place, and the slot-indexed reads behind <code>BlocksByRange</code> would then serve those blocks to peers. Point <code>--data-dir</code> at the right directory, or remove it.</p>
-<p>Note that a genesis time comparison alone would not catch a network that was regenerated with the same <code>GENESIS_TIME</code> but a different validator set, which is why the whole registry is compared.</p>
+<p>Persisted state is accepted only after its genesis identity is verified against the network the node is configured for: the pair <code>(genesis_time, genesis_validators_root)</code>. Lean has no <code>genesis_validators_root</code> field of its own, but its validator registry is fixed at genesis and never mutates afterward, so the root of the registry a lean state carries today is the root it had at genesis; that is the value the <code>Lean</code> variant’s <code>genesis_validators_root()</code> accessor answers with. Both fields are compared by one function, <code>verify_state_genesis</code>, shared by the resume path on either chain and by both checkpoint-sync paths. The slot duration is compared separately, against the persisted <code>config</code> row rather than the state: a lean network sets it in its config file and no state carries it, so a data directory built at another cadence is caught there.</p>
+<p><code>Store::from_db_state</code> no longer runs this check itself: it loads whatever chain a data directory holds and hands back a <code>Store</code>, without judging whether that is the chain or the network the operator configured. The caller (<code>fetch_initial_state</code> for <code>node</code>, <code>fetch_initial_beacon_state</code> for <code>beacon</code>) checks <code>Store::chain()</code> against the sub-command it is running under, then runs <code>verify_state_genesis</code> against the loaded finalized state. Either check failing aborts startup: a chain mismatch as <code>CheckpointSyncError::WrongChain</code>, a genesis mismatch as <code>CheckpointSyncError::Genesis</code> (wrapping <code>GenesisMismatch::GenesisTime</code> or <code>GenesisMismatch::GenesisValidatorsRoot</code>). Both used to be raised from inside <code>from_db_state</code> itself, as <code>ethlambda_storage::Error::GenesisMismatch</code>/<code>::WrongChain</code>; those two variants have been removed from the storage crate now that the check runs one layer up, in the caller that actually knows which network and which chain it wants.</p>
+<p>Either failure is not treated as an empty directory, because initializing a new anchor on top would leave the foreign chain’s rows in place, and the slot-indexed reads behind <code>BlocksByRange</code> would then serve those rows to peers. Point <code>--data-dir</code> at the right directory, or remove it.</p>
+<p>Note that a genesis-time-only comparison still would not catch a network that was regenerated with the same <code>genesis_time</code> but a different validator set, which is why the registry root is compared too; that reasoning is unchanged; only its mechanism is, since a list’s root already commits to the count, each validator’s index, and both pubkeys, where this used to be four separate comparisons.</p>
 <h2 id="verification-checks"><a class="header" href="#verification-checks">Verification Checks</a></h2>
-<p>All checks are performed before a downloaded checkpoint state is accepted. The genesis-identity subset (marked below) is shared with the resume-from-disk path:</p>
+<p>All checks are performed before a downloaded checkpoint anchor is accepted. The genesis-identity checks (marked <em>(shared)</em>) are the ones the resume-from-disk path also runs, on either chain, through the same <code>verify_state_genesis</code> function described in <a href="#foreign-state">Foreign State</a> above.</p>
+<h3 id="lean"><a class="header" href="#lean">Lean</a></h3>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -257,9 +283,7 @@
 <tr><td>Slot &gt; 0</td><td>Checkpoint state cannot be genesis (slot 0)</td></tr>
 <tr><td>Validators non-empty</td><td>State must contain validators</td></tr>
 <tr><td>Genesis time matches <em>(shared)</em></td><td>Wrong network or misconfigured peer</td></tr>
-<tr><td>Validator count matches <em>(shared)</em></td><td>Validator set size differs from genesis config</td></tr>
-<tr><td>Sequential validator indices <em>(shared)</em></td><td>Indices must be 0, 1, 2, … in order</td></tr>
-<tr><td>Validator pubkeys match <em>(shared)</em></td><td>Validator identity differs from genesis config</td></tr>
+<tr><td>Genesis validators root matches <em>(shared)</em></td><td>Wrong validator set: the root commits to the count, each validator’s index, and both pubkeys, so this one comparison subsumes what used to be four</td></tr>
 <tr><td>Finalized slot &lt;= state slot</td><td>Finalized checkpoint cannot be in the future</td></tr>
 <tr><td>Justified slot &gt;= finalized slot</td><td>Justified must be at or after finalized</td></tr>
 <tr><td>Same-slot checkpoints have matching roots</td><td>If justified and finalized are at the same slot, they must agree on the root</td></tr>
@@ -269,7 +293,33 @@
 </tbody>
 </table>
 </div>
-<p>HTTP errors and SSZ decoding failures are caught before verification runs.</p>
+<h3 id="beacon"><a class="header" href="#beacon">Beacon</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Check</th><th>What it catches</th></tr>
+</thead>
+<tbody>
+<tr><td>Slot &gt; 0</td><td>Checkpoint state cannot be genesis (slot 0)</td></tr>
+<tr><td>Validators non-empty</td><td>State must contain validators</td></tr>
+<tr><td>Genesis time matches <em>(shared)</em></td><td>Wrong network or misconfigured peer</td></tr>
+<tr><td>Genesis validators root matches <em>(shared)</em></td><td>Wrong validator set</td></tr>
+<tr><td>Finalized epoch &lt;= current epoch</td><td>Finalized checkpoint cannot be in the future</td></tr>
+<tr><td>Justified epoch &gt;= finalized epoch</td><td>Justified must be at or after finalized</td></tr>
+<tr><td>Block header slot &lt;= state slot</td><td>Block header cannot be ahead of the state</td></tr>
+<tr><td>Block’s fork matches state’s fork</td><td>The fetched block must decode as the same fork the state resolved to</td></tr>
+<tr><td>Anchor pairing</td><td>See <a href="#anchor-pairing">Anchor Pairing</a> below</td></tr>
+</tbody>
+</table>
+</div>
+<p>Beacon has no same-slot-checkpoints-matching-roots check: nothing here computes two separate checkpoint roots to compare, since a trusted checkpoint-synced anchor is finalized by fiat, and the beacon spec’s own construction applies that single checkpoint to all four of the store’s justified/finalized slots at once.</p>
+<p>HTTP errors and SSZ decoding failures are caught before verification runs, on both chains.</p>
+<h2 id="anchor-pairing"><a class="header" href="#anchor-pairing">Anchor Pairing</a></h2>
+<h3 id="beacon-paired-on-the-header-root-not-the-state-root"><a class="header" href="#beacon-paired-on-the-header-root-not-the-state-root">Beacon: paired on the header root, not the state root</a></h3>
+<p>The consensus specification’s <code>get_forkchoice_store</code> asserts <code>anchor_block.state_root == hash_tree_root(anchor_state)</code>: the anchor state is meant to be the anchor block’s own post-state. A checkpoint-synced anchor is not, in general: the Beacon API’s <code>states/finalized</code> endpoint resolves to the state at <code>finalized_checkpoint.epoch.start_slot()</code>, and when that boundary slot was empty (no block was proposed there), the state has advanced past its own <code>latest_block_header</code> by one or more empty slots, so its own root no longer matches what the header committed to. This is routine on mainnet, not a transient race: an empty slot at an epoch boundary is a normal outcome, not a fault to work around.</p>
+<p>Both <code>get_forkchoice_store</code> (<code>ethlambda_state_transition::beacon::fork_choice</code>, the specification’s own construction rules) and the checkpoint-sync path’s own pairing check instead verify that the state’s <code>latest_block_header</code> hashes to the anchor block’s own root, substituting the state’s own root for the header’s <code>state_root</code> field when that field still holds its zero placeholder. (That field is left zero only for the duration of the header’s own slot; <code>process_slot</code> fills it in with the real value the moment the slot moves past it, so once the slot has advanced the header already carries the real value and is trusted as-is.) The header root pins the pair just as precisely as the specification’s check does, since it names exactly one block, and unlike the state’s own root it is unaffected by the state having advanced past that block.</p>
+<p>This is a <strong>documented deviation from the consensus specification</strong>, not an oversight: lighthouse’s checkpoint-sync client (<code>beacon_node/beacon_chain/src/builder.rs</code>, <code>weak_subjectivity_state</code>) makes the same one, for the same reason.</p>
+<p>Lean’s own anchor pairing (<code>anchor_pair_is_consistent</code>) needs no such deviation: lean’s finalized-state endpoint always names the state at the same slot as the anchor block itself, so there is no epoch-boundary snapping and no empty-slot gap between them to account for.</p>
 <h2 id="security-considerations"><a class="header" href="#security-considerations">Security Considerations</a></h2>
 <h3 id="trust-model"><a class="header" href="#trust-model">Trust model</a></h3>
 <p>Checkpoint sync operates under a <a href="https://blog.ethereum.org/2014/11/25/proof-stake-learned-love-weak-subjectivity"><strong>weak subjectivity</strong></a> assumption. In proof of work, any node can objectively determine the canonical chain by verifying the most cumulative work. Proof of stake doesn’t have this property: validators can costlessly sign multiple forks, so a node that wasn’t online to observe the chain in real time cannot distinguish the real chain from a fabricated one using protocol rules alone.</p>
@@ -281,9 +331,8 @@
 </ul>
 <p>What verification <strong>does</strong> protect against:</p>
 <ul>
-<li>Wrong network (genesis time mismatch)</li>
-<li>Wrong validator set (pubkey or count mismatch)</li>
-<li>Structurally invalid states (impossible slot orderings, inconsistent checkpoints)</li>
+<li>Wrong network (genesis time or genesis validators root mismatch)</li>
+<li>Structurally invalid states (impossible slot or epoch orderings, inconsistent checkpoints, a block that does not pair with its state)</li>
 <li>Corrupted data (SSZ decode failures)</li>
 </ul>
 <p>What verification <strong>does not</strong> protect against:</p>

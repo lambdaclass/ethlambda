@@ -34,10 +34,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fa33901c.js";
+            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-7b7e66e6.js"></script>
+        <script src="toc-34fa44cf.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,7 +182,7 @@
                         <h1 id="-storage-what-lives-where"><a class="header" href="#-storage-what-lives-where">💾 Storage: What Lives Where</a></h1>
 <p>This doc explains how ethlambda saves data. Especially,
 the split between the fork choice <code>Store</code> and the <code>StorageBackend</code> trait,
-what each of the eight tables holds, and which data is in-memory only.</p>
+what each of the ten tables holds, and which data is in-memory only.</p>
 <h2 id="overview"><a class="header" href="#overview">Overview</a></h2>
 <p>All chain data flows through a single high-level type, the <strong><code>Store</code></strong>
 (<code>crates/storage/src/store.rs</code>), which persists it through a small pluggable
@@ -229,8 +229,11 @@ Everything persisted is SSZ-encoded bytes.</p>
 <p>The <code>StorageBackend</code> trait knows nothing about consensus types. It moves raw
 bytes in and out of named tables:</p>
 <ul>
-<li><code>begin_read()</code> returns a <code>StorageReadView</code> with <code>get(table, key)</code> and
-<code>prefix_iterator(table, prefix)</code>.</li>
+<li><code>begin_read()</code> returns a <code>StorageReadView</code>. Its one required lookup is
+<code>read(table, key, read_fn)</code>, which lends the value to <code>read_fn</code> without
+copying it; <code>get</code> (an owned copy) and <code>contains</code> are built on it, and
+<code>StorageReadViewExt::read_with</code> decodes straight from the borrowed bytes.
+It also has <code>prefix_iterator(table, prefix)</code>.</li>
 <li><code>begin_write()</code> returns a <code>StorageWriteBatch</code> with <code>put_batch</code>,
 <code>delete_batch</code>, and <code>commit()</code>. A batch stages puts and deletes across
 <strong>multiple tables</strong> and applies them <strong>atomically</strong> on commit.</li>
@@ -242,7 +245,7 @@ bytes in and out of named tables:</p>
 <tr><th>Backend</th><th>Details</th></tr>
 </thead>
 <tbody>
-<tr><td><code>RocksDBBackend</code></td><td>One column family per table. Writes go through a native <code>WriteBatch</code> with <code>sync=false</code> (no fsync per commit).</td></tr>
+<tr><td><code>RocksDBBackend</code></td><td>One column family per table. Writes go through a native <code>WriteBatch</code> with <code>sync=false</code> (no fsync per commit). <code>States</code> and <code>StateDiffs</code> keep values of 4 KiB and up in LZ4-compressed blob files, so compaction never rewrites a snapshot and a lookup miss never reads one.</td></tr>
 <tr><td><code>InMemoryBackend</code></td><td>A <code>HashMap</code> per table behind an <code>RwLock</code>. Its <code>prefix_iterator</code> sorts keys lexicographically to match RocksDB’s iteration order, because pruning relies on slot-ordered early-stop scans (see <a href="#key-encoding">Key encoding</a>).</td></tr>
 </tbody>
 </table>
@@ -276,35 +279,38 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
    │   │ StateDiffs          │         │   attestations)      │    │
    │   │ Metadata            │         │ gossip_signatures    │    │
    │   │ LiveChain           │         │  (raw XMSS sigs      │    │
-   │   └─────────────────────┘         │   awaiting           │    │
-   │                                   │   aggregation)       │    │
-   │   Survives restarts.              │ state_cache (LRU)    │    │
+   │   │ DataColumns         │         │   awaiting           │    │
+   │   │ PendingDataColumns  │         │   aggregation)       │    │
+   │   └─────────────────────┘         │ state_cache (LRU)    │    │
    │                                   └──────────────────────┘    │
-   │                                                               │
-   │                                   Lost on restart.            │
+   │   Survives restarts, except                                   │
+   │   PendingDataColumns, which       Lost on restart.            │
+   │   is cleared at startup.                                      │
    └───────────────────────────────────────────────────────────────┘
 </code></pre>
 <h2 id="the-tables"><a class="header" href="#the-tables">The Tables</a></h2>
-<p>The eight variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
+<p>The ten variants of the <code>Table</code> enum (<code>crates/storage/src/api/tables.rs</code>):</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Table</th><th>Key</th><th>Value</th><th>Pruned?</th></tr>
 </thead>
 <tbody>
-<tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code></td><td>never</td></tr>
-<tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code></td><td>never</td></tr>
+<tr><td><code>BlockHeaders</code></td><td>root</td><td><code>BlockHeader</code>, or a whole beacon block</td><td>never</td></tr>
+<tr><td><code>BlockBodies</code></td><td>root</td><td><code>BlockBody</code> (lean only)</td><td>never</td></tr>
 <tr><td><code>BlockProof</code></td><td>slot ‖ root</td><td>aggregate proof (<code>MultiMessageAggregate</code>)</td><td>yes: finalized older than ~1 day</td></tr>
 <tr><td><code>BlockRoots</code></td><td>slot</td><td>block root (<code>H256</code>)</td><td>never</td></tr>
 <tr><td><code>States</code></td><td>root</td><td>full <code>State</code> snapshot</td><td>never</td></tr>
 <tr><td><code>StateDiffs</code></td><td>root</td><td><code>StateDiff</code></td><td>never</td></tr>
 <tr><td><code>Metadata</code></td><td>string</td><td>SSZ scalars</td><td>never</td></tr>
 <tr><td><code>LiveChain</code></td><td>slot ‖ root</td><td><code>parent_root</code></td><td>yes: below finalized</td></tr>
+<tr><td><code>DataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded)</td><td>no (see <a href="#datacolumns">DataColumns</a> below)</td></tr>
+<tr><td><code>PendingDataColumns</code></td><td>slot ‖ root ‖ column_index</td><td><code>DataColumnSidecar</code> (SSZ-encoded), unverified</td><td>yes: on replay, below finalized, and wholly at startup</td></tr>
 </tbody>
 </table>
 </div>
 <h3 id="key-encoding"><a class="header" href="#key-encoding">Key encoding</a></h3>
-<p>Three key layouts are used:</p>
+<p>Four key layouts are used:</p>
 <ul>
 <li><strong>Root-keyed</strong> tables use the 32-byte SSZ encoding of the block root
 (<code>root.to_ssz()</code>).</li>
@@ -313,6 +319,13 @@ is built from it, and clones are handed to the BlockChain and P2P actors.</p>
 32-byte root. Big-endian means lexicographic key order equals numeric slot
 order, so pruning can iterate from the start of the table and stop at the
 first key past its cutoff instead of scanning everything.</li>
+<li><strong>Slot-prefixed, then column</strong> (<code>DataColumns</code>) extends the same
+<code>slot ‖ root</code> prefix with an 8-byte big-endian <code>column_index</code>, via
+<code>data_column_key</code>. A block’s own sidecars therefore share one lexicographic
+run under their <code>slot ‖ root</code>, so a prefix scan over just that pair (what
+<code>data_column_indices_for</code> and the by-range handler both do; see
+<a href="#datacolumns">DataColumns</a>) recovers every column of one block without
+touching any other block’s.</li>
 <li><strong>Slot-only</strong> (<code>BlockRoots</code>) uses <code>encode_block_root_key</code>: just the 8-byte
 big-endian slot, since the value already holds the root. This table is
 never pruned, so the ordering buys nothing here; it is kept only for
@@ -323,12 +336,28 @@ consistency with the other slot-prefixed keys.</li>
 block, and never pruned: headers are the permanent record of the chain.
 Headers are also read back during state reconstruction (see
 <a href="#state-storage-snapshots--diffs">State Storage</a>).</p>
+<p>On a <strong>beacon</strong> directory this row holds the whole <code>SignedBeaconBlock</code>
+instead, prefixed with a one-byte fork selector the way a <code>States</code> value is,
+since a beacon block’s shape varies by fork and SSZ carries no type tag. The
+two shapes never coexist in one table: a data directory holds one chain for
+its whole life (see <code>Chain</code>).</p>
+<p><code>Store::block_entry</code> is the chain-agnostic reader for a stored block’s slot
+and parent root, and is what the fork-choice tree walk and the <code>BlockRoots</code>
+index diff share. On the beacon arm it decodes the whole block to reach those
+two fields, so a caller walking a chain of them should build
+<code>Store::block_index</code> once instead, which reads the same links out of
+<code>LiveChain</code>.</p>
 <h3 id="blockbodies"><a class="header" href="#blockbodies">BlockBodies</a></h3>
-<p><code>root → BlockBody</code>. Written for every block <strong>except</strong> those with an empty
-body: if <code>header.body_root == EMPTY_BODY_ROOT</code> (the hash tree root of
-<code>BlockBody::default()</code>), nothing is stored and reads synthesize
+<p><code>root → BlockBody</code>, <strong>lean only</strong>. Written for every block <strong>except</strong> those
+with an empty body: if <code>header.body_root == EMPTY_BODY_ROOT</code> (the hash tree
+root of <code>BlockBody::default()</code>), nothing is stored and reads synthesize
 <code>BlockBody::default()</code>. This covers the genesis block and checkpoint sync
 anchors, whose bodies are either empty or unavailable. Never pruned.</p>
+<p>The split exists so a header-only query need not pay for the body, and so an
+empty body can be left out entirely. A beacon block has neither property, and
+nothing reads a beacon header without its block, so the beacon arm writes no
+row here at all: a second row would only add a write and a way for the two to
+disagree.</p>
 <h3 id="blockproof"><a class="header" href="#blockproof">BlockProof</a></h3>
 <p><code>slot ‖ root → MultiMessageAggregate</code>. This table stores the block’s <strong>merged
 aggregate proof blob</strong>. It is keyed by <code>slot ‖ root</code> so that pruning can scan in
@@ -368,35 +397,140 @@ state. Never pruned, so together with the snapshots this preserves the full
 state history. See <a href="#state-storage-snapshots--diffs">State Storage</a> for what a
 diff contains and how states are rebuilt.</p>
 <h3 id="metadata"><a class="header" href="#metadata">Metadata</a></h3>
-<p>String keys mapping to SSZ-encoded scalars — the <code>Store</code>’s own persistent
-fields:</p>
+<p>String keys mapping to (mostly) SSZ-encoded scalars — the <code>Store</code>’s own
+persistent fields. Four are written on every directory, whichever chain it
+holds; the rest are chain-specific, since lean and a beacon directory keep
+different checkpoints.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Key</th><th>Type</th><th>Meaning</th></tr>
+<tr><th>Key</th><th>Type</th><th>Chain</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>time</code></td><td><code>u64</code></td><td>Intervals elapsed since genesis (the store clock)</td></tr>
-<tr><td><code>config</code></td><td><code>ChainConfig</code></td><td>Genesis time and slot duration</td></tr>
-<tr><td><code>head</code></td><td><code>H256</code></td><td>Current fork choice head</td></tr>
-<tr><td><code>safe_target</code></td><td><code>H256</code></td><td>Current safe target (see <a href="lmd_ghost.html">lmd_ghost.md</a>)</td></tr>
-<tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>Latest justified checkpoint</td></tr>
-<tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>Latest finalized checkpoint</td></tr>
+<tr><td><code>db_version</code></td><td><code>u64</code></td><td>both</td><td>On-disk format version this directory was written at</td></tr>
+<tr><td><code>chain</code></td><td>raw byte</td><td>both</td><td>Which consensus protocol this directory holds (<code>Chain</code>)</td></tr>
+<tr><td><code>preset</code></td><td>raw byte</td><td>both</td><td>Which SSZ preset the writing build used (<code>Preset</code>)</td></tr>
+<tr><td><code>time</code></td><td><code>u64</code></td><td>both</td><td>The store clock, as a <strong>UNIX timestamp in milliseconds</strong></td></tr>
+<tr><td><code>config</code></td><td><code>Config</code></td><td>both</td><td>The node’s runtime configuration</td></tr>
+<tr><td><code>head</code></td><td><code>H256</code></td><td>both</td><td>Current fork choice head</td></tr>
+<tr><td><code>anchor_slot</code></td><td><code>u64</code></td><td>both</td><td>The slot this directory’s chain begins at</td></tr>
+<tr><td><code>safe_target</code></td><td><code>H256</code></td><td>lean</td><td>Current safe target (see <a href="lmd_ghost.html">lmd_ghost.md</a>)</td></tr>
+<tr><td><code>latest_justified</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest justified checkpoint</td></tr>
+<tr><td><code>latest_finalized</code></td><td><code>Checkpoint</code></td><td>both</td><td>Latest finalized checkpoint</td></tr>
+<tr><td><code>beacon_unrealized_justified</code></td><td><code>Checkpoint</code></td><td>beacon</td><td>Unrealized justified checkpoint (beacon <code>Checkpoint</code>)</td></tr>
+<tr><td><code>beacon_unrealized_finalized</code></td><td><code>Checkpoint</code></td><td>beacon</td><td>Unrealized finalized checkpoint (beacon <code>Checkpoint</code>)</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>config</code> is the odd one out: <code>init_store</code> writes it once at bootstrap and
-nothing ever rewrites it afterward (it has a getter, <code>Store::config</code>, but no
-setter). Because it never changes, the <code>Store</code> keeps a copy in memory and
-reads of it never reach the backend. It is also part of the DB’s fingerprint:
-<code>from_db_state</code> refuses to resume a data directory belonging to another
-network (see <a href="#startup-and-restore">Startup and Restore</a>). Every other
-<code>Metadata</code> key is mutated in place as the chain progresses.</p>
+<p>Rows marked for one chain are never written on the other, so reaching one
+through the wrong chain’s accessor panics naming the key rather than reading a
+zero. That is deliberate: a data directory holds one chain for its whole life.</p>
+<h4 id="one-clock-three-readings"><a class="header" href="#one-clock-three-readings">One clock, three readings</a></h4>
+<p><code>time</code> is the only clock either chain keeps, and it is a UNIX millisecond.
+Milliseconds because the row has to be fine enough for the finest grid either
+chain schedules on, which is lean’s interval: with <code>INTERVALS_PER_SLOT</code>
+intervals to a slot, most interval boundaries fall strictly between two whole
+seconds, and a second-resolution row could not name them.</p>
+<p>Everything coarser is derived from it, exactly and in one direction:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Reading</th><th>Method</th><th>Used by</th></tr>
+</thead>
+<tbody>
+<tr><td>Milliseconds past genesis</td><td><code>Store::ms_since_genesis</code></td><td>placing a moment within the current slot, against the beacon basis-point deadlines</td></tr>
+<tr><td>Intervals past genesis</td><td><code>Store::intervals_since_genesis</code></td><td>lean’s tick pipeline, its future-slot guards, its fork-choice fixtures and the Hive driver</td></tr>
+<tr><td>Slot</td><td><code>Store::current_slot</code></td><td>both chains, including the beacon <code>get_slots_since_genesis</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Nothing stores a derived reading, so none of them can fall out of step with
+the row or with each other. The beacon specification denominates its own
+<code>Store.time</code> in seconds, so <code>on_tick</code> and <code>on_tick_per_slot</code> convert on the
+way in and the fixture harness divides on the way out; that conversion lives
+at those edges rather than in a second row.</p>
+<p>Lean’s <code>on_tick</code> writes the row only at interval boundaries, since the
+boundary is what it has actually processed: it walks forward one interval at a
+time running that interval’s duty, and the leftover milliseconds up to the
+tick’s own timestamp carry no duty that has run. The one time it moves the
+clock backwards is the deliberate rewind that replays a slot after a gap.</p>
+<h4 id="format-and-shape-tags"><a class="header" href="#format-and-shape-tags">Format and shape tags</a></h4>
+<p><code>db_version</code>, <code>chain</code> and <code>preset</code> are what <code>from_db_state</code> checks before it
+decodes anything else, and the two tags are raw bytes rather than SSZ for that
+reason: they have to be readable by a build that would decode the rest of the
+directory into the wrong shape. <code>db_version</code> catches a layout change this build
+knows about; <code>chain</code> catches lean rows being opened as beacon or the reverse;
+<code>preset</code> catches a <code>preset-minimal</code> build opening a mainnet directory, which
+the other two cannot, since both presets write the same layout at the same
+version while bounding every SSZ container differently. None of the three has a
+migration path.</p>
+<p><code>config</code> and <code>chain</code> are the odd ones out among the mutable rows: written once
+at bootstrap (<code>init_store</code> for lean, <code>init_beacon</code> for beacon) and never
+rewritten afterward (<code>config</code> has a getter, <code>Store::config</code>, and <code>chain</code> has
+<code>Store::chain</code>, but neither has a setter). Because they never change, the
+<code>Store</code> keeps a copy of each in memory, and reads of them never reach the
+backend. Every other <code>Metadata</code> key is mutated in place as the chain
+progresses.</p>
+<p><code>config</code> used to double as the DB’s fingerprint on its own, with
+<code>from_db_state</code> refusing to resume a data directory belonging to another
+network. <code>from_db_state</code> no longer judges the network or the chain (see
+<a href="#startup-and-restore">Startup and Restore</a>): it reads <code>config</code> and <code>chain</code>
+back and hands both to the caller, which compares <code>config</code>’s <code>genesis_time</code>
+and slot duration (and <code>genesis_validators_root</code>, computed off the anchored
+state itself rather than stored in <code>Metadata</code>) against the network it was
+configured for, and <code>chain</code> against the sub-command it is running. A beacon
+resume goes further, comparing every chain value in <code>config</code> (the fork
+schedule, the slot time, <code>PRESET_BASE</code>, …) against the <code>config.yaml</code> it was
+started with, in <code>first_config_difference</code>. <code>CONFIG_NAME</code> is the exception: a
+label with no consensus effect, so a changed one is only warned about, and the
+stored name stays, since <code>config</code> is never rewritten.</p>
+<p>A beacon directory <strong>shares</strong> <code>head</code>, <code>latest_justified</code> and <code>latest_finalized</code>
+rather than keeping parallel ones. <code>init_beacon</code> seeds all three from one
+trusted anchor, exactly as <code>init_store</code> seeds them on a lean directory, so
+<code>update_checkpoints</code> is a single writer for both chains instead of growing an
+absent-key branch per chain. The specification gives a trusted anchor’s
+finality the same starting value as its justification, rather than one actually
+reached through the FFG rules, which is why both start equal.</p>
+<p>The two chains denominate a checkpoint differently, and the stored form is
+lean’s: a beacon epoch is written as its own start slot. That is what makes the
+conversion exact in both directions, through
+<code>Store::beacon_checkpoint_as_stored</code> on the way in and
+<code>Store::beacon_finalized_checkpoint</code> on the way out, and it is what lets the
+shared finalization-advance comparison read a beacon checkpoint with no second
+rule for it.</p>
+<p>Note what is <em>not</em> in the table. There is no stored beacon head row:
+<code>beacon_head()</code> derives its pair from <code>head</code> plus the head block’s own entry,
+because a second row denominated in <code>slot ‖ root</code> would be a value that could
+drift from the first.</p>
+<p><code>init_beacon</code> writes the two beacon-only keys plus <code>db_version</code>, <code>chain</code>,
+<code>preset</code>, <code>config</code>, <code>time</code>, <code>head</code>, <code>anchor_slot</code>, <code>latest_justified</code> and
+<code>latest_finalized</code> in one atomic batch.</p>
+<p><code>anchor_slot</code> is the odd one among these: every other row is either a format
+tag or something a later writer moves, while this one is written once at
+bootstrap and never again, like <code>config</code> and <code>chain</code>. It has to be persisted
+rather than derived because it is the store’s only record of where its chain
+starts. <code>latest_finalized</code> is seeded to the anchor as well, but climbs away
+from it at the first finalization, so after that nothing else on disk can
+answer the question. Both bootstrap paths take it from the anchor block’s own
+slot — <code>anchor_state.latest_block_header.slot</code> on lean, <code>anchor_state.slot()</code>
+on beacon — rather than from the anchor checkpoint, whose beacon form is
+epoch-denominated and would name the epoch’s start slot instead. <code>from_db_state</code>
+reads it back into a <code>Store</code> field, so <code>Store::anchor_slot()</code> costs no backend
+round trip; the <code>Status</code> message’s <code>earliest_available_slot</code> and the
+<code>data_column_sidecars_by_range/1</code> floor are both that one value, which is what
+keeps a refusal from contradicting an advertisement. A directory’s finalized state root, whichever chain it
+holds, is read through <code>Store::finalized_state_root</code>. That needs no
+chain-specific branch: both chains keep their finalized checkpoint in
+<code>latest_finalized</code>, and the epoch-to-slot conversion above touches only the
+slot, never the root. It treats a zero root as <code>Error::UnanchoredDirectory</code>
+rather than a valid answer, since both <code>init_store</code> and <code>init_beacon</code> always
+anchor at a real block root, so a zero root means the directory was built some
+other way or its metadata was corrupted at rest.</p>
 <p>Note that this is <em>not</em> the SSZ <code>StateConfig</code> carried inside <code>State</code>. That one is
 merkleized into the state root, so its layout is fixed by the spec and holds only
-<code>genesis_time</code>; <code>ChainConfig</code> adds the slot duration, which the node needs to
-schedule duties but which never enters a state root. A blob written before the slot
-duration existed still decodes, filling in the 4-second default that chain ran on.</p>
+<code>genesis_time</code>; the runtime <code>Config</code> adds the slot duration and the beacon fork
+schedule, which the node needs to schedule duties but which never enter a state
+root.</p>
 <h3 id="livechain"><a class="header" href="#livechain">LiveChain</a></h3>
 <p><code>slot ‖ root → parent_root</code>. A pure <strong>index</strong> for fork choice: it lets
 <code>get_live_chain()</code> build the <code>root → (slot, parent_root)</code> block tree without
@@ -409,6 +543,87 @@ block itself is kept).</p>
 while the block waits for its parent. When the block is later processed,
 <code>insert_signed_block</code> overwrites the same keys (idempotent) and adds the
 <code>LiveChain</code> entry.</p>
+<h3 id="datacolumns"><a class="header" href="#datacolumns">DataColumns</a></h3>
+<p><code>slot ‖ root ‖ column_index → DataColumnSidecar</code> (SSZ-encoded). Beacon only:
+this is where a fulu data-availability-sampling follower keeps the column
+sidecars its own node id assigned it custody of, so it can verify a block’s
+availability and answer <code>data_column_sidecars_by_{root,range}/1</code> for peers;
+see <a href="./beacon_wire.html#data-column-sidecars">beacon_wire.md</a> for the wire side
+and how a node’s custody set is selected.</p>
+<p>Keyed slot-first, ahead of the root, for the same reason <code>BlockProof</code> is: it
+gives a by-range answer a prefix scan per slot instead of a full-table scan,
+and gives a future pruner a scan that stops early once it passes its cutoff.
+Every writer and reader already has the slot in hand — an arriving sidecar
+carries <code>signed_block_header.message.slot</code>, and the availability check and the
+held-block release path both start from the block itself — so the slot prefix
+costs nothing to supply.</p>
+<p>Sidecars are written on arrival, once the p2p layer has verified one (gossip
+validation for a sidecar gossip accepted, the chain checks in
+<code>beacon::gossip::column::chain_checks</code> for any other), rather than at block
+import. That ordering is what lets the availability
+gate read a block’s columns before the block itself is allowed to import (a
+column has to exist first for the gate to find it), and what lets a restart
+keep every sidecar this node already paid a KZG batch to verify rather than
+re-fetching and re-verifying them. One consequence: a sidecar is stored for
+any block whose header, parent and proposer check out, whether or not that
+block ever actually imports — an equivocation or an orphaned fork’s sidecars
+land here too, since gossip only requires a known, unfinalized parent, not a
+canonical one. <code>data_column_sidecars_in_range</code> (the by-range handler’s source)
+compensates by restricting each slot’s answer to that slot’s canonical root
+via <code>BlockRoots</code>, so a losing sibling’s columns are stored but never served.</p>
+<p><code>DataColumns</code> is the one table in the enum with <strong>no pruning rule at all</strong>,
+not even the finalized-window pruning <code>LiveChain</code> and <code>BlockProof</code> get: every
+sidecar this node has ever custodied is kept forever, by design, until a
+pruner is written (<code>MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS</code> is the
+epoch depth spec gives a future one permission to prune below). That makes it
+the one table whose size a long-running node must actually watch rather than
+assume bounded: at the blob cap this is roughly 360 KB per slot across the
+columns this node custodies, nearer 1 GB per day at current mainnet blob
+counts. <code>lean_table_bytes{table="data_columns"}</code> (see <a href="./metrics.html">metrics.md</a>)
+is that growth made visible; watch it, and size the disk against however long
+the node runs unattended before a pruner exists.</p>
+<h3 id="pendingdatacolumns"><a class="header" href="#pendingdatacolumns">PendingDataColumns</a></h3>
+<p>Same key and same encoding as <code>DataColumns</code>, holding sidecars that have <strong>not
+been verified yet</strong>. A sidecar lands here when its block’s parent has no
+post-state for the chain checks to check the proposer against: the parent may
+still be in flight, or it may be a block the availability gate is itself
+holding. The specification’s gossip rule for that case is <code>[IGNORE]</code> with an
+explicit licence to come back to it, so the sidecar is parked rather than
+dropped, and sent back through the chain checks when the parent gains a
+post-state.</p>
+<p>Two tables rather than one, and that is the whole point of this one. A parked
+sidecar has passed only the cheap structural checks — not its inclusion proof,
+not its KZG batch, not its proposer signature, which are held back so a replay
+pays for them once rather than once per attempt. <code>data_column_indices_for</code>
+reads <code>DataColumns</code> and nothing else, and that read is what the data
+availability gate believes; an unverified row there would let a peer satisfy
+the gate with a column nothing ever judged. A row moves from here to
+<code>DataColumns</code> only by passing every check when it is sent back.</p>
+<p>The chain actor keeps one key per parked row in memory
+(<code>sidecars_awaiting_parent</code>, keyed by the parent root it waits on) and the
+bytes here, because a sidecar carries a cell per blob and the queue’s size is
+chosen by whichever peer is gossiping.</p>
+<p>Nothing caps that queue. The finality sweep that evicts held blocks also
+deletes the rows of parked sidecars at or below the finalized slot, and that is
+the only thing reclaiming them, so it bounds how <em>long</em> a row lives but not how
+fast rows arrive. The chain checks do not require a sidecar’s
+<code>parent_root</code> to name a block this node knows. Every parked sidecar, gossiped
+or fetched, has had its header’s signature checked against the head state
+before it gets this far, but only when a head state is already cached <em>and</em>
+the header’s <code>proposer_index</code> names a validator in it: with no cached head
+state, or a proposer index that names none (<code>u64::MAX</code>, say), the checks skip
+that step and a made-up header still reaches here. A peer exploiting either
+gap can still park rows as fast as it can invent a slot, proposer and index.
+Watch
+<code>lean_sidecars_awaiting_parent</code>: it is the only signal that this is
+happening, and unlike <code>DataColumns</code> these rows were written on a peer’s
+say-so.</p>
+<p>That in-memory map is also the <em>only</em> index into this table, and it does not
+survive a restart, so <code>start_actor</code> clears the table outright before building
+an empty one. Nothing is lost: a parked sidecar had passed no check worth
+preserving, and the block it belongs to asks for its columns again. Without
+that, every crash would leave every row it had parked unreadable, kept until
+the directory was deleted.</p>
 <h2 id="state-storage-snapshots--diffs"><a class="header" href="#state-storage-snapshots--diffs">State Storage: Snapshots + Diffs</a></h2>
 <p>Storing a full <code>State</code> per block would be wasteful: most fields never change
 or change predictably. Instead, <code>insert_state</code> writes:</p>
@@ -489,14 +704,17 @@ sequence of independent write batches:</p>
    │       justified a higher slot)    (+ triggers pruning)
    │
    ├─ 2. insert_signed_block()  ┐            BlockHeaders[root]
-   │                            │            BlockBodies[root]    (if non-empty)
+   │                            │            BlockBodies[root]    (lean, if non-empty)
    │                            ├─one batch─ BlockProof[slot‖root]
    │                            │            LiveChain[slot‖root]
    │                            ┘
    │
-   ├─ 3. insert_state()         ┐            StateDiffs[root]
-   │                            ├─one batch─ States[root]         (anchors only)
-   │                            ┘            (+ LRU cache insert)
+   ├─ 3. insert_state()                 cache + PendingStates insert (synchronous),
+   │      (hands the state to the        then a hand-off to the background writer
+   │       storage crate's own writer     thread, which commits
+   │       thread; see below)                   StateDiffs[root]
+   │                                            States[root]         (anchors only)
+   │                                      on its own schedule, not this one
    │
    └─ 4. update_head()                 Metadata: head
           (re-runs fork choice)        (+ justified/finalized if advanced,
@@ -504,16 +722,30 @@ sequence of independent write batches:</p>
                                           + pruning on finalization)
 </code></pre>
 <p>Each numbered step is atomic on its own, but the import as a whole is <strong>not</strong>
-one transaction. The commit order keeps the on-disk store consistent after any
-prefix of these steps: the justified checkpoint written in step 1 always names
-an already-persisted <strong>ancestor</strong> of the imported block (the state transition
-only counts attestations whose roots match the state’s own
-<code>historical_block_hashes</code>, and every ancestor was fully persisted when it was
-imported), and the head only advances in step 4, after the block and state are
-durable. A crash mid-import can therefore lose the tail of the import — e.g. a
-persisted block and state the head does not point to yet — but never leave
-metadata referencing missing data. Re-importing the block is idempotent (a
-duplicate is skipped via <code>has_state</code>).</p>
+one transaction, and step 3 is no longer one write at all: <code>insert_state</code>
+returns once the state is cached and buffered (see <code>crates/storage/src/state_writer.rs</code>),
+not once the writer thread has actually committed it. That thread drains a
+FIFO one state behind the importer at most (<code>STATE_WRITE_QUEUE_CAPACITY = 2</code>,
+plus the one write it can be holding), so steps 1, 2 and 4 can all reach disk
+before step 3’s own commit does. An unclean shutdown inside that window can
+therefore leave <code>head</code> (from step 4), or <code>latest_justified</code> (from step 1, for
+an even earlier block whose own step 3 might itself still be mid-flight), or
+the finalized checkpoint <code>update_head</code> derives from the head state, naming a
+root this directory has no state for yet — the exact thing “never leave
+metadata referencing missing data” used to rule out, before the state write
+moved off the importer’s thread.</p>
+<p><code>Store::repair_head</code>, called by a resuming caller (see
+<a href="#startup-and-restore">Startup and Restore</a> below), is what restores that
+property for the head: it walks back to the newest ancestor with a persisted
+state and rewinds there, dropping the <code>LiveChain</code> rows of whatever it hops
+over so fork choice does not walk straight back to the stateless tip.
+Justified and finalized are never rewound the same way — they are consensus
+statements, not a pointer a repair may quietly move to an earlier one — so
+<code>Store::verify_anchor_states</code> checks them instead, and a directory that fails
+it is treated as needing a fresh anchor. Re-importing a block whose <code>LiveChain</code>
+row was dropped this way is idempotent the same way any duplicate is: the skip
+check is keyed on <code>has_state</code>, not on whether the block is already on record,
+so a stateless block is reprocessed rather than skipped.</p>
 <h2 id="pruning"><a class="header" href="#pruning">Pruning</a></h2>
 <p>Pruning is driven by finalization and splits into a cheap immediate phase and
 a deferred heavy phase.</p>
@@ -539,13 +771,20 @@ are never touched. Finalized blocks can never revert, so their proofs are
 not needed for fork choice, reorg safety, or re-aggregation once outside
 the window.</li>
 </ul>
-<p><strong>Never pruned:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>, <code>States</code>,
-<code>StateDiffs</code>, and <code>Metadata</code>. Headers, bodies, the canonical slot index, and
-the snapshot+diff chain are the full historical record; only the proof blobs
-and the (non-finalized) fork choice index are disposable.</p>
+<p><strong>Never pruned, by design:</strong> <code>BlockHeaders</code>, <code>BlockBodies</code>, <code>BlockRoots</code>,
+<code>States</code>, <code>StateDiffs</code>, and <code>Metadata</code>. Headers, bodies, the canonical slot
+index, and the snapshot+diff chain are the full historical record; only the
+proof blobs and the (non-finalized) fork choice index are disposable.</p>
+<p><strong>Not pruned yet, unlike the six above:</strong> <code>DataColumns</code>. It is not part of the
+historical-record set above; it simply has no pruning rule written for it,
+which is a gap rather than a decision — see <a href="#datacolumns">DataColumns</a> for
+what bounds it in the meantime (<code>lean_table_bytes{table="data_columns"}</code>) and
+where a future pruner is meant to land
+(<code>MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS</code>).</p>
 <h2 id="in-memory-only-lost-on-restart"><a class="header" href="#in-memory-only-lost-on-restart">In-Memory Only (Lost on Restart)</a></h2>
-<p>Four <code>Store</code> fields never touch the backend. All are bounded buffers shared
-across <code>Store</code> clones:</p>
+<p>Five <code>Store</code> fields never touch the backend. All are bounded buffers (or, for
+<code>beacon</code>, bounded in practice by the validator set and the unfinalized window)
+shared across <code>Store</code> clones:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -555,7 +794,8 @@ across <code>Store</code> clones:</p>
 <tr><td><code>new_payloads</code></td><td>64 messages</td><td>Pending aggregated attestation proofs, not yet active for fork choice</td></tr>
 <tr><td><code>known_payloads</code></td><td>512 messages</td><td>Fork-choice-active aggregated proofs</td></tr>
 <tr><td><code>gossip_signatures</code></td><td>2048 signatures</td><td>Raw per-validator XMSS signatures awaiting aggregation (each ~3 KB, so ~6 MB worst case)</td></tr>
-<tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of reconstructed/imported states</td></tr>
+<tr><td><code>state_cache</code></td><td>32 states</td><td>LRU memoization of block <em>and</em> checkpoint post-states (either chain), each held behind an <code>Arc</code> so a hit is not a copy; one bound covers both kinds, keyed apart by a small enum, and a miss is just a reconstruction rather than an error</td></tr>
+<tr><td><code>beacon</code></td><td>unbounded</td><td>Beacon fork-choice scratch: proposer boost root, block timeliness, equivocating validator indices, latest messages, PoW blocks, and unrealized justifications. None of it is persisted: proposer boost resets every slot, timeliness is read only by the same-slot reorg helpers, equivocators come back from replaying attester slashings on sync, latest messages from one epoch of attestations, PoW blocks stand in for an execution-client call a restarted node would simply make again, and unrealized justifications are refilled as a node re-imports the unfinalized window from its anchor</td></tr>
 </tbody>
 </table>
 </div>
@@ -569,9 +809,9 @@ section of <a href="lmd_ghost.html">lmd_ghost.md</a> for how attestations move b
 pools.</p>
 <p>After a restart these buffers start empty: pending attestations and
 un-aggregated gossip signatures are lost and must be re-collected from the
-network. Everything persisted in the eight tables survives.</p>
+network. Everything persisted in the ten tables survives, except <code>PendingDataColumns</code>, which is cleared outright: its only index is in memory.</p>
 <h2 id="startup-and-restore"><a class="header" href="#startup-and-restore">Startup and Restore</a></h2>
-<p>A <code>Store</code> is created through one of three constructors in
+<p>A <code>Store</code> is created through one of four constructors in
 <code>crates/storage/src/store.rs</code>:</p>
 <div class="table-wrapper">
 <table>
@@ -579,29 +819,63 @@ network. Everything persisted in the eight tables survives.</p>
 <tr><th>Constructor</th><th>When</th><th>What it does</th></tr>
 </thead>
 <tbody>
-<tr><td><code>from_anchor_state</code></td><td>Genesis boot</td><td>Initializes from the genesis state (no anchor block body)</td></tr>
-<tr><td><code>get_forkchoice_store</code></td><td><a href="checkpoint_sync.html">Checkpoint sync</a></td><td>Initializes from a downloaded finalized state + anchor block, after validating they are consistent</td></tr>
-<tr><td><code>from_db_state</code></td><td>Resume from an existing data directory</td><td>Re-opens the persisted store as-is</td></tr>
+<tr><td><code>from_anchor_state</code></td><td>Lean genesis boot</td><td>Initializes from the genesis state (no anchor block body)</td></tr>
+<tr><td><code>get_forkchoice_store</code></td><td>Lean <a href="checkpoint_sync.html">checkpoint sync</a></td><td>Initializes from a downloaded finalized state + anchor block, after validating they are consistent</td></tr>
+<tr><td><code>init_beacon</code></td><td>Beacon <a href="checkpoint_sync.html">checkpoint sync</a></td><td>Writes a beacon directory’s <code>Metadata</code> in one atomic batch, all seeded to one trusted anchor. The anchor block and state themselves are written separately, by <code>ethlambda_state_transition::beacon::fork_choice::get_forkchoice_store</code> (the specification’s own construction rules, which this crate cannot depend on)</td></tr>
+<tr><td><code>from_db_state</code></td><td>Resume from an existing data directory</td><td>Loads whichever chain the directory holds, without judging whether it is the right one</td></tr>
 </tbody>
 </table>
 </div>
 <p>The first two funnel into <code>init_store</code>, which writes the anchor in <strong>one
-atomic batch</strong>: all six <code>Metadata</code> keys (time = 0, config, head = safe_target
-= anchor root, justified = finalized = anchor checkpoint), the anchor header,
-its <code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code>
-(the base of every future diff chain), and the anchor’s <code>LiveChain</code> entry.</p>
-<p><code>from_db_state</code> is the restore path: it reads <code>config</code> and <code>latest_finalized</code>
-from <code>Metadata</code>, returning <code>None</code> for an empty DB. A populated DB from another
-network is fatal instead: the persisted <code>config</code>’s genesis time and slot
-duration, plus the finalized state’s genesis time and validator registry, are
-compared against the genesis config, and a mismatch fails with
-<code>Error::GenesisMismatch</code> rather than being treated as empty, since writing a
-fresh anchor would leave the foreign chain’s rows in place to be served to
-peers. The slot duration has to be checked against the persisted <code>config</code>
-because it is absent from the state by design. At startup the node prefers
-this path but only
-accepts the on-disk store if its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots (~30 minutes) behind the current slot; a staler DB falls through
-to checkpoint sync, which writes a fresh anchor on top of the existing data.</p>
+atomic batch</strong>: the <code>Metadata</code> keys a lean directory needs (the format version
+and the chain and preset tags, time, config, head = safe_target = anchor root,
+justified = finalized = anchor checkpoint), the anchor header, its
+<code>BlockRoots</code> entry, the body if non-empty, a full snapshot into <code>States</code> (the
+base of every future diff chain), and the anchor’s <code>LiveChain</code> entry. <code>time</code>
+starts at genesis rather than at zero because it is an absolute timestamp, so
+genesis is the value that means “the clock has not moved yet”; every derived
+reading is zero there.</p>
+<p><code>init_beacon</code>’s own atomic batch is the beacon-directory keys listed under
+<a href="#metadata">Metadata</a> above; the anchor’s <code>States</code>/<code>BlockHeaders</code>/<code>BlockBodies</code>
+entries are written by its caller instead, through the same <code>insert_state</code> and
+<code>insert_signed_block</code> an ordinary block import uses.</p>
+<p><code>from_db_state</code> is the restore path: it reads <code>db_version</code>, <code>preset</code>, <code>chain</code>,
+<code>config</code> and <code>anchor_slot</code> from <code>Metadata</code>, returning <code>None</code> for an empty DB. A format
+mismatch is still fatal, failing with <code>Error::DbVersionMismatch</code> or
+<code>Error::PresetMismatch</code> rather than reading on, but <code>from_db_state</code> no longer
+judges the network or the chain, and it does not mutate anything either: it
+hands back whichever chain the directory holds, without comparing either
+against anything or repairing anything. Both are now the caller’s job, in a
+fixed order: <code>fetch_initial_state</code> (lean) and <code>fetch_initial_beacon_state</code>
+(beacon) each check <code>Store::chain()</code> against the sub-command they are running
+under, then call <code>Store::verify_anchor_states</code> — which reads back both the
+justified and finalized checkpoints (see <a href="#metadata">Metadata</a> above) and
+confirms each has a persisted state, returning the finalized state — before
+running <code>verify_state_genesis</code> against it. Only once both of those pass does
+either caller call <code>Store::repair_head</code>, described under
+<a href="#write-paths-what-a-block-import-persists">Write Paths</a> above: it is a
+mutation, so it waits until the store it would mutate has been judged fit to
+resume at all, and it leans on <code>verify_anchor_states</code> having already confirmed
+finalized has a state, which is what lets it treat reaching finalized’s slot
+during its own walk as a plain stopping point rather than something it has to
+guard against.</p>
+<p>A chain mismatch aborts with <code>CheckpointSyncError::WrongChain</code>; a genesis
+mismatch aborts with <code>CheckpointSyncError::Genesis</code>, wrapping
+<code>GenesisMismatch::GenesisTime</code> or <code>::GenesisValidatorsRoot</code>; a missing anchor
+state (<code>storage::Error::AnchorStateLost</code>) is treated exactly like a stale DB,
+described next. All three used to be raised (the first two) or were not yet
+possible to raise (the third) from inside <code>from_db_state</code> itself; none of that
+judgment lives in the storage crate anymore, now that the checks that need it
+moved one layer up, to the caller that actually knows which network and which
+chain it wants. None of these failures are treated as an empty directory:
+writing a fresh anchor on top would leave the foreign (or merely incomplete)
+chain’s rows in place, to be served to peers.</p>
+<p>At startup, each chain prefers this path but only accepts the on-disk store if
+its head is at most <code>MAX_RESUMABLE_DB_STATE_AGE = 450</code> slots behind the
+current slot: ~30 minutes at lean’s four-second slots, ~90 minutes at beacon’s
+twelve-second ones. A staler DB, or one whose anchor checkpoint state is
+missing, falls through to checkpoint sync, which writes a fresh anchor on top
+of the existing data.</p>
 <h2 id="key-files"><a class="header" href="#key-files">Key Files</a></h2>
 <div class="table-wrapper">
 <table>
