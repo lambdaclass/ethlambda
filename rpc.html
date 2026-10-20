@@ -34,7 +34,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-1c4812f4.js";
+            window.path_to_searchindex_js = "searchindex-51374219.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -389,15 +389,21 @@ surface rather than sitting beside it; a <code>/lean/v0</code> path on a beacon 
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/headers/{block_id}</code></td><td>JSON</td><td><code>SignedBeaconBlockHeader</code>, plus <code>canonical</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v2/debug/beacon/states/{state_id}</code></td><td>JSON or SSZ</td><td><code>BeaconState</code> at <code>state_id</code></td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/finality_checkpoints</code></td><td>JSON</td><td>That state’s three checkpoints</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/fork</code></td><td>JSON</td><td>That state’s <code>Fork</code>: previous and current version, and the epoch it changed</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/beacon/genesis</code></td><td>JSON</td><td>Genesis time, validators root, fork version</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/config/spec</code></td><td>JSON</td><td>The store’s <code>Config</code>, plus <code>PRESET_BASE</code>, <code>CONFIG_NAME</code>, the preset and the constants (see below)</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/config/deposit_contract</code></td><td>JSON</td><td>The <code>Config</code>’s deposit chain id and contract address</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/syncing</code></td><td>JSON</td><td>Head slot, sync distance, optimistic flag</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/health</code></td><td><em>(status only)</em></td><td><code>200</code> caught up, <code>206</code> syncing</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/version</code></td><td>JSON</td><td>Client version string</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/node/identity</code></td><td>JSON</td><td>Peer ID and metadata only (see below)</td></tr>
 <tr><td><code>GET</code>, <code>POST</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators</code></td><td>JSON</td><td>Registry entries by index or pubkey, with status</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v1/beacon/states/{state_id}/validators/{validator_id}</code></td><td>JSON</td><td>One registry entry, by index or pubkey; <code>404</code> if there is none</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>Proposers for the head’s epoch or the next</td></tr>
+<tr><td><code>GET</code></td><td><code>/eth/v2/validator/duties/proposer/{epoch}</code></td><td>JSON</td><td>The same, with v2’s <code>dependent_root</code> (what Lighthouse asks for)</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/attester/{epoch}</code></td><td>JSON</td><td>Committee assignments for the given indices</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/duties/sync/{epoch}</code></td><td>JSON</td><td>Sync committee seats for the given indices, in the head’s current or next period</td></tr>
+<tr><td><code>POST</code></td><td><code>/eth/v1/validator/liveness/{epoch}</code></td><td>JSON</td><td>Whether this node saw each validator act in the epoch (doppelganger protection)</td></tr>
 <tr><td><code>GET</code></td><td><code>/eth/v1/validator/attestation_data</code></td><td>JSON</td><td>What to attest to at <code>slot</code></td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v2/beacon/pool/attestations</code></td><td><em>(status only)</em></td><td>Validate and gossip <code>SingleAttestation</code>s</td></tr>
 <tr><td><code>POST</code></td><td><code>/eth/v1/validator/beacon_committee_subscriptions</code></td><td><em>(status only)</em></td><td>Aggregators’ entries join their committee’s subnet</td></tr>
@@ -418,8 +424,31 @@ the chain actor writes, so no request waits on the actor.</p>
 duties read fulu’s <code>proposer_lookahead</code>, which covers the head’s epoch and the
 next; attester duties cover the head’s previous, current and next epoch,
 which is as far as its shuffling is already fixed. Anything else is a <code>400</code>.
-<code>dependent_root</code> follows each endpoint’s v1 definition. Attester duties walk
+<code>dependent_root</code> follows each endpoint’s v1 definition, except proposer
+duties v2, whose root is the block before the <em>previous</em> epoch (fulu fixes
+proposers an epoch ahead), or genesis where that would underflow; v2 is a
+<code>503</code> while syncing. Attester duties walk
 every committee of the epoch, a full shuffle per request on mainnet.</li>
+<li><strong>Sync duties</strong> read the head state’s <code>current_sync_committee</code> for an epoch in
+the head’s own sync committee period and <code>next_sync_committee</code> for the one
+after; any other period is a <code>400</code> (an earlier one would need a historical
+state; see <code>docs/spec_deviations.md</code>). A validator is matched by pubkey and
+gets every seat it holds, since the committee is drawn with replacement; one
+with no seat is left out. An unknown index is a <code>400</code>, and the endpoint is a
+<code>503</code> while the node is syncing. This node serves no sync committee message
+or contribution endpoint yet, so a validator client that gets duties here
+cannot publish what they ask for.</li>
+<li><strong>Liveness</strong> is this node’s own view, which the Beacon API allows. A
+validator is live in an epoch if the head state credits it for that epoch (a
+non-zero participation byte, so anything a block already included), <strong>or</strong>
+the node observed it act: an accepted gossip aggregate (its aggregator and
+every attester its signature verified) or subnet attestation, an imported
+block’s proposer, or a submission through <code>pool/attestations</code> or
+<code>aggregate_and_proofs</code>. The observed half covers what no block has included
+yet, most of the current epoch; it keeps the newest three epochs recorded,
+as one bitset each. The window is the store clock’s previous, current and
+next epoch (the next is always <code>false</code>); anything else, and an unknown
+index, is a <code>400</code>, and the endpoint is a <code>503</code> while the node is syncing.</li>
 <li><strong><code>attestation_data</code></strong> follows phase0’s <code>validator.md</code>: the head block, the
 epoch’s boundary block as target, and as source the current justified
 checkpoint of the head state advanced to the slot’s epoch (through fork
