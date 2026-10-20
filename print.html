@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-51374219.js";
+            window.path_to_searchindex_js = "searchindex-ddafbded.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-34fa44cf.js"></script>
@@ -5279,13 +5279,16 @@ knows about; <code>chain</code> catches lean rows being opened as beacon or the 
 the other two cannot, since both presets write the same layout at the same
 version while bounding every SSZ container differently. None of the three has a
 migration path.</p>
-<p><code>config</code> and <code>chain</code> are the odd ones out among the mutable rows: written once
-at bootstrap (<code>init_store</code> for lean, <code>init_beacon</code> for beacon) and never
-rewritten afterward (<code>config</code> has a getter, <code>Store::config</code>, and <code>chain</code> has
-<code>Store::chain</code>, but neither has a setter). Because they never change, the
-<code>Store</code> keeps a copy of each in memory, and reads of them never reach the
-backend. Every other <code>Metadata</code> key is mutated in place as the chain
-progresses.</p>
+<p><code>config</code> and <code>chain</code> are the odd ones out among the mutable rows: written at
+bootstrap (<code>init_store</code> for lean, <code>init_beacon</code> for beacon) and not mutated as
+the chain progresses. <code>chain</code> is never rewritten (it has a getter,
+<code>Store::chain</code>, and no setter). <code>config</code> is rewritten in one place,
+<code>Store::replace_config</code>, by a beacon resume whose config file changed values
+the directory does not contradict (see below), and that method panics unless
+its <code>Store</code> holds the only handle to the cached copy. Because neither changes
+once a <code>Store</code> is shared, the <code>Store</code> keeps a copy of each in memory, and
+reads of them never reach the backend. Every other <code>Metadata</code> key is mutated
+in place as the chain progresses.</p>
 <p><code>config</code> used to double as the DB’s fingerprint on its own, with
 <code>from_db_state</code> refusing to resume a data directory belonging to another
 network. <code>from_db_state</code> no longer judges the network or the chain (see
@@ -5294,11 +5297,22 @@ back and hands both to the caller, which compares <code>config</code>’s <code>
 and slot duration (and <code>genesis_validators_root</code>, computed off the anchored
 state itself rather than stored in <code>Metadata</code>) against the network it was
 configured for, and <code>chain</code> against the sub-command it is running. A beacon
-resume goes further, comparing every chain value in <code>config</code> (the fork
-schedule, the slot time, <code>PRESET_BASE</code>, …) against the <code>config.yaml</code> it was
-started with, in <code>first_config_difference</code>. <code>CONFIG_NAME</code> is the exception: a
-label with no consensus effect, so a changed one is only warned about, and the
-stored name stays, since <code>config</code> is never rewritten.</p>
+resume goes further, comparing every chain value in <code>config</code> (the slot time,
+<code>PRESET_BASE</code>, the churn limits, …) against the <code>config.yaml</code> it was started
+with, in <code>first_config_difference</code>. <code>CONFIG_NAME</code> is exempt: a label with no
+consensus effect, so a changed one is only warned about.</p>
+<p>The fork schedule and <code>BLOB_SCHEDULE</code> are compared against what the directory
+holds instead, because scheduling a fork is an edit to exactly those values,
+made after every existing node initialized its directory. A fork’s version or
+epoch may change as long as both the stored and the new epoch lie past the
+latest epoch the directory has processed: the highest <code>LiveChain</code> slot, or the
+finalized state’s slot when that is later (a checkpoint-sync anchor advanced
+through empty slots). So a fork that was unset and is now scheduled ahead of
+the chain resumes, while one moved onto or off a processed epoch is refused.
+A resume that passes then writes the config file over <code>config</code> with
+<code>Store::replace_config</code>: the node runs on the stored config, so keeping the
+old one would leave it on the old schedule. From then on the file’s values,
+<code>CONFIG_NAME</code> included, are the ones the node reports.</p>
 <p>A beacon directory <strong>shares</strong> <code>head</code>, <code>latest_justified</code> and <code>latest_finalized</code>
 rather than keeping parallel ones. <code>init_beacon</code> seeds all three from one
 trusted anchor, exactly as <code>init_store</code> seeds them on a lean directory, so
