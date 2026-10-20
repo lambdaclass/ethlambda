@@ -28,8 +28,36 @@ use crate::Bootnode;
 use admission::LeanFilter;
 use enr::{EnrForkId, LocalEnrParams, build_local_enr};
 
-/// How often the dial loop looks for a new peer.
-pub const DISCOVERY_DIAL_INTERVAL: Duration = Duration::from_secs(5);
+/// Dials per second the loop opens when this node has no peers at all.
+///
+/// A node short of peers is not idling, it is failing. Mainnet beacon nodes sit
+/// at their inbound cap and answer `Goodbye(129)`, "too many peers", within a
+/// millisecond of the handshake, so landing one with room is a numbers game:
+/// measured on the eth-4 follower, 96% of outbound dials never establish. The
+/// rate is set high enough that the 4% still arrives quickly, and it is a
+/// *starting* rate, not a standing one — see [`DIAL_INTERVAL_AT_TARGET`].
+pub const MAX_DIAL_RATE_PER_SECOND: u64 = 50;
+
+/// The gap between dials at [`MAX_DIAL_RATE_PER_SECOND`], which is the floor
+/// the pacing curve starts from.
+pub const DIAL_INTERVAL_AT_ZERO_PEERS: Duration =
+    Duration::from_micros(1_000_000 / MAX_DIAL_RATE_PER_SECOND);
+
+/// The gap between dials as the peer count reaches its target.
+///
+/// ethrex's `LOOKUP_INTERVAL_MS` itself, which it uses as the ceiling for both
+/// discv5 lookups and RLPx dialing, so the two layers slow down together. Its
+/// floor is 100ms against this node's 20ms, but the ceiling is worth matching
+/// exactly: it is reached while the table is nearly full and peers still churn,
+/// and a slower one there means replacing losses at the rate they happen
+/// instead of ahead of it. Read from upstream rather than copied, so "exactly"
+/// survives a retune there.
+///
+/// This is not where dialing stops. [`dial::dial_budget`] returns 0 at target
+/// and the loop opens nothing at all, so a fast ceiling costs nothing once the
+/// table is genuinely full.
+pub const DIAL_INTERVAL_AT_TARGET: Duration =
+    Duration::from_micros((ethrex_p2p::discovery::LOOKUP_INTERVAL_MS * 1_000.0) as u64);
 
 /// Default connected-peer count above which the dial loop stops dialing.
 /// Overridable per node via [`DiscoverySpawnConfig::target_peers`].
@@ -48,7 +76,12 @@ pub const DEFAULT_DISCOVERY_TARGET_PEERS: usize = 200;
 /// reason attached rather than a number pretending to be a peer budget.
 const PEER_TABLE_TARGET_PEERS: usize = 1;
 
-/// Candidates drawn from the peer table per refill.
+/// Admitted contacts [`dial::spawn_contact_poll`] keeps buffered ahead of the
+/// dial loop, and so the most one refill can draw.
+///
+/// A bound rather than a batch size, because the peer table marks every contact
+/// tried on the way out: this is how far ahead of the dialing the table may be
+/// drawn down. See [`dial::spawn_contact_poll`].
 pub const DISCOVERY_CANDIDATE_BATCH: usize = 8;
 
 /// Why discovery could not be started. Every variant is fatal at startup.
@@ -95,6 +128,10 @@ pub struct DiscoverySpawnConfig {
     /// instead, because it counts only peers registered over RLPx and so can
     /// never see ours; see `PEER_TABLE_TARGET_PEERS`.
     pub target_peers: usize,
+    /// The `eth2` entry to publish and to compare discovered peers against.
+    pub fork_id: EnrForkId,
+    /// The `cgc` entry to publish, or `None` to omit it.
+    pub custody_group_count: Option<u64>,
 }
 
 /// What the P2P actor needs from a running discovery server.
@@ -149,6 +186,8 @@ pub async fn spawn_discovery(
         p2p_port: config.p2p_port,
         subscription_subnets: config.subscription_subnets,
         attestation_committee_count: config.attestation_committee_count,
+        fork_id: config.fork_id,
+        custody_group_count: config.custody_group_count,
     };
     let local_node = params.local_node();
     let local_record = build_local_enr(&params)?;
@@ -162,7 +201,7 @@ pub async fn spawn_discovery(
     // The peer table owns the filter it runs, so the dial loop keeps a clone
     // rather than sharing one: the two carry the same fork id and committee
     // count, which is what makes their judgments agree.
-    let filter = LeanFilter::new(EnrForkId::local(), config.attestation_committee_count);
+    let filter = LeanFilter::new(config.fork_id, config.attestation_committee_count);
     let peer_table = PeerTableServer::spawn_with_filter(
         local_node.node_id(),
         PEER_TABLE_TARGET_PEERS,
@@ -241,6 +280,8 @@ mod tests {
             bootnodes: Vec::new(),
             advertise_ip,
             target_peers: DEFAULT_DISCOVERY_TARGET_PEERS,
+            fork_id: EnrForkId::local(),
+            custody_group_count: None,
         }
     }
 

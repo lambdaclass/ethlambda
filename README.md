@@ -8,7 +8,136 @@ Minimalist, fast and modular implementation of the Lean Ethereum client written 
 
 🌐 Visit our website at [**ethlambda.xyz**](https://ethlambda.xyz) to learn more about the project.
 
-## Getting started
+## Quickstart
+
+### Beacon Chain follower
+
+Follows Ethereum mainnet from a checkpoint-synced anchor and serves the
+standard Beacon API on port 5052, paired with an
+[ethrex](https://github.com/lambdaclass/ethrex) execution client that validates
+each block's execution payload. Both run from pre-built images
+(`ghcr.io/lambdaclass/ethlambda:beacon` and `ghcr.io/lambdaclass/ethrex`), so
+only [Docker](https://www.docker.com/get-started) is needed.
+
+> **Warning:** this uses a lot of disk. ethrex needs at least 500 GB for
+> mainnet (1 TB recommended; see its
+> [hardware requirements](https://docs.ethrex.xyz/getting-started/hardware_requirements.html)).
+
+```sh
+docker pull ghcr.io/lambdaclass/ethlambda:beacon
+docker pull ghcr.io/lambdaclass/ethrex
+
+mkdir -p beacon-data ethrex-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# The secret both clients authenticate the Engine API with
+openssl rand -hex 32 > jwt.hex
+# This host's public address, published in the node's ENR (see below)
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+
+# A private network, so the beacon node reaches ethrex's Engine API by name
+# without publishing it on the host
+docker network create ethereum
+
+docker run -d --name ethrex --network ethereum \
+  -p 30303:30303 -p 30303:30303/udp \
+  -v "$PWD/ethrex-data:/data" \
+  -v "$PWD/jwt.hex:/jwt.hex:ro" \
+  ghcr.io/lambdaclass/ethrex \
+  --network           mainnet \
+  --datadir           /data \
+  --authrpc.addr      0.0.0.0 \
+  --authrpc.jwtsecret /jwt.hex
+
+# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
+docker run -d --name ethlambda-beacon --network ethereum --stop-signal SIGINT \
+  -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
+  -p 127.0.0.1:5052:5052 \
+  -v "$PWD/beacon-data:/data" \
+  -v "$PWD/jwt.hex:/jwt.hex:ro" \
+  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  --network                mainnet \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               /data/node-key \
+  --data-dir               /data/db \
+  --http-address           0.0.0.0 \
+  --discovery.advertise-ip "$PUBLIC_IP" \
+  --execution-endpoint     http://ethrex:8551 \
+  --execution-jwt-secret   /jwt.hex
+```
+
+<details>
+<summary>Running without an execution client</summary>
+
+To run the consensus layer only, drop ethrex, the shared network, the JWT secret
+and the two `--execution-*` flags. The node then follows the chain without
+validating execution payloads:
+
+```sh
+docker pull ghcr.io/lambdaclass/ethlambda:beacon
+
+mkdir -p beacon-data
+# A persisted key keeps the node's identity, and so its custody set, stable across restarts
+openssl rand -hex 32 > beacon-data/node-key
+# This host's public address, published in the node's ENR (see below)
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+
+# The node shuts down gracefully on SIGINT only, so this makes `docker stop` flush its state
+docker run -d --name ethlambda-beacon --stop-signal SIGINT \
+  -p 9000:9000/udp -p 9001:9001/udp -p 9001:9001/tcp \
+  -p 127.0.0.1:5052:5052 \
+  -v "$PWD/beacon-data:/data" \
+  ghcr.io/lambdaclass/ethlambda:beacon beacon \
+  --network                mainnet \
+  --checkpoint-sync-url    https://beaconstate.ethstaker.cc \
+  --node-key               /data/node-key \
+  --data-dir               /data/db \
+  --http-address           0.0.0.0 \
+  --discovery.advertise-ip "$PUBLIC_IP"
+```
+
+</details>
+
+`--discovery.advertise-ip` is the address published in the node's ENR. Behind
+Docker's port mapping the node cannot see its own public address, so without
+the flag it advertises `0.0.0.0` and logs a warning. It still dials out and
+follows the chain, but peers cannot reach it until discovery learns the address
+from their replies.
+
+Follow the logs with `docker logs -f ethlambda-beacon`. The first start
+downloads the finalized state (several hundred MB) and logs
+`Beacon checkpoint sync complete`, then a few minutes of
+`Block parent missing, storing as pending` before `Block imported successfully`
+lines start. Later starts resume from `beacon-data/db`.
+
+ethrex logs `No messages from the consensus layer` until the beacon node's
+first fork choice update, then starts snap sync (`docker logs -f ethrex`).
+Until that finishes, which takes hours on mainnet, ethrex answers each payload
+`SYNCING` and the beacon node imports blocks optimistically.
+
+Check progress from another terminal:
+
+```sh
+curl -s localhost:5052/eth/v1/node/syncing
+```
+
+The node has caught up once `sync_distance` (the chain's current slot minus
+`head_slot`) is near 0. Don't rely on `is_syncing` yet: it currently reads
+`false` during catch-up as well.
+
+For Sepolia or Hoodi, change `--network mainnet` to `--network sepolia` or
+`--network hoodi` in both the ethrex and the beacon node arguments (not Docker's
+own `--network ethereum`), and point `--checkpoint-sync-url` at that network's
+provider. See
+[`ethlambda beacon`](#ethlambda-beacon--the-ethereum-beacon-chain) below for
+the remaining flags.
+
+### Lean consensus devnet
+
+To run a local lean devnet with ethlambda, follow the instructions on the
+[`devnet5-ethlambda-keygen` branch of lambdaclass/lean-quickstart](https://github.com/lambdaclass/lean-quickstart/tree/devnet5-ethlambda-keygen).
+
+## Building from source
 
 ### Prerequisites
 
@@ -34,6 +163,95 @@ make docker-build DOCKER_TAG=local
 
 Run `make help` or take a look at our [`Makefile`](./Makefile) for other useful commands.
 
+### Running the node
+
+The binary follows one of two chains, chosen by a sub-command:
+
+```sh
+cargo build --release
+./target/release/ethlambda <node|beacon> [flags]
+```
+
+[`docs/cli.md`](./docs/cli.md) is the full flag reference for both.
+
+#### `ethlambda node` — the Lean consensus chain
+
+This is what the rest of this README is about, and it is the default: a bare
+flag list with no sub-command still runs the node, so existing scripts and
+Docker entrypoints keep working unchanged.
+
+It needs a genesis config, a validator registry, a bootnode list and this
+node's own keys, all of which a devnet generates for you:
+
+```sh
+./target/release/ethlambda node \
+  --genesis            config/config.yaml \
+  --validators         config/annotated_validators.yaml \
+  --bootnodes          config/nodes.yaml \
+  --validator-config   config/validator-config.yaml \
+  --hash-sig-keys-dir  config/hash-sig-keys \
+  --node-key           config/ethlambda_0.key \
+  --node-id            ethlambda_0 \
+  --data-dir           ./data \
+  --is-aggregator
+```
+
+`--node-id` picks this node's entry out of `annotated_validators.yaml`, so it
+is what decides which validators this process runs.
+
+The easiest way to get those files is `make run-devnet`, which generates them
+under `lean-quickstart/local-devnet/genesis/`. See
+[Running in a devnet](#running-in-a-devnet) below.
+
+> **Important:** at least one node on the network must run with
+> `--is-aggregator`, or attestations are never aggregated into blocks and the
+> chain produces blocks but never finalizes.
+
+#### `ethlambda beacon` — the Ethereum Beacon Chain
+
+A beacon chain follower. It anchors at a finalized checkpoint fetched from a
+Beacon API, then follows the chain to its tip: blocks arriving over gossip and
+range sync are imported through fork choice, and it custodies its slice of the
+fulu data column matrix. What it stores it serves back, to peers over
+`beacon_blocks_by_{range,root}` and to anyone over the standard Beacon API on
+`--api-port`. It has no validator duties: it publishes nothing and subscribes to
+no attestation or sync committee subnet.
+
+```sh
+./target/release/ethlambda beacon \
+  --network             mainnet \
+  --checkpoint-sync-url <beacon-api-url> \
+  --node-key            ./node-key \
+  --data-dir            ./data
+```
+
+| Flag | Meaning |
+|---|---|
+| `--network` | `mainnet` (default), `sepolia`, `hoodi`, or a path to a directory of network files (`config.yaml`, `genesis.ssz`, optionally `bootstrap_nodes.yaml`), the layout `eth-clients` publishes and kurtosis mounts |
+| `--checkpoint-sync-url` | Where the anchor comes from. Required on a fresh data directory for a built-in network, since those never start from genesis. A resumable data directory is used before it; a network loaded from a directory anchors at its own `genesis.ssz` when no URL is given |
+| `--node-key` | Optional, but worth persisting: the columns this node custodies are a function of its node id, so without a key file it changes identity, and custody set, on every restart |
+| `--execution-endpoint`, `--execution-jwt-secret` | Optional Engine API pairing, given together. Without them, blocks import without payload validation |
+
+A built-in network needs nothing else on disk. Its `eth-clients` `config.yaml`
+and bootnode list, and the two genesis values the fork digest is computed from,
+are compiled into the binary, so deriving the wire parameters touches no
+network.
+
+A healthy run logs its anchor, then imports each new block within a couple of
+seconds of its slot starting (from a Sepolia run):
+
+```
+Beacon checkpoint sync complete slot=11197376 fork=fulu validators=1997 finalized_epoch=349916 anchor_block_slot=11197376
+Beacon block decoded slot=11197516 proposer=834 fork="fulu" block_root=c44ad3d8 bytes=92333
+Block imported successfully slot=11197516 proposer=834 block_root=c44ad3d8 parent_root=4397e224
+Beacon aggregate attestation decoded slot=11197516 aggregator=574 attesters=53 target_epoch=349922 …
+```
+
+See [`docs/beacon_wire.md`](./docs/beacon_wire.md) for what goes on the wire,
+[`docs/checkpoint_sync.md`](./docs/checkpoint_sync.md) for how the anchor is
+chosen and verified, and [`docs/rpc.md`](./docs/rpc.md) for the Beacon API
+endpoints.
+
 ### Running in a devnet
 
 To run a local devnet with multiple clients using [lean-quickstart](https://github.com/blockblaz/lean-quickstart):
@@ -52,8 +270,6 @@ Press `Ctrl+C` to stop all nodes.
 > sudo sysctl -w net.core.wmem_max=7340032
 > ```
 > To persist across reboots, add to `/etc/sysctl.conf`. For Docker, pass `--sysctl net.core.rmem_max=7340032 --sysctl net.core.wmem_max=7340032`.
-
-> **Important:** When running nodes manually (outside `make run-devnet`), at least one node must be started with `--is-aggregator` for attestations to be aggregated and included in blocks. Without this flag, the network will produce blocks but never finalize.
 
 For custom devnet configurations, go to `lean-quickstart/local-devnet/genesis/validator-config.yaml` and edit the file before running the command above. See `lean-quickstart`'s documentation for more details on how to configure the devnet.
 

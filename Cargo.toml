@@ -7,13 +7,16 @@ members = [
     "crates/blockchain/fork_choice",
     "crates/blockchain/state_transition",
     "crates/common/crypto",
+    "crates/common/ssz-tree",
     "crates/common/metrics",
     "crates/common/test-fixtures",
     "crates/common/types",
     "crates/net/api",
+    "crates/net/engine",
     "crates/net/p2p",
     "crates/net/rpc",
     "crates/storage",
+    "crates/validator",
 ]
 
 [workspace.package]
@@ -51,19 +54,32 @@ lto = false
 codegen-units = 16
 debug = "line-tables-only"
 incremental = true
+# Inheriting `release` would leave these off, so a `debug_assert!` would run
+# nowhere: the suite runs under this profile, and a plain `dev` build is not a
+# fallback because signature verification and aggregation stack-overflow
+# without release-grade opt-level. Turning them on here is what makes
+# `debug_assertions` mean "checked in tests, absent from shipped binaries".
+debug-assertions = true
+# Set explicitly rather than inherited, so arithmetic behaviour stays identical
+# to `release` regardless of what Cargo defaults this to alongside
+# `debug-assertions`.
+overflow-checks = false
 
 [workspace.dependencies]
 ethlambda-blockchain = { path = "crates/blockchain" }
 ethlambda-fork-choice = { path = "crates/blockchain/fork_choice" }
 ethlambda-state-transition = { path = "crates/blockchain/state_transition" }
 ethlambda-crypto = { path = "crates/common/crypto" }
+ethlambda-ssz-tree = { path = "crates/common/ssz-tree" }
 ethlambda-metrics = { path = "crates/common/metrics" }
 ethlambda-test-fixtures = { path = "crates/common/test-fixtures" }
 ethlambda-types = { path = "crates/common/types" }
 ethlambda-network-api = { path = "crates/net/api" }
+ethlambda-engine = { path = "crates/net/engine" }
 ethlambda-p2p = { path = "crates/net/p2p" }
 ethlambda-rpc = { path = "crates/net/rpc" }
 ethlambda-storage = { path = "crates/storage" }
+ethlambda-validator = { path = "crates/validator" }
 
 tracing = "0.1"
 thiserror = "2.0.9"
@@ -71,6 +87,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.117"
 serde_yaml_ng = "0.10"
 hex = "0.4"
+hmac = "0.12"
+base64 = "0.22"
 
 spawned-concurrency = "0.5.0"
 spawned-rt = "0.5.0"
@@ -80,6 +98,21 @@ tokio-util = "0.7"
 prometheus = "0.14"
 
 clap = { version = "4.3", features = ["derive", "env"] }
+
+# Version pinned to ethrex's workspace: `SecretKey` crosses that API boundary.
+# `rand` is re-exported as `secp256k1::rand`, so nothing needs a direct dep on it
+# to seed a key.
+secp256k1 = { version = "0.30.0", default-features = false, features = ["global-context", "rand"] }
+
+# Merkleizing a beacon state is almost entirely SHA-256 compressions, so which
+# implementation `sha2` picks matters. What `asm` actually buys is aarch64: on
+# x86/x86_64, sha2 0.10.9 compiles its `x86` backend and dispatches to the SHA-NI
+# intrinsics through `cpufeatures` whether or not this feature is set, and `asm`
+# only swaps the *fallback* for that dispatch from pure Rust to `sha2-asm`. On
+# aarch64 the feature is the whole hardware path: without it the crate falls
+# through to the pure-Rust backend. Selection stays at run time either way, so the
+# build remains portable to hardware lacking the extensions.
+sha2 = { version = "0.10.9", features = ["asm"] }
 
 # XMSS signatures + recursive aggregation, through leanVM's own facade crate:
 # it re-exports the aggregation API, the `xmss` module (keys, signing, and the
@@ -95,11 +128,36 @@ zk_alloc = { git = "https://github.com/leanEthereum/leanVM.git", rev = "48a90420
 # Secret-key (de)serialization for the leanVM xmss key format.
 postcard = { version = "1.1.3", features = ["alloc"] }
 
-# SSZ implementation
-libssz = "0.3.0"
-libssz-derive = "0.3.0"
-libssz-merkle = "0.3.0"
-libssz-types = "0.3.0"
+# SSZ implementation.
+#
+# Tracked from git rather than crates.io because the Beacon Chain containers
+# hand out `&mut` into an `SszList` (the validator registry, through
+# `altair_validator_lists_mut`), which published libssz-types 0.3.0 cannot do:
+# it exposes only `Deref` and `Index`. `DerefMut` and `IndexMut` landed after
+# that release, in lambdaclass/libssz#33.
+#
+# Pinned by `rev` rather than tracking `main`: the requirement is a commit that
+# carries #33, not whatever `main` holds today, and `main` here is the SSZ encoder
+# and merkleizer that decides every `hash_tree_root`, so a routine `cargo update`
+# must not be able to move it. Return these to a crates.io version once a release
+# carrying #33 exists.
+libssz = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-derive = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-merkle = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+libssz-types = { git = "https://github.com/lambdaclass/libssz", rev = "36802dd1d3e3a83d95d2ac552647539cbe3f7fd7" }
+
+# VCDIFF delta compression for beacon state diffs.
+#
+# Sigma Prime's maintained fork of the unmaintained liushuyu/xdelta3-rs on
+# crates.io, kept alive for lighthouse's own state-diff layer. Pinned by rev
+# rather than tracking a branch, for the same reason libssz is: this decides
+# whether a reconstructed state is correct, so a routine `cargo update` must
+# not be able to move it.
+#
+# `default-features = false` is required, not tidiness: the default `stream`
+# feature pulls futures-io/futures-util for an async API whose module does not
+# compile at this rev. The one-shot in-memory API used here is outside it.
+xdelta3 = { git = "https://github.com/sigp/xdelta3-rs", rev = "fe3906605c87", default-features = false }
 
 # Build-time version info
 vergen-git2 = { version = "9", features = ["rustc"] }

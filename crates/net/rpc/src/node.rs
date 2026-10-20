@@ -43,7 +43,7 @@ async fn get_syncing(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(genesis_ms);
-    let wall_slot = now_ms.saturating_sub(genesis_ms) / store.config().milliseconds_per_slot;
+    let wall_slot = now_ms.saturating_sub(genesis_ms) / store.config().slot_duration_ms;
     let head_slot = store.head_slot();
     let sync_distance = wall_slot.saturating_sub(head_slot);
     let finalized_slot = store

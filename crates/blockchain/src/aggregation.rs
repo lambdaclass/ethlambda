@@ -1541,7 +1541,7 @@ fn run_aggregation_worker(
 
     // The chain's time grid never changes at runtime, so one read covers the
     // worker's whole life.
-    let time_config = *store.config();
+    let time_config = store.config().time_grid();
 
     while !cancel.is_cancelled() {
         let Some(job) = next_job(&store, &time_config, &aggregator, &paused, &config) else {
@@ -1648,6 +1648,7 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
+        beacon::containers::SignedBeaconBlock,
         block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
         checkpoint::Checkpoint,
         state::{JustificationValidators, JustifiedSlots, State, StateConfig},
@@ -2222,7 +2223,7 @@ mod tests {
             proof: MultiMessageAggregate::default(),
         };
         store
-            .insert_signed_block(root, signed_block)
+            .insert_signed_block(root, SignedBeaconBlock::Lean(signed_block))
             .expect("insert test block should succeed");
     }
 
@@ -2830,7 +2831,7 @@ mod tests {
         let mut store = new_test_store(head_state);
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
         store
-            .insert_signed_block(carrier_root, carrier)
+            .insert_signed_block(carrier_root, SignedBeaconBlock::Lean(carrier))
             .expect("insert block carrying the vote");
 
         let hashed = HashedAttestationData::new(att_data);

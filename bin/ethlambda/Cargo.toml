@@ -24,9 +24,11 @@ ethlambda-crypto.workspace = true
 ethlambda-metrics.workspace = true
 ethlambda-network-api.workspace = true
 ethlambda-p2p.workspace = true
+ethlambda-state-transition.workspace = true
 ethlambda-types.workspace = true
 ethlambda-rpc.workspace = true
 ethlambda-storage.workspace = true
+ethlambda-validator.workspace = true
 
 # Parallel XMSS keygen for the real-crypto benchmark corpus.
 rayon.workspace = true
@@ -36,7 +38,6 @@ libssz-types.workspace = true
 
 tokio.workspace = true
 tokio-util.workspace = true
-
 tracing.workspace = true
 tracing-subscriber = "0.3"
 
@@ -47,8 +48,13 @@ hex.workspace = true
 
 clap.workspace = true
 reqwest.workspace = true
+ethlambda-engine.workspace = true
 thiserror.workspace = true
 eyre.workspace = true
+
+# For `resolve_node_key`'s ephemeral-key generation when `--node-key` is omitted.
+secp256k1.workspace = true
+
 
 tikv-jemallocator = { workspace = true, optional = true }
 
@@ -62,6 +68,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # Keygen writes a directory of key files and the benchmark corpus writes a
 # key set, so their tests need a throwaway directory.
 tempfile = "3"
+
+# Pins the SHA-256 of the built-in mainnet genesis state, so swapping that
+# asset has to be deliberate. Tests only: nothing in the binary hashes it.
+sha2.workspace = true
 
 [build-dependencies]
 vergen-git2.workspace = true

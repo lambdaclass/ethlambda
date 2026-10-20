@@ -6,28 +6,37 @@ instead of relying only on the static bootnode list. The implementation reuses
 [ethrex](https://github.com/lambdaclass/ethrex)'s discovery stack, with discv4
 disabled.
 
-Discovery is **off by default**. Nothing else on the lean network speaks discv5
-today: not leanSpec, not ream's lean network, not zeam. Enabling it currently
-only finds other ethlambda nodes.
+Discovery is **always on for `beacon`** and **opt-in for `node`**. `beacon`
+never had a choice: published mainnet bootnode ENRs carry no `quic` entry, so
+none of them is statically dialable and a crawl is the only way to reach a peer.
+On lean it stays behind `--discovery.enable` (off by default), because nothing
+else on that network speaks discv5 yet, so a crawl there finds only other
+ethlambda nodes. Without the flag a lean node binds no discovery socket and
+peers from its `--bootnodes` list alone, which is also what lets several devnet
+nodes share one host without a `--discovery.port` each.
 
-## Enabling it
-
-```bash
-ethlambda --discovery.enable
-```
+## Configuring it
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--discovery.enable` | `false` | Run the discv5 server and the dial loop |
-| `--discovery.port` | `9000` | UDP port for the discv5 socket |
+| `--discovery.enable` | `false` | `node` only: run discv5. `beacon` has no such flag and always runs it |
+| `--discovery.port` | `9000` (`DEFAULT_DISCOVERY_PORT`) | UDP port for the discv5 socket |
 | `--discovery.advertise-ip` | bind address (`0.0.0.0`) | IP address to advertise in the ENR |
-| `--discovery.target-peers` | `200` | Connected-peer count above which dialing stops |
+| `--discovery.target-peers` | `200` | Peers this node holds: the dial loop's cutoff, and on `beacon` the connection limits too |
+
+All but `--discovery.enable` are common flags with the same default on `node`
+and `beacon`; on a `node` without `--discovery.enable` they are accepted and
+ignored. See [the CLI reference](./cli.md).
 
 `--discovery.port` and `--gossipsub-port` (default `9001`, libp2p QUIC) are both
 UDP and so cannot share a port. `--gossipsub-port` also binds a libp2p TCP
 listener on the same number, which collides with neither: TCP and UDP are
-separate namespaces. The defaults are one apart, so `--discovery.enable`
-works on its own; overriding either onto the other is rejected at startup.
+separate namespaces. The defaults are one apart, so a default invocation works;
+pointing either flag at the other's port is rejected at startup, before the node
+touches its data directory. Co-located nodes on one host that run discovery need
+an explicit `--discovery.port` each, the same way they already need an explicit
+`--gossipsub-port`. Neither check applies to a `node` without
+`--discovery.enable`, since it binds no discovery socket and publishes no ENR.
 
 The discv5 socket always binds the wildcard `0.0.0.0`, since that is where we
 listen, not where peers should dial us. Without `--discovery.advertise-ip` the
@@ -52,6 +61,7 @@ The layout follows the discovery domain of the beacon-chain
 | `secp256k1` | compressed public key from `--node-key` |
 | `eth2` | SSZ `ENRForkID`, 16 bytes |
 | `attnets` | subscribed attestation subnet bitfield |
+| `cgc` | `--custody-group-count`, on `beacon` only; omitted on lean, which has no data-availability domain |
 
 `tcp` and `quic` share the same port number: TCP and UDP are separate
 namespaces, so `build_swarm` binds both without a collision. Advertising both
@@ -82,36 +92,78 @@ A discovered peer is admitted only if:
 - that entry's `fork_digest` equals ours, **and**
 - it advertises a `quic` port, a `tcp` port, or both.
 
+The digest compared against is the caller's, not a constant: lean passes its
+hardcoded dummy and `beacon` passes the digest it derived at startup, so one
+admission policy serves both chains.
+
 A differing `next_fork_version` or `next_fork_epoch` is *not* grounds for
 rejection: the spec permits connecting to a peer that is incompatible with an
 upcoming fork but compatible now.
 
+A peer advertising both transports is dialed with a QUIC-first address list, so
+libp2p races them within one attempt and a `quic` entry that does not answer
+falls back to TCP rather than ending the dial. Most mainnet beacon nodes are in
+exactly that state, which is why a QUIC-only dialer peered so poorly with them.
+
 These checks are handed to ethrex's peer table as a `PeerFilter`, so each record
 is judged the moment it arrives and a peer that fails is not offered for dialing.
 No rejection is final: the peer table runs the filter again as soon as the peer
-publishes a higher-`seq` ENR, so a node that adds a `quic` entry, or gains an
+publishes a higher-`seq` ENR, so a node that adds a transport entry, or gains an
 address through discv5's IP voting, is reconsidered without a restart.
 
 A peer's dial list carries every address it advertises, `quic` and `tcp` both,
-in one dial attempt. libp2p races them: it starts up to `dial_concurrency_factor`
-handshakes at once and keeps whichever completes first, dropping the other. So a
-peer whose `quic` port does not answer still connects over `tcp` with no separate
-retry and no connect timeout waited out first.
+in one dial attempt, `quic` first. libp2p walks that list `dial_concurrency_factor`
+addresses at a time, and ethlambda pins the factor to one, so the `tcp` address is
+reached only after the QUIC attempt ahead of it has failed. A peer whose `quic`
+port does not answer still connects over `tcp` with no separate retry, but it
+waits out `libp2p_quic`'s handshake timeout first.
 
-The list order is not a preference, and nothing should be read into it: the
-default concurrency factor exceeds the two addresses a lean peer can offer, so
-both are always attempted. The cost of that is the thing to know, since it is
-paid on every dial rather than only on a failure: two sockets and two handshakes
-per peer, on both ends, until one wins.
+The list order is therefore a preference and should be read as one. It was a race
+until the mainnet follower was profiled: both handshakes started at once, TCP won
+most of them, and every TCP win is a connection carrying mplex, whose waker
+bookkeeping cost more CPU than the entire beacon state transition. QUIC multiplexes
+natively and reaches none of that code, so the cheaper transport is now asked for
+first instead of merely offered. A lean peer advertises `quic` alone and is
+unaffected either way.
 
 Admitted peers are ranked by how many attestation subnets they advertise that no
 currently connected peer covers, so discovery preferentially fills gaps in subnet
 coverage. A peer advertising no `attnets` is ranked last but never dropped.
 
 Dialing stops once `--discovery.target-peers` peers are connected, and resumes
-if that count drops. That is all the flag does: it is the dial loop's cutoff, and
-nothing in ethrex's peer table or discv5's own pacing enforces it (see
-[below](#discv5-lookups-run-at-the-startup-rate)).
+if that count drops. Nothing in ethrex's peer table or discv5's own pacing
+enforces it (see [below](#discv5-lookups-run-at-the-startup-rate)).
+
+On `beacon` the flag is more than the dial loop's cutoff: the swarm's connection
+limits are derived from it too, so what this node refuses and what it goes
+looking for are two readings of one number.
+
+| Derived from the target | At the default 200 |
+| --- | --- |
+| Ceiling on established connections | 200 |
+| Of those, the most inbound demand may hold (70%) | 140 |
+| The rest, reserved for peers this node dials | 60 |
+
+The reservation is what the dial loop chases as its second shortfall, alongside
+the plain "are we at target" one, so inbound saturation cannot suppress dialing:
+outbound peers are the only ones this node chooses, and so the only lever it has
+on which custody columns its peer set covers. Deriving both from one number is
+what keeps the loop from chasing slots the swarm would refuse, or stopping while
+slots it reserved sit empty. `--discovery.target-peers 0` therefore holds no
+peers at all, dialing none and admitting none.
+
+Lean is unaffected: it runs unlimited connections, so it has nothing to reserve
+against and paces on the total peer count alone.
+
+The loop opens one dial per tick and varies the tick instead of the batch, on
+ethrex's own easeInOutCubic curve, so this node's dialing, its discv5 lookups and
+ethrex's RLPx dialing all ramp the same way. A node with no peers dials at
+`MAX_DIAL_RATE_PER_SECOND`; the gap eases out to ethrex's `LOOKUP_INTERVAL_MS`
+as the table fills, and dialing ends outright at the target. A tick that opens no
+dial waits that same ceiling regardless of the curve, which is what keeps a
+network with fewer peers to offer than `--discovery.target-peers` — every lean
+devnet, against a default target of 200 — from holding the loop at its floor for
+the life of the process, re-drawing candidates it is already connected to.
 
 ## Bootnodes
 
@@ -128,11 +180,11 @@ A bootnode is dropped only when it has none of the three: neither transport to
 dial nor a `udp` port to seed discv5 from. Any other combination is kept,
 including one with only `quic`, only `tcp`, only `udp`, or any pair. The ENRs
 `lean-quickstart` generates today carry `ip`/`quic`/`secp256k1` and no `udp`,
-so they stay reachable but contribute nothing to discovery. A beacon-chain
-bootnode is close to the mirror image, `udp` and `tcp` but no `quic`, and the
-`tcp` entry is what now makes it statically dialable rather than a discv5 seed
-only. A record missing an `ip` or a `secp256k1` key is dropped regardless of
-its transports.
+so they stay reachable but contribute nothing to discovery. The built-in
+mainnet bootnode list is close to the mirror image, `udp` and no `quic`, and a
+`tcp` entry is what makes such a record statically dialable rather than a
+discv5 seed only: four of the seventeen carry one. A record missing an `ip` or
+a `secp256k1` key is dropped regardless of its transports.
 
 The ENR a node logs at startup is only useful to a peer if that node was
 started with a real `--discovery.advertise-ip`.
@@ -184,12 +236,17 @@ startup, which is what several beacon clients do.
 ### One lean devnet is not separated from another
 
 The spec's `fork_digest` is derived from genesis, so it separates one chain from
-another. ethlambda's is the hardcoded cross-client dummy `0x12345678`, and lean
-defines no fork schedule, so every `ENRForkID` field is a constant. The `eth2`
-check therefore separates lean from non-lean but **not one lean devnet from
-another**: two devnets running this code will peer with each other. Closing that
-gap requires lean adopting a genesis-derived fork digest, which is a
-cross-client change to gossip topic names.
+another. Lean's is the hardcoded cross-client dummy `0x12345678`, and lean
+defines no fork schedule, so every `ENRForkID` field it publishes is a constant.
+The `eth2` check therefore separates lean from non-lean but **not one lean
+devnet from another**: two devnets running this code will peer with each other.
+Closing that gap requires lean adopting a genesis-derived fork digest, which is
+a cross-client change to gossip topic names.
+
+This is a lean limitation only. `ethlambda beacon` derives a real digest from
+mainnet's fork schedule and `genesis_validators_root`, so its `eth2` check
+separates mainnet from every other beacon network; see
+[`beacon_wire.md`](./beacon_wire.md).
 
 ### discv5 lookups run at the startup rate
 
