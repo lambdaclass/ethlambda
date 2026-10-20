@@ -54,8 +54,9 @@ pub(crate) struct ReplayEraOptions {
     /// Fetch missing era files from https://<network>.era.nimbus.team/.
     #[arg(long)]
     download: bool,
-    /// Stop each era after this many applied blocks (smoke mode). The
-    /// end-of-era oracle is skipped.
+    /// Stop the era after this many applied blocks (smoke mode). The
+    /// end-of-era oracle is skipped. Takes a single `--era`, since a smoke run
+    /// stops mid-era and has no state to chain from.
     #[arg(long)]
     max_blocks: Option<u64>,
     /// Write a JSON report of every era to this path.
@@ -63,7 +64,20 @@ pub(crate) struct ReplayEraOptions {
     report: Option<PathBuf>,
 }
 
+/// `--max-blocks` leaves the state mid-era, so a second `--era` could only
+/// start fresh from its predecessor's file and apply K more blocks: a run that
+/// looks chained and is not. Refuse it instead.
+fn check_max_blocks(eras: &[EraArg], max_blocks: Option<u64>) -> eyre::Result<()> {
+    ensure!(
+        max_blocks.is_none() || eras.len() <= 1,
+        "--max-blocks stops an era mid-way, so it cannot be combined with several --era values; \
+         run each era as its own smoke run"
+    );
+    Ok(())
+}
+
 pub(crate) fn run(options: ReplayEraOptions) -> eyre::Result<()> {
+    check_max_blocks(&options.eras, options.max_blocks)?;
     let spec = NetworkSpec::parse(&options.network)?;
     let source = NetworkSource::resolve(&spec)?;
     let config = source.config();
@@ -234,6 +248,16 @@ mod tests {
         assert_eq!(parse_era("290"), Ok(EraArg::Number(290)));
         assert_eq!(parse_era("latest"), Ok(EraArg::Latest));
         assert!(parse_era("soon").is_err());
+    }
+
+    #[test]
+    fn max_blocks_refuses_chained_eras() {
+        let one = [EraArg::Number(9)];
+        let two = [EraArg::Number(9), EraArg::Number(10)];
+        assert!(check_max_blocks(&one, Some(512)).is_ok());
+        assert!(check_max_blocks(&two, None).is_ok());
+        let err = check_max_blocks(&two, Some(512)).unwrap_err();
+        assert!(err.to_string().contains("--max-blocks"), "{err}");
     }
 
     #[test]

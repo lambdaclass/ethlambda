@@ -22,8 +22,10 @@ on:
         type: string
       eras:
         description: >-
-          Override the matrix: space-separated `network:era[+era...]` entries,
-          e.g. `mainnet:290 hoodi:198+199`. `latest` is accepted as an era.
+          Override the matrix: space-separated `network:era[+era...][@K]`
+          entries, e.g. `mainnet:290 hoodi:199 hoodi:9@512`. `latest` is
+          accepted as an era. `@K` makes the entry a smoke run of K blocks
+          (a single era only, since a smoke run stops mid-era).
         required: false
         type: string
 
@@ -76,17 +78,33 @@ jobs:
         env:
           OVERRIDE: ${{ inputs.eras }}
         run: |
+          # Era file N holds slots [(N-1)*8192, N*8192), so the file of a fork
+          # epoch E (N = E/256) holds the LAST pre-fork blocks and the upgrade
+          # runs in our own closing process_slots. The `F+F+1` entries add the
+          # first post-fork blocks.
+          #
+          # Mainnet era 290 (the last phase0 file, closing in altair) is left
+          # out: phase0 epoch processing is quadratic in the registry
+          # (get_base_reward recomputes get_total_active_balance per
+          # validator, stf/epoch/rewards.rs), and ~280k validators did not get
+          # through one epoch boundary in 30 minutes. Re-add `290` once that is
+          # fixed; the `eras` dispatch override can still request it.
+          #
+          # Hoodi blocks take ~4.6 s each (mainnet ~0.65 s), so Hoodi runs as
+          # smoke tests of 512 blocks that start right after a fork: era 9
+          # holds the first electra blocks (electra epoch 2048 = file 8), era
+          # 199 the first fulu blocks (fulu epoch 50688 = file 198). They are
+          # separate entries because a smoke run stops mid-era and cannot chain.
           default='[
-            {"network":"mainnet","eras":"290"},
             {"network":"mainnet","eras":"566"},
             {"network":"mainnet","eras":"758"},
             {"network":"mainnet","eras":"1053"},
             {"network":"mainnet","eras":"1422"},
             {"network":"mainnet","eras":"1607+1608"},
             {"network":"mainnet","eras":"latest"},
-            {"network":"hoodi","eras":"8"},
-            {"network":"hoodi","eras":"198+199"},
-            {"network":"hoodi","eras":"latest"},
+            {"network":"hoodi","eras":"9","max_blocks":"512"},
+            {"network":"hoodi","eras":"199","max_blocks":"512"},
+            {"network":"hoodi","eras":"latest","max_blocks":"512"},
             {"network":"sepolia","eras":"222"},
             {"network":"sepolia","eras":"518"},
             {"network":"sepolia","eras":"869"},
@@ -94,15 +112,19 @@ jobs:
             {"network":"sepolia","eras":"1378"}
           ]'
           if [[ -n "$OVERRIDE" ]]; then
-            include=$(printf '%s\n' $OVERRIDE | jq -R -s -c \
-              'split("\n") | map(select(length > 0) | split(":") | {network: .[0], eras: .[1]})')
+            include=$(printf '%s\n' $OVERRIDE | jq -R -s -c '
+              split("\n") | map(select(length > 0)
+                | split(":") as [$network, $rest]
+                | ($rest | split("@")) as [$eras, $max]
+                | {network: $network, eras: $eras}
+                  + (if $max then {max_blocks: $max} else {} end))')
           else
             include=$(jq -c . <<< "$default")
           fi
           echo "include=$include" >> "$GITHUB_OUTPUT"
 
   replay:
-    name: ${{ matrix.network }} era ${{ matrix.eras }}
+    name: ${{ matrix.network }} era ${{ matrix.eras }}${{ matrix.max_blocks && format(' (first {0} blocks)', matrix.max_blocks) || '' }}
     needs: [wait-for-image, matrix]
     runs-on: ubuntu-latest
     timeout-minutes: 330
@@ -116,12 +138,16 @@ jobs:
           IMAGE: ${{ needs.wait-for-image.outputs.image }}
           NETWORK: ${{ matrix.network }}
           ERAS: ${{ matrix.eras }}
+          MAX_BLOCKS: ${{ matrix.max_blocks }}
         run: |
           mkdir -p "$RUNNER_TEMP/eras"
           era_args=()
           for era in ${ERAS//+/ }; do
             era_args+=(--era "$era")
           done
+          if [[ -n "$MAX_BLOCKS" ]]; then
+            era_args+=(--max-blocks "$MAX_BLOCKS")
+          fi
           docker run --rm -v "$RUNNER_TEMP/eras:/eras" "$IMAGE" replay-era \
             --network "$NETWORK" --era-dir /eras --download \
             --report /eras/report.json "${era_args[@]}"

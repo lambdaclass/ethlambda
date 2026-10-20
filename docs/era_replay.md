@@ -47,11 +47,14 @@ era 1607 (mainnet) from file 1606's electra state, advancing to slot
 stored in file 1607 when that slot is empty. Era 1608 then applies the first
 fulu blocks. A non-consecutive era starts fresh from its predecessor's file.
 
-Fork eras are `fork_epoch / 256`:
+Fork files are `F = fork_epoch / 256`. File `F` holds the **last pre-fork**
+blocks (slots up to the fork epoch), and the upgrade happens in our closing
+`process_slots`, so replaying `F` exercises the upgrade at the very end. The
+first post-fork blocks are in file `F+1`, which is why CI chains `F+F+1`:
 
 | Network | altair | bellatrix | capella | deneb | electra | fulu | gloas |
 |---|---|---|---|---|---|---|---|
-| mainnet | 290 | 566 | 758 | 1053 | 1422 | 1607 | n/a |
+| mainnet | 290 (not in CI, see Known limits) | 566 | 758 | 1053 | 1422 | 1607 | n/a |
 | sepolia | in era 0 | in era 0 | 222 | 518 | 869 | 1065 | 1379 |
 | hoodi | genesis | genesis | genesis | genesis | 8 | 198 | n/a |
 
@@ -73,7 +76,7 @@ ethlambda replay-era --network <mainnet|sepolia|hoodi|dir> --era-dir <dir> \
 | `--era-dir` | Where `<config-name>-<NNNNN>-<8 hex>.era` files are read from and downloaded to |
 | `--era` | Repeatable. A number, or `latest` (newest era the host lists; needs `--download`) |
 | `--download` | Fetch missing files from `https://<network>.era.nimbus.team/`, matching the `<network>-<NNNNN>-` prefix in the index page. Written to `.part`, renamed on success |
-| `--max-blocks` | Smoke mode: stop each era after K applied blocks. Per-block checks still run; the end-of-era checks are skipped and reported as `skipped` |
+| `--max-blocks` | Smoke mode: stop the era after K applied blocks. Per-block checks still run; the end-of-era checks are skipped and reported as `skipped`. Takes a single `--era`; combining it with several is a CLI error, since a smoke run stops mid-era and cannot chain |
 | `--report` | JSON array with one entry per era: network, era, `blocks_applied`, `blocks_already_in_state`, `skipped_empty_slots`, `elapsed_secs`, `apply_secs`, `mean_ms_per_block`, the oracle checks with their outcome, and `error` |
 
 Every era needs two files, its own and its predecessor's: about 1.5 GB for a
@@ -95,13 +98,31 @@ per entry:
 
 | Network | Entries |
 |---|---|
-| mainnet | 290, 566, 758, 1053, 1422, 1607+1608, latest |
-| hoodi | 8, 198+199, latest |
-| sepolia | 222, 518, 869, 1065+1066, 1378 |
+| mainnet | 566, 758, 1053, 1422, 1607+1608, latest (full eras) |
+| sepolia | 222, 518, 869, 1065+1066, 1378 (full eras) |
+| hoodi | 9, 199, latest, each `--max-blocks 512` (smoke) |
+
+Hoodi era 9 is the first electra blocks (electra epoch 2048 is the end of
+file 8) and era 199 the first fulu blocks (fulu epoch 50688 is the end of file
+198). They are separate entries because a smoke run cannot chain.
 
 Each job uploads its `report.json`; a failed push run posts the commit, the
 failing entries and the run URL to Slack. Manual dispatch takes an `image` and
-an `eras` override such as `mainnet:290 hoodi:198+199`.
+an `eras` override of space-separated `network:era[+era...][@K]` entries, where
+`@K` adds `--max-blocks K` (single era only), e.g.
+`mainnet:290 hoodi:199 hoodi:9@512`.
+
+## Known limits
+
+- **Phase0 is quadratic.** Mainnet era 290 is excluded from the matrix, see
+  "Phase0 eras are not practical yet" below. The override can still request it.
+- **Hoodi per-block cost is under investigation.** About 4.6 s per block
+  against 0.65 s on mainnet, so a full Hoodi era would exceed the job limit and
+  Hoodi runs as 512-block smoke tests.
+- **Smoke runs do not cross fork boundaries.** A `--max-blocks` run stops
+  mid-era, so it never reaches the closing `process_slots` where the upgrade
+  runs, and it skips the end-of-era checks. That is why the Hoodi entries start
+  at the file after the fork (9, 199) and exercise the first post-fork blocks.
 
 ## Measured runtimes
 
@@ -114,11 +135,11 @@ processing; downloads and the end-of-era checks are excluded):
 | Sepolia era 1, full (7627 blocks, crosses altair and bellatrix) | 116 s, 15.2 ms/block, all three end-of-era checks as below |
 | Sepolia eras 2+3+4, chained | about 120 s each, 15 ms/block, `state_roots` and `block_roots` passed; `Continuing from the previous era's in-memory state` logged |
 | Sepolia era 31, full (slot 253952 empty) | 108 s, 15.9 ms/block, `state_roots`, `block_roots` and `full_state_root` all passed |
-| Mainnet era 1888 (latest, fulu), `--max-blocks 64` | 653 ms/block, every proposer signature and `state_root` passed; 1.5 GB download in about 2 min |
-| Hoodi era 8 (electra), `--max-blocks 256` | 4.6 s/block (1178 s; a second replay was running on the machine) |
+| Mainnet era 1888 (latest, fulu blocks), `--max-blocks 64` | 653 ms/block, every proposer signature and `state_root` passed; 1.5 GB download in about 2 min |
+| Hoodi era 8, `--max-blocks 256` | 4.6 s/block (1178 s; a second replay was running on the machine) |
 
 A full recent era is 8192 blocks, so mainnet at 0.65 s/block is about 90 minutes
-and Hoodi at 4.6 s/block is about 10 hours: the Hoodi entries do not fit the
+and Hoodi at 4.6 s/block is about 10 hours: a full Hoodi era does not fit the
 330 minute job limit of a hosted runner at that speed.
 
 ### Phase0 eras are not practical yet
