@@ -54,7 +54,7 @@ impl ConfigFile {
         // payload timestamp check failing. The seconds field stays
         // authoritative whenever the file has it.
         if !document.contains_key("SECONDS_PER_SLOT") && document.contains_key("SLOT_DURATION_MS") {
-            if config.slot_duration_ms == 0 || config.slot_duration_ms % 1_000 != 0 {
+            if config.slot_duration_ms == 0 || !config.slot_duration_ms.is_multiple_of(1_000) {
                 return Err(ConfigFileError::SlotDurationNotWholeSeconds(
                     config.slot_duration_ms,
                 ));
