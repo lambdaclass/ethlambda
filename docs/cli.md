@@ -8,7 +8,9 @@
 | `ethlambda beacon <flags>` | The Ethereum Beacon Chain, as a gossip follower |
 | `ethlambda <flags>` | `node`: the subcommand is injected |
 
-Two subcommands follow no chain. `ethlambda benchmark` is the offline
+Three subcommands follow no chain. `ethlambda replay-era` replays real chain
+history from `.era` files and checks it against the states stored in them; see
+[`era_replay.md`](./era_replay.md) for its flags and checks. `ethlambda benchmark` is the offline
 benchmarking harness, covering block building (`benchmark synthetic`, run
 through `make bench`) and block import (`benchmark import fetch` /
 `benchmark import replay`). See [`benchmarking.md`](./benchmarking.md) for
@@ -22,7 +24,7 @@ against a beacon node over the standard REST API, documented in
 
 clap has no native default subcommand, so the binary rewrites its own argv
 before parsing. If the first argument is not `node`, `beacon`, `benchmark`,
-`validator`, `help`, `-h`, `--help`, `-V`, or `--version`, then `node` is
+`replay-era`, `validator`, `help`, `-h`, `--help`, `-V`, or `--version`, then `node` is
 inserted ahead of it. The function is `inject_default_subcommand` in
 `bin/ethlambda/src/command.rs`. Every subcommand has to be listed there: a
 missing one would have `node` inserted ahead of it and become unreachable.
