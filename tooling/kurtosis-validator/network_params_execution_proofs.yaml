@@ -17,7 +17,7 @@
 #     --args-file tooling/kurtosis-validator/network_params_execution_proofs.yaml
 #
 # Two lighthouse participants for the reason network_params_ethlambda_beacon.yaml
-# gives (a lone lighthouse refuses inbound peers). 128 of the 256 validators are
+# gives (a lone lighthouse refuses inbound peers). 64 of the 256 validators are
 # left unassigned, so the ethlambda validator client signs for them, and one of
 # them signs the mock proofs.
 participants:
@@ -25,7 +25,10 @@ participants:
     el_image: ghcr.io/lambdaclass/ethrex:latest
     cl_type: lighthouse
     cl_image: ethpandaops/lighthouse:unstable
-    validator_count: 64
+    # 192 of the 256 validators, a two-thirds majority, so finality (which the
+    # light client bootstrap needs) does not depend on the ethlambda validator
+    # client's attestations; the remaining 64 are its, and one signs the proofs.
+    validator_count: 96
     supernode: true
     count: 2
     # Lighthouse serves light client data by default; `--light-client-server`
