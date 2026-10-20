@@ -22,6 +22,18 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
 tracing.workspace = true
 
+# The in-process transport (`include-ethrex`): ethrex's own Engine API handler
+# types, called against an embedded node's RPC context.
+bytes = { version = "1", optional = true }
+ethrex-common = { workspace = true, optional = true }
+ethrex-rlp = { workspace = true, optional = true }
+ethrex-rpc = { workspace = true, optional = true }
+
+[features]
+# Adds `EngineClient::in_process`, which drives an ethrex embedded in this
+# process through typed handler calls instead of JSON-RPC over HTTP.
+include-ethrex = ["dep:bytes", "dep:ethrex-common", "dep:ethrex-rlp", "dep:ethrex-rpc"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = [
     "io-util",
