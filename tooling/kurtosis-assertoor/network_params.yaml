@@ -1,10 +1,10 @@
 # The assertoor battery for ethlambda: a mainnet-preset devnet from
 # lambdaclass/ethereum-package (the fork that adds `cl_type: ethlambda` and
 # `vc_type: ethlambda`), with ethereum-package's built-in assertoor checking
-# every client pair. See README.md; run from the repository root:
-#
-#   kurtosis run github.com/lambdaclass/ethereum-package@bbae5eb7e7b5b938c625b3b2bb2167e997b2d0de \
-#     --enclave ethlambda-assertoor --args-file tooling/kurtosis-assertoor/network_params.yaml
+# every client pair. See README.md ("Run it locally") for the steps. The package
+# comes from a clone of lambdaclass/ethereum-package at the commit pinned in
+# .github/workflows/kurtosis_assertoor.yml (ETHEREUM_PACKAGE_REF), since kurtosis
+# refuses the fork as a remote package.
 #
 # Participants, in the order ethereum-package launches them:
 #   1. lighthouse + geth, lighthouse validator. It has to come first: the first
