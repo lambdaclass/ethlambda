@@ -28,15 +28,18 @@ participants:
     validator_count: 64
     supernode: true
     count: 2
+    # Lighthouse serves light client data by default; `--light-client-server`
+    # is no longer a flag it takes.
     cl_extra_params:
       - --subscribe-all-subnets
-      - --light-client-server
 network_params:
   preset: mainnet
   gloas_fork_epoch: 0
   preregistered_validator_count: 256
-additional_services:
-  - dora
+  # Shorter slots, so finality (which the light client bootstrap needs) comes
+  # in minutes; every client here reads the slot length from the config.
+  seconds_per_slot: 6
+additional_services: []
 global_log_level: info
 ethlambda_validator:
   image: ghcr.io/lambdaclass/ethlambda:execution-proofs

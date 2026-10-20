@@ -2015,6 +2015,33 @@ async fn fetch_initial_beacon_state(
 /// rebuilding it here and letting `get_forkchoice_store` check the header
 /// hash is what proves this reconstruction matches what the state actually
 /// describes, rather than assuming it.
+/// The body a gloas genesis header commits to.
+///
+/// The specification's genesis commits to the empty body. ethpandaops'
+/// genesis generator (`eth-beacon-genesis`), which builds the devnets, commits
+/// to one whose bid is the state's own `latest_execution_payload_bid` (the
+/// execution genesis hash as parent, the empty requests' root) instead. The
+/// header names whichever of the two the network was built with, so that one
+/// is the anchor's; when it names neither, the empty body is returned and
+/// `get_forkchoice_store`'s header check reports the mismatch.
+fn gloas_genesis_body(state: &BeaconState) -> gloas::BeaconBlockBody {
+    let empty = gloas::BeaconBlockBody::empty();
+    let body_root = state.latest_block_header().body_root;
+    if empty.hash_tree_root() == body_root {
+        return empty;
+    }
+    let BeaconState::Gloas(inner) = state else {
+        return empty;
+    };
+    let mut mirrored = empty.clone();
+    mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+    if mirrored.hash_tree_root() == body_root {
+        mirrored
+    } else {
+        empty
+    }
+}
+
 fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
     let header = state.latest_block_header();
     let slot = header.slot;
@@ -2102,7 +2129,7 @@ fn genesis_anchor_block(state: &BeaconState) -> SignedBeaconBlock {
                 proposer_index,
                 parent_root,
                 state_root,
-                body: gloas::BeaconBlockBody::empty(),
+                body: gloas_genesis_body(state),
             },
             signature: Default::default(),
         }),
@@ -3021,6 +3048,38 @@ validators:
                 "invariant broke at fork {fork:?}"
             );
         }
+    }
+
+    /// A gloas genesis built by ethpandaops' `eth-beacon-genesis` commits to a
+    /// body whose bid is the state's own `latest_execution_payload_bid`, not
+    /// the empty body; the anchor block must hash to that header too.
+    #[test]
+    fn a_gloas_genesis_anchor_matches_the_generators_mirrored_bid_body() {
+        let mut config = Config::mainnet();
+        let mut state = beacon::mainnet_genesis_state().unwrap();
+        for fork in ForkName::ALL
+            .into_iter()
+            .skip(1)
+            .take_while(|fork| *fork <= ForkName::Gloas)
+        {
+            config = config.with_fork_epoch(fork, 0);
+            state =
+                ethlambda_state_transition::beacon::upgrade::upgrade_state(&state, fork, &config)
+                    .unwrap();
+        }
+        let BeaconState::Gloas(inner) = &mut state else {
+            panic!("the upgrade chain ends at gloas");
+        };
+        inner.latest_execution_payload_bid.parent_block_hash =
+            ethlambda_types::beacon::primitives::ExecutionBlockHash::repeat_byte(0xfd);
+        let mut mirrored = gloas::BeaconBlockBody::empty();
+        mirrored.signed_execution_payload_bid.message = inner.latest_execution_payload_bid.clone();
+        inner.latest_block_header.body_root = mirrored.hash_tree_root();
+
+        let block = genesis_anchor_block(&state);
+        let mut header = state.latest_block_header().clone();
+        header.state_root = state.hash_tree_root();
+        assert_eq!(block.message_hash_tree_root(), header.hash_tree_root());
     }
 
     /// A unique path under the OS temp dir, so parallel test runs cannot
