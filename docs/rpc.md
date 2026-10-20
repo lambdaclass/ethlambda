@@ -242,6 +242,7 @@ surface rather than sitting beside it; a `/lean/v0` path on a beacon node is a
 | `GET` | `/eth/v1/validator/duties/proposer/{epoch}` | JSON | Proposers for the head's epoch or the next |
 | `POST` | `/eth/v1/validator/duties/attester/{epoch}` | JSON | Committee assignments for the given indices |
 | `POST` | `/eth/v1/validator/duties/sync/{epoch}` | JSON | Sync committee seats for the given indices, in the head's current or next period |
+| `POST` | `/eth/v1/validator/liveness/{epoch}` | JSON | Whether this node saw each validator act in the epoch (doppelganger protection) |
 | `GET` | `/eth/v1/validator/attestation_data` | JSON | What to attest to at `slot` |
 | `POST` | `/eth/v2/beacon/pool/attestations` | *(status only)* | Validate and gossip `SingleAttestation`s |
 | `POST` | `/eth/v1/validator/beacon_committee_subscriptions` | *(status only)* | Aggregators' entries join their committee's subnet |
@@ -272,6 +273,17 @@ the chain actor writes, so no request waits on the actor.
   `503` while the node is syncing. This node serves no sync committee message
   or contribution endpoint yet, so a validator client that gets duties here
   cannot publish what they ask for.
+- **Liveness** is this node's own view, which the Beacon API allows. A
+  validator is live in an epoch if the head state credits it for that epoch (a
+  non-zero participation byte, so anything a block already included), **or**
+  the node observed it act: an accepted gossip aggregate (its aggregator and
+  every attester its signature verified) or subnet attestation, an imported
+  block's proposer, or a submission through `pool/attestations` or
+  `aggregate_and_proofs`. The observed half covers what no block has included
+  yet, most of the current epoch; it keeps the newest three epochs recorded,
+  as one bitset each. The window is the store clock's previous, current and
+  next epoch (the next is always `false`); anything else, and an unknown
+  index, is a `400`, and the endpoint is a `503` while the node is syncing.
 - **`attestation_data`** follows phase0's `validator.md`: the head block, the
   epoch's boundary block as target, and as source the current justified
   checkpoint of the head state advanced to the slot's epoch (through fork
