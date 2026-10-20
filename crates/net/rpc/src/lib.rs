@@ -2,6 +2,8 @@ use std::net::{IpAddr, SocketAddr};
 
 use axum::{Extension, Router};
 use ethlambda_blockchain::{EventBus, SyncStatusController};
+use ethlambda_network_api::RpcToP2PRef;
+use ethlambda_state_transition::beacon::attestation_pool::SharedAttestationPool;
 use ethlambda_storage::Store;
 use ethlambda_types::aggregator::AggregatorController;
 use tokio_util::sync::CancellationToken;
@@ -11,6 +13,7 @@ pub(crate) const SSZ_CONTENT_TYPE: &str = "application/octet-stream";
 
 mod admin;
 mod base;
+mod beacon;
 mod blocks;
 mod events;
 mod fork_choice;
@@ -18,6 +21,7 @@ mod genesis;
 mod heap_profiling;
 pub mod metrics;
 mod node;
+mod shared;
 mod spec;
 pub mod test_driver;
 
@@ -72,39 +76,76 @@ pub async fn start_rpc_server(
         .layer(Extension(aggregator))
         .layer(Extension(sync_status))
         .layer(Extension(events));
-    let metrics_router = metrics::start_prometheus_metrics_api();
-    let debug_router = build_debug_router();
+    start_http_servers(config, Some(api_router), shutdown).await
+}
+
+/// Bind and serve this process's HTTP surface, and return when it stops.
+///
+/// The metrics and debug routers are always served: they need no state, and a
+/// process that records Prometheus series without serving them leaves the
+/// question of whether it is healthy unanswerable. `api_router` is what the
+/// caller has to supply, and is what differs between the two sub-commands.
+///
+/// `Some(router)` serves it alongside them: merged onto one listener when
+/// `api_port == metrics_port`, otherwise on two independent servers, so
+/// pointing both flags at one port is supported rather than a
+/// misconfiguration. `None` serves only metrics and debug, on `metrics_port`;
+/// `api_port` is then unused. That is `ethlambda beacon`, which has no lean
+/// `Store`, `AggregatorController`, `SyncStatusController` or `EventBus` to
+/// build the lean API from, and would be serving lean answers for a beacon
+/// chain if it invented empty ones.
+pub async fn start_http_servers(
+    config: RpcConfig,
+    api_router: Option<Router>,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let metrics_app = Router::new()
+        .merge(metrics::start_prometheus_metrics_api())
+        .merge(build_debug_router());
+
+    let Some(api_router) = api_router else {
+        return serve(
+            config.http_address,
+            config.metrics_port,
+            metrics_app,
+            shutdown,
+        )
+        .await;
+    };
 
     if config.api_port == config.metrics_port {
-        let app = Router::new()
-            .merge(api_router)
-            .merge(metrics_router)
-            .merge(debug_router);
-        let addr = SocketAddr::new(config.http_address, config.api_port);
-        let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-            })
-            .await?;
-    } else {
-        let api_addr = SocketAddr::new(config.http_address, config.api_port);
-        let metrics_addr = SocketAddr::new(config.http_address, config.metrics_port);
-        let api_listener = tokio::net::TcpListener::bind(api_addr).await?;
-        let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
-        let metrics_app = Router::new().merge(metrics_router).merge(debug_router);
-        let metrics_shutdown = shutdown.clone();
-        tokio::try_join!(
-            axum::serve(api_listener, api_router).with_graceful_shutdown(async move {
-                shutdown.cancelled().await;
-            }),
-            axum::serve(metrics_listener, metrics_app).with_graceful_shutdown(async move {
-                metrics_shutdown.cancelled().await;
-            }),
-        )?;
+        let app = Router::new().merge(api_router).merge(metrics_app);
+        return serve(config.http_address, config.api_port, app, shutdown).await;
     }
 
+    let metrics_shutdown = shutdown.clone();
+    tokio::try_join!(
+        serve(config.http_address, config.api_port, api_router, shutdown),
+        serve(
+            config.http_address,
+            config.metrics_port,
+            metrics_app,
+            metrics_shutdown
+        ),
+    )?;
     Ok(())
+}
+
+/// Bind one listener and serve `app` on it until `shutdown` is cancelled.
+async fn serve(
+    address: IpAddr,
+    port: u16,
+    app: Router,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let addr = SocketAddr::new(address, port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "HTTP server listening");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown.cancelled().await;
+        })
+        .await
 }
 
 /// Build the API router with the given store, client version, and peer ID.
@@ -127,6 +168,58 @@ fn build_api_router(store: Store, version: &'static str, peer_id: String) -> Rou
         .with_state(store)
 }
 
+/// Build the Beacon API router.
+///
+/// The mirror of [`build_api_router`], and deliberately not a superset of it:
+/// the `/lean/v0` handlers read lean state variants and metadata keys a beacon
+/// directory does not carry, so serving both off one store would answer lean
+/// questions with beacon data, or panic trying.
+///
+/// The metrics and debug routers are **not** merged here, for the same reason
+/// [`build_api_router`] does not merge them: [`start_http_servers`] serves
+/// them itself, and merging a path twice makes axum panic at startup.
+pub fn build_beacon_api_router(store: Store, version: &'static str, peer_id: String) -> Router {
+    Router::new()
+        .merge(beacon::routes(version, peer_id))
+        .with_state(store)
+}
+
+/// What the Beacon API's validator endpoints reach beyond the store.
+pub struct BeaconApiHandles {
+    /// Through which the pool, aggregate and block endpoints gossip what a
+    /// validator client hands them.
+    pub p2p: RpcToP2PRef,
+    /// Filled by the attestation pool endpoint and the aggregator subnets,
+    /// read by the aggregate endpoint and block production.
+    pub attestation_pool: SharedAttestationPool,
+    /// The execution client block production builds payloads with; `None`
+    /// makes it answer 503.
+    pub engine: Option<ethlambda_engine::EngineClient>,
+}
+
+/// Start the HTTP servers for a beacon node.
+///
+/// The beacon counterpart to [`start_rpc_server`]. It takes no
+/// `AggregatorController` and no `EventBus`: a follower has no aggregator duty
+/// to toggle, and the chain-events stream is part of the lean surface. It does
+/// take the [`BeaconApiHandles`] the validator endpoints need.
+pub async fn start_beacon_rpc_server(
+    config: RpcConfig,
+    store: Store,
+    sync_status: SyncStatusController,
+    handles: BeaconApiHandles,
+    peer_id: String,
+    shutdown: CancellationToken,
+) -> Result<(), std::io::Error> {
+    let api_router = build_beacon_api_router(store, config.version, peer_id)
+        .layer(Extension(sync_status))
+        .layer(Extension(handles.p2p))
+        .layer(Extension(handles.attestation_pool))
+        .layer(Extension(beacon::validator::FeeRecipients::default()))
+        .layer(Extension(handles.engine));
+    start_http_servers(config, Some(api_router), shutdown).await
+}
+
 /// Build the debug router for profiling endpoints.
 fn build_debug_router() -> Router {
     use axum::routing::get;
@@ -140,15 +233,25 @@ fn build_debug_router() -> Router {
 
 #[cfg(test)]
 pub(crate) mod test_utils {
+    use std::sync::Arc;
+
     use axum::Router;
-    use ethlambda_storage::{StorageBackend, Store, Table};
+    use ethlambda_storage::{
+        ForkCheckpoints, StorageBackend, Store, Table, backend::InMemoryBackend,
+    };
     use ethlambda_types::{
+        beacon::{
+            config::Config,
+            containers::{BeaconState, SignedBeaconBlock, phase0, shared::BeaconBlockHeader},
+            preset,
+        },
         block::{Block, BlockBody, BlockHeader},
         checkpoint::Checkpoint,
         primitives::{H256, HashTreeRoot as _},
         state::{JustificationValidators, JustifiedSlots, State, StateConfig},
     };
     use libssz::SszEncode;
+    use libssz_types::SszVector;
 
     /// Build the API router the way tests do, with placeholder client version
     /// and peer ID. Tests that assert on those identity values (e.g. the
@@ -221,6 +324,226 @@ pub(crate) mod test_utils {
 
         root
     }
+
+    /// A two-block beacon store, built for reuse by every beacon HTTP test.
+    pub(crate) struct BeaconFixture {
+        pub(crate) store: Store,
+        pub(crate) anchor_root: H256,
+        // `anchor_slot`, `head_root` and `head_slot` are unread by this
+        // task's own tests (which hardcode the fixture's slots since the
+        // fixture itself is built from a fixed `ANCHOR_SLOT`), but are part
+        // of what every later beacon-endpoint task reuses this fixture for.
+        #[allow(dead_code)]
+        pub(crate) anchor_slot: u64,
+        #[allow(dead_code)]
+        pub(crate) head_root: H256,
+        #[allow(dead_code)]
+        pub(crate) head_slot: u64,
+    }
+
+    /// A minimal phase0 state at `slot`, linked to `parent_root`.
+    ///
+    /// Mirrors `beacon_test_state`/`beacon_test_state_with_parent` in
+    /// `ethlambda_storage::store`'s own tests: nothing here reads validators
+    /// or history, so every fixed-length vector is zero-filled rather than
+    /// populated with real content.
+    fn phase0_beacon_state(slot: u64, parent_root: H256) -> phase0::BeaconState {
+        phase0::BeaconState {
+            genesis_time: 1_606_824_023,
+            genesis_validators_root: H256::ZERO,
+            slot,
+            fork: Default::default(),
+            latest_block_header: BeaconBlockHeader {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body_root: H256::ZERO,
+            },
+            block_roots: SszVector::try_from(vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT])
+                .expect("exactly N elements by construction"),
+            state_roots: SszVector::try_from(vec![H256::ZERO; preset::SLOTS_PER_HISTORICAL_ROOT])
+                .expect("exactly N elements by construction"),
+            historical_roots: Default::default(),
+            eth1_data: Default::default(),
+            eth1_data_votes: Default::default(),
+            eth1_deposit_index: 0,
+            validators: Default::default(),
+            balances: Default::default(),
+            randao_mixes: SszVector::try_from(vec![
+                H256::ZERO;
+                preset::EPOCHS_PER_HISTORICAL_VECTOR
+            ])
+            .expect("exactly N elements by construction"),
+            slashings: SszVector::try_from(vec![0u64; preset::EPOCHS_PER_SLASHINGS_VECTOR])
+                .expect("exactly N elements by construction"),
+            previous_epoch_attestations: Default::default(),
+            current_epoch_attestations: Default::default(),
+            justification_bits: Default::default(),
+            previous_justified_checkpoint: Default::default(),
+            current_justified_checkpoint: Default::default(),
+            finalized_checkpoint: Default::default(),
+        }
+    }
+
+    /// A phase0 block at `slot`, with a trivial (default) body.
+    fn phase0_beacon_block(slot: u64, parent_root: H256) -> SignedBeaconBlock {
+        SignedBeaconBlock::Phase0(phase0::SignedBeaconBlock {
+            message: phase0::BeaconBlock {
+                slot,
+                proposer_index: 0,
+                parent_root,
+                state_root: H256::ZERO,
+                body: phase0::BeaconBlockBody::default(),
+            },
+            signature: Default::default(),
+        })
+    }
+
+    /// Stands in for the P2P actor: records what the Beacon API would have
+    /// gossiped instead of gossiping it.
+    #[derive(Default)]
+    pub(crate) struct RecordingNetwork {
+        pub(crate) published: std::sync::Mutex<
+            Vec<(
+                u64,
+                ethlambda_types::beacon::containers::electra::SingleAttestation,
+            )>,
+        >,
+        pub(crate) aggregates:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedAggregateAndProof>>,
+        pub(crate) subscriptions: std::sync::Mutex<Vec<(u64, u64)>>,
+        pub(crate) blocks:
+            std::sync::Mutex<Vec<ethlambda_types::beacon::containers::SignedBeaconBlock>>,
+    }
+
+    impl ethlambda_network_api::RpcToP2P for RecordingNetwork {
+        fn publish_beacon_attestation(
+            &self,
+            subnet_id: u64,
+            attestation: ethlambda_types::beacon::containers::electra::SingleAttestation,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.published
+                .lock()
+                .unwrap()
+                .push((subnet_id, attestation));
+            Ok(())
+        }
+
+        fn publish_beacon_aggregate(
+            &self,
+            aggregate: ethlambda_types::beacon::containers::SignedAggregateAndProof,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.aggregates.lock().unwrap().push(aggregate);
+            Ok(())
+        }
+
+        fn subscribe_attestation_subnets(
+            &self,
+            subnets: Vec<(u64, u64)>,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.subscriptions.lock().unwrap().extend(subnets);
+            Ok(())
+        }
+
+        fn publish_beacon_block(
+            &self,
+            block: ethlambda_types::beacon::containers::SignedBeaconBlock,
+        ) -> Result<(), spawned_concurrency::error::ActorError> {
+            self.blocks.lock().unwrap().push(block);
+            Ok(())
+        }
+    }
+
+    /// A beacon store whose anchor, and so head, is `state`, under a block at
+    /// the state's slot. Returns the store and that block's root.
+    ///
+    /// For endpoints that read the validator registry or committees, which the
+    /// empty phase0 state in [`beacon_fixture`] cannot exercise. The block is a
+    /// phase0 one whatever `state`'s fork: these endpoints read the state and
+    /// the block's root and slot, never the block's body.
+    pub(crate) fn beacon_store_at(state: BeaconState) -> (Store, H256) {
+        let slot = state.slot();
+        let block = phase0_beacon_block(slot, H256::ZERO);
+        let root = block.message_hash_tree_root();
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            root,
+            Checkpoint { root, slot },
+            slot,
+        );
+        store
+            .insert_signed_block(root, block)
+            .expect("insert anchor block");
+        store
+            .insert_state(root, state)
+            .expect("insert anchor state");
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(root))
+            .expect("make the anchor the head");
+        (store, root)
+    }
+
+    /// Build a beacon store anchored at `anchor_slot`, with a real child block
+    /// at `anchor_slot + 1` whose import moves the head for real.
+    ///
+    /// `Table::BlockRoots` is written only by `Store::update_checkpoints`
+    /// (see `BlockId::resolve_beacon`'s doc), so a fixture that wants that
+    /// table populated has to move the head through the real API rather than
+    /// poke the backend directly. That is what distinguishes this from
+    /// `beacon_test_state`/`beacon_test_block` in `ethlambda_storage::store`'s
+    /// own tests, which this otherwise mirrors.
+    pub(crate) fn beacon_fixture(anchor_slot: u64) -> BeaconFixture {
+        let anchor_block = phase0_beacon_block(anchor_slot, H256::ZERO);
+        let anchor_root = anchor_block.message_hash_tree_root();
+        let anchor_state = phase0_beacon_state(anchor_slot, H256::ZERO);
+
+        let mut store = Store::init_beacon(
+            Arc::new(InMemoryBackend::default()),
+            1_606_824_023,
+            Config::mainnet(),
+            anchor_root,
+            Checkpoint {
+                root: anchor_root,
+                slot: anchor_slot,
+            },
+            anchor_slot,
+        );
+        store
+            .insert_signed_block(anchor_root, anchor_block)
+            .expect("insert anchor block");
+        store
+            .insert_state(anchor_root, BeaconState::Phase0(anchor_state))
+            .expect("insert anchor state");
+
+        let head_slot = anchor_slot + 1;
+        let head_block = phase0_beacon_block(head_slot, anchor_root);
+        let head_root = head_block.message_hash_tree_root();
+        // `parent_root = anchor_root` so `insert_state`'s beacon arm diffs
+        // against the anchor's own state rather than snapshotting again.
+        let head_state = phase0_beacon_state(head_slot, anchor_root);
+
+        store
+            .insert_signed_block(head_root, head_block)
+            .expect("insert head block");
+        store
+            .insert_state(head_root, BeaconState::Phase0(head_state))
+            .expect("insert head state");
+
+        store
+            .update_checkpoints(ForkCheckpoints::head_only(head_root))
+            .expect("move head to the child block");
+
+        BeaconFixture {
+            store,
+            anchor_root,
+            anchor_slot,
+            head_root,
+            head_slot,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -284,10 +607,11 @@ mod tests {
         let finalized = store
             .latest_finalized()
             .expect("latest finalized checkpoint exists");
-        let mut expected_state = store
+        let expected_state = store
             .get_state(&finalized.root)
             .expect("expected state")
             .unwrap();
+        let mut expected_state = expected_state.expect_lean().clone();
         expected_state.latest_block_header.state_root = H256::ZERO;
         let expected_ssz = expected_state.to_ssz();
 
@@ -462,6 +786,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_latest_finalized_block() {
         use ethlambda_types::{
+            beacon::containers::SignedBeaconBlock,
             block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
             checkpoint::Checkpoint,
             primitives::{H256, HashTreeRoot as _},
@@ -491,7 +816,7 @@ mod tests {
 
         // Persist the signed block and mark it as the latest finalized checkpoint.
         store
-            .insert_signed_block(block_root, signed_block.clone())
+            .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block.clone()))
             .expect("insert_signed_block should succeed");
         store
             .update_checkpoints(ForkCheckpoints::new(
@@ -528,6 +853,80 @@ mod tests {
         assert_eq!(body.as_ref(), expected_ssz.as_slice());
     }
 
+    /// The same block, as JSON, when the caller asks for it by name.
+    ///
+    /// The default above stays SSZ and that is load-bearing:
+    /// `bin/ethlambda/src/checkpoint_sync.rs` reads these bytes, and other
+    /// clients' lean checkpoint sync may send no `Accept` at all. JSON here is
+    /// opt-in, which is the opposite of the beacon surface's default.
+    #[tokio::test]
+    async fn the_lean_finalized_block_is_json_when_asked_for() {
+        use ethlambda_types::{
+            beacon::containers::SignedBeaconBlock,
+            block::{Block, BlockBody, MultiMessageAggregate, SignedBlock},
+            checkpoint::Checkpoint,
+            primitives::{H256, HashTreeRoot as _},
+        };
+
+        let state = create_test_state();
+        let backend = Arc::new(InMemoryBackend::new());
+        let mut store = Store::from_anchor_state(backend, state, DEFAULT_MILLISECONDS_PER_SLOT);
+
+        let block = Block {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: store
+                .latest_finalized()
+                .expect("latest finalized checkpoint exists")
+                .root,
+            state_root: H256::ZERO,
+            body: BlockBody::default(),
+        };
+        let block_root = block.header().hash_tree_root();
+        let signed_block = SignedBlock {
+            message: block,
+            proof: MultiMessageAggregate::default(),
+        };
+        store
+            .insert_signed_block(block_root, SignedBeaconBlock::Lean(signed_block))
+            .expect("insert_signed_block should succeed");
+        store
+            .update_checkpoints(ForkCheckpoints::new(
+                block_root,
+                None,
+                Some(Checkpoint {
+                    root: block_root,
+                    slot: 1,
+                }),
+            ))
+            .expect("update_checkpoints should succeed");
+
+        let app = test_utils::test_api_router(store);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/lean/v0/blocks/finalized")
+                    .header(header::ACCEPT, "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            JSON_CONTENT_TYPE
+        );
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Lean encodes integers bare. This is not the beacon surface, whose
+        // every integer is a quoted decimal string.
+        assert_eq!(json["message"]["slot"], 1);
+        assert_eq!(json["message"]["proposer_index"], 0);
+    }
+
     #[tokio::test]
     async fn test_get_latest_finalized_block_serves_genesis_with_placeholder_proof() {
         use ethlambda_types::block::{MultiMessageAggregate, SignedBlock};
@@ -553,6 +952,7 @@ mod tests {
             )
             .expect("genesis served via get_signed_block")
             .unwrap();
+        let genesis_block = genesis_block.expect_lean();
         let expected = SignedBlock {
             message: genesis_block.message.clone(),
             proof: MultiMessageAggregate::default(),

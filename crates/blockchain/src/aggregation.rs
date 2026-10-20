@@ -1272,6 +1272,7 @@ mod tests {
     use ethlambda_storage::backend::InMemoryBackend;
     use ethlambda_types::constants::DEFAULT_MILLISECONDS_PER_SLOT;
     use ethlambda_types::{
+        beacon::containers::SignedBeaconBlock,
         block::{Block, BlockBody, BlockHeader, MultiMessageAggregate, SignedBlock},
         checkpoint::Checkpoint,
         state::{JustificationValidators, JustifiedSlots, State, StateConfig},
@@ -1846,7 +1847,7 @@ mod tests {
             proof: MultiMessageAggregate::default(),
         };
         store
-            .insert_signed_block(root, signed_block)
+            .insert_signed_block(root, SignedBeaconBlock::Lean(signed_block))
             .expect("insert test block should succeed");
     }
 
@@ -2461,7 +2462,7 @@ mod tests {
         let mut store = new_test_store(head_state);
         insert_test_block(&mut store, hashes[0], 0, H256::ZERO);
         store
-            .insert_signed_block(carrier_root, carrier)
+            .insert_signed_block(carrier_root, SignedBeaconBlock::Lean(carrier))
             .expect("insert block carrying the vote");
 
         let hashed = HashedAttestationData::new(att_data);

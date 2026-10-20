@@ -1,4 +1,4 @@
-.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test docs docs-deps docs-serve
+.PHONY: help fmt lint bench update cooldown-check docker-build shadow-build shadow-docker-build run-devnet test test-consensus test-node test-beacon test-beacon-mainnet test-beacon-minimal consensus-spec-tests consensus-spec-gossip-tests docs docs-deps docs-serve
 
 help: ## 📚 Show help for each of the Makefile recipes
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
@@ -12,10 +12,51 @@ lint: ## 🔍 Run clippy on all workspace crates
 	# `--all-targets` skips: lint them by name so they keep compiling
 	cargo clippy --locked --workspace --test forkchoice_spectests --test signature_spectests --test stf_spectests --test ssz_spectests -- -D warnings
 
-test: leanSpec/fixtures ## 🧪 Run all tests
-	# release-fast: release-grade opt-level to avoid stack overflows during
-	# signature verification/aggregation, without paying for LTO on every rebuild
-	cargo test --locked --workspace --profile release-fast
+# release-fast: release-grade opt-level to avoid stack overflows during
+# signature verification/aggregation, without paying for LTO on every rebuild
+#
+# The Beacon Chain spec tests have their own target and are not run here: their
+# fixtures are a separate multi-gigabyte download, and the suite has to be built
+# once per preset. The `--exclude` flags below only divide the halves: the
+# beacon target requires the `beacon-spec-tests` feature, so these commands skip
+# it without excluding anything.
+TEST=cargo test --locked --profile release-fast
+
+# Two halves, one CI job each: undivided, a release-grade build of every test
+# target measured 14 GiB against the 13-14 GiB a stock runner has free. Both
+# halves build the shared dependency graph, so what the split halves is the
+# linked test binaries.
+#
+# Named once, and `test-node` is the workspace minus this list, so the two are
+# exhaustive by construction and a crate added later cannot silently go
+# untested. Keep them roughly even by build weight; the boundary means nothing
+# else.
+CONSENSUS_CRATES=ethlambda-types ethlambda-fork-choice ethlambda-state-transition ethlambda-blockchain ethlambda-crypto ethlambda-ssz-tree
+
+test: test-consensus test-node ## 🧪 Run all tests
+
+test-consensus: leanSpec/fixtures ## 🧪 Run the consensus half of the workspace suite
+	$(TEST) $(addprefix -p ,$(CONSENSUS_CRATES))
+
+test-node: leanSpec/fixtures ## 🧪 Run the node half of the workspace suite
+	$(TEST) --workspace $(addprefix --exclude ,$(CONSENSUS_CRATES))
+
+# --lib as well as the spec target: the BLS and KZG modules keep their fixture
+# vectors as unit tests, which are `ignore`d unless this feature is on.
+BEACON_TEST=cargo test -p ethlambda-state-transition --lib --test beacon_spec_tests --profile release-fast
+
+# The preset fixes SSZ container bounds at compile time, so each preset needs its
+# own build, and a run walks its own fixture tree plus `general` and nothing else.
+# Hence a target per preset rather than one recipe running both: CI gives each its
+# own job, so the two build and run concurrently and each downloads only the trees
+# its preset reads.
+test-beacon: test-beacon-mainnet test-beacon-minimal ## 🧪 Run the Beacon Chain spec tests, both presets
+
+test-beacon-mainnet: consensus-spec-tests consensus-spec-gossip-tests ## 🧪 Run the Beacon Chain spec tests, mainnet preset
+	$(BEACON_TEST) --features beacon-spec-tests
+
+test-beacon-minimal: consensus-spec-tests consensus-spec-gossip-tests ## 🧪 Run the Beacon Chain spec tests, minimal preset
+	$(BEACON_TEST) --features beacon-spec-tests,preset-minimal
 
 # Used ONLY to resolve dependency updates: min-publish-age (.cargo/config.toml)
 # is nightly-only, everything else runs on the stable toolchain pinned in
@@ -94,6 +135,98 @@ leanSpec/fixtures:
 	rm -rf leanSpec/fixtures; \
 	mkdir -p leanSpec/fixtures; \
 	tar -xzf "$$tmpdir/fixtures-prod-scheme.tar.gz" -C leanSpec/fixtures --strip-components=1
+
+# Beacon Chain spec test fixtures, for the `beacon` module of
+# crates/blockchain/state_transition.
+#
+# Pinned rather than tracking the latest release: this fixture tree *is* the
+# definition of correctness for that module, so it should move only when we choose
+# to move it. The release publishes no checksums for these assets, so unlike the
+# leanSpec bundle below there is nothing to verify against.
+CONSENSUS_SPEC_TESTS_VERSION ?= v1.6.1
+CONSENSUS_SPEC_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_TESTS_VERSION)
+
+# Which fixture trees to fetch. A run reads its own preset's tree plus `general`,
+# the preset-independent BLS and KZG vectors, and nothing else, so a CI job pinned
+# to one preset narrows this and skips the other preset's tree. That is worth
+# doing: the three together are ~1.25 GiB compressed and several times that on
+# disk, against a runner that has neither the space nor the time to spare.
+CONSENSUS_SPEC_TESTS_CONFIGS ?= general minimal mainnet
+
+# The stamp is named after the version AND the configs, so changing either names
+# a file that does not exist and forces a fresh download. Depending on the
+# extracted directories instead would make a bump a silent no-op: they already
+# exist, make would consider them up to date, and the suite would go green
+# against the old tree while the docs claimed the new version. Nothing in the
+# fixtures themselves records which release they came from, so the stamp is the
+# only thing that can carry it.
+#
+# The configs belong in the name for the same reason: the recipe wipes the tree
+# before extracting, so a narrowed run leaves the other preset's tree gone, and a
+# stamp naming only the version would then mark a partial tree as complete.
+# `sort` normalises order and duplicates, so the same set always names one stamp.
+empty:=
+space:=$(empty) $(empty)
+CONSENSUS_SPEC_TESTS_STAMP=consensus-spec-tests/.version-$(CONSENSUS_SPEC_TESTS_VERSION)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_TESTS_CONFIGS)))
+
+consensus-spec-tests: $(CONSENSUS_SPEC_TESTS_STAMP) ## ⬇️ Download the Beacon Chain spec test fixtures
+
+# The old tree goes first, rather than being extracted over: every tarball
+# unpacks to `tests/<name>/...`, so all three land side by side in one directory,
+# and unpacking a new version on top of an old one would merge the two, leaving
+# cases a release deleted still present and still passing.
+$(CONSENSUS_SPEC_TESTS_STAMP):
+	@rm -rf consensus-spec-tests
+	@mkdir -p consensus-spec-tests
+	@for config in $(CONSENSUS_SPEC_TESTS_CONFIGS); do \
+		echo "Downloading $$config spec test fixtures ($(CONSENSUS_SPEC_TESTS_VERSION))"; \
+		tmpdir=$$(mktemp -d); \
+		trap 'rm -rf "$$tmpdir"' EXIT; \
+		curl -L -f -o "$$tmpdir/$$config.tar.gz" "$(CONSENSUS_SPEC_TESTS_BASE_URL)/$$config.tar.gz" || exit 1; \
+		tar -xzf "$$tmpdir/$$config.tar.gz" -C consensus-spec-tests || exit 1; \
+		rm -rf "$$tmpdir"; \
+	done
+	@touch $@
+
+# The gossip validation vectors (`networking/gossip_*`) first ship in a
+# pre-release, so they come from a tree of their own rather than moving the pin
+# above. Only fulu's block, column, aggregate and attestation handlers are
+# extracted, since those are the topics this node validates; the rest of each
+# tarball is never unpacked. Fold this back into the main tree once that
+# release is final.
+CONSENSUS_SPEC_GOSSIP_TESTS_VERSION ?= v1.7.0-beta.1
+CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL ?= https://github.com/ethereum/consensus-specs/releases/download/$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)
+# Follows CONSENSUS_SPEC_TESTS_CONFIGS, so narrowing that one narrows this too.
+# `general` is dropped because it has no `networking` runner: naming its
+# members would fail the extraction.
+CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS = $(filter-out general,$(CONSENSUS_SPEC_TESTS_CONFIGS))
+CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS = gossip_beacon_block gossip_data_column_sidecar gossip_beacon_aggregate_and_proof gossip_beacon_attestation
+# Includes the handler list, not just the version and configs: growing the
+# list must re-extract an existing tree, which a stamp keyed on version and
+# configs alone would not notice, since neither of those changed.
+CONSENSUS_SPEC_GOSSIP_TESTS_STAMP=consensus-spec-tests-gossip/.version-$(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION)-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS)))-$(subst $(space),-,$(sort $(CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS)))
+
+consensus-spec-gossip-tests: $(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP) ## ⬇️ Download the gossip validation spec test fixtures
+
+# Member directories are named exactly rather than globbed: GNU tar needs
+# `--wildcards` for a pattern and BSD tar rejects that flag, while a plain
+# directory name extracts its whole subtree on both.
+$(CONSENSUS_SPEC_GOSSIP_TESTS_STAMP):
+	@rm -rf consensus-spec-tests-gossip
+	@mkdir -p consensus-spec-tests-gossip
+	@for config in $(CONSENSUS_SPEC_GOSSIP_TESTS_CONFIGS); do \
+		echo "Downloading $$config gossip test fixtures ($(CONSENSUS_SPEC_GOSSIP_TESTS_VERSION))"; \
+		tmpdir=$$(mktemp -d); \
+		trap 'rm -rf "$$tmpdir"' EXIT; \
+		curl -L -f -o "$$tmpdir/$$config.tar.gz" "$(CONSENSUS_SPEC_GOSSIP_TESTS_BASE_URL)/$$config.tar.gz" || exit 1; \
+		members=""; \
+		for handler in $(CONSENSUS_SPEC_GOSSIP_TESTS_HANDLERS); do \
+			members="$$members tests/$$config/fulu/networking/$$handler"; \
+		done; \
+		tar -xzf "$$tmpdir/$$config.tar.gz" -C consensus-spec-tests-gossip $$members || exit 1; \
+		rm -rf "$$tmpdir"; \
+	done
+	@touch $@
 
 # lambdaclass fork of lean-quickstart: genesis keys come from `ethlambda keygen`, and the
 # partner clients run their devnet-5 images. An existing lean-quickstart/ is never

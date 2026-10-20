@@ -2,8 +2,21 @@ use std::io;
 
 use libp2p::futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use snap::read::FrameEncoder;
+use tracing::debug;
+
+use super::messages::{ErrorMessage, ResponseCode};
+use crate::metrics;
+use libssz::SszDecode as _;
 
 pub const MAX_PAYLOAD_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
+/// An `InvalidData` error, which is what every decode failure on this path is.
+///
+/// Shared with `lean::encoding` and `beacon::encoding`, which produce the same
+/// error for the same reason.
+pub fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
 
 // https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/p2p-interface.md#max_message_size
 pub const MAX_COMPRESSED_PAYLOAD_SIZE: usize = 32 + MAX_PAYLOAD_SIZE + MAX_PAYLOAD_SIZE / 6 + 1024; // ~12 MB
@@ -136,6 +149,120 @@ where
     io::Read::read_exact(&mut decoder, &mut uncompressed)?;
 
     Ok((uncompressed, frame.len()))
+}
+
+/// The width of a `<context-bytes>` field.
+///
+/// One value rather than a per-protocol number, because `ForkDigest`-context is
+/// the only context shape either chain uses: "A fixed-width 4 byte
+/// `<context-bytes>`, set to the `ForkDigest` matching the chunk". The spec does
+/// leave the field "defined per req-resp method", so a method that ever defines
+/// a different one would need more than [`ChunkLimits::has_context`] can say.
+pub const FORK_DIGEST_CONTEXT_LEN: usize = 4;
+
+/// What a chunked response is allowed to look like, on the two axes the two
+/// chains disagree about.
+pub struct ChunkLimits {
+    /// Whether a successful chunk carries a [`FORK_DIGEST_CONTEXT_LEN`]-byte
+    /// `ForkDigest` before its payload. False on every lean protocol, true on
+    /// beacon's block and data-column-sidecar protocols.
+    pub has_context: bool,
+    /// The most chunks a peer may send before the answer is refused.
+    ///
+    /// The loop reads until the peer closes, so without this a peer can stream
+    /// chunks for as long as the stream lives and every one of them is held in
+    /// memory. Set to the widest answer the protocol can legitimately produce,
+    /// which is the request ceiling: a peer sending more than was ever askable
+    /// for is not answering a request.
+    pub max_chunks: usize,
+}
+
+/// Read a response that is one chunk per item, until the peer closes.
+///
+/// Both chains' block responses have this shape, and the framing around them is
+/// identical down to which byte comes first, so the loop lives here and each
+/// chain supplies only what genuinely differs: its [`ChunkLimits`], and how a
+/// chunk body becomes a value.
+///
+/// `response_chunk ::= <result> | <context-bytes> | <encoding-dependent-header>
+/// | <encoded-payload>`. The context bytes are read only after a SUCCESS code,
+/// because the spec leaves them empty on an error chunk, and `decode` is handed
+/// whatever was read, empty slice included.
+///
+/// A chunk with a non-success code is logged and skipped rather than ending the
+/// stream, so a peer that holds some of what was asked for can answer with that
+/// much. The stream ends at EOF. `Err` only on an I/O error other than
+/// `UnexpectedEof`, on more than `max_chunks` chunks, or when `decode` refuses
+/// one, in which case nothing read so far is returned: a peer that mis-encodes
+/// one chunk has not shown itself trustworthy about the others.
+pub async fn read_chunked_response<T, V, F>(
+    io: &mut T,
+    protocol_label: &str,
+    limits: ChunkLimits,
+    decode: F,
+) -> io::Result<Vec<V>>
+where
+    T: AsyncRead + Unpin + Send,
+    F: Fn(&[u8], &[u8]) -> io::Result<V>,
+{
+    let ChunkLimits {
+        has_context,
+        max_chunks,
+    } = limits;
+    let mut items = Vec::new();
+    // Counts every chunk, not just the ones that decoded: a stream of error
+    // chunks costs the same to read as a stream of blocks.
+    let mut chunks = 0_usize;
+
+    loop {
+        let mut result_byte = 0_u8;
+        if let Err(err) = io.read_exact(std::slice::from_mut(&mut result_byte)).await {
+            if err.kind() == io::ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(err);
+        }
+        let code = ResponseCode::from(result_byte);
+
+        chunks += 1;
+        if chunks > max_chunks {
+            return Err(invalid(format!(
+                "{protocol_label} response exceeded {max_chunks} chunks"
+            )));
+        }
+
+        // Only on the success path: an error chunk carries an `ErrorMessage`
+        // straight after the code byte, with the context field left empty. The
+        // buffer is on the stack and reused, so a long response does not
+        // allocate once per chunk for four bytes.
+        let mut context_buf = [0_u8; FORK_DIGEST_CONTEXT_LEN];
+        let context: &[u8] = if has_context && code == ResponseCode::SUCCESS {
+            io.read_exact(&mut context_buf).await?;
+            &context_buf
+        } else {
+            &[]
+        };
+
+        let decoded = decode_payload(io).await?;
+        let payload = decoded.uncompressed;
+        metrics::observe_reqresp_response_chunk_size(
+            protocol_label,
+            payload.len(),
+            decoded.compressed_size,
+        );
+
+        if code != ResponseCode::SUCCESS {
+            let error_message = ErrorMessage::from_ssz_bytes(&payload)
+                .map(|msg| String::from_utf8_lossy(&msg).into_owned())
+                .unwrap_or_else(|_| "<invalid error message>".to_string());
+            debug!(?code, %error_message, "Skipping response chunk with non-success code");
+            continue;
+        }
+
+        items.push(decode(context, &payload)?);
+    }
+
+    Ok(items)
 }
 
 /// Write a varint-prefixed, snappy-compressed SSZ payload. Returns the size

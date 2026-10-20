@@ -45,6 +45,23 @@ pub fn inc_finalizations(result: &str) {
     LEAN_FINALIZATIONS_TOTAL.with_label_values(&[result]).inc();
 }
 
+static LEAN_BEACON_COMMITTEE_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_committee_cache_lookups_total",
+        "Beacon committee shuffling lookups, by whether the committee cache served them",
+        &["result"]
+    )
+    .unwrap()
+});
+
+/// Count one `CommitteeCache` lookup: `hit`, `miss` (a whole-epoch shuffle
+/// was built and cached), or `unkeyable` (built for one caller, not cached).
+pub fn inc_committee_cache_lookups(result: &str) {
+    LEAN_BEACON_COMMITTEE_CACHE_LOOKUPS_TOTAL
+        .with_label_values(&[result])
+        .inc();
+}
+
 static LEAN_STATE_TRANSITION_TIME_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     register_histogram!(
         "lean_state_transition_time_seconds",
@@ -102,4 +119,70 @@ pub fn time_block_processing() -> TimingGuard {
 /// Start timing attestations processing. Records duration when the guard is dropped.
 pub fn time_attestations_processing() -> TimingGuard {
     TimingGuard::new(&LEAN_STATE_TRANSITION_ATTESTATIONS_PROCESSING_TIME_SECONDS)
+}
+
+static LEAN_BEACON_PUBKEY_CACHE_LOOKUPS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "lean_beacon_pubkey_cache_lookups_total",
+        "BLS public keys resolved for a signature check, by whether the validated-pubkey cache \
+         already held them",
+        &["result"]
+    )
+    .unwrap()
+});
+
+// The two label values resolved once: a lookup is counted on every signature
+// check, and the vector's own label lookup would hash the label every time.
+static LEAN_BEACON_PUBKEY_CACHE_HITS: LazyLock<IntCounter> =
+    LazyLock::new(|| LEAN_BEACON_PUBKEY_CACHE_LOOKUPS_TOTAL.with_label_values(&["hit"]));
+static LEAN_BEACON_PUBKEY_CACHE_MISSES: LazyLock<IntCounter> =
+    LazyLock::new(|| LEAN_BEACON_PUBKEY_CACHE_LOOKUPS_TOTAL.with_label_values(&["miss"]));
+
+static LEAN_BEACON_PUBKEY_CACHE_ENTRIES: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "lean_beacon_pubkey_cache_entries",
+        "Validated BLS public keys held by the process-wide pubkey cache"
+    )
+    .unwrap()
+});
+
+/// Count one signature check's public keys: `hits` the cache already held,
+/// `misses` it had to validate (whether or not they then passed).
+pub fn inc_pubkey_cache_lookups(hits: u64, misses: u64) {
+    if hits > 0 {
+        LEAN_BEACON_PUBKEY_CACHE_HITS.inc_by(hits);
+    }
+    if misses > 0 {
+        LEAN_BEACON_PUBKEY_CACHE_MISSES.inc_by(misses);
+    }
+}
+
+/// Count one key added to the pubkey cache. The cache never removes one.
+pub fn inc_pubkey_cache_entries() {
+    LEAN_BEACON_PUBKEY_CACHE_ENTRIES.inc();
+}
+
+static LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
+        "lean_data_column_kzg_verify_seconds",
+        "Time spent batch-verifying one sidecar's cells against its own commitments",
+        vec![0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+    )
+    .unwrap()
+});
+
+/// Start timing a sidecar's KZG cell-proof batch. Records duration when the
+/// guard is dropped.
+///
+/// Here rather than beside the rest of the column metrics, because the batch
+/// runs inside `beacon::gossip::column`'s rules, which both the gossip path
+/// and the p2p layer's chain checks call.
+pub fn time_data_column_kzg_verify() -> TimingGuard {
+    TimingGuard::new(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS)
+}
+
+/// Register the metrics above that should be visible before their first
+/// observation.
+pub fn init() {
+    LazyLock::force(&LEAN_DATA_COLUMN_KZG_VERIFY_SECONDS);
 }

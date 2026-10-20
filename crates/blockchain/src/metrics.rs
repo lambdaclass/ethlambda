@@ -41,6 +41,45 @@ pub const BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASES: &[&str] =
 /// `wrap_proposer` (singleton single-message aggregate over that signature),
 /// `merge_type2` (merge of every single-message aggregate into the block's
 /// multi-message aggregate).
+/// Per-block section labels for `lean_block_import_phase_seconds`, in the
+/// order a block crosses them. Every one of these is produced by
+/// `import_timing::ImportTimings::rows`, which a test in that module asserts.
+pub const BLOCK_IMPORT_PHASES: &[&str] = &[
+    "decode",
+    "queue",
+    "defer",
+    "admit",
+    "guards",
+    "preamble",
+    "parent_wait",
+    "cascade_wait",
+    "da_check",
+    "columns_wait",
+    "engine",
+    "verify_struct",
+    "verify_crypto",
+    "stf",
+    "db_write",
+    "fc_head",
+    "block_atts",
+];
+
+/// The label for a whole completed import.
+///
+/// Written only when the block actually imported: a held block has no total,
+/// because its import has not finished. That is what keeps a two-slot hold
+/// out of the import-cost percentiles without an `outcome` label to filter on.
+pub const BLOCK_IMPORT_TOTAL_PHASE: &str = "total";
+
+/// Section labels charged once per arrival rather than once per block, on the
+/// same histogram as [`BLOCK_IMPORT_PHASES`].
+///
+/// One metric rather than two: the query that matters is `rate(..._sum[5m])`,
+/// seconds spent per second, which does not divide by an event count and so
+/// does not care that these are counted per arrival. `arrival` is the whole
+/// handler call, `cascade` the block drain inside it.
+pub const BLOCK_ARRIVAL_PHASES: &[&str] = &["arrival", "cascade", "prune", "get_head", "fcu"];
+
 pub const BLOCK_PROPOSAL_SEAL_PHASES: &[&str] = &["sign_proposer", "wrap_proposer", "merge_type2"];
 
 /// Where a gossip message landed relative to the interval it was due in.
@@ -353,6 +392,22 @@ static LEAN_ATTESTATION_VALIDATION_TIME_SECONDS: std::sync::LazyLock<Histogram> 
         .unwrap()
     });
 
+/// Buckets run to a whole mainnet slot because that is the question this
+/// answers: a head computation that costs seconds is one the chain actor
+/// cannot afford between blocks, and it took a live node pinned at 100% CPU
+/// with a frozen head to notice, because nothing measured it.
+static LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_beacon_head_compute_time_seconds",
+            "Duration of one beacon fork-choice head computation",
+            vec![
+                0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 12.0
+            ]
+        )
+        .unwrap()
+    });
+
 static LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS: std::sync::LazyLock<Histogram> =
     std::sync::LazyLock::new(|| {
         register_histogram!(
@@ -542,6 +597,52 @@ static LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILD_PHASE_SECONDS: std::sync::LazyLock<
             vec![
                 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0
             ]
+        )
+        .unwrap()
+    });
+
+// --- Block import (the sections `import_timing` marks off) ---
+
+static LEAN_BLOCK_IMPORT_PHASE_SECONDS: std::sync::LazyLock<HistogramVec> =
+    std::sync::LazyLock::new(|| {
+        register_histogram_vec!(
+            "lean_block_import_phase_seconds",
+            "Time one section of a block's journey from the wire to a post-state took. `phase` \
+             is one of [`BLOCK_IMPORT_PHASES`]: the per-block sections, `total` for a whole \
+             completed import, and the per-arrival sections an arrival is charged once for \
+             however many blocks its cascade imported. A section that did not run writes \
+             nothing, so a lean node never reports the beacon-only phases and vice versa.",
+            &["phase", "source"],
+            // One bucket set spans the whole range deliberately: `guards` is
+            // tens of microseconds, `parent_wait` is tens of seconds, and
+            // splitting them into two metrics would mean choosing which
+            // sections may ever be compared against which.
+            //
+            // Above half a second the edges step by 1.5x and 1.33x rather than
+            // doubling. That is where a mainnet block's `stf`, `block_atts`,
+            // `queue` and `total` all sit, and with doubling edges a 16%
+            // drop in the mean `stf` left its percentiles interpolated inside
+            // the same two buckets. The ladder also puts an edge on one
+            // mainnet slot. It stops at 32 s, so a longer section (in
+            // practice a `parent_wait`) lands in `+Inf`.
+            vec![
+                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0,
+                6.0, 8.0, 12.0, 16.0, 32.0,
+            ]
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCK_IMPORT_CASCADE_BLOCKS: std::sync::LazyLock<Histogram> =
+    std::sync::LazyLock::new(|| {
+        register_histogram!(
+            "lean_block_import_cascade_blocks",
+            "Blocks one arrival put through the import path. Attempts, not imports: a block \
+             that ends the pass held or pended counted here all the same, because the question \
+             is how much work the arrival caused. Above one means it unblocked children waiting \
+             on it, which is when the per-arrival sections are amortised and a late sibling's \
+             `cascade_wait` is not the network's fault.",
+            vec![1.0, 2.0, 3.0, 5.0, 8.0, 16.0, 32.0, 64.0, 128.0]
         )
         .unwrap()
     });
@@ -824,6 +925,39 @@ static LEAN_AGGREGATOR_SKIPPED_TOTAL: std::sync::LazyLock<IntCounterVec> =
         .unwrap()
     });
 
+// --- Data Column Sidecars ---
+//
+// The sidecar checks run in the p2p layer, so their counters live there
+// (`lean_data_columns_rejected_total`) and in `ethlambda-state-transition`
+// (`lean_data_column_kzg_verify_seconds`). These are the chain actor's own.
+
+static LEAN_DATA_COLUMNS_STORED_TOTAL: std::sync::LazyLock<IntCounter> =
+    std::sync::LazyLock::new(|| {
+        register_int_counter!(
+            "lean_data_columns_stored_total",
+            "Data column sidecars verified and written to the store"
+        )
+        .unwrap()
+    });
+
+static LEAN_BLOCKS_HELD_FOR_COLUMNS: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_blocks_held_for_columns",
+            "Blocks held from fork choice pending their custody columns"
+        )
+        .unwrap()
+    });
+
+static LEAN_SIDECARS_AWAITING_PARENT: std::sync::LazyLock<IntGauge> =
+    std::sync::LazyLock::new(|| {
+        register_int_gauge!(
+            "lean_sidecars_awaiting_parent",
+            "Data column sidecars parked until their block's parent has a post-state"
+        )
+        .unwrap()
+    });
+
 // --- Initialization ---
 
 /// Register all metrics with the Prometheus registry so they appear in `/metrics` from startup.
@@ -879,6 +1013,7 @@ pub fn init() {
     // Histograms
     std::sync::LazyLock::force(&LEAN_FORK_CHOICE_BLOCK_PROCESSING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_SIGNING_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_ATTESTATIONS_PRODUCTION_TIME_SECONDS);
     std::sync::LazyLock::force(&LEAN_PQ_SIG_ATTESTATION_VERIFICATION_TIME_SECONDS);
@@ -902,6 +1037,12 @@ pub fn init() {
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_CHILD_PAYLOADS_CONSUMED_TOTAL);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_ATTESTATION_DATA_SELECTED);
     std::sync::LazyLock::force(&LEAN_BLOCK_PROPOSAL_AGGREGATES_SELECTED);
+    // Block import timing. The label combinations are left to appear as
+    // blocks arrive: seeding every phase against every source would publish
+    // over fifty series a lean node can never write to, since a third of the
+    // phases are beacon-only and a third of the sources are too.
+    std::sync::LazyLock::force(&LEAN_BLOCK_IMPORT_PHASE_SECONDS);
+    std::sync::LazyLock::force(&LEAN_BLOCK_IMPORT_CASCADE_BLOCKS);
     // Gossip arrival timing
     std::sync::LazyLock::force(&LEAN_GOSSIP_BLOCK_ARRIVAL_DELAY_SECONDS);
     std::sync::LazyLock::force(&LEAN_GOSSIP_ATTESTATION_ARRIVAL_DELAY_SECONDS);
@@ -929,6 +1070,9 @@ pub fn init() {
     for &reason in AGGREGATOR_SKIP_REASONS {
         LEAN_AGGREGATOR_SKIPPED_TOTAL.with_label_values(&[reason]);
     }
+    // Data column sidecars.
+    std::sync::LazyLock::force(&LEAN_DATA_COLUMNS_STORED_TOTAL);
+    LEAN_BLOCKS_HELD_FOR_COLUMNS.set(0);
 }
 
 // --- Public API ---
@@ -1004,6 +1148,13 @@ pub fn time_fork_choice_block_processing() -> TimingGuard {
 /// Start timing attestation validation. Records duration when the guard is dropped.
 pub fn time_attestation_validation() -> TimingGuard {
     TimingGuard::new(&LEAN_ATTESTATION_VALIDATION_TIME_SECONDS)
+}
+
+/// Start timing a beacon fork-choice head computation. Records duration when
+/// the guard is dropped, including on the error path: a head computation that
+/// fails still spent the time, and the failing one was the expensive one.
+pub fn time_beacon_head_compute() -> TimingGuard {
+    TimingGuard::new(&LEAN_BEACON_HEAD_COMPUTE_TIME_SECONDS)
 }
 
 /// Increment the PQ aggregated signatures counter.
@@ -1214,6 +1365,23 @@ pub fn observe_block_proposal_phase(phase: &str, elapsed: Duration) {
         .observe(elapsed.as_secs_f64());
 }
 
+/// Observe one section of a block's import or of the arrival that carried it.
+///
+/// `phase` must be one of [`BLOCK_IMPORT_PHASES`], [`BLOCK_ARRIVAL_PHASES`] or
+/// [`BLOCK_IMPORT_TOTAL_PHASE`]. `source` is `gossip` or `sync`; a block this
+/// node built itself is not observed at all, since it crossed no wire and its
+/// arrival sections would be zeroes that drag every percentile down.
+pub fn observe_block_import_phase(phase: &str, source: &str, elapsed: Duration) {
+    LEAN_BLOCK_IMPORT_PHASE_SECONDS
+        .with_label_values(&[phase, source])
+        .observe(elapsed.as_secs_f64());
+}
+
+/// Observe how many blocks one arrival put through the import path.
+pub fn observe_block_import_cascade_blocks(blocks: usize) {
+    LEAN_BLOCK_IMPORT_CASCADE_BLOCKS.observe(blocks as f64);
+}
+
 /// Increment the completed block-proposal attestation selection runs counter.
 pub fn inc_block_proposal_attestation_builds() {
     LEAN_BLOCK_PROPOSAL_ATTESTATION_BUILDS_TOTAL.inc();
@@ -1242,4 +1410,193 @@ pub fn set_node_sync_status(status: SyncStatus) {
             .with_label_values(&[label])
             .set(i64::from(*label == active));
     }
+}
+
+/// Increment the sidecars written to the store.
+pub fn inc_data_column_stored() {
+    LEAN_DATA_COLUMNS_STORED_TOTAL.inc();
+}
+
+/// Mirror `blocks_awaiting_columns.len()`: called on both insertion and
+/// removal so the gauge is always exact rather than incremented and
+/// decremented independently of the map it reports on.
+pub fn set_blocks_held_for_columns(count: u64) {
+    LEAN_BLOCKS_HELD_FOR_COLUMNS.set(count as i64);
+}
+
+/// Sidecars currently parked against a parent root with no post-state.
+///
+/// Reads as the queue depth of the recovery path the availability gate depends
+/// on: a follower keeping up sits at zero, a brief non-zero is a late parent,
+/// and a value that climbs and does not come back down means parents are not
+/// arriving at all.
+///
+/// Nothing caps the queue, so this is also the only warning that a peer is
+/// parking sidecars under parents it never intends to supply: each one holds a
+/// `Table::PendingDataColumns` row until finality passes its slot. Worth an
+/// alert at a level an honest late parent never reaches.
+pub fn set_sidecars_awaiting_parent(count: u64) {
+    LEAN_SIDECARS_AWAITING_PARENT.set(count as i64);
+}
+
+/// Blocks not imported because no execution client verdict was obtained.
+///
+/// A non-zero rate here means the follower is dropping blocks it cannot ask
+/// about, and its head will park behind the first one. Nothing re-drives a
+/// given-up call, so this is the metric that says the follower has stopped
+/// following rather than merely slowed down.
+pub fn inc_engine_no_verdict() {
+    static LEAN_ENGINE_NO_VERDICT_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_engine_no_verdict_total",
+                "Blocks not imported because the execution client gave no verdict"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NO_VERDICT_TOTAL.inc();
+}
+
+/// Blocks not imported because the execution client has not validated them and
+/// they do not qualify for an optimistic import.
+///
+/// Distinct from [`inc_engine_no_verdict`]: there the execution client never
+/// answered, here it answered `SYNCING` or `ACCEPTED` for a block that
+/// `is_optimistic_candidate_block` refuses. A sustained rate means the
+/// execution client is behind and the blocks reaching this node are too recent
+/// to import on age alone.
+pub fn inc_engine_not_optimistic_candidate() {
+    static LEAN_ENGINE_NOT_OPTIMISTIC_CANDIDATE_TOTAL: std::sync::LazyLock<IntCounter> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter!(
+                "lean_engine_not_optimistic_candidate_total",
+                "Blocks not imported because they are not optimistic candidates"
+            )
+            .unwrap()
+        });
+    LEAN_ENGINE_NOT_OPTIMISTIC_CANDIDATE_TOTAL.inc();
+}
+
+// ---------------------------------------------------------------------------
+// Beacon aggregate gossip
+// ---------------------------------------------------------------------------
+//
+// Deferring the per-aggregate amortizations (one `block_index()` scan and one
+// `EpochCommittees` build per aggregate, rather than one per batch) is only
+// safe while their cost is visible. These are what make it visible: without
+// them the symptom is an unexplained head lag, which is exactly the situation
+// the block-import timing report was added to answer for blocks.
+
+/// Buckets for one aggregate's journey, in seconds.
+///
+/// Reaching the top of this range means a single aggregate costs more than a
+/// mainnet slot's worth of the actor's time at this arrival rate, which is the
+/// threshold the deferred amortization exists for.
+fn beacon_aggregate_duration_buckets() -> Vec<f64> {
+    vec![
+        0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
+    ]
+}
+
+/// How long the chain actor spent on one aggregate, from the moment it was
+/// taken off the mailbox to the moment fork choice had it.
+///
+/// Covers `apply_verified_aggregate` end to end. `ethlambda-p2p`'s gossip
+/// validation already resolved the committees and all three signatures before
+/// handing the aggregate over, so what this measures now is just
+/// `validate_on_attestation_indexed` and recording the vote against an
+/// already-built `block_index()`; a slow observation here points at the store
+/// itself, not at cryptography. Observed for aggregates that were actually
+/// processed, applied or not; one dropped by the applied-bits gate never
+/// reaches this.
+pub fn observe_beacon_aggregate_processing(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_PROCESSING_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_processing_seconds",
+                "Time the chain actor spent applying one gossip aggregate to fork choice",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_PROCESSING_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// How long an aggregate waited between the p2p actor handing it over and the
+/// chain actor picking it up.
+///
+/// The mailbox hop, and the failure mode this whole path introduces: roughly a
+/// thousand aggregates a slot queueing behind block imports arrive too late to
+/// move the head while every per-aggregate timing still looks healthy. Invisible
+/// from inside the chain actor, which is why the instant rides on the message.
+pub fn observe_beacon_aggregate_mailbox_wait(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_MAILBOX_WAIT_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_mailbox_wait_seconds",
+                "Time a gossip aggregate spent in the chain actor's mailbox",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_MAILBOX_WAIT_SECONDS.observe(duration.as_secs_f64());
+}
+
+/// Count one aggregate's outcome.
+///
+/// `applied` is the one that moved a vote. Everything else names why it did
+/// not: `known_subset` is the applied-bits gate, `queue_full` is the deferral
+/// queue's cap, and `invalid` is `apply_verified_aggregate` refusing a
+/// gossip-accepted aggregate, most often because its target has since been
+/// superseded by finality or its own slot has not passed yet.
+pub fn inc_beacon_aggregate_outcome(outcome: &str) {
+    static LEAN_BEACON_AGGREGATE_TOTAL: std::sync::LazyLock<IntCounterVec> =
+        std::sync::LazyLock::new(|| {
+            register_int_counter_vec!(
+                "lean_beacon_aggregate_total",
+                "Gossip aggregates by outcome",
+                &["outcome"]
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_TOTAL
+        .with_label_values(&[outcome])
+        .inc();
+}
+
+/// How many aggregates are held waiting for their own slot to pass.
+///
+/// A steady value near the queue's cap means aggregates are arriving faster
+/// than the once-per-slot drain clears them, which is the backlog the cap
+/// turns into a drop rather than into unbounded memory.
+pub fn update_beacon_aggregates_deferred(count: usize) {
+    static LEAN_BEACON_AGGREGATES_DEFERRED: std::sync::LazyLock<IntGauge> =
+        std::sync::LazyLock::new(|| {
+            register_int_gauge!(
+                "lean_beacon_aggregates_deferred",
+                "Gossip aggregates held until their own slot has passed"
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATES_DEFERRED.set(count as i64);
+}
+
+/// How long one aggregate took from coming off the wire to being applied to
+/// fork choice.
+///
+/// Observed only for aggregates applied on arrival, never for ones released
+/// from the deferral queue: those wait a deliberate slot for their own slot to
+/// pass, and folding that hold in would report the design as latency. The
+/// held path's own health is [`update_beacon_aggregates_deferred`].
+pub fn observe_beacon_aggregate_end_to_end(duration: Duration) {
+    static LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS: std::sync::LazyLock<Histogram> =
+        std::sync::LazyLock::new(|| {
+            register_histogram!(
+                "lean_beacon_aggregate_end_to_end_seconds",
+                "Time from a gossip aggregate arriving on the wire to it reaching fork choice",
+                beacon_aggregate_duration_buckets()
+            )
+            .unwrap()
+        });
+    LEAN_BEACON_AGGREGATE_END_TO_END_SECONDS.observe(duration.as_secs_f64());
 }

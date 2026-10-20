@@ -1,0 +1,20 @@
+[package]
+name = "ethlambda-ssz-tree"
+authors.workspace = true
+edition.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+libssz.workspace = true
+libssz-merkle.workspace = true
+libssz-types.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+libssz-derive.workspace = true
+proptest = "1"

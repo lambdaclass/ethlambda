@@ -73,7 +73,7 @@ pub fn reaggregate_from_block(
         );
         return Vec::new();
     };
-    let validators = &parent_state.validators;
+    let validators = &parent_state.expect_lean().validators;
     let num_validators = validators.len() as u64;
 
     // The claims the merged proof carries: one per body attestation in order,

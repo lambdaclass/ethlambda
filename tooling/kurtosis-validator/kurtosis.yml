@@ -1,0 +1,4 @@
+name: github.com/lambdaclass/ethlambda_private/tooling/kurtosis-validator
+description: |
+  A local Ethereum devnet from ethpandaops/ethereum-package, plus the
+  `ethlambda validator` client signing for validators no other client holds.
