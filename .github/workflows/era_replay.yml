@@ -90,11 +90,13 @@ jobs:
           # through one epoch boundary in 30 minutes. Re-add `290` once that is
           # fixed; the `eras` dispatch override can still request it.
           #
-          # Hoodi blocks take ~4.6 s each (mainnet ~0.65 s), so Hoodi runs as
-          # smoke tests of 512 blocks that start right after a fork: era 9
-          # holds the first electra blocks (electra epoch 2048 = file 8), era
-          # 199 the first fulu blocks (fulu epoch 50688 = file 198). They are
-          # separate entries because a smoke run stops mid-era and cannot chain.
+          # Hoodi: era 8 holds the last deneb blocks (electra epoch 2048) and
+          # the electra upgrade runs in our closing process_slots; 198+199 is
+          # the fulu upgrade (fulu epoch 50688 = file 198) plus the first fulu
+          # era. Full Hoodi eras fit the job limit only with the per-epoch
+          # total-active-balance cache from #648; without it a deneb-era block
+          # costs about 4.6 s, because get_base_reward_per_increment scans the
+          # registry per attestation.
           default='[
             {"network":"mainnet","eras":"566"},
             {"network":"mainnet","eras":"758"},
@@ -102,9 +104,9 @@ jobs:
             {"network":"mainnet","eras":"1422"},
             {"network":"mainnet","eras":"1607+1608"},
             {"network":"mainnet","eras":"latest"},
-            {"network":"hoodi","eras":"9","max_blocks":"512"},
-            {"network":"hoodi","eras":"199","max_blocks":"512"},
-            {"network":"hoodi","eras":"latest","max_blocks":"512"},
+            {"network":"hoodi","eras":"8"},
+            {"network":"hoodi","eras":"198+199"},
+            {"network":"hoodi","eras":"latest"},
             {"network":"sepolia","eras":"222"},
             {"network":"sepolia","eras":"518"},
             {"network":"sepolia","eras":"869"},

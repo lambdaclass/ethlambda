@@ -100,11 +100,11 @@ per entry:
 |---|---|
 | mainnet | 566, 758, 1053, 1422, 1607+1608, latest (full eras) |
 | sepolia | 222, 518, 869, 1065+1066, 1378 (full eras) |
-| hoodi | 9, 199, latest, each `--max-blocks 512` (smoke) |
+| hoodi | 8, 198+199, latest (full eras, need the #648 cache, see Known limits) |
 
-Hoodi era 9 is the first electra blocks (electra epoch 2048 is the end of
-file 8) and era 199 the first fulu blocks (fulu epoch 50688 is the end of file
-198). They are separate entries because a smoke run cannot chain.
+Hoodi era 8 is the last deneb blocks, with the electra upgrade (epoch 2048) in
+our closing `process_slots`; `198+199` is the fulu upgrade (epoch 50688) plus
+the first fulu era.
 
 Each job uploads its `report.json`; a failed push run posts the commit, the
 failing entries and the run URL to Slack. Manual dispatch takes an `image` and
@@ -116,13 +116,15 @@ an `eras` override of space-separated `network:era[+era...][@K]` entries, where
 
 - **Phase0 is quadratic.** Mainnet era 290 is excluded from the matrix, see
   "Phase0 eras are not practical yet" below. The override can still request it.
-- **Hoodi per-block cost is under investigation.** About 4.6 s per block
-  against 0.65 s on mainnet, so a full Hoodi era would exceed the job limit and
-  Hoodi runs as 512-block smoke tests.
+- **Full Hoodi eras depend on #648.** Without the per-epoch
+  total-active-balance cache from #648, a deneb-era block costs about 4.6 s
+  against 0.65 s on mainnet, because `get_base_reward_per_increment` scans the
+  whole registry once per attestation (`stf/deneb.rs:359`,
+  `stf/electra.rs:764`). A full era would then exceed the job limit.
 - **Smoke runs do not cross fork boundaries.** A `--max-blocks` run stops
   mid-era, so it never reaches the closing `process_slots` where the upgrade
-  runs, and it skips the end-of-era checks. That is why the Hoodi entries start
-  at the file after the fork (9, 199) and exercise the first post-fork blocks.
+  runs, and it skips the end-of-era checks. The CI matrix has no smoke entries;
+  they are available through the `eras` override (`@K`).
 
 ## Measured runtimes
 
@@ -140,7 +142,8 @@ processing; downloads and the end-of-era checks are excluded):
 
 A full recent era is 8192 blocks, so mainnet at 0.65 s/block is about 90 minutes
 and Hoodi at 4.6 s/block is about 10 hours: a full Hoodi era does not fit the
-330 minute job limit of a hosted runner at that speed.
+330 minute job limit of a hosted runner at that speed, which is why the matrix
+relies on #648.
 
 ### Phase0 eras are not practical yet
 
