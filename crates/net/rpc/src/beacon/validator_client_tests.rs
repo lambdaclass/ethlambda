@@ -168,6 +168,11 @@ async fn spawn_server(
         .layer(Extension(crate::CustodyColumns(Vec::new())))
         .layer(Extension(crate::beacon::validator::FeeRecipients::default()))
         .layer(Extension(engine))
+        // The mock proof engine, so the execution proof route takes what the
+        // validator client's mock prover submits.
+        .layer(Extension(crate::ProofEngineHandle(Some(Arc::new(
+            ethlambda_state_transition::beacon::execution_proofs::MockExecutionProofEngine,
+        )))))
         .layer(Extension(crate::beacon::graffiti::OwnVersion(Arc::new(
             own_version(),
         ))));
@@ -1178,6 +1183,91 @@ mod gloas {
             head_root,
             context,
         }
+    }
+
+    /// The whole EIP-8440 loop over the wire: the validator client's mock
+    /// prover reads the served head, signs a proof for it under the served
+    /// spec's domain, and submits it; the node checks it as gossip would (the
+    /// head's state, the prover's registry entry and signature, the mock
+    /// engine) and hands it to the network; and what the chain actor then
+    /// keeps is read back from the proofs route. The route's answer is printed,
+    /// since ethrex's partial stateful node pins it as the shape it consumes.
+    #[tokio::test]
+    async fn the_validator_client_can_prove_the_head_with_a_mock_proof() {
+        use ethlambda_types::beacon::fork_choice::PayloadStatusEnum;
+        use ethlambda_validator::execution_prover::ExecutionProverService;
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let Served {
+            client,
+            state,
+            network,
+            mut store,
+            head_root,
+            context,
+            ..
+        } = serve_gloas(32, idle_engine()).await;
+        let slot = state.slot();
+        // The head's payload is held and valid, so there is a full block to
+        // prove and the node vouches for its head.
+        store.insert_verified_payload(slot, &crate::test_utils::gloas_envelope(head_root, slot));
+        store.insert_beacon_block_payload_status(head_root, slot, PayloadStatusEnum::Valid);
+
+        let keys = keys_for(&state, &[4]);
+        let client = Arc::new(client);
+        let prover = ExecutionProverService::new(client.clone(), context.clone());
+        let proof = prover
+            .prove_head(&keys)
+            .await
+            .expect("the prover reaches the node")
+            .expect("the head is new and full, so a proof goes out");
+        assert_eq!(proof.message.head_block_root, head_root);
+        assert_eq!(
+            proof.message.origin_block_root, head_root,
+            "the first proof starts the recursion"
+        );
+        assert_eq!(proof.validator_index, 4);
+        assert_eq!(prover.origin(), Some(head_root));
+        // The node took it over HTTP and handed it to the network.
+        assert_eq!(
+            *network.execution_proofs.lock().unwrap(),
+            vec![proof.clone()]
+        );
+        // The same head again is not proved twice.
+        assert!(prover.prove_head(&keys).await.unwrap().is_none());
+
+        // What the chain actor does with a proof gossip accepted, then the
+        // proofs route a consumer reads.
+        assert!(store.insert_execution_proof(head_root, slot, proof.clone()));
+        let response = crate::beacon::execution_proofs::routes()
+            .with_state(store.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/eth/v1/beacon/execution_proofs/0x{head_root:x}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"][0]["validator_index"], "4");
+        assert_eq!(
+            json["data"][0]["message"]["head_block_root"],
+            format!("0x{head_root:x}")
+        );
+        assert_eq!(json["data"][0]["message"]["proof_type"], "1");
+        assert_eq!(json["execution_optimistic"], false);
+        eprintln!(
+            "ETHLAMBDA_EXECUTION_PROOFS_JSON={}",
+            serde_json::to_string(&json).unwrap()
+        );
+        eprintln!(
+            "ETHLAMBDA_DEPOSIT_CHAIN_ID={}",
+            context.config.deposit_chain_id
+        );
     }
 
     /// One slot of a gloas attester's work: the data comes back without a
